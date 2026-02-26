@@ -28,6 +28,6 @@ Thumbs.db
 *.log
 
 # Agent runtime
-workspace/
-skills/
+/workspace/
+/skills/
 agent.pid

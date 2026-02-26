@@ -300,12 +300,10 @@ WantedBy=multi-user.target"""
 def generate_setup_script(env_content: str) -> str:
     """Generate a self-contained bash setup script for local machines (Mac/Linux).
 
-    Installs the agent as a background service:
-    - macOS: launchd (~/Library/LaunchAgents)
-    - Linux: systemd user service (~/.config/systemd/user)
-
-    The agent auto-starts on login and restarts on crash.
-    A CLI helper (~/toup-agent/toup) provides start/stop/update/logs/status.
+    Installs the agent and starts it in the foreground:
+    - Clones repo, creates venv, installs deps, writes .env
+    - Installs CLI helper (~/toup-agent/toup) for start/stop/update/status
+    - Starts uvicorn in the foreground — user sees output, Ctrl+C stops it
     """
     return f'''#!/bin/bash
 # ═══════════════════════════════════════════════════════════════
@@ -362,6 +360,16 @@ else
   git clone "$REPO" "$AGENT_DIR"
 fi
 
+# Auto-detect repo structure (flat vs nested)
+if [ -f "$AGENT_DIR/agent_main.py" ]; then
+  BACKEND_ROOT="$AGENT_DIR"
+elif [ -f "$AGENT_DIR/brain/backend/agent_main.py" ]; then
+  BACKEND_ROOT="$AGENT_DIR/brain/backend"
+else
+  echo "  ERROR: agent_main.py not found in repo"
+  exit 1
+fi
+
 # ── Virtualenv ───────────────────────────────────────────
 echo ""
 echo "[3/7] Setting up Python environment..."
@@ -372,21 +380,21 @@ if [ ! -d "$AGENT_DIR/venv" ]; then
 fi
 
 echo "  Installing dependencies (this may take a minute)..."
-"$AGENT_DIR/venv/bin/pip" install -q -r "$AGENT_DIR/requirements.txt"
+"$AGENT_DIR/venv/bin/pip" install -q -r "$BACKEND_ROOT/requirements.txt"
 echo "  Dependencies installed"
 
 # ── Write .env ───────────────────────────────────────────
 echo ""
 echo "[4/7] Writing configuration..."
 
-cat > "$AGENT_DIR/.env" << 'TOUP_ENV_EOF'
+cat > "$BACKEND_ROOT/.env" << 'TOUP_ENV_EOF'
 {env_content}
 TOUP_ENV_EOF
-echo "  Configuration saved to $AGENT_DIR/.env"
+echo "  Configuration saved to $BACKEND_ROOT/.env"
 
 # ── Stop existing agent ──────────────────────────────────
 echo ""
-echo "[5/7] Stopping existing agent..."
+echo "[5/6] Stopping existing agent..."
 
 # Stop old PID-based process if exists
 if [ -f "$AGENT_DIR/agent.pid" ]; then
@@ -399,105 +407,24 @@ if [ -f "$AGENT_DIR/agent.pid" ]; then
   rm -f "$AGENT_DIR/agent.pid"
 fi
 
-# Stop existing service if running
+# Stop existing background service if running
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  launchctl bootout gui/$(id -u)/com.toup.agent 2>/dev/null || true
+  launchctl unload "$HOME/Library/LaunchAgents/com.toup.agent.plist" 2>/dev/null || true
 else
   systemctl --user stop toup-agent 2>/dev/null || true
 fi
 
-# ── Install background service ────────────────────────────
-echo ""
-echo "[6/7] Installing background service..."
-
-UVICORN="$AGENT_DIR/venv/bin/uvicorn"
-BACKEND_DIR="$AGENT_DIR"
-LOG_FILE="$AGENT_DIR/agent.log"
-ERR_FILE="$AGENT_DIR/agent-error.log"
-
-if [[ "$OSTYPE" == "darwin"* ]]; then
-  # ── macOS: launchd plist ─────────────────────────────
-  PLIST_DIR="$HOME/Library/LaunchAgents"
-  PLIST_FILE="$PLIST_DIR/com.toup.agent.plist"
-  mkdir -p "$PLIST_DIR"
-
-  cat > "$PLIST_FILE" << PLIST_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.toup.agent</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$UVICORN</string>
-    <string>agent_main:app</string>
-    <string>--host</string>
-    <string>0.0.0.0</string>
-    <string>--port</string>
-    <string>$AGENT_PORT</string>
-  </array>
-  <key>WorkingDirectory</key>
-  <string>$BACKEND_DIR</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>AGENT_DIR</key>
-    <string>$AGENT_DIR</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$LOG_FILE</string>
-  <key>StandardErrorPath</key>
-  <string>$ERR_FILE</string>
-  <key>ThrottleInterval</key>
-  <integer>5</integer>
-</dict>
-</plist>
-PLIST_EOF
-
-  # Load the service
-  launchctl bootstrap gui/$(id -u) "$PLIST_FILE" 2>/dev/null || \\
-    launchctl load "$PLIST_FILE" 2>/dev/null || true
-  echo "  Installed launchd service (auto-starts on login)"
-  SERVICE_TYPE="launchd"
-
-else
-  # ── Linux: systemd user service ─────────────────────
-  SYSTEMD_DIR="$HOME/.config/systemd/user"
-  UNIT_FILE="$SYSTEMD_DIR/toup-agent.service"
-  mkdir -p "$SYSTEMD_DIR"
-
-  cat > "$UNIT_FILE" << UNIT_EOF
-[Unit]
-Description=Toup AI Agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$BACKEND_DIR
-Environment=AGENT_DIR=$AGENT_DIR
-ExecStart=$UVICORN agent_main:app --host 0.0.0.0 --port $AGENT_PORT
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-UNIT_EOF
-
-  systemctl --user daemon-reload
-  systemctl --user enable toup-agent
-  systemctl --user start toup-agent
-  # Enable lingering so the service runs even when not logged in
-  loginctl enable-linger "$(whoami)" 2>/dev/null || true
-  echo "  Installed systemd user service (auto-starts on boot)"
-  SERVICE_TYPE="systemd"
-fi
+# Kill any uvicorn on AGENT_PORT
+lsof -ti :$AGENT_PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
+sleep 1
 
 # ── Create CLI helper ─────────────────────────────────────
+echo ""
+echo "[6/6] Setting up CLI..."
+
+UVICORN="$AGENT_DIR/venv/bin/uvicorn"
+BACKEND_DIR="$BACKEND_ROOT"
+
 cat > "$AGENT_DIR/toup" << 'CLI_EOF'
 #!/bin/bash
 # ═══════════════════════════════════════════════════════
@@ -506,35 +433,24 @@ cat > "$AGENT_DIR/toup" << 'CLI_EOF'
 # ═══════════════════════════════════════════════════════
 
 AGENT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENT_PORT=$(grep '^AGENT_PORT=' "$AGENT_DIR/.env" 2>/dev/null | cut -d= -f2)
+# Auto-detect repo structure
+if [ -f "$AGENT_DIR/agent_main.py" ]; then
+  BACKEND_DIR="$AGENT_DIR"
+elif [ -f "$AGENT_DIR/brain/backend/agent_main.py" ]; then
+  BACKEND_DIR="$AGENT_DIR/brain/backend"
+else
+  BACKEND_DIR="$AGENT_DIR"
+fi
+AGENT_PORT=$(grep '^AGENT_PORT=' "$BACKEND_DIR/.env" 2>/dev/null | cut -d= -f2)
 AGENT_PORT=${{AGENT_PORT:-8001}}
+UVICORN="$AGENT_DIR/venv/bin/uvicorn"
 
-_is_mac() {{ [[ "$OSTYPE" == "darwin"* ]]; }}
-
-_start() {{
-  if _is_mac; then
-    launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.toup.agent.plist" 2>/dev/null || \
-      launchctl load "$HOME/Library/LaunchAgents/com.toup.agent.plist" 2>/dev/null
-  else
-    systemctl --user start toup-agent
-  fi
-  echo "✅ Agent started"
-}}
-
-_stop() {{
-  if _is_mac; then
-    launchctl bootout gui/$(id -u)/com.toup.agent 2>/dev/null || \
-      launchctl unload "$HOME/Library/LaunchAgents/com.toup.agent.plist" 2>/dev/null
-  else
-    systemctl --user stop toup-agent
-  fi
-  echo "🛑 Agent stopped"
-}}
-
-_restart() {{
-  _stop 2>/dev/null
-  sleep 1
-  _start
+_run() {{
+  echo ""
+  echo "  Starting Toup Agent (foreground)..."
+  echo "  Press Ctrl+C to stop."
+  echo ""
+  cd "$BACKEND_DIR" && exec "$UVICORN" agent_main:app --host 0.0.0.0 --port "$AGENT_PORT"
 }}
 
 _status() {{
@@ -545,11 +461,6 @@ _status() {{
     echo "   Health:  $HEALTH"
   else
     echo "❌ Agent is not responding"
-    if _is_mac; then
-      launchctl print gui/$(id -u)/com.toup.agent 2>/dev/null | head -5
-    else
-      systemctl --user status toup-agent --no-pager 2>/dev/null | head -10
-    fi
   fi
 }}
 
@@ -557,89 +468,71 @@ _update() {{
   echo "🔄 Updating Toup Agent..."
   cd "$AGENT_DIR" && git pull --ff-only
   echo "📦 Installing dependencies..."
-  "$AGENT_DIR/venv/bin/pip" install -q -r "$AGENT_DIR/requirements.txt"
-  echo "🔁 Restarting..."
-  _restart
-  sleep 3
-  _status
+  "$AGENT_DIR/venv/bin/pip" install -q -r "$BACKEND_DIR/requirements.txt"
+  echo "✅ Updated! Run: ~/toup-agent/toup start"
+}}
+
+_stop() {{
+  lsof -ti :$AGENT_PORT 2>/dev/null | xargs kill 2>/dev/null || true
+  echo "🛑 Agent stopped"
 }}
 
 _logs() {{
-  tail -f "$AGENT_DIR/agent.log"
+  tail -f "$AGENT_DIR/agent.log" 2>/dev/null || echo "No log file found. Run the agent first."
 }}
 
 case "${{1:-help}}" in
-  start)   _start ;;
-  stop)    _stop ;;
-  restart) _restart ;;
-  status)  _status ;;
-  update)  _update ;;
-  logs)    _logs ;;
+  start|run) _run ;;
+  stop)      _stop ;;
+  status)    _status ;;
+  update)    _update ;;
+  logs)      _logs ;;
   *)
     echo "Usage: toup <command>"
     echo ""
     echo "Commands:"
-    echo "  start    Start the agent"
+    echo "  start    Start the agent (foreground, Ctrl+C to stop)"
     echo "  stop     Stop the agent"
-    echo "  restart  Restart the agent"
     echo "  status   Check if the agent is running"
-    echo "  update   Pull latest code & restart"
+    echo "  update   Pull latest code (then run 'toup start')"
     echo "  logs     Tail the agent logs"
     ;;
 esac
 CLI_EOF
 chmod +x "$AGENT_DIR/toup"
 
-# ── Verify ───────────────────────────────────────────────
+echo "  CLI installed: ~/toup-agent/toup"
+
+# ── Register with platform ────────────────────────────────
+AGENT_API_KEY=$(grep '^AGENT_API_KEY=' "$BACKEND_ROOT/.env" | cut -d= -f2)
+PLATFORM_URL=$(grep '^PLATFORM_API_URL=' "$BACKEND_ROOT/.env" | cut -d= -f2)
+
 echo ""
-echo "[7/7] Verifying..."
+echo "  ════════════════════════════════════════════"
+echo "  ✅ Setup complete!"
+echo ""
+echo "  Starting your agent now..."
+echo "  After you see 'Toup Agent ready', go to https://toup.ai"
+echo "  and click 'Verify Connection'."
+echo ""
+echo "  Press Ctrl+C to stop the agent."
+echo "  To restart later: ~/toup-agent/toup start"
+echo "  To update:        ~/toup-agent/toup update"
+echo "  ════════════════════════════════════════════"
+echo ""
 
-AGENT_API_KEY=$(grep '^AGENT_API_KEY=' "$AGENT_DIR/.env" | cut -d= -f2)
-PLATFORM_URL=$(grep '^PLATFORM_API_URL=' "$AGENT_DIR/.env" | cut -d= -f2)
-
-for i in 1 2 3 4 5 6; do
-  sleep 3
-  if curl -sf "http://localhost:$AGENT_PORT/agent/health" > /dev/null 2>&1; then
-    echo ""
-    echo "  Agent is running at http://localhost:$AGENT_PORT"
-
-    # Register with platform
-    if [ -n "$AGENT_API_KEY" ] && [ -n "$PLATFORM_URL" ]; then
-      curl -sf -X POST "$PLATFORM_URL/agent-setup/register" \\
-        -H "Content-Type: application/json" \\
-        -d "{{\\"agent_api_key\\":\\"$AGENT_API_KEY\\",\\"agent_url\\":\\"http://localhost:$AGENT_PORT\\"}}" > /dev/null 2>&1 \\
-        && echo "  Registered with platform" \\
-        || echo "  (Could not register with platform — verify manually)"
-    fi
-
-    echo ""
-    echo "  ════════════════════════════════════════════"
-    echo "  ✅ Setup complete!"
-    echo ""
-    echo "  Your agent is running as a background service."
-    echo "  It will auto-start on login and restart on crash."
-    echo ""
-    echo "  CLI commands:     ~/toup-agent/toup <command>"
-    echo "    toup status     Check agent status"
-    echo "    toup update     Pull latest code & restart"
-    echo "    toup logs       View agent logs"
-    echo "    toup stop       Stop the agent"
-    echo "    toup start      Start the agent"
-    echo "    toup restart    Restart the agent"
-    echo ""
-    echo "  Web UI:           https://toup.ai"
-    echo "  ════════════════════════════════════════════"
-    echo ""
-    exit 0
+# Register with platform in the background (after agent starts)
+(
+  sleep 10
+  if [ -n "$AGENT_API_KEY" ] && [ -n "$PLATFORM_URL" ]; then
+    curl -sf -X POST "$PLATFORM_URL/agent-setup/register" \\
+      -H "Content-Type: application/json" \\
+      -d "{{\\"agent_api_key\\":\\"$AGENT_API_KEY\\",\\"agent_url\\":\\"http://localhost:$AGENT_PORT\\"}}" > /dev/null 2>&1
   fi
-  echo "  Waiting for agent to start... ($i/6)"
-done
+) &
 
-echo ""
-echo "  Agent did not respond after 18 seconds."
-echo "  Check logs: tail -50 $AGENT_DIR/agent.log"
-echo "  Check errors: tail -50 $AGENT_DIR/agent-error.log"
-exit 1
+# Start agent in foreground — user sees output, Ctrl+C stops it
+cd "$BACKEND_DIR" && exec "$UVICORN" agent_main:app --host 0.0.0.0 --port $AGENT_PORT
 '''
 
 
