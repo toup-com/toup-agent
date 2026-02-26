@@ -447,9 +447,8 @@ async def agent_self_update():
     import subprocess, os, sys
 
     agent_dir = os.environ.get("AGENT_DIR") or os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..")
+        os.path.dirname(__file__)
     )
-    backend_dir = os.path.join(agent_dir, "brain", "backend")
     venv_pip = os.path.join(agent_dir, "venv", "bin", "pip")
 
     steps = []
@@ -472,8 +471,8 @@ async def agent_self_update():
     if needs_install and os.path.exists(venv_pip):
         try:
             result = subprocess.run(
-                [venv_pip, "install", "-q", "-r", os.path.join(backend_dir, "requirements.txt")],
-                cwd=backend_dir, capture_output=True, text=True, timeout=120,
+                [venv_pip, "install", "-q", "-r", os.path.join(agent_dir, "requirements.txt")],
+                cwd=agent_dir, capture_output=True, text=True, timeout=120,
             )
             steps.append({"step": "pip_install", "ok": result.returncode == 0, "output": result.stdout.strip()[:200]})
         except Exception as e:

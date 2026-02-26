@@ -530,10 +530,20 @@ async def _get_or_create_session(
         session = result.scalar_one_or_none()
         
         if session:
-            return session, False
-        
-        # Session not found, create new
-        logger.warning(f"Session {session_id} not found, creating new")
+            # Start a new session if the day changed (daily rotation)
+            if session.started_at:
+                from datetime import datetime, timezone
+                now_utc = datetime.now(timezone.utc)
+                started = session.started_at.replace(tzinfo=timezone.utc) if session.started_at.tzinfo is None else session.started_at
+                if started.date() != now_utc.date():
+                    logger.info(f"Session {session_id} is from {started.date()}, creating new session for today")
+                else:
+                    return session, False
+            else:
+                return session, False
+        else:
+            # Session not found, create new
+            logger.warning(f"Session {session_id} not found, creating new")
     
     # Create new session
     session = Conversation(

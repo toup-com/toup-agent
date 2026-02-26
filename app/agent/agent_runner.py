@@ -489,8 +489,18 @@ class AgentRunner:
             )
             session = result.scalar_one_or_none()
             if session:
-                return session, False
-        
+                # For non-telegram sessions, start a new session if the day changed
+                if session.channel != "telegram" and session.started_at:
+                    from datetime import datetime, timezone
+                    now_utc = datetime.now(timezone.utc)
+                    started = session.started_at.replace(tzinfo=timezone.utc) if session.started_at.tzinfo is None else session.started_at
+                    if started.date() != now_utc.date():
+                        logger.info(f"[AGENT] Session {session_id} is from {started.date()}, creating new session for today")
+                    else:
+                        return session, False
+                else:
+                    return session, False
+
         # Create new session
         session = Conversation(
             user_id=user_id,

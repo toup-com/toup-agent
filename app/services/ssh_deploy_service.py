@@ -17,7 +17,7 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-AGENT_REPO = "https://github.com/toup-com/toup-platform.git"
+AGENT_REPO = "https://github.com/toup-com/toup-agent.git"
 AGENT_DIR = "/opt/toup-agent"
 AGENT_PORT = 8001
 SYSTEMD_UNIT = "toup-agent"
@@ -206,7 +206,7 @@ async def deploy_agent(
 
             ok, _ = await _run_cmd(
                 conn,
-                f"{AGENT_DIR}/venv/bin/pip install -q -r {AGENT_DIR}/brain/backend/requirements.txt",
+                f"{AGENT_DIR}/venv/bin/pip install -q -r {AGENT_DIR}/requirements.txt",
                 on_log, sudo=True,
             )
             if not ok:
@@ -219,7 +219,7 @@ async def deploy_agent(
             safe_env = env_content.replace("'", "'\\''")
             ok, _ = await _run_cmd(
                 conn,
-                f"cat > {AGENT_DIR}/brain/backend/.env << 'TOUP_ENV_EOF'\n{env_content}\nTOUP_ENV_EOF",
+                f"cat > {AGENT_DIR}/.env << 'TOUP_ENV_EOF'\n{env_content}\nTOUP_ENV_EOF",
                 on_log, sudo=True,
             )
             if not ok:
@@ -235,8 +235,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory={AGENT_DIR}/brain/backend
-EnvironmentFile={AGENT_DIR}/brain/backend/.env
+WorkingDirectory={AGENT_DIR}
+EnvironmentFile={AGENT_DIR}/.env
 Environment=AGENT_DIR={AGENT_DIR}
 ExecStart={AGENT_DIR}/venv/bin/uvicorn agent_main:app --host 0.0.0.0 --port {AGENT_PORT}
 Restart=always
@@ -372,17 +372,17 @@ if [ ! -d "$AGENT_DIR/venv" ]; then
 fi
 
 echo "  Installing dependencies (this may take a minute)..."
-"$AGENT_DIR/venv/bin/pip" install -q -r "$AGENT_DIR/brain/backend/requirements.txt"
+"$AGENT_DIR/venv/bin/pip" install -q -r "$AGENT_DIR/requirements.txt"
 echo "  Dependencies installed"
 
 # ── Write .env ───────────────────────────────────────────
 echo ""
 echo "[4/7] Writing configuration..."
 
-cat > "$AGENT_DIR/brain/backend/.env" << 'TOUP_ENV_EOF'
+cat > "$AGENT_DIR/.env" << 'TOUP_ENV_EOF'
 {env_content}
 TOUP_ENV_EOF
-echo "  Configuration saved to $AGENT_DIR/brain/backend/.env"
+echo "  Configuration saved to $AGENT_DIR/.env"
 
 # ── Stop existing agent ──────────────────────────────────
 echo ""
@@ -411,7 +411,7 @@ echo ""
 echo "[6/7] Installing background service..."
 
 UVICORN="$AGENT_DIR/venv/bin/uvicorn"
-BACKEND_DIR="$AGENT_DIR/brain/backend"
+BACKEND_DIR="$AGENT_DIR"
 LOG_FILE="$AGENT_DIR/agent.log"
 ERR_FILE="$AGENT_DIR/agent-error.log"
 
@@ -506,7 +506,7 @@ cat > "$AGENT_DIR/toup" << 'CLI_EOF'
 # ═══════════════════════════════════════════════════════
 
 AGENT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENT_PORT=$(grep '^AGENT_PORT=' "$AGENT_DIR/brain/backend/.env" 2>/dev/null | cut -d= -f2)
+AGENT_PORT=$(grep '^AGENT_PORT=' "$AGENT_DIR/.env" 2>/dev/null | cut -d= -f2)
 AGENT_PORT=${{AGENT_PORT:-8001}}
 
 _is_mac() {{ [[ "$OSTYPE" == "darwin"* ]]; }}
@@ -557,7 +557,7 @@ _update() {{
   echo "🔄 Updating Toup Agent..."
   cd "$AGENT_DIR" && git pull --ff-only
   echo "📦 Installing dependencies..."
-  "$AGENT_DIR/venv/bin/pip" install -q -r "$AGENT_DIR/brain/backend/requirements.txt"
+  "$AGENT_DIR/venv/bin/pip" install -q -r "$AGENT_DIR/requirements.txt"
   echo "🔁 Restarting..."
   _restart
   sleep 3
@@ -594,8 +594,8 @@ chmod +x "$AGENT_DIR/toup"
 echo ""
 echo "[7/7] Verifying..."
 
-AGENT_API_KEY=$(grep '^AGENT_API_KEY=' "$AGENT_DIR/brain/backend/.env" | cut -d= -f2)
-PLATFORM_URL=$(grep '^PLATFORM_API_URL=' "$AGENT_DIR/brain/backend/.env" | cut -d= -f2)
+AGENT_API_KEY=$(grep '^AGENT_API_KEY=' "$AGENT_DIR/.env" | cut -d= -f2)
+PLATFORM_URL=$(grep '^PLATFORM_API_URL=' "$AGENT_DIR/.env" | cut -d= -f2)
 
 for i in 1 2 3 4 5 6; do
   sleep 3
@@ -711,7 +711,7 @@ if (-not (Test-Path "$AGENT_DIR\\venv")) {{
 }}
 
 Write-Host "  Installing dependencies (this may take a minute)..."
-& "$AGENT_DIR\\venv\\Scripts\\pip.exe" install -q -r "$AGENT_DIR\\brain\\backend\\requirements.txt"
+& "$AGENT_DIR\\venv\\Scripts\\pip.exe" install -q -r "$AGENT_DIR\\requirements.txt"
 Write-Host "  Dependencies installed"
 
 # ── Write .env ───────────────────────────────────────────
@@ -720,8 +720,8 @@ Write-Host "[4/6] Writing configuration..."
 
 @"
 {env_content}
-"@ | Set-Content -Path "$AGENT_DIR\\brain\\backend\\.env" -Encoding UTF8
-Write-Host "  Configuration saved to $AGENT_DIR\\brain\\backend\\.env"
+"@ | Set-Content -Path "$AGENT_DIR\\.env" -Encoding UTF8
+Write-Host "  Configuration saved to $AGENT_DIR\\.env"
 
 # ── Stop existing agent if running ───────────────────────
 Write-Host ""
@@ -741,7 +741,7 @@ if (Test-Path $pidFile) {{
 }}
 
 # Start agent
-Push-Location "$AGENT_DIR\\brain\\backend"
+Push-Location "$AGENT_DIR"
 $agentProc = Start-Process -FilePath "$AGENT_DIR\\venv\\Scripts\\uvicorn.exe" `
     -ArgumentList "agent_main:app","--host","0.0.0.0","--port","$AGENT_PORT" `
     -RedirectStandardOutput "$AGENT_DIR\\agent.log" `
