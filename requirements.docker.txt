@@ -1,0 +1,54 @@
+# FastAPI & Server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+
+# Database
+sqlalchemy[asyncio]==2.0.25
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+pgvector==0.2.4
+alembic==1.13.1
+
+# Embeddings & NLP
+sentence-transformers==2.3.1
+numpy>=1.26.0
+openai>=1.0.0
+tiktoken>=0.5.0  # Token counting for chat
+
+# Scheduler
+apscheduler==3.10.4
+
+# Auth & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+pydantic[email]>=2.7.0
+pydantic-settings>=2.5.2
+
+# Utils
+python-dateutil==2.8.2
+httpx>=0.27.0
+tenacity==8.2.3
+
+# Telegram Bot
+python-telegram-bot==21.0.1
+
+# Anthropic Claude API
+anthropic>=0.40.0
+
+# Document parsing
+PyPDF2>=3.0.0
+python-docx>=1.0.0
+
+# Web scraping
+beautifulsoup4==4.12.3
+
+# Process management
+psutil==5.9.8
+
+# Async file I/O
+aiofiles==23.2.1
+
+# MCP Server
+fastmcp==2.9.2

@@ -1,0 +1,21 @@
+HexBrain Database Migrations
+=============================
+
+This directory contains Alembic migration scripts for the HexBrain memory system.
+
+Usage:
+------
+# Generate a new migration after model changes
+alembic revision --autogenerate -m "description"
+
+# Run all pending migrations
+alembic upgrade head
+
+# Downgrade one revision
+alembic downgrade -1
+
+# Show current revision
+alembic current
+
+# Show migration history
+alembic history
