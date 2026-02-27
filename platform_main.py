@@ -32,6 +32,7 @@ from app.api.feedback import router as feedback_router
 from app.api.sessions import router as sessions_router
 from app.api.canvas import router as canvas_router
 from app.api.doctor import router as doctor_router
+from app.api.voice import router as voice_router
 try:
     from app.api.vps import router as vps_router
 except ImportError:
@@ -72,6 +73,17 @@ async def lifespan(app: FastAPI):
             print("✅ Memory maintenance scheduler started")
         except Exception as e:
             print(f"⚠️ Could not start scheduler: {e}")
+
+    # Voice tool calls: primarily routed through agent tunnel (terminal agent),
+    # but keep a local ToolExecutor as fallback for basic tools (memory_search etc.)
+    try:
+        from app.agent.tool_executor import ToolExecutor
+        from app.api.ws_realtime import set_realtime_refs
+        tool_executor = ToolExecutor()
+        set_realtime_refs(tool_executor)
+        print("✅ Voice tools ready (tunnel → terminal agent, local fallback)")
+    except Exception as e:
+        print(f"⚠️ Voice tool executor not available: {e}")
 
     print("🌐 Toup Platform ready.")
     yield
@@ -125,6 +137,20 @@ if vps_router:
 # Canvas & Doctor (UI push, health checks)
 app.include_router(canvas_router, prefix=settings.api_prefix)
 app.include_router(doctor_router, prefix=settings.api_prefix)
+# Voice (transcription & TTS)
+app.include_router(voice_router, prefix=settings.api_prefix)
+# Realtime voice (OpenAI Realtime API proxy)
+try:
+    from app.api.ws_realtime import router as ws_realtime_router
+    app.include_router(ws_realtime_router, prefix=settings.api_prefix)
+except ImportError as e:
+    print(f"⚠️ Realtime voice not mounted: {e}")
+# Agent tunnel (terminal agent connects here for tool dispatch)
+try:
+    from app.api.ws_agent_tunnel import router as ws_tunnel_router
+    app.include_router(ws_tunnel_router, prefix=settings.api_prefix)
+except ImportError as e:
+    print(f"⚠️ Agent tunnel not mounted: {e}")
 # Agent setup & deployment
 try:
     from app.api.agent_setup import router as agent_setup_router

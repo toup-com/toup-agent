@@ -53,9 +53,9 @@ ELEVENLABS_DEFAULT_VOICES = {
 # Transcription (Whisper)
 # ──────────────────────────────────────────────────────────────
 
-async def transcribe_voice(file_path: str, language: Optional[str] = None) -> str:
+async def transcribe_voice(file_path: str, language: Optional[str] = None, api_key: Optional[str] = None) -> str:
     """Transcribe audio using OpenAI Whisper API."""
-    api_key = settings.openai_api_key
+    api_key = api_key or settings.openai_api_key
     if not api_key:
         return "ERROR: OpenAI API key not configured for transcription."
 
@@ -68,10 +68,19 @@ async def transcribe_voice(file_path: str, language: Optional[str] = None) -> st
 
     logger.info(f"[AGENT] Transcribing voice: {file_path} ({file_size} bytes)")
 
+    # Detect MIME type from file extension
+    ext = os.path.splitext(file_path)[1].lower()
+    mime_map = {
+        ".webm": "audio/webm", ".ogg": "audio/ogg", ".mp3": "audio/mpeg",
+        ".wav": "audio/wav", ".m4a": "audio/m4a", ".flac": "audio/flac",
+        ".mp4": "audio/mp4", ".mpeg": "audio/mpeg", ".mpga": "audio/mpeg",
+    }
+    mime_type = mime_map.get(ext, "audio/webm")
+
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             with open(file_path, "rb") as f:
-                files = {"file": (os.path.basename(file_path), f, "audio/ogg")}
+                files = {"file": (os.path.basename(file_path), f, mime_type)}
                 data = {"model": "whisper-1"}
                 if language:
                     data["language"] = language
@@ -108,6 +117,7 @@ async def synthesize_speech(
     speed: float = 1.0,
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> str:
     """
     Generate speech audio from text using the configured TTS provider.
@@ -121,13 +131,14 @@ async def synthesize_speech(
     elif prov == TTSProvider.EDGE or prov == "edge":
         return await _tts_edge(text, voice)
     else:
-        return await _tts_openai(text, voice, model, speed, instructions)
+        return await _tts_openai(text, voice, model, speed, instructions, api_key=api_key)
 
 
 async def _tts_openai(text: str, voice: str, model: str,
-                      speed: float, instructions: Optional[str]) -> str:
+                      speed: float, instructions: Optional[str],
+                      api_key: Optional[str] = None) -> str:
     """OpenAI TTS synthesis."""
-    api_key = settings.openai_api_key
+    api_key = api_key or settings.openai_api_key
     if not api_key:
         return "ERROR: OpenAI API key not configured for TTS."
 
@@ -149,7 +160,7 @@ async def _tts_openai(text: str, voice: str, model: str,
             "model": model,
             "input": text,
             "voice": voice,
-            "response_format": "opus",
+            "response_format": "mp3",
             "speed": speed,
         }
         if instructions and model == "gpt-4o-mini-tts":
@@ -166,7 +177,7 @@ async def _tts_openai(text: str, voice: str, model: str,
             )
             resp.raise_for_status()
 
-        tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
         tmp.write(resp.content)
         tmp.close()
         logger.info("[TTS] OpenAI generated %d bytes → %s", len(resp.content), tmp.name)

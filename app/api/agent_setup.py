@@ -12,6 +12,7 @@ POST /api/agent-setup/test-connection  — test deployed agent health
 POST /api/agent-setup/register         — agent self-registration on startup
 """
 
+import json
 import logging
 import secrets
 import uuid
@@ -74,10 +75,13 @@ class AgentConfigOut(BaseModel):
     deploy_status: str = "none"
     setup_completed: bool = False
     setup_step: int = 1
+    onboarding_completed: bool = False
     # VPS info (if hosting_mode == "vps")
     vps_ip: str | None = None
     vps_status: str | None = None
     vps_plan: str | None = None
+    # Tool access control
+    disabled_tools: list[str] = []
 
     class Config:
         from_attributes = True
@@ -109,6 +113,7 @@ class AgentConfigUpdate(BaseModel):
     elevenlabs_api_key: str | None = None
     setup_step: int | None = None
     setup_completed: bool | None = None
+    disabled_tools: list[str] | None = None
 
 
 class SSHTestRequest(BaseModel):
@@ -181,6 +186,8 @@ def _config_to_out(config: AgentConfig, vps: VPSInstance | None = None) -> Agent
         deploy_status=config.deploy_status,
         setup_completed=config.setup_completed,
         setup_step=config.setup_step,
+        onboarding_completed=config.onboarding_completed,
+        disabled_tools=json.loads(config.disabled_tools) if getattr(config, 'disabled_tools', None) else [],
     )
     if vps:
         out.vps_ip = vps.public_ip
@@ -252,6 +259,9 @@ async def update_config(
     config = await _get_or_create_config(current_user.id, db)
 
     update_data = body.model_dump(exclude_unset=True)
+    # Serialize list fields to JSON for DB storage
+    if "disabled_tools" in update_data:
+        update_data["disabled_tools"] = json.dumps(update_data["disabled_tools"])
     for field, value in update_data.items():
         if hasattr(config, field):
             setattr(config, field, value)
@@ -573,6 +583,8 @@ async def agent_register(
 
     config.agent_url = body.agent_url
     config.deploy_status = "active"
+    config.setup_completed = True
+    config.setup_step = 5
     config.updated_at = datetime.utcnow()
     await db.commit()
 

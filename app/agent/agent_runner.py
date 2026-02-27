@@ -164,6 +164,22 @@ class AgentRunner:
             session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id)
             session_id = session.id
 
+            # Load user's disabled tools from AgentConfig
+            from sqlalchemy import select as _select
+            from app.db import AgentConfig
+            _ac_result = await db.execute(
+                _select(AgentConfig).where(AgentConfig.user_id == user_id)
+            )
+            _ac = _ac_result.scalars().first()
+            if _ac and getattr(_ac, 'disabled_tools', None):
+                import json as _json
+                _user_disabled = set(_json.loads(_ac.disabled_tools))
+                self.tools.user_disabled_tools = _user_disabled
+                # Also hide disabled tools from LLM so it doesn't try to call them
+                self.tool_defs = [t for t in self.tool_defs if t["function"]["name"] not in _user_disabled]
+            else:
+                self.tools.user_disabled_tools = set()
+
             system_prompt = await self._build_system_prompt(db, user_id, user_message)
             logger.info(f"[AGENT] System prompt length: {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
 
@@ -571,7 +587,30 @@ class AgentRunner:
                 logger.info(f"[AGENT] Loaded {len(agent_memories)} agent brain memories")
         except Exception as e:
             logger.warning(f"Agent brain load failed: {e}")
-        
+
+        # 2b. Onboarding mode — inject instructions when onboarding not yet completed
+        try:
+            from app.db.models import AgentConfig
+            _cfg_result = await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == user_id)
+            )
+            _agent_cfg = _cfg_result.scalar_one_or_none()
+            if _agent_cfg and not _agent_cfg.onboarding_completed:
+                sections.append(
+                    "# Onboarding Mode (ACTIVE)\n"
+                    "You are in onboarding mode — this is a new user who just set up their agent. "
+                    "Your goal is to learn three things through natural conversation:\n"
+                    "1. What the user wants to call you (your name) — store with memory_store(brain_type='agent', category='agent_soul')\n"
+                    "2. What they need you for — store with memory_store(brain_type='user', category='goals')\n"
+                    "3. Their name — store with memory_store(brain_type='user', category='identity')\n\n"
+                    "Ask ONE question at a time. Be warm and conversational. "
+                    "Use memory_store to save each piece of info as you learn it. "
+                    "Once you have all three, store a final memory: "
+                    "memory_store(brain_type='agent', category='agent_decisions', content='Onboarding complete. I know the user and they know me.')"
+                )
+        except Exception as e:
+            logger.warning(f"Onboarding check failed: {e}")
+
         # 3. Retrieve relevant user memories (hybrid search: vector + keyword + graph)
         try:
             from app.services.memory_service import MemoryService

@@ -2,7 +2,7 @@
 
 import json
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
@@ -214,18 +214,17 @@ async def get_connections(
 @router.get("/recent", response_model=List[MemoryResponse])
 async def get_recent_memories(
     limit: int = Query(20, ge=1, le=100),
+    brain_type: Optional[str] = Query(None),
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get most recently created memories"""
+    """Get most recently created memories, optionally filtered by brain_type."""
+    filters = [Memory.user_id == current_user.id, Memory.is_deleted == False]
+    if brain_type:
+        filters.append(Memory.brain_type == brain_type)
     result = await db.execute(
         select(Memory)
-        .where(
-            and_(
-                Memory.user_id == current_user.id,
-                Memory.is_deleted == False
-            )
-        )
+        .where(and_(*filters))
         .order_by(Memory.created_at.desc())
         .limit(limit)
     )

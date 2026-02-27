@@ -321,11 +321,6 @@ class MemoryExtractor:
                         importance=0.5
                     ))
         
-        # Always create a conversation summary if we have content
-        if len(user_message) > 20:
-            summary = self._create_conversation_summary(user_message, assistant_response)
-            memories.append(summary)
-        
         # Deduplicate and limit
         unique_memories = self._deduplicate_memories(memories)
         return unique_memories[:max_memories]
@@ -582,7 +577,7 @@ ASSISTANT RESPONSE:
 
 4. **Minimum quality bar:** If you read the memory 6 months from now with zero context, would it be useful and understandable? If not, don't extract it.
 
-5. **Category must be one of:** identity, preferences, beliefs, emotions, people, places, family, experiences, projects, schedule, work, learning, knowledge, tools, media, health, habits, food, travel, goals, context
+5. **Category must be one of:** identity, preferences, beliefs, emotions, people, places, family, experiences, projects, schedule, work, learning, knowledge, tools, media, health, habits, food, travel, goals
 
 6. **Importance guide:**
    - 0.9-1.0: Core identity facts, major life decisions
@@ -640,7 +635,7 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                 "identity", "preferences", "beliefs", "emotions", "people",
                 "places", "family", "experiences", "projects", "schedule",
                 "work", "learning", "knowledge", "tools", "media", "health",
-                "habits", "food", "travel", "goals", "context"
+                "habits", "food", "travel", "goals"
             }}
             
             for mem_data in result.get("memories", [])[:max_memories]:

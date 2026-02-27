@@ -27,6 +27,7 @@ from app.api.ws_chat import router as ws_chat_router, set_ws_refs
 from app.api.api_v1 import router as api_v1_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
+from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 
 _app_start_time = None
 
@@ -170,6 +171,7 @@ async def lifespan(app: FastAPI):
         from app.api.api_v1 import set_api_v1_refs
         set_ws_refs(agent_runner, skill_loader)
         set_api_v1_refs(agent_runner, skill_loader)
+        set_realtime_refs(tool_executor)
 
         # ── Start Telegram bot (if configured) ────────────────
         if settings.telegram_bot_token:
@@ -320,6 +322,24 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ WhatsApp error: {e}")
 
+    # ── Platform Tunnel (connect terminal agent to toup.ai) ──
+    tunnel_client = None
+    if settings.platform_api_url and settings.user_id and tool_executor:
+        try:
+            from app.agent.tunnel_client import AgentTunnelClient
+            from app.services.auth_service import create_access_token
+
+            tunnel_token = create_access_token(settings.user_id)
+            tunnel_client = AgentTunnelClient(
+                platform_url=settings.platform_api_url,
+                auth_token=tunnel_token,
+                tool_executor=tool_executor,
+            )
+            await tunnel_client.start()
+            print("🔗 Platform tunnel connecting...")
+        except Exception as e:
+            print(f"⚠️ Platform tunnel not available: {e}")
+
     print("🤖 Toup Agent ready.")
     print(f"   Server:  http://0.0.0.0:8001")
     print(f"   Health:  http://localhost:8001/agent/health")
@@ -330,6 +350,13 @@ async def lifespan(app: FastAPI):
     # ── Shutdown (reverse order) ──────────────────────────────
     await _hook_bus.emit(HookEvent.SHUTDOWN, {"app": "toup-agent"})
     print("🤖 Toup Agent shutting down...")
+
+    if tunnel_client:
+        try:
+            await tunnel_client.stop()
+            print("🔗 Platform tunnel disconnected")
+        except Exception:
+            pass
 
     if cron_service:
         try:
@@ -404,6 +431,7 @@ app.include_router(ws_chat_router, prefix=settings.api_prefix)
 app.include_router(api_v1_router, prefix=settings.api_prefix)
 app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
+app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 
 
 @app.get("/")

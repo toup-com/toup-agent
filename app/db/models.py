@@ -1019,6 +1019,10 @@ class AgentConfig(Base):
     # Wizard state
     setup_completed: Mapped[bool] = mapped_column(Boolean, default=False)
     setup_step: Mapped[int] = mapped_column(Integer, default=1)  # Current step 1-5
+    onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Tool access control (JSON list of disabled tool names)
+    disabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default="")
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

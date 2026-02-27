@@ -96,6 +96,8 @@ class ToolExecutor:
         # Background process tracking {proc_id: {...}}
         self._processes: Dict[str, Dict[str, Any]] = {}
         self._proc_counter: int = 0
+        # Per-user disabled tools (loaded from AgentConfig)
+        self.user_disabled_tools: Set[str] = set()
 
     def set_chat_id(self, chat_id: Optional[int]):
         """Set the current Telegram chat ID for send_file/send_photo tools."""
@@ -176,6 +178,8 @@ class ToolExecutor:
         # ── Tool Policy Enforcement ──────────────────────────
         if tool_name in settings.tool_deny_list:
             return f"ERROR: Tool '{tool_name}' is blocked by administrator policy."
+        if tool_name in self.user_disabled_tools:
+            return f"ERROR: Tool '{tool_name}' has been disabled by the user."
         if tool_name in settings.tool_elevated_list:
             logger.warning(f"[TOOL-POLICY] Elevated tool invoked: {tool_name}")
 

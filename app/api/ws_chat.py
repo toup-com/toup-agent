@@ -28,9 +28,30 @@ from typing import Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import select
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# ── Onboarding prompt ────────────────────────────────────────────────
+_ONBOARDING_TRIGGER = (
+    "[SYSTEM: ONBOARDING — FIRST CONVERSATION]\n"
+    "The user just set up their AI agent and is opening the chat for the very first time. "
+    "You are coming alive for the first time. Greet them warmly.\n\n"
+    "Your goals for this conversation:\n"
+    "1. Ask what they'd like to call you (your name). Once they answer, use memory_store "
+    "(brain_type='agent', category='agent_soul') to save it.\n"
+    "2. Ask what they primarily need you for. Store with memory_store "
+    "(brain_type='user', category='goals').\n"
+    "3. Ask their name so you can address them personally. Store with memory_store "
+    "(brain_type='user', category='identity').\n\n"
+    "Be conversational and warm. Ask ONE question at a time — don't overwhelm them. "
+    "After you've learned all three, confirm you're ready and store a final memory: "
+    "memory_store(brain_type='agent', category='agent_decisions', "
+    "content='Onboarding complete. I know the user and they know me.')\n\n"
+    "Start by greeting them and asking what they'd like to call you."
+)
 
 # ── ANSI helpers for terminal activity display ────────────────────────
 _CYAN_BOLD = "\033[1;36m"
@@ -148,6 +169,21 @@ async def ws_chat(
                 await websocket.send_json({"type": "error", "message": "Empty message"})
                 continue
 
+            # ── Onboarding trigger ──────────────────────────────
+            is_onboarding_msg = False
+            if text == "__ONBOARDING_START__":
+                from app.db.database import async_session_maker
+                from app.db.models import AgentConfig
+                async with async_session_maker() as _db:
+                    _cfg = (await _db.execute(
+                        select(AgentConfig).where(AgentConfig.user_id == user_id)
+                    )).scalar_one_or_none()
+                    if _cfg and _cfg.onboarding_completed:
+                        text = "Hello!"
+                    else:
+                        text = _ONBOARDING_TRIGGER
+                        is_onboarding_msg = True
+
             session_id = msg.get("session_id")
             model = msg.get("model")
 
@@ -200,6 +236,26 @@ async def ws_chat(
                     f"{response.processing_time_ms or 0}ms, "
                     f"{response.model or '?'}){_RESET}"
                 )
+
+                # Check if onboarding just completed (agent stored the signal memory)
+                for tc in response.tool_calls:
+                    if tc.get("name") == "memory_store":
+                        tc_content = (tc.get("input") or {}).get("content", "")
+                        if "onboarding complete" in tc_content.lower():
+                            try:
+                                from app.db.database import async_session_maker
+                                from app.db.models import AgentConfig
+                                async with async_session_maker() as _db:
+                                    _cfg = (await _db.execute(
+                                        select(AgentConfig).where(AgentConfig.user_id == user_id)
+                                    )).scalar_one_or_none()
+                                    if _cfg:
+                                        _cfg.onboarding_completed = True
+                                        await _db.commit()
+                                        logger.info(f"[WS] Onboarding completed for user {user_id}")
+                            except Exception as e:
+                                logger.warning(f"[WS] Failed to mark onboarding complete: {e}")
+                            break
 
                 await websocket.send_json({
                     "type": "done",
