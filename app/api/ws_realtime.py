@@ -317,16 +317,14 @@ async def _get_user_openai_key(user_id: str) -> Optional[str]:
         return result.scalar_one_or_none()
 
 
-# ── Execute function calls via ToolExecutor or Agent Tunnel ──────────
+# ── Execute function calls via Agent Tunnel or local ToolExecutor ─────
 async def _execute_tool(user_id: str, func_name: str, arguments: dict) -> str:
     """Execute a Realtime API function call.
 
-    Priority:
-    1. If the user's terminal agent is connected via tunnel → proxy through tunnel
-    2. If a local ToolExecutor is available (agent mode) → execute locally
-    3. Otherwise → error
+    On platform: routes through WebSocket tunnel to the user's terminal agent.
+    On agent (local): uses the local ToolExecutor directly.
     """
-    # Try tunnel first (platform mode: proxy to terminal agent)
+    # Route through tunnel (platform mode → terminal agent)
     try:
         from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
         if is_agent_connected(user_id):
@@ -335,7 +333,7 @@ async def _execute_tool(user_id: str, func_name: str, arguments: dict) -> str:
     except ImportError:
         pass
 
-    # Fall back to local ToolExecutor (agent mode)
+    # Local ToolExecutor (only available when running as agent_main.py, not platform)
     if _tool_executor:
         _tool_executor._current_user_id = user_id
         try:
@@ -345,7 +343,7 @@ async def _execute_tool(user_id: str, func_name: str, arguments: dict) -> str:
             logger.exception("[REALTIME] Tool execution failed: %s", func_name)
             return f"ERROR: {e}"
 
-    return "ERROR: No agent connected. Run `toup run` in your terminal to connect your agent."
+    return "ERROR: Your terminal agent is not connected. Open your terminal and run the start command from Agent Settings to connect."
 
 
 # ── DB persistence helpers ────────────────────────────────────────────

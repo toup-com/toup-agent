@@ -74,16 +74,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ Could not start scheduler: {e}")
 
-    # Voice tool calls: primarily routed through agent tunnel (terminal agent),
-    # but keep a local ToolExecutor as fallback for basic tools (memory_search etc.)
-    try:
-        from app.agent.tool_executor import ToolExecutor
-        from app.api.ws_realtime import set_realtime_refs
-        tool_executor = ToolExecutor()
-        set_realtime_refs(tool_executor)
-        print("✅ Voice tools ready (tunnel → terminal agent, local fallback)")
-    except Exception as e:
-        print(f"⚠️ Voice tool executor not available: {e}")
+    # Voice tool calls are routed through the agent tunnel to the user's
+    # terminal agent. No local ToolExecutor — the platform is data-only.
+    print("🎤 Voice ready (tools execute via terminal agent tunnel)")
 
     print("🌐 Toup Platform ready.")
     yield
