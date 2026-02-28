@@ -99,8 +99,8 @@ class AgentTunnelClient:
         async with websockets.connect(
             self.ws_url,
             max_size=10 * 1024 * 1024,
-            ping_interval=20,
-            ping_timeout=30,
+            ping_interval=None,  # Disable protocol-level pings; platform sends app-level heartbeat
+            ping_timeout=None,
         ) as ws:
             self._ws = ws
             self._connected = True
