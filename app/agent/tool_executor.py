@@ -68,7 +68,7 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
 # Default if tool not in the table
 DEFAULT_OUTPUT_LIMIT = 15_000
 
-# Dangerous command patterns
+# Dangerous command patterns — always blocked (catastrophic)
 BLOCKED_PATTERNS = [
     r"rm\s+-rf\s+/\s*$",
     r"rm\s+-rf\s+/\s+",
@@ -76,6 +76,19 @@ BLOCKED_PATTERNS = [
     r"dd\s+if=.*of=/dev/",
     r":\(\)\{.*\}",
     r"chmod\s+-R\s+777\s+/\s*$",
+]
+
+# Destructive command patterns — require explicit user confirmation.
+# When detected, the tool returns a safety message instead of executing.
+# The agent must ask the user to confirm, then re-call with confirmed=true.
+DESTRUCTIVE_PATTERNS = [
+    r"\brm\s+",           # rm (any form: rm file, rm -f, rm -r, rm -rf)
+    r"\brmdir\b",         # rmdir
+    r"\bunlink\b",        # unlink
+    r"\bshred\b",         # shred
+    r"\btrash\b",         # trash
+    r"\bmv\b.*(/dev/null|/tmp/)",  # mv to /dev/null or /tmp (disguised delete)
+    r">\s*/dev/null",     # redirect to /dev/null (truncate)
 ]
 
 
@@ -224,11 +237,23 @@ class ToolExecutor:
         command = inp.get("command", "").strip()
         if not command:
             return "ERROR: Empty command"
-        
-        # Safety check
+
+        # Safety check — always blocked (catastrophic commands)
         for pattern in BLOCKED_PATTERNS:
             if re.search(pattern, command):
                 return f"ERROR: Blocked dangerous command pattern: {pattern}"
+
+        # Destructive command check — requires explicit user confirmation
+        confirmed = inp.get("confirmed", False)
+        if not confirmed:
+            for pattern in DESTRUCTIVE_PATTERNS:
+                if re.search(pattern, command):
+                    return (
+                        f"SAFETY: This command is destructive (matches: {pattern}). "
+                        f"You MUST ask the user for explicit confirmation before executing. "
+                        f"Tell the user exactly what will be deleted and ask 'Are you sure?'. "
+                        f"Only if they clearly say yes, re-call exec with confirmed=true."
+                    )
         
         # Bootstrap workspace on first use
         default_ws = self._ensure_workspace()
@@ -304,6 +329,17 @@ class ToolExecutor:
         command = inp.get("command", "")
         if not command:
             return "ERROR: 'command' is required"
+
+        # Destructive command check
+        confirmed = inp.get("confirmed", False)
+        if not confirmed:
+            for pattern in DESTRUCTIVE_PATTERNS:
+                if re.search(pattern, command):
+                    return (
+                        f"SAFETY: This command is destructive (matches: {pattern}). "
+                        f"You MUST ask the user for explicit confirmation before executing. "
+                        f"Only if they clearly say yes, re-call with confirmed=true."
+                    )
 
         default_ws = self._get_user_workspace()
         workdir = inp.get("workdir", default_ws)
@@ -899,6 +935,15 @@ class ToolExecutor:
         for pattern in BLOCKED_PATTERNS:
             if re.search(pattern, command):
                 return f"ERROR: Blocked dangerous command pattern"
+
+        # Destructive command check
+        if not inp.get("confirmed", False):
+            for pattern in DESTRUCTIVE_PATTERNS:
+                if re.search(pattern, command):
+                    return (
+                        f"SAFETY: This command is destructive. "
+                        f"Ask the user for explicit confirmation first."
+                    )
 
         label = inp.get("label", f"proc-{self._proc_counter}")
         workdir = self._get_user_workspace()

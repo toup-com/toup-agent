@@ -19,7 +19,9 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             "description": (
                 "Execute a shell command and return stdout/stderr. "
                 "Use for running scripts, checking system state, installing packages, etc. "
-                "Commands run in a sandboxed workspace. A timeout is enforced."
+                "Commands run in a sandboxed workspace. A timeout is enforced. "
+                "IMPORTANT: Destructive commands (rm, rmdir, unlink, shred) require "
+                "confirmed=true. You MUST ask the user for explicit confirmation first."
             ),
             "input_schema": {
                 "type": "object",
@@ -35,6 +37,10 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                     "timeout": {
                         "type": "integer",
                         "description": "Timeout in seconds (default 30, max 120).",
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Set to true ONLY after the user explicitly confirmed a destructive operation. Never set this without asking the user first.",
                     },
                 },
                 "required": ["command"],
