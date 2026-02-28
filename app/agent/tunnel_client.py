@@ -157,7 +157,7 @@ class AgentTunnelClient:
         arguments = msg.get("arguments", {})
         user_id = msg.get("user_id", "")
 
-        logger.info("[TUNNEL-CLIENT] Executing tool: %s(%s)", tool_name, arguments)
+        print(f"🔧 [TUNNEL] Executing tool: {tool_name}({arguments})")
 
         try:
             if user_id:
@@ -170,7 +170,7 @@ class AgentTunnelClient:
                 "id": call_id,
                 "result": result,
             }))
-            logger.info("[TUNNEL-CLIENT] Tool %s completed", tool_name)
+            print(f"✅ [TUNNEL] Tool {tool_name} completed (result: {str(result)[:200]})")
 
         except Exception as e:
             logger.exception("[TUNNEL-CLIENT] Tool %s failed", tool_name)
