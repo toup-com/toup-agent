@@ -99,8 +99,8 @@ class AgentTunnelClient:
         async with websockets.connect(
             self.ws_url,
             max_size=10 * 1024 * 1024,
-            ping_interval=None,  # Disable protocol-level pings; platform sends app-level heartbeat
-            ping_timeout=None,
+            ping_interval=15,   # Protocol-level pings every 15s (keeps proxies alive)
+            ping_timeout=30,
         ) as ws:
             self._ws = ws
             self._connected = True
@@ -111,26 +111,41 @@ class AgentTunnelClient:
 
             print("🔗 Connected to toup.ai — voice tools will execute locally")
 
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
+            # Client-side heartbeat: send app-level pong every 15s
+            # This ensures data flows through Railway's proxy regularly
+            async def client_heartbeat():
+                while True:
+                    try:
+                        await asyncio.sleep(15)
+                        await ws.send(json.dumps({"type": "pong"}))
+                    except Exception:
+                        break
 
-                msg_type = msg.get("type")
+            hb_task = asyncio.create_task(client_heartbeat())
 
-                if msg_type == "ping":
-                    await ws.send(json.dumps({"type": "pong"}))
+            try:
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
 
-                elif msg_type == "connected":
-                    logger.info("[TUNNEL-CLIENT] Platform confirmed connection")
+                    msg_type = msg.get("type")
 
-                elif msg_type == "tool_call":
-                    # Execute tool in background (don't block the message loop)
-                    asyncio.create_task(self._handle_tool_call(ws, msg))
+                    if msg_type == "ping":
+                        await ws.send(json.dumps({"type": "pong"}))
 
-                elif msg_type == "error":
-                    logger.error("[TUNNEL-CLIENT] Platform error: %s", msg.get("message"))
+                    elif msg_type == "connected":
+                        logger.info("[TUNNEL-CLIENT] Platform confirmed connection")
+
+                    elif msg_type == "tool_call":
+                        # Execute tool in background (don't block the message loop)
+                        asyncio.create_task(self._handle_tool_call(ws, msg))
+
+                    elif msg_type == "error":
+                        logger.error("[TUNNEL-CLIENT] Platform error: %s", msg.get("message"))
+            finally:
+                hb_task.cancel()
 
         self._connected = False
         print("🔌 Disconnected from toup.ai tunnel")
