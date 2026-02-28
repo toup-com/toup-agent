@@ -116,6 +116,28 @@ class ToolExecutor:
         """Set the current Telegram chat ID for send_file/send_photo tools."""
         self._chat_id = chat_id
 
+    async def _resolve_chat_id(self) -> Optional[int]:
+        """Get the active chat_id, falling back to the user's Telegram ID from DB."""
+        if self._chat_id:
+            return self._chat_id
+        # Look up the user's Telegram ID from the database
+        if not self._current_user_id:
+            return None
+        try:
+            from sqlalchemy import text
+            from app.db.database import engine
+            async with engine.begin() as conn:
+                result = await conn.execute(
+                    text("SELECT telegram_id FROM telegram_user_mappings WHERE user_id = :uid ORDER BY last_seen_at DESC LIMIT 1"),
+                    {"uid": self._current_user_id},
+                )
+                row = result.first()
+                if row:
+                    return row[0]
+        except Exception:
+            pass
+        return None
+
     # ------------------------------------------------------------------
     # Workspace Bootstrap
     # ------------------------------------------------------------------
@@ -724,7 +746,8 @@ class ToolExecutor:
         if not os.path.isfile(path):
             return f"ERROR: File not found: {path}"
 
-        if not self.telegram_bot or not self._chat_id:
+        chat_id = await self._resolve_chat_id()
+        if not self.telegram_bot or not chat_id:
             return "ERROR: Telegram bot not available or no active chat"
 
         try:
@@ -735,7 +758,7 @@ class ToolExecutor:
             bot = self.telegram_bot.app.bot
             with open(path, "rb") as f:
                 await bot.send_document(
-                    chat_id=self._chat_id,
+                    chat_id=chat_id,
                     document=f,
                     filename=os.path.basename(path),
                     caption=caption,
@@ -756,14 +779,15 @@ class ToolExecutor:
         if not os.path.isfile(path):
             return f"ERROR: File not found: {path}"
 
-        if not self.telegram_bot or not self._chat_id:
+        chat_id = await self._resolve_chat_id()
+        if not self.telegram_bot or not chat_id:
             return "ERROR: Telegram bot not available or no active chat"
 
         try:
             bot = self.telegram_bot.app.bot
             with open(path, "rb") as f:
                 await bot.send_photo(
-                    chat_id=self._chat_id,
+                    chat_id=chat_id,
                     photo=f,
                     caption=caption,
                 )
