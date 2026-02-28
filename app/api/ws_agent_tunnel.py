@@ -109,12 +109,39 @@ async def send_tool_call(user_id: str, tool_name: str, arguments: dict) -> str:
 
 
 async def _authenticate_tunnel(token: str) -> Optional[str]:
-    """Validate JWT token and return user_id."""
+    """Validate tunnel token and return user_id.
+
+    Accepts two token types:
+    1. Connect token (toup_ct_...) — looked up in AgentConfig.connect_token
+    2. JWT token — verified via standard auth (fallback)
+    """
+    # 1. Connect token (from dashboard "Generate Connect Token")
+    if token.startswith("toup_ct_"):
+        try:
+            from sqlalchemy import text
+            from app.db.database import engine
+            async with engine.begin() as conn:
+                result = await conn.execute(
+                    text("SELECT user_id FROM agent_configs WHERE connect_token = :token"),
+                    {"token": token},
+                )
+                row = result.first()
+                if row:
+                    logger.info("[TUNNEL] Token auth OK for user %s", row[0][:8])
+                    return row[0]
+                else:
+                    logger.warning("[TUNNEL] Token not found in DB: %s...%s", token[:12], token[-4:])
+        except Exception as e:
+            logger.exception("[TUNNEL] Token auth DB error: %s", e)
+        return None
+
+    # 2. JWT token (fallback for backwards compatibility)
     try:
         from app.api.auth import verify_token
         payload = verify_token(token)
         return payload.get("sub") or payload.get("user_id")
-    except Exception:
+    except Exception as e:
+        logger.warning("[TUNNEL] JWT auth failed: %s", e)
         return None
 
 
@@ -131,11 +158,38 @@ async def agent_tunnel_ws(
     await websocket.accept()
 
     # ── Authenticate ──
+    # Try multiple sources for the token:
+    # 1. FastAPI Query injection
+    # 2. websocket.query_params
+    # 3. First message from client ({"type": "auth", "token": "..."})
+    if not token:
+        token = websocket.query_params.get("token")
+
+    logger.info("[TUNNEL] Auth — query param token: %s (len=%d)",
+                "present" if token else "MISSING", len(token) if token else 0)
+
     user_id = None
     if token:
         user_id = await _authenticate_tunnel(token)
 
+    # If query param auth failed, wait for auth message from client
     if not user_id:
+        logger.info("[TUNNEL] Query param auth failed, waiting for auth message...")
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+            msg = json.loads(raw)
+            if msg.get("type") == "auth" and msg.get("token"):
+                token = msg["token"]
+                logger.info("[TUNNEL] Got auth message — token len=%d", len(token))
+                user_id = await _authenticate_tunnel(token)
+        except asyncio.TimeoutError:
+            logger.warning("[TUNNEL] No auth message received within 10s")
+        except Exception as e:
+            logger.warning("[TUNNEL] Error reading auth message: %s", e)
+
+    if not user_id:
+        logger.warning("[TUNNEL] Auth failed — token: %s",
+                       f"{token[:12]}...{token[-4:]}" if token else "None")
         await websocket.send_json({"type": "error", "message": "Authentication failed"})
         await websocket.close(code=4401)
         return
@@ -241,9 +295,53 @@ async def tunnel_status_me(
 
     tunnel = _tunnels.get(user_id)
     if not tunnel:
-        return {"connected": False}
+        return {"connected": False, "user_id": user_id}
 
     return {
         "connected": True,
         "uptime_seconds": round(tunnel.uptime, 1),
     }
+
+
+@router.get("/agent/tunnel-debug")
+async def tunnel_debug(token: str = Query(None)):
+    """Debug endpoint: test token auth and show tunnel state."""
+    result: dict = {"tunnels_active": list(_tunnels.keys())}
+
+    if not token:
+        result["error"] = "no token provided"
+        return result
+
+    # Test authentication
+    user_id = await _authenticate_tunnel(token)
+    result["auth_user_id"] = user_id
+
+    if user_id:
+        result["is_connected"] = user_id in _tunnels
+        tunnel = _tunnels.get(user_id)
+        if tunnel:
+            result["tunnel_uptime"] = round(tunnel.uptime, 1)
+
+    # Also check raw DB
+    try:
+        from sqlalchemy import text
+        from app.db.database import engine
+        async with engine.begin() as conn:
+            # Count total configs with connect tokens
+            r = await conn.execute(text("SELECT COUNT(*) FROM agent_configs WHERE connect_token IS NOT NULL"))
+            result["configs_with_tokens"] = r.scalar()
+            # Check if this specific token exists
+            if token.startswith("toup_ct_"):
+                r2 = await conn.execute(
+                    text("SELECT user_id, LENGTH(connect_token) FROM agent_configs WHERE connect_token = :t"),
+                    {"t": token},
+                )
+                row = r2.first()
+                result["token_found_in_db"] = row is not None
+                if row:
+                    result["token_user_id"] = row[0]
+                    result["token_length"] = row[1]
+    except Exception as e:
+        result["db_error"] = str(e)
+
+    return result

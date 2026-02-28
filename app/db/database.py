@@ -89,6 +89,8 @@ async def init_db():
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE",
         # Per-user tool access control
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS disabled_tools TEXT DEFAULT ''",
+        # Connect token for tunnel authentication
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS connect_token VARCHAR(100)",
     ]
     async with engine.begin() as conn:
         from sqlalchemy import text

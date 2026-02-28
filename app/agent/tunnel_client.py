@@ -41,6 +41,7 @@ class AgentTunnelClient:
         if ws_url.endswith("/api"):
             ws_url = ws_url[:-4]
         self.ws_url = f"{ws_url}/api/ws/agent-tunnel?token={auth_token}"
+        self._auth_token = auth_token
 
         self.tool_executor = tool_executor
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -104,6 +105,10 @@ class AgentTunnelClient:
             self._ws = ws
             self._connected = True
             logger.info("[TUNNEL-CLIENT] Connected to platform tunnel")
+
+            # Send auth token as first message (fallback if query param is stripped by proxy)
+            await ws.send(json.dumps({"type": "auth", "token": self._auth_token}))
+
             print("🔗 Connected to toup.ai — voice tools will execute locally")
 
             async for raw in ws:

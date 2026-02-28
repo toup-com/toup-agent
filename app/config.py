@@ -198,6 +198,7 @@ class Settings(BaseSettings):
     run_mode: str = "monolith"                       # "monolith" | "platform" | "agent"
     agent_api_key: str = ""                          # API key for authenticating requests to this Agent VPS
     user_id: str = ""                                # Owner user ID (set on Agent VPS via cloud-init)
+    toup_token: str = ""                             # Connect token from toup.ai dashboard (for tunnel auth)
 
     # ── VPS Provisioning (AWS + Stripe) ──────────────────────
     aws_access_key_id: Optional[str] = None        # Set via AWS_ACCESS_KEY_ID

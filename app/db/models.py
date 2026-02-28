@@ -1024,6 +1024,9 @@ class AgentConfig(Base):
     # Tool access control (JSON list of disabled tool names)
     disabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default="")
 
+    # Connect token — used by terminal agent to authenticate tunnel connection
+    connect_token: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

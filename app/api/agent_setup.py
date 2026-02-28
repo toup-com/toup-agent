@@ -82,6 +82,9 @@ class AgentConfigOut(BaseModel):
     vps_plan: str | None = None
     # Tool access control
     disabled_tools: list[str] = []
+    # Connect token (for terminal agent tunnel)
+    has_connect_token: bool = False
+    connect_token: str | None = None
 
     class Config:
         from_attributes = True
@@ -188,6 +191,8 @@ def _config_to_out(config: AgentConfig, vps: VPSInstance | None = None) -> Agent
         setup_step=config.setup_step,
         onboarding_completed=config.onboarding_completed,
         disabled_tools=json.loads(config.disabled_tools) if getattr(config, 'disabled_tools', None) else [],
+        has_connect_token=bool(getattr(config, 'connect_token', None)),
+        connect_token=getattr(config, 'connect_token', None),
     )
     if vps:
         out.vps_ip = vps.public_ip
@@ -293,6 +298,24 @@ async def generate_key(
     config.updated_at = datetime.utcnow()
     await db.commit()
     return {"agent_api_key": key}
+
+
+@router.post("/generate-connect-token")
+async def generate_connect_token(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate a connect token for the terminal agent tunnel.
+
+    The user passes this as TOUP_TOKEN when starting the agent.
+    The agent uses it to authenticate the WebSocket tunnel to the platform.
+    """
+    config = await _get_or_create_config(current_user.id, db)
+    token = f"toup_ct_{secrets.token_urlsafe(32)}"
+    config.connect_token = token
+    config.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"connect_token": token, "user_id": current_user.id}
 
 
 @router.post("/test-ssh")

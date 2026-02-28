@@ -324,21 +324,21 @@ async def lifespan(app: FastAPI):
 
     # ── Platform Tunnel (connect terminal agent to toup.ai) ──
     tunnel_client = None
-    if settings.platform_api_url and settings.user_id and tool_executor:
+    if settings.platform_api_url and settings.user_id and settings.toup_token and tool_executor:
         try:
             from app.agent.tunnel_client import AgentTunnelClient
-            from app.services.auth_service import create_access_token
 
-            tunnel_token = create_access_token(settings.user_id)
             tunnel_client = AgentTunnelClient(
                 platform_url=settings.platform_api_url,
-                auth_token=tunnel_token,
+                auth_token=settings.toup_token,
                 tool_executor=tool_executor,
             )
             await tunnel_client.start()
             print("🔗 Platform tunnel connecting...")
         except Exception as e:
             print(f"⚠️ Platform tunnel not available: {e}")
+    elif settings.user_id and not settings.toup_token:
+        print("💡 To connect to toup.ai, generate a Connect Token in Agent Settings and pass it as TOUP_TOKEN")
 
     print("🤖 Toup Agent ready.")
     print(f"   Server:  http://0.0.0.0:8001")
