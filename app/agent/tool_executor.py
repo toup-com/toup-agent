@@ -1990,6 +1990,8 @@ class ToolExecutor:
         """Resolve a path relative to the user's workspace if not absolute."""
         if not path:
             return self._get_user_workspace()
+        # Expand ~ to the user's home directory
+        path = os.path.expanduser(path)
         if os.path.isabs(path):
             return path
         return os.path.join(self._get_user_workspace(), path)
