@@ -21,8 +21,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-RECONNECT_DELAY = 5  # seconds between reconnect attempts
-MAX_RECONNECT_DELAY = 60
+RECONNECT_DELAY = 2  # seconds between reconnect attempts
+MAX_RECONNECT_DELAY = 5  # cap low — Railway proxy kills WS connections periodically, so reconnect fast
 
 
 class AgentTunnelClient:
@@ -85,8 +85,10 @@ class AgentTunnelClient:
             except Exception as e:
                 if not self._running:
                     break
-                logger.warning("[TUNNEL-CLIENT] Connection lost: %s. Reconnecting in %ds...", e, delay)
                 self._connected = False
+                # Don't spam the terminal — just a brief note
+                print(f"⟳ Tunnel reconnecting in {delay}s...")
+                logger.debug("[TUNNEL-CLIENT] Connection lost: %s", e)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, MAX_RECONNECT_DELAY)
 
