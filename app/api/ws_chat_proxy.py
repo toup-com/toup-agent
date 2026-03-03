@@ -72,6 +72,7 @@ async def ws_chat_proxy(
     WebSocket proxy: browser ↔ platform ↔ agent VPS.
 
     Authenticates the user, finds their agent, and relays messages.
+    Retries agent lookup if agent is still deploying/starting.
     """
     await websocket.accept()
     user_id: Optional[str] = None
@@ -95,8 +96,16 @@ async def ws_chat_proxy(
         await websocket.close(code=4001, reason="Unauthorized")
         return
 
-    # Look up agent info
-    agent_info = await _get_agent_ws_info(user_id)
+    # Look up agent info — retry a few times if agent is still deploying
+    agent_info = None
+    for attempt in range(6):  # Up to 30s of retries
+        agent_info = await _get_agent_ws_info(user_id)
+        if agent_info:
+            break
+        if attempt < 5:
+            await asyncio.sleep(5)
+        logger.info("[WS Proxy] Agent not ready for %s (attempt %d/6)", user_id, attempt + 1)
+
     if not agent_info:
         await websocket.send_json({"type": "error", "message": "No active agent found. Deploy your agent first."})
         await websocket.close(code=4404, reason="No agent")
@@ -107,7 +116,7 @@ async def ws_chat_proxy(
 
     logger.info("[WS Proxy] User %s → Agent %s", user_id, agent_ws_url)
 
-    # Connect to the agent's WebSocket
+    # Connect to the agent's WebSocket — retry if agent is still starting
     try:
         import websockets
     except ImportError:
@@ -116,18 +125,29 @@ async def ws_chat_proxy(
         return
 
     agent_ws = None
-    try:
-        agent_ws = await asyncio.wait_for(
-            websockets.connect(full_url, max_size=10 * 1024 * 1024),
-            timeout=15.0,
-        )
-    except asyncio.TimeoutError:
-        await websocket.send_json({"type": "error", "message": "Agent connection timed out"})
-        await websocket.close(code=4504, reason="Agent timeout")
-        return
-    except Exception as e:
-        logger.warning("[WS Proxy] Agent connect failed: %s", e)
-        await websocket.send_json({"type": "error", "message": f"Cannot reach agent: {e}"})
+    for attempt in range(3):
+        try:
+            agent_ws = await asyncio.wait_for(
+                websockets.connect(full_url, max_size=10 * 1024 * 1024),
+                timeout=15.0,
+            )
+            break
+        except asyncio.TimeoutError:
+            if attempt == 2:
+                await websocket.send_json({"type": "error", "message": "Agent connection timed out"})
+                await websocket.close(code=4504, reason="Agent timeout")
+                return
+            await asyncio.sleep(3)
+        except Exception as e:
+            if attempt == 2:
+                logger.warning("[WS Proxy] Agent connect failed: %s", e)
+                await websocket.send_json({"type": "error", "message": f"Cannot reach agent: {e}"})
+                await websocket.close(code=4502, reason="Agent unreachable")
+                return
+            await asyncio.sleep(3)
+
+    if not agent_ws:
+        await websocket.send_json({"type": "error", "message": "Failed to connect to agent"})
         await websocket.close(code=4502, reason="Agent unreachable")
         return
 
