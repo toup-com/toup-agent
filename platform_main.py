@@ -19,7 +19,7 @@ from app.config import settings
 from app.db import init_db
 
 # ── Platform routers (data CRUD, no agent invocation) ────────────────
-from app.api import auth_router, memories_router, ingest_router, stats_router
+from app.api import auth_router, memories_router, ingest_router, stats_router, agent_router
 from app.api.admin import (
     system_router as admin_router,
     users_router as admin_users_router,
@@ -118,6 +118,8 @@ app.include_router(stats_router, prefix=settings.api_prefix)
 app.include_router(admin_router, prefix=settings.api_prefix)
 app.include_router(admin_users_router, prefix=settings.api_prefix)
 app.include_router(invite_router, prefix=settings.api_prefix)
+# Agent API (store/recall memories from platform UI)
+app.include_router(agent_router, prefix=settings.api_prefix)
 # Brain core
 app.include_router(identity_router, prefix=settings.api_prefix)
 app.include_router(graph_router, prefix=settings.api_prefix)
@@ -132,6 +134,12 @@ app.include_router(canvas_router, prefix=settings.api_prefix)
 app.include_router(doctor_router, prefix=settings.api_prefix)
 # Voice (transcription & TTS)
 app.include_router(voice_router, prefix=settings.api_prefix)
+# WebSocket chat proxy (browser → platform → agent VPS)
+try:
+    from app.api.ws_chat_proxy import router as ws_chat_proxy_router
+    app.include_router(ws_chat_proxy_router, prefix=settings.api_prefix)
+except ImportError as e:
+    print(f"⚠️ Chat proxy not mounted: {e}")
 # Realtime voice (OpenAI Realtime API proxy)
 try:
     from app.api.ws_realtime import router as ws_realtime_router

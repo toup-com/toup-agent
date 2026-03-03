@@ -97,6 +97,31 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ Auto-update check skipped: {e}")
 
+    # ── Ensure owner user exists in DB ─────────────────────────
+    # Must run BEFORE session migration (which references user_id as FK)
+    if settings.user_id:
+        try:
+            from app.db.database import async_session_maker as _sm
+            from app.services.auth_service import get_user_by_id
+            from app.db.models import User
+
+            async with _sm() as _udb:
+                owner = await get_user_by_id(_udb, settings.user_id)
+                if not owner:
+                    owner = User(
+                        id=settings.user_id,
+                        email=f"{settings.user_id[:8]}@agent.local",
+                        hashed_password="",
+                        name="Agent Owner",
+                    )
+                    _udb.add(owner)
+                    await _udb.commit()
+                    print(f"✅ Created owner user: {settings.user_id[:8]}...")
+                else:
+                    print(f"✅ Owner user exists: {settings.user_id[:8]}...")
+        except Exception as e:
+            print(f"⚠️ Could not ensure owner user: {e}")
+
     # ── Migrate orphaned Telegram sessions to platform owner ──
     # Runs before any services start to avoid lock conflicts
     if settings.user_id:

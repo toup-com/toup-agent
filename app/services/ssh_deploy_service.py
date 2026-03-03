@@ -432,6 +432,17 @@ for i in $(seq 1 6); do
     sleep 5
     if curl -sf http://localhost:{AGENT_PORT}/agent/health > /dev/null 2>&1; then
         echo "[OK] Agent is running and healthy!"
+
+        # Register with platform (belt-and-suspenders — _run_deploy also sets agent_url)
+        AGENT_API_KEY=$(grep '^AGENT_API_KEY=' {AGENT_DIR}/.env 2>/dev/null | cut -d= -f2)
+        PLATFORM_URL=$(grep '^PLATFORM_API_URL=' {AGENT_DIR}/.env 2>/dev/null | cut -d= -f2)
+        PUBLIC_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{{print $1}}')
+        if [ -n "$AGENT_API_KEY" ] && [ -n "$PLATFORM_URL" ] && [ -n "$PUBLIC_IP" ]; then
+            curl -sf -X POST "$PLATFORM_URL/agent-setup/register" \
+                -H "Content-Type: application/json" \
+                -d "{{\\"agent_api_key\\":\\"$AGENT_API_KEY\\",\\"agent_url\\":\\"http://$PUBLIC_IP:{AGENT_PORT}\\"}}" > /dev/null 2>&1 && \
+                echo "[OK] Registered with platform" || true
+        fi
         exit 0
     fi
     echo "Waiting for agent to start... (attempt $i/6)"
@@ -734,9 +745,19 @@ echo ""
   # Detect public IP for registration
   PUBLIC_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{{print $1}}')
   if [ -n "$AGENT_API_KEY" ] && [ -n "$PLATFORM_URL" ] && [ -n "$PUBLIC_IP" ]; then
-    curl -sf -X POST "$PLATFORM_URL/agent-setup/register" \\
-      -H "Content-Type: application/json" \\
-      -d "{{\\"agent_api_key\\":\\"$AGENT_API_KEY\\",\\"agent_url\\":\\"http://$PUBLIC_IP:$AGENT_PORT\\"}}" > /dev/null 2>&1
+    # Retry up to 3 times with backoff
+    for attempt in 1 2 3; do
+      RESP=$(curl -sf -w "%{{http_code}}" -X POST "$PLATFORM_URL/agent-setup/register" \
+        -H "Content-Type: application/json" \
+        -d "{{\\"agent_api_key\\":\\"$AGENT_API_KEY\\",\\"agent_url\\":\\"http://$PUBLIC_IP:$AGENT_PORT\\"}}" 2>/dev/null)
+      HTTP_CODE="${{RESP: -3}}"
+      if [ "$HTTP_CODE" = "200" ]; then
+        echo "Registered with platform (http://$PUBLIC_IP:$AGENT_PORT)"
+        break
+      fi
+      echo "Platform register attempt $attempt failed (HTTP $HTTP_CODE), retrying..."
+      sleep $((attempt * 5))
+    done
   fi
 ) &
 
