@@ -412,8 +412,12 @@ async def lifespan(app: FastAPI):
                         print("⚠️ Could not detect public IP for registration")
                         return
                     agent_url = f"http://{public_ip}:8001"
+                    # Ensure /api prefix is included
+                    base = settings.platform_api_url.rstrip("/")
+                    if not base.endswith("/api"):
+                        base = base + "/api"
                     resp = await _c.post(
-                        f"{settings.platform_api_url}/agent-setup/register",
+                        f"{base}/agent-setup/register",
                         json={"agent_api_key": settings.agent_api_key, "agent_url": agent_url},
                         timeout=10.0,
                     )

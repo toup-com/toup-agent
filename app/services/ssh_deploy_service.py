@@ -436,6 +436,8 @@ for i in $(seq 1 6); do
         # Register with platform (belt-and-suspenders — _run_deploy also sets agent_url)
         AGENT_API_KEY=$(grep '^AGENT_API_KEY=' {AGENT_DIR}/.env 2>/dev/null | cut -d= -f2)
         PLATFORM_URL=$(grep '^PLATFORM_API_URL=' {AGENT_DIR}/.env 2>/dev/null | cut -d= -f2)
+        # Ensure /api suffix
+        case "$PLATFORM_URL" in */api) ;; *) PLATFORM_URL="${{PLATFORM_URL%/}}/api" ;; esac
         PUBLIC_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{{print $1}}')
         if [ -n "$AGENT_API_KEY" ] && [ -n "$PLATFORM_URL" ] && [ -n "$PUBLIC_IP" ]; then
             curl -sf -X POST "$PLATFORM_URL/agent-setup/register" \
@@ -724,6 +726,8 @@ echo "  CLI installed: ~/toup-agent/toup"
 # ── Register with platform ────────────────────────────────
 AGENT_API_KEY=$(grep '^AGENT_API_KEY=' "$BACKEND_ROOT/.env" | cut -d= -f2)
 PLATFORM_URL=$(grep '^PLATFORM_API_URL=' "$BACKEND_ROOT/.env" | cut -d= -f2)
+# Ensure /api suffix
+case "$PLATFORM_URL" in */api) ;; *) PLATFORM_URL="${{PLATFORM_URL%/}}/api" ;; esac
 
 echo ""
 echo "  ════════════════════════════════════════════"
