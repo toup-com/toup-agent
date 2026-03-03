@@ -41,10 +41,18 @@ class EmbeddingService:
             print(f"Model loaded. Embedding dimension: {self._model.get_sentence_embedding_dimension()}")
         return self._model
     
-    def embed(self, text: str) -> List[float]:
-        """Generate embedding for a single text"""
+    def _get_openai_client(self, api_key: Optional[str] = None):
+        """Get OpenAI client, using per-user key override if provided."""
+        if api_key:
+            from openai import OpenAI
+            return OpenAI(api_key=api_key)
+        return self.openai_client
+
+    def embed(self, text: str, api_key: Optional[str] = None) -> List[float]:
+        """Generate embedding for a single text. Accepts optional per-user API key."""
         if self.is_openai:
-            response = self.openai_client.embeddings.create(
+            client = self._get_openai_client(api_key)
+            response = client.embeddings.create(
                 model=settings.embedding_model,
                 input=text
             )
@@ -52,15 +60,15 @@ class EmbeddingService:
         else:
             embedding = self.local_model.encode(text, convert_to_numpy=True)
             return embedding.tolist()
-    
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for multiple texts"""
+
+    def embed_batch(self, texts: List[str], api_key: Optional[str] = None) -> List[List[float]]:
+        """Generate embeddings for multiple texts. Accepts optional per-user API key."""
         if not texts:
             return []
-        
+
         if self.is_openai:
-            # OpenAI supports batch embedding
-            response = self.openai_client.embeddings.create(
+            client = self._get_openai_client(api_key)
+            response = client.embeddings.create(
                 model=settings.embedding_model,
                 input=texts
             )
