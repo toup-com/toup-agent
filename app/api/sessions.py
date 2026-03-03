@@ -123,6 +123,43 @@ async def list_sessions(
             params["active_only"] = "true"
         data = await _proxy_sessions(proxy[0], proxy[1], "", params)
         if data is not None:
+            # Also fetch voice sessions from local platform DB and merge them
+            if channel is None or channel == "voice":
+                try:
+                    voice_conditions = [
+                        Conversation.user_id == current_user.id,
+                        Conversation.channel == "voice",
+                    ]
+                    if active_only:
+                        voice_conditions.append(Conversation.is_active == True)
+                    voice_result = await db.execute(
+                        select(Conversation)
+                        .where(and_(*voice_conditions))
+                        .order_by(Conversation.updated_at.desc())
+                        .limit(50)
+                    )
+                    voice_sessions = voice_result.scalars().all()
+                    if voice_sessions:
+                        voice_list = [_session_to_response(s).model_dump(mode="json") for s in voice_sessions]
+                        # Merge into proxy response
+                        proxy_sessions = data.get("sessions", data) if isinstance(data, dict) else data
+                        if isinstance(proxy_sessions, list):
+                            # Deduplicate by ID
+                            existing_ids = {s.get("id") for s in proxy_sessions}
+                            for vs in voice_list:
+                                if vs["id"] not in existing_ids:
+                                    proxy_sessions.append(vs)
+                            # Re-sort by updated_at descending
+                            proxy_sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
+                        elif isinstance(data, dict) and "sessions" in data:
+                            existing_ids = {s.get("id") for s in data["sessions"]}
+                            for vs in voice_list:
+                                if vs["id"] not in existing_ids:
+                                    data["sessions"].append(vs)
+                            data["sessions"].sort(key=lambda s: s.get("updated_at", ""), reverse=True)
+                            data["total_count"] = len(data["sessions"])
+                except Exception as e:
+                    logger.warning("Failed to merge voice sessions: %s", e)
             return JSONResponse(content=data)
 
     # Build query
@@ -170,13 +207,25 @@ async def get_session(
 
     Messages are ordered chronologically (oldest first).
     """
-    # Try proxying to remote agent first
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        params = {"include_messages": str(include_messages).lower(), "message_limit": message_limit}
-        data = await _proxy_sessions(proxy[0], proxy[1], session_id, params)
-        if data is not None:
-            return JSONResponse(content=data)
+    # Check if this session exists locally first (voice sessions are in platform DB)
+    local_check = await db.execute(
+        select(Conversation.id).where(
+            and_(
+                Conversation.id == session_id,
+                Conversation.user_id == current_user.id,
+            )
+        )
+    )
+    is_local = local_check.scalar_one_or_none() is not None
+
+    if not is_local:
+        # Try proxying to remote agent
+        proxy = await _get_agent_proxy_info(current_user.id, db)
+        if proxy:
+            params = {"include_messages": str(include_messages).lower(), "message_limit": message_limit}
+            data = await _proxy_sessions(proxy[0], proxy[1], session_id, params)
+            if data is not None:
+                return JSONResponse(content=data)
 
     # Build query with optional message loading
     query = select(Conversation).where(
@@ -328,13 +377,25 @@ async def get_session_messages(
 
     Messages are ordered chronologically (oldest first).
     """
-    # Try proxying to remote agent first
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        params = {"limit": limit, "offset": offset}
-        data = await _proxy_sessions(proxy[0], proxy[1], f"{session_id}/messages", params)
-        if data is not None:
-            return JSONResponse(content=data)
+    # Check if this session exists in local platform DB first (voice sessions)
+    local_check = await db.execute(
+        select(Conversation.id).where(
+            and_(
+                Conversation.id == session_id,
+                Conversation.user_id == current_user.id,
+            )
+        )
+    )
+    is_local = local_check.scalar_one_or_none() is not None
+
+    if not is_local:
+        # Try proxying to remote agent
+        proxy = await _get_agent_proxy_info(current_user.id, db)
+        if proxy:
+            params = {"limit": limit, "offset": offset}
+            data = await _proxy_sessions(proxy[0], proxy[1], f"{session_id}/messages", params)
+            if data is not None:
+                return JSONResponse(content=data)
 
     # Verify session ownership
     session_query = select(Conversation.id).where(

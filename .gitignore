@@ -1,33 +1,6 @@
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual environment
+*.pyc
+.env
 venv/
 .venv/
-
-# Environment variables (contains secrets)
-.env
-.env.*
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Agent runtime
-/workspace/
-/skills/
-agent.pid
+node_modules/

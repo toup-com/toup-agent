@@ -1,12 +1,15 @@
 """Memory CRUD and search endpoints"""
 
 import json
-from typing import List, Optional
+import logging
+from typing import List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+import httpx
 
-from app.db import get_db, Memory, MemoryEvent
+from app.db import get_db, Memory, MemoryEvent, AgentConfig
 from app.schemas import (
     MemoryCreate, MemoryUpdate, MemoryResponse, MemoryWithScore,
     MemoryWithRelations, MemorySearchRequest, MemorySearchResponse,
@@ -16,17 +19,63 @@ from app.schemas import (
 from app.api.auth import get_current_user
 from app.services.memory_service import MemoryService
 
+logger = logging.getLogger(__name__)
+
 
 async def _get_user_api_key(db: AsyncSession, user_id: str) -> Optional[str]:
     """Fetch the user's OpenAI API key from agent_configs."""
     try:
-        from app.db import AgentConfig
         result = await db.execute(
             select(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)
         )
         return result.scalar_one_or_none()
     except Exception:
         return None
+
+
+# ── Agent proxy helpers ────────────────────────────────────────────
+
+async def _get_agent_proxy_info(
+    user_id: str, db: AsyncSession
+) -> Optional[Tuple[str, str]]:
+    """Return (agent_url, agent_api_key) if the user has a remote agent."""
+    result = await db.execute(
+        select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+        .where(
+            AgentConfig.user_id == user_id,
+            AgentConfig.deploy_status == "active",
+        )
+    )
+    row = result.first()
+    if row and row.agent_url and row.agent_api_key:
+        return (row.agent_url, row.agent_api_key)
+    return None
+
+
+async def _proxy_memories(
+    agent_url: str, agent_api_key: str, path: str,
+    params: Optional[dict] = None, method: str = "GET", body: Optional[dict] = None,
+):
+    """Proxy a memories request to the VPS agent."""
+    url = f"{agent_url}/api/memories/{path}" if path else f"{agent_url}/api/memories"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            if method == "GET":
+                resp = await client.get(
+                    url, headers={"X-Agent-Key": agent_api_key}, params=params or {},
+                )
+            else:
+                resp = await client.post(
+                    url, headers={"X-Agent-Key": agent_api_key},
+                    params=params or {}, json=body or {},
+                )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("Agent memories proxy %s returned %s", url, resp.status_code)
+    except Exception as e:
+        logger.warning("Agent memories proxy %s failed: %s", url, e)
+    return None
+
 
 router = APIRouter(prefix="/memories", tags=["Memories"])
 
@@ -104,10 +153,26 @@ async def list_memories(
 ):
     """
     List all memories for the current user with optional filters.
-    
+
     This is different from /search which does semantic similarity search.
     This endpoint returns memories in chronological order without embedding search.
     """
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params = {"limit": limit, "offset": offset}
+        if brain_type:
+            params["brain_type"] = brain_type
+        if category:
+            params["category"] = category
+        if memory_type:
+            params["memory_type"] = memory_type
+        if min_importance is not None:
+            params["min_importance"] = str(min_importance)
+        data = await _proxy_memories(proxy[0], proxy[1], "", params)
+        if data is not None:
+            return JSONResponse(content=data)
+
     service = MemoryService(db)
     memories, total_count = await service.list_memories(
         user_id=current_user.id,
@@ -142,6 +207,24 @@ async def search_memories_get(
     db: AsyncSession = Depends(get_db)
 ):
     """Semantic search for memories (GET method for browser/frontend compatibility)"""
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params: dict = {"query": query, "limit": limit, "min_similarity": str(min_similarity)}
+        if brain_type:
+            params["brain_type"] = brain_type
+        if categories:
+            params["categories"] = categories
+        if min_importance is not None:
+            params["min_importance"] = str(min_importance)
+        if min_strength is not None:
+            params["min_strength"] = str(min_strength)
+        if memory_level:
+            params["memory_level"] = memory_level
+        data = await _proxy_memories(proxy[0], proxy[1], "search", params)
+        if data is not None:
+            return JSONResponse(content=data)
+
     from app.schemas import MemorySearchRequest, BrainType
     
     # Parse categories if provided
@@ -187,12 +270,22 @@ async def search_memories(
     db: AsyncSession = Depends(get_db)
 ):
     """Semantic search for memories with filters"""
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(
+            proxy[0], proxy[1], "search", method="POST",
+            body=request.model_dump(exclude_none=True),
+        )
+        if data is not None:
+            return JSONResponse(content=data)
+
     _key = await _get_user_api_key(db, current_user.id)
     service = MemoryService(db, api_key=_key)
     results, total_count, search_time_ms = await service.search_memories(
         current_user.id, request
     )
-    
+
     return MemorySearchResponse(
         query=request.query,
         results=results,
@@ -307,6 +400,14 @@ async def get_memories_by_category(
     db: AsyncSession = Depends(get_db)
 ):
     """Get memories by category (supports user, agent, and work categories)"""
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params = {"limit": limit, "offset": offset}
+        data = await _proxy_memories(proxy[0], proxy[1], f"category/{category}", params)
+        if data is not None:
+            return JSONResponse(content=data)
+
     service = MemoryService(db)
     memories = await service.get_memories_by_category(
         current_user.id, category, limit, offset
