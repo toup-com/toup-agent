@@ -167,7 +167,8 @@ except ImportError as e:
 # ── MCP Server ──────────────────────────────────────────────────────
 try:
     from app.mcp_server import mcp
-    mcp.mount(app, path="/api/mcp")
+    mcp_app = mcp.http_app(path="/mcp")
+    app.mount("/api/mcp", mcp_app)
 except ImportError as e:
     print(f"⚠️ MCP server not mounted (fastmcp not installed): {e}")
 except Exception as e:
