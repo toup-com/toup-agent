@@ -104,17 +104,34 @@ async def _authenticate_ws(token: str) -> Optional[str]:
 async def ws_chat(
     websocket: WebSocket,
     token: Optional[str] = Query(None),
+    agent_key: Optional[str] = Query(None),
 ):
     """
-    WebSocket endpoint for real-time chat with the HexBrain agent.
+    WebSocket endpoint for real-time chat with the agent.
 
     Supports streaming text chunks, tool call indicators, and session management.
+    Auth: JWT token (query param or first message) OR agent_key (for platform proxy).
     """
     await websocket.accept()
     user_id: Optional[str] = None
 
-    # Try query-param auth first
-    if token:
+    # Try agent_key auth first (platform proxy mode)
+    if agent_key and settings.agent_api_key and agent_key == settings.agent_api_key:
+        user_id = settings.user_id
+        if user_id:
+            # Ensure stub user exists (same as auth.py agent mode)
+            from app.db.database import async_session_maker as _sm
+            from app.db.models import User
+            async with _sm() as _db:
+                from app.services.auth_service import get_user_by_id
+                u = await get_user_by_id(_db, user_id)
+                if not u:
+                    u = User(id=user_id, email=f"{user_id[:8]}@agent.local", hashed_password="", name="Agent Owner")
+                    _db.add(u)
+                    await _db.commit()
+
+    # Try JWT query-param auth
+    if not user_id and token:
         user_id = await _authenticate_ws(token)
 
     try:
