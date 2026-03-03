@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import delete as sa_delete
+
 from app.db import get_db, User, Invite
 from app.api.auth import get_current_user
 from app.api.admin.deps import require_admin
@@ -259,6 +261,82 @@ async def update_user(
         created_at=user.created_at,
         password_plain=getattr(user, "password_plain", None),
     )
+
+
+@router.delete("/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a user and all their data. Only admins."""
+    from app.db.models import (
+        Identity, Conversation, Message, Memory, Entity, EntityLink,
+        EntityRelationship, BrainStats, MemoryEvent, RetrievalEvent,
+        Document, DocumentChunk, Media, CronJob, TelegramUserMapping,
+        AgentError, Workflow, ApiKey, VPSInstance, AgentConfig,
+        LLMBundleAllocation, LLMUsageRecord,
+    )
+
+    # Safety: cannot delete yourself
+    if user_id == admin.id:
+        raise HTTPException(400, "Cannot delete your own account")
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    # Safety: cannot delete the last admin
+    if getattr(user, "role", "") == "admin":
+        admin_count = await db.execute(
+            select(func.count(User.id)).where(User.role == "admin", User.is_active == True)
+        )
+        if admin_count.scalar() <= 1:
+            raise HTTPException(400, "Cannot delete the last admin")
+
+    # Delete all user data from every related table
+    # Order matters: delete children before parents (foreign key deps)
+
+    # Messages depend on conversations — delete first
+    conv_ids_q = select(Conversation.id).where(Conversation.user_id == user_id)
+    await db.execute(sa_delete(Message).where(Message.conversation_id.in_(conv_ids_q)))
+
+    # Document chunks depend on documents
+    doc_ids_q = select(Document.id).where(Document.user_id == user_id)
+    await db.execute(sa_delete(DocumentChunk).where(DocumentChunk.document_id.in_(doc_ids_q)))
+
+    # Entity links and relationships depend on entities
+    entity_ids_q = select(Entity.id).where(Entity.user_id == user_id)
+    await db.execute(sa_delete(EntityLink).where(EntityLink.entity_id.in_(entity_ids_q)))
+    await db.execute(sa_delete(EntityRelationship).where(
+        (EntityRelationship.source_entity_id.in_(entity_ids_q)) |
+        (EntityRelationship.target_entity_id.in_(entity_ids_q))
+    ))
+
+    # Now delete all direct user_id tables
+    for model in [
+        Identity, Conversation, Memory, Entity, BrainStats,
+        MemoryEvent, RetrievalEvent, Document, Media, CronJob,
+        TelegramUserMapping, Workflow, ApiKey, VPSInstance,
+        AgentConfig, LLMBundleAllocation, LLMUsageRecord,
+    ]:
+        await db.execute(sa_delete(model).where(model.user_id == user_id))
+
+    # AgentError has nullable user_id
+    await db.execute(sa_delete(AgentError).where(AgentError.user_id == user_id))
+
+    # Update invites that reference this user
+    inv_result = await db.execute(select(Invite).where(Invite.used_by == user_id))
+    for inv in inv_result.scalars().all():
+        inv.used_by = None
+        inv.used_at = None
+
+    # Finally delete the user
+    await db.delete(user)
+    await db.commit()
+
+    return {"success": True, "message": f"User {user.email} and all data deleted"}
 
 
 # ─── Public Invite Endpoints (no auth) ────────────────────────
