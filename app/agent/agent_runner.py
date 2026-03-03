@@ -647,7 +647,7 @@ class AgentRunner:
         if not identities:
             sections.insert(0, (
                 "# Core Identity\n"
-                "You are HexBrain, an intelligent AI assistant with persistent memory. "
+                "You are Toup, an intelligent AI assistant with persistent memory. "
                 "You can execute shell commands, read/write files, search the web, "
                 "and remember information about the user across conversations. "
                 "Be helpful, proactive, and concise. Use tools when they help answer the question."
@@ -820,15 +820,28 @@ class AgentRunner:
             from app.services.memory_dedup_service import MemoryDedupService
             from app.schemas import MemoryCreate, BrainType, MemoryType, MemoryLevel
             
+            # Use user's own API key if available
+            user_api_key = None
+            try:
+                from app.db import AgentConfig
+                from sqlalchemy import select as _sel
+                result = await db.execute(
+                    _sel(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)
+                )
+                user_api_key = result.scalar_one_or_none()
+            except Exception:
+                pass
+
             extractor = get_memory_extractor()
             extracted = await extractor.extract_memories_with_llm(
                 user_message=user_message,
                 assistant_response=assistant_response,
                 brain_type="user",
                 max_memories=15,
+                api_key=user_api_key,
             )
             
-            dedup = MemoryDedupService(db)
+            dedup = MemoryDedupService(db, api_key=user_api_key)
             count = 0
             for mem in extracted:
                 memory_data = MemoryCreate(

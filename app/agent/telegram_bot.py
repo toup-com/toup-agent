@@ -438,7 +438,7 @@ class HexBrainTelegramBot:
         await self._get_hexbrain_user_id(update.effective_user.id, telegram_user=update.effective_user)
 
         await update.message.reply_text(
-            "👋 Hey! I'm <b>Hex</b>, your AI assistant.\n\n"
+            "👋 Hey! I'm your <b>Toup</b> AI assistant.\n\n"
             "Send me a message, photo, voice note, or file and I'll help.\n\n"
             "Type /help to see all commands.",
             parse_mode="HTML",
@@ -1456,7 +1456,7 @@ class HexBrainTelegramBot:
                 f"{'=' * 40}\n",
             ]
             for msg in messages:
-                role = "You" if msg.role == "user" else "Hex"
+                role = "You" if msg.role == "user" else "Agent"
                 ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
                 content = msg.content or ""
                 lines.append(f"[{ts}] {role}:\n{content}\n")

@@ -171,7 +171,7 @@ async def lifespan(app: FastAPI):
         from app.api.api_v1 import set_api_v1_refs
         set_ws_refs(agent_runner, skill_loader)
         set_api_v1_refs(agent_runner, skill_loader)
-        set_realtime_refs(tool_executor)
+        set_realtime_refs(tool_executor, agent_runner)
 
         # ── Start Telegram bot (if configured) ────────────────
         if settings.telegram_bot_token:

@@ -43,7 +43,15 @@ async def get_current_user(
         cookie_token = request.cookies.get(SSO_COOKIE_NAME)
         if cookie_token:
             user_id = decode_access_token(cookie_token)
-    
+
+    # 3. Fall back to agent mode — if X-Agent-Key was validated by middleware,
+    #    resolve user from settings.user_id (VPS agent serving platform proxy requests)
+    if not user_id:
+        from app.config import settings
+        agent_key = request.headers.get("x-agent-key", "")
+        if settings.agent_api_key and agent_key == settings.agent_api_key and settings.user_id:
+            user_id = settings.user_id
+
     if not user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

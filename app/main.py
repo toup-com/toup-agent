@@ -33,6 +33,8 @@ from app.api.doctor import router as doctor_router
 from app.api.voice import router as voice_router, set_voice_refs
 # VPS provisioning
 from app.api.vps import router as vps_router
+# Combined checkout
+from app.api.checkout import router as checkout_router
 
 # Global start time for uptime tracking
 _app_start_time = None
@@ -371,6 +373,8 @@ app.include_router(doctor_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 # VPS provisioning
 app.include_router(vps_router, prefix=settings.api_prefix)
+# Combined checkout
+app.include_router(checkout_router, prefix=settings.api_prefix)
 
 
 
@@ -419,7 +423,7 @@ async def health():
         "agent_model": settings.agent_model,
         "thinking_budget": settings.thinking_budget_default,
         "tts_mode": settings.tts_auto_mode,
-        "platform": "HexBrain Agent Platform v6 — Toup Edition",
+        "platform": "Toup Agent Platform v6",
         "channels": {
             "telegram": "enabled" if settings.telegram_bot_token else "disabled",
             "discord": "enabled" if settings.discord_bot_token else "disabled",

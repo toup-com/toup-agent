@@ -5,7 +5,7 @@ from typing import Optional
 
 class Settings(BaseSettings):
     # App
-    app_name: str = "HexBrain Memory System"
+    app_name: str = "Toup Agent Platform"
     debug: bool = True
     
     # Database
@@ -213,7 +213,22 @@ class Settings(BaseSettings):
     stripe_standard_price_id: str = ""             # Stripe Price ID for Standard plan
     stripe_pro_price_id: str = ""                  # Stripe Price ID for Pro plan
     stripe_llm_bundle_price_id: str = ""           # Stripe Price ID for $40/mo LLM bundle
+    stripe_supabase_price_id: str = ""             # Stripe Price ID for $5/mo managed Supabase
     vps_provisioning_enabled: bool = False         # Gate: set True once AWS creds are configured
+    ssh_lambda_function_name: str = "toup-ssh-proxy"  # Lambda function for SSH proxy
+
+    # ── Hostinger VPS ─────────────────────────────────────────────
+    hostinger_api_token: Optional[str] = None     # Set via HOSTINGER_API_TOKEN
+    hostinger_data_center_id: int = 1             # Hostinger data center (1=US, etc.)
+    hostinger_template_id: int = 1               # OS template ID (Ubuntu 24.04)
+    hostinger_payment_method_id: str = ""         # Billing payment method ID
+    hostinger_enabled: bool = False               # Gate: set True once Hostinger is configured
+
+    # ── Hetzner Cloud VPS ─────────────────────────────────────────
+    hetzner_api_token: Optional[str] = None       # Set via HETZNER_API_TOKEN
+    hetzner_location: str = "ash"                 # Hetzner location (ash=Ashburn US, fsn1=Falkenstein DE)
+    hetzner_ssh_key_id: str = ""                  # Hetzner SSH key ID (optional, for backup access)
+    hetzner_enabled: bool = False                 # Gate: set True once Hetzner is configured
 
     # ── Agent Spawn Policies ─────────────────────────────────
     allow_agents: list[str] = []  # If non-empty, only these agent IDs can be spawned

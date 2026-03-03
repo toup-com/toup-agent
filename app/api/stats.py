@@ -1,13 +1,16 @@
 """Stats endpoints for brain visualization"""
 
 import json
+import logging
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
+import httpx
 
-from app.db import get_db, Memory, Entity, BrainStats, memory_relationships
+from app.db import get_db, Memory, Entity, BrainStats, memory_relationships, AgentConfig
 from app.schemas import (
     BrainStatsResponse, CategoryStats, TimelineResponse, TimelineEntry,
     ConnectionsResponse, ConnectionData, MemoryResponse, MemoryCategory, AgentCategory
@@ -15,7 +18,48 @@ from app.schemas import (
 from app.api.auth import get_current_user
 from app.api.memories import memory_to_response
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/stats", tags=["Statistics"])
+
+
+async def _get_agent_proxy_info(
+    user_id: str, db: AsyncSession
+) -> Optional[Tuple[str, str]]:
+    """Return (agent_url, agent_api_key) if the user has a remote agent, else None."""
+    result = await db.execute(
+        select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+        .where(
+            AgentConfig.user_id == user_id,
+            AgentConfig.deploy_status == "active",
+        )
+    )
+    row = result.first()
+    if row and row.agent_url and row.agent_api_key:
+        return (row.agent_url, row.agent_api_key)
+    return None
+
+
+async def _proxy_stats(
+    agent_url: str,
+    agent_api_key: str,
+    path: str,
+    params: Optional[dict] = None,
+) -> Optional[dict | list]:
+    """Proxy a stats request to the VPS agent. Returns parsed JSON or None on failure."""
+    url = f"{agent_url}/api/stats/{path}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                url,
+                headers={"X-Agent-Key": agent_api_key},
+                params=params or {},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("Agent stats proxy %s returned %s", url, resp.status_code)
+    except Exception as e:
+        logger.warning("Agent stats proxy %s failed: %s", url, e)
+    return None
 
 
 @router.get("/categories", response_model=BrainStatsResponse)
@@ -25,7 +69,15 @@ async def get_category_stats(
     db: AsyncSession = Depends(get_db)
 ):
     """Get memory statistics by category for visualization"""
-    
+
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params = {"brain_type": brain_type} if brain_type else {}
+        data = await _proxy_stats(proxy[0], proxy[1], "categories", params)
+        if data:
+            return JSONResponse(content=data)
+
     # Build query filters
     filters = [
         Memory.user_id == current_user.id,
@@ -97,7 +149,7 @@ async def get_region_stats(
     db: AsyncSession = Depends(get_db)
 ):
     """Alias for get_category_stats"""
-    return await get_category_stats(current_user, db)
+    return await get_category_stats(brain_type=None, current_user=current_user, db=db)
 
 
 @router.get("/timeline", response_model=TimelineResponse)
@@ -107,6 +159,14 @@ async def get_timeline(
     db: AsyncSession = Depends(get_db)
 ):
     """Get memory activity timeline for the past N days"""
+
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_stats(proxy[0], proxy[1], "timeline", {"days": days})
+        if data:
+            return JSONResponse(content=data)
+
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=days)
     
@@ -161,6 +221,14 @@ async def get_connections(
     db: AsyncSession = Depends(get_db)
 ):
     """Get memory connection graph data for visualization"""
+
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_stats(proxy[0], proxy[1], "connections", {"limit": limit})
+        if data:
+            return JSONResponse(content=data)
+
     # Get connections
     result = await db.execute(
         select(
@@ -219,6 +287,17 @@ async def get_recent_memories(
     db: AsyncSession = Depends(get_db)
 ):
     """Get most recently created memories, optionally filtered by brain_type."""
+
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params: dict = {"limit": limit}
+        if brain_type:
+            params["brain_type"] = brain_type
+        data = await _proxy_stats(proxy[0], proxy[1], "recent", params)
+        if data:
+            return JSONResponse(content=data)
+
     filters = [Memory.user_id == current_user.id, Memory.is_deleted == False]
     if brain_type:
         filters.append(Memory.brain_type == brain_type)
@@ -239,6 +318,14 @@ async def get_entity_stats(
     db: AsyncSession = Depends(get_db)
 ):
     """Get entity statistics for visualization"""
+
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_stats(proxy[0], proxy[1], "entities", {"limit": limit})
+        if data:
+            return JSONResponse(content=data)
+
     result = await db.execute(
         select(Entity)
         .where(Entity.user_id == current_user.id)

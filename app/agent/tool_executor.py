@@ -595,7 +595,16 @@ class ToolExecutor:
             )
             
             async with async_session_maker() as db:
-                dedup = MemoryDedupService(db)
+                # Fetch user's API key for embedding
+                _ukey = None
+                try:
+                    from sqlalchemy import select as _sel
+                    from app.db import AgentConfig
+                    _r = await db.execute(_sel(AgentConfig.openai_api_key).where(AgentConfig.user_id == self._current_user_id))
+                    _ukey = _r.scalar_one_or_none()
+                except Exception:
+                    pass
+                dedup = MemoryDedupService(db, api_key=_ukey)
                 memory, action = await dedup.smart_create_memory(
                     new_memory=memory_data,
                     user_id=self._current_user_id,
@@ -1300,7 +1309,7 @@ class ToolExecutor:
 
             lines = [f"Session {session_id[:8]}... ({len(messages)} messages)\n"]
             for msg in messages:
-                role_label = "You" if msg.role == "user" else "Hex"
+                role_label = "You" if msg.role == "user" else "Agent"
                 ts = msg.created_at.strftime("%H:%M")
                 content = msg.content[:500]
                 if len(msg.content) > 500:
