@@ -61,10 +61,19 @@ async def get_current_user(
     
     user = await get_user_by_id(db, user_id)
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-        )
+        # In agent mode, auto-create a stub user for the platform owner
+        from app.config import settings
+        if settings.agent_api_key and settings.user_id and user_id == settings.user_id:
+            from app.db.models import User
+            user = User(id=user_id, email=f"{user_id[:8]}@agent.local", hashed_password="", name="Agent Owner")
+            db.add(user)
+            await db.commit()
+            await db.refresh(user)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found",
+            )
     
     if not user.is_active:
         raise HTTPException(
