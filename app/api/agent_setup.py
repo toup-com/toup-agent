@@ -438,7 +438,7 @@ async def trigger_deploy(
     # Determine SSH credentials
     ssh_host = config.ssh_host
     ssh_port = config.ssh_port or 22
-    ssh_user = config.ssh_user or "ubuntu"
+    ssh_user = config.ssh_user or "root"
     ssh_password = config.ssh_password
     ssh_key = config.ssh_key
 
