@@ -241,6 +241,7 @@ async def ws_chat(
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
                     model_override=model,
+                    save_user_message=not is_onboarding_msg,
                 )
 
                 # Terminal activity: show agent response summary

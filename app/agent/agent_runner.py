@@ -118,6 +118,7 @@ class AgentRunner:
         model_override: Optional[str] = None,
         thinking_budget: int = 0,
         idempotency_key: Optional[str] = None,
+        save_user_message: bool = True,
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
@@ -414,6 +415,7 @@ class AgentRunner:
                 tokens_output=total_output,
                 model=model_used,
                 processing_time_ms=int((time.time() - start) * 1000),
+                save_user_message=save_user_message,
             )
 
             if settings.auto_extract_memories and final_text:
@@ -766,6 +768,7 @@ class AgentRunner:
         tokens_output: int,
         model: str,
         processing_time_ms: int,
+        save_user_message: bool = True,
     ):
         from sqlalchemy import select
         from app.db.models import Message, Conversation
@@ -774,12 +777,16 @@ class AgentRunner:
         user_message = user_message.replace("\x00", "")
         assistant_response = assistant_response.replace("\x00", "")
 
-        user_msg = Message(
-            conversation_id=session_id,
-            role="user",
-            content=user_message,
-        )
-        db.add(user_msg)
+        msg_count = 0
+
+        if save_user_message:
+            user_msg = Message(
+                conversation_id=session_id,
+                role="user",
+                content=user_message,
+            )
+            db.add(user_msg)
+            msg_count += 1
 
         asst_msg = Message(
             conversation_id=session_id,
@@ -791,6 +798,7 @@ class AgentRunner:
             processing_time_ms=processing_time_ms,
         )
         db.add(asst_msg)
+        msg_count += 1
 
         # Update conversation counters (load by ID in this short-lived session)
         result = await db.execute(
@@ -798,7 +806,7 @@ class AgentRunner:
         )
         session = result.scalar_one_or_none()
         if session:
-            session.message_count = (session.message_count or 0) + 2
+            session.message_count = (session.message_count or 0) + msg_count
             session.total_tokens = (session.total_tokens or 0) + tokens_input + tokens_output
             session.updated_at = datetime.utcnow()
 

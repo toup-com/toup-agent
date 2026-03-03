@@ -389,6 +389,41 @@ async def lifespan(app: FastAPI):
     elif settings.user_id and not settings.toup_token:
         print("💡 To connect to toup.ai, generate a Connect Token in Agent Settings and pass it as TOUP_TOKEN")
 
+    # ── Self-register with platform (belt-and-suspenders) ────
+    if settings.platform_api_url and settings.agent_api_key:
+        async def _self_register():
+            """Detect public IP and register with platform. Non-blocking."""
+            import httpx as _hx
+            try:
+                async with _hx.AsyncClient(timeout=8.0) as _c:
+                    # Detect public IP
+                    try:
+                        _ip_resp = await _c.get("https://api.ipify.org")
+                        public_ip = _ip_resp.text.strip()
+                    except Exception:
+                        try:
+                            import subprocess as _sp
+                            _r = _sp.run(["hostname", "-I"], capture_output=True, text=True, timeout=3)
+                            public_ip = _r.stdout.strip().split()[0] if _r.returncode == 0 else None
+                        except Exception:
+                            public_ip = None
+                    if not public_ip:
+                        print("⚠️ Could not detect public IP for registration")
+                        return
+                    agent_url = f"http://{public_ip}:8001"
+                    resp = await _c.post(
+                        f"{settings.platform_api_url}/agent-setup/register",
+                        json={"agent_api_key": settings.agent_api_key, "agent_url": agent_url},
+                        timeout=10.0,
+                    )
+                    if resp.status_code == 200:
+                        print(f"✅ Registered with platform ({agent_url})")
+                    else:
+                        print(f"⚠️ Platform register returned {resp.status_code}")
+            except Exception as e:
+                print(f"⚠️ Platform registration failed: {e}")
+        asyncio.create_task(_self_register())
+
     print("🤖 Toup Agent ready.")
     print(f"   Server:  http://0.0.0.0:8001")
     print(f"   Health:  http://localhost:8001/agent/health")
