@@ -314,10 +314,20 @@ async def delete_user(
         (EntityRelationship.target_entity_id.in_(entity_ids_q))
     ))
 
-    # Now delete all direct user_id tables
+    # Memory children: memory_events, memory_relationships, entity_links (by memory_id)
+    from app.db.models import memory_relationships as mem_rel_table
+    mem_ids_q = select(Memory.id).where(Memory.user_id == user_id)
+    await db.execute(sa_delete(MemoryEvent).where(MemoryEvent.memory_id.in_(mem_ids_q)))
+    await db.execute(mem_rel_table.delete().where(
+        mem_rel_table.c.source_id.in_(mem_ids_q) |
+        mem_rel_table.c.target_id.in_(mem_ids_q)
+    ))
+
+    # Now delete all direct user_id tables (order: children before parents)
     for model in [
-        Identity, Conversation, Memory, Entity, BrainStats,
-        MemoryEvent, RetrievalEvent, Document, Media, CronJob,
+        Identity, MemoryEvent, RetrievalEvent, Memory,
+        Conversation, Entity, BrainStats,
+        Document, Media, CronJob,
         TelegramUserMapping, Workflow, ApiKey, VPSInstance,
         AgentConfig, LLMBundleAllocation, LLMUsageRecord,
     ]:
