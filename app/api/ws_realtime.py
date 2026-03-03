@@ -51,19 +51,23 @@ router = APIRouter(tags=["Realtime Voice"])
 
 # ── Module refs (set from agent_main.py lifespan) ─────────────────────
 _tool_executor = None
+_agent_runner = None
 
 
-def set_realtime_refs(tool_executor):
-    """Set reference to tool executor for handling function calls."""
-    global _tool_executor
+def set_realtime_refs(tool_executor, agent_runner=None):
+    """Set reference to tool executor and agent runner for handling function calls."""
+    global _tool_executor, _agent_runner
     _tool_executor = tool_executor
+    _agent_runner = agent_runner
 
 
 # ── OpenAI Realtime tool definitions ──────────────────────────────────
-# Tools that require Telegram bot / chat_id and cannot work in voice mode
+# Tools that don't make sense in voice mode (voice already speaks, no need for TTS/voice chat)
+# All other tools (including Telegram message, send_file, etc.) work via the tunnel
 VOICE_INCOMPATIBLE_TOOLS = {
-    "send_file", "send_photo", "tts", "poll", "thread",
-    "message", "moderate", "spawn", "talk_mode",
+    "tts",         # Voice agent already speaks — no need for Telegram voice messages
+    "talk_mode",   # Telegram voice chat mode — not applicable
+    "spawn",       # Sub-agent spawning — Telegram-specific
 }
 
 
@@ -114,6 +118,30 @@ def _build_realtime_tools():
                 },
             },
             "required": ["path"],
+        },
+    })
+    # Reasoning tool — delegates questions to the best reasoning model
+    # GPT-4o Realtime is for voice I/O only; actual reasoning goes through this tool
+    tools.append({
+        "type": "function",
+        "name": "think",
+        "description": (
+            "Use a dedicated reasoning model to answer the user's question or solve their task. "
+            "You MUST call this tool for ANY question, request, or task that requires knowledge, "
+            "reasoning, analysis, coding, math, planning, research, explanations, or factual answers. "
+            "Only skip this for simple greetings (hi, hello, bye), yes/no acknowledgments, and casual "
+            "small talk that needs no real thought. Pass the user's full question as-is. "
+            "Relay the result naturally in your own words."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The user's full question or task",
+                },
+            },
+            "required": ["task"],
         },
     })
     return tools
@@ -246,6 +274,18 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         "- When the user shares something worth remembering, use the memory_store tool.\n"
         "- You can navigate the user to different pages using the navigate_to tool. "
         "Offer to show them relevant pages when helpful.\n"
+        "- You have FULL ACCESS to the user's computer terminal through a connected agent. "
+        "You can run shell commands (exec), read files (read_file), write files (write_file), "
+        "edit files (edit_file), search files (grep, find, ls), browse the web (web_search, browser), "
+        "and more. Use these tools whenever the user asks you to do something on their computer.\n"
+        "- When executing terminal commands, briefly tell the user what you're doing.\n"
+        "- IMPORTANT: You have a 'think' tool. You MUST call it for ANY question, task, or request "
+        "that requires knowledge, reasoning, analysis, coding, math, planning, research, explanations, "
+        "factual answers, or problem-solving. The 'think' tool connects you to a powerful reasoning model. "
+        "Only handle simple greetings (hi, hello, bye), yes/no acknowledgments, and casual small talk directly. "
+        "For EVERYTHING ELSE, call think(task=<user's full question>). "
+        "When you get the result, relay the answer naturally in your own words. "
+        "NEVER mention the think tool, model switching, or reasoning models to the user.\n"
         "- The user may share their screen with you. When they do, you'll receive periodic "
         "[Screen context: ...] messages describing what's on their screen. Use this visual context "
         "to help them. Don't describe the screen unprompted every time — wait for the user to ask or reference it.\n"
@@ -387,6 +427,7 @@ async def _save_voice_messages(
     session_id: str,
     user_text: str,
     assistant_text: str,
+    model: str = "gpt-4o-realtime",
 ) -> None:
     """Persist a user/assistant message pair to the DB using raw SQL for reliability."""
     import uuid as _uuid
@@ -413,8 +454,8 @@ async def _save_voice_messages(
         if assistant_text:
             await conn.execute(text(
                 "INSERT INTO messages (id, conversation_id, role, content, model_used, created_at) "
-                "VALUES (:id, :cid, 'assistant', :content, 'gpt-4o-realtime', NOW())"
-            ), {"id": str(_uuid.uuid4()), "cid": session_id, "content": assistant_text.replace("\x00", "")})
+                "VALUES (:id, :cid, 'assistant', :content, :model, NOW())"
+            ), {"id": str(_uuid.uuid4()), "cid": session_id, "content": assistant_text.replace("\x00", ""), "model": model})
             count += 1
 
         if count > 0:
@@ -434,6 +475,15 @@ async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: 
         from app.services.memory_dedup_service import MemoryDedupService
         from app.schemas import MemoryCreate, BrainType, MemoryLevel
         from app.db.database import async_session_maker
+        from app.db import AgentConfig
+
+        # Fetch the user's own OpenAI API key for extraction
+        user_api_key = None
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)
+            )
+            user_api_key = result.scalar_one_or_none()
 
         extractor = get_memory_extractor()
         extracted = await extractor.extract_memories_with_llm(
@@ -441,13 +491,14 @@ async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: 
             assistant_response=assistant_text,
             brain_type="user",
             max_memories=15,
+            api_key=user_api_key,
         )
 
         if not extracted:
             return
 
         async with async_session_maker() as db:
-            dedup = MemoryDedupService(db)
+            dedup = MemoryDedupService(db, api_key=user_api_key)
             count = 0
             for mem in extracted:
                 memory_data = MemoryCreate(
@@ -516,6 +567,119 @@ async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: 
 
     except Exception as e:
         logger.warning("[REALTIME] Voice memory extraction failed: %s", e)
+
+
+# ── Deep Think — Claude Opus reasoning for complex voice tasks ────────
+async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
+    """
+    Route reasoning to the best model using the model router.
+
+    GPT-4o Realtime is voice I/O only. Actual reasoning goes through:
+      - medium complexity → GPT-5.2 (settings.agent_model)
+      - heavy complexity  → Claude Opus 4.6
+
+    Returns (result_text, model_used).
+    """
+    from app.services.model_router import classify_request
+
+    # Classify the task complexity
+    decision = classify_request(task)
+    # Since the voice agent already decided this needs reasoning (called think),
+    # treat "light" as at least "medium" — use the configured agent_model
+    if decision.tier == "light":
+        model_override = settings.agent_model  # e.g. gpt-5.2
+    else:
+        model_override = decision.model  # medium=agent_model, heavy=claude-opus-4-6
+
+    logger.info(
+        "[REALTIME] think: tier=%s, model=%s, reason=%s",
+        decision.tier, model_override, decision.reason,
+    )
+
+    # Option A: Use agent_runner (preferred — full tool access + memory)
+    if _agent_runner:
+        try:
+            response = await _agent_runner.run(
+                user_message=task,
+                user_id=user_id,
+                session_id=session_id,
+                model_override=model_override,
+            )
+            logger.info(
+                "[REALTIME] think via agent_runner: %d chars, model=%s, %dms",
+                len(response.text), response.model, response.processing_time_ms,
+            )
+            return response.text, response.model or model_override
+        except Exception as e:
+            logger.warning("[REALTIME] think via agent_runner failed: %s", e)
+
+    # Option B: Direct API call (fallback — no tools but always works)
+    try:
+        # If it's a Claude model, use Anthropic API
+        if model_override.startswith("claude-"):
+            from app.services.anthropic_service import AnthropicService
+            svc = AnthropicService()
+
+            context_messages = []
+            if session_id:
+                try:
+                    from sqlalchemy import text as sql_text
+                    from app.db.database import engine
+                    async with engine.connect() as conn:
+                        result = await conn.execute(sql_text(
+                            "SELECT role, content FROM messages "
+                            "WHERE conversation_id = :sid "
+                            "ORDER BY created_at DESC LIMIT 10"
+                        ), {"sid": session_id})
+                        rows = list(reversed(result.fetchall()))
+                        for role, content in rows:
+                            if role in ("user", "assistant"):
+                                context_messages.append({"role": role, "content": content})
+                except Exception:
+                    pass
+
+            context_messages.append({"role": "user", "content": task})
+
+            chunks = []
+            async for event in svc.create_message_stream(
+                messages=context_messages,
+                system="You are a powerful reasoning assistant. Answer thoroughly and accurately. Be concise enough for a voice response.",
+                tools=[],
+                model=model_override,
+            ):
+                if event.type == "text":
+                    chunks.append(event.text)
+
+            result = "".join(chunks)
+            logger.info("[REALTIME] think via Anthropic direct: %d chars", len(result))
+            return result or "I couldn't generate a response.", model_override
+
+        else:
+            # OpenAI model — direct chat completions call
+            import httpx
+            context_messages = [{"role": "user", "content": task}]
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+                    json={
+                        "model": model_override,
+                        "messages": [
+                            {"role": "system", "content": "You are a reasoning assistant. Answer accurately and concisely for a voice response."},
+                            {"role": "user", "content": task},
+                        ],
+                        "max_tokens": 2048,
+                    },
+                )
+                resp.raise_for_status()
+                result = resp.json()["choices"][0]["message"]["content"]
+
+            logger.info("[REALTIME] think via OpenAI direct: %d chars, model=%s", len(result), model_override)
+            return result or "I couldn't generate a response.", model_override
+
+    except Exception as e:
+        logger.warning("[REALTIME] think fallback failed: %s", e)
+        return "I'll do my best to answer directly.", "gpt-4o-realtime"
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────
@@ -678,6 +842,7 @@ async def realtime_voice_ws(
     # Track state for transcript accumulation and persistence
     response_text_accum = ""
     last_user_text = ""  # Track last user message for memory extraction
+    turn_model = "gpt-4o-realtime"  # Model used for current turn (changes if deep_think is called)
 
     screen_sharing_active = False
     first_frame_sent = False
@@ -804,7 +969,7 @@ async def realtime_voice_ws(
 
     async def openai_to_client():
         """Relay OpenAI Realtime API events → browser."""
-        nonlocal response_text_accum, db_session_id
+        nonlocal response_text_accum, db_session_id, last_user_text, turn_model
         try:
             async for raw_msg in openai_ws:
                 event = json.loads(raw_msg)
@@ -842,6 +1007,7 @@ async def realtime_voice_ws(
                         await websocket.send_json({
                             "type": "response_done",
                             "text": full_text,
+                            "model": turn_model,
                         })
 
                         # Persist assistant message to DB
@@ -854,7 +1020,7 @@ async def realtime_voice_ws(
                                 logger.exception("[REALTIME] Failed late session creation for assistant")
                         if db_session_id:
                             try:
-                                await _save_voice_messages(db_session_id, "", full_text)
+                                await _save_voice_messages(db_session_id, "", full_text, model=turn_model)
                             except Exception as e:
                                 logger.exception("[REALTIME] Failed to save assistant message")
 
@@ -866,6 +1032,7 @@ async def realtime_voice_ws(
                             last_user_text = ""  # Reset so we don't re-extract
 
                     response_text_accum = ""
+                    turn_model = "gpt-4o-realtime"  # Reset for next turn
 
                     await websocket.send_json({"type": "state", "state": "listening"})
 
@@ -918,6 +1085,7 @@ async def realtime_voice_ws(
                             arguments = {}
 
                         logger.info("[REALTIME] Function call: %s(%s)", func_name, arguments)
+                        await websocket.send_json({"type": "state", "state": "tool_use"})
 
                         # ── Client-side tool: navigate_to ──
                         if func_name == "navigate_to":
@@ -932,6 +1100,13 @@ async def realtime_voice_ws(
                                           "/brain/agent": "Agent Brain", "/workspace": "Workspace",
                                           "/dashboard": "Dashboard", "/agent": "Agent Setup"}
                                 result = f"Navigated to {_NAMES.get(path, path)}. Voice conversation continues."
+
+                        # ── Think: delegate reasoning to best model ──
+                        elif func_name == "think":
+                            task = arguments.get("task", "")
+                            result, turn_model_used = await _think(user_id, task, db_session_id)
+                            turn_model = turn_model_used
+
                         else:
                             # ── Server-side tools ──
                             result = await _execute_tool(user_id, func_name, arguments)
