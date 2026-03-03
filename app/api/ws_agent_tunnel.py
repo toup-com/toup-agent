@@ -18,6 +18,7 @@ Protocol:
   Platform → Agent:
     { "type": "ping" }                              — heartbeat
     { "type": "tool_call", "id": "...", "tool_name": "...", "arguments": {...} }
+    { "type": "restart" }                            — graceful restart (settings changed)
 """
 
 import asyncio
@@ -108,6 +109,26 @@ async def send_tool_call(user_id: str, tool_name: str, arguments: dict) -> str:
         _pending_calls.pop(call_id, None)
 
 
+async def send_restart(user_id: str) -> bool:
+    """Send a restart command to the terminal agent via tunnel.
+
+    Called when agent settings are saved on the platform.
+    The agent will gracefully restart to pick up new config.
+    """
+    tunnel = _tunnels.get(user_id)
+    if not tunnel:
+        logger.info("[TUNNEL] No active tunnel for %s — cannot send restart", user_id[:8])
+        return False
+
+    try:
+        await tunnel.ws.send_json({"type": "restart"})
+        logger.info("[TUNNEL] Sent restart command to agent %s", user_id[:8])
+        return True
+    except Exception as e:
+        logger.warning("[TUNNEL] Failed to send restart to %s: %s", user_id[:8], e)
+        return False
+
+
 async def _authenticate_tunnel(token: str) -> Optional[str]:
     """Validate tunnel token and return user_id.
 
@@ -135,14 +156,15 @@ async def _authenticate_tunnel(token: str) -> Optional[str]:
             logger.exception("[TUNNEL] Token auth DB error: %s", e)
         return None
 
-    # 2. JWT token (fallback for backwards compatibility)
+    # 2. JWT token (fallback — used by tunnel-status/me from frontend)
     try:
-        from app.api.auth import verify_token
-        payload = verify_token(token)
-        return payload.get("sub") or payload.get("user_id")
+        from app.services import decode_access_token
+        user_id = decode_access_token(token)
+        if user_id:
+            return user_id
     except Exception as e:
         logger.warning("[TUNNEL] JWT auth failed: %s", e)
-        return None
+    return None
 
 
 @router.websocket("/ws/agent-tunnel")
@@ -213,7 +235,7 @@ async def agent_tunnel_ws(
     async def heartbeat():
         while True:
             try:
-                await asyncio.sleep(30)
+                await asyncio.sleep(15)
                 await websocket.send_json({"type": "ping"})
             except Exception:
                 break

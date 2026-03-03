@@ -886,12 +886,15 @@ class VPSPlan(Base):
 
     id: Mapped[str] = mapped_column(String(20), primary_key=True)  # "starter" | "standard" | "pro"
     name: Mapped[str] = mapped_column(String(50), nullable=False)
-    instance_type: Mapped[str] = mapped_column(String(20), nullable=False)  # EC2 instance type
+    instance_type: Mapped[str] = mapped_column(String(20), nullable=False)  # EC2 instance type or Hostinger plan
     vcpu: Mapped[int] = mapped_column(Integer, nullable=False)
     ram_gb: Mapped[int] = mapped_column(Integer, nullable=False)
     storage_gb: Mapped[int] = mapped_column(Integer, nullable=False)
     price_cents: Mapped[int] = mapped_column(Integer, nullable=False)  # Monthly price in cents
     stripe_price_id: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    provider: Mapped[str] = mapped_column(String(20), nullable=False, default="aws")  # "aws" | "hostinger" | "hetzner"
+    hostinger_plan_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # Hostinger catalog plan ID
+    hetzner_server_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # Hetzner server type (e.g. "cx23")
 
     instances: Mapped[List["VPSInstance"]] = relationship("VPSInstance", back_populates="plan")
 
@@ -905,9 +908,12 @@ class VPSInstance(Base):
     plan_id: Mapped[str] = mapped_column(String(20), ForeignKey("vps_plans.id"), nullable=False)
     # Lifecycle status
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | provisioning | active | error | terminated
+    provider: Mapped[str] = mapped_column(String(20), default="aws")  # "aws" | "hostinger"
     # AWS details (populated after provisioning)
     aws_instance_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     aws_region: Mapped[str] = mapped_column(String(20), default="us-east-1")
+    # Hostinger details
+    hostinger_vm_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     public_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
     public_dns: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     ami_id: Mapped[str] = mapped_column(String(50), nullable=False, default="")
@@ -990,6 +996,7 @@ class AgentConfig(Base):
     groq_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     xai_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     deepseek_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    agent_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     agent_model: Mapped[str] = mapped_column(String(50), default="gpt-5.2")
 
     # LLM Bundle subscription
@@ -1026,6 +1033,10 @@ class AgentConfig(Base):
 
     # Connect token — used by terminal agent to authenticate tunnel connection
     connect_token: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    # Database mode for agent deployment
+    db_mode: Mapped[str] = mapped_column(String(20), default="auto")  # auto | own_supabase | local_postgres
+    supabase_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

@@ -120,6 +120,47 @@ def create_bundle_checkout_session(
     return {"id": session.id, "url": session.url}
 
 
+def get_stripe_price_for_plan(plan_id: str) -> str:
+    """Return the Stripe Price ID for a VPS plan."""
+    attr = PLAN_PRICE_MAP.get(plan_id)
+    if not attr:
+        raise ValueError(f"Unknown plan_id: {plan_id}")
+    price_id: str = getattr(settings, attr, "")
+    if not price_id:
+        raise ValueError(
+            f"Stripe price ID for plan '{plan_id}' is not configured "
+            f"(set {attr.upper()} in environment)"
+        )
+    return price_id
+
+
+def create_combined_checkout_session(
+    user_id: str,
+    user_email: str,
+    line_items: list[dict],
+    metadata: dict,
+    success_url: str,
+    cancel_url: str,
+) -> dict:
+    """
+    Create a Stripe Checkout Session with multiple subscription line items.
+    Used for combined VPS + LLM Bundle + Managed Supabase checkout.
+    """
+    client = _get_stripe_client()
+    session = client.checkout.sessions.create(
+        params={
+            "mode": "subscription",
+            "line_items": line_items,
+            "customer_email": user_email,
+            "success_url": success_url,
+            "cancel_url": cancel_url,
+            "metadata": metadata,
+            "subscription_data": {"metadata": metadata},
+        }
+    )
+    return {"id": session.id, "url": session.url}
+
+
 def verify_webhook(payload: bytes, sig_header: str) -> Optional[dict]:
     """
     Verify a Stripe webhook signature and return the parsed event dict,

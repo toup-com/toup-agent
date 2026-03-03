@@ -91,6 +91,39 @@ async def init_db():
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS disabled_tools TEXT DEFAULT ''",
         # Connect token for tunnel authentication
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS connect_token VARCHAR(100)",
+        # Agent display name (migration 017)
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS agent_name VARCHAR(100)",
+        # Database mode for agent deployment
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS db_mode VARCHAR(20) DEFAULT 'auto'",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS supabase_url TEXT",
+        # Multi-provider VPS support (Hostinger + Hetzner)
+        "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
+        "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS hostinger_plan_id VARCHAR(50)",
+        "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS hetzner_server_type VARCHAR(20)",
+        "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
+        "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS hostinger_vm_id VARCHAR(50)",
+    ]
+    # Seed user-facing VPS plans
+    # TEMPORARY: Using AWS until Hetzner account is verified, then switch to Hetzner
+    # Hetzner targets: CX23=$3.80, CX33=$6, CX43=$10.30/mo (much cheaper)
+    _seed_statements = [
+        # Starter: AWS t3.small — 2 vCPU, 2GB RAM, 20GB — keeping same specs/price for now
+        """INSERT INTO vps_plans (id, name, instance_type, vcpu, ram_gb, storage_gb, price_cents, stripe_price_id, provider)
+           VALUES ('starter', 'Starter', 't3.small', 2, 2, 20, 900, '', 'aws')
+           ON CONFLICT (id) DO UPDATE SET provider='aws', instance_type='t3.small',
+             vcpu=2, ram_gb=2, storage_gb=20, price_cents=900""",
+        # Standard: AWS t3.medium — 2 vCPU, 4GB RAM, 40GB
+        """INSERT INTO vps_plans (id, name, instance_type, vcpu, ram_gb, storage_gb, price_cents, stripe_price_id, provider)
+           VALUES ('standard', 'Standard', 't3.medium', 2, 4, 40, 1900, '', 'aws')
+           ON CONFLICT (id) DO UPDATE SET provider='aws', instance_type='t3.medium',
+             vcpu=2, ram_gb=4, storage_gb=40, price_cents=1900""",
+        # Pro: AWS t3.large — 2 vCPU, 8GB RAM, 80GB
+        """INSERT INTO vps_plans (id, name, instance_type, vcpu, ram_gb, storage_gb, price_cents, stripe_price_id, provider)
+           VALUES ('pro', 'Pro', 't3.large', 2, 8, 80, 3900, '', 'aws')
+           ON CONFLICT (id) DO UPDATE SET provider='aws', instance_type='t3.large',
+             vcpu=2, ram_gb=8, storage_gb=80, price_cents=3900""",
+        # Remove ALL plans except the 3 user-facing tiers
+        "DELETE FROM vps_plans WHERE id NOT IN ('starter', 'standard', 'pro')",
     ]
     async with engine.begin() as conn:
         from sqlalchemy import text
@@ -99,6 +132,11 @@ async def init_db():
                 await conn.execute(text(stmt))
             except Exception:
                 pass  # column already exists or DB doesn't support IF NOT EXISTS
+        for stmt in _seed_statements:
+            try:
+                await conn.execute(text(stmt))
+            except Exception:
+                pass  # already seeded or table doesn't exist yet
 
 
 async def drop_db():

@@ -182,16 +182,25 @@ async def _chat_complete(
     
     if request.auto_extract_memories and settings.auto_extract_memories:
         try:
+            # Fetch user's API key for extraction
+            _user_key = None
+            try:
+                from app.db import AgentConfig
+                _r = await db.execute(select(AgentConfig.openai_api_key).where(AgentConfig.user_id == current_user.id))
+                _user_key = _r.scalar_one_or_none()
+            except Exception:
+                pass
             extracted = await memory_extractor.extract_memories_with_llm(
                 user_message=request.message,
                 assistant_response=llm_response.content,
                 brain_type="user",
-                max_memories=5
+                max_memories=5,
+                api_key=_user_key,
             )
             
             # Use dedup service for intelligent memory creation
-            dedup_service = MemoryDedupService(db)
-            
+            dedup_service = MemoryDedupService(db, api_key=_user_key)
+
             # Store extracted memories with deduplication
             for mem in extracted:
                 # Create MemoryCreate schema from extracted data
@@ -422,15 +431,23 @@ async def _chat_stream(
             if request.auto_extract_memories and settings.auto_extract_memories:
                 try:
                     memory_extractor = get_memory_extractor()
-                    dedup_service = MemoryDedupService(db)
-                    
+
+                    _ukey = None
+                    try:
+                        from app.db import AgentConfig
+                        _r2 = await db.execute(select(AgentConfig.openai_api_key).where(AgentConfig.user_id == current_user.id))
+                        _ukey = _r2.scalar_one_or_none()
+                    except Exception:
+                        pass
                     extracted = await memory_extractor.extract_memories_with_llm(
                         user_message=request.message,
                         assistant_response=full_response,
                         brain_type="user",
-                        max_memories=5
+                        max_memories=5,
+                        api_key=_ukey,
                     )
                     
+                    dedup_service = MemoryDedupService(db, api_key=_ukey)
                     extracted_memory_ids = []
                     for mem in extracted:
                         memory_data = MemoryCreate(

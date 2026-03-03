@@ -4,6 +4,7 @@ import json
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.db import get_db, Memory, MemoryEvent
 from app.schemas import (
@@ -14,6 +15,18 @@ from app.schemas import (
 )
 from app.api.auth import get_current_user
 from app.services.memory_service import MemoryService
+
+
+async def _get_user_api_key(db: AsyncSession, user_id: str) -> Optional[str]:
+    """Fetch the user's OpenAI API key from agent_configs."""
+    try:
+        from app.db import AgentConfig
+        result = await db.execute(
+            select(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)
+        )
+        return result.scalar_one_or_none()
+    except Exception:
+        return None
 
 router = APIRouter(prefix="/memories", tags=["Memories"])
 
@@ -72,7 +85,8 @@ async def create_memory(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new memory"""
-    service = MemoryService(db)
+    _key = await _get_user_api_key(db, current_user.id)
+    service = MemoryService(db, api_key=_key)
     memory = await service.create_memory(current_user.id, memory_data)
     return memory_to_response(memory)
 
@@ -152,7 +166,8 @@ async def search_memories_get(
         memory_level=memory_level
     )
     
-    service = MemoryService(db)
+    _key = await _get_user_api_key(db, current_user.id)
+    service = MemoryService(db, api_key=_key)
     results, total_count, search_time_ms = await service.search_memories(
         current_user.id, request
     )
@@ -172,7 +187,8 @@ async def search_memories(
     db: AsyncSession = Depends(get_db)
 ):
     """Semantic search for memories with filters"""
-    service = MemoryService(db)
+    _key = await _get_user_api_key(db, current_user.id)
+    service = MemoryService(db, api_key=_key)
     results, total_count, search_time_ms = await service.search_memories(
         current_user.id, request
     )
@@ -468,8 +484,8 @@ async def deduplicate_memories(
         dry_run: If True, just report what would be merged without doing it
     """
     from app.services.memory_dedup_service import MemoryDedupService
-    
-    dedup_service = MemoryDedupService(db)
+    _key = await _get_user_api_key(db, current_user.id)
+    dedup_service = MemoryDedupService(db, api_key=_key)
     results = await dedup_service.find_and_merge_duplicates(
         user_id=current_user.id,
         category=category,
@@ -502,8 +518,8 @@ async def get_duplicate_report(
     Returns statistics and detailed groups of potential duplicates.
     """
     from app.services.memory_dedup_service import MemoryDedupService
-    
-    dedup_service = MemoryDedupService(db)
+    _key = await _get_user_api_key(db, current_user.id)
+    dedup_service = MemoryDedupService(db, api_key=_key)
     report = await dedup_service.get_duplicate_report(
         user_id=current_user.id,
         category=category,
@@ -542,8 +558,9 @@ async def merge_into_memory(
             detail="Memory not found"
         )
     
-    dedup_service = MemoryDedupService(db)
-    
+    _key = await _get_user_api_key(db, current_user.id)
+    dedup_service = MemoryDedupService(db, api_key=_key)
+
     # Create a temporary MemoryCreate for the merge
     merge_data = MemoryCreate(
         content=new_content,

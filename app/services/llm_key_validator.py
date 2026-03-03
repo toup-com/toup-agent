@@ -34,13 +34,19 @@ async def validate_key(provider: str, api_key: str) -> dict:
                     headers={"Authorization": f"Bearer {api_key}"},
                 )
             elif provider == "anthropic":
+                # OAuth tokens (sk-ant-oat*) use Bearer auth; regular keys use x-api-key
+                is_oauth = api_key.startswith("sk-ant-oat")
+                headers = {
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                }
+                if is_oauth:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                else:
+                    headers["x-api-key"] = api_key
                 r = await client.post(
                     "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
+                    headers=headers,
                     json={
                         "model": "claude-haiku-4-5-20251001",
                         "max_tokens": 1,

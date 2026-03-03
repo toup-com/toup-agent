@@ -1,17 +1,19 @@
 """
 SSH-based agent deployment service.
 
-Connects to a target machine via SSH and installs/configures the Toup Agent.
-Yields log lines in real-time for WebSocket streaming to the frontend.
+Routes SSH operations through AWS Lambda because Railway blocks outbound port 22.
+The Lambda function (toup-ssh-proxy) connects to the target machine and executes commands.
+
+For local machine deployments, generates a setup script the user runs directly.
 """
 
 import asyncio
+import json
 import logging
 import time
 from typing import Awaitable, Callable, Optional
 
-import asyncssh
-import httpx
+import boto3
 
 from app.config import settings
 
@@ -23,42 +25,54 @@ AGENT_PORT = 8001
 SYSTEMD_UNIT = "toup-agent"
 
 
-async def _run_cmd(
-    conn: asyncssh.SSHClientConnection,
-    cmd: str,
-    on_log: Callable[[str, str], Awaitable[None]],
-    label: str = "",
-    sudo: bool = False,
-) -> tuple[bool, str]:
-    """Run a single command via SSH and stream output."""
-    full_cmd = f"sudo {cmd}" if sudo else cmd
-    await on_log(f"$ {full_cmd}", "cmd")
+# ── Lambda invocation helpers ────────────────────────────────────
 
-    try:
-        result = await asyncio.wait_for(
-            conn.run(full_cmd, check=False),
-            timeout=300,  # 5 min max per command
-        )
-    except asyncio.TimeoutError:
-        await on_log(f"Command timed out after 300s", "error")
-        return False, ""
+def _get_lambda_client():
+    """Get a boto3 Lambda client using AWS credentials from settings."""
+    from botocore.config import Config as BotoConfig
+    return boto3.client(
+        "lambda",
+        region_name=settings.aws_region,
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        config=BotoConfig(
+            read_timeout=120,    # 2 min read timeout (for poll responses)
+            connect_timeout=10,
+        ),
+    )
 
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
 
-    if stdout:
-        for line in stdout.split("\n")[-20:]:  # Last 20 lines
-            await on_log(line, "info")
-    if stderr and result.exit_status != 0:
-        for line in stderr.split("\n")[-10:]:
-            await on_log(line, "error")
+async def _invoke_lambda(payload: dict) -> dict:
+    """Invoke the SSH proxy Lambda function and return parsed response."""
+    function_name = settings.ssh_lambda_function_name
+    if not function_name:
+        raise RuntimeError("SSH Lambda not configured (SSH_LAMBDA_FUNCTION_NAME is empty)")
 
-    if result.exit_status != 0:
-        await on_log(f"Command exited with code {result.exit_status}", "error")
-        return False, stdout
+    loop = asyncio.get_event_loop()
+    client = _get_lambda_client()
 
-    return True, stdout
+    # Run synchronous boto3 call in thread pool
+    response = await loop.run_in_executor(
+        None,
+        lambda: client.invoke(
+            FunctionName=function_name,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode(),
+        ),
+    )
 
+    # Parse response
+    response_payload = json.loads(response["Payload"].read().decode())
+
+    # Check for Lambda-level errors
+    if "FunctionError" in response:
+        error_msg = response_payload.get("errorMessage", "Lambda execution failed")
+        raise RuntimeError(f"Lambda error: {error_msg}")
+
+    return response_payload
+
+
+# ── SSH Test ─────────────────────────────────────────────────────
 
 async def test_ssh_connection(
     ssh_host: str,
@@ -67,55 +81,35 @@ async def test_ssh_connection(
     ssh_password: Optional[str] = None,
     ssh_key: Optional[str] = None,
 ) -> dict:
-    """Test SSH connectivity and return machine info."""
+    """Test SSH connectivity via Lambda proxy and return machine info."""
+    logger.info(f"SSH test via Lambda: {ssh_host}:{ssh_port} as {ssh_user}")
+
     try:
-        conn_kwargs = _build_conn_kwargs(ssh_host, ssh_port, ssh_user, ssh_password, ssh_key)
-        async with asyncssh.connect(**conn_kwargs) as conn:
-            # Get OS info
-            os_result = await conn.run("cat /etc/os-release 2>/dev/null | head -1 || uname -s", check=False)
-            os_info = (os_result.stdout or "Unknown").strip()
-            if "PRETTY_NAME=" in os_info:
-                os_info = os_info.split("=", 1)[1].strip('"')
+        result = await _invoke_lambda({
+            "action": "test",
+            "ssh_host": ssh_host,
+            "ssh_port": ssh_port,
+            "ssh_user": ssh_user,
+            "ssh_password": ssh_password,
+            "ssh_key": ssh_key,
+        })
 
-            # Get Python version
-            py_result = await conn.run("python3 --version 2>/dev/null || echo 'not found'", check=False)
-            py_info = (py_result.stdout or "not found").strip()
+        if "error" in result:
+            logger.error(f"SSH test failed: {result['error']}")
+            return {"connected": False, "error": result["error"]}
 
-            return {
-                "connected": True,
-                "os": os_info,
-                "python": py_info,
-            }
-    except asyncssh.PermissionDenied:
-        return {"connected": False, "error": "Authentication failed. Check username and password."}
-    except asyncssh.ConnectionLost:
-        return {"connected": False, "error": "Connection lost. Check the host address."}
-    except OSError as e:
-        return {"connected": False, "error": f"Cannot reach host: {e}"}
-    except Exception as e:
+        logger.info(f"SSH test success: {result.get('os')}, {result.get('python')}")
+        return result
+
+    except RuntimeError as e:
+        logger.error(f"SSH test Lambda error: {e}")
         return {"connected": False, "error": str(e)}
+    except Exception as e:
+        logger.error(f"SSH test unexpected error: {type(e).__name__}: {e}")
+        return {"connected": False, "error": f"SSH proxy error: {str(e)}"}
 
 
-def _build_conn_kwargs(
-    ssh_host: str,
-    ssh_port: int,
-    ssh_user: str,
-    ssh_password: Optional[str],
-    ssh_key: Optional[str],
-) -> dict:
-    """Build asyncssh connection kwargs."""
-    kwargs = {
-        "host": ssh_host,
-        "port": ssh_port,
-        "username": ssh_user,
-        "known_hosts": None,  # Skip host key verification
-    }
-    if ssh_key:
-        kwargs["client_keys"] = [asyncssh.import_private_key(ssh_key)]
-    elif ssh_password:
-        kwargs["password"] = ssh_password
-    return kwargs
-
+# ── Deploy via Lambda ────────────────────────────────────────────
 
 async def deploy_agent(
     ssh_host: str,
@@ -125,9 +119,14 @@ async def deploy_agent(
     ssh_key: Optional[str],
     env_content: str,
     on_log: Callable[[str, str], Awaitable[None]],
+    db_mode: str = "auto",
 ) -> bool:
     """
-    Deploy the Toup Agent to a remote machine via SSH.
+    Deploy the Toup Agent to a remote machine via Lambda SSH proxy.
+
+    Uses async deploy: Lambda starts the script with nohup and returns
+    immediately. Backend polls for log output every few seconds, streaming
+    lines to the frontend in real-time. No more timeout issues.
 
     Args:
         ssh_host: Target machine hostname/IP
@@ -138,100 +137,276 @@ async def deploy_agent(
         env_content: Generated .env file content
         on_log: Async callback (line, level) for real-time log streaming.
                 Levels: "info", "success", "error", "cmd", "step"
+        db_mode: Database mode ("auto", "local_postgres", "own_supabase")
 
     Returns:
         True if deployment succeeded, False otherwise
     """
-    await on_log("Connecting to {}:{}...".format(ssh_host, ssh_port), "step")
+    await on_log("Connecting via SSH proxy...", "step")
+
+    # Build the deploy script that will run on the remote machine
+    deploy_script = _build_deploy_script(env_content, db_mode=db_mode)
+
+    ssh_creds = {
+        "ssh_host": ssh_host,
+        "ssh_port": ssh_port,
+        "ssh_user": ssh_user,
+        "ssh_password": ssh_password,
+        "ssh_key": ssh_key,
+    }
 
     try:
-        conn_kwargs = _build_conn_kwargs(ssh_host, ssh_port, ssh_user, ssh_password, ssh_key)
-        async with asyncssh.connect(**conn_kwargs) as conn:
-            await on_log(f"Connected as {ssh_user}", "success")
+        await on_log(f"Deploying to {ssh_host}:{ssh_port}...", "step")
 
-            # Step 1: Check prerequisites
-            await on_log("Checking prerequisites...", "step")
-            ok, py_ver = await _run_cmd(conn, "python3 --version", on_log)
-            if not ok:
-                await on_log("Installing Python...", "step")
-                ok, _ = await _run_cmd(
-                    conn,
-                    "apt update -qq && apt install -y python3 python3-venv python3-pip git",
-                    on_log, sudo=True,
-                )
-                if not ok:
-                    await on_log("Failed to install prerequisites", "error")
+        # Step 1: Start deploy in background (returns immediately)
+        start_result = await _invoke_lambda({
+            **ssh_creds,
+            "action": "deploy_start",
+            "script": deploy_script,
+        })
+
+        if "error" in start_result:
+            await on_log(f"Connection failed: {start_result['error']}", "error")
+            return False
+
+        if not start_result.get("started"):
+            await on_log("Failed to start deploy script on server", "error")
+            return False
+
+        pid = start_result.get("pid", "?")
+        await on_log(f"Deploy started (PID {pid}), streaming logs...", "info")
+
+        # Step 2: Poll for status every 3 seconds
+        offset = 0
+        max_polls = 200  # 200 * 3s = 10 minutes max
+        consecutive_errors = 0
+
+        for poll_num in range(max_polls):
+            await asyncio.sleep(3)
+
+            try:
+                status = await _invoke_lambda({
+                    **ssh_creds,
+                    "action": "deploy_status",
+                    "offset": offset,
+                })
+                consecutive_errors = 0  # Reset on success
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    await on_log(f"Lost connection to server: {e}", "error")
                     return False
+                await on_log(f"Poll hiccup ({e}), retrying...", "info")
+                continue
 
-            ok, git_ver = await _run_cmd(conn, "git --version", on_log)
-            if not ok:
-                ok, _ = await _run_cmd(conn, "apt install -y git", on_log, sudo=True)
-                if not ok:
-                    await on_log("Failed to install git", "error")
-                    return False
-
-            # Step 2: Clone or update agent code
-            await on_log("Setting up agent code...", "step")
-            ok, _ = await _run_cmd(conn, f"test -d {AGENT_DIR}/.git && echo exists", on_log)
-            if "exists" in (_ or ""):
-                await on_log("Updating existing agent code...", "info")
-                ok, _ = await _run_cmd(conn, f"cd {AGENT_DIR} && git pull --ff-only", on_log, sudo=True)
-            else:
-                await on_log("Cloning agent repository...", "info")
-                ok, _ = await _run_cmd(
-                    conn,
-                    f"mkdir -p {AGENT_DIR} && git clone {AGENT_REPO} {AGENT_DIR}",
-                    on_log, sudo=True,
-                )
-            if not ok:
-                await on_log("Failed to set up agent code", "error")
+            if "error" in status:
+                await on_log(f"SSH error: {status['error']}", "error")
                 return False
 
-            # Step 3: Create virtualenv and install deps
-            await on_log("Installing dependencies...", "step")
-            ok, _ = await _run_cmd(
-                conn,
-                f"test -d {AGENT_DIR}/venv/bin/python && echo exists",
-                on_log,
-            )
-            if "exists" not in (_ or ""):
-                ok, _ = await _run_cmd(
-                    conn,
-                    f"python3 -m venv {AGENT_DIR}/venv",
-                    on_log, sudo=True,
-                )
-                if not ok:
-                    await on_log("Failed to create virtualenv", "error")
-                    return False
+            # Stream new output lines
+            new_output = status.get("output", "")
+            if new_output:
+                for line in new_output.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("[STEP]"):
+                        await on_log(line[6:].strip(), "step")
+                    elif line.startswith("[OK]"):
+                        await on_log(line[4:].strip(), "success")
+                    elif line.startswith("[ERR]"):
+                        await on_log(line[5:].strip(), "error")
+                    else:
+                        await on_log(line, "info")
 
-            ok, _ = await _run_cmd(
-                conn,
-                f"{AGENT_DIR}/venv/bin/pip install -q -r {AGENT_DIR}/requirements.txt",
-                on_log, sudo=True,
-            )
-            if not ok:
-                await on_log("Failed to install Python dependencies", "error")
-                return False
+            offset = status.get("offset", offset)
 
-            # Step 4: Write .env
-            await on_log("Writing configuration...", "step")
-            # Escape single quotes in env content for echo
-            safe_env = env_content.replace("'", "'\\''")
-            ok, _ = await _run_cmd(
-                conn,
-                f"cat > {AGENT_DIR}/.env << 'TOUP_ENV_EOF'\n{env_content}\nTOUP_ENV_EOF",
-                on_log, sudo=True,
-            )
-            if not ok:
-                await on_log("Failed to write .env", "error")
-                return False
-            await on_log("Configuration written", "success")
+            # Check if deploy finished
+            if not status.get("running", True):
+                exit_code = status.get("exit_code")
+                if exit_code is not None:
+                    if status.get("success"):
+                        await on_log("Deployment completed successfully!", "success")
+                        return True
+                    else:
+                        await on_log(
+                            f"Deployment failed (exit code: {exit_code})", "error"
+                        )
+                        return False
+                else:
+                    # Process ended but no exit code file yet — wait one more cycle
+                    await asyncio.sleep(2)
+                    try:
+                        final = await _invoke_lambda({
+                            **ssh_creds,
+                            "action": "deploy_status",
+                            "offset": offset,
+                        })
+                        # Stream any remaining output
+                        remaining = final.get("output", "")
+                        if remaining:
+                            for line in remaining.split("\n"):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                if line.startswith("[STEP]"):
+                                    await on_log(line[6:].strip(), "step")
+                                elif line.startswith("[OK]"):
+                                    await on_log(line[4:].strip(), "success")
+                                elif line.startswith("[ERR]"):
+                                    await on_log(line[5:].strip(), "error")
+                                else:
+                                    await on_log(line, "info")
 
-            # Step 5: Create systemd service
-            await on_log("Configuring systemd service...", "step")
-            service_content = f"""[Unit]
+                        if final.get("success"):
+                            await on_log("Deployment completed successfully!", "success")
+                            return True
+                        else:
+                            ec = final.get("exit_code", "unknown")
+                            await on_log(f"Deployment failed (exit code: {ec})", "error")
+                            return False
+                    except Exception:
+                        await on_log("Deploy process ended — could not read exit code", "error")
+                        return False
+
+        # If we get here, we exceeded max polls
+        await on_log("Deployment timed out (exceeded 10 minutes)", "error")
+        return False
+
+    except RuntimeError as e:
+        await on_log(f"Lambda error: {e}", "error")
+        return False
+    except Exception as e:
+        logger.exception("Deploy failed: %s", e)
+        await on_log(f"Deployment error: {e}", "error")
+        return False
+
+
+def _build_deploy_script(env_content: str, db_mode: str = "auto") -> str:
+    """Build the bash script that runs on the remote machine to install the agent."""
+
+    # PostgreSQL + pgvector installation section (only for local_postgres mode)
+    pg_section = ""
+    if db_mode == "local_postgres":
+        pg_section = """
+# ── Install PostgreSQL + pgvector ────────────────────────────
+echo "[STEP] Installing PostgreSQL + pgvector..."
+export DEBIAN_FRONTEND=noninteractive
+
+# Wait for any existing apt locks to clear
+for i in $(seq 1 10); do
+    if ! flock -n /var/lib/dpkg/lock-frontend true 2>/dev/null; then
+        echo "Waiting for apt lock to clear... ($i/10)"
+        sleep 3
+    else
+        break
+    fi
+done
+
+if ! command -v psql &>/dev/null; then
+    echo "Installing PostgreSQL..."
+    apt-get update -qq 2>&1
+    apt-get install -y postgresql postgresql-contrib curl ca-certificates 2>&1
+    systemctl start postgresql
+    systemctl enable postgresql
+    echo "[OK] PostgreSQL installed: $(psql --version)"
+else
+    echo "[OK] PostgreSQL already installed: $(psql --version)"
+    systemctl start postgresql 2>/dev/null || true
+fi
+
+# Install pgvector extension
+echo "Installing pgvector extension..."
+PG_MAJOR=$(psql --version | grep -oP '\\d+' | head -1)
+
+if sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null; then
+    echo "[OK] pgvector already available"
+else
+    # Try installing from apt package first
+    if apt-get install -y postgresql-${PG_MAJOR}-pgvector 2>/dev/null; then
+        echo "[OK] pgvector installed from package"
+    else
+        echo "Building pgvector from source..."
+        apt-get install -y postgresql-server-dev-all build-essential git 2>&1
+        cd /tmp && rm -rf pgvector && git clone https://github.com/pgvector/pgvector.git 2>&1
+        cd pgvector && make 2>&1 && make install 2>&1
+        cd / && rm -rf /tmp/pgvector
+        echo "[OK] pgvector built from source"
+    fi
+fi
+
+# Create database user and database
+echo "Setting up database..."
+sudo -u postgres psql -c "CREATE USER toup WITH PASSWORD 'toup';" 2>/dev/null || \\
+    sudo -u postgres psql -c "ALTER USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
+sudo -u postgres psql -c "CREATE DATABASE toup_brain OWNER toup;" 2>/dev/null || true
+sudo -u postgres psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
+echo "[OK] Database toup_brain ready (user: toup, pgvector enabled)"
+"""
+
+    return f"""#!/bin/bash
+set -e
+
+# Kill any previous deploy scripts still running
+for pid in $(pgrep -f toup_deploy.sh 2>/dev/null); do
+    if [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ]; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+done
+
+echo "[STEP] Checking prerequisites..."
+
+# Install Python + Git + venv if missing
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq 2>&1
+if ! command -v python3 &>/dev/null; then
+    echo "[STEP] Installing Python 3..."
+    apt-get install -y python3 python3-venv python3-pip git curl 2>&1
+else
+    # Ensure python3-venv is installed (often missing on Ubuntu minimal)
+    apt-get install -y python3-venv 2>&1
+fi
+echo "[OK] Python: $(python3 --version 2>&1)"
+
+if ! command -v git &>/dev/null; then
+    apt-get install -y git 2>&1
+fi
+echo "[OK] Git: $(git --version)"
+{pg_section}
+# Clone or update agent code
+echo "[STEP] Setting up agent code..."
+if [ -d "{AGENT_DIR}/.git" ]; then
+    echo "Updating existing agent code..."
+    cd {AGENT_DIR} && git pull --ff-only 2>&1 || true
+else
+    echo "Cloning agent repository..."
+    mkdir -p {AGENT_DIR}
+    git clone {AGENT_REPO} {AGENT_DIR} 2>&1
+fi
+echo "[OK] Agent code ready"
+
+# Create virtualenv
+echo "[STEP] Setting up Python environment..."
+if [ ! -d "{AGENT_DIR}/venv/bin/python" ]; then
+    python3 -m venv {AGENT_DIR}/venv
+fi
+echo "Installing dependencies (this may take a minute)..."
+{AGENT_DIR}/venv/bin/pip install -q -r {AGENT_DIR}/requirements.txt 2>&1
+echo "[OK] Dependencies installed"
+
+# Write .env
+echo "[STEP] Writing configuration..."
+cat > {AGENT_DIR}/.env << 'TOUP_ENV_EOF'
+{env_content}
+TOUP_ENV_EOF
+echo "[OK] Configuration written"
+
+# Create systemd service
+echo "[STEP] Configuring systemd service..."
+cat > /etc/systemd/system/{SYSTEMD_UNIT}.service << 'TOUP_SVC_EOF'
+[Unit]
 Description=Toup Agent Service
-After=network.target
+After=network.target postgresql.service
 
 [Service]
 Type=simple
@@ -243,68 +418,100 @@ Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target"""
+WantedBy=multi-user.target
+TOUP_SVC_EOF
 
-            ok, _ = await _run_cmd(
-                conn,
-                f"cat > /etc/systemd/system/{SYSTEMD_UNIT}.service << 'TOUP_SVC_EOF'\n{service_content}\nTOUP_SVC_EOF",
-                on_log, sudo=True,
-            )
-            if not ok:
-                await on_log("Failed to create systemd service", "error")
-                return False
+systemctl daemon-reload
+systemctl enable {SYSTEMD_UNIT}
+systemctl restart {SYSTEMD_UNIT}
+echo "[OK] Service started"
 
-            # Step 6: Enable and start service
-            await on_log("Starting agent service...", "step")
-            ok, _ = await _run_cmd(
-                conn,
-                f"systemctl daemon-reload && systemctl enable {SYSTEMD_UNIT} && systemctl restart {SYSTEMD_UNIT}",
-                on_log, sudo=True,
-            )
-            if not ok:
-                await on_log("Failed to start agent service", "error")
-                return False
+# Verify agent health
+echo "[STEP] Verifying agent health..."
+for i in $(seq 1 6); do
+    sleep 5
+    if curl -sf http://localhost:{AGENT_PORT}/agent/health > /dev/null 2>&1; then
+        echo "[OK] Agent is running and healthy!"
+        exit 0
+    fi
+    echo "Waiting for agent to start... (attempt $i/6)"
+done
 
-            # Step 7: Verify agent health
-            await on_log("Verifying agent health...", "step")
-            for attempt in range(6):  # Retry up to 30s
-                await asyncio.sleep(5)
-                ok, output = await _run_cmd(
-                    conn,
-                    f"curl -sf http://localhost:{AGENT_PORT}/agent/health 2>/dev/null || echo FAIL",
-                    on_log,
-                )
-                if ok and "FAIL" not in (output or "FAIL"):
-                    await on_log("Agent is running!", "success")
-                    return True
-                await on_log(f"Waiting for agent to start... (attempt {attempt + 1}/6)", "info")
+echo "[ERR] Agent did not respond to health check after 30s"
+# Show recent logs for debugging
+echo "Recent logs:"
+journalctl -u {SYSTEMD_UNIT} --no-pager -n 20 2>/dev/null || true
+exit 1
+"""
 
-            await on_log("Agent did not respond to health check after 30s", "error")
-            return False
 
-    except asyncssh.PermissionDenied:
-        await on_log("SSH authentication failed. Check credentials.", "error")
-        return False
-    except asyncssh.ConnectionLost:
-        await on_log("SSH connection lost", "error")
-        return False
-    except OSError as e:
-        await on_log(f"Cannot reach host: {e}", "error")
-        return False
-    except Exception as e:
-        logger.exception("Deploy failed: %s", e)
-        await on_log(f"Deployment error: {e}", "error")
-        return False
-
+# ── Local Machine Scripts (no Lambda needed) ─────────────────────
 
 def generate_setup_script(env_content: str) -> str:
     """Generate a self-contained bash setup script for local machines (Mac/Linux).
 
     Installs the agent and starts it in the foreground:
     - Clones repo, creates venv, installs deps, writes .env
+    - Optionally installs PostgreSQL + pgvector for local_postgres db_mode
     - Installs CLI helper (~/toup-agent/toup) for start/stop/update/status
     - Starts uvicorn in the foreground — user sees output, Ctrl+C stops it
     """
+    # Detect if local PostgreSQL install is needed
+    needs_local_pg = "postgresql+asyncpg://toup:toup@localhost" in env_content
+
+    pg_install_section = ""
+    if needs_local_pg:
+        pg_install_section = r'''
+# ── Install PostgreSQL + pgvector (local mode) ──────────
+echo ""
+echo "[4/8] Setting up local PostgreSQL + pgvector..."
+
+if ! command -v psql &>/dev/null; then
+  echo "  Installing PostgreSQL..."
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    if command -v brew &>/dev/null; then
+      brew install postgresql@16 pgvector
+      brew services start postgresql@16
+    else
+      echo "  Homebrew is required to install PostgreSQL on macOS."
+      echo "  Install with: /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+      exit 1
+    fi
+  else
+    sudo apt-get update -qq
+    sudo apt-get install -y postgresql postgresql-contrib
+    sudo systemctl start postgresql
+    sudo systemctl enable postgresql
+    # Install pgvector extension
+    sudo apt-get install -y postgresql-16-pgvector 2>/dev/null || \
+    sudo apt-get install -y postgresql-15-pgvector 2>/dev/null || \
+    sudo apt-get install -y postgresql-14-pgvector 2>/dev/null || {
+      echo "  Building pgvector from source..."
+      sudo apt-get install -y postgresql-server-dev-all build-essential
+      cd /tmp && git clone https://github.com/pgvector/pgvector.git
+      cd pgvector && make && sudo make install
+      cd / && rm -rf /tmp/pgvector
+    }
+  fi
+else
+  echo "  PostgreSQL already installed: $(psql --version)"
+fi
+
+# Create database and user
+echo "  Creating database..."
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  createuser toup 2>/dev/null || true
+  psql postgres -c "ALTER USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
+  createdb -O toup toup_brain 2>/dev/null || true
+  psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
+else
+  sudo -u postgres psql -c "CREATE USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
+  sudo -u postgres psql -c "CREATE DATABASE toup_brain OWNER toup;" 2>/dev/null || true
+  sudo -u postgres psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
+fi
+echo "  PostgreSQL + pgvector ready"
+'''
+
     return f'''#!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 #  Toup Agent — Local Setup Script
@@ -382,7 +589,7 @@ fi
 echo "  Installing dependencies (this may take a minute)..."
 "$AGENT_DIR/venv/bin/pip" install -q -r "$BACKEND_ROOT/requirements.txt"
 echo "  Dependencies installed"
-
+{pg_install_section}
 # ── Write .env ───────────────────────────────────────────
 echo ""
 echo "[4/7] Writing configuration..."
@@ -456,25 +663,25 @@ _run() {{
 _status() {{
   if curl -sf "http://localhost:$AGENT_PORT/agent/health" > /dev/null 2>&1; then
     HEALTH=$(curl -sf "http://localhost:$AGENT_PORT/agent/health")
-    echo "✅ Agent is running"
+    echo "Agent is running"
     echo "   URL:     http://localhost:$AGENT_PORT"
     echo "   Health:  $HEALTH"
   else
-    echo "❌ Agent is not responding"
+    echo "Agent is not responding"
   fi
 }}
 
 _update() {{
-  echo "🔄 Updating Toup Agent..."
+  echo "Updating Toup Agent..."
   cd "$AGENT_DIR" && git pull --ff-only
-  echo "📦 Installing dependencies..."
+  echo "Installing dependencies..."
   "$AGENT_DIR/venv/bin/pip" install -q -r "$BACKEND_DIR/requirements.txt"
-  echo "✅ Updated! Run: ~/toup-agent/toup start"
+  echo "Updated! Run: ~/toup-agent/toup start"
 }}
 
 _stop() {{
   lsof -ti :$AGENT_PORT 2>/dev/null | xargs kill 2>/dev/null || true
-  echo "🛑 Agent stopped"
+  echo "Agent stopped"
 }}
 
 _logs() {{
@@ -509,7 +716,7 @@ PLATFORM_URL=$(grep '^PLATFORM_API_URL=' "$BACKEND_ROOT/.env" | cut -d= -f2)
 
 echo ""
 echo "  ════════════════════════════════════════════"
-echo "  ✅ Setup complete!"
+echo "  Setup complete!"
 echo ""
 echo "  Starting your agent now..."
 echo "  After you see 'Toup Agent ready', go to https://toup.ai"
@@ -524,10 +731,12 @@ echo ""
 # Register with platform in the background (after agent starts)
 (
   sleep 10
-  if [ -n "$AGENT_API_KEY" ] && [ -n "$PLATFORM_URL" ]; then
+  # Detect public IP for registration
+  PUBLIC_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{{print $1}}')
+  if [ -n "$AGENT_API_KEY" ] && [ -n "$PLATFORM_URL" ] && [ -n "$PUBLIC_IP" ]; then
     curl -sf -X POST "$PLATFORM_URL/agent-setup/register" \\
       -H "Content-Type: application/json" \\
-      -d "{{\\"agent_api_key\\":\\"$AGENT_API_KEY\\",\\"agent_url\\":\\"http://localhost:$AGENT_PORT\\"}}" > /dev/null 2>&1
+      -d "{{\\"agent_api_key\\":\\"$AGENT_API_KEY\\",\\"agent_url\\":\\"http://$PUBLIC_IP:$AGENT_PORT\\"}}" > /dev/null 2>&1
   fi
 ) &
 
@@ -538,7 +747,6 @@ cd "$BACKEND_DIR" && exec "$UVICORN" agent_main:app --host 0.0.0.0 --port $AGENT
 
 def generate_setup_script_windows(env_content: str) -> str:
     """Generate a PowerShell setup script for Windows."""
-    # Escape single quotes in env_content for PowerShell here-string
     return f'''# ═══════════════════════════════════════════════════════════════
 #  Toup Agent — Windows Setup Script (PowerShell)
 #  Generated by Toup Platform
@@ -697,6 +905,9 @@ def generate_env_content(
     whatsapp_access_token: str = "",
     brave_api_key: str = "",
     elevenlabs_api_key: str = "",
+    toup_token: str = "",
+    db_mode: str = "auto",
+    supabase_url: str = "",
 ) -> str:
     """Generate .env file content for the agent service."""
     lines = [
@@ -707,13 +918,24 @@ def generate_env_content(
         "RUN_MODE=agent",
         "",
         "# --- Database ---",
-        f"DATABASE_URL={settings.database_url}",
+    ]
+    if db_mode == "own_supabase" and supabase_url:
+        lines.append(f"DATABASE_URL={supabase_url}")
+    elif db_mode == "local_postgres":
+        lines.append("DATABASE_URL=postgresql+asyncpg://toup:toup@localhost:5432/toup_brain")
+    else:
+        lines.append(f"DATABASE_URL={settings.database_url}")
+    lines += [
         "",
         "# --- Platform ---",
         f"PLATFORM_API_URL={settings.platform_api_url}",
         f"USER_ID={user_id}",
         f"AGENT_API_KEY={agent_api_key}",
-        "",
+    ]
+    if toup_token:
+        lines.append(f"TOUP_TOKEN={toup_token}")
+    lines.append("")
+    lines += [
         "# --- Auth (must match platform for JWT validation) ---",
         f"JWT_SECRET={settings.jwt_secret}",
         "",

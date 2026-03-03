@@ -4,11 +4,14 @@ Model Auto-Router — Heuristic-based model selection for cost optimization.
 Classifies each user request by complexity/intent and routes to the
 cheapest model that can handle it well.
 
-Tiers:
-  - light:   Simple greetings, short Q&A, chit-chat, single-fact lookups  → Claude Sonnet 4.5
-  - medium:  Multi-step tasks, summarization, moderate reasoning, tool use  → Claude Opus 4.6
+Tiers (cost-optimized):
+  - light:   Simple greetings, short Q&A, chit-chat, single-fact lookups  → gpt-4o-mini (cheapest)
+  - medium:  Multi-step tasks, summarization, moderate reasoning, tool use  → configured agent_model (GPT)
   - heavy:   Complex coding, multi-file edits, deep analysis, planning,
              long-form generation, math proofs, multi-tool orchestration   → Claude Opus 4.6
+
+Voice/real-time stays on OpenAI always (handled by ws_realtime.py).
+Only truly complex text tasks escalate to Claude Opus for best quality.
 
 The router uses fast heuristics (no LLM call) to classify in <1ms.
 """
@@ -40,30 +43,32 @@ class ModelTier:
     cost_per_1k_output: float = 0.0
 
 
-# Default tier configs (can be overridden via settings)
-DEFAULT_TIERS: Dict[str, ModelTier] = {
-    "light": ModelTier(
-        name="light",
-        model="claude-sonnet-4-5",
-        label="Claude Sonnet 4.5",
-        cost_per_1k_input=0.003,
-        cost_per_1k_output=0.015,
-    ),
-    "medium": ModelTier(
-        name="medium",
-        model="claude-opus-4-6",
-        label="Claude Opus 4.6",
-        cost_per_1k_input=0.015,
-        cost_per_1k_output=0.075,
-    ),
-    "heavy": ModelTier(
-        name="heavy",
-        model="claude-opus-4-6",
-        label="Claude Opus 4.6",
-        cost_per_1k_input=0.015,
-        cost_per_1k_output=0.075,
-    ),
-}
+# Default tier configs — cost-optimized: GPT for light/medium, Claude only for heavy
+def _get_tiers() -> Dict[str, ModelTier]:
+    """Build tiers dynamically so medium tier always reflects current agent_model."""
+    return {
+        "light": ModelTier(
+            name="light",
+            model="gpt-4o-mini",
+            label="GPT-4o Mini",
+            cost_per_1k_input=0.00015,
+            cost_per_1k_output=0.0006,
+        ),
+        "medium": ModelTier(
+            name="medium",
+            model=settings.agent_model,  # e.g. gpt-5.2
+            label=settings.agent_model,
+            cost_per_1k_input=0.003,
+            cost_per_1k_output=0.015,
+        ),
+        "heavy": ModelTier(
+            name="heavy",
+            model="claude-opus-4-6",
+            label="Claude Opus 4.6",
+            cost_per_1k_input=0.015,
+            cost_per_1k_output=0.075,
+        ),
+    }
 
 
 # ── Complexity Signals ───────────────────────────────────────────────
@@ -144,13 +149,14 @@ def classify_request(
     Scoring approach:
       - Start with a base score of 0
       - Add/subtract based on message characteristics
-      - Map final score to tier: <30 = light, 30-65 = medium, >65 = heavy
+      - Map final score to tier: <20 = light, 20-70 = medium, >70 = heavy
     """
     if not user_message.strip():
+        light = _get_tiers()["light"]
         return RoutingDecision(
             tier="light",
-            model=DEFAULT_TIERS["light"].model,
-            label=DEFAULT_TIERS["light"].label,
+            model=light.model,
+            label=light.label,
             confidence=0.95,
             reason="Empty message",
         )
@@ -162,7 +168,6 @@ def classify_request(
 
     # ── 1. Length signal ──────────────────────────────────────────
     word_count = len(text.split())
-    char_count = len(text)
 
     if word_count <= 5:
         signals["length"] = -10
@@ -248,17 +253,21 @@ def classify_request(
     score = sum(signals.values())
 
     # ── Map to tier ───────────────────────────────────────────────
-    if score < 15:
+    # Cost-optimized thresholds:
+    #   light (<20):  simple stuff → gpt-4o-mini (very cheap)
+    #   medium (20-70): moderate tasks → configured GPT model
+    #   heavy (>70):  truly complex → Claude Opus 4.6 (expensive, worth it)
+    if score < 20:
         tier_name = "light"
-        confidence = min(0.95, 0.7 + (15 - score) / 100)
-    elif score < 50:
+        confidence = min(0.95, 0.7 + (20 - score) / 100)
+    elif score < 70:
         tier_name = "medium"
-        confidence = min(0.9, 0.6 + abs(score - 32.5) / 100)
+        confidence = min(0.9, 0.6 + abs(score - 45) / 100)
     else:
         tier_name = "heavy"
-        confidence = min(0.95, 0.7 + (score - 50) / 100)
+        confidence = min(0.95, 0.7 + (score - 70) / 100)
 
-    tier = DEFAULT_TIERS[tier_name]
+    tier = _get_tiers()[tier_name]
 
     # If the selected tier uses a Claude model but no Anthropic key is set,
     # fall back to the configured agent_model (OpenAI)

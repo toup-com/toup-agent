@@ -144,6 +144,16 @@ class AgentTunnelClient:
                         # Execute tool in background (don't block the message loop)
                         asyncio.create_task(self._handle_tool_call(ws, msg))
 
+                    elif msg_type == "restart":
+                        logger.info("[TUNNEL-CLIENT] Restart command received — restarting agent...")
+                        print("🔄 Settings changed on toup.ai — restarting agent...")
+                        try:
+                            await ws.send(json.dumps({"type": "status", "status": "restarting"}))
+                        except Exception:
+                            pass
+                        import os
+                        os._exit(0)  # Service manager auto-restarts
+
                     elif msg_type == "error":
                         logger.error("[TUNNEL-CLIENT] Platform error: %s", msg.get("message"))
             finally:

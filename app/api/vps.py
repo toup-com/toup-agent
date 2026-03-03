@@ -20,7 +20,9 @@ from app.api.auth import get_current_user
 from app.config import settings
 from app.db import get_db, VPSPlan, VPSInstance
 from app.services.stripe_service import create_checkout_session, verify_webhook
-from app.services.aws_service import provision_instance
+from app.services.aws_service import provision_instance as aws_provision_instance
+from app.services.hostinger_service import provision_instance as hostinger_provision_instance
+from app.services.hetzner_service import provision_instance as hetzner_provision_instance
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ class VPSPlanOut(BaseModel):
     storage_gb: int
     price_cents: int
     price_display: str  # e.g. "$10/mo"
+    provider: str = "aws"  # "aws" | "hostinger"
 
     class Config:
         from_attributes = True
@@ -55,6 +58,7 @@ class VPSStatusResponse(BaseModel):
     status: str  # pending | provisioning | active | error | terminated | none
     plan_id: str | None = None
     plan_name: str | None = None
+    provider: str | None = None  # "aws" | "hostinger"
     public_ip: str | None = None
     public_dns: str | None = None
     ssh_password: str | None = None  # Only returned when status first becomes active
@@ -87,6 +91,7 @@ async def list_plans(db: AsyncSession = Depends(get_db)):
             storage_gb=p.storage_gb,
             price_cents=p.price_cents,
             price_display=f"${p.price_cents // 100}/mo",
+            provider=p.provider or "aws",
         )
         for p in plans
     ]
@@ -129,13 +134,15 @@ async def create_vps_checkout(
 
     # Create pending VPSInstance (stripe_session_id filled after checkout creation)
     vps_id = str(uuid.uuid4())
+    provider = plan.provider or "aws"
     vps = VPSInstance(
         id=vps_id,
         user_id=current_user.id,
         plan_id=plan.id,
         status="pending",
-        aws_region=settings.aws_region,
-        ami_id=settings.aws_ami_id,
+        provider=provider,
+        aws_region=settings.aws_region if provider == "aws" else "",
+        ami_id=settings.aws_ami_id if provider == "aws" else "",
     )
     db.add(vps)
     await db.commit()
@@ -191,6 +198,7 @@ async def get_vps_status(
         status=vps.status,
         plan_id=vps.plan_id,
         plan_name=plan.name if plan else None,
+        provider=vps.provider or "aws",
         public_ip=vps.public_ip,
         public_dns=vps.public_dns,
         # Only expose SSH password once status is active
@@ -273,35 +281,58 @@ async def stripe_webhook(
         stripe_session_id = session_data.get("id")
         subscription_id = session_data.get("subscription")
         metadata = session_data.get("metadata", {})
+        user_id = metadata.get("user_id", "")
         vps_instance_id = metadata.get("vps_instance_id")
 
-        if not stripe_session_id or not vps_instance_id:
-            logger.warning("Webhook missing session_id or vps_instance_id: %s", metadata)
-            return {"received": True}
+        # ── 1. Handle VPS provisioning ─────────────────────────
+        if vps_instance_id and stripe_session_id:
+            result = await db.execute(
+                select(VPSInstance).where(VPSInstance.stripe_session_id == stripe_session_id)
+            )
+            vps_obj: VPSInstance | None = result.scalar_one_or_none()
 
-        # Look up VPSInstance
-        result = await db.execute(
-            select(VPSInstance).where(VPSInstance.stripe_session_id == stripe_session_id)
-        )
-        vps: VPSInstance | None = result.scalar_one_or_none()
+            if vps_obj and vps_obj.status == "pending":
+                vps_obj.status = "provisioning"
+                if subscription_id:
+                    vps_obj.stripe_subscription_id = subscription_id
+                await db.commit()
 
-        if not vps:
-            logger.warning("No VPSInstance found for stripe_session_id=%s", stripe_session_id)
-            return {"received": True}
+                from app.db.database import async_session_maker
+                provider = vps_obj.provider or "aws"
+                provisioners = {
+                    "aws": aws_provision_instance,
+                    "hostinger": hostinger_provision_instance,
+                    "hetzner": hetzner_provision_instance,
+                }
+                provisioner = provisioners.get(provider, aws_provision_instance)
+                background_tasks.add_task(provisioner, vps_obj.id, async_session_maker)
+                logger.info("Provisioning queued for VPS %s (provider=%s, user=%s)", vps_obj.id, provider, vps_obj.user_id)
 
-        if vps.status != "pending":
-            # Already processing or done
-            return {"received": True}
+        # ── 2. Handle LLM Bundle activation ────────────────────
+        if metadata.get("llm_bundle") == "true" and user_id:
+            from app.db import AgentConfig
+            cfg_result = await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == user_id)
+            )
+            agent_config = cfg_result.scalar_one_or_none()
+            if agent_config:
+                agent_config.bundle_status = "active"
+                agent_config.bundle_stripe_subscription_id = subscription_id or ""
+                agent_config.bundle_started_at = datetime.utcnow()
+                agent_config.llm_mode = "bundle"
+                await db.commit()
+                logger.info("LLM Bundle activated for user %s", user_id)
 
-        # Mark as provisioning and kick off background task
-        vps.status = "provisioning"
-        if subscription_id:
-            vps.stripe_subscription_id = subscription_id
-        await db.commit()
-
-        from app.db.database import async_session_maker
-        background_tasks.add_task(provision_instance, vps.id, async_session_maker)
-
-        logger.info("Provisioning queued for VPS %s (user %s)", vps.id, vps.user_id)
+        # ── 3. Handle Managed Supabase activation ──────────────
+        if metadata.get("managed_supabase") == "true" and user_id:
+            from app.db import AgentConfig
+            cfg_result = await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == user_id)
+            )
+            agent_config = cfg_result.scalar_one_or_none()
+            if agent_config:
+                agent_config.db_mode = "managed"
+                await db.commit()
+                logger.info("Managed Supabase activated for user %s", user_id)
 
     return {"received": True}

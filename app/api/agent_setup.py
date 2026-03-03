@@ -48,6 +48,8 @@ class AgentConfigOut(BaseModel):
     # SSH creds never returned — only whether they're set
     has_ssh_password: bool = False
     has_ssh_key: bool = False
+    # Agent identity
+    agent_name: str | None = None
     # LLM
     llm_mode: str = "manual"
     openai_api_key_set: bool = False
@@ -85,6 +87,9 @@ class AgentConfigOut(BaseModel):
     # Connect token (for terminal agent tunnel)
     has_connect_token: bool = False
     connect_token: str | None = None
+    # Database mode
+    db_mode: str = "auto"
+    supabase_url_set: bool = False
 
     class Config:
         from_attributes = True
@@ -97,6 +102,7 @@ class AgentConfigUpdate(BaseModel):
     ssh_user: str | None = None
     ssh_password: str | None = None
     ssh_key: str | None = None
+    agent_name: str | None = None
     llm_mode: str | None = None
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
@@ -117,6 +123,8 @@ class AgentConfigUpdate(BaseModel):
     setup_step: int | None = None
     setup_completed: bool | None = None
     disabled_tools: list[str] | None = None
+    db_mode: str | None = None
+    supabase_url: str | None = None
 
 
 class SSHTestRequest(BaseModel):
@@ -162,6 +170,7 @@ def _config_to_out(config: AgentConfig, vps: VPSInstance | None = None) -> Agent
         ssh_user=config.ssh_user,
         has_ssh_password=bool(config.ssh_password),
         has_ssh_key=bool(config.ssh_key),
+        agent_name=getattr(config, 'agent_name', None),
         llm_mode=config.llm_mode or "manual",
         openai_api_key_set=bool(config.openai_api_key),
         anthropic_api_key_set=bool(config.anthropic_api_key),
@@ -193,6 +202,8 @@ def _config_to_out(config: AgentConfig, vps: VPSInstance | None = None) -> Agent
         disabled_tools=json.loads(config.disabled_tools) if getattr(config, 'disabled_tools', None) else [],
         has_connect_token=bool(getattr(config, 'connect_token', None)),
         connect_token=getattr(config, 'connect_token', None),
+        db_mode=getattr(config, 'db_mode', None) or "auto",
+        supabase_url_set=bool(getattr(config, 'supabase_url', None)),
     )
     if vps:
         out.vps_ip = vps.public_ip
@@ -224,6 +235,9 @@ def _build_env(config: AgentConfig, user_id: str) -> str:
         whatsapp_access_token=config.whatsapp_access_token or "",
         brave_api_key=config.brave_api_key or "",
         elevenlabs_api_key=config.elevenlabs_api_key or "",
+        toup_token=getattr(config, 'connect_token', '') or "",
+        db_mode=getattr(config, 'db_mode', 'auto') or "auto",
+        supabase_url=getattr(config, 'supabase_url', '') or "",
     )
 
 
@@ -273,6 +287,15 @@ async def update_config(
     config.updated_at = datetime.utcnow()
     await db.commit()
     await db.refresh(config)
+
+    # Signal terminal agent to restart and pick up new config
+    try:
+        from app.api.ws_agent_tunnel import send_restart
+        restarted = await send_restart(str(current_user.id))
+        if restarted:
+            logger.info("[AGENT-SETUP] Sent restart to terminal agent for %s", str(current_user.id)[:8])
+    except Exception as e:
+        logger.warning("[AGENT-SETUP] Failed to send restart: %s", e)
 
     # Fetch VPS info
     vps_result = await db.execute(
@@ -366,14 +389,35 @@ async def trigger_deploy(
     config = await _get_or_create_config(current_user.id, db)
 
     if config.deploy_status == "deploying":
-        raise HTTPException(status_code=409, detail="Deployment already in progress")
+        # Check if there's actually a live deploy process in memory
+        log_state = _deploy_logs.get(current_user.id)
+        has_active_deploy = log_state and not log_state.get("done", False)
 
-    if not config.openai_api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key is required")
+        if has_active_deploy:
+            # Real deploy running — only allow override if stale (>15 min)
+            if config.updated_at and (datetime.utcnow() - config.updated_at).total_seconds() > 15 * 60:
+                config.deploy_status = "error"
+                config.deploy_log = (config.deploy_log or "") + "\n[System] Previous deployment timed out. Resetting."
+                await db.commit()
+            else:
+                raise HTTPException(status_code=409, detail="Deployment already in progress")
+        else:
+            # No in-memory deploy (server restarted or process finished) — auto-reset
+            config.deploy_status = "error"
+            config.deploy_log = (config.deploy_log or "") + "\n[System] Previous deployment was interrupted. Resetting."
+            await db.commit()
+
+    # Require at least one LLM source: own API key OR bundle mode
+    if config.llm_mode != "bundle" and not config.openai_api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key is required (or select LLM Bundle)")
 
     # Generate API key if not set
     if not config.agent_api_key:
         config.agent_api_key = f"toup_ak_{secrets.token_urlsafe(32)}"
+
+    # Auto-generate connect token for platform tunnel
+    if not config.connect_token:
+        config.connect_token = f"toup_ct_{secrets.token_urlsafe(32)}"
 
     # Determine SSH credentials
     ssh_host = config.ssh_host
@@ -422,6 +466,7 @@ async def trigger_deploy(
         ssh_password=ssh_password,
         ssh_key=ssh_key,
         env_content=env_content,
+        db_mode=getattr(config, 'db_mode', 'auto') or 'auto',
         agent_url=f"http://{ssh_host}:8001",
         db_factory=async_session_maker,
     )
@@ -437,6 +482,7 @@ async def _run_deploy(
     ssh_password: str | None,
     ssh_key: str | None,
     env_content: str,
+    db_mode: str,
     agent_url: str,
     db_factory,
 ):
@@ -450,7 +496,7 @@ async def _run_deploy(
         from app.services.ssh_deploy_service import deploy_agent
         success = await deploy_agent(
             ssh_host, ssh_port, ssh_user, ssh_password, ssh_key,
-            env_content, on_log,
+            env_content, on_log, db_mode=db_mode,
         )
     except Exception as e:
         logger.exception("Deploy background task failed: %s", e)
@@ -607,7 +653,7 @@ async def agent_register(
     config.agent_url = body.agent_url
     config.deploy_status = "active"
     config.setup_completed = True
-    config.setup_step = 5
+    config.setup_step = 6
     config.updated_at = datetime.utcnow()
     await db.commit()
 
@@ -618,3 +664,39 @@ async def agent_register(
 def get_deploy_logs(user_id: str) -> dict | None:
     """Get deploy log state for WebSocket streaming."""
     return _deploy_logs.get(user_id)
+
+
+@router.get("/install/{connect_token}")
+async def get_install_script(
+    connect_token: str,
+    platform: str = "bash",
+    db: AsyncSession = Depends(get_db),
+):
+    """Public endpoint: serve setup script for curl piping.
+
+    Authenticated via connect_token in the URL (no JWT required).
+    Usage: curl -sL https://toup.ai/api/agent-setup/install/<token> | bash
+    """
+    result = await db.execute(
+        select(AgentConfig).where(AgentConfig.connect_token == connect_token)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    # Auto-generate agent_api_key if missing
+    if not config.agent_api_key:
+        config.agent_api_key = f"toup_ak_{secrets.token_urlsafe(32)}"
+        await db.commit()
+
+    env_content = _build_env(config, config.user_id)
+
+    if platform == "windows":
+        from app.services.ssh_deploy_service import generate_setup_script_windows
+        script = generate_setup_script_windows(env_content)
+    else:
+        from app.services.ssh_deploy_service import generate_setup_script
+        script = generate_setup_script(env_content)
+
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(script, media_type="text/plain")
