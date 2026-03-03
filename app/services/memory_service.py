@@ -237,8 +237,9 @@ def extract_temporal_filters(query: str) -> dict:
 class MemoryService:
     """Service for memory CRUD operations and search"""
     
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, api_key: Optional[str] = None):
         self.db = db
+        self.api_key = api_key
         self.embedding_service = get_embedding_service()
     
     async def create_memory(
@@ -262,7 +263,7 @@ class MemoryService:
             Memory: The created or reinforced memory
         """
         # Generate embedding
-        embedding = self.embedding_service.embed(memory_data.content)
+        embedding = self.embedding_service.embed(memory_data.content, api_key=self.api_key)
         
         # Deduplication: Check for similar existing memories
         if deduplicate:
@@ -537,7 +538,7 @@ class MemoryService:
         
         # Generate new embedding if not provided
         if new_embedding is None:
-            new_embedding = self.embedding_service.embed(new_content)
+            new_embedding = self.embedding_service.embed(new_content, api_key=self.api_key)
         
         # Update memory
         memory.content = new_content
@@ -796,7 +797,7 @@ class MemoryService:
         # Update content and regenerate embedding if content changed
         if "content" in update_dict:
             old_values["content"] = memory.content[:100]  # Truncate for audit
-            embedding = self.embedding_service.embed(update_dict["content"])
+            embedding = self.embedding_service.embed(update_dict["content"], api_key=self.api_key)
             memory.embedding_json = json.dumps(embedding)  # Backward compat
             if hasattr(memory, 'embedding'):
                 memory.embedding = embedding  # Native pgvector
@@ -893,8 +894,8 @@ class MemoryService:
         start_time = time.time()
         
         # Generate query embedding
-        query_embedding = self.embedding_service.embed(request.query)
-        
+        query_embedding = self.embedding_service.embed(request.query, api_key=self.api_key)
+
         # Build base query with filters - only search active, non-deleted memories
         query = select(Memory).where(
             and_(
@@ -1305,7 +1306,7 @@ class MemoryService:
         min_similarity: float = 0.7
     ) -> List[Tuple[Memory, float]]:
         """Find memories similar to given content. Uses pgvector when available."""
-        embedding = self.embedding_service.embed(content)
+        embedding = self.embedding_service.embed(content, api_key=self.api_key)
         
         # Try pgvector-accelerated search
         if hasattr(Memory, 'embedding') and Memory.embedding is not None:
@@ -1432,7 +1433,7 @@ class MemoryService:
             mem.last_accessed_at = datetime.utcnow()
             mem.confidence = max(mem.confidence, confidence)
         else:
-            embedding = self.embedding_service.embed(relationship_content)
+            embedding = self.embedding_service.embed(relationship_content, api_key=self.api_key)
             
             rel_memory = Memory(
                 id=str(uuid.uuid4()),
@@ -1814,8 +1815,8 @@ class MemoryService:
                 temporal_before = temporal["created_before"]
         
         # Generate query embedding once (shared by vector strategy)
-        query_embedding = self.embedding_service.embed(query)
-        
+        query_embedding = self.embedding_service.embed(query, api_key=self.api_key)
+
         # Run enabled strategies in parallel
         tasks = {}
         fetch_limit = limit * 4  # Over-fetch per strategy for re-ranker input

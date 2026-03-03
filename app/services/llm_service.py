@@ -50,8 +50,8 @@ class LLMService:
     - Model configuration
     """
     
-    def __init__(self):
-        self.client = AsyncOpenAI(api_key=settings.openai_api_key)
+    def __init__(self, api_key: Optional[str] = None):
+        self.client = AsyncOpenAI(api_key=api_key or settings.openai_api_key)
         self.default_model = settings.default_model
         self.default_temperature = settings.temperature
         self.default_max_tokens = settings.max_tokens

@@ -519,17 +519,18 @@ class MemoryExtractor:
         user_message: str,
         assistant_response: str,
         brain_type: str = "user",
-        max_memories: int = 15
+        max_memories: int = 15,
+        api_key: Optional[str] = None,
     ) -> List[ExtractedMemory]:
         """
         Extract memories using LLM for more sophisticated understanding.
         Phase 4: Uses schema-enforced entity extraction with typed attributes.
         Falls back to rule-based extraction on failure.
         """
-        from app.services.llm_service import get_llm_service
+        from app.services.llm_service import get_llm_service, LLMService
         from app.services.extraction_schemas import generate_entity_schemas_prompt
-        
-        llm = get_llm_service()
+
+        llm = LLMService(api_key=api_key) if api_key else get_llm_service()
         
         entity_schemas_doc = generate_entity_schemas_prompt()
         

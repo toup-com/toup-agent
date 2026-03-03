@@ -40,11 +40,16 @@ class MemoryDedupService:
     - Using LLM to intelligently combine information
     """
     
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, api_key: Optional[str] = None):
         self.db = db
-        self.memory_service = MemoryService(db)
+        self.api_key = api_key
+        self.memory_service = MemoryService(db, api_key=api_key)
         self.embedding_service = get_embedding_service()
-        self.llm_service = get_llm_service()
+        if api_key:
+            from app.services.llm_service import LLMService
+            self.llm_service = LLMService(api_key=api_key)
+        else:
+            self.llm_service = get_llm_service()
     
     async def smart_create_memory(
         self,
@@ -72,7 +77,7 @@ class MemoryDedupService:
             - "reinforced": Same info, just strengthened existing
         """
         # Step 1: Generate embedding for new content
-        new_embedding = self.embedding_service.embed(new_memory.content)
+        new_embedding = self.embedding_service.embed(new_memory.content, api_key=self.api_key)
         
         # Handle brain_type - can be enum or string
         brain_type_value = (
