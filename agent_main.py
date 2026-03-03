@@ -24,6 +24,7 @@ from app.db import init_db
 # ── Agent routers (invoke AgentRunner) ───────────────────────────────
 from app.api import agent_router
 from app.api.stats import router as stats_router
+from app.api.sessions import router as sessions_router
 from app.api.chat import router as chat_router
 from app.api.ws_chat import router as ws_chat_router, set_ws_refs
 from app.api.api_v1 import router as api_v1_router
@@ -474,6 +475,7 @@ app.add_middleware(AgentAPIKeyMiddleware)
 # ── Register agent routers ───────────────────────────────────────────
 app.include_router(agent_router, prefix=settings.api_prefix)
 app.include_router(stats_router, prefix=settings.api_prefix)
+app.include_router(sessions_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
 app.include_router(ws_chat_router, prefix=settings.api_prefix)
 app.include_router(api_v1_router, prefix=settings.api_prefix)
