@@ -104,25 +104,31 @@ async def init_db():
         "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
         "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS hostinger_vm_id VARCHAR(50)",
         "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS hetzner_vm_id VARCHAR(50)",
+        # Target OS for remote deploy (linux/macos/windows)
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS target_os VARCHAR(20)",
     ]
-    # Seed user-facing VPS plans — Hetzner Cloud (verified)
-    # Hetzner CX shared vCPU: much better specs than AWS at same price
+    # Seed user-facing VPS plans — Hetzner Cloud CPX (AMD, Shared Regular Performance)
+    # Location: ASH (Ashburn, Virginia, USA)
+    # NOTE: CPX11 (2GB RAM) too small for local embeddings + PostgreSQL + Python
     _seed_statements = [
-        # Starter: Hetzner CX22 — 2 vCPU, 4GB RAM, 80GB SSD (~$7.49 cost, $9 price)
+        # Starter: CPX21 — 3 vCPU, 4GB RAM, 80GB SSD ($10.59 cost, $15 price)
+        # For: 1-5 users, light usage, 1 embedding model (lazy-loaded)
         """INSERT INTO vps_plans (id, name, instance_type, vcpu, ram_gb, storage_gb, price_cents, stripe_price_id, provider, hetzner_server_type)
-           VALUES ('starter', 'Starter', 'cx22', 2, 4, 80, 900, '', 'hetzner', 'cx22')
-           ON CONFLICT (id) DO UPDATE SET provider='hetzner', instance_type='cx22',
-             hetzner_server_type='cx22', vcpu=2, ram_gb=4, storage_gb=80, price_cents=900""",
-        # Standard: Hetzner CX32 — 4 vCPU, 8GB RAM, 160GB SSD (~$11.49 cost, $19 price)
+           VALUES ('starter', 'Starter', 'cpx21', 3, 4, 80, 1500, '', 'hetzner', 'cpx21')
+           ON CONFLICT (id) DO UPDATE SET provider='hetzner', instance_type='cpx21',
+             hetzner_server_type='cpx21', vcpu=3, ram_gb=4, storage_gb=80, price_cents=1500, name='Starter'""",
+        # Standard: CPX31 — 4 vCPU, 8GB RAM, 160GB SSD ($18.59 cost, $25 price)
+        # For: 5-20 users, recommended tier, embedding model always loaded
         """INSERT INTO vps_plans (id, name, instance_type, vcpu, ram_gb, storage_gb, price_cents, stripe_price_id, provider, hetzner_server_type)
-           VALUES ('standard', 'Standard', 'cx32', 4, 8, 160, 1900, '', 'hetzner', 'cx32')
-           ON CONFLICT (id) DO UPDATE SET provider='hetzner', instance_type='cx32',
-             hetzner_server_type='cx32', vcpu=4, ram_gb=8, storage_gb=160, price_cents=1900""",
-        # Pro: Hetzner CX42 — 8 vCPU, 16GB RAM, 320GB SSD (~$20.49 cost, $39 price)
+           VALUES ('standard', 'Standard', 'cpx31', 4, 8, 160, 2500, '', 'hetzner', 'cpx31')
+           ON CONFLICT (id) DO UPDATE SET provider='hetzner', instance_type='cpx31',
+             hetzner_server_type='cpx31', vcpu=4, ram_gb=8, storage_gb=160, price_cents=2500, name='Standard'""",
+        # Pro: CPX41 — 8 vCPU, 16GB RAM, 240GB SSD ($34.09 cost, $45 price)
+        # For: 20-50+ users, power use, multiple models, large vector DBs
         """INSERT INTO vps_plans (id, name, instance_type, vcpu, ram_gb, storage_gb, price_cents, stripe_price_id, provider, hetzner_server_type)
-           VALUES ('pro', 'Pro', 'cx42', 8, 16, 320, 3900, '', 'hetzner', 'cx42')
-           ON CONFLICT (id) DO UPDATE SET provider='hetzner', instance_type='cx42',
-             hetzner_server_type='cx42', vcpu=8, ram_gb=16, storage_gb=320, price_cents=3900""",
+           VALUES ('pro', 'Pro', 'cpx41', 8, 16, 240, 4500, '', 'hetzner', 'cpx41')
+           ON CONFLICT (id) DO UPDATE SET provider='hetzner', instance_type='cpx41',
+             hetzner_server_type='cpx41', vcpu=8, ram_gb=16, storage_gb=240, price_cents=4500, name='Pro'""",
         # Remove ALL plans except the 3 user-facing tiers
         "DELETE FROM vps_plans WHERE id NOT IN ('starter', 'standard', 'pro')",
     ]

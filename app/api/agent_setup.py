@@ -44,7 +44,8 @@ class AgentConfigOut(BaseModel):
     hosting_mode: str = "self-hosted"
     ssh_host: str | None = None
     ssh_port: int = 22
-    ssh_user: str | None = "ubuntu"
+    ssh_user: str | None = None
+    target_os: str | None = None  # "linux" | "macos" | "windows"
     # SSH creds never returned — only whether they're set
     has_ssh_password: bool = False
     has_ssh_key: bool = False
@@ -103,6 +104,7 @@ class AgentConfigUpdate(BaseModel):
     ssh_user: str | None = None
     ssh_password: str | None = None
     ssh_key: str | None = None
+    target_os: str | None = None
     agent_name: str | None = None
     llm_mode: str | None = None
     openai_api_key: str | None = None
@@ -169,6 +171,7 @@ def _config_to_out(config: AgentConfig, vps: VPSInstance | None = None) -> Agent
         ssh_host=config.ssh_host,
         ssh_port=config.ssh_port,
         ssh_user=config.ssh_user,
+        target_os=getattr(config, 'target_os', None),
         has_ssh_password=bool(config.ssh_password),
         has_ssh_key=bool(config.ssh_key),
         agent_name=getattr(config, 'agent_name', None),
@@ -355,7 +358,7 @@ async def test_ssh(
     # Determine SSH credentials
     ssh_host = body.ssh_host or config.ssh_host
     ssh_port = body.ssh_port or config.ssh_port or 22
-    ssh_user = body.ssh_user or config.ssh_user or "ubuntu"
+    ssh_user = body.ssh_user or config.ssh_user or "root"
     ssh_password = body.ssh_password or config.ssh_password
     ssh_key = body.ssh_key or config.ssh_key
 
@@ -378,6 +381,17 @@ async def test_ssh(
 
     from app.services.ssh_deploy_service import test_ssh_connection
     result = await test_ssh_connection(ssh_host, ssh_port, ssh_user, ssh_password, ssh_key)
+
+    # Enrich with os_type classification
+    if result.get("connected") and result.get("os"):
+        os_str = result["os"].lower()
+        if "darwin" in os_str or "macos" in os_str or "mac os" in os_str:
+            result["os_type"] = "macos"
+        elif "windows" in os_str:
+            result["os_type"] = "windows"
+        else:
+            result["os_type"] = "linux"
+
     return result
 
 
@@ -469,6 +483,7 @@ async def trigger_deploy(
         ssh_key=ssh_key,
         env_content=env_content,
         db_mode=getattr(config, 'db_mode', 'auto') or 'auto',
+        target_os=getattr(config, 'target_os', 'linux') or 'linux',
         agent_url=f"http://{ssh_host}:8001",
         db_factory=async_session_maker,
     )
@@ -485,6 +500,7 @@ async def _run_deploy(
     ssh_key: str | None,
     env_content: str,
     db_mode: str,
+    target_os: str,
     agent_url: str,
     db_factory,
 ):
@@ -498,7 +514,7 @@ async def _run_deploy(
         from app.services.ssh_deploy_service import deploy_agent
         success = await deploy_agent(
             ssh_host, ssh_port, ssh_user, ssh_password, ssh_key,
-            env_content, on_log, db_mode=db_mode,
+            env_content, on_log, db_mode=db_mode, target_os=target_os,
         )
     except Exception as e:
         logger.exception("Deploy background task failed: %s", e)

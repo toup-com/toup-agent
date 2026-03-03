@@ -983,9 +983,10 @@ class AgentConfig(Base):
     hosting_mode: Mapped[str] = mapped_column(String(20), default="self-hosted")  # "vps" | "self-hosted"
     ssh_host: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     ssh_port: Mapped[int] = mapped_column(Integer, default=22)
-    ssh_user: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, default="ubuntu")
+    ssh_user: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, default=None)
     ssh_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     ssh_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # PEM key content
+    target_os: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # "linux" | "macos" | "windows"
 
     # Step 2: LLM
     llm_mode: Mapped[str] = mapped_column(String(20), default="manual")  # "manual" | "bundle"

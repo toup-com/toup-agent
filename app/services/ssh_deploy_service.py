@@ -120,6 +120,7 @@ async def deploy_agent(
     env_content: str,
     on_log: Callable[[str, str], Awaitable[None]],
     db_mode: str = "auto",
+    target_os: str = "linux",
 ) -> bool:
     """
     Deploy the Toup Agent to a remote machine via Lambda SSH proxy.
@@ -138,14 +139,15 @@ async def deploy_agent(
         on_log: Async callback (line, level) for real-time log streaming.
                 Levels: "info", "success", "error", "cmd", "step"
         db_mode: Database mode ("auto", "local_postgres", "own_supabase")
+        target_os: Target OS ("linux", "macos", "windows")
 
     Returns:
         True if deployment succeeded, False otherwise
     """
-    await on_log("Connecting via SSH proxy...", "step")
+    await on_log(f"Connecting via SSH proxy (target: {target_os})...", "step")
 
     # Build the deploy script that will run on the remote machine
-    deploy_script = _build_deploy_script(env_content, db_mode=db_mode)
+    deploy_script = _build_deploy_script(env_content, db_mode=db_mode, target_os=target_os)
 
     ssh_creds = {
         "ssh_host": ssh_host,
@@ -282,8 +284,15 @@ async def deploy_agent(
         return False
 
 
-def _build_deploy_script(env_content: str, db_mode: str = "auto") -> str:
+def _build_deploy_script(env_content: str, db_mode: str = "auto", target_os: str = "linux") -> str:
     """Build the bash script that runs on the remote machine to install the agent."""
+    if target_os == "macos":
+        return _build_deploy_script_macos(env_content, db_mode)
+    return _build_deploy_script_linux(env_content, db_mode)
+
+
+def _build_deploy_script_linux(env_content: str, db_mode: str = "auto") -> str:
+    """Build Linux deploy script with distro-aware package management."""
 
     # PostgreSQL + pgvector installation section (only for local_postgres mode)
     pg_section = ""
@@ -291,22 +300,31 @@ def _build_deploy_script(env_content: str, db_mode: str = "auto") -> str:
         pg_section = """
 # ── Install PostgreSQL + pgvector ────────────────────────────
 echo "[STEP] Installing PostgreSQL + pgvector..."
-export DEBIAN_FRONTEND=noninteractive
 
-# Wait for any existing apt locks to clear
-for i in $(seq 1 10); do
-    if ! flock -n /var/lib/dpkg/lock-frontend true 2>/dev/null; then
-        echo "Waiting for apt lock to clear... ($i/10)"
-        sleep 3
-    else
-        break
-    fi
-done
+if [ "$PKG_MGR" = "apt" ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    for i in $(seq 1 10); do
+        if ! flock -n /var/lib/dpkg/lock-frontend true 2>/dev/null; then
+            echo "Waiting for apt lock to clear... ($i/10)"
+            sleep 3
+        else
+            break
+        fi
+    done
+fi
 
 if ! command -v psql &>/dev/null; then
     echo "Installing PostgreSQL..."
-    apt-get update -qq 2>&1
-    apt-get install -y postgresql postgresql-contrib curl ca-certificates 2>&1
+    if [ "$PKG_MGR" = "apt" ]; then
+        apt-get update -qq 2>&1
+        apt-get install -y postgresql postgresql-contrib curl ca-certificates 2>&1
+    elif [ "$PKG_MGR" = "dnf" ]; then
+        dnf install -y postgresql-server postgresql-contrib curl ca-certificates 2>&1
+        postgresql-setup --initdb 2>/dev/null || true
+    elif [ "$PKG_MGR" = "yum" ]; then
+        yum install -y postgresql-server postgresql-contrib curl ca-certificates 2>&1
+        postgresql-setup initdb 2>/dev/null || true
+    fi
     systemctl start postgresql
     systemctl enable postgresql
     echo "[OK] PostgreSQL installed: $(psql --version)"
@@ -322,16 +340,24 @@ PG_MAJOR=$(psql --version | grep -oP '\\d+' | head -1)
 if sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null; then
     echo "[OK] pgvector already available"
 else
-    # Try installing from apt package first
-    if apt-get install -y postgresql-${PG_MAJOR}-pgvector 2>/dev/null; then
-        echo "[OK] pgvector installed from package"
-    else
-        echo "Building pgvector from source..."
-        apt-get install -y postgresql-server-dev-all build-essential git 2>&1
-        cd /tmp && rm -rf pgvector && git clone https://github.com/pgvector/pgvector.git 2>&1
-        cd pgvector && make 2>&1 && make install 2>&1
-        cd / && rm -rf /tmp/pgvector
-        echo "[OK] pgvector built from source"
+    if [ "$PKG_MGR" = "apt" ]; then
+        apt-get install -y postgresql-${PG_MAJOR}-pgvector 2>/dev/null || {
+            echo "Building pgvector from source..."
+            apt-get install -y postgresql-server-dev-all build-essential git 2>&1
+            cd /tmp && rm -rf pgvector && git clone https://github.com/pgvector/pgvector.git 2>&1
+            cd pgvector && make 2>&1 && make install 2>&1
+            cd / && rm -rf /tmp/pgvector
+            echo "[OK] pgvector built from source"
+        }
+    elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
+        $PKG_MGR install -y pgvector_${PG_MAJOR} 2>/dev/null || {
+            echo "Building pgvector from source..."
+            $PKG_MGR install -y postgresql-devel gcc make git 2>&1
+            cd /tmp && rm -rf pgvector && git clone https://github.com/pgvector/pgvector.git 2>&1
+            cd pgvector && make 2>&1 && make install 2>&1
+            cd / && rm -rf /tmp/pgvector
+            echo "[OK] pgvector built from source"
+        }
     fi
 fi
 
@@ -354,22 +380,57 @@ for pid in $(pgrep -f toup_deploy.sh 2>/dev/null); do
     fi
 done
 
+# ── Detect package manager ──────────────────────────────
+if command -v apt-get &>/dev/null; then
+    PKG_MGR="apt"
+elif command -v dnf &>/dev/null; then
+    PKG_MGR="dnf"
+elif command -v yum &>/dev/null; then
+    PKG_MGR="yum"
+elif command -v pacman &>/dev/null; then
+    PKG_MGR="pacman"
+else
+    echo "[ERR] No supported package manager found (apt/dnf/yum/pacman)"
+    exit 1
+fi
+echo "[OK] Package manager: $PKG_MGR"
+
 echo "[STEP] Checking prerequisites..."
 
 # Install Python + Git + venv if missing
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq 2>&1
-if ! command -v python3 &>/dev/null; then
-    echo "[STEP] Installing Python 3..."
-    apt-get install -y python3 python3-venv python3-pip git curl 2>&1
-else
-    # Ensure python3-venv is installed (often missing on Ubuntu minimal)
-    apt-get install -y python3-venv 2>&1
+if [ "$PKG_MGR" = "apt" ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq 2>&1
+    if ! command -v python3 &>/dev/null; then
+        echo "[STEP] Installing Python 3..."
+        apt-get install -y python3 python3-venv python3-pip git curl 2>&1
+    else
+        apt-get install -y python3-venv 2>&1
+    fi
+elif [ "$PKG_MGR" = "dnf" ]; then
+    if ! command -v python3 &>/dev/null; then
+        echo "[STEP] Installing Python 3..."
+        dnf install -y python3 python3-pip git curl 2>&1
+    fi
+elif [ "$PKG_MGR" = "yum" ]; then
+    if ! command -v python3 &>/dev/null; then
+        echo "[STEP] Installing Python 3..."
+        yum install -y python3 python3-pip git curl 2>&1
+    fi
+elif [ "$PKG_MGR" = "pacman" ]; then
+    if ! command -v python3 &>/dev/null; then
+        echo "[STEP] Installing Python 3..."
+        pacman -Sy --noconfirm python python-pip git curl 2>&1
+    fi
 fi
 echo "[OK] Python: $(python3 --version 2>&1)"
 
 if ! command -v git &>/dev/null; then
-    apt-get install -y git 2>&1
+    if [ "$PKG_MGR" = "apt" ]; then apt-get install -y git 2>&1;
+    elif [ "$PKG_MGR" = "dnf" ]; then dnf install -y git 2>&1;
+    elif [ "$PKG_MGR" = "yum" ]; then yum install -y git 2>&1;
+    elif [ "$PKG_MGR" = "pacman" ]; then pacman -Sy --noconfirm git 2>&1;
+    fi
 fi
 echo "[OK] Git: $(git --version)"
 {pg_section}
@@ -433,10 +494,9 @@ for i in $(seq 1 6); do
     if curl -sf http://localhost:{AGENT_PORT}/agent/health > /dev/null 2>&1; then
         echo "[OK] Agent is running and healthy!"
 
-        # Register with platform (belt-and-suspenders — _run_deploy also sets agent_url)
+        # Register with platform
         AGENT_API_KEY=$(grep '^AGENT_API_KEY=' {AGENT_DIR}/.env 2>/dev/null | cut -d= -f2)
         PLATFORM_URL=$(grep '^PLATFORM_API_URL=' {AGENT_DIR}/.env 2>/dev/null | cut -d= -f2)
-        # Ensure /api suffix
         case "$PLATFORM_URL" in */api) ;; *) PLATFORM_URL="${{PLATFORM_URL%/}}/api" ;; esac
         PUBLIC_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{{print $1}}')
         if [ -n "$AGENT_API_KEY" ] && [ -n "$PLATFORM_URL" ] && [ -n "$PUBLIC_IP" ]; then
@@ -451,9 +511,174 @@ for i in $(seq 1 6); do
 done
 
 echo "[ERR] Agent did not respond to health check after 30s"
-# Show recent logs for debugging
 echo "Recent logs:"
 journalctl -u {SYSTEMD_UNIT} --no-pager -n 20 2>/dev/null || true
+exit 1
+"""
+
+
+LAUNCHD_PLIST = "com.toup.agent"
+
+
+def _build_deploy_script_macos(env_content: str, db_mode: str = "auto") -> str:
+    """Build macOS deploy script using Homebrew + launchd."""
+
+    pg_section = ""
+    if db_mode == "local_postgres":
+        pg_section = """
+# ── Install PostgreSQL + pgvector ────────────────────────────
+echo "[STEP] Installing PostgreSQL + pgvector..."
+if ! command -v psql &>/dev/null; then
+    brew install postgresql@16 pgvector 2>&1
+    brew services start postgresql@16
+else
+    echo "[OK] PostgreSQL already installed: $(psql --version)"
+    brew services start postgresql@16 2>/dev/null || brew services start postgresql 2>/dev/null || true
+fi
+
+# Create database and user
+createuser toup 2>/dev/null || true
+psql postgres -c "ALTER USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
+createdb -O toup toup_brain 2>/dev/null || true
+psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
+echo "[OK] Database toup_brain ready"
+"""
+
+    return f"""#!/bin/bash
+set -e
+
+AGENT_DIR="{AGENT_DIR}"
+
+# Kill any previous deploy scripts still running
+for pid in $(pgrep -f toup_deploy.sh 2>/dev/null); do
+    if [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ]; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+done
+
+echo "[STEP] Checking prerequisites..."
+
+# Check for Homebrew
+if ! command -v brew &>/dev/null; then
+    echo "[ERR] Homebrew is required on macOS but not installed."
+    echo "[ERR] Install it: /bin/bash -c \\\"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\\\""
+    exit 1
+fi
+echo "[OK] Homebrew found"
+
+# Install Python + Git if missing
+if ! command -v python3 &>/dev/null; then
+    echo "[STEP] Installing Python 3..."
+    brew install python3 2>&1
+fi
+echo "[OK] Python: $(python3 --version 2>&1)"
+
+if ! command -v git &>/dev/null; then
+    echo "[STEP] Installing Git..."
+    brew install git 2>&1
+fi
+echo "[OK] Git: $(git --version)"
+{pg_section}
+# Clone or update agent code
+echo "[STEP] Setting up agent code..."
+sudo mkdir -p "$AGENT_DIR" 2>/dev/null || mkdir -p "$AGENT_DIR"
+sudo chown $(whoami) "$AGENT_DIR" 2>/dev/null || true
+if [ -d "$AGENT_DIR/.git" ]; then
+    echo "Updating existing agent code..."
+    cd "$AGENT_DIR" && git pull --ff-only 2>&1 || true
+else
+    echo "Cloning agent repository..."
+    git clone {AGENT_REPO} "$AGENT_DIR" 2>&1
+fi
+echo "[OK] Agent code ready"
+
+# Create virtualenv
+echo "[STEP] Setting up Python environment..."
+if [ ! -d "$AGENT_DIR/venv/bin/python" ]; then
+    python3 -m venv "$AGENT_DIR/venv"
+fi
+echo "Installing dependencies (this may take a minute)..."
+"$AGENT_DIR/venv/bin/pip" install -q -r "$AGENT_DIR/requirements.txt" 2>&1
+echo "[OK] Dependencies installed"
+
+# Write .env
+echo "[STEP] Writing configuration..."
+cat > "$AGENT_DIR/.env" << 'TOUP_ENV_EOF'
+{env_content}
+TOUP_ENV_EOF
+echo "[OK] Configuration written"
+
+# Stop existing service
+echo "[STEP] Configuring launchd service..."
+launchctl unload "$HOME/Library/LaunchAgents/{LAUNCHD_PLIST}.plist" 2>/dev/null || true
+lsof -ti :{AGENT_PORT} 2>/dev/null | xargs kill -9 2>/dev/null || true
+
+# Create LaunchAgent plist
+mkdir -p "$HOME/Library/LaunchAgents"
+cat > "$HOME/Library/LaunchAgents/{LAUNCHD_PLIST}.plist" << TOUP_PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_PLIST}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$AGENT_DIR/venv/bin/uvicorn</string>
+        <string>agent_main:app</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>{AGENT_PORT}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$AGENT_DIR</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AGENT_DIR</key>
+        <string>$AGENT_DIR</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$AGENT_DIR/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>$AGENT_DIR/agent_err.log</string>
+</dict>
+</plist>
+TOUP_PLIST_EOF
+
+launchctl load "$HOME/Library/LaunchAgents/{LAUNCHD_PLIST}.plist"
+echo "[OK] Service started via launchd"
+
+# Verify agent health
+echo "[STEP] Verifying agent health..."
+for i in $(seq 1 6); do
+    sleep 5
+    if curl -sf http://localhost:{AGENT_PORT}/agent/health > /dev/null 2>&1; then
+        echo "[OK] Agent is running and healthy!"
+
+        # Register with platform
+        AGENT_API_KEY=$(grep '^AGENT_API_KEY=' "$AGENT_DIR/.env" 2>/dev/null | cut -d= -f2)
+        PLATFORM_URL=$(grep '^PLATFORM_API_URL=' "$AGENT_DIR/.env" 2>/dev/null | cut -d= -f2)
+        case "$PLATFORM_URL" in */api) ;; *) PLATFORM_URL="${{PLATFORM_URL%/}}/api" ;; esac
+        PUBLIC_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || ipconfig getifaddr en0 2>/dev/null)
+        if [ -n "$AGENT_API_KEY" ] && [ -n "$PLATFORM_URL" ] && [ -n "$PUBLIC_IP" ]; then
+            curl -sf -X POST "$PLATFORM_URL/agent-setup/register" \
+                -H "Content-Type: application/json" \
+                -d "{{\\"agent_api_key\\":\\"$AGENT_API_KEY\\",\\"agent_url\\":\\"http://$PUBLIC_IP:{AGENT_PORT}\\"}}" > /dev/null 2>&1 && \
+                echo "[OK] Registered with platform" || true
+        fi
+        exit 0
+    fi
+    echo "Waiting for agent to start... (attempt $i/6)"
+done
+
+echo "[ERR] Agent did not respond to health check after 30s"
+echo "Recent logs:"
+cat "$AGENT_DIR/agent_err.log" 2>/dev/null | tail -20 || true
 exit 1
 """
 
