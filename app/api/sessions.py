@@ -9,22 +9,65 @@ Each session maintains:
 - Metadata for context
 """
 
+import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from sqlalchemy.orm import selectinload
-from typing import Optional
+from typing import Optional, Tuple
 import json
+import httpx
 
-from app.db import get_db, Conversation, Message, User
+from app.db import get_db, Conversation, Message, User, AgentConfig
 from app.schemas import (
     SessionCreate, SessionResponse, SessionWithMessages, SessionListResponse,
     ChatMessageResponse
 )
 from app.api.auth import get_current_user
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+
+
+# ── Agent proxy helpers (same pattern as stats.py) ────────────────────
+
+async def _get_agent_proxy_info(
+    user_id: str, db: AsyncSession
+) -> Optional[Tuple[str, str]]:
+    """Return (agent_url, agent_api_key) if the user has a remote agent."""
+    result = await db.execute(
+        select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+        .where(
+            AgentConfig.user_id == user_id,
+            AgentConfig.deploy_status == "active",
+        )
+    )
+    row = result.first()
+    if row and row.agent_url and row.agent_api_key:
+        return (row.agent_url, row.agent_api_key)
+    return None
+
+
+async def _proxy_sessions(
+    agent_url: str, agent_api_key: str, path: str, params: Optional[dict] = None
+):
+    """Proxy a sessions request to the VPS agent."""
+    url = f"{agent_url}/api/sessions/{path}" if path else f"{agent_url}/api/sessions"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                url,
+                headers={"X-Agent-Key": agent_api_key},
+                params=params or {},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("Agent sessions proxy %s returned %s", url, resp.status_code)
+    except Exception as e:
+        logger.warning("Agent sessions proxy %s failed: %s", url, e)
+    return None
 
 
 @router.post("", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
@@ -66,10 +109,22 @@ async def list_sessions(
 ):
     """
     List conversation sessions for the current user.
-    
+
     Optionally filter by channel or active status.
     Sessions are ordered by most recent first.
     """
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params = {"limit": limit, "offset": offset}
+        if channel:
+            params["channel"] = channel
+        if active_only:
+            params["active_only"] = "true"
+        data = await _proxy_sessions(proxy[0], proxy[1], "", params)
+        if data is not None:
+            return JSONResponse(content=data)
+
     # Build query
     conditions = [Conversation.user_id == current_user.id]
     
@@ -112,9 +167,17 @@ async def get_session(
 ):
     """
     Get a specific session with its message history.
-    
+
     Messages are ordered chronologically (oldest first).
     """
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params = {"include_messages": str(include_messages).lower(), "message_limit": message_limit}
+        data = await _proxy_sessions(proxy[0], proxy[1], session_id, params)
+        if data is not None:
+            return JSONResponse(content=data)
+
     # Build query with optional message loading
     query = select(Conversation).where(
         and_(
@@ -262,9 +325,17 @@ async def get_session_messages(
 ):
     """
     Get messages from a session with pagination.
-    
+
     Messages are ordered chronologically (oldest first).
     """
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params = {"limit": limit, "offset": offset}
+        data = await _proxy_sessions(proxy[0], proxy[1], f"{session_id}/messages", params)
+        if data is not None:
+            return JSONResponse(content=data)
+
     # Verify session ownership
     session_query = select(Conversation.id).where(
         and_(
