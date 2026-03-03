@@ -78,6 +78,7 @@ class AgentConfigOut(BaseModel):
     setup_completed: bool = False
     setup_step: int = 1
     onboarding_completed: bool = False
+    agent_color: str | None = None
     # VPS info (if hosting_mode == "vps")
     vps_ip: str | None = None
     vps_status: str | None = None
@@ -199,6 +200,7 @@ def _config_to_out(config: AgentConfig, vps: VPSInstance | None = None) -> Agent
         setup_completed=config.setup_completed,
         setup_step=config.setup_step,
         onboarding_completed=config.onboarding_completed,
+        agent_color=getattr(config, 'agent_color', None),
         disabled_tools=json.loads(config.disabled_tools) if getattr(config, 'disabled_tools', None) else [],
         has_connect_token=bool(getattr(config, 'connect_token', None)),
         connect_token=getattr(config, 'connect_token', None),
@@ -659,6 +661,27 @@ async def agent_register(
 
     logger.info("Agent registered: user=%s url=%s", config.user_id, body.agent_url)
     return {"registered": True}
+
+
+class ColorUpdateRequest(BaseModel):
+    color: str
+
+
+@router.put("/color")
+async def update_agent_color(
+    body: ColorUpdateRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update agent color (from onboarding or settings)."""
+    import re
+    if not re.match(r'^#[0-9A-Fa-f]{6}$', body.color):
+        raise HTTPException(status_code=400, detail="Invalid hex color")
+    config = await _get_or_create_config(current_user.id, db)
+    config.agent_color = body.color
+    config.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"color": config.agent_color}
 
 
 def get_deploy_logs(user_id: str) -> dict | None:

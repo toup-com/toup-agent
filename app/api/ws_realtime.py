@@ -296,29 +296,51 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
     if onboarding:
         sections.append(
             "# ONBOARDING MODE (ACTIVE — THIS IS YOUR FIRST CONVERSATION)\n"
-            "You are meeting the user for the very first time. They just set you up and "
-            "clicked 'Start' to activate you. You are coming alive!\n\n"
-            "Your goal: Get to know the user through a warm, natural conversation. "
-            "Ask questions ONE AT A TIME and listen carefully. Use memory_store to save "
-            "every important piece of information as you learn it.\n\n"
-            "Things to learn (ask naturally, not as a checklist):\n"
-            "1. What they'd like to call you — your name. "
-            "(Store: brain_type='agent', category='agent_soul')\n"
-            "2. Their name. "
-            "(Store: brain_type='user', category='identity')\n"
-            "3. What they primarily need you for — their goals, work, domain. "
-            "(Store: brain_type='user', category='goals')\n"
-            "4. Their preferred language for conversations. "
-            "(Store: brain_type='user', category='preferences')\n"
-            "5. Anything else they want you to know about them — hobbies, style preferences, etc. "
-            "(Store: brain_type='user', category='identity' or 'preferences')\n\n"
-            "Start by greeting them warmly and introducing yourself. Then ask what they'd like "
-            "to call you. Be enthusiastic about coming alive for the first time!\n\n"
-            "After you've gathered the core information (at minimum: your name, their name, "
-            "and what they need), wrap up by confirming what you've learned and tell them "
-            "you're ready to help. Store a final memory:\n"
-            "memory_store(brain_type='agent', category='agent_decisions', "
-            "content='Onboarding complete. I know the user and they know me.')"
+            "You are meeting the user for the very first time. They just deployed you and "
+            "you are coming alive! You are centered on their screen, looking at them.\n\n"
+
+            "## CONVERSATION FLOW (FOLLOW THIS ORDER STRICTLY)\n\n"
+
+            "### Phase 1: Names\n"
+            "Your FIRST question MUST be: \"What is your name, and what is my name?\"\n"
+            "Wait for their answer. Then:\n"
+            "- Store user's name: memory_store(brain_type='user', category='identity', "
+            "content='User name: <name>')\n"
+            "- Store your name: memory_store(brain_type='agent', category='agent_soul', "
+            "content='My name is <name>')\n\n"
+
+            "### Phase 2: Color\n"
+            "After names are set, say something like: \"Now, what color would you like for me? "
+            "Pick one from the options on your screen.\"\n"
+            "Then IMMEDIATELY call: set_onboarding_phase(phase='color')\n"
+            "This will show clickable color circles on the user's screen.\n"
+            "WAIT for the user to pick. You will receive a message like "
+            "'[COLOR_SELECTED: #hex]'. Acknowledge the color warmly.\n\n"
+
+            "### Phase 3: Deep Profiling\n"
+            "Continue naturally, ONE question at a time:\n"
+            "- What they primarily need you for — goals, work domain. "
+            "Store: brain_type='user', category='goals'\n"
+            "- Their preferred language. "
+            "Store: brain_type='user', category='preferences'\n"
+            "- How they want you to communicate — formal/casual, concise/detailed, "
+            "personality preferences. Store: brain_type='agent', category='agent_soul'\n"
+            "- Any behavioral rules they want (things to always/never do). "
+            "Store: brain_type='agent', category='agent_soul'\n"
+            "- Anything else — hobbies, schedule, work style. "
+            "Store: brain_type='user', category appropriate\n\n"
+
+            "### Phase 4: Wrap Up\n"
+            "After gathering core info (minimum: both names, color, goals, language, "
+            "personality preference), summarize what you learned. Then call "
+            "finalize_onboarding() to save the complete profiles and finish.\n\n"
+
+            "RULES:\n"
+            "- Be warm, enthusiastic, conversational. You're meeting your human!\n"
+            "- Ask ONE question at a time. Never dump a list.\n"
+            "- Use memory_store for EACH piece of info as you learn it.\n"
+            "- Match the user's language automatically.\n"
+            "- Do NOT call finalize_onboarding until you have gathered enough info."
         )
 
     return "\n\n".join(sections)
@@ -682,6 +704,126 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
         return "I'll do my best to answer directly.", "gpt-4o-realtime"
 
 
+# ── Finalize onboarding — compile profiles + write .md files ─────────
+async def _finalize_onboarding(user_id: str) -> str:
+    """Compile agent and user memories into Identity records and .md files.
+
+    1. Query all agent brain memories → build saul.md (agent soul)
+    2. Query all user brain memories → build identity.md (user profile)
+    3. Upsert Identity DB records (SOUL + USER_PROFILE)
+    4. Write saul.md + identity.md to VPS via tunnel write_file tool
+    """
+    from app.db.database import async_session_maker
+    from app.db.models import Identity, IdentityType, AgentConfig
+    from app.services.memory_service import MemoryService
+
+    try:
+        async with async_session_maker() as db:
+            mem_svc = MemoryService(db)
+
+            # ── 1. Compile agent brain → saul.md ──
+            agent_memories = await mem_svc.get_memories_by_brain_type(
+                user_id=user_id, brain_type="agent", limit=10000,
+            )
+            soul_sections = ["# Agent Soul\n"]
+            agent_name = None
+            for m in (agent_memories or []):
+                cat = m.get("category", "")
+                content = m.get("content", "")
+                if "my name is" in content.lower():
+                    # Extract agent name
+                    agent_name = content.split("is")[-1].strip().rstrip(".")
+                soul_sections.append(f"- [{cat}] {content}")
+            saul_content = "\n".join(soul_sections)
+
+            # ── 2. Compile user brain → identity.md ──
+            user_memories = await mem_svc.get_memories_by_brain_type(
+                user_id=user_id, brain_type="user", limit=10000,
+            )
+            identity_sections = ["# User Profile\n"]
+            for m in (user_memories or []):
+                cat = m.get("category", "")
+                content = m.get("content", "")
+                identity_sections.append(f"- [{cat}] {content}")
+            identity_content = "\n".join(identity_sections)
+
+            # ── 3. Upsert Identity DB records ──
+            # SOUL identity
+            existing_soul = (await db.execute(
+                select(Identity).where(
+                    Identity.user_id == user_id,
+                    Identity.identity_type == IdentityType.SOUL.value,
+                )
+            )).scalars().first()
+            if existing_soul:
+                existing_soul.content = saul_content
+                if agent_name:
+                    existing_soul.name = agent_name
+                existing_soul.updated_at = datetime.utcnow()
+            else:
+                import uuid as _uuid
+                db.add(Identity(
+                    id=str(_uuid.uuid4()),
+                    user_id=user_id,
+                    identity_type=IdentityType.SOUL.value,
+                    name=agent_name or "Agent Soul",
+                    content=saul_content,
+                    priority=100,
+                    is_active=True,
+                ))
+
+            # USER_PROFILE identity
+            existing_profile = (await db.execute(
+                select(Identity).where(
+                    Identity.user_id == user_id,
+                    Identity.identity_type == IdentityType.USER_PROFILE.value,
+                )
+            )).scalars().first()
+            if existing_profile:
+                existing_profile.content = identity_content
+                existing_profile.updated_at = datetime.utcnow()
+            else:
+                import uuid as _uuid
+                db.add(Identity(
+                    id=str(_uuid.uuid4()),
+                    user_id=user_id,
+                    identity_type=IdentityType.USER_PROFILE.value,
+                    name="User Profile",
+                    content=identity_content,
+                    priority=90,
+                    is_active=True,
+                ))
+
+            await db.commit()
+            logger.info("[REALTIME] Upserted Identity records for user %s", user_id[:8])
+
+        # ── 4. Write .md files to VPS via tunnel ──
+        try:
+            from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
+            if is_agent_connected(user_id):
+                await send_tool_call(user_id, "write_file", {
+                    "path": "/opt/toup-agent/saul.md",
+                    "content": saul_content,
+                })
+                await send_tool_call(user_id, "write_file", {
+                    "path": "/opt/toup-agent/identity.md",
+                    "content": identity_content,
+                })
+                logger.info("[REALTIME] Wrote saul.md + identity.md to VPS for user %s", user_id[:8])
+        except Exception as e:
+            logger.warning("[REALTIME] Failed to write .md files to VPS: %s", e)
+
+        return (
+            f"Onboarding finalized! Agent soul profile ({len(agent_memories or [])} memories) "
+            f"and user profile ({len(user_memories or [])} memories) saved. "
+            "The user will be redirected to the Hub."
+        )
+
+    except Exception as e:
+        logger.exception("[REALTIME] _finalize_onboarding failed: %s", e)
+        return f"Onboarding finalized with some issues: {e}"
+
+
 # ── WebSocket endpoint ────────────────────────────────────────────────
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
 
@@ -767,6 +909,28 @@ async def realtime_voice_ws(
                 logger.info("[REALTIME] Filtered %d disabled tools for user %s", len(_user_disabled), user_id[:8])
     except Exception as e:
         logger.warning("[REALTIME] Failed to load disabled tools: %s", e)
+
+    # Add onboarding-specific tools
+    if onboarding:
+        session_tools = list(session_tools)  # copy
+        session_tools.append({
+            "type": "function",
+            "name": "set_onboarding_phase",
+            "description": "Set the onboarding UI phase. Call with phase='color' when asking the user to pick a color.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phase": {"type": "string", "enum": ["color", "profiling", "done"]},
+                },
+                "required": ["phase"],
+            },
+        })
+        session_tools.append({
+            "type": "function",
+            "name": "finalize_onboarding",
+            "description": "Call when onboarding conversation is complete to save all profiles and finish setup. Only call after gathering: both names, color, goals, language, and personality.",
+            "parameters": {"type": "object", "properties": {}},
+        })
 
     logger.info("[REALTIME] %d tools available for voice session", len(session_tools))
 
@@ -959,6 +1123,21 @@ async def realtime_voice_ws(
                     first_frame_sent = False
                     logger.info("[REALTIME] Screen sharing stopped for user %s", user_id)
 
+                elif msg_type == "inject_text":
+                    # UI sent a text event (e.g., color selection) — inject into OpenAI conversation
+                    inject_content = msg.get("text", "")
+                    if inject_content:
+                        await openai_ws.send(json.dumps({
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": inject_content}],
+                            },
+                        }))
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                        logger.info("[REALTIME] Injected text: %s", inject_content[:60])
+
                 elif msg_type == "stop":
                     break
 
@@ -1107,11 +1286,38 @@ async def realtime_voice_ws(
                             result, turn_model_used = await _think(user_id, task, db_session_id)
                             turn_model = turn_model_used
 
+                        # ── Onboarding: set UI phase ──
+                        elif func_name == "set_onboarding_phase":
+                            phase = arguments.get("phase", "")
+                            await websocket.send_json({
+                                "type": "onboarding_phase",
+                                "phase": phase,
+                            })
+                            result = f"Onboarding UI phase set to '{phase}'. The user can now see the {phase} interface."
+
+                        # ── Onboarding: finalize (compile profiles, mark complete) ──
+                        elif func_name == "finalize_onboarding":
+                            result = await _finalize_onboarding(user_id)
+                            try:
+                                from app.db.database import async_session_maker as _asm
+                                from app.db.models import AgentConfig
+                                async with _asm() as _db:
+                                    _cfg = (await _db.execute(
+                                        select(AgentConfig).where(AgentConfig.user_id == user_id)
+                                    )).scalar_one_or_none()
+                                    if _cfg:
+                                        _cfg.onboarding_completed = True
+                                        await _db.commit()
+                                        logger.info("[REALTIME] Onboarding finalized for user %s", user_id[:8])
+                            except Exception as oe:
+                                logger.warning("[REALTIME] Failed to mark onboarding complete: %s", oe)
+                            await websocket.send_json({"type": "onboarding_phase", "phase": "done"})
+
                         else:
                             # ── Server-side tools ──
                             result = await _execute_tool(user_id, func_name, arguments)
 
-                        # Check if onboarding just completed
+                        # Check if onboarding just completed (legacy detection via memory_store)
                         if (onboarding and func_name == "memory_store"
                                 and "onboarding complete" in arguments.get("content", "").lower()):
                             try:

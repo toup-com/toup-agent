@@ -1027,6 +1027,7 @@ class AgentConfig(Base):
     setup_completed: Mapped[bool] = mapped_column(Boolean, default=False)
     setup_step: Mapped[int] = mapped_column(Integer, default=1)  # Current step 1-5
     onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    agent_color: Mapped[Optional[str]] = mapped_column(String(7), nullable=True)  # Hex color, e.g. "#9B59B6"
 
     # Tool access control (JSON list of disabled tool names)
     disabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default="")
