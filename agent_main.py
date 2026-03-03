@@ -12,6 +12,7 @@ Usage:
 This is what runs on each user's provisioned EC2 instance.
 """
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
