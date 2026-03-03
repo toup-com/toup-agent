@@ -12,6 +12,7 @@ Usage:
 This is what runs on each user's provisioned EC2 instance.
 """
 
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,6 +76,26 @@ async def lifespan(app: FastAPI):
     print("🤖 Toup Agent starting up...")
     await init_db()
     print("✅ Database initialized")
+
+    # ── Auto-update check (non-blocking) ────────────────────
+    try:
+        import subprocess
+        agent_dir = os.environ.get("AGENT_DIR") or os.path.abspath(os.path.dirname(__file__))
+        result = subprocess.run(
+            ["git", "pull", "--ff-only"],
+            cwd=agent_dir, capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and "Already up to date" not in result.stdout:
+            print(f"📦 Auto-updated: {result.stdout.strip()[:100]}")
+            # Install any new deps
+            venv_pip = os.path.join(agent_dir, "venv", "bin", "pip")
+            if os.path.exists(venv_pip):
+                subprocess.run(
+                    [venv_pip, "install", "-q", "-r", os.path.join(agent_dir, "requirements.txt")],
+                    cwd=agent_dir, capture_output=True, timeout=60,
+                )
+    except Exception as e:
+        print(f"⚠️ Auto-update check skipped: {e}")
 
     # ── Migrate orphaned Telegram sessions to platform owner ──
     # Runs before any services start to avoid lock conflicts
