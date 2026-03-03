@@ -409,24 +409,26 @@ async def lifespan(app: FastAPI):
                         except Exception:
                             public_ip = None
                     if not public_ip:
-                        print("⚠️ Could not detect public IP for registration")
+                        print("⚠️ Could not detect public IP for registration", flush=True)
                         return
                     agent_url = f"http://{public_ip}:8001"
                     # Ensure /api prefix is included
                     base = settings.platform_api_url.rstrip("/")
                     if not base.endswith("/api"):
                         base = base + "/api"
+                    reg_url = f"{base}/agent-setup/register"
+                    print(f"📡 Registering with platform: {reg_url} as {agent_url}", flush=True)
                     resp = await _c.post(
-                        f"{base}/agent-setup/register",
+                        reg_url,
                         json={"agent_api_key": settings.agent_api_key, "agent_url": agent_url},
                         timeout=10.0,
                     )
                     if resp.status_code == 200:
-                        print(f"✅ Registered with platform ({agent_url})")
+                        print(f"✅ Registered with platform ({agent_url})", flush=True)
                     else:
-                        print(f"⚠️ Platform register returned {resp.status_code}")
+                        print(f"⚠️ Platform register returned {resp.status_code}: {resp.text[:200]}", flush=True)
             except Exception as e:
-                print(f"⚠️ Platform registration failed: {e}")
+                print(f"⚠️ Platform registration failed: {e}", flush=True)
         asyncio.create_task(_self_register())
 
     print("🤖 Toup Agent ready.")
