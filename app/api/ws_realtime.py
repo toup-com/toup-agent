@@ -437,33 +437,28 @@ async def _vps_api(
 
 
 async def _ensure_vps_user(user_id: str):
-    """Ensure the platform user exists in VPS users table (FK constraints)."""
-    from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
-    if not is_agent_connected(user_id):
-        return
-    import shlex
-    from app.db.database import async_session_maker
-    from app.db.models import User
-    user_name = "Platform Owner"
-    try:
-        async with async_session_maker() as db:
-            plat_user = (await db.execute(
-                select(User).where(User.id == user_id)
-            )).scalars().first()
-            if plat_user and plat_user.name:
-                user_name = plat_user.name
-    except Exception:
-        pass
-    vps_email = f"owner_{user_id}@toup.local"
-    esc_name = user_name.replace("'", "''")
-    sql = (
-        f"INSERT INTO users (id, email, hashed_password, name, role, is_active, created_at, updated_at) "
-        f"VALUES ('{user_id}', '{vps_email}', '', '{esc_name}', 'beta_user', true, now(), now()) "
-        f"ON CONFLICT (id) DO NOTHING;"
-    )
-    await send_tool_call(user_id, "exec", {
-        "command": f"sudo -u postgres psql -d toup_brain -c {shlex.quote(sql)}",
-    })
+    """Ensure the platform user exists in VPS users table (FK constraints).
+
+    The VPS agent's agent_main.py already creates the owner user on startup
+    (for all DB backends). This is a safety-net that verifies via health check.
+    If the VPS is unreachable or user creation failed, voice still works —
+    sessions and messages go through VPS HTTP API which handles auth internally.
+    """
+    # Just verify the VPS agent is healthy — it creates the user on startup
+    vps = await _get_vps_info(user_id)
+    if vps:
+        agent_url, agent_api_key = vps
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(
+                    f"{agent_url}/agent/health",
+                    headers={"X-Agent-Key": agent_api_key},
+                )
+                if resp.status_code == 200:
+                    logger.info("[REALTIME] VPS agent healthy for user %s", user_id[:8])
+                    return
+        except Exception as e:
+            logger.warning("[REALTIME] VPS health check failed (non-fatal): %s", e)
 
 
 # ── Execute function calls via Agent Tunnel or local ToolExecutor ─────
@@ -499,53 +494,38 @@ async def _execute_tool(user_id: str, func_name: str, arguments: dict) -> str:
 async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) -> str:
     """Get existing session or create a new one on VPS. Returns session_id.
 
+    Uses VPS HTTP API (works for all DB backends: local postgres, Supabase, etc.)
     All conversation data lives on the user's VPS, never the platform DB.
     """
     import uuid as _uuid
-    import shlex
-    from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
 
-    # If VPS agent is connected, create/check session on VPS via tunnel
-    if is_agent_connected(user_id):
-        if session_id:
-            # Check if session exists on VPS
-            check_sql = (
-                f"SELECT id FROM conversations "
-                f"WHERE id = '{session_id}' AND user_id = '{user_id}' "
-                f"AND started_at::date = CURRENT_DATE LIMIT 1;"
-            )
-            result = await send_tool_call(user_id, "exec", {
-                "command": f"sudo -u postgres psql -d toup_brain -t -A -c {shlex.quote(check_sql)}",
-            })
-            if result and not result.startswith("ERROR") and session_id in result:
-                logger.info("[REALTIME] Reusing existing VPS session %s", session_id[:8])
-                return session_id
-
-        new_id = session_id or str(_uuid.uuid4())
-        create_sql = (
-            f"INSERT INTO conversations (id, user_id, channel, is_active, started_at, updated_at, message_count, total_tokens) "
-            f"VALUES ('{new_id}', '{user_id}', 'voice', true, NOW(), NOW(), 0, 0) "
-            f"ON CONFLICT (id) DO NOTHING;"
-        )
-        await send_tool_call(user_id, "exec", {
-            "command": f"sudo -u postgres psql -d toup_brain -c {shlex.quote(create_sql)}",
-        })
-        logger.info("[REALTIME] Created VPS voice session %s", new_id[:8])
-        return new_id
-
-    # Fallback: VPS not connected, create via API if available
     vps = await _get_vps_info(user_id)
     if vps:
         agent_url, agent_api_key = vps
-        data = await _vps_api(agent_url, agent_api_key, "POST", "/api/sessions", json_body={
+
+        # Check if existing session is reusable (from today)
+        if session_id:
+            data = await _vps_api(
+                agent_url, agent_api_key, "GET", f"/api/sessions/{session_id}",
+                params={"include_messages": "false"},
+            )
+            if data and data.get("id"):
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                started = data.get("started_at", "") or data.get("updated_at", "")
+                if today_str in str(started):
+                    logger.info("[REALTIME] Reusing existing VPS session %s", session_id[:8])
+                    return session_id
+
+        # Create new session via VPS API
+        new_data = await _vps_api(agent_url, agent_api_key, "POST", "/api/sessions", json_body={
             "title": "Voice Session",
             "channel": "voice",
         })
-        if data and data.get("id"):
-            logger.info("[REALTIME] Created VPS voice session via API %s", data["id"][:8])
-            return data["id"]
+        if new_data and new_data.get("id"):
+            logger.info("[REALTIME] Created VPS voice session via API %s", new_data["id"][:8])
+            return new_data["id"]
 
-    # Last resort: generate UUID locally (no persistence, but session still works)
+    # Fallback: generate UUID locally (session still works for audio relay, just not persisted)
     fallback_id = session_id or str(_uuid.uuid4())
     logger.warning("[REALTIME] VPS unreachable, using local session ID %s (not persisted)", fallback_id[:8])
     return fallback_id
@@ -558,11 +538,11 @@ async def _save_voice_messages(
     assistant_text: str,
     model: str = "gpt-4o-realtime",
 ) -> None:
-    """Persist a user/assistant message pair to VPS DB. Never writes to platform DB."""
-    import uuid as _uuid
-    import shlex
-    from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
+    """Persist a user/assistant message pair to VPS via HTTP API.
 
+    Uses POST /api/sessions/{id}/messages on the VPS agent.
+    Works for all DB backends (local postgres, Supabase, etc.)
+    """
     if not user_text and not assistant_text:
         return
 
@@ -571,41 +551,33 @@ async def _save_voice_messages(
         session_id[:8], len(user_text), len(assistant_text),
     )
 
-    if not is_agent_connected(user_id):
-        logger.warning("[REALTIME] VPS not connected, cannot save voice messages")
+    vps = await _get_vps_info(user_id)
+    if not vps:
+        logger.warning("[REALTIME] VPS info not available, cannot save voice messages")
         return
 
-    stmts = []
+    agent_url, agent_api_key = vps
     count = 0
+
     if user_text:
-        esc = user_text.replace("\x00", "").replace("'", "''")
-        stmts.append(
-            f"INSERT INTO messages (id, conversation_id, role, content, created_at) "
-            f"VALUES ('{_uuid.uuid4()}', '{session_id}', 'user', '{esc}', NOW());"
+        result = await _vps_api(
+            agent_url, agent_api_key, "POST",
+            f"/api/sessions/{session_id}/messages",
+            json_body={"role": "user", "content": user_text},
         )
-        count += 1
+        if result:
+            count += 1
 
     if assistant_text:
-        esc = assistant_text.replace("\x00", "").replace("'", "''")
-        esc_model = model.replace("'", "''")
-        stmts.append(
-            f"INSERT INTO messages (id, conversation_id, role, content, model_used, created_at) "
-            f"VALUES ('{_uuid.uuid4()}', '{session_id}', 'assistant', '{esc}', '{esc_model}', NOW());"
+        result = await _vps_api(
+            agent_url, agent_api_key, "POST",
+            f"/api/sessions/{session_id}/messages",
+            json_body={"role": "assistant", "content": assistant_text, "model_used": model},
         )
-        count += 1
+        if result:
+            count += 1
 
-    if count > 0:
-        stmts.append(
-            f"UPDATE conversations SET message_count = COALESCE(message_count, 0) + {count}, "
-            f"updated_at = NOW() WHERE id = '{session_id}';"
-        )
-
-    sql = " ".join(stmts)
-    await send_tool_call(user_id, "exec", {
-        "command": f"sudo -u postgres psql -d toup_brain -c {shlex.quote(sql)}",
-    })
-
-    logger.info("[REALTIME] Saved %d message(s) to VPS session %s", count, session_id[:8])
+    logger.info("[REALTIME] Saved %d message(s) to VPS session %s via API", count, session_id[:8])
 
 
 # ── Background memory extraction (mirrors agent_runner._extract_memories) ──
@@ -800,7 +772,6 @@ async def _finalize_onboarding(user_id: str) -> str:
     3. Write .md files to VPS via tunnel write_file
     4. Upsert Identity records in VPS DB via tunnel exec
     """
-    import shlex
     from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
 
     try:
@@ -871,30 +842,42 @@ async def _finalize_onboarding(user_id: str) -> str:
         })
         logger.info("[REALTIME] Wrote saul.md + identity.md to VPS for user %s", user_id[:8])
 
-        # ── 5. Upsert Identity records in VPS DB (NOT platform DB) ──
-        for id_type, id_name, id_content, id_priority in [
-            ("soul", agent_name or "Agent Soul", saul_content, 100),
-            ("user_profile", "User Profile", identity_content, 90),
-        ]:
-            try:
-                esc_content = id_content.replace("'", "''")
-                esc_name = id_name.replace("'", "''")
-                del_sql = (
-                    f"DELETE FROM identities WHERE user_id = '{user_id}' "
-                    f"AND identity_type = '{id_type}';"
-                )
-                ins_sql = (
-                    f"INSERT INTO identities (id, user_id, identity_type, name, content, priority, is_active, created_at, updated_at) "
-                    f"VALUES (gen_random_uuid(), '{user_id}', '{id_type}', '{esc_name}', "
-                    f"'{esc_content}', {id_priority}, true, now(), now());"
-                )
-                await send_tool_call(user_id, "exec", {
-                    "command": f'sudo -u postgres psql -d toup_brain -c {shlex.quote(del_sql + " " + ins_sql)}',
-                })
-            except Exception as e:
-                logger.warning("[REALTIME] Failed to push Identity %s to VPS: %s", id_type, e)
+        # ── 5. Upsert Identity records on VPS via HTTP API ──
+        if vps:
+            for id_type, id_name, id_content, id_priority in [
+                ("soul", agent_name or "Agent Soul", saul_content, 100),
+                ("user_profile", "User Profile", identity_content, 90),
+            ]:
+                try:
+                    # Delete existing identity of this type first
+                    existing = await _vps_api(
+                        agent_url, agent_api_key, "GET", "/api/identity",
+                        params={"identity_type": id_type},
+                    )
+                    if existing:
+                        id_list = existing.get("identities", existing) if isinstance(existing, dict) else existing
+                        if isinstance(id_list, list):
+                            for old_id in id_list:
+                                old_id_val = old_id.get("id", "")
+                                if old_id_val:
+                                    async with httpx.AsyncClient(timeout=10.0) as client:
+                                        await client.delete(
+                                            f"{agent_url}/api/identity/{old_id_val}",
+                                            headers={"X-Agent-Key": agent_api_key},
+                                        )
 
-        logger.info("[REALTIME] Pushed Identity records to VPS for user %s", user_id[:8])
+                    # Create new identity
+                    await _vps_api(agent_url, agent_api_key, "POST", "/api/identity", json_body={
+                        "identity_type": id_type,
+                        "name": id_name,
+                        "content": id_content,
+                        "priority": id_priority,
+                        "is_active": True,
+                    })
+                except Exception as e:
+                    logger.warning("[REALTIME] Failed to push Identity %s to VPS: %s", id_type, e)
+
+            logger.info("[REALTIME] Pushed Identity records to VPS for user %s", user_id[:8])
 
         return (
             f"Onboarding finalized! Agent soul profile ({len(agent_memories)} memories) "

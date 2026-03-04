@@ -426,6 +426,63 @@ async def get_session_messages(
     return [_message_to_response(m) for m in messages]
 
 
+@router.post("/{session_id}/messages", response_model=ChatMessageResponse, status_code=status.HTTP_201_CREATED)
+async def create_session_message(
+    session_id: str,
+    role: str = "user",
+    content: str = "",
+    model_used: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Add a message to a session.
+
+    Used by the platform voice route to persist voice messages
+    on the user's VPS database (not platform DB).
+    """
+    import uuid as _uuid
+
+    # Verify session ownership
+    session_query = select(Conversation).where(
+        and_(
+            Conversation.id == session_id,
+            Conversation.user_id == current_user.id,
+        )
+    )
+    result = await db.execute(session_query)
+    session = result.scalar_one_or_none()
+
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Content is required"
+        )
+
+    msg = Message(
+        id=str(_uuid.uuid4()),
+        conversation_id=session_id,
+        role=role,
+        content=content.replace("\x00", ""),
+        model_used=model_used,
+    )
+    db.add(msg)
+
+    session.message_count = (session.message_count or 0) + 1
+    session.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(msg)
+
+    return _message_to_response(msg)
+
+
 def _session_to_response(session: Conversation) -> SessionResponse:
     """Convert Conversation model to SessionResponse."""
     metadata = None
