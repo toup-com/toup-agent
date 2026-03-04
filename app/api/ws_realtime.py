@@ -1002,6 +1002,12 @@ async def realtime_voice_ws(
         ready_msg["session_id"] = db_session_id
     await websocket.send_json(ready_msg)
 
+    # ── 6b. Auto-greet in onboarding mode ─────────────────────
+    # Trigger the agent to speak first so the user doesn't stare at "Listening..."
+    if onboarding:
+        await openai_ws.send(json.dumps({"type": "response.create"}))
+        logger.info("[REALTIME] Onboarding: triggered initial greeting")
+
     # ── 7. Bidirectional relay ────────────────────────────────
     # Track state for transcript accumulation and persistence
     response_text_accum = ""
