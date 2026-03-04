@@ -361,13 +361,14 @@ else
     fi
 fi
 
-# Create database user and database
+# Create database user and database (drop existing for clean slate)
 echo "Setting up database..."
 sudo -u postgres psql -c "CREATE USER toup WITH PASSWORD 'toup';" 2>/dev/null || \\
     sudo -u postgres psql -c "ALTER USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
+sudo -u postgres psql -c "DROP DATABASE IF EXISTS toup_brain;" 2>/dev/null || true
 sudo -u postgres psql -c "CREATE DATABASE toup_brain OWNER toup;" 2>/dev/null || true
 sudo -u postgres psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
-echo "[OK] Database toup_brain ready (user: toup, pgvector enabled)"
+echo "[OK] Database toup_brain ready (user: toup, pgvector enabled, clean slate)"
 """
 
     return f"""#!/bin/bash
@@ -740,10 +741,12 @@ echo "  Creating database..."
 if [[ "$OSTYPE" == "darwin"* ]]; then
   createuser toup 2>/dev/null || true
   psql postgres -c "ALTER USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
+  dropdb toup_brain 2>/dev/null || true
   createdb -O toup toup_brain 2>/dev/null || true
   psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
 else
   sudo -u postgres psql -c "CREATE USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
+  sudo -u postgres psql -c "DROP DATABASE IF EXISTS toup_brain;" 2>/dev/null || true
   sudo -u postgres psql -c "CREATE DATABASE toup_brain OWNER toup;" 2>/dev/null || true
   sudo -u postgres psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
 fi

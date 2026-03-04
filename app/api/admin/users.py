@@ -323,9 +323,16 @@ async def delete_user(
         mem_rel_table.c.target_id.in_(mem_ids_q)
     ))
 
+    # Delete retrieval_events by conversation_id (FK to conversations)
+    await db.execute(sa_delete(RetrievalEvent).where(
+        RetrievalEvent.conversation_id.in_(conv_ids_q)
+    ))
+    # Also delete any retrieval_events by user_id (covers orphans)
+    await db.execute(sa_delete(RetrievalEvent).where(RetrievalEvent.user_id == user_id))
+
     # Now delete all direct user_id tables (order: children before parents)
     for model in [
-        Identity, MemoryEvent, RetrievalEvent, Memory,
+        Identity, MemoryEvent, Memory,
         Conversation, Entity, BrainStats,
         Document, Media, CronJob,
         TelegramUserMapping, Workflow, ApiKey, VPSInstance,
