@@ -84,12 +84,13 @@ async def send_tool_call(user_id: str, tool_name: str, arguments: dict) -> str:
     _pending_calls[call_id] = future
 
     try:
-        # Send tool call to agent
+        # Send tool call to agent (include user_id so VPS sets _current_user_id)
         await tunnel.ws.send_json({
             "type": "tool_call",
             "id": call_id,
             "tool_name": tool_name,
             "arguments": arguments,
+            "user_id": user_id,
         })
         logger.info("[TUNNEL] Sent tool_call %s → agent %s", tool_name, user_id[:8])
 

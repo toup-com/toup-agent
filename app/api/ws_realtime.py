@@ -714,7 +714,7 @@ async def _finalize_onboarding(user_id: str) -> str:
     4. Write saul.md + identity.md to VPS via tunnel write_file tool
     """
     from app.db.database import async_session_maker
-    from app.db.models import Identity, IdentityType, AgentConfig
+    from app.db.models import Identity, IdentityType, AgentConfig, User
     from app.services.memory_service import MemoryService
 
     try:
@@ -797,10 +797,11 @@ async def _finalize_onboarding(user_id: str) -> str:
             await db.commit()
             logger.info("[REALTIME] Upserted Identity records for user %s", user_id[:8])
 
-        # ── 4. Write .md files to VPS via tunnel ──
+        # ── 4. Sync to VPS via tunnel ──
         try:
             from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
             if is_agent_connected(user_id):
+                # 4a. Write .md files
                 await send_tool_call(user_id, "write_file", {
                     "path": "/opt/toup-agent/saul.md",
                     "content": saul_content,
@@ -810,12 +811,95 @@ async def _finalize_onboarding(user_id: str) -> str:
                     "content": identity_content,
                 })
                 logger.info("[REALTIME] Wrote saul.md + identity.md to VPS for user %s", user_id[:8])
+
+                # 4b. Ensure platform user exists in VPS database
+                # The VPS has its own PostgreSQL (toup_brain) with FK constraints.
+                # The platform user_id must exist in VPS users table before
+                # we can insert memories/identities.
+                import shlex
+                # Use a unique email (contains full UUID) to avoid
+                # collisions with any existing users on the VPS
+                user_name = "Platform Owner"
+                try:
+                    async with async_session_maker() as pdb:
+                        plat_user = (await pdb.execute(
+                            select(User).where(User.id == user_id)
+                        )).scalars().first()
+                        if plat_user and plat_user.name:
+                            user_name = plat_user.name
+                except Exception:
+                    pass
+
+                vps_email = f"owner_{user_id}@toup.local"
+                escaped_name_u = user_name.replace("'", "''")
+                ensure_user_sql = (
+                    f"INSERT INTO users (id, email, hashed_password, name, role, is_active, created_at, updated_at) "
+                    f"VALUES ('{user_id}', '{vps_email}', '', '{escaped_name_u}', 'beta_user', true, now(), now()) "
+                    f"ON CONFLICT (id) DO NOTHING;"
+                )
+                await send_tool_call(user_id, "exec", {
+                    "command": f'sudo -u postgres psql -d toup_brain -c {shlex.quote(ensure_user_sql)}',
+                })
+                logger.info("[REALTIME] Ensured user %s exists in VPS DB", user_id[:8])
+
+                # 4c. Push memories to VPS brain database via memory_store tool
+                # Each call generates embeddings + dedup on the VPS
+                pushed = 0
+                all_memories = [
+                    *[{**m, "brain_type": "agent"} for m in (agent_memories or [])],
+                    *[{**m, "brain_type": "user"} for m in (user_memories or [])],
+                ]
+                for m in all_memories:
+                    try:
+                        result = await send_tool_call(user_id, "memory_store", {
+                            "content": m.get("content", ""),
+                            "category": m.get("category", "context"),
+                            "brain_type": m["brain_type"],
+                            "importance": m.get("importance", 0.7),
+                        })
+                        if not result.startswith("ERROR"):
+                            pushed += 1
+                        else:
+                            logger.warning("[REALTIME] memory_store failed: %s", result[:200])
+                    except Exception as e:
+                        logger.warning("[REALTIME] memory_store exception: %s", e)
+
+                logger.info(
+                    "[REALTIME] Pushed %d/%d memories to VPS brain DB for user %s",
+                    pushed, len(all_memories), user_id[:8],
+                )
+
+                # 4d. Push Identity records to VPS brain database
+                for id_type, id_name, id_content, id_priority in [
+                    ("soul", agent_name or "Agent Soul", saul_content, 100),
+                    ("user_profile", "User Profile", identity_content, 90),
+                ]:
+                    try:
+                        esc_content = id_content.replace("'", "''")
+                        esc_name = id_name.replace("'", "''")
+                        # Delete existing + insert fresh (no unique constraint on identities)
+                        del_sql = (
+                            f"DELETE FROM identities WHERE user_id = '{user_id}' "
+                            f"AND identity_type = '{id_type}';"
+                        )
+                        ins_sql = (
+                            f"INSERT INTO identities (id, user_id, identity_type, name, content, priority, is_active, created_at, updated_at) "
+                            f"VALUES (gen_random_uuid(), '{user_id}', '{id_type}', '{esc_name}', "
+                            f"'{esc_content}', {id_priority}, true, now(), now());"
+                        )
+                        await send_tool_call(user_id, "exec", {
+                            "command": f'sudo -u postgres psql -d toup_brain -c {shlex.quote(del_sql + " " + ins_sql)}',
+                        })
+                    except Exception as e:
+                        logger.warning("[REALTIME] Failed to push Identity %s to VPS: %s", id_type, e)
+
+                logger.info("[REALTIME] Pushed Identity records to VPS for user %s", user_id[:8])
         except Exception as e:
-            logger.warning("[REALTIME] Failed to write .md files to VPS: %s", e)
+            logger.warning("[REALTIME] Failed to sync to VPS: %s", e)
 
         return (
             f"Onboarding finalized! Agent soul profile ({len(agent_memories or [])} memories) "
-            f"and user profile ({len(user_memories or [])} memories) saved. "
+            f"and user profile ({len(user_memories or [])} memories) saved and synced to VPS. "
             "The user will be redirected to the Hub."
         )
 
@@ -825,7 +909,7 @@ async def _finalize_onboarding(user_id: str) -> str:
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────
-OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2025-06-03"
 
 
 @router.websocket("/ws/realtime")
@@ -936,7 +1020,7 @@ async def realtime_voice_ws(
 
     # ── 5. Connect to OpenAI Realtime API ─────────────────────
     # Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
-    voice = "shimmer"  # warm/natural, closest to 'nova' from TTS API
+    voice = "coral"  # natural, expressive voice
     openai_ws = None
 
     try:
