@@ -39,8 +39,7 @@ from typing import Optional
 import httpx
 import websockets
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
-from sqlalchemy import select, and_
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.config import settings
 from app.agent.tool_definitions import get_agent_tools, get_extended_tools
@@ -154,110 +153,124 @@ REALTIME_TOOLS = _build_realtime_tools()
 async def build_realtime_instructions(user_id: str, onboarding: bool = False) -> str:
     """Build system instructions for the Realtime API session.
 
-    Loads Identity documents and agent brain memories, same as AgentRunner._build_system_prompt,
-    but with voice-specific formatting rules instead of Telegram formatting.
+    Reads ALL personal data (identities, memories, history) from the user's VPS
+    via httpx API calls. The platform DB is NEVER used for personal data.
     """
-    from app.db.database import async_session_maker
-    from app.db.models import Identity, IdentityType
-
     sections = []
 
-    async with async_session_maker() as db:
-        # 1. Load identity documents (same query as agent_runner.py:531)
-        result = await db.execute(
-            select(Identity).where(
-                and_(
-                    Identity.user_id == user_id,
-                    Identity.is_active == True,
-                )
-            ).order_by(Identity.priority.desc())
+    vps = await _get_vps_info(user_id)
+    if vps:
+        agent_url, agent_api_key = vps
+
+        # 1. Load identity documents from VPS
+        try:
+            identities_data = await _vps_api(
+                agent_url, agent_api_key, "GET", "/api/identity",
+                params={"active_only": "true"},
+            )
+            if identities_data:
+                id_list = identities_data.get("identities", identities_data) if isinstance(identities_data, dict) else identities_data
+                if isinstance(id_list, list):
+                    # Sort by priority descending (highest first)
+                    id_list.sort(key=lambda x: x.get("priority", 0), reverse=True)
+                    for identity in id_list:
+                        itype = identity.get("identity_type", "")
+                        content = identity.get("content", "")
+                        if itype == "soul":
+                            sections.append(f"# Core Identity\n{content}")
+                        elif itype == "agent_instructions":
+                            sections.append(f"# Behavioral Guidelines\n{content}")
+                        elif itype == "user_profile":
+                            sections.append(f"# About the User\n{content}")
+                        elif itype == "tools":
+                            sections.append(f"# Tool Guidelines\n{content}")
+        except Exception as e:
+            logger.warning("[REALTIME] Failed to load VPS identities: %s", e)
+
+        # 2. Load ALL agent brain memories from VPS
+        try:
+            agent_mems_data = await _vps_api(
+                agent_url, agent_api_key, "GET", "/api/memories",
+                params={"brain_type": "agent", "limit": 10000},
+            )
+            if agent_mems_data:
+                mems = agent_mems_data.get("memories", agent_mems_data) if isinstance(agent_mems_data, dict) else agent_mems_data
+                if isinstance(mems, list) and mems:
+                    lines = ["# Agent Brain (Permanent Knowledge)"]
+                    for m in mems:
+                        cat = m.get("category", "")
+                        content = m.get("content", "")
+                        lines.append(f"- [{cat}] {content}")
+                    sections.append("\n".join(lines))
+        except Exception as e:
+            logger.warning("[REALTIME] Failed to load VPS agent memories: %s", e)
+
+        # 2b. Load ALL user brain memories from VPS
+        try:
+            user_mems_data = await _vps_api(
+                agent_url, agent_api_key, "GET", "/api/memories",
+                params={"brain_type": "user", "limit": 10000},
+            )
+            if user_mems_data:
+                mems = user_mems_data.get("memories", user_mems_data) if isinstance(user_mems_data, dict) else user_mems_data
+                if isinstance(mems, list) and mems:
+                    lines = ["# User Brain (What You Know About the User)"]
+                    for m in mems:
+                        cat = m.get("category", "")
+                        content = m.get("content", "")
+                        lines.append(f"- [{cat}] {content}")
+                    sections.append("\n".join(lines))
+                    logger.info("[REALTIME] Loaded %d user brain memories from VPS", len(mems))
+        except Exception as e:
+            logger.warning("[REALTIME] Failed to load VPS user memories: %s", e)
+
+        # 2c. Load today's chat history from VPS sessions
+        try:
+            sessions_data = await _vps_api(
+                agent_url, agent_api_key, "GET", "/api/sessions",
+                params={"limit": 5, "active_only": "false"},
+            )
+            if sessions_data:
+                sess_list = sessions_data.get("sessions", []) if isinstance(sessions_data, dict) else []
+                today_messages = []
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                for sess in sess_list[:5]:
+                    sess_id = sess.get("id", "")
+                    sess_updated = sess.get("updated_at", "")
+                    if not sess_updated or today_str not in sess_updated:
+                        continue
+                    msgs_data = await _vps_api(
+                        agent_url, agent_api_key, "GET",
+                        f"/api/sessions/{sess_id}/messages",
+                        params={"limit": 20},
+                    )
+                    if msgs_data and isinstance(msgs_data, list):
+                        today_messages.extend(msgs_data)
+
+                if today_messages:
+                    # Sort by created_at, take last 20
+                    today_messages.sort(key=lambda m: m.get("created_at", ""))
+                    recent = today_messages[-20:]
+                    lines = ["# Today's Conversation History (most recent)"]
+                    for m in recent:
+                        role = m.get("role", "")
+                        content = m.get("content", "")
+                        if role in ("user", "assistant") and content:
+                            speaker = "User" if role == "user" else "You"
+                            truncated = content[:300] + "..." if len(content) > 300 else content
+                            lines.append(f"{speaker}: {truncated}")
+                    if len(lines) > 1:
+                        sections.append("\n".join(lines))
+                        logger.info("[REALTIME] Loaded %d today's messages from VPS", len(recent))
+        except Exception as e:
+            logger.warning("[REALTIME] Failed to load VPS chat history: %s", e)
+
+    if not sections:
+        sections.append(
+            "# Core Identity\n"
+            "You are Toup, an intelligent AI assistant with persistent memory. "
+            "You remember past conversations and learn about the user over time."
         )
-        identities = result.scalars().all()
-
-        for identity in identities:
-            itype = identity.identity_type
-            if itype == IdentityType.SOUL.value:
-                sections.append(f"# Core Identity\n{identity.content}")
-            elif itype == IdentityType.AGENT_INSTRUCTIONS.value:
-                sections.append(f"# Behavioral Guidelines\n{identity.content}")
-            elif itype == IdentityType.USER_PROFILE.value:
-                sections.append(f"# About the User\n{identity.content}")
-            elif itype == IdentityType.TOOLS.value:
-                sections.append(f"# Tool Guidelines\n{identity.content}")
-
-        if not sections:
-            sections.append(
-                "# Core Identity\n"
-                "You are Toup, an intelligent AI assistant with persistent memory. "
-                "You remember past conversations and learn about the user over time."
-            )
-
-        # 2. Load ALL agent brain memories — this is who the agent is
-        try:
-            from app.services.memory_service import MemoryService
-            mem_svc = MemoryService(db)
-            agent_memories = await mem_svc.get_memories_by_brain_type(
-                user_id=user_id,
-                brain_type="agent",
-                limit=10000,
-            )
-            if agent_memories:
-                lines = ["# Agent Brain (Permanent Knowledge)"]
-                for m in agent_memories:
-                    cat = m.get("category", "")
-                    content = m.get("content", "")
-                    lines.append(f"- [{cat}] {content}")
-                sections.append("\n".join(lines))
-        except Exception as e:
-            logger.warning("[REALTIME] Failed to load agent memories: %s", e)
-
-        # 2b. Load ALL user brain memories — everything the agent knows about the user
-        try:
-            from app.services.memory_service import MemoryService as _UMemSvc
-            user_mem_svc = _UMemSvc(db)
-            user_memories = await user_mem_svc.get_memories_by_brain_type(
-                user_id=user_id,
-                brain_type="user",
-                limit=10000,
-            )
-            if user_memories:
-                lines = ["# User Brain (What You Know About the User)"]
-                for m in user_memories:
-                    cat = m.get("category", "")
-                    content = m.get("content", "")
-                    lines.append(f"- [{cat}] {content}")
-                sections.append("\n".join(lines))
-                logger.info("[REALTIME] Loaded %d user brain memories", len(user_memories))
-        except Exception as e:
-            logger.warning("[REALTIME] Failed to load user memories: %s", e)
-
-        # 2c. Load today's chat history (text + voice) so voice agent has context
-        try:
-            from sqlalchemy import text as sql_text
-            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            result = await db.execute(
-                sql_text(
-                    "SELECT m.role, m.content FROM messages m "
-                    "JOIN conversations c ON m.conversation_id = c.id "
-                    "WHERE c.user_id = :uid "
-                    "  AND m.created_at::date = :today "
-                    "  AND m.role IN ('user', 'assistant') "
-                    "ORDER BY m.created_at DESC LIMIT 20"
-                ),
-                {"uid": user_id, "today": today_str},
-            )
-            rows = list(reversed(result.fetchall()))
-            if rows:
-                lines = ["# Today's Conversation History (most recent)"]
-                for role, content in rows:
-                    speaker = "User" if role == "user" else "You"
-                    # Truncate very long messages to keep instructions reasonable
-                    truncated = content[:300] + "..." if len(content) > 300 else content
-                    lines.append(f"{speaker}: {truncated}")
-                sections.append("\n".join(lines))
-                logger.info("[REALTIME] Loaded %d today's messages into voice context", len(rows))
-        except Exception as e:
-            logger.warning("[REALTIME] Failed to load today's chat history: %s", e)
 
     # 3. Voice-specific instructions
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -379,6 +392,80 @@ async def _get_user_openai_key(user_id: str) -> Optional[str]:
         return result.scalar_one_or_none()
 
 
+# ── VPS helpers — all personal data lives on user's VPS, never platform ──
+
+async def _get_vps_info(user_id: str) -> Optional[tuple]:
+    """Return (agent_url, agent_api_key) for the user's VPS agent."""
+    from app.db.database import async_session_maker
+    from app.db.models import AgentConfig
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+            .where(AgentConfig.user_id == user_id, AgentConfig.deploy_status == "active")
+        )
+        row = result.first()
+        if row and row.agent_url and row.agent_api_key:
+            return (row.agent_url, row.agent_api_key)
+    return None
+
+
+async def _vps_api(
+    agent_url: str, agent_api_key: str, method: str, path: str,
+    params: dict = None, json_body: dict = None,
+):
+    """Make an authenticated API call to the user's VPS agent.
+
+    Uses X-Agent-Key header — VPS auth.py resolves to settings.user_id.
+    """
+    url = f"{agent_url}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            if method == "GET":
+                resp = await client.get(
+                    url, headers={"X-Agent-Key": agent_api_key}, params=params or {},
+                )
+            else:
+                resp = await client.post(
+                    url, headers={"X-Agent-Key": agent_api_key}, json=json_body or {},
+                )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("[REALTIME] VPS API %s %s → %s", method, path, resp.status_code)
+    except Exception as e:
+        logger.warning("[REALTIME] VPS API %s %s failed: %s", method, path, e)
+    return None
+
+
+async def _ensure_vps_user(user_id: str):
+    """Ensure the platform user exists in VPS users table (FK constraints)."""
+    from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
+    if not is_agent_connected(user_id):
+        return
+    import shlex
+    from app.db.database import async_session_maker
+    from app.db.models import User
+    user_name = "Platform Owner"
+    try:
+        async with async_session_maker() as db:
+            plat_user = (await db.execute(
+                select(User).where(User.id == user_id)
+            )).scalars().first()
+            if plat_user and plat_user.name:
+                user_name = plat_user.name
+    except Exception:
+        pass
+    vps_email = f"owner_{user_id}@toup.local"
+    esc_name = user_name.replace("'", "''")
+    sql = (
+        f"INSERT INTO users (id, email, hashed_password, name, role, is_active, created_at, updated_at) "
+        f"VALUES ('{user_id}', '{vps_email}', '', '{esc_name}', 'beta_user', true, now(), now()) "
+        f"ON CONFLICT (id) DO NOTHING;"
+    )
+    await send_tool_call(user_id, "exec", {
+        "command": f"sudo -u postgres psql -d toup_brain -c {shlex.quote(sql)}",
+    })
+
+
 # ── Execute function calls via Agent Tunnel or local ToolExecutor ─────
 async def _execute_tool(user_id: str, func_name: str, arguments: dict) -> str:
     """Execute a Realtime API function call.
@@ -410,97 +497,136 @@ async def _execute_tool(user_id: str, func_name: str, arguments: dict) -> str:
 
 # ── DB persistence helpers ────────────────────────────────────────────
 async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) -> str:
-    """Get existing session or create a new one. Returns session_id. Uses raw SQL."""
+    """Get existing session or create a new one on VPS. Returns session_id.
+
+    All conversation data lives on the user's VPS, never the platform DB.
+    """
     import uuid as _uuid
-    from sqlalchemy import text
-    from app.db.database import engine
+    import shlex
+    from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
 
-    # Try to reuse existing session if it's from today
-    if session_id:
-        async with engine.begin() as conn:
-            result = await conn.execute(text(
-                "SELECT id, started_at FROM conversations "
-                "WHERE id = :sid AND user_id = :uid"
-            ), {"sid": session_id, "uid": user_id})
-            row = result.first()
-            if row:
-                started = row[1]
-                now_utc = datetime.now(timezone.utc)
-                if started:
-                    if hasattr(started, 'tzinfo') and started.tzinfo is None:
-                        started = started.replace(tzinfo=timezone.utc)
-                    if started.date() == now_utc.date():
-                        logger.info("[REALTIME] Reusing existing session %s", row[0][:8])
-                        return row[0]
+    # If VPS agent is connected, create/check session on VPS via tunnel
+    if is_agent_connected(user_id):
+        if session_id:
+            # Check if session exists on VPS
+            check_sql = (
+                f"SELECT id FROM conversations "
+                f"WHERE id = '{session_id}' AND user_id = '{user_id}' "
+                f"AND started_at::date = CURRENT_DATE LIMIT 1;"
+            )
+            result = await send_tool_call(user_id, "exec", {
+                "command": f"sudo -u postgres psql -d toup_brain -t -A -c {shlex.quote(check_sql)}",
+            })
+            if result and not result.startswith("ERROR") and session_id in result:
+                logger.info("[REALTIME] Reusing existing VPS session %s", session_id[:8])
+                return session_id
 
-    # Create new session
-    new_id = str(_uuid.uuid4())
-    async with engine.begin() as conn:
-        await conn.execute(text(
-            "INSERT INTO conversations (id, user_id, channel, is_active, started_at, updated_at, message_count, total_tokens) "
-            "VALUES (:id, :uid, 'voice', true, NOW(), NOW(), 0, 0)"
-        ), {"id": new_id, "uid": user_id})
+        new_id = session_id or str(_uuid.uuid4())
+        create_sql = (
+            f"INSERT INTO conversations (id, user_id, channel, is_active, started_at, updated_at, message_count, total_tokens) "
+            f"VALUES ('{new_id}', '{user_id}', 'voice', true, NOW(), NOW(), 0, 0) "
+            f"ON CONFLICT (id) DO NOTHING;"
+        )
+        await send_tool_call(user_id, "exec", {
+            "command": f"sudo -u postgres psql -d toup_brain -c {shlex.quote(create_sql)}",
+        })
+        logger.info("[REALTIME] Created VPS voice session %s", new_id[:8])
+        return new_id
 
-    logger.info("[REALTIME] Created new voice session %s", new_id[:8])
-    return new_id
+    # Fallback: VPS not connected, create via API if available
+    vps = await _get_vps_info(user_id)
+    if vps:
+        agent_url, agent_api_key = vps
+        data = await _vps_api(agent_url, agent_api_key, "POST", "/api/sessions", json_body={
+            "title": "Voice Session",
+            "channel": "voice",
+        })
+        if data and data.get("id"):
+            logger.info("[REALTIME] Created VPS voice session via API %s", data["id"][:8])
+            return data["id"]
+
+    # Last resort: generate UUID locally (no persistence, but session still works)
+    fallback_id = session_id or str(_uuid.uuid4())
+    logger.warning("[REALTIME] VPS unreachable, using local session ID %s (not persisted)", fallback_id[:8])
+    return fallback_id
 
 
 async def _save_voice_messages(
+    user_id: str,
     session_id: str,
     user_text: str,
     assistant_text: str,
     model: str = "gpt-4o-realtime",
 ) -> None:
-    """Persist a user/assistant message pair to the DB using raw SQL for reliability."""
+    """Persist a user/assistant message pair to VPS DB. Never writes to platform DB."""
     import uuid as _uuid
-    from sqlalchemy import text
-    from app.db.database import engine
+    import shlex
+    from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
 
     if not user_text and not assistant_text:
         return
 
     logger.info(
-        "[REALTIME] Saving to session %s: user=%d chars, assistant=%d chars",
+        "[REALTIME] Saving to VPS session %s: user=%d chars, assistant=%d chars",
         session_id[:8], len(user_text), len(assistant_text),
     )
 
+    if not is_agent_connected(user_id):
+        logger.warning("[REALTIME] VPS not connected, cannot save voice messages")
+        return
+
+    stmts = []
     count = 0
-    async with engine.begin() as conn:
-        if user_text:
-            await conn.execute(text(
-                "INSERT INTO messages (id, conversation_id, role, content, created_at) "
-                "VALUES (:id, :cid, 'user', :content, NOW())"
-            ), {"id": str(_uuid.uuid4()), "cid": session_id, "content": user_text.replace("\x00", "")})
-            count += 1
+    if user_text:
+        esc = user_text.replace("\x00", "").replace("'", "''")
+        stmts.append(
+            f"INSERT INTO messages (id, conversation_id, role, content, created_at) "
+            f"VALUES ('{_uuid.uuid4()}', '{session_id}', 'user', '{esc}', NOW());"
+        )
+        count += 1
 
-        if assistant_text:
-            await conn.execute(text(
-                "INSERT INTO messages (id, conversation_id, role, content, model_used, created_at) "
-                "VALUES (:id, :cid, 'assistant', :content, :model, NOW())"
-            ), {"id": str(_uuid.uuid4()), "cid": session_id, "content": assistant_text.replace("\x00", ""), "model": model})
-            count += 1
+    if assistant_text:
+        esc = assistant_text.replace("\x00", "").replace("'", "''")
+        esc_model = model.replace("'", "''")
+        stmts.append(
+            f"INSERT INTO messages (id, conversation_id, role, content, model_used, created_at) "
+            f"VALUES ('{_uuid.uuid4()}', '{session_id}', 'assistant', '{esc}', '{esc_model}', NOW());"
+        )
+        count += 1
 
-        if count > 0:
-            await conn.execute(text(
-                "UPDATE conversations SET message_count = COALESCE(message_count, 0) + :count, "
-                "updated_at = NOW() WHERE id = :cid"
-            ), {"count": count, "cid": session_id})
+    if count > 0:
+        stmts.append(
+            f"UPDATE conversations SET message_count = COALESCE(message_count, 0) + {count}, "
+            f"updated_at = NOW() WHERE id = '{session_id}';"
+        )
 
-    logger.info("[REALTIME] Saved %d message(s) to session %s via raw SQL", count, session_id[:8])
+    sql = " ".join(stmts)
+    await send_tool_call(user_id, "exec", {
+        "command": f"sudo -u postgres psql -d toup_brain -c {shlex.quote(sql)}",
+    })
+
+    logger.info("[REALTIME] Saved %d message(s) to VPS session %s", count, session_id[:8])
 
 
 # ── Background memory extraction (mirrors agent_runner._extract_memories) ──
 async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: str) -> None:
-    """Extract and store memories from a voice conversation turn. Runs as background task."""
+    """Extract and store memories from a voice conversation turn on VPS.
+
+    Uses LLM extraction on platform, then pushes memories to VPS via tunnel
+    memory_store tool. No personal data is written to the platform DB.
+    """
     try:
         from app.services.memory_extractor import get_memory_extractor
-        from app.services.memory_dedup_service import MemoryDedupService
-        from app.schemas import MemoryCreate, BrainType, MemoryLevel
+        from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
+
+        if not is_agent_connected(user_id):
+            logger.info("[REALTIME] VPS not connected, skipping voice memory extraction")
+            return
+
+        # Fetch the user's own OpenAI API key for LLM extraction (operational data, not personal)
+        user_api_key = None
         from app.db.database import async_session_maker
         from app.db import AgentConfig
-
-        # Fetch the user's own OpenAI API key for extraction
-        user_api_key = None
         async with async_session_maker() as db:
             result = await db.execute(
                 select(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)
@@ -519,73 +645,29 @@ async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: 
         if not extracted:
             return
 
-        async with async_session_maker() as db:
-            dedup = MemoryDedupService(db, api_key=user_api_key)
-            count = 0
-            for mem in extracted:
-                memory_data = MemoryCreate(
-                    content=mem.content,
-                    summary=mem.summary,
-                    brain_type=BrainType.USER,
-                    category=mem.category.value if hasattr(mem.category, "value") else mem.category,
-                    memory_type=mem.memory_type,
-                    importance=mem.importance,
-                    confidence=mem.confidence,
-                    memory_level=MemoryLevel.EPISODIC,
-                    emotional_salience=0.5,
-                    tags=mem.tags,
-                    metadata={**(mem.metadata or {}), "source": "voice"},
-                    source_type="conversation",
-                )
-                stored, action = await dedup.smart_create_memory(
-                    new_memory=memory_data,
-                    user_id=user_id,
-                )
-                logger.info("[REALTIME] Memory %s: %s", action, stored.content[:50])
-                count += 1
-
-                # Upsert entities with schema-enforced data
-                if mem.entities:
-                    from app.services.memory_service import MemoryService as _MemSvc
-                    _ms = _MemSvc(db)
-                    for ent in mem.entities:
-                        ent_name = ent.get("name", "").strip()
-                        if not ent_name or len(ent_name) < 2:
-                            continue
-                        await _ms._upsert_entity(
-                            user_id=user_id,
-                            name=ent_name,
-                            entity_type=ent.get("type", "unknown"),
-                            schema_type=ent.get("schema_type"),
-                            attributes=ent.get("data"),
-                        )
-
-            # Extract entity relationships
+        # Push each memory to VPS via tunnel memory_store (handles embedding + dedup on VPS)
+        pushed = 0
+        for mem in extracted:
+            cat = mem.category.value if hasattr(mem.category, "value") else mem.category
             try:
-                relationships = await extractor.extract_relationships_with_llm(
-                    user_message=user_text,
-                    assistant_response=assistant_text,
-                )
-                if relationships:
-                    from app.services.memory_service import MemoryService
-                    mem_service = MemoryService(db)
-                    for rel in relationships:
-                        await mem_service.store_entity_relationship(
-                            user_id=user_id,
-                            source_name=rel["source"],
-                            source_type=rel["source_type"],
-                            target_name=rel["target"],
-                            target_type=rel["target_type"],
-                            relationship=rel["relationship"],
-                            confidence=rel["confidence"],
-                            properties=rel.get("properties"),
-                        )
-                    logger.info("[REALTIME] Extracted %d entity relationships from voice", len(relationships))
+                result = await send_tool_call(user_id, "memory_store", {
+                    "content": mem.content,
+                    "category": cat,
+                    "brain_type": "user",
+                    "importance": mem.importance,
+                })
+                if not result.startswith("ERROR"):
+                    pushed += 1
+                    logger.info("[REALTIME] Memory stored on VPS: %s", mem.content[:50])
+                else:
+                    logger.warning("[REALTIME] VPS memory_store failed: %s", result[:200])
             except Exception as e:
-                logger.warning("[REALTIME] Voice relationship extraction failed (non-fatal): %s", e)
+                logger.warning("[REALTIME] VPS memory_store exception: %s", e)
 
-            await db.commit()
-            logger.info("[REALTIME] Voice memory extraction done: %d memories for user %s", count, user_id[:8])
+        logger.info(
+            "[REALTIME] Voice memory extraction done: %d/%d pushed to VPS for %s",
+            pushed, len(extracted), user_id[:8],
+        )
 
     except Exception as e:
         logger.warning("[REALTIME] Voice memory extraction failed: %s", e)
@@ -645,18 +727,20 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
             context_messages = []
             if session_id:
                 try:
-                    from sqlalchemy import text as sql_text
-                    from app.db.database import engine
-                    async with engine.connect() as conn:
-                        result = await conn.execute(sql_text(
-                            "SELECT role, content FROM messages "
-                            "WHERE conversation_id = :sid "
-                            "ORDER BY created_at DESC LIMIT 10"
-                        ), {"sid": session_id})
-                        rows = list(reversed(result.fetchall()))
-                        for role, content in rows:
-                            if role in ("user", "assistant"):
-                                context_messages.append({"role": role, "content": content})
+                    vps = await _get_vps_info(user_id)
+                    if vps:
+                        agent_url, agent_api_key = vps
+                        msgs_data = await _vps_api(
+                            agent_url, agent_api_key, "GET",
+                            f"/api/sessions/{session_id}/messages",
+                            params={"limit": 10},
+                        )
+                        if msgs_data and isinstance(msgs_data, list):
+                            for m in msgs_data[-10:]:
+                                role = m.get("role", "")
+                                content = m.get("content", "")
+                                if role in ("user", "assistant") and content:
+                                    context_messages.append({"role": role, "content": content})
                 except Exception:
                     pass
 
@@ -708,198 +792,113 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
 async def _finalize_onboarding(user_id: str) -> str:
     """Compile agent and user memories into Identity records and .md files.
 
-    1. Query all agent brain memories → build saul.md (agent soul)
-    2. Query all user brain memories → build identity.md (user profile)
-    3. Upsert Identity DB records (SOUL + USER_PROFILE)
-    4. Write saul.md + identity.md to VPS via tunnel write_file tool
+    ALL data is read from and written to the user's VPS. The platform DB
+    is NEVER used for personal data (memories, identities, conversations).
+
+    1. Read agent + user memories from VPS (they were stored via tunnel memory_store)
+    2. Compile saul.md (agent soul) + identity.md (user profile)
+    3. Write .md files to VPS via tunnel write_file
+    4. Upsert Identity records in VPS DB via tunnel exec
     """
-    from app.db.database import async_session_maker
-    from app.db.models import Identity, IdentityType, AgentConfig, User
-    from app.services.memory_service import MemoryService
+    import shlex
+    from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
 
     try:
-        async with async_session_maker() as db:
-            mem_svc = MemoryService(db)
+        if not is_agent_connected(user_id):
+            return "Onboarding finalized but VPS agent is not connected. Memories were stored during conversation."
 
-            # ── 1. Compile agent brain → saul.md ──
-            agent_memories = await mem_svc.get_memories_by_brain_type(
-                user_id=user_id, brain_type="agent", limit=10000,
+        # Ensure VPS user exists (for FK constraints)
+        await _ensure_vps_user(user_id)
+
+        # ── 1. Read memories from VPS ──
+        vps = await _get_vps_info(user_id)
+        agent_memories = []
+        user_memories = []
+
+        if vps:
+            agent_url, agent_api_key = vps
+
+            agent_mems_data = await _vps_api(
+                agent_url, agent_api_key, "GET", "/api/memories",
+                params={"brain_type": "agent", "limit": 10000},
             )
-            soul_sections = ["# Agent Soul\n"]
-            agent_name = None
-            for m in (agent_memories or []):
-                cat = m.get("category", "")
-                content = m.get("content", "")
-                if "my name is" in content.lower():
-                    # Extract agent name
-                    agent_name = content.split("is")[-1].strip().rstrip(".")
-                soul_sections.append(f"- [{cat}] {content}")
-            saul_content = "\n".join(soul_sections)
+            if agent_mems_data:
+                agent_memories = agent_mems_data.get("memories", agent_mems_data) if isinstance(agent_mems_data, dict) else agent_mems_data
+                if not isinstance(agent_memories, list):
+                    agent_memories = []
 
-            # ── 2. Compile user brain → identity.md ──
-            user_memories = await mem_svc.get_memories_by_brain_type(
-                user_id=user_id, brain_type="user", limit=10000,
+            user_mems_data = await _vps_api(
+                agent_url, agent_api_key, "GET", "/api/memories",
+                params={"brain_type": "user", "limit": 10000},
             )
-            identity_sections = ["# User Profile\n"]
-            for m in (user_memories or []):
-                cat = m.get("category", "")
-                content = m.get("content", "")
-                identity_sections.append(f"- [{cat}] {content}")
-            identity_content = "\n".join(identity_sections)
+            if user_mems_data:
+                user_memories = user_mems_data.get("memories", user_mems_data) if isinstance(user_mems_data, dict) else user_mems_data
+                if not isinstance(user_memories, list):
+                    user_memories = []
 
-            # ── 3. Upsert Identity DB records ──
-            # SOUL identity
-            existing_soul = (await db.execute(
-                select(Identity).where(
-                    Identity.user_id == user_id,
-                    Identity.identity_type == IdentityType.SOUL.value,
+        logger.info(
+            "[REALTIME] Onboarding finalize: %d agent, %d user memories from VPS",
+            len(agent_memories), len(user_memories),
+        )
+
+        # ── 2. Compile saul.md (agent soul) ──
+        soul_sections = ["# Agent Soul\n"]
+        agent_name = None
+        for m in agent_memories:
+            cat = m.get("category", "")
+            content = m.get("content", "")
+            if "my name is" in content.lower():
+                agent_name = content.split("is")[-1].strip().rstrip(".")
+            soul_sections.append(f"- [{cat}] {content}")
+        saul_content = "\n".join(soul_sections)
+
+        # ── 3. Compile identity.md (user profile) ──
+        identity_sections = ["# User Profile\n"]
+        for m in user_memories:
+            cat = m.get("category", "")
+            content = m.get("content", "")
+            identity_sections.append(f"- [{cat}] {content}")
+        identity_content = "\n".join(identity_sections)
+
+        # ── 4. Write .md files to VPS ──
+        await send_tool_call(user_id, "write_file", {
+            "path": "/opt/toup-agent/saul.md",
+            "content": saul_content,
+        })
+        await send_tool_call(user_id, "write_file", {
+            "path": "/opt/toup-agent/identity.md",
+            "content": identity_content,
+        })
+        logger.info("[REALTIME] Wrote saul.md + identity.md to VPS for user %s", user_id[:8])
+
+        # ── 5. Upsert Identity records in VPS DB (NOT platform DB) ──
+        for id_type, id_name, id_content, id_priority in [
+            ("soul", agent_name or "Agent Soul", saul_content, 100),
+            ("user_profile", "User Profile", identity_content, 90),
+        ]:
+            try:
+                esc_content = id_content.replace("'", "''")
+                esc_name = id_name.replace("'", "''")
+                del_sql = (
+                    f"DELETE FROM identities WHERE user_id = '{user_id}' "
+                    f"AND identity_type = '{id_type}';"
                 )
-            )).scalars().first()
-            if existing_soul:
-                existing_soul.content = saul_content
-                if agent_name:
-                    existing_soul.name = agent_name
-                existing_soul.updated_at = datetime.utcnow()
-            else:
-                import uuid as _uuid
-                db.add(Identity(
-                    id=str(_uuid.uuid4()),
-                    user_id=user_id,
-                    identity_type=IdentityType.SOUL.value,
-                    name=agent_name or "Agent Soul",
-                    content=saul_content,
-                    priority=100,
-                    is_active=True,
-                ))
-
-            # USER_PROFILE identity
-            existing_profile = (await db.execute(
-                select(Identity).where(
-                    Identity.user_id == user_id,
-                    Identity.identity_type == IdentityType.USER_PROFILE.value,
-                )
-            )).scalars().first()
-            if existing_profile:
-                existing_profile.content = identity_content
-                existing_profile.updated_at = datetime.utcnow()
-            else:
-                import uuid as _uuid
-                db.add(Identity(
-                    id=str(_uuid.uuid4()),
-                    user_id=user_id,
-                    identity_type=IdentityType.USER_PROFILE.value,
-                    name="User Profile",
-                    content=identity_content,
-                    priority=90,
-                    is_active=True,
-                ))
-
-            await db.commit()
-            logger.info("[REALTIME] Upserted Identity records for user %s", user_id[:8])
-
-        # ── 4. Sync to VPS via tunnel ──
-        try:
-            from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
-            if is_agent_connected(user_id):
-                # 4a. Write .md files
-                await send_tool_call(user_id, "write_file", {
-                    "path": "/opt/toup-agent/saul.md",
-                    "content": saul_content,
-                })
-                await send_tool_call(user_id, "write_file", {
-                    "path": "/opt/toup-agent/identity.md",
-                    "content": identity_content,
-                })
-                logger.info("[REALTIME] Wrote saul.md + identity.md to VPS for user %s", user_id[:8])
-
-                # 4b. Ensure platform user exists in VPS database
-                # The VPS has its own PostgreSQL (toup_brain) with FK constraints.
-                # The platform user_id must exist in VPS users table before
-                # we can insert memories/identities.
-                import shlex
-                # Use a unique email (contains full UUID) to avoid
-                # collisions with any existing users on the VPS
-                user_name = "Platform Owner"
-                try:
-                    async with async_session_maker() as pdb:
-                        plat_user = (await pdb.execute(
-                            select(User).where(User.id == user_id)
-                        )).scalars().first()
-                        if plat_user and plat_user.name:
-                            user_name = plat_user.name
-                except Exception:
-                    pass
-
-                vps_email = f"owner_{user_id}@toup.local"
-                escaped_name_u = user_name.replace("'", "''")
-                ensure_user_sql = (
-                    f"INSERT INTO users (id, email, hashed_password, name, role, is_active, created_at, updated_at) "
-                    f"VALUES ('{user_id}', '{vps_email}', '', '{escaped_name_u}', 'beta_user', true, now(), now()) "
-                    f"ON CONFLICT (id) DO NOTHING;"
+                ins_sql = (
+                    f"INSERT INTO identities (id, user_id, identity_type, name, content, priority, is_active, created_at, updated_at) "
+                    f"VALUES (gen_random_uuid(), '{user_id}', '{id_type}', '{esc_name}', "
+                    f"'{esc_content}', {id_priority}, true, now(), now());"
                 )
                 await send_tool_call(user_id, "exec", {
-                    "command": f'sudo -u postgres psql -d toup_brain -c {shlex.quote(ensure_user_sql)}',
+                    "command": f'sudo -u postgres psql -d toup_brain -c {shlex.quote(del_sql + " " + ins_sql)}',
                 })
-                logger.info("[REALTIME] Ensured user %s exists in VPS DB", user_id[:8])
+            except Exception as e:
+                logger.warning("[REALTIME] Failed to push Identity %s to VPS: %s", id_type, e)
 
-                # 4c. Push memories to VPS brain database via memory_store tool
-                # Each call generates embeddings + dedup on the VPS
-                pushed = 0
-                all_memories = [
-                    *[{**m, "brain_type": "agent"} for m in (agent_memories or [])],
-                    *[{**m, "brain_type": "user"} for m in (user_memories or [])],
-                ]
-                for m in all_memories:
-                    try:
-                        result = await send_tool_call(user_id, "memory_store", {
-                            "content": m.get("content", ""),
-                            "category": m.get("category", "context"),
-                            "brain_type": m["brain_type"],
-                            "importance": m.get("importance", 0.7),
-                        })
-                        if not result.startswith("ERROR"):
-                            pushed += 1
-                        else:
-                            logger.warning("[REALTIME] memory_store failed: %s", result[:200])
-                    except Exception as e:
-                        logger.warning("[REALTIME] memory_store exception: %s", e)
-
-                logger.info(
-                    "[REALTIME] Pushed %d/%d memories to VPS brain DB for user %s",
-                    pushed, len(all_memories), user_id[:8],
-                )
-
-                # 4d. Push Identity records to VPS brain database
-                for id_type, id_name, id_content, id_priority in [
-                    ("soul", agent_name or "Agent Soul", saul_content, 100),
-                    ("user_profile", "User Profile", identity_content, 90),
-                ]:
-                    try:
-                        esc_content = id_content.replace("'", "''")
-                        esc_name = id_name.replace("'", "''")
-                        # Delete existing + insert fresh (no unique constraint on identities)
-                        del_sql = (
-                            f"DELETE FROM identities WHERE user_id = '{user_id}' "
-                            f"AND identity_type = '{id_type}';"
-                        )
-                        ins_sql = (
-                            f"INSERT INTO identities (id, user_id, identity_type, name, content, priority, is_active, created_at, updated_at) "
-                            f"VALUES (gen_random_uuid(), '{user_id}', '{id_type}', '{esc_name}', "
-                            f"'{esc_content}', {id_priority}, true, now(), now());"
-                        )
-                        await send_tool_call(user_id, "exec", {
-                            "command": f'sudo -u postgres psql -d toup_brain -c {shlex.quote(del_sql + " " + ins_sql)}',
-                        })
-                    except Exception as e:
-                        logger.warning("[REALTIME] Failed to push Identity %s to VPS: %s", id_type, e)
-
-                logger.info("[REALTIME] Pushed Identity records to VPS for user %s", user_id[:8])
-        except Exception as e:
-            logger.warning("[REALTIME] Failed to sync to VPS: %s", e)
+        logger.info("[REALTIME] Pushed Identity records to VPS for user %s", user_id[:8])
 
         return (
-            f"Onboarding finalized! Agent soul profile ({len(agent_memories or [])} memories) "
-            f"and user profile ({len(user_memories or [])} memories) saved and synced to VPS. "
+            f"Onboarding finalized! Agent soul profile ({len(agent_memories)} memories) "
+            f"and user profile ({len(user_memories)} memories) saved to VPS. "
             "The user will be redirected to the Hub."
         )
 
@@ -944,6 +943,12 @@ async def realtime_voice_ws(
         return
 
     logger.info("[REALTIME] Session starting for user %s", user_id[:8])
+
+    # ── 1b. Ensure user exists on VPS (for FK constraints) ────
+    try:
+        await _ensure_vps_user(user_id)
+    except Exception as e:
+        logger.warning("[REALTIME] _ensure_vps_user failed (non-fatal): %s", e)
 
     # ── 2. Load OpenAI API key ────────────────────────────────
     openai_key = await _get_user_openai_key(user_id)
@@ -1295,7 +1300,7 @@ async def realtime_voice_ws(
                                 logger.exception("[REALTIME] Failed late session creation for assistant")
                         if db_session_id:
                             try:
-                                await _save_voice_messages(db_session_id, "", full_text, model=turn_model)
+                                await _save_voice_messages(user_id, db_session_id, "", full_text, model=turn_model)
                             except Exception as e:
                                 logger.exception("[REALTIME] Failed to save assistant message")
 
@@ -1330,7 +1335,7 @@ async def realtime_voice_ws(
                                 logger.exception("[REALTIME] Failed late session creation")
                         if db_session_id:
                             try:
-                                await _save_voice_messages(db_session_id, user_text, "")
+                                await _save_voice_messages(user_id, db_session_id, user_text, "")
                             except Exception as e:
                                 logger.exception("[REALTIME] Failed to save user transcript")
                         last_user_text = user_text
