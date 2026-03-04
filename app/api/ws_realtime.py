@@ -1003,10 +1003,9 @@ async def realtime_voice_ws(
     await websocket.send_json(ready_msg)
 
     # ── 6b. Auto-greet in onboarding mode ─────────────────────
-    # Trigger the agent to speak first so the user doesn't stare at "Listening..."
-    if onboarding:
-        await openai_ws.send(json.dumps({"type": "response.create"}))
-        logger.info("[REALTIME] Onboarding: triggered initial greeting")
+    # Wait for client's "audio_ready" signal before greeting, so audio doesn't get dropped.
+    # The client sends this after getUserMedia + AudioContext are fully set up.
+    onboarding_greet_pending = onboarding
 
     # ── 7. Bidirectional relay ────────────────────────────────
     # Track state for transcript accumulation and persistence
@@ -1072,7 +1071,7 @@ async def realtime_voice_ws(
 
     async def client_to_openai():
         """Relay browser audio → OpenAI Realtime API."""
-        nonlocal voice, db_session_id, screen_sharing_active, first_frame_sent
+        nonlocal voice, db_session_id, screen_sharing_active, first_frame_sent, onboarding_greet_pending
         try:
             while True:
                 raw = await websocket.receive_text()
@@ -1128,6 +1127,13 @@ async def realtime_voice_ws(
                     screen_sharing_active = False
                     first_frame_sent = False
                     logger.info("[REALTIME] Screen sharing stopped for user %s", user_id)
+
+                elif msg_type == "audio_ready":
+                    # Client signals that AudioContext + mic are ready for playback
+                    if onboarding_greet_pending:
+                        onboarding_greet_pending = False
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                        logger.info("[REALTIME] Onboarding: client audio ready, triggered greeting")
 
                 elif msg_type == "inject_text":
                     # UI sent a text event (e.g., color selection) — inject into OpenAI conversation
