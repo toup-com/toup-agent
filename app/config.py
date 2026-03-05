@@ -9,10 +9,10 @@ class Settings(BaseSettings):
     debug: bool = True
     
     # Database
-    database_url: str = "sqlite+aiosqlite:///./hexbrain.db"
+    database_url: str = "sqlite+aiosqlite:///./toup.db"
     
     # For production PostgreSQL with pgvector:
-    # database_url: str = "postgresql+asyncpg://user:pass@localhost:5432/hexbrain"
+    # database_url: str = "postgresql+asyncpg://user:pass@localhost:5432/toup_brain"
     
     # Property alias for Alembic compatibility
     @property
@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     temperature: float = 0.7  # Response creativity
     
     # Auth
-    jwt_secret: str = "hexbrain-dev-secret-change-in-production"
+    jwt_secret: str = "toup-dev-secret-change-in-production"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24 * 7  # 1 week
     
@@ -41,8 +41,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = [
         "http://localhost:5173", "http://localhost:3000", 
         "http://localhost:80", "http://localhost",
-        "https://toup.ai", "https://brain.toup.ai", "https://brain-ui.toup.ai",
-        "https://hex-api.toup.ai",
+        "https://toup.ai",
     ]
     
     # Memory extraction
@@ -63,7 +62,7 @@ class Settings(BaseSettings):
     telegram_bot_token: Optional[str] = None  # Set via TELEGRAM_BOT_TOKEN env var
     telegram_allowed_user_ids: list[int] = []  # Restrict to specific Telegram user IDs
     telegram_polling_mode: bool = True  # True=polling, False=webhook
-    telegram_user_map: dict[str, str] = {}  # Map Telegram user ID → HexBrain user ID
+    telegram_user_map: dict[str, str] = {}  # Map Telegram user ID → Toup user ID
     
     # Anthropic Claude (kept for future use)
     anthropic_api_key: Optional[str] = None  # Set via ANTHROPIC_API_KEY env var
