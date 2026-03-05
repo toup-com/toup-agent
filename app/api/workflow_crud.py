@@ -180,3 +180,35 @@ async def duplicate_workflow(workflow_id: str, db: AsyncSession = Depends(get_db
     await db.commit()
     await db.refresh(copy)
     return _to_out(copy)
+
+
+# ── Execution ────────────────────────────────────────────────────
+
+# Module-level reference set by agent_main.py lifespan
+_workflow_engine = None
+
+
+def set_workflow_engine(engine):
+    """Set the workflow engine reference (called from agent_main.py)."""
+    global _workflow_engine
+    _workflow_engine = engine
+
+
+@router.post("/{workflow_id}/run")
+async def run_workflow(
+    workflow_id: str,
+    req: Optional[dict] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Execute a workflow and return the results."""
+    result = await db.execute(select(Workflow).where(Workflow.id == workflow_id))
+    w = result.scalar_one_or_none()
+    if not w:
+        raise HTTPException(404, "Workflow not found")
+
+    if not _workflow_engine:
+        raise HTTPException(503, "Workflow engine not initialized")
+
+    trigger_data = req or {}
+    ctx = await _workflow_engine.execute(w, trigger_data=trigger_data, user_id=settings.user_id)
+    return ctx.to_dict()

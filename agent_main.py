@@ -224,6 +224,13 @@ async def lifespan(app: FastAPI):
         set_api_v1_refs(agent_runner, skill_loader)
         set_realtime_refs(tool_executor, agent_runner)
 
+        # ── Workflow execution engine ─────────────────────────
+        from app.agent.workspace.engine import WorkflowEngine
+        from app.api.workflow_crud import set_workflow_engine
+        workflow_engine = WorkflowEngine(agent_runner=agent_runner, tool_executor=tool_executor)
+        set_workflow_engine(workflow_engine)
+        print("⚡ Workflow engine initialized")
+
         # ── Start Telegram bot (if configured) ────────────────
         if settings.telegram_bot_token:
             telegram_bot = ToupTelegramBot(
