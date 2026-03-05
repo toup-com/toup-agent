@@ -184,3 +184,25 @@ async def duplicate_workflow(
     if isinstance(result, dict) and result.get("error"):
         raise HTTPException(result["status"], result.get("detail", "Agent error"))
     return result
+
+
+@router.post("/{workflow_id}/run")
+async def run_workflow(
+    workflow_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Execute a workflow — proxied to VPS agent."""
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    _require_agent(proxy)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    result = await _proxy_workflow(*proxy, path=f"{workflow_id}/run", method="POST", body=body)
+    if result is None:
+        raise HTTPException(502, "Agent unreachable")
+    if isinstance(result, dict) and result.get("error"):
+        raise HTTPException(result.get("status", 500), result.get("detail", "Agent error"))
+    return result
