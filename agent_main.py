@@ -34,6 +34,7 @@ from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.workflow_crud import router as workflow_crud_router
+from app.api.dashboard import router as dashboard_router
 
 _app_start_time = None
 
@@ -535,6 +536,7 @@ app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(workflow_crud_router, prefix=settings.api_prefix)
+app.include_router(dashboard_router, prefix=settings.api_prefix)
 
 
 @app.get("/")
