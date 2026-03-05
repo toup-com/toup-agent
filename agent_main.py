@@ -33,6 +33,7 @@ from app.api.api_v1 import router as api_v1_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
+from app.api.workflow_crud import router as workflow_crud_router
 
 _app_start_time = None
 
@@ -181,7 +182,7 @@ async def lifespan(app: FastAPI):
     agent_runner = None
 
     try:
-        from app.agent.telegram_bot import HexBrainTelegramBot
+        from app.agent.telegram_bot import ToupTelegramBot
         from app.agent.agent_runner import AgentRunner
         from app.agent.tool_executor import ToolExecutor
         from app.services.openai_agent_service import OpenAIAgentService
@@ -225,7 +226,7 @@ async def lifespan(app: FastAPI):
 
         # ── Start Telegram bot (if configured) ────────────────
         if settings.telegram_bot_token:
-            telegram_bot = HexBrainTelegramBot(
+            telegram_bot = ToupTelegramBot(
                 token=settings.telegram_bot_token,
                 agent_runner=agent_runner,
             )
@@ -526,6 +527,7 @@ app.include_router(api_v1_router, prefix=settings.api_prefix)
 app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
+app.include_router(workflow_crud_router, prefix=settings.api_prefix)
 
 
 @app.get("/")

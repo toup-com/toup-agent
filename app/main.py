@@ -1,5 +1,5 @@
 """
-HexBrain Memory System - Main Application Entry Point
+Toup Agent Platform - Main Application Entry Point
 """
 
 from contextlib import asynccontextmanager
@@ -33,6 +33,8 @@ from app.api.doctor import router as doctor_router
 from app.api.voice import router as voice_router, set_voice_refs
 # VPS provisioning
 from app.api.vps import router as vps_router
+# Workflows
+from app.api.workflows import router as workflows_router
 # Combined checkout
 from app.api.checkout import router as checkout_router
 
@@ -48,7 +50,7 @@ async def lifespan(app: FastAPI):
     _app_start_time = _time.time()
 
     # Startup
-    print("🧠 HexBrain Memory System starting up...")
+    print("🧠 Toup Agent starting up...")
     await init_db()
     print("✅ Database initialized")
     
@@ -81,7 +83,7 @@ async def lifespan(app: FastAPI):
     skill_loader = None
     if settings.telegram_bot_token:
         try:
-            from app.agent.telegram_bot import HexBrainTelegramBot
+            from app.agent.telegram_bot import ToupTelegramBot
             from app.agent.agent_runner import AgentRunner
             from app.agent.tool_executor import ToolExecutor
             from app.services.openai_agent_service import OpenAIAgentService
@@ -107,7 +109,7 @@ async def lifespan(app: FastAPI):
                 tool_executor=tool_executor,
                 skill_loader=skill_loader,
             )
-            telegram_bot = HexBrainTelegramBot(
+            telegram_bot = ToupTelegramBot(
                 token=settings.telegram_bot_token,
                 agent_runner=agent_runner,
             )
@@ -182,7 +184,7 @@ async def lifespan(app: FastAPI):
     # ── Hook Bus ─────────────────────────────────────────────
     from app.agent.hooks import get_hook_bus, HookEvent
     _hook_bus = get_hook_bus()
-    await _hook_bus.emit(HookEvent.STARTUP, {"app": "hexbrain"})
+    await _hook_bus.emit(HookEvent.STARTUP, {"app": "toup"})
     print("🔌 Hook bus started")
 
     # ── Set webhook refs ─────────────────────────────────────
@@ -253,10 +255,10 @@ async def lifespan(app: FastAPI):
     yield
     
     # ── Shutdown hooks ───────────────────────────────────────
-    await _hook_bus.emit(HookEvent.SHUTDOWN, {"app": "hexbrain"})
-    
+    await _hook_bus.emit(HookEvent.SHUTDOWN, {"app": "toup"})
+
     # Shutdown — reverse order for clean teardown
-    print("🧠 HexBrain shutting down gracefully...")
+    print("🧠 Toup Agent shutting down gracefully...")
     
     # 1. Stop cron scheduler first (no new jobs)
     if cron_service:
@@ -327,7 +329,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
     
-    print("🧠 HexBrain Memory System shutdown complete.")
+    print("🧠 Toup Agent shutdown complete.")
 
 
 app = FastAPI(
@@ -373,6 +375,8 @@ app.include_router(doctor_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 # VPS provisioning
 app.include_router(vps_router, prefix=settings.api_prefix)
+# Workflows (proxied to VPS agent)
+app.include_router(workflows_router, prefix=settings.api_prefix)
 # Combined checkout
 app.include_router(checkout_router, prefix=settings.api_prefix)
 
