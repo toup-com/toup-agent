@@ -681,14 +681,25 @@ async def agent_self_update():
     else:
         steps.append({"step": "pip_install", "ok": True, "output": "skipped (no changes)"})
 
-    # 3. Schedule restart — re-exec the process after response is sent
+    # 3. Schedule restart — use systemctl if available, else re-exec
     import asyncio
 
     async def _delayed_restart():
         await asyncio.sleep(1.0)  # Give time for HTTP response to be sent
         print("\n🔄 Restarting after update...")
-        # Re-exec ourselves — works with or without a service manager
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        # Prefer systemctl restart if running as a systemd service
+        service_name = os.environ.get("SYSTEMD_SERVICE") or "toup-agent"
+        systemctl = subprocess.run(
+            ["systemctl", "is-active", service_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if systemctl.returncode == 0:
+            # We're running under systemd — let it handle the restart
+            subprocess.Popen(["systemctl", "restart", service_name])
+        else:
+            # Not systemd — re-exec ourselves
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
     asyncio.get_event_loop().create_task(_delayed_restart())
 
