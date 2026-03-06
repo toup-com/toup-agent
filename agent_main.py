@@ -29,6 +29,7 @@ from app.api.memories import router as memories_router
 from app.api.sessions import router as sessions_router
 from app.api.chat import router as chat_router
 from app.api.ws_chat import router as ws_chat_router, set_ws_refs
+from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.api_v1 import router as api_v1_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
@@ -222,6 +223,7 @@ async def lifespan(app: FastAPI):
         # Wire WebSocket and API v1 refs (so they can invoke the agent)
         from app.api.api_v1 import set_api_v1_refs
         set_ws_refs(agent_runner, skill_loader)
+        set_ws_browser_refs(agent_runner, skill_loader)
         set_api_v1_refs(agent_runner, skill_loader)
         set_realtime_refs(tool_executor, agent_runner)
 
@@ -531,6 +533,7 @@ app.include_router(memories_router, prefix=settings.api_prefix)
 app.include_router(sessions_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
 app.include_router(ws_chat_router, prefix=settings.api_prefix)
+app.include_router(ws_browser_router, prefix=settings.api_prefix)
 app.include_router(api_v1_router, prefix=settings.api_prefix)
 app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
