@@ -1,7 +1,7 @@
 """
 CLI Doctor — System health checks and diagnostics.
 
-Provides comprehensive health checks for the HexBrain platform:
+Provides comprehensive health checks for the Toup platform:
   * Database connectivity and schema
   * API endpoint availability
   * Docker / sandbox status
@@ -106,7 +106,7 @@ class DoctorReport:
         }
         lines = [
             "╔══════════════════════════════════════════╗",
-            "║       HexBrain Doctor Report             ║",
+            "║       Toup Agent Doctor Report            ║",
             "╚══════════════════════════════════════════╝",
             "",
         ]
@@ -229,7 +229,7 @@ async def _check_config() -> CheckResult:
         from app.config import settings
         issues = []
 
-        if settings.jwt_secret == "hexbrain-dev-secret-change-in-production":
+        if settings.jwt_secret in ("hexbrain-dev-secret-change-in-production", "toup-dev-secret-change-in-production"):
             issues.append("JWT secret is still the default — change in production!")
 
         if not settings.openai_api_key:

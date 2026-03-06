@@ -7,7 +7,7 @@ Connects via Feishu Open Platform Bot API + WebSocket.
 import logging
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger("hexbrain.channel.feishu")
+logger = logging.getLogger("toup.channel.feishu")
 
 
 class FeishuChannel:

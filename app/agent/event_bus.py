@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 from collections import deque
 
-logger = logging.getLogger("hexbrain.event_bus")
+logger = logging.getLogger("toup.event_bus")
 
 
 class EventPriority(str, Enum):

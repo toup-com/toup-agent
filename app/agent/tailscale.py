@@ -111,7 +111,7 @@ class TailscaleManager:
         self._state = TailscaleState.CONNECTED
         self._connected_at = time.time()
         self._ip = "100.64.0.1"
-        self._dns_name = f"{self._config.hostname or 'hexbrain'}.{self._config.tailnet or 'tailnet'}.ts.net"
+        self._dns_name = f"{self._config.hostname or 'toup'}.{self._config.tailnet or 'tailnet'}.ts.net"
         logger.info(f"[TAILSCALE] Connected as {self._dns_name}")
         return True
 

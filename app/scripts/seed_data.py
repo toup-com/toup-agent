@@ -78,7 +78,7 @@ async def seed_database():
     
     async with async_session_maker() as db:
         # Create or get demo user
-        demo_email = "demo@hexbrain.local"
+        demo_email = "demo@toup.local"
         demo_password = "demo123456"
         
         user = await get_user_by_email(db, demo_email)

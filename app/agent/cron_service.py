@@ -1,5 +1,5 @@
 """
-Cron Service — Scheduled tasks for the HexBrain Agent Runtime.
+Cron Service — Scheduled tasks for the Toup Agent Runtime.
 
 Supports:
 - "at" jobs: one-shot at a specific datetime
@@ -99,7 +99,7 @@ def parse_schedule(schedule: str) -> tuple[str, Any]:
 
 class CronService:
     """
-    Manages scheduled jobs for the HexBrain agent.
+    Manages scheduled jobs for the Toup agent.
     
     Jobs are stored in DB and scheduled via APScheduler.
     On startup, loads all enabled jobs from DB.

@@ -183,7 +183,7 @@ class SkillLoader:
 
     def _load_skill_from_file(self, filepath: str, fallback_name: str) -> Optional[Skill]:
         """Import a skill.py file and find the Skill subclass."""
-        module_name = f"hexbrain_skill_{fallback_name}"
+        module_name = f"toup_skill_{fallback_name}"
 
         spec = importlib.util.spec_from_file_location(module_name, filepath)
         if not spec or not spec.loader:

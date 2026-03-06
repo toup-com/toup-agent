@@ -1,5 +1,5 @@
 """
-Tool definitions for the HexBrain Agent Runtime.
+Tool definitions for the Toup Agent Runtime.
 
 Each tool is defined in Anthropic's tool format:
 { name, description, input_schema (JSON Schema) }
@@ -169,7 +169,7 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "memory_search",
             "description": (
-                "Search HexBrain's memory system using semantic search. "
+                "Search your memory system using semantic search. "
                 "Returns matching memories ranked by relevance."
             ),
             "input_schema": {
@@ -198,7 +198,7 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "memory_store",
             "description": (
-                "Store a new memory into HexBrain. "
+                "Store a new memory into your brain. "
                 "Automatically deduplicates and merges with existing memories."
             ),
             "input_schema": {

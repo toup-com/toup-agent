@@ -270,7 +270,7 @@ async def logout_user(response: Response):
 @router.post("/demo", response_model=Token)
 async def demo_login(db: AsyncSession = Depends(get_db)):
     """Create or login as demo user (for testing)"""
-    demo_email = "demo@hexbrain.local"
+    demo_email = "demo@toup.local"
     demo_password = "demo123456"
     
     user = await get_user_by_email(db, demo_email)

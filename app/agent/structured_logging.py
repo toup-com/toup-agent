@@ -114,7 +114,7 @@ def get_subsystem_logger(subsystem: Subsystem) -> SubsystemLogger:
     """Get a structured logger for a subsystem."""
     key = subsystem.value
     if key not in _loggers:
-        logger = logging.getLogger(f"hexbrain.{key}")
+        logger = logging.getLogger(f"toup.{key}")
         _loggers[key] = SubsystemLogger(subsystem, logger)
     return _loggers[key]
 
@@ -128,7 +128,7 @@ def enable_structured_logging(level: int = logging.INFO):
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(StructuredFormatter())
 
-    root = logging.getLogger("hexbrain")
+    root = logging.getLogger("toup")
     root.addHandler(handler)
     root.setLevel(level)
     _structured_enabled = True

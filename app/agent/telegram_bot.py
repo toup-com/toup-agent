@@ -1,4 +1,4 @@
-"""HexBrain Telegram Bot — Connects Telegram to the Agent Runtime.
+"""Toup Telegram Bot — Connects Telegram to the Agent Runtime.
 
 Handles:
 - Text messages → AgentRunner
@@ -44,9 +44,9 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-class HexBrainTelegramBot:
+class ToupTelegramBot:
     """
-    Telegram bot that connects to the HexBrain Agent Runtime.
+    Telegram bot that connects to the Toup Agent Runtime.
 
     - Receives messages from Telegram
     - Routes them through AgentRunner (memory + tools + LLM)
@@ -62,7 +62,7 @@ class HexBrainTelegramBot:
         self.cron_service = None  # Set after cron service starts
         self.subagent_manager = None  # Set after subagent manager created
 
-        # Map Telegram user ID → HexBrain user ID (in-memory cache)
+        # Map Telegram user ID → Toup user ID (in-memory cache)
         self._user_map: dict[int, str] = {}
         # Map Telegram chat ID → session ID
         self._session_map: dict[int, str] = {}
@@ -169,7 +169,7 @@ class HexBrainTelegramBot:
             BotCommand("skills", "List loaded skill plugins"),
         ])
 
-        logger.info("🤖 HexBrain Telegram bot started (polling mode)")
+        logger.info("🤖 Toup Telegram bot started (polling mode)")
 
     async def stop(self):
         """Stop the bot gracefully."""
@@ -230,9 +230,9 @@ class HexBrainTelegramBot:
             row = result.scalar_one_or_none()
             return bool(row)  # True only if is_paired == True
 
-    async def _get_hexbrain_user_id(self, telegram_user_id: int, telegram_user=None) -> str:
+    async def _get_toup_user_id(self, telegram_user_id: int, telegram_user=None) -> str:
         """
-        Map a Telegram user ID to a HexBrain user ID.
+        Map a Telegram user ID to a Toup user ID.
         Uses TelegramUserMapping DB table. Auto-creates user if needed.
         Falls back to config mapping for hardcoded overrides.
         """
@@ -240,11 +240,11 @@ class HexBrainTelegramBot:
         if telegram_user_id in self._user_map:
             return self._user_map[telegram_user_id]
 
-        # Check if there's a configured mapping override (Telegram ID → HexBrain user ID)
+        # Check if there's a configured mapping override (Telegram ID → Toup user ID)
         tg_id_str = str(telegram_user_id)
         if tg_id_str in settings.telegram_user_map:
             mapped_id = settings.telegram_user_map[tg_id_str]
-            logger.info(f"[AGENT] Telegram user {telegram_user_id} mapped to HexBrain user {mapped_id} via config")
+            logger.info(f"[AGENT] Telegram user {telegram_user_id} mapped to Toup user {mapped_id} via config")
             self._user_map[telegram_user_id] = mapped_id
 
             # Config-mapped users are implicitly paired — ensure DB reflects that
@@ -291,7 +291,7 @@ class HexBrainTelegramBot:
                     mapping.telegram_username = telegram_user.username
                 await db.commit()
                 self._user_map[telegram_user_id] = mapping.user_id
-                logger.info(f"[AGENT] Telegram user {telegram_user_id} → HexBrain user {mapping.user_id} (from DB)")
+                logger.info(f"[AGENT] Telegram user {telegram_user_id} → Toup user {mapping.user_id} (from DB)")
                 return mapping.user_id
 
             # No mapping exists — map to platform owner or create new user
@@ -323,7 +323,7 @@ class HexBrainTelegramBot:
             # Fallback: create a new user (multi-tenant / no owner configured)
             from app.services.auth_service import get_user_by_email, create_user
 
-            email = f"telegram_{telegram_user_id}@hexbrain.bot"
+            email = f"telegram_{telegram_user_id}@toup.local"
 
             user = await get_user_by_email(db, email)
             if not user:
@@ -333,7 +333,7 @@ class HexBrainTelegramBot:
                     password=f"tg_{telegram_user_id}_bot_user",
                     name=name,
                 )
-                logger.info(f"Created HexBrain user for Telegram user {telegram_user_id}: {user.id}")
+                logger.info(f"Created Toup user for Telegram user {telegram_user_id}: {user.id}")
 
             # Create mapping
             new_mapping = TelegramUserMapping(
@@ -345,7 +345,7 @@ class HexBrainTelegramBot:
             db.add(new_mapping)
             await db.commit()
 
-            logger.info(f"[AGENT] Telegram user {telegram_user_id} → HexBrain user {user.id} (new mapping)")
+            logger.info(f"[AGENT] Telegram user {telegram_user_id} → Toup user {user.id} (new mapping)")
             self._user_map[telegram_user_id] = user.id
             return user.id
 
@@ -435,7 +435,7 @@ class HexBrainTelegramBot:
             return
 
         # Ensure user mapping exists (creates session on first message)
-        await self._get_hexbrain_user_id(update.effective_user.id, telegram_user=update.effective_user)
+        await self._get_toup_user_id(update.effective_user.id, telegram_user=update.effective_user)
 
         await update.message.reply_text(
             "👋 Hey! I'm your <b>Toup</b> AI assistant.\n\n"
@@ -482,7 +482,7 @@ class HexBrainTelegramBot:
         if not self._is_allowed(update.effective_user.id):
             return
 
-        user_id = await self._get_hexbrain_user_id(update.effective_user.id)
+        user_id = await self._get_toup_user_id(update.effective_user.id)
 
         msg_count = 0
         tokens_used = 0
@@ -557,7 +557,7 @@ class HexBrainTelegramBot:
             return
 
         chat_id = update.effective_chat.id
-        user_id = await self._get_hexbrain_user_id(update.effective_user.id)
+        user_id = await self._get_toup_user_id(update.effective_user.id)
 
         # Mark old session as inactive in DB
         old_session_id = await self._get_session_id(chat_id, user_id)
@@ -593,7 +593,7 @@ class HexBrainTelegramBot:
             return
 
         chat_id = update.effective_chat.id
-        user_id = await self._get_hexbrain_user_id(update.effective_user.id)
+        user_id = await self._get_toup_user_id(update.effective_user.id)
 
         # Mark old session as inactive
         old_session_id = await self._get_session_id(chat_id, user_id)
@@ -685,9 +685,9 @@ class HexBrainTelegramBot:
             if mapping:
                 mapping.is_paired = True
             else:
-                # Create mapping + mark paired — _get_hexbrain_user_id will
+                # Create mapping + mark paired — _get_toup_user_id will
                 # create the full user later on first message
-                user_id = await self._get_hexbrain_user_id(tg_user.id)
+                user_id = await self._get_toup_user_id(tg_user.id)
                 result2 = await db.execute(
                     select(TelegramUserMapping).where(
                         TelegramUserMapping.telegram_id == tg_user.id
@@ -703,12 +703,12 @@ class HexBrainTelegramBot:
         await update.message.reply_text("✅ Paired successfully! You can now use the bot.")
 
     async def _cmd_whoami(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /whoami — show user's Telegram + HexBrain info."""
+        """Handle /whoami — show user's Telegram + Toup info."""
         if not self._is_allowed(update.effective_user.id):
             return
 
         tg_user = update.effective_user
-        user_id = await self._get_hexbrain_user_id(tg_user.id)
+        user_id = await self._get_toup_user_id(tg_user.id)
 
         user_email = "unknown"
         msg_count = 0
@@ -772,7 +772,7 @@ class HexBrainTelegramBot:
             f"👤 <b>Your Info</b>\n\n"
             f"Name: {name}\n"
             f"Telegram ID: <code>{tg_user.id}</code>\n"
-            f"HexBrain User: <code>{user_email}</code>\n"
+            f"Toup User: <code>{user_email}</code>\n"
             f"Session: {session_status}\n"
             f"Memories: {mem_count} stored about you",
             parse_mode="HTML",
@@ -1244,7 +1244,7 @@ class HexBrainTelegramBot:
         if not self._is_allowed(update.effective_user.id):
             return
 
-        user_id = await self._get_hexbrain_user_id(update.effective_user.id)
+        user_id = await self._get_toup_user_id(update.effective_user.id)
         chat_id = update.effective_chat.id
         session_id = await self._get_session_id(chat_id, user_id)
 
@@ -1290,7 +1290,7 @@ class HexBrainTelegramBot:
         if not self._is_allowed(update.effective_user.id):
             return
 
-        user_id = await self._get_hexbrain_user_id(update.effective_user.id)
+        user_id = await self._get_toup_user_id(update.effective_user.id)
 
         session_tokens_in = 0
         session_tokens_out = 0
@@ -1390,7 +1390,7 @@ class HexBrainTelegramBot:
         if not self._is_allowed(update.effective_user.id):
             return
 
-        user_id = await self._get_hexbrain_user_id(update.effective_user.id)
+        user_id = await self._get_toup_user_id(update.effective_user.id)
 
         if not self.cron_service:
             await update.message.reply_text("⏰ Cron service not available.")
@@ -1422,7 +1422,7 @@ class HexBrainTelegramBot:
         if not self._is_allowed(update.effective_user.id):
             return
 
-        user_id = await self._get_hexbrain_user_id(update.effective_user.id)
+        user_id = await self._get_toup_user_id(update.effective_user.id)
         chat_id = update.effective_chat.id
         session_id = await self._get_session_id(chat_id, user_id)
 
@@ -1449,7 +1449,7 @@ class HexBrainTelegramBot:
 
             # Build export text
             lines = [
-                f"=== HexBrain Conversation Export ===",
+                f"=== Toup Conversation Export ===",
                 f"Session: {session_id}",
                 f"Messages: {len(messages)}",
                 f"Exported: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
@@ -1466,7 +1466,7 @@ class HexBrainTelegramBot:
             # Send as file
             import io
             file_bytes = io.BytesIO(export_text.encode("utf-8"))
-            file_bytes.name = f"hexbrain_export_{session_id[:8]}.txt"
+            file_bytes.name = f"toup_export_{session_id[:8]}.txt"
             await update.message.reply_document(
                 document=file_bytes,
                 caption=f"📄 Exported {len(messages)} messages from session <code>{session_id[:8]}</code>",
@@ -1485,7 +1485,7 @@ class HexBrainTelegramBot:
             await update.message.reply_text("🔧 Sub-agent system not available.")
             return
 
-        user_id = await self._get_hexbrain_user_id(update.effective_user.id)
+        user_id = await self._get_toup_user_id(update.effective_user.id)
         runs = self.subagent_manager.list_runs(user_id=user_id)
 
         if not runs:
@@ -1564,7 +1564,7 @@ class HexBrainTelegramBot:
         # Create a lightweight update-like wrapper for _process_message
         logger.info(f"[TG] Callback query: {callback_data}")
 
-        user_id = await self._get_hexbrain_user_id(update.effective_user.id)
+        user_id = await self._get_toup_user_id(update.effective_user.id)
         session_id = await self._get_session_id(chat_id, user_id)
 
         cancel_event = self.get_cancel_event(chat_id)
@@ -1869,8 +1869,8 @@ class HexBrainTelegramBot:
         tg_user_id = update.effective_user.id
         msg_id = update.message.message_id
 
-        # Get HexBrain user ID
-        user_id = await self._get_hexbrain_user_id(tg_user_id, telegram_user=update.effective_user)
+        # Get Toup user ID
+        user_id = await self._get_toup_user_id(tg_user_id, telegram_user=update.effective_user)
 
         # Get or set session (cache + DB fallback)
         session_id = await self._get_session_id(chat_id, user_id)

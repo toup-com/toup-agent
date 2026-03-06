@@ -91,7 +91,7 @@ class AnthropicService:
     ]
     _CC_TOOL_LOOKUP = {t.lower(): t for t in CLAUDE_CODE_TOOLS}
     
-    # Map HexBrain tool names → Claude Code tool names
+    # Map Toup tool names → Claude Code tool names
     _TOOL_NAME_MAP = {
         "exec": "Bash",
         "read_file": "Read",
@@ -112,11 +112,11 @@ class AnthropicService:
         "sessions_history": "AskUserQuestion",
         "browser": "Read",  # duplicate — will rename below
     }
-    # Reverse map for converting CC names back to HexBrain names
+    # Reverse map for converting CC names back to Toup names
     _TOOL_NAME_REVERSE = {}
     
     def _build_tool_maps(self, tools: list) -> tuple:
-        """Build forward (hex→cc) and reverse (cc→hex) tool name maps.
+        """Build forward (toup→cc) and reverse (cc→toup) tool name maps.
         Ensures each CC name is unique by appending suffix if needed."""
         forward = {}
         reverse = {}

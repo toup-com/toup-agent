@@ -7,7 +7,7 @@ Connects via Nostr relay WebSocket (NIP-01).
 import logging
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger("hexbrain.channel.nostr")
+logger = logging.getLogger("toup.channel.nostr")
 
 
 class NostrChannel:

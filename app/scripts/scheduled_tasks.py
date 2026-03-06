@@ -26,7 +26,7 @@ from app.services.consolidation_service import get_consolidation_service
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("hexbrain.scheduler")
+logger = logging.getLogger("toup.scheduler")
 
 # Global scheduler instance
 scheduler: Optional[AsyncIOScheduler] = None

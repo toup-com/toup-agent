@@ -29,7 +29,7 @@ class HeartbeatService:
 
     Dependencies (set via setters after construction):
       - agent_runner: AgentRunner instance
-      - telegram_bot: HexBrainTelegramBot instance
+      - telegram_bot: ToupTelegramBot instance
     """
 
     def __init__(self):

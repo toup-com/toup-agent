@@ -1,5 +1,5 @@
 """
-Discord Channel Adapter — Connects Discord to HexBrain agent runtime.
+Discord Channel Adapter — Connects Discord to Toup agent runtime.
 
 Uses discord.py (py-cord) to handle:
 - DM conversations

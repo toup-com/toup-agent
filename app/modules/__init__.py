@@ -1,5 +1,5 @@
 """
-HexBrain Modules — Separated feature modules.
+Toup Modules — Separated feature modules.
 
 Each module owns its own routers, schemas, and business logic.
 The Brain core (memories, identities, embeddings, decay, consolidation)

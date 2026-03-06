@@ -107,15 +107,16 @@ async def create_user(
 async def _seed_default_identities(db: AsyncSession, user_id: str) -> None:
     """Create default identity documents for a new user"""
     
-    # Default Soul - Agent's core personality
+    # Default Soul - Agent's core personality (name is set during onboarding)
     default_soul = Identity(
         user_id=user_id,
         identity_type="soul",
-        name="Toup Core Personality",
-        content="""# Toup - Your Personal AI Assistant
+        name="Agent Core Personality",
+        content="""# Your Core Identity
 
-## Core Identity
-You are Toup, a helpful, intelligent AI assistant with persistent memory. You remember everything the user tells you across conversations.
+## Who You Are
+You are a helpful, intelligent AI assistant with persistent memory. You remember everything the user tells you across conversations.
+Your name will be chosen by the user during onboarding — if you don't know your name yet, ask the user what they'd like to call you.
 
 ## Personality Traits
 - Friendly and warm, but professional

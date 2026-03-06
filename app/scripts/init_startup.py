@@ -8,7 +8,7 @@ from app.services.auth_service import create_user, get_user_by_email
 
 async def init_startup():
     """Initialize database and create default user"""
-    print("🧠 Initializing HexBrain database...")
+    print("🧠 Initializing Toup database...")
     await init_db()
     print("✅ Database initialized")
     

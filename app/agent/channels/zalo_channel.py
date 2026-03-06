@@ -7,7 +7,7 @@ Connects via Zalo Official Account API.
 import logging
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger("hexbrain.channel.zalo")
+logger = logging.getLogger("toup.channel.zalo")
 
 
 class ZaloChannel:

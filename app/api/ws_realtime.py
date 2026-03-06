@@ -268,8 +268,9 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
     if not sections:
         sections.append(
             "# Core Identity\n"
-            "You are Toup, an intelligent AI assistant with persistent memory. "
-            "You remember past conversations and learn about the user over time."
+            "You are an intelligent AI assistant with persistent memory. "
+            "You remember past conversations and learn about the user over time. "
+            "If you don't know your name, ask the user what they'd like to call you."
         )
 
     # 3. Voice-specific instructions
@@ -310,12 +311,14 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         sections.append(
             "# ONBOARDING MODE (ACTIVE — THIS IS YOUR FIRST CONVERSATION)\n"
             "You are meeting the user for the very first time. They just deployed you and "
-            "you are coming alive! You are centered on their screen, looking at them.\n\n"
+            "you are coming alive! You are centered on their screen, looking at them.\n"
+            "IMPORTANT: You do NOT have a name yet. The user will choose your name. "
+            "Do NOT introduce yourself with any name — not 'Toup', not 'Agent', nothing.\n\n"
 
             "## CONVERSATION FLOW (FOLLOW THIS ORDER STRICTLY)\n\n"
 
             "### Phase 1: Names\n"
-            "Your FIRST question MUST be: \"What is your name, and what is my name?\"\n"
+            "Your FIRST question MUST be to ask what the user wants to call you and what their name is.\n"
             "Wait for their answer. Then:\n"
             "- Store user's name: memory_store(brain_type='user', category='identity', "
             "content='User name: <name>')\n"
@@ -963,7 +966,7 @@ async def realtime_voice_ws(
         logger.info("[REALTIME] Built instructions (%d chars, onboarding=%s)", len(instructions), onboarding)
     except Exception as e:
         logger.exception("[REALTIME] Failed to build instructions")
-        instructions = "You are Toup, a helpful AI assistant in a voice conversation."
+        instructions = "You are a helpful AI assistant in a voice conversation."
 
     # ── 4b. Load user's disabled tools and filter ──────────────
     session_tools = REALTIME_TOOLS
@@ -1051,9 +1054,9 @@ async def realtime_voice_ws(
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.5,
+                    "threshold": 0.8,
                     "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
+                    "silence_duration_ms": 700,
                 },
                 "tools": session_tools,
                 "tool_choice": "auto",

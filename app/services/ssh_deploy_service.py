@@ -811,8 +811,8 @@ fi
 # Auto-detect repo structure (flat vs nested)
 if [ -f "$AGENT_DIR/agent_main.py" ]; then
   BACKEND_ROOT="$AGENT_DIR"
-elif [ -f "$AGENT_DIR/brain/backend/agent_main.py" ]; then
-  BACKEND_ROOT="$AGENT_DIR/brain/backend"
+elif [ -f "$AGENT_DIR/backend/agent_main.py" ]; then
+  BACKEND_ROOT="$AGENT_DIR/backend"
 else
   echo "  ERROR: agent_main.py not found in repo"
   exit 1
@@ -884,8 +884,8 @@ AGENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Auto-detect repo structure
 if [ -f "$AGENT_DIR/agent_main.py" ]; then
   BACKEND_DIR="$AGENT_DIR"
-elif [ -f "$AGENT_DIR/brain/backend/agent_main.py" ]; then
-  BACKEND_DIR="$AGENT_DIR/brain/backend"
+elif [ -f "$AGENT_DIR/backend/agent_main.py" ]; then
+  BACKEND_DIR="$AGENT_DIR/backend"
 else
   BACKEND_DIR="$AGENT_DIR"
 fi

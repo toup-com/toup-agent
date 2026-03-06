@@ -1,5 +1,5 @@
 """
-Alembic environment configuration for HexBrain.
+Alembic environment configuration for Toup.
 Supports async SQLAlchemy with PostgreSQL.
 """
 

@@ -1,5 +1,5 @@
 """
-Sub-Agent Manager — Background task system for HexBrain.
+Sub-Agent Manager — Background task system for Toup.
 
 The agent can spawn independent background tasks that:
 - Run with their own isolated session

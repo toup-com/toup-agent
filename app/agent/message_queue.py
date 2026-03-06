@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 from collections import deque
 
-logger = logging.getLogger("hexbrain.message_queue")
+logger = logging.getLogger("toup.message_queue")
 
 
 class MessageStatus(str, Enum):

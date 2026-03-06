@@ -1,5 +1,5 @@
 """
-Update Mechanism — Self-update support for HexBrain.
+Update Mechanism — Self-update support for Toup.
 
 Checks for new versions, downloads updates, and applies them.
 Supports both git-based and release-based update strategies.
@@ -90,7 +90,7 @@ class UpdateResult:
 
 class Updater:
     """
-    Manages HexBrain version checking and updates.
+    Manages Toup version checking and updates.
 
     Supports multiple update strategies:
     - git: Pull latest from the repository

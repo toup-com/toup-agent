@@ -1,5 +1,5 @@
 """
-Slack Channel Adapter — Connects Slack to HexBrain agent runtime.
+Slack Channel Adapter — Connects Slack to Toup agent runtime.
 
 Uses slack-bolt (Socket Mode) to handle:
 - DM conversations
@@ -7,7 +7,7 @@ Uses slack-bolt (Socket Mode) to handle:
 - Thread replies
 - File uploads
 - Reactions
-- Slash commands (/hexbrain)
+- Slash commands (/toup)
 """
 
 import asyncio

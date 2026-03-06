@@ -1,7 +1,7 @@
 """
 Chat API - Main chat orchestration endpoint
 
-This is the core of the HexBrain Agent Platform.
+This is the core of the Toup Agent Platform.
 The chat endpoint orchestrates:
 1. Session management (create/continue conversations)
 2. Memory retrieval (find relevant memories)

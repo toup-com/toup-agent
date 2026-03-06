@@ -1,5 +1,5 @@
 """
-Document Processing Service for HexBrain
+Document Processing Service for Toup
 
 Handles:
 - PDF extraction
@@ -180,7 +180,7 @@ class DocumentService:
         self,
         embedding_service=None,
         openai_client=None,
-        storage_path: str = "/tmp/hexbrain_uploads"
+        storage_path: str = "/tmp/toup_uploads"
     ):
         self.embedding_service = embedding_service
         self.openai_client = openai_client

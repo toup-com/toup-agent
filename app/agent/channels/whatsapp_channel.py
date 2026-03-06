@@ -1,5 +1,5 @@
 """
-WhatsApp Channel Adapter — Connects WhatsApp Business API to HexBrain agent runtime.
+WhatsApp Channel Adapter — Connects WhatsApp Business API to Toup agent runtime.
 
 Uses the WhatsApp Cloud API (Meta Business) via webhook:
 - Incoming text messages

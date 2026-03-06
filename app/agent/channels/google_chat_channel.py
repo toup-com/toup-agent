@@ -9,7 +9,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
-logger = logging.getLogger("hexbrain.channel.google_chat")
+logger = logging.getLogger("toup.channel.google_chat")
 
 
 class GoogleChatChannel:

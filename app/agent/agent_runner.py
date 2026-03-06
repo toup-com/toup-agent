@@ -590,6 +590,26 @@ class AgentRunner:
         except Exception as e:
             logger.warning(f"Agent brain load failed: {e}")
 
+        # 2a. Load work brain memories (workflows, SOPs, operational knowledge)
+        try:
+            from app.services.memory_service import MemoryService
+            work_mem_svc = MemoryService(db)
+            work_memories = await work_mem_svc.get_memories_by_brain_type(
+                user_id=user_id,
+                brain_type="work",
+                limit=50,
+            )
+            if work_memories:
+                work_lines = ["# Work Brain (Workflows & Operational Knowledge)"]
+                for m in work_memories:
+                    cat = m.get("category", "")
+                    content = m.get("content", "")
+                    work_lines.append(f"- [{cat}] {content}")
+                sections.append("\n".join(work_lines))
+                logger.info(f"[AGENT] Loaded {len(work_memories)} work brain memories")
+        except Exception as e:
+            logger.warning(f"Work brain load failed: {e}")
+
         # 2b. Onboarding mode — inject instructions when onboarding not yet completed
         try:
             from app.db.models import AgentConfig
@@ -601,10 +621,15 @@ class AgentRunner:
                 sections.append(
                     "# Onboarding Mode (ACTIVE)\n"
                     "You are in onboarding mode — this is a new user who just set up their agent. "
-                    "Your goal is to learn three things through natural conversation:\n"
-                    "1. What the user wants to call you (your name) — store with memory_store(brain_type='agent', category='agent_soul')\n"
-                    "2. What they need you for — store with memory_store(brain_type='user', category='goals')\n"
-                    "3. Their name — store with memory_store(brain_type='user', category='identity')\n\n"
+                    "You do NOT have a name yet. The user will choose your name.\n\n"
+                    "Your goal is to learn three things through natural conversation, IN THIS ORDER:\n"
+                    "1. **YOUR NAME** (FIRST!) — Ask: 'What would you like to call me?' "
+                    "Store with: memory_store(brain_type='agent', category='agent_soul', content='My name is <NAME>')\n"
+                    "2. **Their name** — Ask: 'And what's your name?' "
+                    "Store with: memory_store(brain_type='user', category='identity', content='User name: <NAME>')\n"
+                    "3. **What they need you for** — Ask: 'What do you need me to help you with?' "
+                    "Store with: memory_store(brain_type='user', category='goals', content='...')\n\n"
+                    "IMPORTANT: Do NOT introduce yourself with any name. Start by asking what they'd like to call you. "
                     "Ask ONE question at a time. Be warm and conversational. "
                     "Use memory_store to save each piece of info as you learn it. "
                     "Once you have all three, store a final memory: "
@@ -645,15 +670,54 @@ class AgentRunner:
         except Exception as e:
             logger.warning(f"Memory retrieval failed in agent prompt: {e}")
         
-        # 3. Default identity if none exists
+        # 3. Default identity if none exists — use agent brain memory for name
         if not identities:
-            sections.insert(0, (
-                "# Core Identity\n"
-                "You are Toup, an intelligent AI assistant with persistent memory. "
-                "You can execute shell commands, read/write files, search the web, "
-                "and remember information about the user across conversations. "
-                "Be helpful, proactive, and concise. Use tools when they help answer the question."
-            ))
+            # Check if the agent has a stored name from onboarding
+            agent_name = None
+            if agent_memories:
+                for m in agent_memories:
+                    content = (m.get("content") or "").lower()
+                    if "my name is" in content or m.get("category") == "agent_soul":
+                        raw = m.get("content", "")
+                        if "my name is" in raw.lower():
+                            agent_name = raw.lower().split("my name is")[-1].strip().rstrip(".").strip().title()
+                        elif raw.strip() and not raw.startswith("User"):
+                            agent_name = raw.strip()
+                        if agent_name:
+                            break
+            if agent_name:
+                sections.insert(0, (
+                    f"# Core Identity\n"
+                    f"Your name is {agent_name}. You are an intelligent AI assistant with persistent memory.\n"
+                    f"Be helpful, proactive, and concise. Use tools when they help answer the question."
+                ))
+            else:
+                sections.insert(0, (
+                    "# Core Identity\n"
+                    "You are an intelligent AI assistant with persistent memory.\n"
+                    "If you don't know your name yet, ask the user what they'd like to call you.\n"
+                    "Be helpful, proactive, and concise. Use tools when they help answer the question."
+                ))
+
+        # 3b. Always include capabilities section — the agent must know what it can do
+        sections.append(
+            "# Your Environment & Capabilities\n"
+            "You are running as an agent service ON the user's server/VPS. "
+            "This means:\n"
+            "- **Terminal access**: Your `exec` tool runs shell commands directly on THIS machine. "
+            "You have full access to the filesystem, system tools, package managers, and services.\n"
+            "- **Database access**: You have direct access to the `toup_brain` PostgreSQL database via "
+            "`memory_store`, `memory_search`, and other tools. You can also query it via `exec` with psql.\n"
+            "- **File system**: You can read, write, and edit files anywhere on this machine using "
+            "`read_file`, `write_file`, `edit_file`, `ls`, `find`, `grep`.\n"
+            "- **Web access**: You can search the web (`web_search`), fetch pages (`web_fetch`), "
+            "and automate browsers (`browser`).\n"
+            "- **Admin capabilities**: You ARE the agent running on this system. You can install packages, "
+            "manage services, modify configurations, and perform system administration tasks.\n"
+            "- **Memory management**: You can store, search, and manage memories in the brain database. "
+            "You can also delete or modify memories by using `exec` with psql commands.\n\n"
+            "When the user asks you to do something on their system, USE your tools — don't say you can't."
+        )
         
         # 4. Runtime context
         now = datetime.utcnow()

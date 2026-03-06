@@ -463,7 +463,7 @@ class VoiceWakeDetector:
     hotword models while still providing a natural activation mechanism.
     """
 
-    DEFAULT_WAKE_WORDS = {"hey hex", "ok hex", "hexbrain", "hex brain"}
+    DEFAULT_WAKE_WORDS = {"hey toup", "ok toup", "toup"}
 
     def __init__(self, wake_words: Optional[set] = None):
         self.wake_words = wake_words or self.DEFAULT_WAKE_WORDS

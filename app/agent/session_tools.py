@@ -98,9 +98,9 @@ class SessionManager:
     def _register_default_agent(self):
         self._agents["default"] = AgentInfo(
             agent_id="default",
-            name="HexBrain",
+            name="Toup Agent",
             model="claude-opus-4-6",
-            description="Primary HexBrain agent",
+            description="Primary Toup agent",
             tools=["read_file", "write_file", "edit_file", "exec", "web_search", "web_fetch"],
         )
 

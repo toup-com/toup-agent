@@ -7,7 +7,7 @@ from enum import Enum
 
 
 class BrainType(str, Enum):
-    """Types of brains in the HexBrain system"""
+    """Types of brains in the Toup system"""
     USER = "user"       # User's personal memories
     AGENT = "agent"     # Hex agent's learned knowledge
     WORK = "work"       # Workflows and operational processes

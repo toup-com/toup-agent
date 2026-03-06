@@ -1,5 +1,5 @@
 """
-Toup Workflow Skill — Knowledge and guidance for building HexBrain visual workflows.
+Toup Workflow Skill — Knowledge and guidance for building Toup visual workflows.
 
 Provides the agent with deep knowledge about the 25 node types, workflow patterns,
 validation rules, MCP tool usage, and common mistakes — modeled after the
@@ -86,7 +86,7 @@ class ToupWorkflowSkill(Skill):
         name="toup_workflow",
         version="1.0.0",
         description=(
-            "Deep knowledge for building HexBrain visual workflows: "
+            "Deep knowledge for building Toup visual workflows: "
             "25 node types, 6 patterns, validation rules, MCP tool guidance, "
             "and common mistake avoidance."
         ),
@@ -235,7 +235,7 @@ class ToupWorkflowSkill(Skill):
     def get_system_prompt_section(self) -> Optional[str]:
         return (
             "# Toup Workflow Skill — Visual Workflow Builder Knowledge\n\n"
-            "You have deep knowledge about building HexBrain visual workflows.\n"
+            "You have deep knowledge about building Toup visual workflows.\n"
             "Use the `toup_workflow__*` tools to access detailed guides:\n\n"
             "- `toup_workflow__get_skill_guide` — Core concepts, quick reference, building sequence\n"
             "- `toup_workflow__get_node_reference` — All 25 node types with fields & handles\n"

@@ -71,7 +71,7 @@ async def ws_chat(
     token: Optional[str] = Query(None),
 ):
     """
-    WebSocket endpoint for real-time chat with the HexBrain agent.
+    WebSocket endpoint for real-time chat with the Toup agent.
 
     Supports streaming text chunks, tool call indicators, and session management.
     """

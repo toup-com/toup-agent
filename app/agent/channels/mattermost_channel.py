@@ -7,7 +7,7 @@ Connects via Mattermost Bot API + WebSocket events.
 import logging
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger("hexbrain.channel.mattermost")
+logger = logging.getLogger("toup.channel.mattermost")
 
 
 class MattermostChannel:

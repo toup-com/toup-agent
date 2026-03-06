@@ -88,7 +88,8 @@ DESTRUCTIVE_PATTERNS = [
     r"\bshred\b",         # shred
     r"\btrash\b",         # trash
     r"\bmv\b.*(/dev/null|/tmp/)",  # mv to /dev/null or /tmp (disguised delete)
-    r">\s*/dev/null",     # redirect to /dev/null (truncate)
+    # Note: ">/dev/null" and "2>/dev/null" are NOT destructive — they just
+    # discard output, which is standard practice for suppressing noise.
 ]
 
 
@@ -178,10 +179,10 @@ class ToolExecutor:
                 if not os.path.exists(readme_path):
                     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
                     readme = (
-                        f"# HexBrain Workspace\n\n"
+                        f"# Toup Agent Workspace\n\n"
                         f"Created: {now}\n"
                         f"User: {user_id or 'shared'}\n\n"
-                        f"This directory is used by the HexBrain agent for file operations.\n"
+                        f"This directory is used by the Toup agent for file operations.\n"
                         f"Files created here can be sent to you via Telegram.\n"
                     )
                     try:
@@ -664,7 +665,7 @@ class ToolExecutor:
                 resp = await client.get(
                     "https://html.duckduckgo.com/html/",
                     params={"q": query},
-                    headers={"User-Agent": "Mozilla/5.0 (HexBrain Agent)"},
+                    headers={"User-Agent": "Mozilla/5.0 (Toup Agent)"},
                 )
                 resp.raise_for_status()
             
@@ -705,7 +706,7 @@ class ToolExecutor:
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
                 resp = await client.get(
                     url,
-                    headers={"User-Agent": "Mozilla/5.0 (HexBrain Agent)"},
+                    headers={"User-Agent": "Mozilla/5.0 (Toup Agent)"},
                 )
                 resp.raise_for_status()
             

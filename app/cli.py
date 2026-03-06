@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-hexbrain — Command-line interface for HexBrain agent platform.
+toup — Command-line interface for Toup agent platform.
 
 Usage:
-    hexbrain send "Hello, what time is it?"
-    hexbrain status
-    hexbrain doctor
-    hexbrain sessions
-    hexbrain cron list
+    toup send "Hello, what time is it?"
+    toup status
+    toup doctor
+    toup sessions
+    toup cron list
 """
 import argparse
 import json
@@ -96,7 +96,7 @@ def cmd_status(args):
 
 def cmd_doctor(args):
     """Run diagnostics — check all subsystems."""
-    print("🏥 HexBrain Doctor\n")
+    print("🏥 Toup Agent Doctor\n")
     checks = []
 
     # 1. API reachable
@@ -204,8 +204,8 @@ def cmd_cron(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="hexbrain",
-        description="HexBrain CLI — interact with the agent platform",
+        prog="toup",
+        description="Toup CLI — interact with the agent platform",
     )
     parser.add_argument("--url", default=DEFAULT_BASE, help="API base URL")
     parser.add_argument("--user", default=DEFAULT_USER, help="Username")

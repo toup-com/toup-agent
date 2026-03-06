@@ -9,7 +9,7 @@ Usage:
     from app.agent.sandbox_manager import get_sandbox_manager
 
     mgr = get_sandbox_manager()
-    sandbox = mgr.create_sandbox("session_123", image="hexbrain-sandbox:latest")
+    sandbox = mgr.create_sandbox("session_123", image="toup-sandbox:latest")
     result = await mgr.exec_in_sandbox(sandbox.sandbox_id, "echo hello")
     mgr.destroy_sandbox(sandbox.sandbox_id)
 """

@@ -1,1 +1,1 @@
-"""Toup Workflow Skill — workflow building knowledge for HexBrain agents."""
+"""Toup Workflow Skill — workflow building knowledge for Toup agents."""

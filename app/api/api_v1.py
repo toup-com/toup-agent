@@ -1,5 +1,5 @@
 """
-Public API v1 — Programmatic access to HexBrain via API keys.
+Public API v1 — Programmatic access to Toup via API keys.
 
 Endpoints:
   POST /api/v1/chat           — Send a message and get a response
@@ -213,7 +213,7 @@ async def api_chat(
     req: ChatRequest,
     user_id: str = Depends(get_api_key_user),
 ):
-    """Send a message to HexBrain and get a response."""
+    """Send a message to the agent and get a response."""
     if not _agent_runner:
         raise HTTPException(status_code=503, detail="Agent not available")
 

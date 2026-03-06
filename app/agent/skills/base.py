@@ -1,5 +1,5 @@
 """
-Skill base class — the contract every HexBrain plugin must implement.
+Skill base class — the contract every Toup plugin must implement.
 
 A Skill is a self-contained capability module that:
   1. Registers one or more agent tools
@@ -51,7 +51,7 @@ class SkillContext:
 
 
 class Skill(abc.ABC):
-    """Abstract base class for a HexBrain skill plugin."""
+    """Abstract base class for a Toup skill plugin."""
 
     # Every subclass MUST set this
     meta: SkillMeta

@@ -1,7 +1,7 @@
 """
 Document & Media Ingestion API
 
-Upload and process documents and media files for the HexBrain memory system.
+Upload and process documents and media files for the Toup memory system.
 Supports:
 - Documents: PDF, Markdown, Text, Code, DOCX, JSON, YAML, CSV
 - Media: Images, Videos, Audio

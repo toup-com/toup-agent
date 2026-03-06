@@ -168,7 +168,7 @@ class WorkspaceManager:
     listing, cleanup, and quota enforcement.
     """
 
-    DEFAULT_BASE = "/tmp/hexbrain_workspaces"
+    DEFAULT_BASE = "/tmp/toup_workspaces"
 
     def __init__(self, base_path: Optional[str] = None):
         self._base_path = base_path or self.DEFAULT_BASE

@@ -124,7 +124,7 @@ class RPCMethod:
 
 class RPCServer:
     """
-    JSON-RPC 2.0 server for HexBrain gateway.
+    JSON-RPC 2.0 server for Toup gateway.
 
     Handles parsing, routing, and response formatting for
     JSON-RPC requests. Methods are registered with handlers.

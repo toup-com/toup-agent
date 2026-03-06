@@ -46,7 +46,7 @@ async def run_demo_simulation():
     """Run a demo simulation against the running backend"""
     base_url = "http://localhost:8000/api"
     
-    print("🚀 Starting HexBrain Demo Simulation")
+    print("🚀 Starting Toup Demo Simulation")
     print("=" * 50)
     print("Make sure the backend is running at http://localhost:8000")
     print("Open the frontend at http://localhost:5173 to watch the brain update!")

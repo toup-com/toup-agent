@@ -51,7 +51,7 @@ class MultiAgentRouter:
         # Register the default persona
         self.register(AgentPersona(
             name="default",
-            description="General-purpose HexBrain agent",
+            description="General-purpose Toup agent",
         ))
 
     def register(self, persona: AgentPersona) -> None:

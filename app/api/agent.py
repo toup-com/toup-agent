@@ -1,4 +1,4 @@
-"""Agent API endpoints - for HexBrain agent to store and retrieve memories"""
+"""Agent API endpoints - for Toup agent to store and retrieve memories"""
 
 import json
 from typing import List
