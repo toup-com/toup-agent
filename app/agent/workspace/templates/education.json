@@ -1,0 +1,206 @@
+{
+  "name": "education",
+  "keywords": ["education", "study", "learning", "student", "teaching", "course", "exam", "homework", "tutor", "academic", "university", "school", "research"],
+  "description": "Education workflows for study planning, flashcard creation, and progress tracking",
+  "workflows": [
+    {
+      "name": "Study Session Planner",
+      "description": "Searches your course materials and schedule to create an optimized study plan",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_manual",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Start",
+            "templateType": "trigger_manual",
+            "config": {}
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "action_memory_search",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Search Course Materials",
+            "templateType": "action_memory_search",
+            "config": {
+              "query": "course materials syllabus schedule upcoming exams assignments"
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "ai_agent",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Create Study Plan",
+            "templateType": "ai_agent",
+            "config": {
+              "model": "default",
+              "prompt": "You are an academic study coach. Based on the following course materials, schedule, and upcoming deadlines, create an optimized study plan. Use spaced repetition principles, prioritize by urgency, and include break times:\n\n{{input.text}}",
+              "temperature": 0.5
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "action_memory_store",
+          "position": {"x": 850, "y": 200},
+          "data": {
+            "label": "Save Study Plan",
+            "templateType": "action_memory_store",
+            "config": {
+              "content": "Study plan: {{input.text}}"
+            }
+          }
+        },
+        {
+          "id": "node_5",
+          "type": "output_respond",
+          "position": {"x": 1100, "y": 200},
+          "data": {
+            "label": "Return Plan",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"},
+        {"id": "e4", "source": "node_4", "target": "node_5"}
+      ]
+    },
+    {
+      "name": "Flashcard Generator",
+      "description": "Extracts key concepts from study material and formats them as flashcards",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_manual",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Start",
+            "templateType": "trigger_manual",
+            "config": {}
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "ai_extract",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Extract Key Concepts",
+            "templateType": "ai_extract",
+            "config": {
+              "model": "default",
+              "prompt": "Extract the key concepts, definitions, and important facts from this study material. Return each as a distinct item with a question and answer pair:\n\n{{input.text}}",
+              "fields": ["question", "answer", "topic"]
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "data_transform",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Format as Flashcards",
+            "templateType": "data_transform",
+            "config": {
+              "template": "Flashcard set:\n{{#each items}}\n---\nQ: {{question}}\nA: {{answer}}\nTopic: {{topic}}\n{{/each}}"
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "action_memory_store",
+          "position": {"x": 850, "y": 200},
+          "data": {
+            "label": "Save Flashcards",
+            "templateType": "action_memory_store",
+            "config": {
+              "content": "Flashcards: {{input.text}}"
+            }
+          }
+        },
+        {
+          "id": "node_5",
+          "type": "output_respond",
+          "position": {"x": 1100, "y": 200},
+          "data": {
+            "label": "Return Flashcards",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"},
+        {"id": "e4", "source": "node_4", "target": "node_5"}
+      ]
+    },
+    {
+      "name": "Weekly Progress Report",
+      "description": "Every Friday evening, summarizes study progress and suggests improvements for next week",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_schedule",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Friday Evening Trigger",
+            "templateType": "trigger_schedule",
+            "config": {
+              "cron": "0 18 * * 5"
+            }
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "action_memory_search",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Search Study Sessions",
+            "templateType": "action_memory_search",
+            "config": {
+              "query": "study sessions completed this week progress notes quiz results"
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "ai_chat",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Summarize Progress",
+            "templateType": "ai_chat",
+            "config": {
+              "model": "default",
+              "prompt": "Summarize the student's weekly study progress based on these session records. Include: topics covered, time spent, areas of strength, areas needing improvement, and specific suggestions for next week:\n\n{{input.text}}",
+              "temperature": 0.5
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "output_respond",
+          "position": {"x": 850, "y": 200},
+          "data": {
+            "label": "Send Report",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"}
+      ]
+    }
+  ]
+}

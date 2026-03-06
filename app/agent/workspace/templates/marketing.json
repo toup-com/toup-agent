@@ -1,0 +1,199 @@
+{
+  "name": "marketing",
+  "keywords": ["marketing", "campaign", "ads", "seo", "social", "brand", "growth", "leads", "funnel", "analytics", "advertising", "audience"],
+  "description": "Marketing workflows for campaign tracking, lead scoring, and social monitoring",
+  "workflows": [
+    {
+      "name": "Campaign Performance Digest",
+      "description": "Weekly Monday digest that analyzes campaign performance trends from saved data",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_schedule",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Weekly Monday Trigger",
+            "templateType": "trigger_schedule",
+            "config": {
+              "cron": "0 9 * * 1"
+            }
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "action_memory_search",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Search Campaign Data",
+            "templateType": "action_memory_search",
+            "config": {
+              "query": "campaign metrics performance data spend ROI"
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "ai_agent",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Analyze Performance Trends",
+            "templateType": "ai_agent",
+            "config": {
+              "model": "default",
+              "prompt": "You are a marketing analyst. Analyze these campaign performance records and identify trends, top performers, underperformers, and actionable recommendations:\n\n{{input.text}}",
+              "temperature": 0.5
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "output_respond",
+          "position": {"x": 850, "y": 200},
+          "data": {
+            "label": "Send Digest",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"}
+      ]
+    },
+    {
+      "name": "Lead Scorer",
+      "description": "Receives lead data via webhook, classifies the lead as hot/warm/cold, and stores the score",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_webhook",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Receive Lead",
+            "templateType": "trigger_webhook",
+            "config": {
+              "method": "POST"
+            }
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "ai_classify",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Classify Lead",
+            "templateType": "ai_classify",
+            "config": {
+              "model": "default",
+              "categories": ["hot", "warm", "cold"],
+              "prompt": "Classify this lead based on their engagement level, company size, budget indicators, and urgency signals:\n\n{{input.text}}"
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "action_memory_store",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Save Lead Score",
+            "templateType": "action_memory_store",
+            "config": {
+              "content": "Lead scored as {{input.category}}: {{input.text}}"
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "output_respond",
+          "position": {"x": 850, "y": 200},
+          "data": {
+            "label": "Return Score",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"}
+      ]
+    },
+    {
+      "name": "Social Mention Alert",
+      "description": "Every 4 hours, checks for new social mentions and summarizes them if found",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_schedule",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Every 4 Hours",
+            "templateType": "trigger_schedule",
+            "config": {
+              "cron": "0 */4 * * *"
+            }
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "action_http",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Check Mentions API",
+            "templateType": "action_http",
+            "config": {
+              "method": "GET",
+              "url": "{{config.mentions_api_url}}",
+              "headers": {}
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "logic_if",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "New Mentions?",
+            "templateType": "logic_if",
+            "config": {
+              "condition": "input.data.length > 0"
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "ai_chat",
+          "position": {"x": 850, "y": 200},
+          "data": {
+            "label": "Summarize Mentions",
+            "templateType": "ai_chat",
+            "config": {
+              "model": "default",
+              "prompt": "Summarize these new social media mentions. Group by sentiment (positive/neutral/negative) and highlight any that need immediate attention:\n\n{{input.text}}",
+              "temperature": 0.5
+            }
+          }
+        },
+        {
+          "id": "node_5",
+          "type": "output_respond",
+          "position": {"x": 1100, "y": 200},
+          "data": {
+            "label": "Send Alert",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"},
+        {"id": "e4", "source": "node_4", "target": "node_5"}
+      ]
+    }
+  ]
+}

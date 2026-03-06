@@ -1,0 +1,166 @@
+{
+  "name": "developer",
+  "keywords": ["developer", "software", "programming", "code", "engineering", "devops", "deploy", "github", "coding", "tech", "api", "backend", "frontend"],
+  "description": "Workflows for software developers: code reviews, deploy notifications, and bug triage",
+  "workflows": [
+    {
+      "name": "Code Review Assistant",
+      "description": "Submit code for an AI-powered review with best practices and improvement suggestions",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_manual",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Submit Code",
+            "templateType": "trigger_manual",
+            "config": {}
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "ai_agent",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Review Code",
+            "templateType": "ai_agent",
+            "config": {
+              "prompt": "Review the following code. Check for: bugs, security issues, performance problems, naming conventions, and best practices. Provide specific suggestions with code examples.\n\nCode:\n{{input.text}}",
+              "model": "default"
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "output_respond",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Return Review",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"}
+      ]
+    },
+    {
+      "name": "Deploy Notification",
+      "description": "Receives a webhook from your CI/CD pipeline and sends a Telegram notification about the deployment",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_webhook",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Receive Deploy Hook",
+            "templateType": "trigger_webhook",
+            "config": {
+              "method": "POST"
+            }
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "ai_extract",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Extract Deploy Info",
+            "templateType": "ai_extract",
+            "config": {
+              "prompt": "Extract deployment details from this webhook payload: service name, environment, version, status, and deployer.",
+              "fields": ["service", "environment", "version", "status", "deployer"]
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "action_send_telegram",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Notify via Telegram",
+            "templateType": "action_send_telegram",
+            "config": {
+              "message": "Deploy {{input.status}}: {{input.service}} v{{input.version}} to {{input.environment}} by {{input.deployer}}"
+            }
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"}
+      ]
+    },
+    {
+      "name": "Bug Triage",
+      "description": "Classify bug severity and send urgent alerts for critical issues",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_manual",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Report Bug",
+            "templateType": "trigger_manual",
+            "config": {}
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "ai_classify",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Classify Severity",
+            "templateType": "ai_classify",
+            "config": {
+              "prompt": "Classify the severity of this bug report.",
+              "categories": ["critical", "high", "medium", "low"]
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "logic_if",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Is Critical?",
+            "templateType": "logic_if",
+            "config": {
+              "condition": "{{input.category}} == 'critical'"
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "action_send_telegram",
+          "position": {"x": 850, "y": 100},
+          "data": {
+            "label": "Urgent Alert",
+            "templateType": "action_send_telegram",
+            "config": {
+              "message": "CRITICAL BUG: {{input.text}}\nSeverity: {{input.category}}"
+            }
+          }
+        },
+        {
+          "id": "node_5",
+          "type": "output_log",
+          "position": {"x": 850, "y": 300},
+          "data": {
+            "label": "Log Bug",
+            "templateType": "output_log",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"},
+        {"id": "e4", "source": "node_3", "target": "node_5"}
+      ]
+    }
+  ]
+}

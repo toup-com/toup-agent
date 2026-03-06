@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -212,3 +212,15 @@ async def run_workflow(
     trigger_data = req or {}
     ctx = await _workflow_engine.execute(w, trigger_data=trigger_data, user_id=settings.user_id)
     return ctx.to_dict()
+
+
+# ── Workspace Generation (post-onboarding) ──────────────────────
+
+@router.post("/generate-from-onboarding")
+async def generate_workspace_from_onboarding(
+    background_tasks: BackgroundTasks,
+):
+    """Auto-generate personalized workflows from onboarding goals. Runs in background."""
+    from app.agent.workspace.workspace_generator import generate_workspace
+    background_tasks.add_task(generate_workspace, settings.user_id)
+    return {"status": "generating", "message": "Workspace generation started"}

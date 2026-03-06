@@ -1400,6 +1400,19 @@ async def realtime_voice_ws(
                                 logger.warning("[REALTIME] Failed to mark onboarding complete: %s", oe)
                             await websocket.send_json({"type": "onboarding_phase", "phase": "done"})
 
+                            # Trigger personalized workspace generation on VPS
+                            try:
+                                _vps = await _get_vps_info(user_id)
+                                if _vps:
+                                    _agent_url, _agent_key = _vps
+                                    await _vps_api(
+                                        _agent_url, _agent_key, "POST",
+                                        "/api/workflows/generate-from-onboarding",
+                                    )
+                                    logger.info("[REALTIME] Triggered workspace generation for %s", user_id[:8])
+                            except Exception as _wg_err:
+                                logger.warning("[REALTIME] Workspace generation trigger failed: %s", _wg_err)
+
                         else:
                             # ── Server-side tools ──
                             result = await _execute_tool(user_id, func_name, arguments)

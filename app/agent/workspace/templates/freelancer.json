@@ -1,0 +1,196 @@
+{
+  "name": "freelancer",
+  "keywords": ["freelancer", "freelance", "client", "invoice", "project", "contract", "gig", "self-employed", "consulting", "independent"],
+  "description": "Workflows for freelancers: invoice reminders, project status updates, and client onboarding",
+  "workflows": [
+    {
+      "name": "Invoice Reminder",
+      "description": "Weekly check for pending invoices with AI-drafted reminder messages every Monday at 10 AM",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_schedule",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Weekly Monday 10 AM",
+            "templateType": "trigger_schedule",
+            "config": {
+              "cron": "0 10 * * 1"
+            }
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "action_memory_search",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Find Pending Invoices",
+            "templateType": "action_memory_search",
+            "config": {
+              "query": "pending invoices, unpaid, outstanding payment, due date"
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "ai_chat",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Draft Reminder",
+            "templateType": "ai_chat",
+            "config": {
+              "model": "default",
+              "prompt": "Based on these pending invoices, draft a polite but firm payment reminder for each overdue invoice. Include invoice details and amounts.\n\nPending invoices: {{input.results}}",
+              "temperature": 0.6
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "output_respond",
+          "position": {"x": 850, "y": 200},
+          "data": {
+            "label": "Show Reminders",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"}
+      ]
+    },
+    {
+      "name": "Project Status Update",
+      "description": "Pull project-related memories and compile a comprehensive status report",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_manual",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Request Update",
+            "templateType": "trigger_manual",
+            "config": {}
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "action_memory_search",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Search Project Memories",
+            "templateType": "action_memory_search",
+            "config": {
+              "query": "project progress, milestones, deliverables, tasks, deadlines"
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "ai_agent",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Compile Status Report",
+            "templateType": "ai_agent",
+            "config": {
+              "prompt": "Compile a professional project status report from these memories. Include: progress summary, completed milestones, upcoming deadlines, blockers, and next steps.\n\nProject data: {{input.results}}",
+              "model": "default"
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "output_respond",
+          "position": {"x": 850, "y": 200},
+          "data": {
+            "label": "Deliver Report",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"}
+      ]
+    },
+    {
+      "name": "New Client Onboarding",
+      "description": "Extract client details, save to memory, and generate a personalized welcome message",
+      "nodes_json": [
+        {
+          "id": "node_1",
+          "type": "trigger_manual",
+          "position": {"x": 100, "y": 200},
+          "data": {
+            "label": "Enter Client Info",
+            "templateType": "trigger_manual",
+            "config": {}
+          }
+        },
+        {
+          "id": "node_2",
+          "type": "ai_extract",
+          "position": {"x": 350, "y": 200},
+          "data": {
+            "label": "Extract Client Details",
+            "templateType": "ai_extract",
+            "config": {
+              "prompt": "Extract client onboarding details from this input.",
+              "fields": ["name", "company", "email", "project_type", "budget", "timeline", "requirements"]
+            }
+          }
+        },
+        {
+          "id": "node_3",
+          "type": "action_memory_store",
+          "position": {"x": 600, "y": 200},
+          "data": {
+            "label": "Save Client Info",
+            "templateType": "action_memory_store",
+            "config": {
+              "content": "{{input.extracted}}",
+              "metadata": {
+                "type": "client_profile"
+              }
+            }
+          }
+        },
+        {
+          "id": "node_4",
+          "type": "ai_chat",
+          "position": {"x": 850, "y": 200},
+          "data": {
+            "label": "Generate Welcome Message",
+            "templateType": "ai_chat",
+            "config": {
+              "model": "default",
+              "prompt": "Generate a warm, professional welcome message for a new client. Personalize it with their details and outline next steps for the project.\n\nClient: {{input.extracted}}",
+              "temperature": 0.7
+            }
+          }
+        },
+        {
+          "id": "node_5",
+          "type": "output_respond",
+          "position": {"x": 1100, "y": 200},
+          "data": {
+            "label": "Show Welcome Message",
+            "templateType": "output_respond",
+            "config": {}
+          }
+        }
+      ],
+      "edges_json": [
+        {"id": "e1", "source": "node_1", "target": "node_2"},
+        {"id": "e2", "source": "node_2", "target": "node_3"},
+        {"id": "e3", "source": "node_3", "target": "node_4"},
+        {"id": "e4", "source": "node_4", "target": "node_5"}
+      ]
+    }
+  ]
+}
