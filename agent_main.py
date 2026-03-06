@@ -60,8 +60,8 @@ class AgentAPIKeyMiddleware(BaseHTTPMiddleware):
         if request.url.path in _PUBLIC_PATHS:
             return await call_next(request)
 
-        # Check the API key header
-        provided_key = request.headers.get("x-agent-key", "")
+        # Check the API key — header or query param (for WebSocket connections)
+        provided_key = request.headers.get("x-agent-key", "") or request.query_params.get("agent_key", "")
         if provided_key != settings.agent_api_key:
             return Response(
                 content='{"detail":"Invalid or missing agent API key"}',
