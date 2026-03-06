@@ -1,9 +1,9 @@
 """
-Workflow Builder — Conversational AI that asks questions then generates workflows.
+App Builder — Conversational AI that asks questions then generates React apps.
 
 Uses SSE (Server-Sent Events) to stream the AI conversation to the frontend.
 The AI asks clarifying questions about the user's needs, then generates
-workflow JSON that updates the preview in real-time.
+React component code that renders as a live preview via Sandpack.
 """
 
 import json
@@ -23,56 +23,64 @@ from app.config import settings
 from app.db import get_db, User, Workflow, Memory
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/workflows/builder", tags=["Workflow Builder"])
+router = APIRouter(prefix="/workflows/builder", tags=["App Builder"])
 
-# Node types available for workflow generation
-AVAILABLE_NODES = """
-Triggers: trigger_manual, trigger_schedule (cron), trigger_webhook, trigger_telegram, trigger_event (memory events)
-AI Nodes: ai_agent (full agent with tools), ai_chat (simple LLM call), ai_classify, ai_extract, ai_embedding
-Actions: action_memory_search, action_memory_store, action_http (HTTP request), action_exec (shell), action_send_telegram
-Logic: logic_if (branching), logic_switch, logic_merge, logic_loop, logic_wait (delay)
-Data: data_transform (JS code), data_set (variable), data_filter
-Output: output_respond (reply to trigger), output_log
-"""
 
-SYSTEM_PROMPT = f"""You are Toup's workflow builder AI. Your job is to understand what the user needs and create agentic workflows for them.
+SYSTEM_PROMPT = """You are Toup's app builder AI. You build custom React apps for users based on their needs — like v0 or Bolt.
 
 ## Your Process:
-1. UNDERSTAND: Ask 2-3 focused questions to understand exactly what the user needs. Be specific — ask about their tools, frequency, triggers, etc.
-2. PLAN: Once you understand, briefly describe the workflows you'll create (1-2 sentences each).
-3. BUILD: Generate the workflows one by one. For each workflow, output a special JSON block that the frontend renders as a visual workflow.
+1. UNDERSTAND: Ask 2-3 focused questions to understand exactly what the user needs. Ask about their specific use case, what data they want to track, what features matter most.
+2. PLAN: Once you understand, briefly describe the app you'll create (2-3 sentences).
+3. BUILD: Generate a complete React component. The code renders live in the user's browser via Sandpack.
 
-## Available Node Types:
-{AVAILABLE_NODES}
+## Code Rules:
+- Output code in a single ```app code fence (NOT ```tsx or ```jsx, use ```app)
+- Export a default function component called `App`
+- Use ONLY inline styles (style={{...}}) — no CSS imports, no className with Tailwind (Tailwind CDN is loaded but inline styles are more reliable in Sandpack)
+- Use React hooks (useState, useEffect, useRef, useMemo, useCallback) — they're available
+- NO external imports — no axios, no lodash, no external packages. Only React is available.
+- Build a COMPLETE, functional app — not a skeleton or placeholder
+- Include realistic sample data so the app looks populated and useful
+- Use a modern dark theme by default (dark backgrounds #0f172a, #1e293b, white/gray text)
+- Make it responsive and polished — this should look like a real product
+- Include interactive elements: buttons that work, inputs that filter, tabs that switch, etc.
 
-## When generating a workflow, output it in this exact format:
-```workflow
-{{
-  "name": "Workflow Name",
-  "description": "What this workflow does",
-  "nodes": [
-    {{"id": "node_1", "type": "trigger_schedule", "position": {{"x": 0, "y": 200}}, "data": {{"label": "Daily at 9am", "templateType": "trigger_schedule", "config": {{"cron": "0 9 * * *"}}}}}}
-  ],
-  "edges": [
-    {{"id": "e1-2", "source": "node_1", "target": "node_2"}}
-  ]
-}}
+## Design Guidelines:
+- Use a clean, modern design with good spacing and visual hierarchy
+- Use color accents sparingly (violet/purple #8b5cf6 for primary actions)
+- Include icons as emoji or Unicode symbols (not imported icon libraries)
+- Add smooth hover effects and transitions via inline styles
+- Make the app feel complete — include headers, stats cards, lists, forms as appropriate
+
+## Example Output:
+```app
+export default function App() {
+  const [activeTab, setActiveTab] = React.useState('dashboard');
+  const [items, setItems] = React.useState([
+    { id: 1, name: 'Example Item', status: 'active' },
+  ]);
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#0f172a', color: '#e2e8f0', fontFamily: 'system-ui' }}>
+      {/* Header */}
+      <header style={{ padding: '1rem 2rem', borderBottom: '1px solid #1e293b' }}>
+        <h1 style={{ fontSize: '1.25rem', fontWeight: 700 }}>My App</h1>
+      </header>
+      {/* Content */}
+      <main style={{ padding: '2rem' }}>
+        {/* ... full app content ... */}
+      </main>
+    </div>
+  );
+}
 ```
 
-## Rules:
-- Nodes must use ONLY the types listed above
-- Each workflow needs exactly ONE trigger node (leftmost, x=0)
-- Position nodes left-to-right: x=0, x=300, x=600, etc. Keep y around 200.
-- Connect nodes with edges (source → target)
-- Keep workflows focused: 3-6 nodes each
-- Generate 2-4 workflows based on the user's needs
-- Be conversational and friendly, not robotic
-- After generating all workflows, ask if they want to adjust anything
-
 ## Important:
-- Do NOT generate workflows until you've asked questions and understand the user's needs
-- Be specific in your questions — "What tools do you use?" is better than "Tell me more"
-- Each workflow block must be valid JSON inside ```workflow``` fences
+- Do NOT generate code until you've asked questions and understand the user's needs
+- Be specific in your questions — "What data do you want to track?" is better than "Tell me more"
+- When iterating, output the FULL updated component (not just the changed parts)
+- After generating, ask if they want to adjust anything (colors, features, layout, etc.)
+- Keep conversation friendly and concise — you're a builder, not a lecturer
 """
 
 
@@ -102,7 +110,6 @@ async def _stream_openai(messages: list[dict]):
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     model = getattr(settings, "default_model", "gpt-4o-mini")
-    # Use a stronger model for the builder if available
     agent_model = getattr(settings, "agent_model", None)
     if agent_model and agent_model != "gpt-4o-mini":
         model = agent_model
@@ -111,7 +118,7 @@ async def _stream_openai(messages: list[dict]):
         model=model,
         messages=messages,
         temperature=0.7,
-        max_tokens=4096,
+        max_tokens=8192,
         stream=True,
     )
 
@@ -128,7 +135,6 @@ async def _stream_anthropic(messages: list[dict]):
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
     model = getattr(settings, "anthropic_model", "claude-opus-4-6")
 
-    # Convert system message
     system_msg = ""
     chat_messages = []
     for m in messages:
@@ -139,7 +145,7 @@ async def _stream_anthropic(messages: list[dict]):
 
     async with client.messages.stream(
         model=model,
-        max_tokens=4096,
+        max_tokens=8192,
         system=system_msg,
         messages=chat_messages,
     ) as stream:
@@ -153,12 +159,11 @@ async def builder_chat(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Stream AI responses for the workflow builder conversation."""
+    """Stream AI responses for the app builder conversation."""
 
     if not settings.openai_api_key and not settings.anthropic_api_key:
         raise HTTPException(500, "No LLM API key configured")
 
-    # Build conversation with system prompt
     user_context = await _get_user_context(current_user.id, db)
     system_content = SYSTEM_PROMPT
     if user_context:
@@ -168,14 +173,12 @@ async def builder_chat(
     for msg in request.messages:
         messages.append({"role": msg["role"], "content": msg["content"]})
 
-    # Pick provider
     use_anthropic = bool(settings.anthropic_api_key)
 
     async def event_stream():
         try:
             streamer = _stream_anthropic(messages) if use_anthropic else _stream_openai(messages)
             async for token in streamer:
-                # SSE format
                 data = json.dumps({"type": "token", "content": token})
                 yield f"data: {data}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -193,9 +196,10 @@ async def builder_chat(
     )
 
 
-class SaveWorkflowsRequest(BaseModel):
-    workflows: list[dict]  # Array of {name, description, nodes, edges}
+# ── Save endpoints ────────────────────────────────────────────────
 
+class SaveWorkflowsRequest(BaseModel):
+    workflows: list[dict]
 
 @router.post("/save")
 async def save_built_workflows(
@@ -203,7 +207,7 @@ async def save_built_workflows(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Save workflows generated by the builder conversation."""
+    """Save workflows generated by the builder (legacy)."""
     created = []
     for wf_data in request.workflows:
         wf = Workflow(
@@ -223,3 +227,41 @@ async def save_built_workflows(
 
     await db.commit()
     return {"status": "saved", "count": len(created), "workflows": created}
+
+
+class SaveAppRequest(BaseModel):
+    name: str
+    code: str
+
+@router.post("/save-app")
+async def save_built_app(
+    request: SaveAppRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save an app generated by the builder as a workflow with embedded code."""
+    wf = Workflow(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        name=request.name,
+        description="Generated app",
+        status="draft",
+        nodes_json=json.dumps([{
+            "id": "app",
+            "type": "app_component",
+            "position": {"x": 0, "y": 0},
+            "data": {
+                "label": request.name,
+                "templateType": "app_component",
+                "code": request.code,
+                "config": {},
+            },
+        }]),
+        edges_json="[]",
+        run_count=0,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(wf)
+    await db.commit()
+    return {"status": "saved", "id": wf.id, "name": wf.name}

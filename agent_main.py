@@ -33,7 +33,6 @@ from app.api.api_v1 import router as api_v1_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
-from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.workflow_crud import router as workflow_crud_router
 from app.api.dashboard import router as dashboard_router
 
@@ -223,7 +222,6 @@ async def lifespan(app: FastAPI):
         # Wire WebSocket and API v1 refs (so they can invoke the agent)
         from app.api.api_v1 import set_api_v1_refs
         set_ws_refs(agent_runner, skill_loader)
-        set_ws_browser_refs(agent_runner, skill_loader)
         set_api_v1_refs(agent_runner, skill_loader)
         set_realtime_refs(tool_executor, agent_runner)
 
@@ -537,7 +535,6 @@ app.include_router(api_v1_router, prefix=settings.api_prefix)
 app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
-app.include_router(ws_browser_router, prefix=settings.api_prefix)
 app.include_router(workflow_crud_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
 
