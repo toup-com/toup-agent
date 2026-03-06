@@ -89,16 +89,26 @@ class AgentRunner:
         self.anthropic = AnthropicService()
         self.tools = tool_executor
         self.skill_loader = skill_loader
-        # Combine core tools + skill tools
-        self.tool_defs = get_agent_tools() + get_extended_tools()
-        if self.skill_loader:
-            self.tool_defs = self.tool_defs + self.skill_loader.get_all_tool_definitions()
+        # Core tools (static) — skill tools are added dynamically via property
+        self._core_tool_defs = get_agent_tools() + get_extended_tools()
         self.max_iterations = settings.agent_max_tool_iterations
         self._session_model_override: Optional[str] = None  # Per-session model
         self._current_lane: str = 'main'  # Active execution lane
         self._idempotency_key: Optional[str] = None  # Current run idempotency key
+        self._disabled_tool_names: set = set()  # Per-session disabled tools
         # Phase 5: Track retrieved memories for feedback loop
         self._last_retrieved_memories: List[Dict[str, Any]] = []
+
+    @property
+    def tool_defs(self) -> list:
+        """Dynamically combine core tools + skill tools (picks up new app skills)."""
+        defs = list(self._core_tool_defs)
+        if self.skill_loader:
+            defs = defs + self.skill_loader.get_all_tool_definitions()
+        # Apply per-session disabled filter
+        if self._disabled_tool_names:
+            defs = [t for t in defs if t.get("function", {}).get("name") not in self._disabled_tool_names]
+        return defs
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -177,9 +187,10 @@ class AgentRunner:
                 _user_disabled = set(_json.loads(_ac.disabled_tools))
                 self.tools.user_disabled_tools = _user_disabled
                 # Also hide disabled tools from LLM so it doesn't try to call them
-                self.tool_defs = [t for t in self.tool_defs if t["function"]["name"] not in _user_disabled]
+                self._disabled_tool_names = _user_disabled
             else:
                 self.tools.user_disabled_tools = set()
+                self._disabled_tool_names = set()
 
             system_prompt = await self._build_system_prompt(db, user_id, user_message)
             logger.info(f"[AGENT] System prompt length: {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
