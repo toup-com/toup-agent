@@ -33,7 +33,6 @@ from app.api.api_v1 import router as api_v1_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
-from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.workflow_crud import router as workflow_crud_router
 from app.api.dashboard import router as dashboard_router
 
@@ -60,8 +59,8 @@ class AgentAPIKeyMiddleware(BaseHTTPMiddleware):
         if request.url.path in _PUBLIC_PATHS:
             return await call_next(request)
 
-        # Check the API key — header or query param (for WebSocket connections)
-        provided_key = request.headers.get("x-agent-key", "") or request.query_params.get("agent_key", "")
+        # Check the API key header
+        provided_key = request.headers.get("x-agent-key", "")
         if provided_key != settings.agent_api_key:
             return Response(
                 content='{"detail":"Invalid or missing agent API key"}',
@@ -225,7 +224,6 @@ async def lifespan(app: FastAPI):
         set_ws_refs(agent_runner, skill_loader)
         set_api_v1_refs(agent_runner, skill_loader)
         set_realtime_refs(tool_executor, agent_runner)
-        set_ws_browser_refs(agent_runner, skill_loader)
 
         # Wire workflow execution engine
         from app.agent.workspace.engine import WorkflowEngine
@@ -539,7 +537,6 @@ app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(workflow_crud_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
-app.include_router(ws_browser_router, prefix=settings.api_prefix)
 
 
 @app.get("/")
@@ -616,16 +613,16 @@ async def agent_self_update():
     else:
         steps.append({"step": "pip_install", "ok": True, "output": "skipped (no changes)"})
 
-    # 3. Schedule restart — exit after response is sent
-    # The service manager (launchd/systemd) will restart us automatically
+    # 3. Schedule restart — re-exec the process after response is sent
     import asyncio
 
-    async def _delayed_exit():
+    async def _delayed_restart():
         await asyncio.sleep(1.0)  # Give time for HTTP response to be sent
         print("\n🔄 Restarting after update...")
-        os._exit(0)  # Service manager restarts us
+        # Re-exec ourselves — works with or without a service manager
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    asyncio.get_event_loop().create_task(_delayed_exit())
+    asyncio.get_event_loop().create_task(_delayed_restart())
 
     steps.append({"step": "restart", "ok": True, "output": "scheduled"})
     return {"success": True, "steps": steps}
