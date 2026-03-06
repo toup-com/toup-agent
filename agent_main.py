@@ -17,7 +17,7 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.config import settings
 from app.db import init_db
@@ -33,6 +33,7 @@ from app.api.api_v1 import router as api_v1_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
+from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.workflow_crud import router as workflow_crud_router
 from app.api.dashboard import router as dashboard_router
 
@@ -42,33 +43,61 @@ _app_start_time = None
 _PUBLIC_PATHS = frozenset({"/", "/agent/health", "/docs", "/openapi.json", "/redoc"})
 
 
-class AgentAPIKeyMiddleware(BaseHTTPMiddleware):
-    """Validates the X-Agent-Key header on non-public endpoints.
+class AgentAPIKeyMiddleware:
+    """Raw ASGI middleware that validates the X-Agent-Key header.
 
-    When AGENT_API_KEY is set (i.e. running on a user's VPS), every request
-    must include a matching header. In monolith/dev mode (no key set), all
-    requests pass through.
+    Uses raw ASGI instead of BaseHTTPMiddleware so WebSocket connections
+    pass through correctly (BaseHTTPMiddleware blocks WebSockets).
+    WebSocket endpoints handle their own auth via query params.
     """
 
-    async def dispatch(self, request: Request, call_next):
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        # Let WebSocket connections through — they handle their own auth
+        if scope["type"] == "websocket":
+            await self.app(scope, receive, send)
+            return
+
+        # Only check HTTP requests
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         # Skip auth if no key is configured (local dev / monolith mode)
         if not settings.agent_api_key:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         # Allow public endpoints without auth
-        if request.url.path in _PUBLIC_PATHS:
-            return await call_next(request)
+        path = scope.get("path", "")
+        if path in _PUBLIC_PATHS:
+            await self.app(scope, receive, send)
+            return
 
-        # Check the API key header
-        provided_key = request.headers.get("x-agent-key", "")
+        # Check the API key from headers
+        headers = dict(scope.get("headers", []))
+        provided_key = headers.get(b"x-agent-key", b"").decode()
+
+        # Also check query params (for backwards compat)
+        if not provided_key:
+            qs = scope.get("query_string", b"").decode()
+            for part in qs.split("&"):
+                if part.startswith("agent_key="):
+                    provided_key = part[len("agent_key="):]
+                    break
+
         if provided_key != settings.agent_api_key:
-            return Response(
+            response = Response(
                 content='{"detail":"Invalid or missing agent API key"}',
                 status_code=401,
                 media_type="application/json",
             )
+            await response(scope, receive, send)
+            return
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
 @asynccontextmanager
@@ -224,6 +253,7 @@ async def lifespan(app: FastAPI):
         set_ws_refs(agent_runner, skill_loader)
         set_api_v1_refs(agent_runner, skill_loader)
         set_realtime_refs(tool_executor, agent_runner)
+        set_ws_browser_refs(agent_runner, skill_loader)
 
         # Wire workflow execution engine
         from app.agent.workspace.engine import WorkflowEngine
@@ -537,6 +567,7 @@ app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(workflow_crud_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
+app.include_router(ws_browser_router, prefix=settings.api_prefix)
 
 
 @app.get("/")
