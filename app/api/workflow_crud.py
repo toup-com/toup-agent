@@ -395,3 +395,65 @@ async def generate_workspace_from_onboarding(
     from app.agent.workspace.workspace_generator import generate_workspace
     background_tasks.add_task(generate_workspace, settings.user_id)
     return {"status": "generating", "message": "Workspace generation started"}
+
+
+class GenerateRequest(BaseModel):
+    description: str
+
+
+@router.post("/generate")
+async def generate_workspace_from_description(
+    request: GenerateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate personalized workflows from a user description."""
+    from app.agent.workspace.workspace_generator import (
+        load_template_packs, match_packs, _keyword_match,
+    )
+
+    user_id = settings.user_id
+    description = request.description.strip()
+    if not description:
+        raise HTTPException(400, "Description is required")
+
+    # Guard: skip if workflows already exist
+    existing = (await db.execute(
+        select(Workflow.id).where(Workflow.user_id == user_id).limit(1)
+    )).scalar_one_or_none()
+    if existing:
+        return {"status": "exists", "message": "Workflows already exist"}
+
+    # Match template packs
+    packs = load_template_packs()
+    if not packs:
+        raise HTTPException(500, "No template packs available")
+
+    try:
+        matched = await match_packs(description)
+    except Exception:
+        matched = _keyword_match(description, packs)
+
+    # Create workflows in DB
+    created = []
+    for pack_name in matched:
+        pack = packs.get(pack_name)
+        if not pack:
+            continue
+        for wf_template in pack.get("workflows", []):
+            wf = Workflow(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                name=wf_template["name"],
+                description=wf_template.get("description", ""),
+                status="draft",
+                nodes_json=json.dumps(wf_template["nodes_json"]),
+                edges_json=json.dumps(wf_template["edges_json"]),
+                run_count=0,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(wf)
+            created.append({"id": wf.id, "name": wf.name})
+
+    await db.commit()
+    return {"status": "created", "count": len(created), "packs": matched, "workflows": created}
