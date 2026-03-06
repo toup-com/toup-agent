@@ -123,7 +123,9 @@ async def save_built_workflows(
 
 class SaveAppRequest(BaseModel):
     name: str
-    code: str
+    files: Optional[dict] = None         # Multi-file: {"/App.jsx": "code", ...}
+    dependencies: Optional[dict] = None  # {"lucide-react": "latest", ...}
+    code: Optional[str] = None           # Legacy single-file fallback
 
 @router.post("/save-app")
 async def save_built_app(
@@ -138,7 +140,19 @@ async def save_built_app(
 
     agent_url, agent_api_key = agent
 
-    # Build the workflow payload with the app code embedded in nodes_json
+    # Build node data — supports both multi-file and legacy single-file
+    node_data: dict = {
+        "label": request.name,
+        "templateType": "app_component",
+        "config": {},
+    }
+    if request.files:
+        node_data["files"] = request.files
+        if request.dependencies:
+            node_data["dependencies"] = request.dependencies
+    elif request.code:
+        node_data["code"] = request.code
+
     wf_payload = {
         "name": request.name,
         "description": "Generated app",
@@ -146,12 +160,7 @@ async def save_built_app(
             "id": "app",
             "type": "app_component",
             "position": {"x": 0, "y": 0},
-            "data": {
-                "label": request.name,
-                "templateType": "app_component",
-                "code": request.code,
-                "config": {},
-            },
+            "data": node_data,
         }]),
         "edges_json": "[]",
     }
