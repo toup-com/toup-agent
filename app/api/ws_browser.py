@@ -759,13 +759,15 @@ async def _run_browser_agent_inner(
     max_steps = 20
 
     for step in range(max_steps):
-        logger.info("[WS Browser] Step %d/%d — calling LLM", step + 1, max_steps)
+        logger.warning("[WS Browser] Step %d/%d — calling LLM", step + 1, max_steps)
+        # Force tool use on first step so agent always browses (never text-only)
+        tc = "required" if step == 0 else "auto"
         try:
             response = await client.chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": BROWSER_SYSTEM_PROMPT}] + conversation,
                 tools=BROWSER_TOOLS,
-                tool_choice="auto",
+                tool_choice=tc,
                 max_completion_tokens=2048,
                 temperature=0.2,
             )
