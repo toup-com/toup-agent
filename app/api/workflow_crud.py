@@ -29,6 +29,8 @@ router = APIRouter(prefix="/workflows", tags=["Workflows"])
 class WorkflowCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
+    nodes_json: Optional[str] = None
+    edges_json: Optional[str] = None
 
 
 class WorkflowUpdate(BaseModel):
@@ -105,8 +107,8 @@ async def create_workflow(req: WorkflowCreate, db: AsyncSession = Depends(get_db
         name=req.name,
         description=req.description,
         status="draft",
-        nodes_json="[]",
-        edges_json="[]",
+        nodes_json=req.nodes_json or "[]",
+        edges_json=req.edges_json or "[]",
         run_count=0,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
