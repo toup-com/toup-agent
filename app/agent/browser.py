@@ -373,7 +373,14 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
         if _browser and _browser.is_connected():
             return _browser
         try:
-            from playwright.async_api import async_playwright
+            # Patchright = patched Playwright that bypasses CDP detection (Cloudflare, Google captchas)
+            # Falls back to regular Playwright if not installed
+            try:
+                from patchright.async_api import async_playwright
+                logger.info("[BROWSER] Using Patchright (anti-detect Playwright)")
+            except ImportError:
+                from playwright.async_api import async_playwright
+                logger.info("[BROWSER] Patchright not found, using standard Playwright")
             _playwright = await async_playwright().start()
 
             if profile == BrowserProfile.REMOTE and cdp_url:
@@ -423,7 +430,7 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
             return _browser
         except ImportError:
             raise RuntimeError(
-                "Playwright not installed. Run: pip install playwright && playwright install chromium"
+                "Browser not installed. Run: pip install patchright && patchright install chromium"
             )
         except Exception as e:
             logger.exception("[BROWSER] Failed to launch browser")

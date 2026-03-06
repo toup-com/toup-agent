@@ -70,6 +70,9 @@ anthropic>=0.30.0
 pytest==7.4.4
 pytest-asyncio==0.23.3
 
+# Browser automation (anti-detect)
+patchright>=1.0.0  # Drop-in Playwright replacement that bypasses CDP detection
+
 # MCP Server
 fastmcp==2.14.5
 
