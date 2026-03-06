@@ -254,11 +254,13 @@ export const sampleData = [...];
 - uuid (for generating IDs)
 - zustand (state management for complex apps)
 
-When you use a package, also output a dependencies block:
+When you use a package, also output a dependencies block.
+IMPORTANT: If using recharts, you MUST also include "react-is": "latest" (peer dependency).
 ```dependencies
 {
   "lucide-react": "latest",
   "recharts": "latest",
+  "react-is": "latest",
   "react-router-dom": "latest"
 }
 ```
