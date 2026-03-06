@@ -53,6 +53,3 @@ slack-sdk>=3.27.0
 # AI providers
 anthropic>=0.30.0
 cohere>=5.0.0
-
-# MCP Server
-fastmcp==2.14.5
