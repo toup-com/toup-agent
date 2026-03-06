@@ -403,8 +403,14 @@ After parallel_search completes, you receive all results and can summarize the b
 - If the user asks to find something, navigate to the website and actually find it
 - Use CSS selectors (preferred) or text content to target elements
 - When searching on a site, use type_text with press_enter=true
-- For web searches, navigate directly: https://www.google.com/search?q=YOUR+QUERY or go to the specific site
-- If a site blocks you, try the direct URL (e.g. churchs.com, ubereats.com)
+- CRITICAL: NEVER use Google Search (google.com/search). Google blocks automated browsers with captchas.
+  Instead, navigate DIRECTLY to the relevant website:
+  - Flights: kayak.com, skyscanner.com, google.com/travel/flights (NOT google.com/search)
+  - Shopping: amazon.com, bestbuy.com, walmart.com, ebay.com
+  - Hotels: booking.com, hotels.com, expedia.com
+  - Food: ubereats.com, doordash.com, yelp.com
+  - General: duckduckgo.com/?q=YOUR+QUERY (NOT google.com)
+- If a site blocks you with a captcha, DON'T try to solve it. Navigate to an alternative site instead.
 - Scroll down to find more content if needed
 - NEVER ask the user clarifying questions — just go browse and find the answer
 - Call `done` with a clear summary when finished"""
@@ -790,14 +796,29 @@ async def _run_browser_agent_inner(
 
     conversation.append({"role": "user", "content": context_message})
 
-    # ── Auto-detect comparison tasks → force parallel_search on first step ──
+    # ── Auto-detect tasks that benefit from parallel search ──
+    _msg_lower = user_message.lower()
+    # Explicit comparison keywords
     _comparison_keywords = [
         "best price", "cheapest", "compare", "find me the best",
         "lowest price", "best deal", "search multiple", "which site",
-        "across sites", "comparison", "best flight", "best hotel",
-        "shop around", "price check", "find the best",
+        "across sites", "comparison", "shop around", "price check",
+        "find the best", "best option",
     ]
-    _is_comparison = any(kw in user_message.lower() for kw in _comparison_keywords)
+    # Category keywords — when user is searching for flights/hotels/products
+    _category_keywords = [
+        "flight", "flights", "fly", "airline",
+        "hotel", "hotels", "accommodation", "stay",
+        "buy", "purchase", "price", "how much",
+        "search me", "search for", "find me", "look for",
+        "book", "booking", "reserve", "reservation",
+    ]
+    _has_comparison = any(kw in _msg_lower for kw in _comparison_keywords)
+    _has_category = any(kw in _msg_lower for kw in _category_keywords)
+    # Also detect route patterns like "yyz to dxb", "toronto to dubai"
+    import re
+    _has_route = bool(re.search(r'\b\w{3,}\s+to\s+\w{3,}\b', _msg_lower))
+    _is_comparison = _has_comparison or (_has_category and _has_route) or (_has_category and any(w in _msg_lower for w in ["best", "cheap", "price", "deal"]))
 
     if _is_comparison:
         logger.warning("[WS Browser] Comparison task detected — forcing parallel_search planning")
@@ -808,7 +829,13 @@ async def _run_browser_agent_inner(
                 {"role": "system", "content": (
                     "You are a search planner. Given the user's request, output a JSON array of search tasks. "
                     "Each item has 'url' (full URL to start on) and 'task' (what to search/find on that site). "
-                    "Choose 4-8 relevant websites. Output ONLY the JSON array, nothing else."
+                    "Choose 4-8 relevant websites. Output ONLY the JSON array, nothing else.\n\n"
+                    "IMPORTANT: NEVER use google.com/search — it blocks automated browsers. Instead go DIRECTLY to relevant sites:\n"
+                    "- Flights: https://www.kayak.com/flights/..., https://www.skyscanner.com, https://www.google.com/travel/flights, "
+                    "https://www.momondo.com, https://www.cheapflights.com, https://www.expedia.com/Flights\n"
+                    "- Hotels: https://www.booking.com, https://www.hotels.com, https://www.expedia.com, https://www.agoda.com\n"
+                    "- Shopping: https://www.amazon.com, https://www.bestbuy.com, https://www.walmart.com, https://www.ebay.com\n"
+                    "For flights, construct direct URLs when possible, e.g. https://www.kayak.com/flights/YYZ-DXB/2026-03-19"
                 )},
                 {"role": "user", "content": user_message},
             ],
@@ -955,7 +982,9 @@ Rules:
 - Extract specific data (prices, names, details)
 - Call `done` with ALL relevant findings — be specific with numbers and prices
 - You have max 12 steps, so be efficient
-- NEVER ask questions — just search and report findings"""
+- NEVER ask questions — just search and report findings
+- NEVER use google.com/search — go directly to the assigned site
+- If you hit a captcha, call `done` with summary "BLOCKED: Site showed captcha" and move on"""
 
 
 async def _run_worker(

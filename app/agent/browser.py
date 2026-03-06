@@ -385,11 +385,23 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 )
                 logger.info("[BROWSER] Attached to Chrome via CDP")
             else:
-                _browser = await _playwright.chromium.launch(
-                    headless=True,
-                    args=STEALTH_ARGS,
-                )
-                logger.info("[BROWSER] Chromium launched (headless + stealth)")
+                # Try real Chrome first (much better anti-detection than Chromium)
+                # Then fall back to Chromium with new headless mode
+                import shutil
+                real_chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+                if real_chrome:
+                    _browser = await _playwright.chromium.launch(
+                        executable_path=real_chrome,
+                        headless=True,
+                        args=STEALTH_ARGS + ["--headless=new"],
+                    )
+                    logger.info("[BROWSER] Real Chrome launched (new headless): %s", real_chrome)
+                else:
+                    _browser = await _playwright.chromium.launch(
+                        headless=True,
+                        args=STEALTH_ARGS + ["--headless=new"],
+                    )
+                    logger.info("[BROWSER] Chromium launched (new headless + stealth)")
 
             # Create a stealth context — all tabs share this context
             _context = await _browser.new_context(
