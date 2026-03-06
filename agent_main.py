@@ -598,7 +598,7 @@ try:
     mcp_app = app_mcp.http_app(path="/mcp")
     app.mount("/api/app-mcp", mcp_app)
 except Exception as _mcp_err:
-    logger.warning("App MCP server not mounted: %s", _mcp_err)
+    print(f"⚠️ App MCP server not mounted: {_mcp_err}")
 
 
 @app.get("/")
