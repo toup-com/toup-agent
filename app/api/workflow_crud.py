@@ -214,6 +214,177 @@ async def run_workflow(
     return ctx.to_dict()
 
 
+# ── App Builder (AI chat → SSE stream) ───────────────────────────
+
+BUILDER_SYSTEM_PROMPT = """You are Toup's app builder AI. You build custom React apps for users based on their needs — like v0 or Bolt.
+
+## Your Process:
+1. UNDERSTAND: Ask 2-3 focused questions to understand exactly what the user needs. Ask about their specific use case, what data they want to track, what features matter most.
+2. PLAN: Once you understand, briefly describe the app you'll create (2-3 sentences).
+3. BUILD: Generate a complete React component. The code renders live in the user's browser via Sandpack.
+
+## Code Rules:
+- Output code in a single ```app code fence (NOT ```tsx or ```jsx, use ```app)
+- Export a default function component called `App`
+- Use ONLY inline styles (style={{...}}) — no CSS imports, no className with Tailwind
+- Use React hooks (useState, useEffect, useRef, useMemo, useCallback) — they're available
+- NO external imports — no axios, no lodash, no external packages. Only React is available.
+- Build a COMPLETE, functional app — not a skeleton or placeholder
+- Include realistic sample data so the app looks populated and useful
+- Use a modern dark theme by default (dark backgrounds #0f172a, #1e293b, white/gray text)
+- Make it responsive and polished — this should look like a real product
+- Include interactive elements: buttons that work, inputs that filter, tabs that switch, etc.
+
+## Design Guidelines:
+- Use a clean, modern design with good spacing and visual hierarchy
+- Use color accents sparingly (violet/purple #8b5cf6 for primary actions)
+- Include icons as emoji or Unicode symbols (not imported icon libraries)
+- Add smooth hover effects and transitions via inline styles
+- Make the app feel complete — include headers, stats cards, lists, forms as appropriate
+
+## Example Output:
+```app
+export default function App() {
+  const [activeTab, setActiveTab] = React.useState('dashboard');
+  const [items, setItems] = React.useState([
+    { id: 1, name: 'Example Item', status: 'active' },
+  ]);
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#0f172a', color: '#e2e8f0', fontFamily: 'system-ui' }}>
+      <header style={{ padding: '1rem 2rem', borderBottom: '1px solid #1e293b' }}>
+        <h1 style={{ fontSize: '1.25rem', fontWeight: 700 }}>My App</h1>
+      </header>
+      <main style={{ padding: '2rem' }}>
+        {/* ... full app content ... */}
+      </main>
+    </div>
+  );
+}
+```
+
+## Important:
+- Do NOT generate code until you've asked questions and understand the user's needs
+- Be specific in your questions — "What data do you want to track?" is better than "Tell me more"
+- When iterating, output the FULL updated component (not just the changed parts)
+- After generating, ask if they want to adjust anything (colors, features, layout, etc.)
+- Keep conversation friendly and concise — you're a builder, not a lecturer
+"""
+
+
+class BuilderChatRequest(BaseModel):
+    messages: list[dict]  # [{role: "user"/"assistant", content: "..."}]
+
+
+async def _stream_openai(messages: list[dict]):
+    """Stream from OpenAI using the agent's configured model."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    model = getattr(settings, "agent_model", "gpt-4o-mini")
+
+    try:
+        stream = await client.chat.completions.create(
+            model=model, messages=messages,
+            max_completion_tokens=16384, stream=True,
+        )
+    except Exception:
+        stream = await client.chat.completions.create(
+            model=model, messages=messages,
+            temperature=0.7, max_tokens=16384, stream=True,
+        )
+
+    async for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if delta and delta.content:
+            yield delta.content
+
+
+async def _stream_anthropic(messages: list[dict]):
+    """Stream from Anthropic using the agent's strongest model."""
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    model = getattr(settings, "anthropic_model", "claude-sonnet-4-20250514")
+
+    system_msg = ""
+    chat_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_msg = m["content"]
+        else:
+            chat_messages.append(m)
+
+    async with client.messages.stream(
+        model=model, max_tokens=16384,
+        system=system_msg, messages=chat_messages,
+    ) as stream:
+        async for text in stream.text_stream:
+            yield text
+
+
+def _get_strongest_provider() -> str:
+    """Return 'anthropic' or 'openai' based on available keys."""
+    if getattr(settings, "anthropic_api_key", None):
+        return "anthropic"
+    if getattr(settings, "openai_api_key", None):
+        return "openai"
+    return "none"
+
+
+@router.post("/builder/chat")
+async def builder_chat(request: BuilderChatRequest, db: AsyncSession = Depends(get_db)):
+    """Stream AI app builder responses. Runs on the VPS agent with user's own API keys."""
+    provider = _get_strongest_provider()
+    if provider == "none":
+        raise HTTPException(500, "No LLM API key configured on this agent")
+
+    # Get user context from memories
+    user_context = ""
+    try:
+        from app.db.models import Memory
+        rows = (await db.execute(
+            select(Memory.content).where(
+                Memory.user_id == settings.user_id,
+                Memory.brain_type == "user",
+            ).limit(10)
+        )).scalars().all()
+        if rows:
+            user_context = "\nUser context:\n" + "\n".join(f"- {r}" for r in rows)
+    except Exception:
+        pass
+
+    system_content = BUILDER_SYSTEM_PROMPT + user_context
+    messages = [{"role": "system", "content": system_content}]
+    for msg in request.messages:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+
+    model_name = (
+        getattr(settings, "anthropic_model", "claude-sonnet-4-20250514")
+        if provider == "anthropic"
+        else getattr(settings, "agent_model", "gpt-4o-mini")
+    )
+
+    async def event_stream():
+        try:
+            streamer = _stream_anthropic(messages) if provider == "anthropic" else _stream_openai(messages)
+            # Send model info as first event
+            yield f"data: {json.dumps({'type': 'meta', 'model': model_name, 'provider': provider})}\n\n"
+            async for token in streamer:
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        except Exception as e:
+            logger.error("Builder chat stream error: %s", e)
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ── Workspace Generation (post-onboarding) ──────────────────────
 
 @router.post("/generate-from-onboarding")

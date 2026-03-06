@@ -1,17 +1,17 @@
 """
-App Builder — Conversational AI that asks questions then generates React apps.
+App Builder — Platform proxy that forwards builder chat to the user's VPS agent.
 
-Uses SSE (Server-Sent Events) to stream the AI conversation to the frontend.
-The AI asks clarifying questions about the user's needs, then generates
-React component code that renders as a live preview via Sandpack.
+The user's agent has their API keys and uses their strongest model.
+Platform just authenticates the user and proxies the SSE stream.
 """
 
 import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -20,147 +20,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
 from app.config import settings
-from app.db import get_db, User, Workflow, Memory
+from app.db import get_db, User, Workflow, AgentConfig
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/workflows/builder", tags=["App Builder"])
 
 
-SYSTEM_PROMPT = """You are Toup's app builder AI. You build custom React apps for users based on their needs — like v0 or Bolt.
-
-## Your Process:
-1. UNDERSTAND: Ask 2-3 focused questions to understand exactly what the user needs. Ask about their specific use case, what data they want to track, what features matter most.
-2. PLAN: Once you understand, briefly describe the app you'll create (2-3 sentences).
-3. BUILD: Generate a complete React component. The code renders live in the user's browser via Sandpack.
-
-## Code Rules:
-- Output code in a single ```app code fence (NOT ```tsx or ```jsx, use ```app)
-- Export a default function component called `App`
-- Use ONLY inline styles (style={{...}}) — no CSS imports, no className with Tailwind (Tailwind CDN is loaded but inline styles are more reliable in Sandpack)
-- Use React hooks (useState, useEffect, useRef, useMemo, useCallback) — they're available
-- NO external imports — no axios, no lodash, no external packages. Only React is available.
-- Build a COMPLETE, functional app — not a skeleton or placeholder
-- Include realistic sample data so the app looks populated and useful
-- Use a modern dark theme by default (dark backgrounds #0f172a, #1e293b, white/gray text)
-- Make it responsive and polished — this should look like a real product
-- Include interactive elements: buttons that work, inputs that filter, tabs that switch, etc.
-
-## Design Guidelines:
-- Use a clean, modern design with good spacing and visual hierarchy
-- Use color accents sparingly (violet/purple #8b5cf6 for primary actions)
-- Include icons as emoji or Unicode symbols (not imported icon libraries)
-- Add smooth hover effects and transitions via inline styles
-- Make the app feel complete — include headers, stats cards, lists, forms as appropriate
-
-## Example Output:
-```app
-export default function App() {
-  const [activeTab, setActiveTab] = React.useState('dashboard');
-  const [items, setItems] = React.useState([
-    { id: 1, name: 'Example Item', status: 'active' },
-  ]);
-
-  return (
-    <div style={{ minHeight: '100vh', background: '#0f172a', color: '#e2e8f0', fontFamily: 'system-ui' }}>
-      {/* Header */}
-      <header style={{ padding: '1rem 2rem', borderBottom: '1px solid #1e293b' }}>
-        <h1 style={{ fontSize: '1.25rem', fontWeight: 700 }}>My App</h1>
-      </header>
-      {/* Content */}
-      <main style={{ padding: '2rem' }}>
-        {/* ... full app content ... */}
-      </main>
-    </div>
-  );
-}
-```
-
-## Important:
-- Do NOT generate code until you've asked questions and understand the user's needs
-- Be specific in your questions — "What data do you want to track?" is better than "Tell me more"
-- When iterating, output the FULL updated component (not just the changed parts)
-- After generating, ask if they want to adjust anything (colors, features, layout, etc.)
-- Keep conversation friendly and concise — you're a builder, not a lecturer
-"""
+async def _get_agent_info(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]]:
+    """Return (agent_url, agent_api_key) if the user has a deployed agent."""
+    result = await db.execute(
+        select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+        .where(
+            AgentConfig.user_id == user_id,
+            AgentConfig.deploy_status == "active",
+        )
+    )
+    row = result.first()
+    if row and row.agent_url and row.agent_api_key:
+        return (row.agent_url, row.agent_api_key)
+    return None
 
 
 class BuilderMessage(BaseModel):
-    messages: list[dict]  # [{role: "user"/"assistant", content: "..."}]
-
-
-async def _get_user_context(user_id: str, db: AsyncSession) -> str:
-    """Get user context from onboarding memories."""
-    try:
-        rows = (await db.execute(
-            select(Memory.content).where(
-                Memory.user_id == user_id,
-                Memory.brain_type == "user",
-            ).limit(10)
-        )).scalars().all()
-        if rows:
-            return "User context from their profile:\n" + "\n".join(f"- {r}" for r in rows)
-    except Exception:
-        pass
-    return ""
-
-
-async def _stream_openai(messages: list[dict]):
-    """Stream response from OpenAI."""
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
-    model = getattr(settings, "default_model", "gpt-4o-mini")
-    agent_model = getattr(settings, "agent_model", None)
-    if agent_model and agent_model != "gpt-4o-mini":
-        model = agent_model
-
-    # Newer OpenAI models (o-series, gpt-4.1+) use max_completion_tokens
-    # and some don't support temperature. Try the new API first, fall back.
-    try:
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_completion_tokens=8192,
-            stream=True,
-        )
-    except Exception:
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=8192,
-            stream=True,
-        )
-
-    async for chunk in stream:
-        delta = chunk.choices[0].delta if chunk.choices else None
-        if delta and delta.content:
-            yield delta.content
-
-
-async def _stream_anthropic(messages: list[dict]):
-    """Stream response from Anthropic."""
-    import anthropic
-
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    model = getattr(settings, "anthropic_model", "claude-opus-4-6")
-
-    system_msg = ""
-    chat_messages = []
-    for m in messages:
-        if m["role"] == "system":
-            system_msg = m["content"]
-        else:
-            chat_messages.append(m)
-
-    async with client.messages.stream(
-        model=model,
-        max_tokens=8192,
-        system=system_msg,
-        messages=chat_messages,
-    ) as stream:
-        async for text in stream.text_stream:
-            yield text
+    messages: list[dict]
 
 
 @router.post("/chat")
@@ -169,40 +51,40 @@ async def builder_chat(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Stream AI responses for the app builder conversation."""
+    """Proxy builder chat to the user's VPS agent (SSE stream)."""
+    agent = await _get_agent_info(current_user.id, db)
+    if not agent:
+        raise HTTPException(503, "Agent not deployed. Deploy your agent first to use the App Builder.")
 
-    if not settings.openai_api_key and not settings.anthropic_api_key:
-        raise HTTPException(500, "No LLM API key configured")
+    agent_url, agent_api_key = agent
 
-    user_context = await _get_user_context(current_user.id, db)
-    system_content = SYSTEM_PROMPT
-    if user_context:
-        system_content += f"\n\n{user_context}"
-
-    messages = [{"role": "system", "content": system_content}]
-    for msg in request.messages:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-
-    use_anthropic = bool(settings.anthropic_api_key)
-
-    async def event_stream():
+    async def proxy_stream():
         try:
-            streamer = _stream_anthropic(messages) if use_anthropic else _stream_openai(messages)
-            async for token in streamer:
-                data = json.dumps({"type": "token", "content": token})
-                yield f"data: {data}\n\n"
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+                async with client.stream(
+                    "POST",
+                    f"{agent_url}/api/workflows/builder/chat",
+                    headers={"X-Agent-Key": agent_api_key, "Content-Type": "application/json"},
+                    json={"messages": request.messages},
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        error_msg = f"Agent returned {resp.status_code}: {body.decode()[:200]}"
+                        yield f"data: {json.dumps({'type': 'error', 'content': error_msg})}\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data: "):
+                            yield f"{line}\n\n"
+        except httpx.ConnectError:
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Could not connect to your agent. Is it running?'})}\n\n"
         except Exception as e:
-            logger.error("Builder chat stream error: %s", e)
+            logger.error("Builder proxy error: %s", e)
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
 
     return StreamingResponse(
-        event_stream(),
+        proxy_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -249,7 +131,7 @@ async def save_built_app(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Save an app generated by the builder as a workflow with embedded code."""
+    """Save an app generated by the builder."""
     wf = Workflow(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
