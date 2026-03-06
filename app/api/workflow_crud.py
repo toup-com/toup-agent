@@ -427,8 +427,8 @@ SUGGESTIONS_PROMPT = """Based on this user's goals and context, suggest 4 specif
 User context:
 {context}
 
-Return ONLY a JSON array of 4 strings. Example:
-["IELTS vocabulary flashcard trainer", "Speaking practice timer with scoring", "Essay structure planner", "Listening test simulator"]"""
+Return a JSON object with a "suggestions" key containing an array of 4 strings. Example:
+{{"suggestions": ["IELTS vocabulary flashcard trainer", "Speaking practice timer with scoring", "Essay structure planner", "Listening test simulator"]}}"""
 
 
 @router.get("/builder/suggestions")
@@ -492,15 +492,17 @@ async def builder_suggestions(db: AsyncSession = Depends(get_db)):
                     messages=[{"role": "user", "content": SUGGESTIONS_PROMPT.format(context=context)}],
                     response_format={"type": "json_object"},
                 )
-            except Exception:
+            except Exception as oai_err:
+                logger.info("Builder suggestions: max_completion_tokens failed (%s), retrying with max_tokens", oai_err)
                 resp = await client.chat.completions.create(
                     model=model, max_tokens=300, temperature=0.7,
                     messages=[{"role": "user", "content": SUGGESTIONS_PROMPT.format(context=context)}],
                     response_format={"type": "json_object"},
                 )
             text = resp.choices[0].message.content or "[]"
+            logger.info("Builder suggestions: raw OpenAI response: %s", text[:500])
             data = json.loads(text)
-            suggestions = data if isinstance(data, list) else data.get("suggestions", [])
+            suggestions = data if isinstance(data, list) else data.get("suggestions", data.get("ideas", data.get("apps", [])))
 
         if suggestions and len(suggestions) >= 3:
             logger.info("Builder suggestions: generated %d personalized suggestions", len(suggestions))
