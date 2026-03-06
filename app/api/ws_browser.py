@@ -353,23 +353,26 @@ BROWSER_TOOLS = [
     },
 ]
 
-BROWSER_SYSTEM_PROMPT = """You are an AI browser agent controlling a real web browser. You help users accomplish tasks on the web.
+BROWSER_SYSTEM_PROMPT = """You are an AI browser agent. You MUST use your browser tools to accomplish tasks. You control a REAL web browser.
 
-## Your workflow for EVERY action:
-1. After navigating to any page, you automatically receive a page analysis (text + interactive elements)
-2. Study the content and interactive elements carefully
-3. Decide what to click, type, or scroll based on what you see
-4. After each action, you get a new analysis — use it before the next step
-5. Continue until done, then call `done` with a summary
+CRITICAL: You MUST call browser tools. NEVER respond with just text. ALWAYS use navigate, click, type_text, scroll, etc.
+
+## Your workflow:
+1. FIRST call `navigate` to go to a relevant website
+2. Read the page analysis you receive back
+3. Use `click`, `type_text`, `scroll` to interact with the page
+4. Repeat until the task is done
+5. Call `done` with a summary
 
 ## Rules:
-- After every action you get page content + interactive elements — use this to plan next steps
+- ALWAYS start by navigating to a website. Never just talk about what you would do.
+- If the user asks to find something, navigate to the website and actually find it
 - Use CSS selectors (preferred) or text content to target elements
-- When searching, type the query and set press_enter=true
+- When searching on a site, use type_text with press_enter=true
+- For web searches, navigate directly: https://www.google.com/search?q=YOUR+QUERY or go to the specific site
+- If a site blocks you, try the direct URL (e.g. churchs.com, ubereats.com)
 - Scroll down to find more content if needed
-- If something doesn't work, try a different selector or approach
-- For Google: https://www.google.com/search?q=YOUR+QUERY
-- Be methodical: navigate -> see page -> interact -> see result -> continue
+- NEVER ask the user clarifying questions — just go browse and find the answer
 - Call `done` with a clear summary when finished"""
 
 
@@ -710,10 +713,34 @@ async def _run_browser_agent(
     conversation: List[Dict[str, Any]],
     overlay: AgentOverlay,
 ):
+    try:
+        await _run_browser_agent_inner(
+            websocket, page, tab_manager, browser_mod,
+            user_message, conversation, overlay,
+        )
+    except Exception as e:
+        logger.exception("[WS Browser] Agent loop crashed")
+        try:
+            await websocket.send_json({"type": "error", "message": f"Agent error: {e}"})
+        except Exception:
+            pass
+
+
+async def _run_browser_agent_inner(
+    websocket: WebSocket,
+    page,
+    tab_manager,
+    browser_mod,
+    user_message: str,
+    conversation: List[Dict[str, Any]],
+    overlay: AgentOverlay,
+):
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     model = settings.agent_model
+
+    logger.info("[WS Browser] Starting agent loop: model=%s, message='%s'", model, user_message[:100])
 
     # Activate overlay
     await overlay.inject()
@@ -732,11 +759,13 @@ async def _run_browser_agent(
     max_steps = 20
 
     for step in range(max_steps):
+        logger.info("[WS Browser] Step %d/%d — calling LLM", step + 1, max_steps)
         try:
             response = await client.chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": BROWSER_SYSTEM_PROMPT}] + conversation,
                 tools=BROWSER_TOOLS,
+                tool_choice="auto",
                 max_completion_tokens=2048,
                 temperature=0.2,
             )
@@ -747,6 +776,9 @@ async def _run_browser_agent(
 
         choice = response.choices[0]
         msg = choice.message
+
+        logger.info("[WS Browser] LLM response: tool_calls=%s, content_len=%d",
+                     bool(msg.tool_calls), len(msg.content or ""))
 
         if not msg.tool_calls:
             text = msg.content or ""
