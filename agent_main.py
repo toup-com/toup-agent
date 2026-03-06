@@ -59,12 +59,8 @@ class AgentAPIKeyMiddleware(BaseHTTPMiddleware):
         if request.url.path in _PUBLIC_PATHS:
             return await call_next(request)
 
-        # Skip WebSocket upgrades — they handle auth via query params
-        if request.headers.get("upgrade", "").lower() == "websocket":
-            return await call_next(request)
-
-        # Check the API key — header or query param
-        provided_key = request.headers.get("x-agent-key", "") or request.query_params.get("agent_key", "")
+        # Check the API key header
+        provided_key = request.headers.get("x-agent-key", "")
         if provided_key != settings.agent_api_key:
             return Response(
                 content='{"detail":"Invalid or missing agent API key"}',
@@ -577,9 +573,9 @@ async def agent_self_update():
     """Pull latest code, install deps, and restart the agent process.
 
     The restart works by:
-    1. git pull --ff-only
+    1. git pull --ff-only (or clone if no .git)
     2. pip install -r requirements.txt (if changed)
-    3. Exit with code 0 — the service manager (systemd/launchd) restarts us
+    3. Re-exec the process (works with or without systemd)
     """
     import subprocess, os, sys
 
@@ -587,19 +583,40 @@ async def agent_self_update():
         os.path.dirname(__file__)
     )
     venv_pip = os.path.join(agent_dir, "venv", "bin", "pip")
+    agent_repo = "https://github.com/toup-com/toup-agent.git"
 
     steps = []
 
-    # 1. Git pull
+    # 1. Git pull (or bootstrap .git if missing)
+    git_dir = os.path.join(agent_dir, ".git")
     try:
-        result = subprocess.run(
-            ["git", "pull", "--ff-only"],
-            cwd=agent_dir, capture_output=True, text=True, timeout=30,
-        )
-        pull_output = result.stdout.strip() or result.stderr.strip()
-        steps.append({"step": "git_pull", "ok": result.returncode == 0, "output": pull_output})
-        if result.returncode != 0:
-            return {"success": False, "steps": steps, "error": "git pull failed"}
+        if not os.path.isdir(git_dir):
+            # No .git — bootstrap by initializing and pulling
+            subprocess.run(["git", "init"], cwd=agent_dir, capture_output=True, timeout=10)
+            subprocess.run(["git", "remote", "add", "origin", agent_repo],
+                           cwd=agent_dir, capture_output=True, timeout=10)
+            result = subprocess.run(
+                ["git", "fetch", "--depth", "1", "origin", "main"],
+                cwd=agent_dir, capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                subprocess.run(["git", "checkout", "-f", "origin/main"],
+                               cwd=agent_dir, capture_output=True, timeout=10)
+                subprocess.run(["git", "branch", "-f", "main", "origin/main"],
+                               cwd=agent_dir, capture_output=True, timeout=10)
+                subprocess.run(["git", "checkout", "main"],
+                               cwd=agent_dir, capture_output=True, timeout=10)
+            pull_output = "bootstrapped .git and fetched latest"
+            steps.append({"step": "git_bootstrap", "ok": True, "output": pull_output})
+        else:
+            result = subprocess.run(
+                ["git", "pull", "--ff-only"],
+                cwd=agent_dir, capture_output=True, text=True, timeout=30,
+            )
+            pull_output = result.stdout.strip() or result.stderr.strip()
+            steps.append({"step": "git_pull", "ok": result.returncode == 0, "output": pull_output})
+            if result.returncode != 0:
+                return {"success": False, "steps": steps, "error": "git pull failed"}
     except Exception as e:
         return {"success": False, "steps": [{"step": "git_pull", "ok": False, "output": str(e)}]}
 
