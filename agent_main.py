@@ -229,6 +229,29 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ Skill loading error: {e}")
             skill_loader = SkillLoader()
 
+        # Load app skills from existing builder apps in DB
+        try:
+            from app.agent.skills.builtins.app_skill import load_app_skills_from_db
+            app_count = await load_app_skills_from_db(skill_loader)
+            if app_count:
+                print(f"📱 Loaded {app_count} app skill(s) from builder")
+        except Exception as e:
+            print(f"⚠️ App skill loading error: {e}")
+
+        # Wire skill_loader to workflow CRUD for auto-registration
+        try:
+            from app.api.workflow_crud import set_skill_loader
+            set_skill_loader(skill_loader)
+        except Exception:
+            pass
+
+        # Wire skill_loader to App MCP server
+        try:
+            from app.agent.app_mcp_server import set_mcp_skill_loader
+            set_mcp_skill_loader(skill_loader)
+        except Exception:
+            pass
+
         # Build the agent pipeline
         openai_agent_svc = OpenAIAgentService()
         subagent_manager = SubAgentManager()
@@ -568,6 +591,14 @@ app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(workflow_crud_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
 app.include_router(ws_browser_router, prefix=settings.api_prefix)
+
+# Mount App MCP server for external MCP clients
+try:
+    from app.agent.app_mcp_server import app_mcp, set_mcp_skill_loader
+    mcp_app = app_mcp.http_app(path="/mcp")
+    app.mount("/api/app-mcp", mcp_app)
+except Exception as _mcp_err:
+    logger.warning("App MCP server not mounted: %s", _mcp_err)
 
 
 @app.get("/")

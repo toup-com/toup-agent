@@ -23,6 +23,45 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/workflows", tags=["Workflows"])
 
+# ── App skill auto-registration ─────────────────────────────────
+_skill_loader = None
+
+
+def set_skill_loader(loader):
+    """Called by agent_main.py to wire skill registration on workflow CRUD."""
+    global _skill_loader
+    _skill_loader = loader
+
+
+async def _maybe_register_app_skill(workflow):
+    """If the workflow has an app_component node, register an AppSkill."""
+    if not _skill_loader:
+        return
+    try:
+        nodes = json.loads(workflow.nodes_json or "[]")
+        from app.agent.skills.builtins.app_skill import AppSkill, slugify, _find_app_node
+        node = _find_app_node(nodes)
+        if node:
+            slug = slugify(workflow.name, workflow.id)
+            skill = AppSkill(workflow.id, workflow.name, slug)
+            await _skill_loader.register_dynamic(skill)
+            logger.info("[APP-SKILL] Registered skill for app '%s'", workflow.name)
+    except Exception as e:
+        logger.warning("[APP-SKILL] Registration failed: %s", e)
+
+
+async def _maybe_unload_app_skill(workflow):
+    """Unload the app skill for a deleted workflow."""
+    if not _skill_loader:
+        return
+    try:
+        from app.agent.skills.builtins.app_skill import slugify
+        slug = slugify(workflow.name, workflow.id)
+        skill_name = f"app_{slug}"
+        await _skill_loader.unload_skill(skill_name)
+    except Exception as e:
+        logger.debug("[APP-SKILL] Unload skipped: %s", e)
+
 
 # ── Request / Response schemas ───────────────────────────────────────
 
@@ -116,6 +155,7 @@ async def create_workflow(req: WorkflowCreate, db: AsyncSession = Depends(get_db
     db.add(w)
     await db.commit()
     await db.refresh(w)
+    await _maybe_register_app_skill(w)
     return _to_out(w)
 
 
@@ -143,6 +183,7 @@ async def update_workflow(
 
     await db.commit()
     await db.refresh(w)
+    await _maybe_register_app_skill(w)
     return _to_out(w)
 
 
@@ -153,6 +194,7 @@ async def delete_workflow(workflow_id: str, db: AsyncSession = Depends(get_db)):
     w = result.scalar_one_or_none()
     if not w:
         raise HTTPException(404, "Workflow not found")
+    await _maybe_unload_app_skill(w)
     await db.delete(w)
     await db.commit()
     return {"status": "deleted", "id": workflow_id}
@@ -299,6 +341,11 @@ IMPORTANT: If using recharts, you MUST also include "react-is": "latest" (peer d
 - When user asks for changes, ONLY output the files that changed
 - DO NOT re-output unchanged files
 - Always include the full content of changed files (not partial diffs)
+
+## Agent Integration:
+Your app will be automatically integrated with the user's AI agent.
+The agent can inspect and modify all files. Write clean, modular code
+with clear file separation so changes are easy to apply per-file.
 
 ## Important:
 - Keep questions minimal (1-2 max), then BUILD immediately

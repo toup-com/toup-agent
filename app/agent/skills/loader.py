@@ -108,6 +108,34 @@ class SkillLoader:
         return hooks
 
     # ------------------------------------------------------------------
+    # Dynamic registration (hot-reload)
+    # ------------------------------------------------------------------
+
+    async def register_dynamic(self, skill: Skill) -> bool:
+        """Register a skill instance at runtime (no filesystem needed).
+        If a skill with the same name already exists, unload it first."""
+        name = skill.meta.name
+        if name in self._skills:
+            await self.unload_skill(name)
+        await self._register(skill)
+        return True
+
+    async def unload_skill(self, name: str) -> bool:
+        """Unload a single skill by name."""
+        skill = self._skills.pop(name, None)
+        if not skill:
+            return False
+        # Remove tool index entries
+        for tool in skill.get_tools():
+            self._tool_index.pop(tool.get("name", ""), None)
+        try:
+            await skill.on_unload()
+        except Exception as e:
+            logger.warning(f"[SKILLS] Error unloading {name}: {e}")
+        logger.info(f"[SKILLS] Unloaded '{name}'")
+        return True
+
+    # ------------------------------------------------------------------
     # Tool execution
     # ------------------------------------------------------------------
 
