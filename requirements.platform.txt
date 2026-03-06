@@ -55,4 +55,4 @@ anthropic>=0.30.0
 cohere>=5.0.0
 
 # MCP Server
-fastmcp==2.9.2
+fastmcp==2.14.5
