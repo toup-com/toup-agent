@@ -416,6 +416,86 @@ async def builder_chat(request: BuilderChatRequest, db: AsyncSession = Depends(g
     )
 
 
+# ── Builder suggestions (personalized from user memories) ─────
+
+SUGGESTIONS_PROMPT = """Based on this user's goals and context, suggest 4 specific app ideas they would find useful. Each suggestion should be a short phrase (under 60 chars) describing a concrete app.
+
+User context:
+{context}
+
+Return ONLY a JSON array of 4 strings. Example:
+["IELTS vocabulary flashcard trainer", "Speaking practice timer with scoring", "Essay structure planner", "Listening test simulator"]"""
+
+
+@router.get("/builder/suggestions")
+async def builder_suggestions(db: AsyncSession = Depends(get_db)):
+    """Return personalized app suggestions based on user memories."""
+    fallback = [
+        "Project management dashboard with kanban board",
+        "Personal CRM to track clients and deals",
+        "Habit tracker with streaks and analytics",
+        "E-commerce admin panel with order management",
+    ]
+
+    try:
+        from app.db.models import Memory
+
+        # Read user memories — goals first, then general
+        rows = (await db.execute(
+            select(Memory.content).where(
+                Memory.user_id == settings.user_id,
+                Memory.brain_type == "user",
+            ).order_by(
+                # goals category first
+                Memory.category.desc(),
+            ).limit(15)
+        )).scalars().all()
+
+        if not rows:
+            return {"suggestions": fallback, "personalized": False}
+
+        context = "\n".join(f"- {r}" for r in rows)
+
+        # Try LLM-based suggestions
+        provider = _get_strongest_provider()
+        if provider == "none":
+            return {"suggestions": fallback, "personalized": False}
+
+        suggestions = None
+
+        if provider == "anthropic":
+            import anthropic
+            client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+            model = getattr(settings, "anthropic_model", "claude-sonnet-4-20250514")
+            resp = await client.messages.create(
+                model=model, max_tokens=300,
+                messages=[{"role": "user", "content": SUGGESTIONS_PROMPT.format(context=context)}],
+            )
+            text = resp.content[0].text if resp.content else "[]"
+            if "[" in text:
+                suggestions = json.loads(text[text.index("["):text.rindex("]") + 1])
+        else:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=settings.openai_api_key)
+            model = getattr(settings, "agent_model", "gpt-4o-mini")
+            resp = await client.chat.completions.create(
+                model=model, max_tokens=300, temperature=0.7,
+                messages=[{"role": "user", "content": SUGGESTIONS_PROMPT.format(context=context)}],
+                response_format={"type": "json_object"},
+            )
+            text = resp.choices[0].message.content or "[]"
+            data = json.loads(text)
+            suggestions = data if isinstance(data, list) else data.get("suggestions", [])
+
+        if suggestions and len(suggestions) >= 3:
+            return {"suggestions": suggestions[:4], "personalized": True}
+
+    except Exception as e:
+        logger.warning("Builder suggestions failed: %s", e)
+
+    return {"suggestions": fallback, "personalized": False}
+
+
 # ── Workspace Generation (post-onboarding) ──────────────────────
 
 @router.post("/generate-from-onboarding")

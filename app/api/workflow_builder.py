@@ -88,6 +88,43 @@ async def builder_chat(
     )
 
 
+# ── Personalized suggestions ──────────────────────────────────────
+
+@router.get("/suggestions")
+async def builder_suggestions(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get personalized app suggestions from the user's VPS agent."""
+    agent = await _get_agent_info(current_user.id, db)
+    if not agent:
+        return {"suggestions": [
+            "Project management dashboard with kanban board",
+            "Personal CRM to track clients and deals",
+            "Habit tracker with streaks and analytics",
+            "E-commerce admin panel with order management",
+        ], "personalized": False}
+
+    agent_url, agent_api_key = agent
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+            resp = await client.get(
+                f"{agent_url}/api/workflows/builder/suggestions",
+                headers={"X-Agent-Key": agent_api_key},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.warning("Builder suggestions proxy failed: %s", e)
+
+    return {"suggestions": [
+        "Project management dashboard with kanban board",
+        "Personal CRM to track clients and deals",
+        "Habit tracker with streaks and analytics",
+        "E-commerce admin panel with order management",
+    ], "personalized": False}
+
+
 # ── Save endpoints ────────────────────────────────────────────────
 
 class SaveWorkflowsRequest(BaseModel):
