@@ -740,7 +740,7 @@ async def _run_browser_agent_inner(
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     model = settings.agent_model
 
-    logger.info("[WS Browser] Starting agent loop: model=%s, message='%s'", model, user_message[:100])
+    logger.warning("[WS Browser] Starting agent loop: model=%s, message='%s'", model, user_message[:100])
 
     # Activate overlay
     await overlay.inject()
