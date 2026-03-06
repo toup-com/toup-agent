@@ -486,11 +486,18 @@ async def builder_suggestions(db: AsyncSession = Depends(get_db)):
             from openai import AsyncOpenAI
             client = AsyncOpenAI(api_key=settings.openai_api_key)
             model = getattr(settings, "agent_model", "gpt-4o-mini")
-            resp = await client.chat.completions.create(
-                model=model, max_tokens=300, temperature=0.7,
-                messages=[{"role": "user", "content": SUGGESTIONS_PROMPT.format(context=context)}],
-                response_format={"type": "json_object"},
-            )
+            try:
+                resp = await client.chat.completions.create(
+                    model=model, max_completion_tokens=300,
+                    messages=[{"role": "user", "content": SUGGESTIONS_PROMPT.format(context=context)}],
+                    response_format={"type": "json_object"},
+                )
+            except Exception:
+                resp = await client.chat.completions.create(
+                    model=model, max_tokens=300, temperature=0.7,
+                    messages=[{"role": "user", "content": SUGGESTIONS_PROMPT.format(context=context)}],
+                    response_format={"type": "json_object"},
+                )
             text = resp.choices[0].message.content or "[]"
             data = json.loads(text)
             suggestions = data if isinstance(data, list) else data.get("suggestions", [])

@@ -618,6 +618,12 @@ async def agent_self_update():
 
     steps = []
 
+    # Ensure git safe.directory is set (prevents "dubious ownership" errors)
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", agent_dir],
+        capture_output=True, timeout=5,
+    )
+
     # 1. Git pull (or bootstrap .git if missing)
     git_dir = os.path.join(agent_dir, ".git")
     try:
