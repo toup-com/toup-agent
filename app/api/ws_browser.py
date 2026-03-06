@@ -259,6 +259,31 @@ BROWSER_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "parallel_search",
+            "description": "Spawn multiple browser agents to search different websites simultaneously. Use this when you need to compare results across sites (e.g., finding best prices, comparing products). Each worker opens a separate browser tab and searches independently. Results are collected and you can summarize them.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "searches": {
+                        "type": "array",
+                        "description": "List of parallel search tasks",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string", "description": "Starting URL for this worker"},
+                                "task": {"type": "string", "description": "What this worker should do on the site"},
+                            },
+                            "required": ["url", "task"],
+                        },
+                    },
+                },
+                "required": ["searches"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "navigate",
             "description": "Navigate the browser to a URL.",
             "parameters": {
@@ -363,6 +388,15 @@ CRITICAL: You MUST call browser tools. NEVER respond with just text. ALWAYS use 
 3. Use `click`, `type_text`, `scroll` to interact with the page
 4. Repeat until the task is done
 5. Call `done` with a summary
+
+## Parallel Search — IMPORTANT:
+When the user asks you to COMPARE prices, find the BEST deal, or search MULTIPLE websites, use `parallel_search` FIRST.
+This spawns multiple browser agents that search different sites simultaneously.
+Examples of when to use parallel_search:
+- "Find me the cheapest flight from YYZ to DXB" → search Google Flights, Skyscanner, Kayak, Momondo, etc. simultaneously
+- "Find the best price for iPhone 16" → search Amazon, BestBuy, Walmart, eBay simultaneously
+- "Compare hotel prices in Dubai" → search Booking.com, Hotels.com, Expedia, Agoda simultaneously
+After parallel_search completes, you receive all results and can summarize the best option.
 
 ## Rules:
 - ALWAYS start by navigating to a website. Never just talk about what you would do.
@@ -808,17 +842,23 @@ async def _run_browser_agent_inner(
                 "args": fn_args,
             })
 
-            result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
+            # Handle parallel_search specially — it spawns concurrent workers
+            if fn_name == "parallel_search":
+                searches = fn_args.get("searches", [])
+                result = await _exec_parallel_search(searches, websocket, browser_mod)
+            else:
+                result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
 
             conversation.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": result[:6000],
+                "content": result[:12000],  # larger for parallel results
             })
 
-            # Screenshot after every action
-            await _send_screenshot(websocket, page, overlay)
-            await _send_state(websocket, page, tab_manager)
+            # Screenshot after every action (skip for parallel_search — workers handle their own)
+            if fn_name != "parallel_search":
+                await _send_screenshot(websocket, page, overlay)
+                await _send_state(websocket, page, tab_manager)
 
             if fn_name == "done":
                 await websocket.send_json({
@@ -834,6 +874,212 @@ async def _run_browser_agent_inner(
     await _send_screenshot(websocket, page, overlay)
     await overlay.hide_cursor()
     await overlay.set_active(False)
+
+
+# ---------------------------------------------------------------------------
+# Parallel search — multi-agent concurrent browsing
+# ---------------------------------------------------------------------------
+
+WORKER_TOOLS = [t for t in BROWSER_TOOLS if t["function"]["name"] != "parallel_search"]
+
+WORKER_SYSTEM_PROMPT = """You are a focused browser search worker. You have ONE specific task on ONE specific website.
+Complete your task efficiently and call `done` with a clear summary of what you found (include prices, details, URLs).
+
+Rules:
+- Navigate to the assigned URL first
+- Search/browse to find the requested information
+- Extract specific data (prices, names, details)
+- Call `done` with ALL relevant findings — be specific with numbers and prices
+- You have max 12 steps, so be efficient
+- NEVER ask questions — just search and report findings"""
+
+
+async def _run_worker(
+    worker_id: str,
+    url: str,
+    task: str,
+    websocket: WebSocket,
+    browser_mod,
+) -> Dict[str, Any]:
+    """Run a single parallel search worker in its own browser tab."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    model = settings.agent_model
+
+    result = {"worker_id": worker_id, "url": url, "task": task, "status": "error", "summary": ""}
+
+    try:
+        from app.agent.browser import get_stealth_context, get_tab_manager
+        ctx = await get_stealth_context()
+        tab_manager = get_tab_manager()
+        tab_id = await tab_manager.open_tab(ctx, url, viewport={"width": 1280, "height": 720})
+        page = tab_manager.get_tab(tab_id)
+        overlay = AgentOverlay(page, websocket)
+        await overlay.inject()
+
+        # Send initial screenshot
+        await _send_worker_screenshot(websocket, page, overlay, worker_id)
+
+        analysis = await _analyze_page(page)
+        conversation = [
+            {"role": "user", "content": f"{task}\n\n[Current page]\n{analysis}"}
+        ]
+
+        max_steps = 12
+
+        for step in range(max_steps):
+            tc_mode = "required" if step == 0 else "auto"
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "system", "content": WORKER_SYSTEM_PROMPT}] + conversation,
+                    tools=WORKER_TOOLS,
+                    tool_choice=tc_mode,
+                    max_completion_tokens=1500,
+                    temperature=0.2,
+                )
+            except Exception as e:
+                logger.error("[Worker %s] LLM error: %s", worker_id, e)
+                result["summary"] = f"LLM error: {e}"
+                break
+
+            choice = response.choices[0]
+            msg = choice.message
+
+            if not msg.tool_calls:
+                text = msg.content or ""
+                result["summary"] = text
+                result["status"] = "done"
+                break
+
+            conversation.append(msg.model_dump())
+
+            for tc_item in msg.tool_calls:
+                fn_name = tc_item.function.name
+                try:
+                    fn_args = json.loads(tc_item.function.arguments)
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                # Send tool use event tagged with worker_id
+                try:
+                    await websocket.send_json({
+                        "type": "worker_tool_use",
+                        "worker_id": worker_id,
+                        "tool": fn_name,
+                        "args": fn_args,
+                    })
+                except Exception:
+                    pass
+
+                tool_result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tc_item.id,
+                    "content": tool_result[:6000],
+                })
+
+                # Screenshot after every action
+                await _send_worker_screenshot(websocket, page, overlay, worker_id)
+
+                if fn_name == "done":
+                    result["summary"] = fn_args.get("summary", "Task completed.")
+                    result["status"] = "done"
+                    break
+
+            if result["status"] == "done":
+                break
+        else:
+            # Exhausted steps — grab whatever we have
+            if not result["summary"]:
+                result["summary"] = "Ran out of steps. Could not complete the search on this site."
+            result["status"] = "timeout"
+
+        # Cleanup: close the tab
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.exception("[Worker %s] Error", worker_id)
+        result["summary"] = f"Error: {e}"
+
+    # Notify frontend this worker finished
+    try:
+        await websocket.send_json({
+            "type": "worker_done",
+            "worker_id": worker_id,
+            "status": result["status"],
+            "summary": result["summary"],
+            "url": url,
+        })
+    except Exception:
+        pass
+
+    return result
+
+
+async def _send_worker_screenshot(websocket: WebSocket, page, overlay: AgentOverlay, worker_id: str):
+    """Send a screenshot tagged with the worker ID."""
+    try:
+        png_bytes = await page.screenshot(type="png")
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        await websocket.send_json({
+            "type": "worker_screenshot",
+            "worker_id": worker_id,
+            "image": b64,
+        })
+    except Exception as e:
+        logger.warning("[Worker %s] Screenshot failed: %s", worker_id, e)
+
+
+async def _exec_parallel_search(
+    searches: List[Dict[str, str]],
+    websocket: WebSocket,
+    browser_mod,
+) -> str:
+    """Execute parallel search workers and return aggregated results."""
+    # Cap at 8 concurrent workers
+    searches = searches[:8]
+
+    # Notify frontend about worker lineup
+    workers_info = []
+    for i, s in enumerate(searches):
+        wid = f"w{i}"
+        workers_info.append({"worker_id": wid, "url": s["url"], "task": s["task"]})
+
+    await websocket.send_json({
+        "type": "parallel_start",
+        "workers": workers_info,
+    })
+
+    # Run all workers concurrently
+    tasks = []
+    for i, s in enumerate(searches):
+        wid = f"w{i}"
+        tasks.append(_run_worker(wid, s["url"], s["task"], websocket, browser_mod))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Aggregate results
+    summary_parts = []
+    for i, res in enumerate(results):
+        if isinstance(res, Exception):
+            summary_parts.append(f"Worker {i} ({searches[i]['url']}): ERROR — {res}")
+        else:
+            summary_parts.append(f"Worker {i} ({res.get('url', '?')}): {res.get('summary', 'No result')}")
+
+    await websocket.send_json({
+        "type": "parallel_done",
+        "results": [
+            r if isinstance(r, dict) else {"worker_id": f"w{i}", "status": "error", "summary": str(r)}
+            for i, r in enumerate(results)
+        ],
+    })
+
+    return "## Parallel Search Results\n\n" + "\n\n---\n\n".join(summary_parts)
 
 
 # ---------------------------------------------------------------------------
