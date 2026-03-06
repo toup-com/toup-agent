@@ -44,9 +44,23 @@ STEALTH_ARGS = [
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
-    "--disable-features=TranslateUI",
+    "--disable-features=TranslateUI,AutomationControlled,OptimizationHints",
     "--disable-ipc-flooding-protection",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-extensions",
+    "--disable-hang-monitor",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--disable-sync",
+    "--disable-translate",
+    "--metrics-recording-only",
+    "--no-first-run",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--enable-features=NetworkService,NetworkServiceInProcess",
     "--lang=en-US,en",
+    "--window-size=1280,720",
 ]
 
 STEALTH_USER_AGENT = (
@@ -55,44 +69,140 @@ STEALTH_USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-# JS to inject into every page to evade bot detection
+# JS to inject into every page to evade bot detection — comprehensive stealth
 STEALTH_INIT_SCRIPT = """
 () => {
-    // Remove webdriver flag
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    // ─── webdriver ───
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    // Also delete it from the prototype
+    delete Object.getPrototypeOf(navigator).webdriver;
 
-    // Override plugins to look real
+    // ─── navigator overrides ───
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+    Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+
+    // ─── plugins (realistic PluginArray) ───
+    const makeFakePlugin = (name, desc, filename) => {
+        const p = { name, description: desc, filename, length: 1 };
+        p[0] = { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' };
+        Object.setPrototypeOf(p, Plugin.prototype);
+        return p;
+    };
+    const fakePlugins = [
+        makeFakePlugin('Chrome PDF Plugin', 'Portable Document Format', 'internal-pdf-viewer'),
+        makeFakePlugin('Chrome PDF Viewer', '', 'mhjfbmdgcfjbbpaeojofohoefgiehjai'),
+        makeFakePlugin('Native Client', '', 'internal-nacl-plugin'),
+    ];
     Object.defineProperty(navigator, 'plugins', {
-        get: () => [1, 2, 3, 4, 5],
+        get: () => {
+            const arr = fakePlugins;
+            arr.item = (i) => arr[i] || null;
+            arr.namedItem = (n) => arr.find(p => p.name === n) || null;
+            arr.refresh = () => {};
+            Object.setPrototypeOf(arr, PluginArray.prototype);
+            return arr;
+        },
+    });
+    Object.defineProperty(navigator, 'mimeTypes', {
+        get: () => {
+            const mt = [{ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: fakePlugins[0] }];
+            mt.item = (i) => mt[i] || null;
+            mt.namedItem = (n) => mt.find(m => m.type === n) || null;
+            Object.setPrototypeOf(mt, MimeTypeArray.prototype);
+            return mt;
+        },
     });
 
-    // Override languages
-    Object.defineProperty(navigator, 'languages', {
-        get: () => ['en-US', 'en'],
-    });
+    // ─── chrome runtime ───
+    if (!window.chrome) window.chrome = {};
+    window.chrome.runtime = { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect: function(){}, sendMessage: function(){} };
+    window.chrome.loadTimes = function() { return { commitLoadTime: Date.now()/1000, connectionInfo: 'h2', finishDocumentLoadTime: Date.now()/1000, finishLoadTime: Date.now()/1000, firstPaintAfterLoadTime: 0, firstPaintTime: Date.now()/1000, navigationType: 'Other', npnNegotiatedProtocol: 'h2', requestTime: Date.now()/1000 - 0.5, startLoadTime: Date.now()/1000 - 0.5, wasAlternateProtocolAvailable: false, wasFetchedViaSpdy: true, wasNpnNegotiated: true }; };
+    window.chrome.csi = function() { return { onloadT: Date.now(), pageT: Date.now() - performance.timing.navigationStart, startE: performance.timing.navigationStart, tran: 15 }; };
+    window.chrome.app = { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } };
 
-    // Chrome runtime
-    window.chrome = {
-        runtime: {},
-        loadTimes: function() {},
-        csi: function() {},
-        app: { isInstalled: false },
+    // ─── permissions ───
+    const origQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+    window.navigator.permissions.query = (params) => {
+        if (params.name === 'notifications') return Promise.resolve({ state: Notification.permission });
+        if (params.name === 'push') return Promise.resolve({ state: 'prompt' });
+        if (params.name === 'midi' || params.name === 'camera' || params.name === 'microphone') return Promise.resolve({ state: 'prompt' });
+        return origQuery(params).catch(() => Promise.resolve({ state: 'prompt' }));
     };
 
-    // Permissions query
-    const originalQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters) =>
-        parameters.name === 'notifications'
-            ? Promise.resolve({ state: Notification.permission })
-            : originalQuery(parameters);
-
-    // WebGL vendor/renderer
-    const getParameter = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(parameter) {
-        if (parameter === 37445) return 'Intel Inc.';
-        if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-        return getParameter.call(this, parameter);
+    // ─── WebGL vendor/renderer ───
+    const getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(p) {
+        if (p === 37445) return 'Intel Inc.';
+        if (p === 37446) return 'Intel Iris OpenGL Engine';
+        return getParam.call(this, p);
     };
+    // WebGL2
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+        const getParam2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Intel Inc.';
+            if (p === 37446) return 'Intel Iris OpenGL Engine';
+            return getParam2.call(this, p);
+        };
+    }
+
+    // ─── canvas fingerprint noise ───
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function(type) {
+        if (type === 'image/png' || !type) {
+            const ctx = this.getContext('2d');
+            if (ctx) {
+                const style = ctx.fillStyle;
+                ctx.fillStyle = 'rgba(255,255,255,0.01)';
+                ctx.fillRect(0, 0, 1, 1);
+                ctx.fillStyle = style;
+            }
+        }
+        return origToDataURL.apply(this, arguments);
+    };
+    const origToBlob = HTMLCanvasElement.prototype.toBlob;
+    HTMLCanvasElement.prototype.toBlob = function(cb, type, quality) {
+        if (type === 'image/png' || !type) {
+            const ctx = this.getContext('2d');
+            if (ctx) {
+                const style = ctx.fillStyle;
+                ctx.fillStyle = 'rgba(255,255,255,0.01)';
+                ctx.fillRect(0, 0, 1, 1);
+                ctx.fillStyle = style;
+            }
+        }
+        return origToBlob.apply(this, arguments);
+    };
+
+    // ─── Notification mock ───
+    if (!window.Notification) {
+        window.Notification = { permission: 'default', requestPermission: () => Promise.resolve('default') };
+    }
+
+    // ─── iframe contentWindow trap ───
+    try {
+        const origContentWindow = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+        Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+            get: function() {
+                const w = origContentWindow.get.call(this);
+                if (w) {
+                    try { Object.defineProperty(w.navigator, 'webdriver', { get: () => false }); } catch(e) {}
+                }
+                return w;
+            },
+        });
+    } catch(e) {}
+
+    // ─── Connection / Network Information ───
+    if (!navigator.connection) {
+        Object.defineProperty(navigator, 'connection', {
+            get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false }),
+        });
+    }
 }
 """
 

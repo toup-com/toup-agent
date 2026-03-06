@@ -790,12 +790,76 @@ async def _run_browser_agent_inner(
 
     conversation.append({"role": "user", "content": context_message})
 
+    # ── Auto-detect comparison tasks → force parallel_search on first step ──
+    _comparison_keywords = [
+        "best price", "cheapest", "compare", "find me the best",
+        "lowest price", "best deal", "search multiple", "which site",
+        "across sites", "comparison", "best flight", "best hotel",
+        "shop around", "price check", "find the best",
+    ]
+    _is_comparison = any(kw in user_message.lower() for kw in _comparison_keywords)
+
+    if _is_comparison:
+        logger.warning("[WS Browser] Comparison task detected — forcing parallel_search planning")
+        # Ask LLM to plan which sites to search in parallel
+        plan_response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": (
+                    "You are a search planner. Given the user's request, output a JSON array of search tasks. "
+                    "Each item has 'url' (full URL to start on) and 'task' (what to search/find on that site). "
+                    "Choose 4-8 relevant websites. Output ONLY the JSON array, nothing else."
+                )},
+                {"role": "user", "content": user_message},
+            ],
+            max_completion_tokens=1000,
+            temperature=0.3,
+        )
+        plan_text = (plan_response.choices[0].message.content or "").strip()
+        # Parse the JSON array
+        searches = []
+        try:
+            # Handle markdown code blocks
+            if "```" in plan_text:
+                plan_text = plan_text.split("```")[1]
+                if plan_text.startswith("json"):
+                    plan_text = plan_text[4:]
+                plan_text = plan_text.strip()
+            searches = json.loads(plan_text)
+            if not isinstance(searches, list):
+                searches = []
+        except json.JSONDecodeError:
+            logger.warning("[WS Browser] Failed to parse parallel search plan: %s", plan_text[:200])
+
+        if searches:
+            logger.warning("[WS Browser] Parallel search plan: %d sites", len(searches))
+            await websocket.send_json({
+                "type": "tool_use",
+                "tool": "parallel_search",
+                "args": {"searches": searches},
+            })
+            result = await _exec_parallel_search(searches, websocket, browser_mod)
+            # Add to conversation as if the agent called the tool
+            conversation.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "parallel_auto", "type": "function", "function": {"name": "parallel_search", "arguments": json.dumps({"searches": searches})}}],
+            })
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": "parallel_auto",
+                "content": result[:12000],
+            })
+            # Now let the agent summarize the results
+            logger.warning("[WS Browser] Parallel search complete — asking agent to summarize")
+
     max_steps = 20
 
     for step in range(max_steps):
         logger.warning("[WS Browser] Step %d/%d — calling LLM", step + 1, max_steps)
         # Force tool use on first step so agent always browses (never text-only)
-        tc = "required" if step == 0 else "auto"
+        # But if we already did parallel search, let the agent respond freely
+        tc = "required" if step == 0 and not _is_comparison else "auto"
         try:
             response = await client.chat.completions.create(
                 model=model,
