@@ -119,7 +119,13 @@ async def ws_browser_proxy(
     for attempt in range(3):
         try:
             agent_ws = await asyncio.wait_for(
-                websockets.connect(full_url, max_size=20 * 1024 * 1024),  # 20MB for screenshots
+                websockets.connect(
+                    full_url,
+                    max_size=20 * 1024 * 1024,  # 20MB for screenshots
+                    ping_interval=30,
+                    ping_timeout=120,  # Agent may take long to process
+                    close_timeout=10,
+                ),
                 timeout=15.0,
             )
             break
