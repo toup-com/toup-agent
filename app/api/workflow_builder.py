@@ -107,13 +107,16 @@ async def builder_suggestions(
 
     agent_url, agent_api_key = agent
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=5.0)) as client:
             resp = await client.get(
                 f"{agent_url}/api/workflows/builder/suggestions",
                 headers={"X-Agent-Key": agent_api_key},
             )
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                logger.info("Builder suggestions from agent: personalized=%s", data.get("personalized"))
+                return data
+            logger.warning("Builder suggestions agent returned %s: %s", resp.status_code, resp.text[:200])
     except Exception as e:
         logger.warning("Builder suggestions proxy failed: %s", e)
 

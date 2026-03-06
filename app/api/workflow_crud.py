@@ -452,13 +452,16 @@ async def builder_suggestions(db: AsyncSession = Depends(get_db)):
         )).scalars().all()
 
         if not rows:
+            logger.info("Builder suggestions: no memories found for user %s", settings.user_id[:8])
             return {"suggestions": fallback, "personalized": False}
 
         context = "\n".join(f"- {r}" for r in rows)
+        logger.info("Builder suggestions: found %d memories, using context (%d chars)", len(rows), len(context))
 
         # Try LLM-based suggestions
         provider = _get_strongest_provider()
         if provider == "none":
+            logger.warning("Builder suggestions: no LLM provider available")
             return {"suggestions": fallback, "personalized": False}
 
         suggestions = None
@@ -466,7 +469,8 @@ async def builder_suggestions(db: AsyncSession = Depends(get_db)):
         if provider == "anthropic":
             import anthropic
             client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-            model = getattr(settings, "anthropic_model", "claude-sonnet-4-20250514")
+            # Use Haiku for fast, cheap suggestions (no need for Opus here)
+            model = "claude-haiku-4-5-20251001"
             resp = await client.messages.create(
                 model=model, max_tokens=300,
                 messages=[{"role": "user", "content": SUGGESTIONS_PROMPT.format(context=context)}],
@@ -488,10 +492,12 @@ async def builder_suggestions(db: AsyncSession = Depends(get_db)):
             suggestions = data if isinstance(data, list) else data.get("suggestions", [])
 
         if suggestions and len(suggestions) >= 3:
+            logger.info("Builder suggestions: generated %d personalized suggestions", len(suggestions))
             return {"suggestions": suggestions[:4], "personalized": True}
+        logger.warning("Builder suggestions: LLM returned insufficient suggestions: %s", suggestions)
 
     except Exception as e:
-        logger.warning("Builder suggestions failed: %s", e)
+        logger.warning("Builder suggestions failed: %s", e, exc_info=True)
 
     return {"suggestions": fallback, "personalized": False}
 
