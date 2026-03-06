@@ -114,23 +114,23 @@ async def _stream_openai(messages: list[dict]):
     if agent_model and agent_model != "gpt-4o-mini":
         model = agent_model
 
-    # Newer OpenAI models (o1, o3, etc.) use max_completion_tokens instead of max_tokens
-    _needs_completion_tokens = any(
-        model.startswith(p) for p in ("o1", "o3", "o4")
-    )
-    token_kwarg = (
-        {"max_completion_tokens": 8192}
-        if _needs_completion_tokens
-        else {"max_tokens": 8192}
-    )
-
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.7,
-        stream=True,
-        **token_kwarg,
-    )
+    # Newer OpenAI models (o-series, gpt-4.1+) use max_completion_tokens
+    # and some don't support temperature. Try the new API first, fall back.
+    try:
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_completion_tokens=8192,
+            stream=True,
+        )
+    except Exception:
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=8192,
+            stream=True,
+        )
 
     async for chunk in stream:
         delta = chunk.choices[0].delta if chunk.choices else None
