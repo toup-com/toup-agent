@@ -120,6 +120,130 @@ def _stop_xvfb():
 
 
 # ──────────────────────────────────────────────────────────────
+# Local Proxy Forwarder — handles proxy auth so Chromium doesn't have to
+# ──────────────────────────────────────────────────────────────
+
+_proxy_server: asyncio.AbstractServer | None = None
+_proxy_port: int | None = None
+
+
+async def _start_proxy_forwarder(upstream_url: str) -> int:
+    """
+    Start a local TCP proxy that forwards to an authenticated upstream proxy.
+
+    Chromium doesn't support proxy auth in headed mode (ERR_PROXY_AUTH_UNSUPPORTED).
+    This spins up a local proxy on 127.0.0.1 (no auth) that injects the
+    Proxy-Authorization header before forwarding to the real proxy.
+
+    Returns the local port number.
+    """
+    global _proxy_server, _proxy_port
+
+    if _proxy_port is not None:
+        return _proxy_port
+
+    import base64
+    from urllib.parse import urlparse
+
+    parsed = urlparse(upstream_url)
+    upstream_host = parsed.hostname
+    upstream_port = parsed.port or 80
+    auth_header = None
+    if parsed.username:
+        creds = f"{parsed.username}:{parsed.password or ''}"
+        auth_header = f"Proxy-Authorization: Basic {base64.b64encode(creds.encode()).decode()}\r\n"
+
+    async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _handle_client(client_reader: asyncio.StreamReader,
+                             client_writer: asyncio.StreamWriter):
+        try:
+            # Read the request line (e.g. "CONNECT host:443 HTTP/1.1\r\n")
+            first_line = await asyncio.wait_for(client_reader.readline(), timeout=30)
+            if not first_line:
+                client_writer.close()
+                return
+
+            # Read remaining headers
+            headers = bytearray(first_line)
+            while True:
+                line = await asyncio.wait_for(client_reader.readline(), timeout=30)
+                headers.extend(line)
+                if line == b"\r\n" or not line:
+                    break
+
+            # Connect to upstream proxy
+            up_reader, up_writer = await asyncio.open_connection(
+                upstream_host, upstream_port
+            )
+
+            # Inject auth header into the request to the upstream proxy
+            if auth_header:
+                # Insert Proxy-Authorization after the first line
+                first_line_end = headers.index(b"\r\n") + 2
+                modified = (
+                    bytes(headers[:first_line_end])
+                    + auth_header.encode()
+                    + bytes(headers[first_line_end:])
+                )
+            else:
+                modified = bytes(headers)
+
+            up_writer.write(modified)
+            await up_writer.drain()
+
+            # For CONNECT tunnels, check upstream response first
+            if first_line.upper().startswith(b"CONNECT"):
+                # Read upstream proxy response
+                up_response = bytearray()
+                while True:
+                    resp_line = await asyncio.wait_for(up_reader.readline(), timeout=30)
+                    up_response.extend(resp_line)
+                    if resp_line == b"\r\n" or not resp_line:
+                        break
+                # Forward the response to client
+                client_writer.write(bytes(up_response))
+                await client_writer.drain()
+
+            # Bidirectional pipe
+            await asyncio.gather(
+                _pipe(client_reader, up_writer),
+                _pipe(up_reader, client_writer),
+            )
+        except Exception as e:
+            logger.debug("[PROXY-FWD] Connection error: %s", e)
+        finally:
+            try:
+                client_writer.close()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(_handle_client, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    _proxy_server = server
+    _proxy_port = port
+    logger.info(
+        "[PROXY-FWD] Local forwarder on :%d → %s:%d (auth injected)",
+        port, upstream_host, upstream_port,
+    )
+    return port
+
+
+# ──────────────────────────────────────────────────────────────
 # Browser Profiles
 # ──────────────────────────────────────────────────────────────
 
@@ -675,7 +799,6 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 logger.info("[BROWSER] Patchright not found, using standard Playwright")
             _playwright = await async_playwright().start()
 
-            proxy_config = None
             if profile == BrowserProfile.REMOTE and cdp_url:
                 _browser = await _playwright.chromium.connect_over_cdp(cdp_url)
                 logger.info("[BROWSER] Connected to remote CDP: %s", cdp_url)
@@ -698,28 +821,21 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                     launch_args.append("--headless=new")
 
                 # Proxy support — residential proxy eliminates datacenter IP detection
+                # Chromium doesn't support proxy auth natively (ERR_PROXY_AUTH_UNSUPPORTED)
+                # so we run a local forwarder that handles auth transparently
                 from app.config import settings
-                proxy_config = None
+                browser_proxy_arg = None
                 if getattr(settings, "browser_proxy", ""):
-                    proxy_url = settings.browser_proxy
-                    # Parse http://user:pass@host:port into Playwright's format
-                    from urllib.parse import urlparse
-                    parsed = urlparse(proxy_url)
-                    if parsed.username:
-                        proxy_config = {
-                            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-                            "username": parsed.username,
-                            "password": parsed.password or "",
-                        }
-                    else:
-                        proxy_config = {"server": proxy_url}
-                    logger.info("[BROWSER] Using proxy: %s:%s", parsed.hostname, parsed.port)
+                    local_port = await _start_proxy_forwarder(settings.browser_proxy)
+                    browser_proxy_arg = {"server": f"http://127.0.0.1:{local_port}"}
+                    logger.info("[BROWSER] Local proxy forwarder on port %d", local_port)
 
                 if real_chrome:
                     _browser = await _playwright.chromium.launch(
                         executable_path=real_chrome,
                         headless=not use_headed,
                         args=launch_args,
+                        proxy=browser_proxy_arg,
                     )
                     mode = "headed + Xvfb" if use_headed else "headless=new"
                     logger.info("[BROWSER] Real Chrome launched (%s): %s", mode, real_chrome)
@@ -727,13 +843,12 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                     _browser = await _playwright.chromium.launch(
                         headless=not use_headed,
                         args=launch_args,
+                        proxy=browser_proxy_arg,
                     )
                     mode = "headed + Xvfb" if use_headed else "headless=new"
                     logger.info("[BROWSER] Chromium launched (%s + Patchright stealth)", mode)
 
             # Create a stealth context — all tabs share this context
-            # Proxy auth goes here (not browser.launch) — headed Chromium
-            # doesn't support proxy auth at browser level
             _context = await _browser.new_context(
                 viewport={"width": 1280, "height": 720},
                 user_agent=STEALTH_USER_AGENT,
@@ -742,7 +857,6 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 locale="en-US",
                 timezone_id="America/New_York",
                 color_scheme="light",
-                proxy=proxy_config,
             )
             _context.set_default_timeout(30_000)
 
