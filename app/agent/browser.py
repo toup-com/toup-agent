@@ -164,7 +164,7 @@ STEALTH_ARGS = [
 STEALTH_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
+    "Chrome/137.0.0.0 Safari/537.36"
 )
 
 # JS to inject into every page to evade bot detection — comprehensive stealth
@@ -684,8 +684,10 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 )
                 logger.info("[BROWSER] Attached to Chrome via CDP")
             else:
-                # Strategy: Real headed Chromium > headless=new > plain headless
-                # A headed browser on Xvfb is undetectable — it's a real browser
+                # Strategy: Real headed Chromium > full Chromium + --headless=new > Xvfb headed
+                # CRITICAL: Never use chromium_headless_shell — it's trivially detectable.
+                # Instead, use the FULL Chromium binary with Chrome's own --headless=new flag.
+                # This runs the complete browser engine headlessly = undetectable.
                 real_chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
                 display = _start_xvfb()
                 use_headed = display is not None
@@ -694,20 +696,33 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 if not use_headed:
                     launch_args.append("--headless=new")
 
+                # Proxy support — residential proxy eliminates datacenter IP detection
+                from app.config import settings
+                proxy_config = None
+                if getattr(settings, "browser_proxy", ""):
+                    proxy_config = {"server": settings.browser_proxy}
+                    logger.info("[BROWSER] Using proxy: %s", settings.browser_proxy.split("@")[-1] if "@" in settings.browser_proxy else "configured")
+
                 if real_chrome:
                     _browser = await _playwright.chromium.launch(
                         executable_path=real_chrome,
                         headless=not use_headed,
                         args=launch_args,
+                        proxy=proxy_config,
                     )
                     mode = "headed + Xvfb" if use_headed else "headless=new"
                     logger.info("[BROWSER] Real Chrome launched (%s): %s", mode, real_chrome)
                 else:
+                    # KEY: headless=False + --headless=new in args forces patchright
+                    # to use the FULL chromium binary (not headless_shell) while Chrome
+                    # itself runs headlessly via its own flag. This is the standard
+                    # anti-detection approach used by undetectable browsers.
                     _browser = await _playwright.chromium.launch(
-                        headless=not use_headed,
+                        headless=False if not use_headed else False,
                         args=launch_args,
+                        proxy=proxy_config,
                     )
-                    mode = "headed + Xvfb" if use_headed else "headless=new"
+                    mode = "headed + Xvfb" if use_headed else "headless=new (full Chromium)"
                     logger.info("[BROWSER] Chromium launched (%s + Patchright stealth)", mode)
 
             # Create a stealth context — all tabs share this context
