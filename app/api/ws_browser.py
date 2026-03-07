@@ -414,7 +414,7 @@ After parallel_search completes, you receive all results and can summarize the b
   - Shopping: amazon.com, bestbuy.com, walmart.com, ebay.com
   - Hotels: booking.com, hotels.com, expedia.com
   - Food: ubereats.com, doordash.com, yelp.com
-  - General: duckduckgo.com/?q=YOUR+QUERY (NOT google.com)
+  - General: google.com/search?q=YOUR+QUERY
 - If a site blocks you with a captcha, DON'T try to solve it. Navigate to an alternative site instead.
 - Scroll down to find more content if needed
 - NEVER ask the user clarifying questions — just go browse and find the answer
