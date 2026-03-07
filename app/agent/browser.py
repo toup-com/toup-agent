@@ -700,8 +700,19 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 from app.config import settings
                 proxy_config = None
                 if getattr(settings, "browser_proxy", ""):
-                    proxy_config = {"server": settings.browser_proxy}
-                    logger.info("[BROWSER] Using proxy: %s", settings.browser_proxy.split("@")[-1] if "@" in settings.browser_proxy else "configured")
+                    proxy_url = settings.browser_proxy
+                    # Parse http://user:pass@host:port into Playwright's format
+                    from urllib.parse import urlparse
+                    parsed = urlparse(proxy_url)
+                    if parsed.username:
+                        proxy_config = {
+                            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                            "username": parsed.username,
+                            "password": parsed.password or "",
+                        }
+                    else:
+                        proxy_config = {"server": proxy_url}
+                    logger.info("[BROWSER] Using proxy: %s:%s", parsed.hostname, parsed.port)
 
                 if real_chrome:
                     _browser = await _playwright.chromium.launch(
