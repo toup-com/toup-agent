@@ -675,6 +675,7 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 logger.info("[BROWSER] Patchright not found, using standard Playwright")
             _playwright = await async_playwright().start()
 
+            proxy_config = None
             if profile == BrowserProfile.REMOTE and cdp_url:
                 _browser = await _playwright.chromium.connect_over_cdp(cdp_url)
                 logger.info("[BROWSER] Connected to remote CDP: %s", cdp_url)
@@ -719,7 +720,6 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                         executable_path=real_chrome,
                         headless=not use_headed,
                         args=launch_args,
-                        proxy=proxy_config,
                     )
                     mode = "headed + Xvfb" if use_headed else "headless=new"
                     logger.info("[BROWSER] Real Chrome launched (%s): %s", mode, real_chrome)
@@ -727,12 +727,13 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                     _browser = await _playwright.chromium.launch(
                         headless=not use_headed,
                         args=launch_args,
-                        proxy=proxy_config,
                     )
                     mode = "headed + Xvfb" if use_headed else "headless=new"
                     logger.info("[BROWSER] Chromium launched (%s + Patchright stealth)", mode)
 
             # Create a stealth context — all tabs share this context
+            # Proxy auth goes here (not browser.launch) — headed Chromium
+            # doesn't support proxy auth at browser level
             _context = await _browser.new_context(
                 viewport={"width": 1280, "height": 720},
                 user_agent=STEALTH_USER_AGENT,
@@ -741,6 +742,7 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 locale="en-US",
                 timezone_id="America/New_York",
                 color_scheme="light",
+                proxy=proxy_config,
             )
             _context.set_default_timeout(30_000)
 
