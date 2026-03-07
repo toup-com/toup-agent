@@ -848,9 +848,8 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 if proxy_val.strip():
                     logger.info("[BROWSER] BROWSER_PROXY is set (%d chars), starting forwarder...", len(proxy_val))
                     local_port = await _start_proxy_forwarder(proxy_val.strip())
-                    browser_proxy_arg = {"server": f"http://127.0.0.1:{local_port}"}
-                    logger.info("[BROWSER] Browser will use local proxy 127.0.0.1:%d", local_port)
-                    # Quick connectivity test — verify upstream proxy is reachable
+                    # Quick connectivity test — verify upstream proxy accepts our credentials
+                    proxy_works = False
                     try:
                         test_r, test_w = await asyncio.wait_for(
                             asyncio.open_connection("127.0.0.1", local_port), timeout=5
@@ -858,10 +857,18 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                         test_w.write(b"CONNECT httpbin.org:443 HTTP/1.1\r\nHost: httpbin.org:443\r\n\r\n")
                         await test_w.drain()
                         resp = await asyncio.wait_for(test_r.readline(), timeout=10)
-                        logger.info("[BROWSER] Proxy test: %s", resp.decode(errors="replace").strip())
+                        resp_str = resp.decode(errors="replace").strip()
+                        logger.info("[BROWSER] Proxy test response: %s", resp_str)
                         test_w.close()
+                        proxy_works = b"200" in resp
                     except Exception as e:
                         logger.error("[BROWSER] Proxy test FAILED: %s", e)
+
+                    if proxy_works:
+                        browser_proxy_arg = {"server": f"http://127.0.0.1:{local_port}"}
+                        logger.info("[BROWSER] Proxy OK — browser will use residential proxy")
+                    else:
+                        logger.warning("[BROWSER] Proxy credentials REJECTED — launching WITHOUT proxy (captchas possible)")
                 else:
                     logger.info("[BROWSER] No BROWSER_PROXY set, launching without proxy")
 
