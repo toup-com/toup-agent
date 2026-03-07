@@ -42,13 +42,13 @@ RUN python -m patchright install chromium || python -m playwright install chromi
 COPY backend/ .
 
 # Create non-root user and workspace
-RUN useradd -m -u 1000 hexbrain && \
+RUN useradd -m -u 1000 toup && \
     mkdir -p /app/workspace && \
-    chown -R hexbrain:hexbrain /app && \
-    # Copy browser binaries to hexbrain's home so non-root can access them
-    cp -r /root/.cache/ms-playwright /home/hexbrain/.cache/ms-playwright 2>/dev/null || true && \
-    chown -R hexbrain:hexbrain /home/hexbrain/.cache 2>/dev/null || true
-USER hexbrain
+    chown -R toup:toup /app && \
+    # Copy browser binaries to toup's home so non-root can access them
+    cp -r /root/.cache/ms-playwright /home/toup/.cache/ms-playwright 2>/dev/null || true && \
+    chown -R toup:toup /home/toup/.cache 2>/dev/null || true
+USER toup
 
 # Expose port
 EXPOSE 8000
