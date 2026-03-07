@@ -13,6 +13,8 @@ import asyncio
 import base64
 import json
 import logging
+import random
+import sys
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
@@ -22,6 +24,9 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["WebSocket Browser"])
+
+def _is_mac() -> bool:
+    return sys.platform == "darwin"
 
 _agent_runner = None
 _skill_loader = None
@@ -594,6 +599,8 @@ async def _exec_browser_tool(
                 url = "https://" + url
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             await _wait_stable(page)
+            # Human-like pause after page load (Atlas behavior)
+            await asyncio.sleep(random.uniform(0.3, 0.8))
             await overlay.inject()
             await overlay.set_active(True)
             await overlay.move_cursor(640, 360, "")
@@ -602,60 +609,53 @@ async def _exec_browser_tool(
             return f"Navigated to {page.url} — {title}\n\n{analysis}"
 
         elif name == "click":
+            # Atlas-style: resolve element → Bezier mouse move → real mouse click
+            from app.agent.browser import (
+                human_click, human_move_mouse,
+                get_element_center, get_text_element_center, get_element_center_by_index,
+            )
+
             selector = args.get("selector")
             text = args.get("text")
             index = args.get("index")
+            cursor_pos = (overlay.x, overlay.y)
 
+            target = None
             if selector:
                 rect = await overlay.move_to_selector(selector)
-                await asyncio.sleep(0.5)
-                if rect:
-                    await overlay.click_ripple(rect["cx"], rect["cy"])
-                try:
-                    await page.click(selector, timeout=5_000)
-                except Exception:
+                target = await get_element_center(page, selector)
+            elif text:
+                rect = await overlay.move_to_text(text)
+                target = await get_text_element_center(page, text)
+            elif index is not None:
+                target = await get_element_center_by_index(page, index)
+                if target:
+                    await overlay.move_cursor(int(target[0]), int(target[1]))
+            else:
+                return "ERROR: provide selector, text, or index"
+
+            if not target:
+                # Fallback: try DOM click if coordinates unavailable
+                if selector:
                     try:
                         await page.evaluate(f"document.querySelector({json.dumps(selector)})?.click()")
                     except Exception as e:
                         return f"ERROR clicking '{selector}': {e}"
-            elif text:
-                rect = await overlay.move_to_text(text)
-                await asyncio.sleep(0.5)
-                if rect:
-                    await overlay.click_ripple(rect["cx"], rect["cy"])
-                loc = page.get_by_text(text, exact=False).first
-                try:
-                    await loc.click(timeout=5_000)
-                except Exception:
+                elif text:
                     try:
+                        loc = page.get_by_text(text, exact=False).first
                         await loc.dispatch_event("click")
                     except Exception as e:
                         return f"ERROR clicking text '{text}': {e}"
-            elif index is not None:
-                center = await page.evaluate("""(idx) => {
-                    const SELECTOR = "a[href], button, input, select, textarea, [role='button'], [role='link'], [role='tab'], [onclick]";
-                    const els = Array.from(document.querySelectorAll(SELECTOR));
-                    const visible = els.filter(el => {
-                        const r = el.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0 && !el.id?.startsWith('__toup_');
-                    });
-                    if (idx < visible.length) {
-                        const r = visible[idx].getBoundingClientRect();
-                        visible[idx].click();
-                        return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
-                    }
-                    return null;
-                }""", index)
-                if center:
-                    await overlay.move_cursor(center["x"], center["y"])
-                    await asyncio.sleep(0.3)
-                    await overlay.click_ripple(center["x"], center["y"])
                 else:
                     return f"ERROR: element index {index} not found"
             else:
-                return "ERROR: provide selector, text, or index"
+                # Human-like Bezier mouse move → real mouse click at coordinates
+                await human_click(page, target[0], target[1], from_pos=cursor_pos)
+                overlay.x, overlay.y = int(target[0]), int(target[1])
+                await overlay.click_ripple(int(target[0]), int(target[1]))
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(random.uniform(0.3, 0.6))
             await _wait_stable(page)
             await overlay.inject()
             title = await page.title()
@@ -663,27 +663,50 @@ async def _exec_browser_tool(
             return f"Clicked. Now on: {page.url} — {title}\n\n{analysis}"
 
         elif name == "type_text":
+            # Atlas-style: move mouse to field → click → type char-by-char
+            from app.agent.browser import (
+                human_click, human_type, get_element_center,
+            )
+
             text_to_type = args.get("text", "")
             selector = args.get("selector")
             clear = args.get("clear", True)
             press_enter = args.get("press_enter", False)
+            cursor_pos = (overlay.x, overlay.y)
 
             if selector:
                 rect = await overlay.move_to_selector(selector)
-                await asyncio.sleep(0.3)
-                if clear:
-                    await page.fill(selector, text_to_type, timeout=5_000)
+                target = await get_element_center(page, selector)
+                if target:
+                    # Move mouse to field and click it (human-like)
+                    await human_click(page, target[0], target[1], from_pos=cursor_pos)
+                    overlay.x, overlay.y = int(target[0]), int(target[1])
+                    await asyncio.sleep(random.uniform(0.1, 0.25))
                 else:
-                    await page.click(selector, timeout=5_000)
-                    await page.keyboard.type(text_to_type, delay=30)
+                    # Fallback: programmatic focus
+                    try:
+                        await page.click(selector, timeout=3_000)
+                    except Exception:
+                        pass
+
+                if clear:
+                    # Select all then type over (more human than page.fill)
+                    await page.keyboard.press("Control+a" if not _is_mac() else "Meta+a")
+                    await asyncio.sleep(random.uniform(0.05, 0.12))
+
+                # Type character by character with human timing
+                await human_type(page, text_to_type)
+
                 if press_enter:
-                    await page.press(selector, "Enter")
+                    await asyncio.sleep(random.uniform(0.1, 0.3))
+                    await page.keyboard.press("Enter")
             else:
-                await page.keyboard.type(text_to_type, delay=30)
+                await human_type(page, text_to_type)
                 if press_enter:
+                    await asyncio.sleep(random.uniform(0.1, 0.3))
                     await page.keyboard.press("Enter")
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(random.uniform(0.15, 0.35))
             if press_enter:
                 await _wait_stable(page)
                 await overlay.inject()
@@ -695,12 +718,13 @@ async def _exec_browser_tool(
             return result
 
         elif name == "scroll":
+            # Atlas-style: incremental wheel events instead of one big jump
+            from app.agent.browser import human_scroll
+
             direction = args.get("direction", "down")
             amount = int(args.get("amount", 500))
-            delta = amount if direction == "down" else -amount
             await overlay.scroll_visual(direction)
-            await page.mouse.wheel(0, delta)
-            await asyncio.sleep(0.6)
+            await human_scroll(page, direction, amount)
             cy = 200 if direction == "up" else 520
             await overlay.move_cursor(640, cy, "")
             analysis = await _analyze_page(page)
