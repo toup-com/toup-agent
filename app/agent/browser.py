@@ -131,11 +131,9 @@ async def _start_proxy_forwarder(upstream_url: str) -> int:
     """
     Start a local TCP proxy that forwards to an authenticated upstream proxy.
 
-    Chromium doesn't support proxy auth in headed mode (ERR_PROXY_AUTH_UNSUPPORTED).
-    This spins up a local proxy on 127.0.0.1 (no auth) that injects the
-    Proxy-Authorization header before forwarding to the real proxy.
-
-    Returns the local port number.
+    Chromium doesn't support proxy auth (ERR_PROXY_AUTH_UNSUPPORTED).
+    This spins up a local HTTP proxy on 127.0.0.1 (no auth) that adds the
+    Proxy-Authorization header before forwarding to the real upstream proxy.
     """
     global _proxy_server, _proxy_port
 
@@ -148,10 +146,13 @@ async def _start_proxy_forwarder(upstream_url: str) -> int:
     parsed = urlparse(upstream_url)
     upstream_host = parsed.hostname
     upstream_port = parsed.port or 80
-    auth_header = None
+    auth_b64 = None
     if parsed.username:
         creds = f"{parsed.username}:{parsed.password or ''}"
-        auth_header = f"Proxy-Authorization: Basic {base64.b64encode(creds.encode()).decode()}\r\n"
+        auth_b64 = base64.b64encode(creds.encode()).decode()
+        logger.info("[PROXY-FWD] Upstream: %s:%d user=%s", upstream_host, upstream_port, parsed.username)
+    else:
+        logger.info("[PROXY-FWD] Upstream: %s:%d (no auth)", upstream_host, upstream_port)
 
     async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -161,7 +162,7 @@ async def _start_proxy_forwarder(upstream_url: str) -> int:
                     break
                 writer.write(data)
                 await writer.drain()
-        except (ConnectionError, asyncio.CancelledError):
+        except (ConnectionError, asyncio.CancelledError, OSError):
             pass
         finally:
             try:
@@ -171,6 +172,7 @@ async def _start_proxy_forwarder(upstream_url: str) -> int:
 
     async def _handle_client(client_reader: asyncio.StreamReader,
                              client_writer: asyncio.StreamWriter):
+        up_writer = None
         try:
             # Read the request line (e.g. "CONNECT host:443 HTTP/1.1\r\n")
             first_line = await asyncio.wait_for(client_reader.readline(), timeout=30)
@@ -178,46 +180,64 @@ async def _start_proxy_forwarder(upstream_url: str) -> int:
                 client_writer.close()
                 return
 
-            # Read remaining headers
-            headers = bytearray(first_line)
+            is_connect = first_line.upper().startswith(b"CONNECT")
+            target = first_line.split(b" ")[1].decode(errors="replace") if b" " in first_line else "?"
+            logger.info("[PROXY-FWD] %s %s", "CONNECT" if is_connect else "HTTP", target)
+
+            # Read remaining headers from browser
+            raw_headers = bytearray(first_line)
             while True:
                 line = await asyncio.wait_for(client_reader.readline(), timeout=30)
-                headers.extend(line)
+                raw_headers.extend(line)
                 if line == b"\r\n" or not line:
                     break
 
             # Connect to upstream proxy
-            up_reader, up_writer = await asyncio.open_connection(
-                upstream_host, upstream_port
-            )
-
-            # Inject auth header into the request to the upstream proxy
-            if auth_header:
-                # Insert Proxy-Authorization after the first line
-                first_line_end = headers.index(b"\r\n") + 2
-                modified = (
-                    bytes(headers[:first_line_end])
-                    + auth_header.encode()
-                    + bytes(headers[first_line_end:])
+            try:
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(upstream_host, upstream_port),
+                    timeout=15,
                 )
-            else:
-                modified = bytes(headers)
+            except Exception as e:
+                logger.error("[PROXY-FWD] Cannot connect to upstream %s:%d: %s", upstream_host, upstream_port, e)
+                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await client_writer.drain()
+                client_writer.close()
+                return
+
+            # Build request with auth header injected
+            first_line_end = raw_headers.index(b"\r\n") + 2
+            auth_line = f"Proxy-Authorization: Basic {auth_b64}\r\n".encode() if auth_b64 else b""
+            modified = bytes(raw_headers[:first_line_end]) + auth_line + bytes(raw_headers[first_line_end:])
 
             up_writer.write(modified)
             await up_writer.drain()
 
-            # For CONNECT tunnels, check upstream response first
-            if first_line.upper().startswith(b"CONNECT"):
-                # Read upstream proxy response
-                up_response = bytearray()
+            if is_connect:
+                # Read upstream CONNECT response
+                resp_first = await asyncio.wait_for(up_reader.readline(), timeout=30)
+                up_response = bytearray(resp_first)
                 while True:
                     resp_line = await asyncio.wait_for(up_reader.readline(), timeout=30)
                     up_response.extend(resp_line)
                     if resp_line == b"\r\n" or not resp_line:
                         break
-                # Forward the response to client
-                client_writer.write(bytes(up_response))
-                await client_writer.drain()
+
+                status_line = resp_first.decode(errors="replace").strip()
+                # Check if upstream accepted the CONNECT
+                if b"200" in resp_first:
+                    logger.info("[PROXY-FWD] CONNECT %s → 200 OK", target)
+                    # Send success to browser
+                    client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    await client_writer.drain()
+                else:
+                    # Upstream rejected — DON'T forward 407 to browser
+                    logger.error("[PROXY-FWD] CONNECT %s REJECTED: %s", target, status_line)
+                    client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    await client_writer.drain()
+                    client_writer.close()
+                    return
+            # else: for regular HTTP, upstream sends the HTTP response directly
 
             # Bidirectional pipe
             await asyncio.gather(
@@ -225,21 +245,20 @@ async def _start_proxy_forwarder(upstream_url: str) -> int:
                 _pipe(up_reader, client_writer),
             )
         except Exception as e:
-            logger.debug("[PROXY-FWD] Connection error: %s", e)
+            logger.error("[PROXY-FWD] Error: %s", e)
         finally:
-            try:
-                client_writer.close()
-            except Exception:
-                pass
+            for w in [client_writer, up_writer]:
+                if w:
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
 
     server = await asyncio.start_server(_handle_client, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     _proxy_server = server
     _proxy_port = port
-    logger.info(
-        "[PROXY-FWD] Local forwarder on :%d → %s:%d (auth injected)",
-        port, upstream_host, upstream_port,
-    )
+    logger.info("[PROXY-FWD] Listening on 127.0.0.1:%d", port)
     return port
 
 
@@ -825,10 +844,26 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 # so we run a local forwarder that handles auth transparently
                 from app.config import settings
                 browser_proxy_arg = None
-                if getattr(settings, "browser_proxy", ""):
-                    local_port = await _start_proxy_forwarder(settings.browser_proxy)
+                proxy_val = getattr(settings, "browser_proxy", "") or ""
+                if proxy_val.strip():
+                    logger.info("[BROWSER] BROWSER_PROXY is set (%d chars), starting forwarder...", len(proxy_val))
+                    local_port = await _start_proxy_forwarder(proxy_val.strip())
                     browser_proxy_arg = {"server": f"http://127.0.0.1:{local_port}"}
-                    logger.info("[BROWSER] Local proxy forwarder on port %d", local_port)
+                    logger.info("[BROWSER] Browser will use local proxy 127.0.0.1:%d", local_port)
+                    # Quick connectivity test — verify upstream proxy is reachable
+                    try:
+                        test_r, test_w = await asyncio.wait_for(
+                            asyncio.open_connection("127.0.0.1", local_port), timeout=5
+                        )
+                        test_w.write(b"CONNECT httpbin.org:443 HTTP/1.1\r\nHost: httpbin.org:443\r\n\r\n")
+                        await test_w.drain()
+                        resp = await asyncio.wait_for(test_r.readline(), timeout=10)
+                        logger.info("[BROWSER] Proxy test: %s", resp.decode(errors="replace").strip())
+                        test_w.close()
+                    except Exception as e:
+                        logger.error("[BROWSER] Proxy test FAILED: %s", e)
+                else:
+                    logger.info("[BROWSER] No BROWSER_PROXY set, launching without proxy")
 
                 if real_chrome:
                     _browser = await _playwright.chromium.launch(
