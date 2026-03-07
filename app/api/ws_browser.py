@@ -408,13 +408,7 @@ After parallel_search completes, you receive all results and can summarize the b
 - If the user asks to find something, navigate to the website and actually find it
 - Use CSS selectors (preferred) or text content to target elements
 - When searching on a site, use type_text with press_enter=true
-- CRITICAL: NEVER use Google Search (google.com/search). Google blocks automated browsers with captchas.
-  Instead, navigate DIRECTLY to the relevant website:
-  - Flights: kayak.com, skyscanner.com, google.com/travel/flights (NOT google.com/search)
-  - Shopping: amazon.com, bestbuy.com, walmart.com, ebay.com
-  - Hotels: booking.com, hotels.com, expedia.com
-  - Food: ubereats.com, doordash.com, yelp.com
-  - General: google.com/search?q=YOUR+QUERY
+- For general browsing, navigate directly to websites or use Google Search
 - If a site blocks you with a captcha, DON'T try to solve it. Navigate to an alternative site instead.
 - Scroll down to find more content if needed
 - NEVER ask the user clarifying questions — just go browse and find the answer
@@ -597,7 +591,7 @@ async def _exec_browser_tool(
                 return "ERROR: url is required"
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
-            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             await _wait_stable(page)
             # Human-like pause after page load (Atlas behavior)
             await asyncio.sleep(random.uniform(0.3, 0.8))
@@ -845,56 +839,24 @@ async def _run_browser_agent_inner(
     _is_comparison = _has_comparison or (_has_category and _has_route) or (_has_category and any(w in _msg_lower for w in ["best", "cheap", "price", "deal"]))
 
     if _is_comparison:
-        logger.warning("[WS Browser] Comparison task detected — forcing parallel_search planning")
-        # Ask LLM to plan which sites to search in parallel
-        plan_response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": (
-                    "You are a search planner. Given the user's request, output a JSON array of search tasks. "
-                    "Each item has 'url' (full URL to start on) and 'task' (what to search/find on that site). "
-                    "Choose 4-8 relevant websites. Output ONLY the JSON array, nothing else.\n\n"
-                    "IMPORTANT: NEVER use google.com/search — it blocks automated browsers. Instead go DIRECTLY to relevant sites:\n"
-                    "- Flights: https://www.kayak.com/flights/..., https://www.skyscanner.com, https://www.google.com/travel/flights, "
-                    "https://www.momondo.com, https://www.cheapflights.com, https://www.expedia.com/Flights\n"
-                    "- Hotels: https://www.booking.com, https://www.hotels.com, https://www.expedia.com, https://www.agoda.com\n"
-                    "- Shopping: https://www.amazon.com, https://www.bestbuy.com, https://www.walmart.com, https://www.ebay.com\n"
-                    "For flights, construct direct URLs when possible, e.g. https://www.kayak.com/flights/YYZ-DXB/2026-03-19"
-                )},
-                {"role": "user", "content": user_message},
-            ],
-            max_completion_tokens=1000,
-            temperature=0.3,
-        )
-        plan_text = (plan_response.choices[0].message.content or "").strip()
-        # Parse the JSON array
-        searches = []
-        try:
-            # Handle markdown code blocks
-            if "```" in plan_text:
-                plan_text = plan_text.split("```")[1]
-                if plan_text.startswith("json"):
-                    plan_text = plan_text[4:]
-                plan_text = plan_text.strip()
-            searches = json.loads(plan_text)
-            if not isinstance(searches, list):
-                searches = []
-        except json.JSONDecodeError:
-            logger.warning("[WS Browser] Failed to parse parallel search plan: %s", plan_text[:200])
+        logger.warning("[WS Browser] Comparison task detected — Google-first parallel search")
 
-        if searches:
-            logger.warning("[WS Browser] Parallel search plan: %d sites", len(searches))
+        # Step 1: Search Google to find relevant sites
+        google_searches = await _google_first_search(user_message, page, overlay, websocket)
+
+        if google_searches:
+            logger.warning("[WS Browser] Google found %d sites to search", len(google_searches))
             await websocket.send_json({
                 "type": "tool_use",
                 "tool": "parallel_search",
-                "args": {"searches": searches},
+                "args": {"searches": google_searches},
             })
-            result = await _exec_parallel_search(searches, websocket, browser_mod)
+            result = await _exec_parallel_search(google_searches, websocket, browser_mod)
             # Add to conversation as if the agent called the tool
             conversation.append({
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [{"id": "parallel_auto", "type": "function", "function": {"name": "parallel_search", "arguments": json.dumps({"searches": searches})}}],
+                "tool_calls": [{"id": "parallel_auto", "type": "function", "function": {"name": "parallel_search", "arguments": json.dumps({"searches": google_searches})}}],
             })
             conversation.append({
                 "role": "tool",
@@ -995,6 +957,144 @@ async def _run_browser_agent_inner(
 # Parallel search — multi-agent concurrent browsing
 # ---------------------------------------------------------------------------
 
+async def _google_first_search(
+    user_message: str,
+    page,
+    overlay: AgentOverlay,
+    websocket: WebSocket,
+) -> List[Dict[str, str]]:
+    """
+    Google-first parallel search strategy:
+    1. Navigate the main agent's page to Google with the user's query
+    2. Extract the first 8 organic (non-ad) results
+    3. Ask LLM to assign a task per result
+    Returns a list of {"url": ..., "task": ...} dicts for parallel workers.
+    """
+    from openai import AsyncOpenAI
+
+    try:
+        # Build a search query from the user's message
+        query = user_message.strip()
+        google_url = f"https://www.google.com/search?q={__import__('urllib.parse', fromlist=['quote_plus']).quote_plus(query)}"
+
+        logger.warning("[Google-first] Searching Google: %s", google_url)
+
+        # Navigate main page to Google
+        await websocket.send_json({
+            "type": "tool_use",
+            "tool": "navigate",
+            "args": {"url": google_url},
+        })
+        await page.goto(google_url, wait_until="domcontentloaded", timeout=60_000)
+        await _wait_stable(page)
+        await asyncio.sleep(1.0)
+        await overlay.inject()
+
+        # Send screenshot so user sees the Google results
+        await _send_screenshot(websocket, page, overlay)
+
+        # Extract organic search results (skip ads)
+        organic_results = await page.evaluate("""() => {
+            const results = [];
+            // Google organic results are in <div class="g"> or similar containers
+            const allLinks = document.querySelectorAll('div.g a[href]');
+            const seen = new Set();
+            for (const a of allLinks) {
+                const href = a.href;
+                if (!href || href.includes('google.com') || href.includes('youtube.com')
+                    || href.startsWith('javascript:') || href.includes('/search?')
+                    || href.includes('webcache.') || seen.has(new URL(href).hostname)) continue;
+                seen.add(new URL(href).hostname);
+                const title = (a.querySelector('h3') || a).innerText || '';
+                if (title && href.startsWith('http')) {
+                    results.push({ url: href, title: title.slice(0, 120) });
+                }
+                if (results.length >= 8) break;
+            }
+            return results;
+        }""")
+
+        logger.warning("[Google-first] Found %d organic results", len(organic_results))
+
+        if not organic_results:
+            # Fallback: try alternative selectors
+            organic_results = await page.evaluate("""() => {
+                const results = [];
+                const seen = new Set();
+                const anchors = document.querySelectorAll('a[href][data-ved]');
+                for (const a of anchors) {
+                    const href = a.href;
+                    if (!href || href.includes('google.com') || href.includes('youtube.com')
+                        || href.startsWith('javascript:') || href.includes('/search?')
+                        || seen.has(new URL(href).hostname)) continue;
+                    seen.add(new URL(href).hostname);
+                    const title = (a.querySelector('h3') || a).innerText || '';
+                    if (title && href.startsWith('http')) {
+                        results.push({ url: href, title: title.slice(0, 120) });
+                    }
+                    if (results.length >= 8) break;
+                }
+                return results;
+            }""")
+            logger.warning("[Google-first] Fallback selector found %d results", len(organic_results))
+
+        if not organic_results:
+            return []
+
+        # Ask LLM to assign a specific task to each result
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        model = settings.agent_model
+
+        results_text = "\n".join(
+            f"{i+1}. {r['title']} — {r['url']}" for i, r in enumerate(organic_results)
+        )
+
+        plan_response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": (
+                    "You are a search task planner. Given the user's request and a list of Google search results, "
+                    "output a JSON array where each item has 'url' (the result URL) and 'task' (specific instructions "
+                    "for what to find/do on that website). Be specific with the task — include the exact search terms, "
+                    "dates, routes, etc. from the user's request. Output ONLY the JSON array, nothing else."
+                )},
+                {"role": "user", "content": f"User request: {user_message}\n\nGoogle results:\n{results_text}"},
+            ],
+            max_completion_tokens=1500,
+            temperature=0.2,
+        )
+        plan_text = (plan_response.choices[0].message.content or "").strip()
+
+        # Parse JSON
+        if "```" in plan_text:
+            plan_text = plan_text.split("```")[1]
+            if plan_text.startswith("json"):
+                plan_text = plan_text[4:]
+            plan_text = plan_text.strip()
+
+        searches = json.loads(plan_text)
+        if not isinstance(searches, list):
+            return []
+
+        # Deduplicate by hostname
+        seen_hosts = set()
+        deduped = []
+        for s in searches:
+            try:
+                from urllib.parse import urlparse
+                host = urlparse(s["url"]).hostname
+                if host and host not in seen_hosts:
+                    seen_hosts.add(host)
+                    deduped.append(s)
+            except Exception:
+                continue
+        return deduped[:8]
+
+    except Exception as e:
+        logger.error("[Google-first] Failed: %s", e)
+        return []
+
+
 WORKER_TOOLS = [t for t in BROWSER_TOOLS if t["function"]["name"] != "parallel_search"]
 
 WORKER_SYSTEM_PROMPT = """You are a focused browser search worker. You have ONE specific task on ONE specific website.
@@ -1007,8 +1107,8 @@ Rules:
 - Call `done` with ALL relevant findings — be specific with numbers and prices
 - You have max 12 steps, so be efficient
 - NEVER ask questions — just search and report findings
-- NEVER use google.com/search — go directly to the assigned site
-- If you hit a captcha, call `done` with summary "BLOCKED: Site showed captcha" and move on"""
+- Stay on the assigned website — do not navigate to other sites
+- If you hit a captcha or the page won't load, call `done` with summary "BLOCKED: Site showed captcha or timed out" and move on"""
 
 
 async def _run_worker(

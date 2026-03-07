@@ -517,7 +517,7 @@ class TabManager:
         if viewport:
             await page.set_viewport_size(viewport)
         if url and url != "about:blank":
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         self._counter += 1
         tab_id = f"tab_{self._counter}"
         self._tabs[tab_id] = page
