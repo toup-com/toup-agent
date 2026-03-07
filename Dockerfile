@@ -30,9 +30,6 @@ RUN apt-get update && apt-get install -y \
     libwayland-client0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch first (prevents ~3GB of NVIDIA CUDA packages)
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-
 # Copy requirements first for better caching
 # Railway build context is repo root, so paths are relative to repo root
 COPY backend/requirements.docker.txt requirements.txt
