@@ -724,16 +724,12 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                     mode = "headed + Xvfb" if use_headed else "headless=new"
                     logger.info("[BROWSER] Real Chrome launched (%s): %s", mode, real_chrome)
                 else:
-                    # KEY: headless=False + --headless=new in args forces patchright
-                    # to use the FULL chromium binary (not headless_shell) while Chrome
-                    # itself runs headlessly via its own flag. This is the standard
-                    # anti-detection approach used by undetectable browsers.
                     _browser = await _playwright.chromium.launch(
-                        headless=False if not use_headed else False,
+                        headless=not use_headed,
                         args=launch_args,
                         proxy=proxy_config,
                     )
-                    mode = "headed + Xvfb" if use_headed else "headless=new (full Chromium)"
+                    mode = "headed + Xvfb" if use_headed else "headless=new"
                     logger.info("[BROWSER] Chromium launched (%s + Patchright stealth)", mode)
 
             # Create a stealth context — all tabs share this context
