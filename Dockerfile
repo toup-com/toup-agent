@@ -31,14 +31,15 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
-COPY requirements.docker.txt requirements.txt
+# Railway build context is repo root, so paths are relative to repo root
+COPY backend/requirements.docker.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Chromium browser for Patchright/Playwright
 RUN python -m patchright install chromium || python -m playwright install chromium
 
-# Copy application code
-COPY . .
+# Copy backend application code
+COPY backend/ .
 
 # Create non-root user and workspace
 RUN useradd -m -u 1000 hexbrain && \
@@ -52,5 +53,5 @@ USER hexbrain
 # Expose port
 EXPOSE 8000
 
-# Initialize and start server (migrations already applied)
-CMD python -m app.scripts.init_startup && uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Initialize and start server
+CMD python -m app.scripts.init_startup && uvicorn platform_main:app --host 0.0.0.0 --port 8000
