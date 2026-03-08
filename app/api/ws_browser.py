@@ -264,6 +264,7 @@ BROWSER_TOOLS = [
     {"type": "function", "function": {"name": "navigate", "description": "Navigate to a URL. ONLY use to go to a NEW website.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
     {"type": "function", "function": {"name": "click", "description": "Click an element by selector, text, or index.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector"}, "text": {"type": "string", "description": "Visible text"}, "index": {"type": "integer", "description": "Index from elements list"}}}}},
     {"type": "function", "function": {"name": "type_text", "description": "Type text into an input field.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}, "clear": {"type": "boolean"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}}},
+    {"type": "function", "function": {"name": "select_date", "description": "Select a date on a calendar/date picker. Use this instead of click for date selection.", "parameters": {"type": "object", "properties": {"date": {"type": "string", "description": "Date in YYYY-MM-DD format, e.g. 2026-03-19"}}, "required": ["date"]}}},
     {"type": "function", "function": {"name": "scroll", "description": "Scroll the page.", "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["up", "down"]}, "amount": {"type": "integer"}}}}},
     {"type": "function", "function": {"name": "go_back", "description": "Go back to previous page.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "wait", "description": "Wait for page to load.", "parameters": {"type": "object", "properties": {"milliseconds": {"type": "integer"}}}}},
@@ -312,10 +313,9 @@ COMMON MISTAKE: After filling "Where from?", the next field is "Where to?" (dest
 
 ## DATE PICKERS:
 - Click the date field to open the calendar
-- Look at the calendar screenshot CAREFULLY — identify the exact cell for the date you need
-- Click ONLY the day number (e.g. click text "19", NOT "19 $614")
-- After selecting the date, click "Done" to confirm
-- Verify the selected date is correct before moving on
+- Use `select_date` with YYYY-MM-DD format (e.g. select_date(date="2026-03-19"))
+- This finds the exact calendar cell reliably — do NOT use click for dates
+- After select_date, click "Done" to confirm the selection
 
 After ALL fields are filled, click Search/Submit.
 
@@ -360,7 +360,7 @@ async def _analyze_page(page) -> str:
 async def _get_interactive_elements(page, limit: int = 50) -> str:
     try:
         elements = await page.evaluate("""() => {
-            const SELECTOR = "a[href], button, input, select, textarea, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='checkbox'], [role='radio'], [onclick], [tabindex], [contenteditable='true']";
+            const SELECTOR = "a[href], button, input, select, textarea, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='checkbox'], [role='radio'], [role='gridcell'], [role='option'], [role='listbox'], [role='switch'], [data-iso], [onclick], [tabindex], [contenteditable='true']";
             const els = Array.from(document.querySelectorAll(SELECTOR));
             const visible = els.filter(el => {
                 const r = el.getBoundingClientRect();
@@ -761,6 +761,89 @@ async def _exec_browser_tool(
             result += f"\n\nLOOK at the screenshot — if you see a dropdown/autocomplete list, click the correct suggestion BEFORE moving to the next field.\n\n{analysis}"
             return result
 
+        elif name == "select_date":
+            # Smart date selection — finds calendar cells by multiple strategies
+            from app.agent.browser import human_click
+            date_str = args.get("date", "")
+            if not date_str:
+                return "ERROR: date is required (YYYY-MM-DD format)"
+
+            # Parse date for multiple matching strategies
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                day = dt.day
+                # Multiple date format strings to search for
+                date_searches = [
+                    f"{dt.strftime('%Y-%m-%d')}",          # 2026-03-19 (data-iso)
+                    f"{dt.strftime('%A, %B')} {day}, {dt.year}",  # Wednesday, March 19, 2026
+                    f"{dt.strftime('%B')} {day}",           # March 19
+                ]
+            except ValueError:
+                return f"ERROR: invalid date format '{date_str}'. Use YYYY-MM-DD."
+
+            # Strategy 1: data-iso attribute (Google Flights, many calendar libs)
+            cell = await page.evaluate("""(iso) => {
+                const el = document.querySelector(`[data-iso="${iso}"]`);
+                if (el) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) return { x: r.left + r.width/2, y: r.top + r.height/2 };
+                }
+                return null;
+            }""", date_str)
+
+            # Strategy 2: aria-label containing the date
+            if not cell:
+                for search in date_searches:
+                    cell = await page.evaluate("""(search) => {
+                        const els = document.querySelectorAll('[aria-label]');
+                        for (const el of els) {
+                            const label = el.getAttribute('aria-label') || '';
+                            if (label.includes(search)) {
+                                const r = el.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0 && r.width < 200)
+                                    return { x: r.left + r.width/2, y: r.top + r.height/2 };
+                            }
+                        }
+                        return null;
+                    }""", search)
+                    if cell:
+                        break
+
+            # Strategy 3: gridcell role with matching day number
+            if not cell:
+                cell = await page.evaluate("""(day) => {
+                    const cells = document.querySelectorAll('[role="gridcell"], [role="button"]');
+                    for (const el of cells) {
+                        const text = (el.textContent || '').trim();
+                        if (text === String(day) || text.startsWith(day + '\\n') || text.startsWith(day + ' ')) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0 && r.width < 100)
+                                return { x: r.left + r.width/2, y: r.top + r.height/2 };
+                        }
+                    }
+                    return null;
+                }""", str(day))
+
+            if cell:
+                await overlay.move_cursor(int(cell["x"]), int(cell["y"]), f"Selecting {date_str}")
+                await human_click(page, cell["x"], cell["y"], from_pos=(overlay.x, overlay.y))
+                overlay.x, overlay.y = int(cell["x"]), int(cell["y"])
+                await overlay.click_ripple(int(cell["x"]), int(cell["y"]))
+                await asyncio.sleep(0.5)
+                analysis = await _analyze_page(page)
+                return f"Selected date {date_str} on calendar.\n\n{analysis}"
+            else:
+                # Fallback: try clicking the day number as text
+                try:
+                    loc = page.get_by_text(str(day), exact=True).first
+                    await loc.click(timeout=3_000)
+                    await asyncio.sleep(0.5)
+                    analysis = await _analyze_page(page)
+                    return f"Clicked date {day} (text fallback).\n\n{analysis}"
+                except Exception:
+                    return f"ERROR: Could not find date {date_str} on the calendar. Make sure the calendar is open and showing the correct month."
+
         elif name == "scroll":
             # Atlas-style: incremental wheel events instead of one big jump
             from app.agent.browser import human_scroll
@@ -936,6 +1019,7 @@ async def _run_browser_agent_inner(
                     "navigate": lambda a: f"Navigating to {a.get('url', '...')}",
                     "click": lambda a: f"Clicking {a.get('text') or a.get('selector', 'element')}",
                     "type_text": lambda a: f'Typing "{(a.get("text", ""))[:40]}"',
+                    "select_date": lambda a: f"Selecting date {a.get('date', '...')}",
                     "scroll": lambda a: f"Scrolling {a.get('direction', 'down')}",
                     "go_back": lambda _: "Going back",
                     "wait": lambda _: "Waiting for page to load...",
@@ -969,7 +1053,7 @@ async def _run_browser_agent_inner(
 
                 # Vision: attach screenshot for visual actions so LLM sees the page
                 # type_text included — LLM must see autocomplete dropdowns after typing
-                _visual_actions = {"navigate", "click", "scroll", "go_back", "type_text"}
+                _visual_actions = {"navigate", "click", "scroll", "go_back", "type_text", "select_date"}
                 if fn_name in _visual_actions:
                     try:
                         _snap = await page.screenshot(type="png")
