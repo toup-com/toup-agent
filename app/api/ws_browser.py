@@ -1008,7 +1008,36 @@ async def _exec_browser_tool(
                     return f"ERROR: Could not click dropdown trigger '{trigger}'"
 
             # Step 2: Wait for dropdown to appear (crucial timing)
-            await asyncio.sleep(random.uniform(0.4, 0.7))
+            await asyncio.sleep(random.uniform(0.6, 1.0))
+
+            # Debug: log what's in any visible dropdown/menu
+            try:
+                _dropdown_debug = await page.evaluate("""() => {
+                    const containers = document.querySelectorAll(
+                        '[role="listbox"], [role="menu"], ul.VfPpkd-rymPhb, [class*="dropdown"], [class*="menu"]'
+                    );
+                    const results = [];
+                    for (const c of containers) {
+                        if (c.offsetParent === null) continue;
+                        const items = c.querySelectorAll('li, [role="option"], [role="menuitem"]');
+                        for (const item of items) {
+                            if (item.offsetParent === null) continue;
+                            results.push({
+                                tag: item.tagName,
+                                text: (item.textContent || '').trim().slice(0, 60),
+                                role: item.getAttribute('role'),
+                                classList: Array.from(item.classList).slice(0, 3).join(' '),
+                            });
+                        }
+                    }
+                    return results;
+                }""")
+                if _dropdown_debug:
+                    logger.warning("[SELECT_DROPDOWN] Visible dropdown items: %s", json.dumps(_dropdown_debug, ensure_ascii=False)[:500])
+                else:
+                    logger.warning("[SELECT_DROPDOWN] ⚠️ No visible dropdown/menu containers found!")
+            except Exception as e:
+                logger.warning("[SELECT_DROPDOWN] Debug failed: %s", e)
 
             # Step 3: Click the option from the now-open dropdown
             logger.warning("[SELECT_DROPDOWN] Clicking option: '%s'", option)
@@ -1039,12 +1068,16 @@ async def _exec_browser_tool(
                             await loc.click(timeout=2_000, force=True)
                             logger.warning("[SELECT_DROPDOWN] Retried with Playwright force=True")
                         except Exception:
-                            # Try JS click as ultimate fallback
+                            # Try JS click as ultimate fallback (with robust visibility check)
                             await page.evaluate("""(optionText) => {
                                 const optLower = optionText.toLowerCase().trim();
-                                const els = document.querySelectorAll('li, [role="option"], [role="menuitem"]');
+                                const els = document.querySelectorAll('li, [role="option"], [role="menuitem"], span, div');
                                 for (const el of els) {
-                                    if ((el.textContent || '').trim().toLowerCase() === optLower && el.offsetParent !== null) {
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width === 0 || r.height === 0) continue;
+                                    const s = window.getComputedStyle(el);
+                                    if (s.display === 'none' || s.visibility === 'hidden') continue;
+                                    if ((el.textContent || '').trim().toLowerCase() === optLower) {
                                         el.click();
                                         return;
                                     }
@@ -1070,32 +1103,38 @@ async def _exec_browser_tool(
                     except Exception:
                         pass
 
-                # Fallback 2: JavaScript DOM search (case-insensitive, broad)
+                # Fallback 2: JavaScript DOM search (case-insensitive, robust visibility)
                 if not _option_clicked:
                     try:
                         clicked = await page.evaluate("""(optionText) => {
                             const optLower = optionText.toLowerCase().trim();
 
-                            // Strategy 1: Standard dropdown roles
+                            // Robust visibility check — offsetParent is null for fixed/absolute elements
+                            function isVisible(el) {
+                                const r = el.getBoundingClientRect();
+                                if (r.width === 0 || r.height === 0) return false;
+                                const s = window.getComputedStyle(el);
+                                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                                return true;
+                            }
+
+                            // Strategy 1: Dropdown items by role/tag
                             const roleEls = document.querySelectorAll(
-                                '[role="option"], [role="menuitem"], [role="listbox"] *, li, [class*="menu"] *, [class*="dropdown"] *'
+                                '[role="option"], [role="menuitem"], [role="listbox"] li, ul li, [class*="menu"] li'
                             );
                             for (const el of roleEls) {
                                 const text = (el.textContent || '').trim().toLowerCase();
-                                if (text === optLower && el.offsetParent !== null) {
+                                if (text === optLower && isVisible(el)) {
                                     el.click();
                                     return 'exact-role';
                                 }
                             }
 
-                            // Strategy 2: Any visible element with matching text (covers Material Design)
-                            const allEls = document.querySelectorAll('*');
-                            let bestMatch = null;
-                            let bestLen = Infinity;
-                            for (const el of allEls) {
-                                if (el.offsetParent === null) continue;
-                                const text = (el.textContent || '').trim().toLowerCase();
-                                // Exact match on inner text (not children's text)
+                            // Strategy 2: Inner spans/divs with exact own text
+                            const spans = document.querySelectorAll('span, div, li, a');
+                            for (const el of spans) {
+                                if (!isVisible(el)) continue;
+                                // Own text only (not children)
                                 const ownText = Array.from(el.childNodes)
                                     .filter(n => n.nodeType === 3)
                                     .map(n => n.textContent.trim().toLowerCase())
@@ -1104,7 +1143,14 @@ async def _exec_browser_tool(
                                     el.click();
                                     return 'exact-own-text';
                                 }
-                                // Full textContent match — pick shortest (most specific)
+                            }
+
+                            // Strategy 3: Shortest textContent match (most specific element)
+                            let bestMatch = null;
+                            let bestLen = Infinity;
+                            for (const el of document.querySelectorAll('*')) {
+                                if (!isVisible(el)) continue;
+                                const text = (el.textContent || '').trim().toLowerCase();
                                 if (text === optLower && text.length < bestLen) {
                                     bestMatch = el;
                                     bestLen = text.length;
@@ -1115,10 +1161,10 @@ async def _exec_browser_tool(
                                 return 'exact-textcontent';
                             }
 
-                            // Strategy 3: Partial match (contains)
+                            // Strategy 4: Partial match in dropdown items
                             for (const el of roleEls) {
                                 const text = (el.textContent || '').trim().toLowerCase();
-                                if (text.includes(optLower) && el.offsetParent !== null) {
+                                if (text.includes(optLower) && isVisible(el)) {
                                     el.click();
                                     return 'partial';
                                 }
