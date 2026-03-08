@@ -704,6 +704,28 @@ async def _exec_browser_tool(
             if any([d1, d2, d3, d4]):
                 logger.warning("[NAVIGATE] Popups dismissed across passes")
 
+            # ── Auto-scroll to form on Google Flights (form is below hero section) ──
+            _nav_url = page.url or ""
+            if "google.com/travel/flights" in _nav_url and "/search" not in _nav_url:
+                try:
+                    # Scroll to the flight search form
+                    await page.evaluate("""() => {
+                        // Find the "Where from?" input or the flight form
+                        const formEl = document.querySelector('input[aria-label*="Where from"]')
+                            || document.querySelector('[aria-label*="Flight search"]')
+                            || document.querySelector('[role="search"]');
+                        if (formEl) {
+                            formEl.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        } else {
+                            // Fallback: scroll to roughly where the form is
+                            window.scrollTo(0, 1600);
+                        }
+                    }""")
+                    await asyncio.sleep(0.5)
+                    logger.warning("[NAVIGATE] Auto-scrolled to Google Flights form")
+                except Exception:
+                    pass
+
             await overlay.inject()
             await overlay.set_active(True)
             await overlay.move_cursor(640, 360, "")
