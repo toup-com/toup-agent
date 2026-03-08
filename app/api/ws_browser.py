@@ -261,15 +261,15 @@ GET_TEXT_ELEMENT_RECT_JS = """
 # ---------------------------------------------------------------------------
 
 BROWSER_TOOLS = [
-    {"type": "function", "function": {"name": "navigate", "description": "Navigate to a URL. ONLY use to go to a NEW website.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
-    {"type": "function", "function": {"name": "click", "description": "Click an element by selector, text, or index.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector"}, "text": {"type": "string", "description": "Visible text"}, "index": {"type": "integer", "description": "Index from elements list"}}}}},
-    {"type": "function", "function": {"name": "type_text", "description": "Type text into an input field.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}, "clear": {"type": "boolean"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}}},
-    {"type": "function", "function": {"name": "select_date", "description": "Select a date on a calendar/date picker. Use this instead of click for date selection.", "parameters": {"type": "object", "properties": {"date": {"type": "string", "description": "Date in YYYY-MM-DD format, e.g. 2026-03-19"}}, "required": ["date"]}}},
-    {"type": "function", "function": {"name": "scroll", "description": "Scroll the page.", "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["up", "down"]}, "amount": {"type": "integer"}}}}},
-    {"type": "function", "function": {"name": "select_dropdown", "description": "Select an option from a dropdown menu. Atomically clicks the trigger to open the dropdown, then clicks the option. Use this for ANY dropdown (trip type, passenger count, cabin class, sort order, etc.).", "parameters": {"type": "object", "properties": {"trigger_text": {"type": "string", "description": "Text of the dropdown trigger button (e.g. 'Round trip', '1 passenger', 'Economy')"}, "option_text": {"type": "string", "description": "Text of the option to select (e.g. 'One way', '2 passengers', 'Business')"}}, "required": ["trigger_text", "option_text"]}}},
-    {"type": "function", "function": {"name": "go_back", "description": "Go back to previous page.", "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {"name": "wait", "description": "Wait for page to load.", "parameters": {"type": "object", "properties": {"milliseconds": {"type": "integer"}}}}},
-    {"type": "function", "function": {"name": "done", "description": "Task complete — include summary.", "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}},
+    {"name": "navigate", "description": "Navigate to a URL. ONLY use to go to a NEW website.", "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
+    {"name": "click", "description": "Click an element by selector, text, or index.", "input_schema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector"}, "text": {"type": "string", "description": "Visible text"}, "index": {"type": "integer", "description": "Index from elements list"}}}},
+    {"name": "type_text", "description": "Type text into an input field.", "input_schema": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}, "clear": {"type": "boolean"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}},
+    {"name": "select_date", "description": "Select a date on a calendar/date picker. Use this instead of click for date selection.", "input_schema": {"type": "object", "properties": {"date": {"type": "string", "description": "Date in YYYY-MM-DD format, e.g. 2026-03-19"}}, "required": ["date"]}},
+    {"name": "scroll", "description": "Scroll the page.", "input_schema": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["up", "down"]}, "amount": {"type": "integer"}}}},
+    {"name": "select_dropdown", "description": "Select an option from a dropdown menu. Atomically clicks the trigger to open the dropdown, then clicks the option. Use this for ANY dropdown (trip type, passenger count, cabin class, sort order, etc.).", "input_schema": {"type": "object", "properties": {"trigger_text": {"type": "string", "description": "Text of the dropdown trigger button (e.g. 'Round trip', '1 passenger', 'Economy')"}, "option_text": {"type": "string", "description": "Text of the option to select (e.g. 'One way', '2 passengers', 'Business')"}}, "required": ["trigger_text", "option_text"]}},
+    {"name": "go_back", "description": "Go back to previous page.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "wait", "description": "Wait for page to load.", "input_schema": {"type": "object", "properties": {"milliseconds": {"type": "integer"}}}},
+    {"name": "done", "description": "Task complete — include summary.", "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}},
 ]
 
 BROWSER_SYSTEM_PROMPT = """You are an AI browser agent controlling a REAL web browser. You can SEE the page via screenshots attached to each message.
@@ -866,21 +866,23 @@ async def _exec_browser_tool(
             if _is_airport_field and _is_flights_page and not press_enter:
                 try:
                     # Google Flights autocomplete: list items in the dropdown panel
-                    # They appear as <li> with role="option" or as clickable items in the suggestion list
+                    # IMPORTANT: filter out trip type dropdown items (Round trip, One way, etc.)
                     _ac_result = await page.evaluate("""() => {
-                        // Strategy 1: role="option" list items (most common)
-                        const options = document.querySelectorAll('li[role="option"], ul[role="listbox"] li');
-                        if (options.length > 0) {
-                            const first = options[0];
-                            const text = first.textContent.trim().substring(0, 80);
-                            first.click();
-                            return text;
-                        }
-                        // Strategy 2: Material autocomplete items
-                        const matItems = document.querySelectorAll('.mat-option, [data-value]');
-                        if (matItems.length > 0) {
-                            const first = matItems[0];
-                            const text = first.textContent.trim().substring(0, 80);
+                        const EXCLUDE = ['round trip', 'one way', 'multi-city', 'economy',
+                                         'premium economy', 'business', 'first class'];
+                        const allOptions = document.querySelectorAll('li[role="option"], ul[role="listbox"] li');
+                        const airportOptions = [...allOptions].filter(el => {
+                            const txt = el.textContent.trim().toLowerCase();
+                            // Skip empty or very short items
+                            if (txt.length < 3) return false;
+                            // Skip trip type / cabin class dropdown items
+                            if (EXCLUDE.some(ex => txt === ex || txt.startsWith(ex))) return false;
+                            // Airport suggestions are longer and contain airport/city names
+                            return true;
+                        });
+                        if (airportOptions.length > 0) {
+                            const first = airportOptions[0];
+                            const text = first.textContent.trim().substring(0, 100);
                             first.click();
                             return text;
                         }
@@ -888,24 +890,11 @@ async def _exec_browser_tool(
                     }""")
                     if _ac_result:
                         _autocomplete_clicked = _ac_result
-                        logger.warning("[TYPE_TEXT] Auto-clicked autocomplete: %s", _ac_result[:80])
+                        logger.warning("[TYPE_TEXT] Auto-clicked airport autocomplete: %s", _ac_result[:100])
                         await asyncio.sleep(random.uniform(0.5, 0.8))
                         await _wait_stable(page)
                     else:
-                        # Fallback: try clicking using Playwright's text matching on visible dropdown items
-                        logger.warning("[TYPE_TEXT] No autocomplete items found via JS, trying Playwright locator...")
-                        try:
-                            # Look for any visible list item that contains the typed text or related airport name
-                            _suggestions = page.locator('li[role="option"]')
-                            _count = await _suggestions.count()
-                            if _count > 0:
-                                await _suggestions.first.click(timeout=3000)
-                                _autocomplete_clicked = f"(clicked first of {_count} suggestions)"
-                                logger.warning("[TYPE_TEXT] Clicked autocomplete via Playwright (%d options)", _count)
-                                await asyncio.sleep(random.uniform(0.5, 0.8))
-                                await _wait_stable(page)
-                        except Exception as _pw_err:
-                            logger.warning("[TYPE_TEXT] Playwright autocomplete click failed: %s", _pw_err)
+                        logger.warning("[TYPE_TEXT] No airport autocomplete items found after typing '%s'", text_to_type)
                 except Exception as _ac_err:
                     logger.warning("[TYPE_TEXT] Autocomplete auto-click failed: %s", _ac_err)
 
@@ -1434,11 +1423,11 @@ async def _run_browser_agent_inner(
     conversation: List[Dict[str, Any]],
     overlay: AgentOverlay,
 ):
-    from openai import AsyncOpenAI
+    from anthropic import AsyncAnthropic
     import base64 as _b64mod
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
-    model = "gpt-5.4"
+    client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    model = "claude-opus-4-6"
 
     logger.warning("=" * 80)
     logger.warning("[BROWSER AGENT] NEW SESSION")
@@ -1500,7 +1489,7 @@ async def _run_browser_agent_inner(
             _init_b64 = _b64mod.b64encode(_init_png).decode()
             conversation.append({"role": "user", "content": [
                 {"type": "text", "text": context_message},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_init_b64}", "detail": "high"}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _init_b64}},
             ]})
         except Exception:
             conversation.append({"role": "user", "content": context_message})
@@ -1528,15 +1517,16 @@ async def _run_browser_agent_inner(
                 "text": "Looking at the page..." if step == 0 else "Deciding next action...",
             })
 
-            tc_mode = "required" if (step == 0 or _force_tool_next) else "auto"
+            tc_mode = {"type": "any"} if (step == 0 or _force_tool_next) else {"type": "auto"}
             _force_tool_next = False  # Reset after using
             try:
-                response = await client.chat.completions.create(
+                response = await client.messages.create(
                     model=model,
-                    messages=[{"role": "system", "content": system_prompt}] + conversation,
+                    system=system_prompt,
+                    messages=conversation,
                     tools=BROWSER_TOOLS,
                     tool_choice=tc_mode,
-                    max_completion_tokens=2048,
+                    max_tokens=2048,
                     temperature=0.2,
                 )
             except Exception as e:
@@ -1544,14 +1534,17 @@ async def _run_browser_agent_inner(
                 await websocket.send_json({"type": "error", "message": f"LLM error: {e}"})
                 return
 
-            msg = response.choices[0].message
+            # Extract text and tool_use blocks from Anthropic response
+            _text_blocks = [b.text for b in response.content if b.type == "text"]
+            _tool_blocks = [b for b in response.content if b.type == "tool_use"]
+            _combined_text = "\n".join(_text_blocks).strip()
 
             # ── Log the LLM's thinking / reasoning ──
-            if msg.content:
-                logger.warning("[STEP %d] LLM THINKING: %s", step + 1, msg.content[:500])
+            if _combined_text:
+                logger.warning("[STEP %d] LLM THINKING: %s", step + 1, _combined_text[:500])
 
-            if not msg.tool_calls:
-                text = msg.content or ""
+            if not _tool_blocks:
+                text = _combined_text
                 logger.warning("[STEP %d] LLM returned TEXT (no tool call): %s", step + 1, text[:300])
 
                 # ── Check if the text response is a failure/give-up — if so, force retry ──
@@ -1579,17 +1572,21 @@ async def _run_browser_agent_inner(
                 return
 
             # Log all tool calls the LLM wants to make
-            for _tc in msg.tool_calls:
-                logger.warning("[STEP %d] LLM TOOL CALL: %s(%s)", step + 1, _tc.function.name, _tc.function.arguments[:300])
+            for _tc in _tool_blocks:
+                logger.warning("[STEP %d] LLM TOOL CALL: %s(%s)", step + 1, _tc.name, json.dumps(_tc.input)[:300])
 
-            conversation.append(msg.model_dump())
+            # Append assistant message with all content blocks (Anthropic format)
+            _assistant_content = []
+            for b in response.content:
+                if b.type == "text":
+                    _assistant_content.append({"type": "text", "text": b.text})
+                elif b.type == "tool_use":
+                    _assistant_content.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+            conversation.append({"role": "assistant", "content": _assistant_content})
 
-            for tc in msg.tool_calls:
-                fn_name = tc.function.name
-                try:
-                    fn_args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    fn_args = {}
+            for tc in _tool_blocks:
+                fn_name = tc.name
+                fn_args = tc.input or {}
 
                 logger.warning("[STEP %d] EXECUTING: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:300])
 
@@ -1704,17 +1701,17 @@ async def _run_browser_agent_inner(
                         _snap_b64 = _b64mod.b64encode(_snap).decode()
                         tool_content = [
                             {"type": "text", "text": result[:12000]},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_snap_b64}", "detail": "high"}},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _snap_b64}},
                         ]
                     except Exception:
                         tool_content = result[:12000]
                 else:
                     tool_content = result[:12000]
 
+                # Anthropic format: tool results go as user messages with tool_result type
                 conversation.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": tool_content,
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": tc.id, "content": tool_content if isinstance(tool_content, list) else [{"type": "text", "text": tool_content}]}],
                 })
 
                 await _send_state(websocket, page, tab_manager)
