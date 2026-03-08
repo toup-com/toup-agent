@@ -229,8 +229,9 @@ class Settings(BaseSettings):
     hetzner_ssh_key_id: str = ""                  # Hetzner SSH key ID (optional, for backup access)
     hetzner_enabled: bool = False                 # Gate: set True once Hetzner is configured
 
-    # ── Browser Proxy (residential proxy for anti-detection) ──
+    # ── Browser Proxy & Captcha ──
     browser_proxy: str = ""  # e.g. "http://user:pass@proxy.example.com:8080"
+    captcha_solver_enabled: bool = True  # Auto-solve captchas on navigation
 
     # ── Agent Spawn Policies ─────────────────────────────────
     allow_agents: list[str] = []  # If non-empty, only these agent IDs can be spawned

@@ -192,14 +192,22 @@ async def _start_proxy_forwarder(upstream_url: str) -> int:
                 if line == b"\r\n" or not line:
                     break
 
-            # Connect to upstream proxy
-            try:
-                up_reader, up_writer = await asyncio.wait_for(
-                    asyncio.open_connection(upstream_host, upstream_port),
-                    timeout=15,
-                )
-            except Exception as e:
-                logger.error("[PROXY-FWD] Cannot connect to upstream %s:%d: %s", upstream_host, upstream_port, e)
+            # Connect to upstream proxy (with retry)
+            up_reader, up_writer = None, None
+            for _retry in range(2):
+                try:
+                    up_reader, up_writer = await asyncio.wait_for(
+                        asyncio.open_connection(upstream_host, upstream_port),
+                        timeout=30,
+                    )
+                    break
+                except Exception as e:
+                    if _retry == 0:
+                        logger.warning("[PROXY-FWD] Upstream connect failed, retrying: %s", e)
+                        await asyncio.sleep(2)
+                    else:
+                        logger.error("[PROXY-FWD] Cannot connect to upstream %s:%d: %s", upstream_host, upstream_port, e)
+            if not up_writer:
                 client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await client_writer.drain()
                 client_writer.close()
@@ -260,6 +268,366 @@ async def _start_proxy_forwarder(upstream_url: str) -> int:
     _proxy_port = port
     logger.info("[PROXY-FWD] Listening on 127.0.0.1:%d", port)
     return port
+
+
+# ──────────────────────────────────────────────────────────────
+# Captcha Detection & Solving
+# ──────────────────────────────────────────────────────────────
+
+class CaptchaType(str, Enum):
+    CLOUDFLARE_TURNSTILE = "cloudflare_turnstile"
+    RECAPTCHA_V2 = "recaptcha_v2"
+    HCAPTCHA = "hcaptcha"
+    PERIMETERX = "perimeterx"
+    DATADOME = "datadome"
+    GENERIC = "generic"
+
+
+async def detect_captcha(page) -> dict | None:
+    """Detect captcha on the current page via DOM inspection. Returns dict with type info or None."""
+    try:
+        result = await page.evaluate("""() => {
+            const body = document.body ? document.body.innerText : '';
+            const title = document.title || '';
+            const html = document.documentElement.innerHTML || '';
+
+            // Cloudflare Turnstile
+            if (document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+                document.querySelector('.cf-turnstile') ||
+                document.querySelector('[data-sitekey]') && html.includes('cloudflare')) {
+                return { type: 'cloudflare_turnstile' };
+            }
+
+            // Cloudflare interstitial ("Just a moment..." / "Checking your browser")
+            if ((title.includes('Just a moment') || title.includes('Attention Required') ||
+                 body.includes('Checking your browser') || body.includes('Enable JavaScript and cookies')) &&
+                html.includes('cloudflare')) {
+                return { type: 'cloudflare_turnstile' };
+            }
+
+            // reCAPTCHA v2
+            if (document.querySelector('iframe[src*="google.com/recaptcha"]') ||
+                document.querySelector('.g-recaptcha') ||
+                document.querySelector('#recaptcha')) {
+                return { type: 'recaptcha_v2' };
+            }
+
+            // hCaptcha
+            if (document.querySelector('iframe[src*="hcaptcha.com"]') ||
+                document.querySelector('.h-captcha')) {
+                return { type: 'hcaptcha' };
+            }
+
+            // PerimeterX
+            if (document.querySelector('#px-captcha') ||
+                document.querySelector('iframe[src*="captcha.px-cdn.net"]') ||
+                body.includes('Press & Hold') ||
+                html.includes('_pxCaptcha')) {
+                return { type: 'perimeterx' };
+            }
+
+            // DataDome
+            if (document.querySelector('iframe[src*="captcha-delivery.com"]') ||
+                document.querySelector('iframe[src*="interstitial-delivery.com"]') ||
+                html.includes('datadome')) {
+                return { type: 'datadome' };
+            }
+
+            // Generic challenge pages
+            const challengeWords = ['verify you are human', 'are you a robot',
+                'security check', 'access denied', 'please verify',
+                'bot protection', 'human verification'];
+            const lower = (title + ' ' + body.slice(0, 500)).toLowerCase();
+            for (const w of challengeWords) {
+                if (lower.includes(w)) {
+                    return { type: 'generic' };
+                }
+            }
+
+            return null;
+        }""")
+        if result:
+            logger.info("[CAPTCHA] Detected: %s on %s", result["type"], page.url)
+        return result
+    except Exception as e:
+        logger.debug("[CAPTCHA] Detection error: %s", e)
+        return None
+
+
+async def solve_captcha(page, captcha_info: dict, max_attempts: int = 2) -> bool:
+    """Attempt to solve a detected captcha. Returns True if solved."""
+    captcha_type = captcha_info.get("type", "")
+    logger.info("[CAPTCHA] Attempting to solve: %s", captcha_type)
+
+    for attempt in range(max_attempts):
+        try:
+            if captcha_type == CaptchaType.CLOUDFLARE_TURNSTILE:
+                solved = await _solve_cloudflare(page)
+            elif captcha_type == CaptchaType.PERIMETERX:
+                solved = await _solve_perimeterx(page)
+            elif captcha_type == CaptchaType.RECAPTCHA_V2:
+                solved = await _solve_recaptcha_v2(page)
+            elif captcha_type == CaptchaType.DATADOME:
+                solved = await _solve_datadome(page)
+            else:
+                # Generic/hCaptcha — wait and check if it auto-resolves
+                await asyncio.sleep(3)
+                check = await detect_captcha(page)
+                solved = check is None
+
+            if solved:
+                logger.info("[CAPTCHA] Solved %s on attempt %d", captcha_type, attempt + 1)
+                return True
+
+            logger.info("[CAPTCHA] Attempt %d failed for %s, retrying...", attempt + 1, captcha_type)
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.error("[CAPTCHA] Error solving %s: %s", captcha_type, e)
+
+    logger.warning("[CAPTCHA] Failed to solve %s after %d attempts", captcha_type, max_attempts)
+    return False
+
+
+async def _solve_cloudflare(page) -> bool:
+    """Solve Cloudflare Turnstile / interstitial challenge."""
+    # Wait for Turnstile to load
+    await asyncio.sleep(3)
+
+    # Try to find and click the Turnstile checkbox in its iframe
+    try:
+        turnstile_frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+        checkbox = turnstile_frame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage')
+        if await checkbox.count() > 0:
+            box = await checkbox.first.bounding_box()
+            if box:
+                await human_click(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                logger.info("[CAPTCHA] Clicked Turnstile checkbox")
+    except Exception as e:
+        logger.debug("[CAPTCHA] Turnstile iframe click: %s", e)
+
+    # Also try clicking any visible verify button on the main page
+    try:
+        for selector in ['#challenge-stage input', 'button:has-text("Verify")', 'input[type="button"][value*="Verify"]']:
+            btn = page.locator(selector)
+            if await btn.count() > 0:
+                box = await btn.first.bounding_box()
+                if box:
+                    await human_click(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    break
+    except Exception:
+        pass
+
+    # Wait for the page to pass the challenge (URL change or content change)
+    await asyncio.sleep(5)
+    check = await detect_captcha(page)
+    return check is None
+
+
+async def _solve_perimeterx(page) -> bool:
+    """Solve PerimeterX press-and-hold challenge."""
+    try:
+        # Find the press-and-hold button
+        px_btn = page.locator('#px-captcha')
+        if await px_btn.count() == 0:
+            px_btn = page.locator('[aria-label*="hold"], button:has-text("Hold")')
+        if await px_btn.count() == 0:
+            return False
+
+        box = await px_btn.first.bounding_box()
+        if not box:
+            return False
+
+        cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+        # Move to button naturally
+        await page.mouse.move(cx, cy, steps=random.randint(8, 15))
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+
+        # Press and hold for 8-12 seconds with micro-movements
+        await page.mouse.down()
+        hold_time = random.uniform(8, 12)
+        elapsed = 0
+        while elapsed < hold_time:
+            # Slight hand tremor during hold
+            dx = random.gauss(0, 0.5)
+            dy = random.gauss(0, 0.5)
+            await page.mouse.move(cx + dx, cy + dy)
+            sleep_t = random.uniform(0.1, 0.3)
+            await asyncio.sleep(sleep_t)
+            elapsed += sleep_t
+        await page.mouse.up()
+        logger.info("[CAPTCHA] PerimeterX hold released after %.1fs", hold_time)
+
+        # Wait for page to reload
+        await asyncio.sleep(5)
+        check = await detect_captcha(page)
+        return check is None
+    except Exception as e:
+        logger.error("[CAPTCHA] PerimeterX error: %s", e)
+        return False
+
+
+async def _solve_recaptcha_v2(page) -> bool:
+    """Solve reCAPTCHA v2 — click checkbox, if image challenge appears use vision."""
+    try:
+        # Find and click "I'm not a robot" checkbox
+        recaptcha_frame = page.frame_locator('iframe[src*="google.com/recaptcha"][title*="reCAPTCHA"]')
+        checkbox = recaptcha_frame.locator('.recaptcha-checkbox-border, #recaptcha-anchor')
+        if await checkbox.count() > 0:
+            box = await checkbox.first.bounding_box()
+            if box:
+                await human_click(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                logger.info("[CAPTCHA] Clicked reCAPTCHA checkbox")
+                await asyncio.sleep(3)
+
+        # Check if we passed (sometimes checkbox click alone works)
+        check = await detect_captcha(page)
+        if check is None:
+            return True
+
+        # Image challenge appeared — try vision solving
+        # Find the challenge iframe
+        challenge_frame = page.frame_locator('iframe[src*="google.com/recaptcha"][title*="challenge"]')
+        if await challenge_frame.locator('body').count() == 0:
+            return False
+
+        # Take screenshot of the challenge for vision solving
+        for round_num in range(3):
+            try:
+                # Get challenge instruction text
+                instruction = await challenge_frame.locator('.rc-imageselect-desc, .rc-imageselect-desc-wrapper').inner_text()
+                logger.info("[CAPTCHA] reCAPTCHA challenge: %s", instruction)
+
+                # Screenshot the challenge area
+                challenge_el = challenge_frame.locator('.rc-imageselect-challenge, #rc-imageselect')
+                screenshot = await challenge_el.first.screenshot()
+
+                # Send to Claude Vision for solving
+                solution = await _vision_solve_image_captcha(screenshot, instruction)
+                if not solution:
+                    return False
+
+                # Click the identified tiles
+                tiles = challenge_frame.locator('.rc-imageselect-tile, td[role="button"]')
+                tile_count = await tiles.count()
+                for idx in solution:
+                    if 0 < idx <= tile_count:
+                        tile_box = await tiles.nth(idx - 1).bounding_box()
+                        if tile_box:
+                            await human_click(page,
+                                tile_box["x"] + tile_box["width"] / 2,
+                                tile_box["y"] + tile_box["height"] / 2)
+                            await asyncio.sleep(random.uniform(0.3, 0.6))
+
+                # Click verify
+                verify_btn = challenge_frame.locator('#recaptcha-verify-button, button:has-text("Verify")')
+                if await verify_btn.count() > 0:
+                    vbox = await verify_btn.first.bounding_box()
+                    if vbox:
+                        await human_click(page, vbox["x"] + vbox["width"] / 2, vbox["y"] + vbox["height"] / 2)
+
+                await asyncio.sleep(3)
+                check = await detect_captcha(page)
+                if check is None:
+                    return True
+                # New images might have appeared — continue loop
+            except Exception as e:
+                logger.debug("[CAPTCHA] reCAPTCHA round %d error: %s", round_num, e)
+                break
+
+        return False
+    except Exception as e:
+        logger.error("[CAPTCHA] reCAPTCHA error: %s", e)
+        return False
+
+
+async def _solve_datadome(page) -> bool:
+    """Solve DataDome challenge — wait for auto-resolution or click slider."""
+    try:
+        await asyncio.sleep(4)
+
+        # DataDome sometimes has a slider
+        dd_frame = page.frame_locator('iframe[src*="captcha-delivery.com"], iframe[src*="interstitial"]')
+        slider = dd_frame.locator('.captcha-slider, .dd-slider, input[type="range"]')
+        if await slider.count() > 0:
+            box = await slider.first.bounding_box()
+            if box:
+                # Drag slider from left to right
+                start_x = box["x"] + 5
+                end_x = box["x"] + box["width"] - 5
+                y = box["y"] + box["height"] / 2
+                await page.mouse.move(start_x, y)
+                await page.mouse.down()
+                steps = random.randint(15, 25)
+                for i in range(steps):
+                    x = start_x + (end_x - start_x) * (i + 1) / steps
+                    await page.mouse.move(x + random.gauss(0, 0.5), y + random.gauss(0, 0.3))
+                    await asyncio.sleep(random.uniform(0.02, 0.06))
+                await page.mouse.up()
+                logger.info("[CAPTCHA] DataDome slider dragged")
+
+        await asyncio.sleep(4)
+        check = await detect_captcha(page)
+        return check is None
+    except Exception as e:
+        logger.error("[CAPTCHA] DataDome error: %s", e)
+        return False
+
+
+async def _vision_solve_image_captcha(screenshot_bytes: bytes, instruction: str) -> list[int] | None:
+    """Use Claude Vision to solve an image captcha. Returns list of tile indices (1-indexed)."""
+    try:
+        import base64
+        import httpx
+
+        from app.config import settings
+        api_key = getattr(settings, "anthropic_api_key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            logger.warning("[CAPTCHA] No ANTHROPIC_API_KEY for vision solving")
+            return None
+
+        img_b64 = base64.b64encode(screenshot_bytes).decode()
+        prompt = (
+            f"You are solving an image CAPTCHA challenge. The instruction says: \"{instruction}\"\n"
+            "The image shows a grid of numbered tiles (numbered 1 to N, left-to-right, top-to-bottom).\n"
+            "Return ONLY a JSON array of the tile numbers that match the instruction.\n"
+            "Example: [1, 4, 7]\n"
+            "If you cannot determine the answer, return []."
+        )
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 100,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }],
+                },
+            )
+            data = resp.json()
+            text = data.get("content", [{}])[0].get("text", "")
+            logger.info("[CAPTCHA] Vision response: %s", text)
+
+            # Parse JSON array from response
+            import re
+            match = re.search(r'\[[\d,\s]*\]', text)
+            if match:
+                return json.loads(match.group())
+            return None
+    except Exception as e:
+        logger.error("[CAPTCHA] Vision solving error: %s", e)
+        return None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -442,6 +810,40 @@ STEALTH_INIT_SCRIPT = """
     if (!navigator.connection) {
         Object.defineProperty(navigator, 'connection', {
             get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false }),
+        });
+    }
+
+    // ─── Window dimensions (headless reports 0) ───
+    Object.defineProperty(window, 'outerWidth', { get: () => 1280 });
+    Object.defineProperty(window, 'outerHeight', { get: () => 720 });
+    Object.defineProperty(window, 'innerWidth', { get: () => 1280 });
+    Object.defineProperty(window, 'innerHeight', { get: () => 720 });
+
+    // ─── Screen properties (match Xvfb display) ───
+    Object.defineProperty(screen, 'width', { get: () => 1280 });
+    Object.defineProperty(screen, 'height', { get: () => 720 });
+    Object.defineProperty(screen, 'availWidth', { get: () => 1280 });
+    Object.defineProperty(screen, 'availHeight', { get: () => 720 });
+    Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+    Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+
+    // ─── AudioContext fingerprint noise ───
+    try {
+        const origGetChannelData = AudioBuffer.prototype.getChannelData;
+        AudioBuffer.prototype.getChannelData = function(channel) {
+            const data = origGetChannelData.call(this, channel);
+            for (let i = 0; i < Math.min(data.length, 10); i++) {
+                data[i] += (Math.random() - 0.5) * 0.0001;
+            }
+            return data;
+        };
+    } catch(e) {}
+
+    // ─── Battery API (headless often lacks this) ───
+    if (!navigator.getBattery) {
+        navigator.getBattery = () => Promise.resolve({
+            charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1,
+            addEventListener: () => {}, removeEventListener: () => {},
         });
     }
 }

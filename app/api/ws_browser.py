@@ -409,7 +409,7 @@ After parallel_search completes, you receive all results and can summarize the b
 - Use CSS selectors (preferred) or text content to target elements
 - When searching on a site, use type_text with press_enter=true
 - For general browsing, navigate directly to websites or use Google Search
-- If a site blocks you with a captcha, DON'T try to solve it. Navigate to an alternative site instead.
+- Captchas are auto-solved by the system. If a site still blocks you after navigation, try waiting 3 seconds and navigating again. If still blocked, try an alternative site.
 - Scroll down to find more content if needed
 - NEVER ask the user clarifying questions — just go browse and find the answer
 - Call `done` with a clear summary when finished"""
@@ -595,11 +595,25 @@ async def _exec_browser_tool(
             await _wait_stable(page)
             # Human-like pause after page load (Atlas behavior)
             await asyncio.sleep(random.uniform(0.3, 0.8))
+
+            # ── Auto-solve captchas ──
+            from app.agent.browser import detect_captcha, solve_captcha
+            captcha = await detect_captcha(page)
+            if captcha:
+                solved = await solve_captcha(page, captcha)
+                if solved:
+                    await _wait_stable(page)
+                    await asyncio.sleep(0.5)
+
             await overlay.inject()
             await overlay.set_active(True)
             await overlay.move_cursor(640, 360, "")
             title = await page.title()
             analysis = await _analyze_page(page)
+            # Warn agent if captcha is still present after solving attempt
+            captcha_after = await detect_captcha(page)
+            if captcha_after:
+                analysis = f"WARNING: Page shows a {captcha_after['type']} captcha that could not be auto-solved.\n\n{analysis}"
             return f"Navigated to {page.url} — {title}\n\n{analysis}"
 
         elif name == "click":
@@ -988,6 +1002,12 @@ async def _google_first_search(
         await page.goto(google_url, wait_until="domcontentloaded", timeout=60_000)
         await _wait_stable(page)
         await asyncio.sleep(1.0)
+        # Auto-solve if Google shows a captcha
+        from app.agent.browser import detect_captcha, solve_captcha
+        gcaptcha = await detect_captcha(page)
+        if gcaptcha:
+            await solve_captcha(page, gcaptcha)
+            await _wait_stable(page)
         await overlay.inject()
 
         # Send screenshot so user sees the Google results
@@ -1108,7 +1128,7 @@ Rules:
 - You have max 12 steps, so be efficient
 - NEVER ask questions — just search and report findings
 - Stay on the assigned website — do not navigate to other sites
-- If you hit a captcha or the page won't load, call `done` with summary "BLOCKED: Site showed captcha or timed out" and move on"""
+- Captchas are auto-solved by the system. If the page still won't load after 2 navigations, call `done` with summary "BLOCKED: Site showed captcha or timed out" and move on"""
 
 
 async def _run_worker(
