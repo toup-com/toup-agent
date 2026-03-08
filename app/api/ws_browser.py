@@ -260,7 +260,8 @@ GET_TEXT_ELEMENT_RECT_JS = """
 # Browser tool definitions (OpenAI function-calling format)
 # ---------------------------------------------------------------------------
 
-BROWSER_TOOLS = [
+# Tool definitions — Anthropic format (also used as canonical source)
+_BROWSER_TOOLS_DEF = [
     {"name": "navigate", "description": "Navigate to a URL. ONLY use to go to a NEW website.", "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
     {"name": "click", "description": "Click an element by selector, text, or index.", "input_schema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector"}, "text": {"type": "string", "description": "Visible text"}, "index": {"type": "integer", "description": "Index from elements list"}}}},
     {"name": "type_text", "description": "Type text into an input field.", "input_schema": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}, "clear": {"type": "boolean"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}},
@@ -271,6 +272,9 @@ BROWSER_TOOLS = [
     {"name": "wait", "description": "Wait for page to load.", "input_schema": {"type": "object", "properties": {"milliseconds": {"type": "integer"}}}},
     {"name": "done", "description": "Task complete — include summary.", "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}},
 ]
+# OpenAI format conversion
+BROWSER_TOOLS_OPENAI = [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}} for t in _BROWSER_TOOLS_DEF]
+BROWSER_TOOLS_ANTHROPIC = _BROWSER_TOOLS_DEF
 
 BROWSER_SYSTEM_PROMPT = """You are an AI browser agent controlling a REAL web browser. You can SEE the page via screenshots attached to each message.
 
@@ -1423,23 +1427,21 @@ async def _run_browser_agent_inner(
     conversation: List[Dict[str, Any]],
     overlay: AgentOverlay,
 ):
-    from anthropic import AsyncAnthropic
     import base64 as _b64mod
 
+    # ── LLM provider: use Anthropic Claude if regular API key available, else OpenAI ──
     _ant_key = settings.anthropic_api_key or ""
-    import os as _os
-    if _ant_key.startswith("sk-ant-oat"):
-        # OAuth token — must use auth_token, not api_key (which sends x-api-key header)
-        # Temporarily remove ANTHROPIC_API_KEY env var to prevent SDK auto-pickup
-        _saved_env = _os.environ.pop("ANTHROPIC_API_KEY", None)
-        try:
-            client = AsyncAnthropic(auth_token=_ant_key)
-        finally:
-            if _saved_env is not None:
-                _os.environ["ANTHROPIC_API_KEY"] = _saved_env
-    else:
+    _use_claude = _ant_key and _ant_key.startswith("sk-ant-api")
+    if _use_claude:
+        from anthropic import AsyncAnthropic
         client = AsyncAnthropic(api_key=_ant_key)
-    model = "claude-opus-4-6"
+        model = "claude-opus-4-6"
+        _llm_provider = "anthropic"
+    else:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        model = "gpt-5.4"
+        _llm_provider = "openai"
 
     logger.warning("=" * 80)
     logger.warning("[BROWSER AGENT] NEW SESSION")
@@ -1495,13 +1497,20 @@ async def _run_browser_agent_inner(
     await screencast.start()
 
     try:
+        # Helper: create image content block in provider-specific format
+        def _img_block(b64_data):
+            if _llm_provider == "anthropic":
+                return {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_data}}
+            else:
+                return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_data}", "detail": "high"}}
+
         # Build user message with vision screenshot
         try:
             _init_png = await page.screenshot(type="png")
             _init_b64 = _b64mod.b64encode(_init_png).decode()
             conversation.append({"role": "user", "content": [
                 {"type": "text", "text": context_message},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _init_b64}},
+                _img_block(_init_b64),
             ]})
         except Exception:
             conversation.append({"role": "user", "content": context_message})
@@ -1529,27 +1538,53 @@ async def _run_browser_agent_inner(
                 "text": "Looking at the page..." if step == 0 else "Deciding next action...",
             })
 
-            tc_mode = {"type": "any"} if (step == 0 or _force_tool_next) else {"type": "auto"}
+            _force_required = step == 0 or _force_tool_next
             _force_tool_next = False  # Reset after using
             try:
-                response = await client.messages.create(
-                    model=model,
-                    system=system_prompt,
-                    messages=conversation,
-                    tools=BROWSER_TOOLS,
-                    tool_choice=tc_mode,
-                    max_tokens=2048,
-                    temperature=0.2,
-                )
+                if _llm_provider == "anthropic":
+                    tc_mode = {"type": "any"} if _force_required else {"type": "auto"}
+                    response = await client.messages.create(
+                        model=model,
+                        system=system_prompt,
+                        messages=conversation,
+                        tools=BROWSER_TOOLS_ANTHROPIC,
+                        tool_choice=tc_mode,
+                        max_tokens=2048,
+                        temperature=0.2,
+                    )
+                else:
+                    tc_mode = "required" if _force_required else "auto"
+                    response = await client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "system", "content": system_prompt}] + conversation,
+                        tools=BROWSER_TOOLS_OPENAI,
+                        tool_choice=tc_mode,
+                        max_completion_tokens=2048,
+                        temperature=0.2,
+                    )
             except Exception as e:
                 logger.error("[STEP %d] LLM CALL FAILED: %s", step + 1, e)
                 await websocket.send_json({"type": "error", "message": f"LLM error: {e}"})
                 return
 
-            # Extract text and tool_use blocks from Anthropic response
-            _text_blocks = [b.text for b in response.content if b.type == "text"]
-            _tool_blocks = [b for b in response.content if b.type == "tool_use"]
-            _combined_text = "\n".join(_text_blocks).strip()
+            # Normalize response into provider-agnostic format
+            if _llm_provider == "anthropic":
+                _text_blocks = [b.text for b in response.content if b.type == "text"]
+                _tool_blocks = [b for b in response.content if b.type == "tool_use"]
+                _combined_text = "\n".join(_text_blocks).strip()
+            else:
+                msg = response.choices[0].message
+                _combined_text = msg.content or ""
+                # Convert OpenAI tool calls to tool_block-like objects
+                class _ToolBlock:
+                    def __init__(self, tc):
+                        self.id = tc.id
+                        self.name = tc.function.name
+                        try:
+                            self.input = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            self.input = {}
+                _tool_blocks = [_ToolBlock(tc) for tc in (msg.tool_calls or [])]
 
             # ── Log the LLM's thinking / reasoning ──
             if _combined_text:
@@ -1587,18 +1622,21 @@ async def _run_browser_agent_inner(
             for _tc in _tool_blocks:
                 logger.warning("[STEP %d] LLM TOOL CALL: %s(%s)", step + 1, _tc.name, json.dumps(_tc.input)[:300])
 
-            # Append assistant message with all content blocks (Anthropic format)
-            _assistant_content = []
-            for b in response.content:
-                if b.type == "text":
-                    _assistant_content.append({"type": "text", "text": b.text})
-                elif b.type == "tool_use":
-                    _assistant_content.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
-            conversation.append({"role": "assistant", "content": _assistant_content})
+            # Append assistant message in provider-specific format
+            if _llm_provider == "anthropic":
+                _assistant_content = []
+                for b in response.content:
+                    if b.type == "text":
+                        _assistant_content.append({"type": "text", "text": b.text})
+                    elif b.type == "tool_use":
+                        _assistant_content.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+                conversation.append({"role": "assistant", "content": _assistant_content})
+            else:
+                conversation.append(msg.model_dump())
 
             for tc in _tool_blocks:
                 fn_name = tc.name
-                fn_args = tc.input or {}
+                fn_args = tc.input if hasattr(tc, 'input') else {}
 
                 logger.warning("[STEP %d] EXECUTING: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:300])
 
@@ -1713,18 +1751,25 @@ async def _run_browser_agent_inner(
                         _snap_b64 = _b64mod.b64encode(_snap).decode()
                         tool_content = [
                             {"type": "text", "text": result[:12000]},
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _snap_b64}},
+                            _img_block(_snap_b64),
                         ]
                     except Exception:
                         tool_content = result[:12000]
                 else:
                     tool_content = result[:12000]
 
-                # Anthropic format: tool results go as user messages with tool_result type
-                conversation.append({
-                    "role": "user",
-                    "content": [{"type": "tool_result", "tool_use_id": tc.id, "content": tool_content if isinstance(tool_content, list) else [{"type": "text", "text": tool_content}]}],
-                })
+                # Append tool result in provider-specific format
+                if _llm_provider == "anthropic":
+                    conversation.append({
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": tc.id, "content": tool_content if isinstance(tool_content, list) else [{"type": "text", "text": tool_content}]}],
+                    })
+                else:
+                    conversation.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_content,
+                    })
 
                 await _send_state(websocket, page, tab_manager)
 
