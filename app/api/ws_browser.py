@@ -272,36 +272,39 @@ BROWSER_TOOLS = [
 
 BROWSER_SYSTEM_PROMPT = """You are an AI browser agent controlling a REAL web browser. You can SEE the page via screenshots attached to each message.
 
-## CRITICAL RULES:
-1. LOOK at the screenshot FIRST. The screenshot shows you EXACTLY what's on screen. Use it to decide your next action.
-2. NEVER navigate away from a page you're working on. If you're on Emirates filling a form, STAY on Emirates. Don't go to Google.
-3. ONE action at a time. Look at screenshot → take ONE precise action → look at next screenshot → repeat.
-4. Use the interactive elements list AND the screenshot together. The list gives you selectors, the screenshot shows you what's visible.
-5. NEVER just talk — ALWAYS use a tool.
+## CRITICAL — HANDLE POPUPS FIRST:
+Before doing ANYTHING else, look at the screenshot. If you see ANY of these, dismiss them IMMEDIATELY:
+- Cookie/privacy banners → click "Accept" or "Accept All" (NEVER "Cookie preferences" or "Manage")
+- Modal dialogs/overlays → click "Close" or the X button
+- Advisory/warning popups → click "Close"
+You MUST dismiss ALL visible popups before interacting with the page behind them.
 
-## How to interact:
-- `click` — use `selector` (CSS, preferred), `text` (visible text), or `index` (from elements list)
-- `type_text` — type into input fields. Use `selector` to target the right field. Set `press_enter=true` to submit.
+## RULES:
+1. LOOK at the screenshot FIRST. It shows EXACTLY what's on screen.
+2. NEVER navigate away from a page you're working on. Stay on the current site.
+3. ONE action at a time. Screenshot → one action → next screenshot → repeat.
+4. Use the interactive elements list AND screenshot together.
+5. ALWAYS use a tool — never just talk.
+
+## Tools:
+- `click` — use `selector` (CSS preferred), `text` (visible text), or `index` (from elements list)
+- `type_text` — type into input fields. Use `selector` to target. `press_enter=true` to submit.
 - `scroll` — scroll down/up to see more content
-- `navigate` — ONLY use this to go to a NEW website. NOT to leave a page you're working on.
-- `wait` — wait for page to load/update after actions
+- `navigate` — ONLY to go to a NEW website. Never to leave a page you're working on.
+- `wait` — wait for page to load/update
 - `done` — call with summary when task is complete
 
-## Filling forms (flights, bookings, etc.):
-- Look at the screenshot to see form fields (departure, arrival, dates, etc.)
-- Click on each field, type the value, then move to the next field
-- For date pickers: look at the calendar in the screenshot, click the correct date directly
-- For dropdowns/autocomplete: type the value, wait for suggestions, click the right one
-- After filling all fields, click the search/submit button
+## Forms (flights, bookings, etc.):
+- Click each field, type the value, then move to next
+- Date pickers: click the correct date in the calendar directly
+- Dropdowns/autocomplete: type, wait for suggestions, click the right one
+- After filling all fields, click search/submit
 
-## Rules:
-- STAY on the current website until the task there is done
-- Use CSS selectors from the elements list for precise clicking
-- Cookie banners and popups are auto-dismissed. If you still see one, click Accept/Close.
-- Captchas are auto-solved. If still blocked, try `wait` then retry once.
-- Scroll to find content that might be below the fold
+## Other rules:
+- STAY on the current website until done
+- Scroll to find content below the fold
 - NEVER ask clarifying questions — just do it
-- Call `done` with a detailed summary of what you found/accomplished"""
+- Call `done` with a detailed summary"""
 
 
 # ---------------------------------------------------------------------------
@@ -550,8 +553,11 @@ async def _auto_dismiss_popups(page):
         if dismissed:
             logger.info("[BROWSER] Auto-dismissed popups: %s", dismissed)
             await asyncio.sleep(0.5)  # Wait for animations
+            return True
+        return False
     except Exception as e:
         logger.debug("[BROWSER] Auto-dismiss failed (ok): %s", e)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +594,14 @@ async def _exec_browser_tool(
                     await _wait_stable(page)
                     await asyncio.sleep(0.5)
 
-            # ── Auto-dismiss cookie banners, modals, popups ──
+            # ── Auto-dismiss popups — they load async, so retry with delays ──
+            # First pass: immediate
+            await _auto_dismiss_popups(page)
+            # Second pass: wait for async JS popups (cookie banners, modals)
+            await asyncio.sleep(2.0)
+            await _auto_dismiss_popups(page)
+            # Third pass: catch any remaining layers
+            await asyncio.sleep(1.0)
             await _auto_dismiss_popups(page)
 
             await overlay.inject()
