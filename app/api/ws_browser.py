@@ -830,7 +830,9 @@ async def _exec_browser_tool(
                     await page.keyboard.press("Enter")
 
             # Wait for autocomplete/dropdown to appear after typing
-            await asyncio.sleep(random.uniform(0.8, 1.2))
+            # Longer wait for airport codes to ensure autocomplete has time to load
+            _wait_time = random.uniform(1.5, 2.0) if len(text_to_type) <= 4 else random.uniform(0.8, 1.2)
+            await asyncio.sleep(_wait_time)
             if press_enter:
                 await _wait_stable(page)
             await overlay.inject()
