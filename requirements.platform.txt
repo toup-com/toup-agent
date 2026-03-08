@@ -51,7 +51,7 @@ slack-bolt>=1.18.0
 slack-sdk>=3.27.0
 
 # AI providers
-anthropic>=0.30.0
+anthropic>=0.40.0
 cohere>=5.0.0
 
 # Browser automation (headless Chromium for browser agent)

@@ -1427,9 +1427,16 @@ async def _run_browser_agent_inner(
     import base64 as _b64mod
 
     _ant_key = settings.anthropic_api_key or ""
+    import os as _os
     if _ant_key.startswith("sk-ant-oat"):
-        # OAuth token — use auth_token parameter
-        client = AsyncAnthropic(auth_token=_ant_key)
+        # OAuth token — must use auth_token, not api_key (which sends x-api-key header)
+        # Temporarily remove ANTHROPIC_API_KEY env var to prevent SDK auto-pickup
+        _saved_env = _os.environ.pop("ANTHROPIC_API_KEY", None)
+        try:
+            client = AsyncAnthropic(auth_token=_ant_key)
+        finally:
+            if _saved_env is not None:
+                _os.environ["ANTHROPIC_API_KEY"] = _saved_env
     else:
         client = AsyncAnthropic(api_key=_ant_key)
     model = "claude-opus-4-6"
