@@ -793,7 +793,7 @@ async def _run_browser_agent_inner(
     import base64 as _b64mod
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
-    model = "gpt-4.1"
+    model = "gpt-5.4"
 
     logger.warning("[WS Browser] Starting agent loop: model=%s, message='%s'", model, user_message[:100])
 
