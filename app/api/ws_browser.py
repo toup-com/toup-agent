@@ -294,20 +294,19 @@ You MUST dismiss ALL visible popups before interacting with the page behind them
 - `wait` — wait for page to load/update
 - `done` — call with summary when task is complete
 
-## AUTOCOMPLETE FIELDS (CRITICAL — airports, cities, etc.):
-When typing in a search/autocomplete field (like Google Flights, Skyscanner, etc.):
-1. Click the input field first
-2. Type the search text (e.g. "Toronto")
-3. STOP — do NOT move to the next field yet
-4. Look at the NEXT screenshot — you will see a dropdown with suggestions
-5. CLICK the correct suggestion from the dropdown list
-6. Only AFTER clicking the suggestion, move to the next field
-If you skip step 5 and just move on, the field won't be properly filled!
+## FILLING FORMS (flights, bookings, etc.) — FOLLOW THIS EXACTLY:
+For EACH field in order:
+1. LOOK at the screenshot carefully. Identify the field by its label/placeholder (e.g. "Where from?", "Where to?", "Departure", "Return")
+2. CLICK the correct field — match the label, not just the position
+3. TYPE the value
+4. WAIT — look at the next screenshot for autocomplete dropdown
+5. CLICK the correct suggestion from the dropdown
+6. Only THEN move to the NEXT field
 
-## Forms (flights, bookings, etc.):
-- For each field: click → type → WAIT for dropdown → click suggestion → next field
-- Date pickers: click the date field, then click the correct date in the calendar
-- After filling ALL fields, click the search/submit button
+COMMON MISTAKE: After filling "Where from?", the next field is "Where to?" (destination), NOT "Departure" (date). Read the field labels carefully!
+
+For date pickers: click the date field, then click the correct date directly on the calendar.
+After ALL fields are filled, click Search/Submit.
 
 ## Other rules:
 - STAY on the current website until done
@@ -356,16 +355,18 @@ async def _get_interactive_elements(page, limit: int = 50) -> str:
                 const r = el.getBoundingClientRect();
                 const tag = el.tagName.toLowerCase();
                 const type = el.type || '';
-                const text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().slice(0, 80);
+                const placeholder = el.placeholder || '';
+                const ariaLabel = el.getAttribute('aria-label') || '';
+                const text = (el.innerText || el.value || '').trim().slice(0, 80);
                 const href = el.href || '';
                 const id = el.id || '';
                 const name = el.name || '';
                 let sel = tag;
                 if (id) sel = '#' + CSS.escape(id);
                 else if (name) sel = tag + '[name="' + name + '"]';
+                else if (ariaLabel) sel = tag + '[aria-label="' + ariaLabel.replace(/"/g, '\\\\"') + '"]';
                 else if (type && tag === 'input') sel = 'input[type="' + type + '"]';
-                else if (el.getAttribute('aria-label')) sel = tag + '[aria-label="' + el.getAttribute('aria-label').replace(/"/g, '\\\\"') + '"]';
-                return { tag, type, text, href: href.slice(0, 120), selector: sel, x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+                return { tag, type, text, placeholder, aria_label: ariaLabel, href: href.slice(0, 120), selector: sel, x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
             });
         }""")
         lines = []
@@ -373,6 +374,10 @@ async def _get_interactive_elements(page, limit: int = 50) -> str:
             parts = [f"[{i}] <{el['tag']}>"]
             if el.get("type"):
                 parts.append(f"type={el['type']}")
+            if el.get("placeholder"):
+                parts.append(f'placeholder="{el["placeholder"]}"')
+            if el.get("aria_label"):
+                parts.append(f'aria-label="{el["aria_label"]}"')
             if el.get("text"):
                 parts.append(f'"{el["text"]}"')
             if el.get("href"):
