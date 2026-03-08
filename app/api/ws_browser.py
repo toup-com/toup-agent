@@ -641,17 +641,19 @@ async def _exec_browser_tool(
                     await asyncio.sleep(0.5)
 
             # ── Auto-dismiss popups — they load async, so retry with delays ──
-            # First pass: immediate
-            await _auto_dismiss_popups(page)
-            # Second pass: wait for async JS popups (cookie banners, modals)
+            logger.warning("[NAVIGATE] Auto-dismiss pass 1 (immediate)")
+            d1 = await _auto_dismiss_popups(page)
             await asyncio.sleep(2.0)
-            await _auto_dismiss_popups(page)
-            # Third pass: catch any remaining layers
+            logger.warning("[NAVIGATE] Auto-dismiss pass 2 (after 2s)")
+            d2 = await _auto_dismiss_popups(page)
             await asyncio.sleep(1.5)
-            await _auto_dismiss_popups(page)
-            # Fourth pass: late-loading promo overlays (Google Flights, etc.)
+            logger.warning("[NAVIGATE] Auto-dismiss pass 3 (after 3.5s)")
+            d3 = await _auto_dismiss_popups(page)
             await asyncio.sleep(2.0)
-            await _auto_dismiss_popups(page)
+            logger.warning("[NAVIGATE] Auto-dismiss pass 4 (after 5.5s)")
+            d4 = await _auto_dismiss_popups(page)
+            if any([d1, d2, d3, d4]):
+                logger.warning("[NAVIGATE] Popups dismissed across passes")
 
             await overlay.inject()
             await overlay.set_active(True)
@@ -719,6 +721,14 @@ async def _exec_browser_tool(
 
             await asyncio.sleep(random.uniform(0.3, 0.6))
             await _wait_stable(page)
+
+            # ── Auto-dismiss overlays that appear after click (Flight Deals, etc.) ──
+            dismissed = await _auto_dismiss_popups(page)
+            if dismissed:
+                logger.warning("[CLICK] Auto-dismissed overlay after click")
+                await asyncio.sleep(0.5)
+                await _wait_stable(page)
+
             await overlay.inject()
             title = await page.title()
             analysis = await _analyze_page(page)
@@ -951,7 +961,11 @@ async def _run_browser_agent_inner(
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     model = "gpt-5.4"
 
-    logger.warning("[WS Browser] Starting agent loop: model=%s, message='%s'", model, user_message[:100])
+    logger.warning("=" * 80)
+    logger.warning("[BROWSER AGENT] NEW SESSION")
+    logger.warning("[BROWSER AGENT] User message: %s", user_message)
+    logger.warning("[BROWSER AGENT] Model: %s", model)
+    logger.warning("=" * 80)
 
     # Activate overlay
     await overlay.inject()
@@ -965,8 +979,9 @@ async def _run_browser_agent_inner(
     from app.agent.browser_skills import SkillRegistry
     registry = SkillRegistry()
     system_prompt, classification = registry.build_augmented_prompt(BROWSER_SYSTEM_PROMPT, user_message)
-    logger.info("[WS Browser] Skill classification: category=%s, confidence=%.2f, params=%s",
-                classification.category, classification.confidence, classification.params)
+    logger.warning("[BROWSER AGENT] Skill: category=%s confidence=%.2f params=%s",
+                   classification.category, classification.confidence, classification.params)
+    logger.warning("[BROWSER AGENT] System prompt length: %d chars", len(system_prompt))
 
     # Tell frontend which skill is active
     try:
@@ -1016,7 +1031,16 @@ async def _run_browser_agent_inner(
         last_action_key = ""
 
         for step in range(max_steps):
-            logger.warning("[WS Browser] Step %d/%d — calling LLM", step + 1, max_steps)
+            logger.warning("-" * 60)
+            logger.warning("[STEP %d/%d] Calling LLM...", step + 1, max_steps)
+
+            # Log current page state
+            try:
+                _cur_url = page.url
+                _cur_title = await page.title()
+                logger.warning("[STEP %d] Page: %s — %s", step + 1, _cur_url, _cur_title)
+            except Exception:
+                pass
 
             # Narration: tell the user what's happening during LLM thinking
             await websocket.send_json({
@@ -1035,18 +1059,27 @@ async def _run_browser_agent_inner(
                     temperature=0.2,
                 )
             except Exception as e:
-                logger.error("[WS Browser] LLM call failed: %s", e)
+                logger.error("[STEP %d] LLM CALL FAILED: %s", step + 1, e)
                 await websocket.send_json({"type": "error", "message": f"LLM error: {e}"})
                 return
 
             msg = response.choices[0].message
 
+            # ── Log the LLM's thinking / reasoning ──
+            if msg.content:
+                logger.warning("[STEP %d] LLM THINKING: %s", step + 1, msg.content[:500])
+
             if not msg.tool_calls:
                 text = msg.content or ""
+                logger.warning("[STEP %d] LLM returned TEXT (no tool call) — ending. Text: %s", step + 1, text[:300])
                 conversation.append({"role": "assistant", "content": text})
                 if text:
                     await websocket.send_json({"type": "agent_message", "content": text})
                 return
+
+            # Log all tool calls the LLM wants to make
+            for _tc in msg.tool_calls:
+                logger.warning("[STEP %d] LLM TOOL CALL: %s(%s)", step + 1, _tc.function.name, _tc.function.arguments[:300])
 
             conversation.append(msg.model_dump())
 
@@ -1057,7 +1090,7 @@ async def _run_browser_agent_inner(
                 except json.JSONDecodeError:
                     fn_args = {}
 
-                logger.info("[WS Browser] Step %d: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:200])
+                logger.warning("[STEP %d] EXECUTING: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:300])
 
                 # ── Stuck detection: if agent repeats the same action 3+ times, inject a hint ──
                 action_key = f"{fn_name}:{json.dumps(fn_args, sort_keys=True)[:100]}"
@@ -1068,7 +1101,7 @@ async def _run_browser_agent_inner(
                     last_action_key = action_key
 
                 if consecutive_same_actions >= 2:
-                    # Inject a hint to try something different
+                    logger.warning("[STEP %d] ⚠️ STUCK DETECTED: same action repeated %d times: %s", step + 1, consecutive_same_actions + 1, action_key[:100])
                     conversation.append({
                         "role": "user",
                         "content": "[SYSTEM] You are repeating the same action. This action is not working. Try a DIFFERENT approach: use a different selector, scroll to find the element, or try an alternative strategy.",
@@ -1104,6 +1137,15 @@ async def _run_browser_agent_inner(
                     })
 
                 result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
+                logger.warning("[STEP %d] RESULT: %s", step + 1, result[:500])
+
+                # Log page URL after action (detect if navigation happened unexpectedly)
+                try:
+                    _post_url = page.url
+                    if fn_name != "navigate" and _post_url != _cur_url:
+                        logger.warning("[STEP %d] ⚠️ URL CHANGED unexpectedly: %s → %s", step + 1, _cur_url, _post_url)
+                except Exception:
+                    pass
 
                 # ── Validator: append verification prompt to tool result ──
                 if fn_name == "type_text":
@@ -1145,12 +1187,14 @@ async def _run_browser_agent_inner(
                 await _send_state(websocket, page, tab_manager)
 
                 if fn_name == "done":
+                    logger.warning("[STEP %d] ✅ TASK COMPLETE: %s", step + 1, fn_args.get("summary", "")[:300])
                     await websocket.send_json({
                         "type": "agent_message",
                         "content": fn_args.get("summary", "Task completed."),
                     })
                     return
 
+        logger.warning("[BROWSER AGENT] ❌ MAX STEPS REACHED (%d) — agent did not finish", max_steps)
         await websocket.send_json({
             "type": "agent_message",
             "content": "I've taken many steps. Let me know if you'd like me to continue.",
