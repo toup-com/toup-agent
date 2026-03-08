@@ -818,7 +818,7 @@ async def _run_browser_agent_inner(
     await overlay.inject()
     await overlay.set_active(True)
 
-    # Initial page analysis + screenshot
+    # Initial page analysis + screenshot (vision: send screenshot to LLM)
     current_analysis = await _analyze_page(page)
     await _send_screenshot(websocket, page, overlay)
 
@@ -826,7 +826,16 @@ async def _run_browser_agent_inner(
     if page.url and page.url != "about:blank":
         context_message = f"{user_message}\n\n[Current browser state]\n{current_analysis}"
 
-    conversation.append({"role": "user", "content": context_message})
+    # Build user message with vision (screenshot as image)
+    try:
+        _init_png = await page.screenshot(type="png")
+        _init_b64 = __import__("base64").b64encode(_init_png).decode()
+        conversation.append({"role": "user", "content": [
+            {"type": "text", "text": context_message},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_init_b64}", "detail": "low"}},
+        ]})
+    except Exception:
+        conversation.append({"role": "user", "content": context_message})
 
     # ── Auto-detect tasks that benefit from parallel search ──
     _msg_lower = user_message.lower()
@@ -940,10 +949,22 @@ async def _run_browser_agent_inner(
             else:
                 result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
 
+            # Vision: attach fresh screenshot to tool result so LLM sees the page after each action
+            _tool_content: Any = result[:12000]
+            if fn_name != "parallel_search":
+                try:
+                    _snap = await page.screenshot(type="png")
+                    _snap_b64 = __import__("base64").b64encode(_snap).decode()
+                    _tool_content = [
+                        {"type": "text", "text": result[:12000]},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_snap_b64}", "detail": "low"}},
+                    ]
+                except Exception:
+                    pass
             conversation.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": result[:12000],  # larger for parallel results
+                "content": _tool_content,
             })
 
             # Screenshot after every action (skip for parallel_search — workers handle their own)
@@ -1159,9 +1180,17 @@ async def _run_worker(
         await _send_worker_screenshot(websocket, page, overlay, worker_id)
 
         analysis = await _analyze_page(page)
-        conversation = [
-            {"role": "user", "content": f"{task}\n\n[Current page]\n{analysis}"}
-        ]
+        # Vision: include screenshot in worker initial message
+        _worker_text = f"{task}\n\n[Current page]\n{analysis}"
+        try:
+            _w_png = await page.screenshot(type="png")
+            _w_b64 = __import__("base64").b64encode(_w_png).decode()
+            conversation = [{"role": "user", "content": [
+                {"type": "text", "text": _worker_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_w_b64}", "detail": "low"}},
+            ]}]
+        except Exception:
+            conversation = [{"role": "user", "content": _worker_text}]
 
         max_steps = 12
 
@@ -1211,10 +1240,21 @@ async def _run_worker(
                     pass
 
                 tool_result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
+                # Vision: attach screenshot to worker tool results
+                _wt_content: Any = tool_result[:6000]
+                try:
+                    _wt_snap = await page.screenshot(type="png")
+                    _wt_b64 = __import__("base64").b64encode(_wt_snap).decode()
+                    _wt_content = [
+                        {"type": "text", "text": tool_result[:6000]},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_wt_b64}", "detail": "low"}},
+                    ]
+                except Exception:
+                    pass
                 conversation.append({
                     "role": "tool",
                     "tool_call_id": tc_item.id,
-                    "content": tool_result[:6000],
+                    "content": _wt_content,
                 })
 
                 # Screenshot after every action

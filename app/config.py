@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     deepseek_api_key: Optional[str] = None
 
     # Agent Runtime
-    agent_model: str = "gpt-5.2"  # Primary agent model
+    agent_model: str = "gpt-5.4"  # Primary agent model
     agent_fallback_model: str = "gpt-4o"  # Fallback if primary model fails
     agent_max_tokens: int = 16000  # Max output tokens for agent
     agent_max_tool_iterations: int = 20  # Max tool call loops before forcing stop
