@@ -869,36 +869,46 @@ async def _exec_browser_tool(
             _is_flights_page = "google.com/travel/flights" in _cur_url
             if _is_airport_field and _is_flights_page and not press_enter:
                 try:
-                    # Google Flights autocomplete: list items in the dropdown panel
-                    # IMPORTANT: filter out trip type dropdown items (Round trip, One way, etc.)
-                    _ac_result = await page.evaluate("""() => {
-                        const EXCLUDE = ['round trip', 'one way', 'multi-city', 'economy',
-                                         'premium economy', 'business', 'first class'];
+                    # Strategy: find the autocomplete suggestion that CONTAINS what we typed
+                    # This avoids clicking trip type/cabin class dropdown items
+                    _typed_upper = text_to_type.upper().strip()
+                    _ac_result = await page.evaluate("""(typedText) => {
+                        const typed = typedText.toLowerCase();
+                        // Find all list items with role=option
                         const allOptions = document.querySelectorAll('li[role="option"], ul[role="listbox"] li');
-                        const airportOptions = [...allOptions].filter(el => {
+                        // Strategy 1: find items containing the typed text (airport code/city name)
+                        const matching = [...allOptions].filter(el => {
                             const txt = el.textContent.trim().toLowerCase();
-                            // Skip empty or very short items
-                            if (txt.length < 3) return false;
-                            // Skip trip type / cabin class dropdown items
-                            if (EXCLUDE.some(ex => txt === ex || txt.startsWith(ex))) return false;
-                            // Airport suggestions are longer and contain airport/city names
-                            return true;
+                            return txt.length > 5 && txt.includes(typed);
                         });
-                        if (airportOptions.length > 0) {
-                            const first = airportOptions[0];
+                        if (matching.length > 0) {
+                            const first = matching[0];
                             const text = first.textContent.trim().substring(0, 100);
                             first.click();
-                            return text;
+                            return 'MATCH:' + text;
                         }
-                        return '';
-                    }""")
-                    if _ac_result:
-                        _autocomplete_clicked = _ac_result
-                        logger.warning("[TYPE_TEXT] Auto-clicked airport autocomplete: %s", _ac_result[:100])
+                        // Strategy 2: find items containing "airport" or "international"
+                        const airportItems = [...allOptions].filter(el => {
+                            const txt = el.textContent.trim().toLowerCase();
+                            return txt.length > 10 && (txt.includes('airport') || txt.includes('international') || txt.includes('intl'));
+                        });
+                        if (airportItems.length > 0) {
+                            const first = airportItems[0];
+                            const text = first.textContent.trim().substring(0, 100);
+                            first.click();
+                            return 'AIRPORT:' + text;
+                        }
+                        // Debug: log what items ARE visible
+                        const items = [...allOptions].map(el => el.textContent.trim().substring(0, 50));
+                        return 'NONE:' + items.join(' | ');
+                    }""", _typed_upper)
+                    if _ac_result.startswith("MATCH:") or _ac_result.startswith("AIRPORT:"):
+                        _autocomplete_clicked = _ac_result.split(":", 1)[1]
+                        logger.warning("[TYPE_TEXT] Auto-clicked airport autocomplete: %s", _autocomplete_clicked[:100])
                         await asyncio.sleep(random.uniform(0.5, 0.8))
                         await _wait_stable(page)
                     else:
-                        logger.warning("[TYPE_TEXT] No airport autocomplete items found after typing '%s'", text_to_type)
+                        logger.warning("[TYPE_TEXT] No airport autocomplete match for '%s'. Visible items: %s", text_to_type, _ac_result[:200])
                 except Exception as _ac_err:
                     logger.warning("[TYPE_TEXT] Autocomplete auto-click failed: %s", _ac_err)
 
