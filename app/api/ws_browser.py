@@ -520,6 +520,93 @@ class AgentOverlay:
 
 
 # ---------------------------------------------------------------------------
+# Auto-dismiss common popups (cookie banners, modals, overlays)
+# ---------------------------------------------------------------------------
+
+async def _auto_dismiss_popups(page):
+    """Click away cookie banners, consent popups, and modal overlays instantly."""
+    try:
+        dismissed = await page.evaluate("""() => {
+            const dismissed = [];
+
+            // Common cookie/consent button selectors
+            const buttonSelectors = [
+                // Cookie consent
+                'button[id*="accept" i]', 'button[id*="cookie" i]',
+                'a[id*="accept" i]',
+                '[class*="cookie"] button', '[class*="consent"] button',
+                '[id*="consent"] button', '[id*="gdpr"] button',
+                '[class*="cookie-banner"] button',
+                '[data-testid*="accept" i]', '[data-testid*="cookie" i]',
+                // OneTrust (very common)
+                '#onetrust-accept-btn-handler',
+                '.onetrust-accept-btn-handler',
+                // Cookiebot
+                '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+                // Generic modal close
+                '[class*="modal"] [class*="close"]',
+                '[class*="dialog"] [class*="close"]',
+                '[class*="popup"] [class*="close"]',
+                '[class*="overlay"] [class*="close"]',
+                '[role="dialog"] button[aria-label*="close" i]',
+                '[role="dialog"] button[aria-label*="dismiss" i]',
+            ];
+
+            // Text-based matching for buttons
+            const textMatches = [
+                'accept', 'accept all', 'accept cookies', 'agree',
+                'got it', 'i agree', 'ok', 'allow', 'allow all',
+                'continue', 'dismiss',
+            ];
+
+            // Try selector-based first
+            for (const sel of buttonSelectors) {
+                const btn = document.querySelector(sel);
+                if (btn && btn.offsetParent !== null) {
+                    btn.click();
+                    dismissed.push('selector: ' + sel);
+                }
+            }
+
+            // Then text-based: find visible buttons/links with matching text
+            if (dismissed.length === 0) {
+                const allButtons = document.querySelectorAll('button, a[role="button"], [class*="btn"]');
+                for (const btn of allButtons) {
+                    const text = (btn.textContent || '').trim().toLowerCase();
+                    if (text.length < 30 && textMatches.some(t => text === t || text.startsWith(t))) {
+                        if (btn.offsetParent !== null) {
+                            btn.click();
+                            dismissed.push('text: ' + text);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Also try to close modal overlays (like Emirates "Limited operations" popup)
+            const closeButtons = document.querySelectorAll(
+                'button.close, .modal .close, [class*="modal"] button:not([class*="accept"]), ' +
+                'button[aria-label="Close"], button[aria-label="close"], ' +
+                '.modal-header button, [class*="dialog-close"]'
+            );
+            for (const btn of closeButtons) {
+                const text = (btn.textContent || '').trim().toLowerCase();
+                if (btn.offsetParent !== null && (text === 'close' || text === '×' || text === 'x' || text === '' || btn.getAttribute('aria-label')?.toLowerCase().includes('close'))) {
+                    btn.click();
+                    dismissed.push('modal-close: ' + (text || 'aria-close'));
+                }
+            }
+
+            return dismissed;
+        }""")
+        if dismissed:
+            logger.info("[BROWSER] Auto-dismissed popups: %s", dismissed)
+            await asyncio.sleep(0.5)  # Wait for animations
+    except Exception as e:
+        logger.debug("[BROWSER] Auto-dismiss failed (ok): %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Browser tool executor
 # ---------------------------------------------------------------------------
 
@@ -552,6 +639,9 @@ async def _exec_browser_tool(
                 if solved:
                     await _wait_stable(page)
                     await asyncio.sleep(0.5)
+
+            # ── Auto-dismiss cookie banners, modals, popups ──
+            await _auto_dismiss_popups(page)
 
             await overlay.inject()
             await overlay.set_active(True)
