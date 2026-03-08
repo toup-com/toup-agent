@@ -261,80 +261,13 @@ GET_TEXT_ELEMENT_RECT_JS = """
 # ---------------------------------------------------------------------------
 
 BROWSER_TOOLS = [
-    {
-        "name": "navigate",
-        "description": "Navigate the browser to a URL.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "URL to navigate to"}
-            },
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "click",
-        "description": "Click an element. The cursor will move to it visually before clicking.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "selector": {"type": "string", "description": "CSS selector of element to click"},
-                "text": {"type": "string", "description": "Visible text of the element to click"},
-                "index": {"type": "integer", "description": "Index from the interactive elements list"},
-            },
-        },
-    },
-    {
-        "name": "type_text",
-        "description": "Type text into an input field. The cursor moves to the field first.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "selector": {"type": "string", "description": "CSS selector of the input"},
-                "text": {"type": "string", "description": "Text to type"},
-                "clear": {"type": "boolean", "description": "Clear field before typing (default: true)"},
-                "press_enter": {"type": "boolean", "description": "Press Enter after typing (default: false)"},
-            },
-            "required": ["text"],
-        },
-    },
-    {
-        "name": "scroll",
-        "description": "Scroll the page to see more content.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "direction": {"type": "string", "enum": ["up", "down"], "description": "Scroll direction"},
-                "amount": {"type": "integer", "description": "Pixels to scroll (default: 500)"},
-            },
-        },
-    },
-    {
-        "name": "go_back",
-        "description": "Go back to the previous page.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "wait",
-        "description": "Wait for the page to load/update.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "milliseconds": {"type": "integer", "description": "Time to wait (default: 2000)"},
-            },
-        },
-    },
-    {
-        "name": "done",
-        "description": "Call when the task is complete. Include a summary.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "summary": {"type": "string", "description": "Summary of what you accomplished"},
-            },
-            "required": ["summary"],
-        },
-    },
+    {"type": "function", "function": {"name": "navigate", "description": "Navigate to a URL. ONLY use to go to a NEW website.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+    {"type": "function", "function": {"name": "click", "description": "Click an element by selector, text, or index.", "parameters": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector"}, "text": {"type": "string", "description": "Visible text"}, "index": {"type": "integer", "description": "Index from elements list"}}}}},
+    {"type": "function", "function": {"name": "type_text", "description": "Type text into an input field.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}, "clear": {"type": "boolean"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}}},
+    {"type": "function", "function": {"name": "scroll", "description": "Scroll the page.", "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["up", "down"]}, "amount": {"type": "integer"}}}}},
+    {"type": "function", "function": {"name": "go_back", "description": "Go back to previous page.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "wait", "description": "Wait for page to load.", "parameters": {"type": "object", "properties": {"milliseconds": {"type": "integer"}}}}},
+    {"type": "function", "function": {"name": "done", "description": "Task complete — include summary.", "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}},
 ]
 
 BROWSER_SYSTEM_PROMPT = """You are an AI browser agent controlling a REAL web browser. You can SEE the page via screenshots attached to each message.
@@ -856,11 +789,11 @@ async def _run_browser_agent_inner(
     conversation: List[Dict[str, Any]],
     overlay: AgentOverlay,
 ):
-    from app.services.anthropic_service import get_anthropic_service
+    from openai import AsyncOpenAI
     import base64 as _b64mod
 
-    anthropic_svc = get_anthropic_service()
-    model = "claude-opus-4-6"
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    model = "gpt-4.1"
 
     logger.warning("[WS Browser] Starting agent loop: model=%s, message='%s'", model, user_message[:100])
 
@@ -876,74 +809,60 @@ async def _run_browser_agent_inner(
     if page.url and page.url != "about:blank":
         context_message = f"{user_message}\n\n[Current browser state]\n{current_analysis}"
 
-    # Start live screenshot stream (~3 FPS) so user sees cursor/page in real-time
+    # Start live screenshot stream so user sees cursor/page in real-time
     _stream_stop = asyncio.Event()
     _stream_task = asyncio.create_task(
-        _screenshot_stream_loop(websocket, page, overlay, _stream_stop, fps=3)
+        _screenshot_stream_loop(websocket, page, overlay, _stream_stop, fps=8)
     )
 
     try:
-        # Build user message with vision (screenshot as image) — Anthropic format
-        user_content: Any = [{"type": "text", "text": context_message}]
+        # Build user message with vision screenshot
         try:
             _init_png = await page.screenshot(type="png")
             _init_b64 = _b64mod.b64encode(_init_png).decode()
-            user_content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/png", "data": _init_b64},
-            })
+            conversation.append({"role": "user", "content": [
+                {"type": "text", "text": context_message},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_init_b64}", "detail": "low"}},
+            ]})
         except Exception:
-            pass
-        conversation.append({"role": "user", "content": user_content})
+            conversation.append({"role": "user", "content": context_message})
 
         max_steps = 30
 
         for step in range(max_steps):
-            logger.warning("[WS Browser] Step %d/%d — calling Anthropic", step + 1, max_steps)
+            logger.warning("[WS Browser] Step %d/%d — calling LLM", step + 1, max_steps)
+            tc_mode = "required" if step == 0 else "auto"
             try:
-                response = await anthropic_svc.create_message(
-                    messages=conversation,
-                    system=BROWSER_SYSTEM_PROMPT,
-                    tools=BROWSER_TOOLS,
+                response = await client.chat.completions.create(
                     model=model,
-                    max_tokens=2048,
+                    messages=[{"role": "system", "content": BROWSER_SYSTEM_PROMPT}] + conversation,
+                    tools=BROWSER_TOOLS,
+                    tool_choice=tc_mode,
+                    max_completion_tokens=2048,
                     temperature=0.2,
                 )
             except Exception as e:
-                logger.error("[WS Browser] Anthropic call failed: %s", e)
+                logger.error("[WS Browser] LLM call failed: %s", e)
                 await websocket.send_json({"type": "error", "message": f"LLM error: {e}"})
                 return
 
-            logger.info("[WS Browser] Anthropic response: tool_calls=%d, content_len=%d, stop=%s",
-                         len(response.tool_calls), len(response.content), response.stop_reason)
+            msg = response.choices[0].message
 
-            # No tool calls — just text response
-            if not response.tool_calls:
-                text = response.content or ""
+            if not msg.tool_calls:
+                text = msg.content or ""
                 conversation.append({"role": "assistant", "content": text})
                 if text:
                     await websocket.send_json({"type": "agent_message", "content": text})
                 return
 
-            # Build assistant message with content blocks (text + tool_use)
-            # Use CC names (cc_name) in conversation for API compatibility with OAuth
-            assistant_content = []
-            if response.content:
-                assistant_content.append({"type": "text", "text": response.content})
-            for tc in response.tool_calls:
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": tc["id"],
-                    "name": tc.get("cc_name", tc["name"]),
-                    "input": tc["input"],
-                })
-            conversation.append({"role": "assistant", "content": assistant_content})
+            conversation.append(msg.model_dump())
 
-            # Execute each tool and collect results
-            tool_results = []
-            for tc in response.tool_calls:
-                fn_name = tc["name"]
-                fn_args = tc["input"]
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                try:
+                    fn_args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    fn_args = {}
 
                 logger.info("[WS Browser] Step %d: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:200])
 
@@ -955,24 +874,25 @@ async def _run_browser_agent_inner(
 
                 result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
 
-                # Vision: attach screenshot for visual actions
+                # Vision: attach screenshot for visual actions so LLM sees the page
                 _visual_actions = {"navigate", "click", "scroll", "go_back"}
-                tool_result_content: Any = result[:12000]
                 if fn_name in _visual_actions:
                     try:
                         _snap = await page.screenshot(type="png")
                         _snap_b64 = _b64mod.b64encode(_snap).decode()
-                        tool_result_content = [
+                        tool_content = [
                             {"type": "text", "text": result[:12000]},
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _snap_b64}},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_snap_b64}", "detail": "low"}},
                         ]
                     except Exception:
-                        pass
+                        tool_content = result[:12000]
+                else:
+                    tool_content = result[:12000]
 
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tc["id"],
-                    "content": tool_result_content,
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_content,
                 })
 
                 await _send_state(websocket, page, tab_manager)
@@ -982,18 +902,13 @@ async def _run_browser_agent_inner(
                         "type": "agent_message",
                         "content": fn_args.get("summary", "Task completed."),
                     })
-                    conversation.append({"role": "user", "content": tool_results})
                     return
-
-            # Append all tool results as a single user message
-            conversation.append({"role": "user", "content": tool_results})
 
         await websocket.send_json({
             "type": "agent_message",
             "content": "I've taken many steps. Let me know if you'd like me to continue.",
         })
     finally:
-        # Stop the live screenshot stream
         _stream_stop.set()
         _stream_task.cancel()
         try:
