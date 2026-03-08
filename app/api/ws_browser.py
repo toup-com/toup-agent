@@ -310,7 +310,13 @@ For EACH field in order:
 
 COMMON MISTAKE: After filling "Where from?", the next field is "Where to?" (destination), NOT "Departure" (date). Read the field labels carefully!
 
-For date pickers: click the date field, then click the correct date directly on the calendar.
+## DATE PICKERS:
+- Click the date field to open the calendar
+- Look at the calendar screenshot CAREFULLY — identify the exact cell for the date you need
+- Click ONLY the day number (e.g. click text "19", NOT "19 $614")
+- After selecting the date, click "Done" to confirm
+- Verify the selected date is correct before moving on
+
 After ALL fields are filled, click Search/Submit.
 
 ## COMPLETING THE TASK:
@@ -674,8 +680,14 @@ async def _exec_browser_tool(
                         return f"ERROR clicking '{selector}': {e}"
                 elif text:
                     try:
-                        loc = page.get_by_text(text, exact=False).first
-                        await loc.dispatch_event("click")
+                        # Try exact text first, then fuzzy — use .click() not
+                        # dispatch_event which fires at container center (wrong pos)
+                        loc = page.get_by_text(text, exact=True).first
+                        try:
+                            await loc.click(timeout=3_000)
+                        except Exception:
+                            loc = page.get_by_text(text, exact=False).first
+                            await loc.click(timeout=3_000)
                     except Exception as e:
                         return f"ERROR clicking text '{text}': {e}"
                 else:
@@ -868,7 +880,7 @@ async def _run_browser_agent_inner(
             _init_b64 = _b64mod.b64encode(_init_png).decode()
             conversation.append({"role": "user", "content": [
                 {"type": "text", "text": context_message},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_init_b64}", "detail": "low"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_init_b64}", "detail": "high"}},
             ]})
         except Exception:
             conversation.append({"role": "user", "content": context_message})
@@ -964,7 +976,7 @@ async def _run_browser_agent_inner(
                         _snap_b64 = _b64mod.b64encode(_snap).decode()
                         tool_content = [
                             {"type": "text", "text": result[:12000]},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_snap_b64}", "detail": "low"}},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_snap_b64}", "detail": "high"}},
                         ]
                     except Exception:
                         tool_content = result[:12000]
