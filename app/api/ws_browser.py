@@ -775,122 +775,132 @@ async def _run_browser_agent_inner(
     if page.url and page.url != "about:blank":
         context_message = f"{user_message}\n\n[Current browser state]\n{current_analysis}"
 
-    # Build user message with vision (screenshot as image) — Anthropic format
-    user_content: Any = [{"type": "text", "text": context_message}]
+    # Start live screenshot stream (~3 FPS) so user sees cursor/page in real-time
+    _stream_stop = asyncio.Event()
+    _stream_task = asyncio.create_task(
+        _screenshot_stream_loop(websocket, page, overlay, _stream_stop, fps=3)
+    )
+
     try:
-        _init_png = await page.screenshot(type="png")
-        _init_b64 = _b64mod.b64encode(_init_png).decode()
-        user_content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/png", "data": _init_b64},
-        })
-    except Exception:
-        pass
-    conversation.append({"role": "user", "content": user_content})
-
-    max_steps = 20
-
-    for step in range(max_steps):
-        logger.warning("[WS Browser] Step %d/%d — calling Anthropic", step + 1, max_steps)
+        # Build user message with vision (screenshot as image) — Anthropic format
+        user_content: Any = [{"type": "text", "text": context_message}]
         try:
-            response = await anthropic_svc.create_message(
-                messages=conversation,
-                system=BROWSER_SYSTEM_PROMPT,
-                tools=BROWSER_TOOLS,
-                model=model,
-                max_tokens=2048,
-                temperature=0.2,
-            )
-        except Exception as e:
-            logger.error("[WS Browser] Anthropic call failed: %s", e)
-            await websocket.send_json({"type": "error", "message": f"LLM error: {e}"})
-            return
-
-        logger.info("[WS Browser] Anthropic response: tool_calls=%d, content_len=%d, stop=%s",
-                     len(response.tool_calls), len(response.content), response.stop_reason)
-
-        # No tool calls — just text response
-        if not response.tool_calls:
-            text = response.content or ""
-            conversation.append({"role": "assistant", "content": text})
-            if text:
-                await websocket.send_json({"type": "agent_message", "content": text})
-            await overlay.hide_cursor()
-            await overlay.set_active(False)
-            return
-
-        # Build assistant message with content blocks (text + tool_use)
-        # Use CC names (cc_name) in conversation for API compatibility with OAuth
-        assistant_content = []
-        if response.content:
-            assistant_content.append({"type": "text", "text": response.content})
-        for tc in response.tool_calls:
-            assistant_content.append({
-                "type": "tool_use",
-                "id": tc["id"],
-                "name": tc.get("cc_name", tc["name"]),
-                "input": tc["input"],
+            _init_png = await page.screenshot(type="png")
+            _init_b64 = _b64mod.b64encode(_init_png).decode()
+            user_content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": _init_b64},
             })
-        conversation.append({"role": "assistant", "content": assistant_content})
+        except Exception:
+            pass
+        conversation.append({"role": "user", "content": user_content})
 
-        # Execute each tool and collect results
-        tool_results = []
-        for tc in response.tool_calls:
-            fn_name = tc["name"]
-            fn_args = tc["input"]
+        max_steps = 20
 
-            logger.info("[WS Browser] Step %d: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:200])
-
-            await websocket.send_json({
-                "type": "tool_use",
-                "tool": fn_name,
-                "args": fn_args,
-            })
-
-            result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
-
-            # Vision: attach screenshot for visual actions
-            _visual_actions = {"navigate", "click", "scroll", "go_back"}
-            tool_result_content: Any = result[:12000]
-            if fn_name in _visual_actions:
-                try:
-                    _snap = await page.screenshot(type="png")
-                    _snap_b64 = _b64mod.b64encode(_snap).decode()
-                    tool_result_content = [
-                        {"type": "text", "text": result[:12000]},
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _snap_b64}},
-                    ]
-                except Exception:
-                    pass
-
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tc["id"],
-                "content": tool_result_content,
-            })
-
-            await _send_screenshot(websocket, page, overlay)
-            await _send_state(websocket, page, tab_manager)
-
-            if fn_name == "done":
-                await websocket.send_json({
-                    "type": "agent_message",
-                    "content": fn_args.get("summary", "Task completed."),
-                })
-                # Still append tool results so conversation is valid
-                conversation.append({"role": "user", "content": tool_results})
+        for step in range(max_steps):
+            logger.warning("[WS Browser] Step %d/%d — calling Anthropic", step + 1, max_steps)
+            try:
+                response = await anthropic_svc.create_message(
+                    messages=conversation,
+                    system=BROWSER_SYSTEM_PROMPT,
+                    tools=BROWSER_TOOLS,
+                    model=model,
+                    max_tokens=2048,
+                    temperature=0.2,
+                )
+            except Exception as e:
+                logger.error("[WS Browser] Anthropic call failed: %s", e)
+                await websocket.send_json({"type": "error", "message": f"LLM error: {e}"})
                 return
 
-        # Append all tool results as a single user message
-        conversation.append({"role": "user", "content": tool_results})
+            logger.info("[WS Browser] Anthropic response: tool_calls=%d, content_len=%d, stop=%s",
+                         len(response.tool_calls), len(response.content), response.stop_reason)
 
-    await websocket.send_json({
-        "type": "agent_message",
-        "content": "I've taken many steps. Let me know if you'd like me to continue.",
-    })
-    await _send_screenshot(websocket, page, overlay)
-    await overlay.hide_cursor()
-    await overlay.set_active(False)
+            # No tool calls — just text response
+            if not response.tool_calls:
+                text = response.content or ""
+                conversation.append({"role": "assistant", "content": text})
+                if text:
+                    await websocket.send_json({"type": "agent_message", "content": text})
+                return
+
+            # Build assistant message with content blocks (text + tool_use)
+            # Use CC names (cc_name) in conversation for API compatibility with OAuth
+            assistant_content = []
+            if response.content:
+                assistant_content.append({"type": "text", "text": response.content})
+            for tc in response.tool_calls:
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": tc["id"],
+                    "name": tc.get("cc_name", tc["name"]),
+                    "input": tc["input"],
+                })
+            conversation.append({"role": "assistant", "content": assistant_content})
+
+            # Execute each tool and collect results
+            tool_results = []
+            for tc in response.tool_calls:
+                fn_name = tc["name"]
+                fn_args = tc["input"]
+
+                logger.info("[WS Browser] Step %d: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:200])
+
+                await websocket.send_json({
+                    "type": "tool_use",
+                    "tool": fn_name,
+                    "args": fn_args,
+                })
+
+                result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
+
+                # Vision: attach screenshot for visual actions
+                _visual_actions = {"navigate", "click", "scroll", "go_back"}
+                tool_result_content: Any = result[:12000]
+                if fn_name in _visual_actions:
+                    try:
+                        _snap = await page.screenshot(type="png")
+                        _snap_b64 = _b64mod.b64encode(_snap).decode()
+                        tool_result_content = [
+                            {"type": "text", "text": result[:12000]},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _snap_b64}},
+                        ]
+                    except Exception:
+                        pass
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc["id"],
+                    "content": tool_result_content,
+                })
+
+                await _send_state(websocket, page, tab_manager)
+
+                if fn_name == "done":
+                    await websocket.send_json({
+                        "type": "agent_message",
+                        "content": fn_args.get("summary", "Task completed."),
+                    })
+                    conversation.append({"role": "user", "content": tool_results})
+                    return
+
+            # Append all tool results as a single user message
+            conversation.append({"role": "user", "content": tool_results})
+
+        await websocket.send_json({
+            "type": "agent_message",
+            "content": "I've taken many steps. Let me know if you'd like me to continue.",
+        })
+    finally:
+        # Stop the live screenshot stream
+        _stream_stop.set()
+        _stream_task.cancel()
+        try:
+            await _stream_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        await overlay.hide_cursor()
+        await overlay.set_active(False)
 
 
 
@@ -909,6 +919,29 @@ async def _send_screenshot(websocket: WebSocket, page, overlay: AgentOverlay):
         })
     except Exception as e:
         logger.warning("[WS Browser] Screenshot failed: %s", e)
+
+
+async def _screenshot_stream_loop(
+    websocket: WebSocket,
+    page,
+    overlay: AgentOverlay,
+    stop_event: asyncio.Event,
+    fps: float = 3,
+):
+    """Stream screenshots at ~fps while the agent is working, giving live view."""
+    interval = 1.0 / fps
+    while not stop_event.is_set():
+        try:
+            png_bytes = await page.screenshot(type="png")
+            b64 = base64.b64encode(png_bytes).decode("ascii")
+            await websocket.send_json({
+                "type": "screenshot",
+                "image": b64,
+                "cursor": {"x": overlay.x, "y": overlay.y},
+            })
+        except Exception:
+            pass  # page may be navigating — skip frame
+        await asyncio.sleep(interval)
 
 
 async def _send_state(websocket: WebSocket, page, tab_manager):
