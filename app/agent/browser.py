@@ -1062,7 +1062,11 @@ class TabManager:
         if viewport:
             await page.set_viewport_size(viewport)
         if url and url != "about:blank":
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                # Timeout is OK — page may have partially loaded, continue anyway
+                logger.warning("[BROWSER] open_tab goto timeout for %s: %s (continuing)", url, e)
         self._counter += 1
         tab_id = f"tab_{self._counter}"
         self._tabs[tab_id] = page

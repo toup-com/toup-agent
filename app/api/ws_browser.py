@@ -591,7 +591,10 @@ async def _exec_browser_tool(
                 return "ERROR: url is required"
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
-            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            except Exception:
+                pass  # Timeout OK — page may have partially loaded
             await _wait_stable(page)
             # Human-like pause after page load (Atlas behavior)
             await asyncio.sleep(random.uniform(0.3, 0.8))
@@ -949,9 +952,10 @@ async def _run_browser_agent_inner(
             else:
                 result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
 
-            # Vision: attach fresh screenshot to tool result so LLM sees the page after each action
+            # Vision: attach screenshot to tool result for visual actions only
             _tool_content: Any = result[:12000]
-            if fn_name != "parallel_search":
+            _visual_actions = {"navigate", "click_element", "scroll", "go_back", "switch_tab"}
+            if fn_name in _visual_actions:
                 try:
                     _snap = await page.screenshot(type="png")
                     _snap_b64 = __import__("base64").b64encode(_snap).decode()
@@ -1240,17 +1244,18 @@ async def _run_worker(
                     pass
 
                 tool_result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
-                # Vision: attach screenshot to worker tool results
+                # Vision: screenshot every 3rd step to balance speed vs awareness
                 _wt_content: Any = tool_result[:6000]
-                try:
-                    _wt_snap = await page.screenshot(type="png")
-                    _wt_b64 = __import__("base64").b64encode(_wt_snap).decode()
-                    _wt_content = [
-                        {"type": "text", "text": tool_result[:6000]},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_wt_b64}", "detail": "low"}},
-                    ]
-                except Exception:
-                    pass
+                if step % 3 == 0 or fn_name in ("navigate", "click_element"):
+                    try:
+                        _wt_snap = await page.screenshot(type="png")
+                        _wt_b64 = __import__("base64").b64encode(_wt_snap).decode()
+                        _wt_content = [
+                            {"type": "text", "text": tool_result[:6000]},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_wt_b64}", "detail": "low"}},
+                        ]
+                    except Exception:
+                        pass
                 conversation.append({
                     "role": "tool",
                     "tool_call_id": tc_item.id,
