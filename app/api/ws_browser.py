@@ -988,7 +988,7 @@ async def _exec_browser_tool(
                     except Exception:
                         pass
 
-                # Fallback 2: aria-label selector (for Google Flights trip type button)
+                # Fallback 2: aria-label selector with mouse.click at bounding box center
                 if not _trigger_clicked:
                     _aria_selectors = [
                         f'button[aria-label*="{trigger}" i]',
@@ -997,10 +997,16 @@ async def _exec_browser_tool(
                     ]
                     for _sel in _aria_selectors:
                         try:
-                            await page.click(_sel, timeout=2_000)
-                            _trigger_clicked = True
-                            logger.warning("[SELECT_DROPDOWN] Trigger clicked via selector: %s", _sel)
-                            break
+                            _loc = page.locator(_sel).first
+                            _box = await _loc.bounding_box(timeout=2_000)
+                            if _box:
+                                _cx = _box["x"] + _box["width"] / 2
+                                _cy = _box["y"] + _box["height"] / 2
+                                # Use page.mouse.click instead of locator.click for raw mouse event
+                                await page.mouse.click(_cx, _cy)
+                                _trigger_clicked = True
+                                logger.warning("[SELECT_DROPDOWN] Trigger clicked via mouse.click at (%.0f, %.0f) for selector: %s", _cx, _cy, _sel)
+                                break
                         except Exception:
                             continue
 
@@ -1264,6 +1270,8 @@ async def _exec_browser_tool(
                 "did not work", "not working", "please retry", "try again",
                 "no flight", "no listing", "never loaded", "results did not",
                 "misfiring", "not stay stable", "not trustworthy",
+                "not yet displayed", "not displayed", "still in the date",
+                "remained set as round", "remained stuck",
             ]
             if any(fw in _done_lower for fw in _fail_indicators):
                 logger.warning("[DONE] ❌ Failure detected in done() summary: %s", _done_summary[:200])
