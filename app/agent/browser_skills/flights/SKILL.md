@@ -42,18 +42,18 @@ Map the user's cities to IATA airport codes:
 ### Step 3: Dismiss Overlays
 If you see "Try AI powered Flight Deals" or any promotional overlay, click "Got it", "No thanks", or the X button.
 
-### Step 4: Verify Search Parameters
-- Look at the search form at the top of the results page
-- Verify the origin, destination, date, and trip type are correct
-- If anything is wrong, navigate to the corrected URL
+### Step 4: Scroll Down to See Results
+- ⚠️ CRITICAL: Flight results are BELOW the search form. You MUST scroll down to see them.
+- Use `scroll` with direction "down" and amount 800-1200 to see the flight listings
+- Do NOT assume the page has no results — the results are always below the form
 
 ### Step 5: Read Results
-- The results should load automatically on the search page
-- If you see "Explore destinations" instead of flight results, the URL was wrong — re-navigate
-- Scroll down to see flight results
+- Look for flight cards showing airline, price, times, duration, stops
 - Look for "Best flights" and "Cheapest" sections
 - Extract: airline, price, departure/arrival times, duration, number of stops
 - Present the top 3-5 options to the user
+- If you see "Explore destinations" instead of flight results, the URL was wrong — re-navigate
+- ⚠️ Do NOT call done() with a failure message. If you don't see results, SCROLL DOWN first.
 
 ## FALLBACK: Manual Form Entry (only if URL method fails)
 
