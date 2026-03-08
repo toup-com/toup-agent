@@ -47,6 +47,10 @@ KEYWORD_RULES: Dict[str, List[str]] = {
         "newegg", "wayfair", "costco",
         "cheapest", "best price", "deal on", "discount",
         "product", "gadget", "electronics",
+        "headphones", "laptop", "monitor", "keyboard", "mouse",
+        "phone case", "charger", "speaker", "camera",
+        "under $", "under 100", "under 200", "under 300", "under 500",
+        "best for", "review",
     ],
     "food_delivery": [
         "uber eats", "ubereats", "doordash", "grubhub", "postmates",
@@ -97,6 +101,8 @@ KEYWORD_RULES: Dict[str, List[str]] = {
         "online course", "learn to", "tutorial for", "class on",
         "university", "college", "scholarship", "financial aid",
         "study for", "test prep", "duolingo",
+        "course for", "course on", "training for", "certification",
+        "bootcamp", "for beginners", "for advanced",
     ],
     "entertainment": [
         "imdb", "rotten tomatoes", "justwatch", "netflix",
@@ -142,7 +148,8 @@ KEYWORD_RULES: Dict[str, List[str]] = {
     "technology": [
         "g2.com", "capterra", "producthunt", "techcrunch",
         "software comparison", "saas", "app review",
-        "best software for", "tool for",
+        "best software for", "tool for", "best app for",
+        "project management", "crm software", "software for",
     ],
     "travel_general": [
         "trip to", "travel to", "visit", "vacation to",
