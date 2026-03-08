@@ -1426,7 +1426,12 @@ async def _run_browser_agent_inner(
     from anthropic import AsyncAnthropic
     import base64 as _b64mod
 
-    client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    _ant_key = settings.anthropic_api_key or ""
+    if _ant_key.startswith("sk-ant-oat"):
+        # OAuth token — use auth_token parameter
+        client = AsyncAnthropic(auth_token=_ant_key)
+    else:
+        client = AsyncAnthropic(api_key=_ant_key)
     model = "claude-opus-4-6"
 
     logger.warning("=" * 80)
