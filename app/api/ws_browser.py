@@ -288,14 +288,23 @@ Before interacting with a page, dismiss ANY visible popups or promotional overla
 - If a promotional overlay is covering the page, you MUST close it FIRST before filling any forms
 - LOOK at the screenshot — if there is ANY overlay/modal/banner on top of the form, dismiss it before typing
 
+## TASK ANALYSIS — DO THIS FIRST (before any actions):
+Analyze the user's request COMPLETELY before starting:
+- For flights: determine origin, destination, date(s), and whether it's ONE-WAY or ROUND TRIP
+  - If only ONE date is mentioned → it's ONE-WAY. Change trip type to "One way" FIRST.
+  - If two dates are mentioned → it's ROUND TRIP (the default).
+- For shopping: determine what product, any filters (price range, brand, etc.)
+- Plan your steps mentally before clicking anything.
+
 ## RULES:
-1. LOOK at the screenshot CAREFULLY before EVERY action. Analyze what is ACTUALLY visible — are there any overlays, popups, promotional banners covering the form? If yes, dismiss them FIRST.
-2. UNDERSTAND THE FULL TASK before starting. Break it down: e.g. "find YYZ to DXB flight on March 19" means: (a) navigate to flights site, (b) fill "From" field, (c) fill "To" field, (d) set date, (e) search, (f) read results.
+1. LOOK at the screenshot CAREFULLY before EVERY action. Are there overlays/popups covering the form? Dismiss them FIRST.
+2. NEVER click hamburger menus, navigation menus, or "Main menu" — these waste steps. Only interact with the FORM elements.
 3. NEVER navigate away from a page you're working on. Stay on the current site.
 4. ONE action at a time. Screenshot → analyze what you see → one action → next screenshot → repeat.
 5. Use the interactive elements list AND screenshot together.
 6. ALWAYS use a tool — never just talk.
 7. READ FIELD LABELS CAREFULLY. "Where from?" is origin. "Where to?" is destination. "Departure" is date. "Return" is return date. Do NOT confuse them.
+8. If you can't see the full form, SCROLL UP first to see all form fields before starting to fill them.
 
 ## Tools:
 - `click` — use `selector` (CSS preferred), `text` (visible text), or `index` (from elements list)
@@ -305,16 +314,24 @@ Before interacting with a page, dismiss ANY visible popups or promotional overla
 - `wait` — wait for page to load/update
 - `done` — call with summary when task is complete
 
-## FILLING FORMS (flights, bookings, etc.) — FOLLOW THIS EXACTLY:
-For EACH field in order:
-1. LOOK at the screenshot carefully. Identify the field by its label/placeholder (e.g. "Where from?", "Where to?", "Departure", "Return")
-2. CLICK the correct field — match the label, not just the position
-3. TYPE the value
-4. WAIT — look at the next screenshot for autocomplete dropdown
-5. CLICK the correct suggestion from the dropdown
-6. Only THEN move to the NEXT field
+## FILLING FLIGHT SEARCH FORMS — FOLLOW THIS ORDER EXACTLY:
+1. SET TRIP TYPE FIRST: If user mentions only ONE date → click the trip type dropdown (usually says "Round trip") → select "One way". If two dates → leave as "Round trip".
+2. FILL ORIGIN ("Where from?"): Click the field → type airport code → select from dropdown
+3. FILL DESTINATION ("Where to?"): Click the field → type airport code → select from dropdown
+4. SET DATE: Click "Departure" → use `select_date` tool → click "Done"
+5. CLICK SEARCH
 
-COMMON MISTAKE: After filling "Where from?", the next field is "Where to?" (destination), NOT "Departure" (date). Read the field labels carefully!
+For EACH text field:
+- CLICK the correct field (match the label, not position)
+- TYPE the value
+- WAIT for autocomplete dropdown in next screenshot
+- CLICK the correct suggestion from the dropdown
+- Only THEN move to the NEXT field
+
+COMMON MISTAKES TO AVOID:
+- After filling origin, the NEXT field is destination ("Where to?"), NOT date ("Departure")
+- Do NOT click the trip type dropdown from a hamburger/main menu — it's a small dropdown near the form fields
+- When selecting "One way" from the dropdown, click the EXACT text "One way", not "Round trip"
 
 ## DATE PICKERS:
 - Click the date field to open the calendar
@@ -975,7 +992,11 @@ async def _run_browser_agent_inner(
     # Hint: if user wants flights, go directly to Google Flights (not Google Search)
     lower_msg = user_message.lower()
     if any(w in lower_msg for w in ["flight", "fly", "airline", "yyz", "dxb", "jfk", "lax", "lhr", "cdg"]):
-        context_message += "\n\nHINT: Navigate directly to https://www.google.com/travel/flights to search for flights. Do NOT use Google Search."
+        # Detect one-way vs round trip from the message
+        import re
+        date_matches = re.findall(r'\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}', lower_msg)
+        trip_type_hint = "ONE-WAY (only one date mentioned — change trip type to 'One way' FIRST)" if len(date_matches) <= 1 else "ROUND TRIP (two dates mentioned)"
+        context_message += f"\n\nHINT: Navigate directly to https://www.google.com/travel/flights to search for flights. Do NOT use Google Search.\nTRIP TYPE: {trip_type_hint}"
     elif any(w in lower_msg for w in ["buy", "shop", "price", "cheap", "product", "amazon"]):
         context_message += "\n\nHINT: Navigate directly to the relevant website to find actual products and prices. Do NOT just read Google search results."
     if page.url and page.url != "about:blank":
