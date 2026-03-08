@@ -988,7 +988,7 @@ async def _exec_browser_tool(
                     except Exception:
                         pass
 
-                # Fallback 2: aria-label selector with mouse.click at bounding box center
+                # Fallback 2: aria-label selector — scroll into view then click
                 if not _trigger_clicked:
                     _aria_selectors = [
                         f'button[aria-label*="{trigger}" i]',
@@ -998,16 +998,22 @@ async def _exec_browser_tool(
                     for _sel in _aria_selectors:
                         try:
                             _loc = page.locator(_sel).first
+                            # CRITICAL: scroll into view first — element may be off-screen
+                            await _loc.scroll_into_view_if_needed(timeout=2_000)
+                            await asyncio.sleep(0.3)
                             _box = await _loc.bounding_box(timeout=2_000)
                             if _box:
                                 _cx = _box["x"] + _box["width"] / 2
                                 _cy = _box["y"] + _box["height"] / 2
-                                # Use page.mouse.click instead of locator.click for raw mouse event
-                                await page.mouse.click(_cx, _cy)
+                                logger.warning("[SELECT_DROPDOWN] Trigger at (%.0f, %.0f) — scrolled into view", _cx, _cy)
+                                # Use human_click for natural mouse movement
+                                await human_click(page, _cx, _cy, from_pos=cursor_pos)
+                                overlay.x, overlay.y = int(_cx), int(_cy)
                                 _trigger_clicked = True
-                                logger.warning("[SELECT_DROPDOWN] Trigger clicked via mouse.click at (%.0f, %.0f) for selector: %s", _cx, _cy, _sel)
+                                logger.warning("[SELECT_DROPDOWN] Trigger clicked via human_click at (%.0f, %.0f) for selector: %s", _cx, _cy, _sel)
                                 break
-                        except Exception:
+                        except Exception as e:
+                            logger.warning("[SELECT_DROPDOWN] Selector %s failed: %s", _sel, e)
                             continue
 
                 if not _trigger_clicked:
@@ -1027,23 +1033,18 @@ async def _exec_browser_tool(
                     return false;
                 }""")
                 if not _has_dropdown:
-                    logger.warning("[SELECT_DROPDOWN] No dropdown found after click, trying dispatchEvent approach")
-                    # Google Flights uses Material Design 3 buttons — they need mousedown+mouseup events
-                    await page.evaluate("""(triggerText) => {
-                        const btns = document.querySelectorAll('button, [role="button"]');
-                        for (const btn of btns) {
-                            const text = (btn.textContent || '').trim().toLowerCase();
-                            if (text.includes(triggerText.toLowerCase())) {
-                                // Dispatch full mouse event sequence
-                                btn.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
-                                btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
-                                btn.dispatchEvent(new PointerEvent('pointerup', {bubbles: true}));
-                                btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
-                                btn.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-                                return;
-                            }
-                        }
-                    }""", trigger)
+                    logger.warning("[SELECT_DROPDOWN] No dropdown found after click, trying keyboard approach")
+                    # Keyboard approach: focus the button then press Space/Enter to open dropdown
+                    try:
+                        _sel_try = f'button[aria-label*="trip" i]'
+                        _loc2 = page.locator(_sel_try).first
+                        await _loc2.scroll_into_view_if_needed(timeout=2_000)
+                        await _loc2.focus(timeout=2_000)
+                        await asyncio.sleep(0.2)
+                        await page.keyboard.press("Space")
+                        logger.warning("[SELECT_DROPDOWN] Opened dropdown via keyboard Space")
+                    except Exception as e2:
+                        logger.warning("[SELECT_DROPDOWN] Keyboard approach failed: %s", e2)
                     await asyncio.sleep(0.8)
             except Exception as e:
                 logger.warning("[SELECT_DROPDOWN] Retry trigger click failed: %s", e)
@@ -1217,6 +1218,27 @@ async def _exec_browser_tool(
                             logger.warning("[SELECT_DROPDOWN] JS DOM search found no match for '%s'", option)
                     except Exception as e:
                         logger.warning("[SELECT_DROPDOWN] JS DOM search failed: %s", e)
+
+                # Fallback 3: Keyboard navigation (Arrow keys + Enter)
+                if not _option_clicked:
+                    logger.warning("[SELECT_DROPDOWN] All click methods failed, trying keyboard navigation")
+                    # Map common option positions for known dropdowns
+                    _option_lower = option.lower()
+                    _option_positions = {
+                        "one way": 1,      # Second item (after "Round trip")
+                        "multi-city": 2,   # Third item
+                    }
+                    _arrow_count = _option_positions.get(_option_lower)
+                    if _arrow_count is not None:
+                        try:
+                            for _ in range(_arrow_count):
+                                await page.keyboard.press("ArrowDown")
+                                await asyncio.sleep(0.1)
+                            await page.keyboard.press("Enter")
+                            _option_clicked = True
+                            logger.warning("[SELECT_DROPDOWN] Option selected via keyboard (ArrowDown x%d + Enter)", _arrow_count)
+                        except Exception as e:
+                            logger.warning("[SELECT_DROPDOWN] Keyboard navigation failed: %s", e)
 
                 if not _option_clicked:
                     return f"ERROR: Dropdown opened but could not find option '{option}'"
