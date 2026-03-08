@@ -595,14 +595,21 @@ async def _vision_solve_image_captcha(screenshot_bytes: bytes, instruction: str)
             "If you cannot determine the answer, return []."
         )
 
+        # OAuth tokens (sk-ant-oat*) use Bearer auth, regular keys use x-api-key
+        _is_oauth = "sk-ant-oat" in api_key
+        _headers = {
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        if _is_oauth:
+            _headers["authorization"] = f"Bearer {api_key}"
+        else:
+            _headers["x-api-key"] = api_key
+
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
+                headers=_headers,
                 json={
                     "model": "claude-sonnet-4-20250514",
                     "max_tokens": 100,
