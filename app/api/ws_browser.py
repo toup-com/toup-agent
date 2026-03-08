@@ -857,12 +857,68 @@ async def _exec_browser_tool(
             await asyncio.sleep(_wait_time)
             if press_enter:
                 await _wait_stable(page)
+
+            # ── Auto-click autocomplete for airport fields on Google Flights ──
+            _autocomplete_clicked = ""
+            _cur_url = page.url or ""
+            _is_airport_field = selector and ("where from" in (selector or "").lower() or "where to" in (selector or "").lower())
+            _is_flights_page = "google.com/travel/flights" in _cur_url
+            if _is_airport_field and _is_flights_page and not press_enter:
+                try:
+                    # Google Flights autocomplete: list items in the dropdown panel
+                    # They appear as <li> with role="option" or as clickable items in the suggestion list
+                    _ac_result = await page.evaluate("""() => {
+                        // Strategy 1: role="option" list items (most common)
+                        const options = document.querySelectorAll('li[role="option"], ul[role="listbox"] li');
+                        if (options.length > 0) {
+                            const first = options[0];
+                            const text = first.textContent.trim().substring(0, 80);
+                            first.click();
+                            return text;
+                        }
+                        // Strategy 2: Material autocomplete items
+                        const matItems = document.querySelectorAll('.mat-option, [data-value]');
+                        if (matItems.length > 0) {
+                            const first = matItems[0];
+                            const text = first.textContent.trim().substring(0, 80);
+                            first.click();
+                            return text;
+                        }
+                        return '';
+                    }""")
+                    if _ac_result:
+                        _autocomplete_clicked = _ac_result
+                        logger.warning("[TYPE_TEXT] Auto-clicked autocomplete: %s", _ac_result[:80])
+                        await asyncio.sleep(random.uniform(0.5, 0.8))
+                        await _wait_stable(page)
+                    else:
+                        # Fallback: try clicking using Playwright's text matching on visible dropdown items
+                        logger.warning("[TYPE_TEXT] No autocomplete items found via JS, trying Playwright locator...")
+                        try:
+                            # Look for any visible list item that contains the typed text or related airport name
+                            _suggestions = page.locator('li[role="option"]')
+                            _count = await _suggestions.count()
+                            if _count > 0:
+                                await _suggestions.first.click(timeout=3000)
+                                _autocomplete_clicked = f"(clicked first of {_count} suggestions)"
+                                logger.warning("[TYPE_TEXT] Clicked autocomplete via Playwright (%d options)", _count)
+                                await asyncio.sleep(random.uniform(0.5, 0.8))
+                                await _wait_stable(page)
+                        except Exception as _pw_err:
+                            logger.warning("[TYPE_TEXT] Playwright autocomplete click failed: %s", _pw_err)
+                except Exception as _ac_err:
+                    logger.warning("[TYPE_TEXT] Autocomplete auto-click failed: %s", _ac_err)
+
             await overlay.inject()
 
             result = f"Typed '{text_to_type[:60]}'" + (" + Enter" if press_enter else "")
-            # ALWAYS analyze page after typing — LLM needs to see dropdown suggestions
+            if _autocomplete_clicked:
+                result += f"\n✅ Auto-selected from autocomplete: {_autocomplete_clicked}"
+                result += "\nThe airport has been set. Move on to the NEXT field."
+            else:
+                result += "\n\nLOOK at the screenshot — if you see a dropdown/autocomplete list, click the correct suggestion BEFORE moving to the next field."
             analysis = await _analyze_page(page)
-            result += f"\n\nLOOK at the screenshot — if you see a dropdown/autocomplete list, click the correct suggestion BEFORE moving to the next field.\n\n{analysis}"
+            result += f"\n\n{analysis}"
             return result
 
         elif name == "select_date":
