@@ -272,12 +272,17 @@ BROWSER_TOOLS = [
 
 BROWSER_SYSTEM_PROMPT = """You are an AI browser agent controlling a REAL web browser. You can SEE the page via screenshots attached to each message.
 
-## CRITICAL — HANDLE POPUPS FIRST:
-Before doing ANYTHING else, look at the screenshot. If you see ANY of these, dismiss them IMMEDIATELY:
+## CRITICAL — YOU MUST USE THE ACTUAL WEBSITE:
+- NEVER just read Google search results or AI Overviews and call it done.
+- You have a REAL browser — navigate to the actual website (Google Flights, Amazon, etc.) and USE it.
+- For flights: go to Google Flights, fill in the search form, and get REAL prices from actual results.
+- For shopping: go to the store website, search, and find actual product listings with prices.
+- Google search snippets and AI Overviews are NOT a substitute for using the website.
+
+## HANDLE POPUPS FIRST:
+Before interacting with a page, dismiss any visible popups:
 - Cookie/privacy banners → click "Accept" or "Accept All" (NEVER "Cookie preferences" or "Manage")
 - Modal dialogs/overlays → click "Close" or the X button
-- Advisory/warning popups → click "Close"
-You MUST dismiss ALL visible popups before interacting with the page behind them.
 
 ## RULES:
 1. LOOK at the screenshot FIRST. It shows EXACTLY what's on screen.
@@ -308,11 +313,16 @@ COMMON MISTAKE: After filling "Where from?", the next field is "Where to?" (dest
 For date pickers: click the date field, then click the correct date directly on the calendar.
 After ALL fields are filled, click Search/Submit.
 
+## COMPLETING THE TASK:
+- Only call `done` when you have ACTUAL results from the website (prices, listings, etc.)
+- Scroll through results to find the best options before summarizing
+- Include specific details: prices, airlines, times, product names, etc.
+- If a form submission fails, try again — don't give up immediately
+
 ## Other rules:
 - STAY on the current website until done
 - Scroll to find content below the fold
-- NEVER ask clarifying questions — just do it
-- Call `done` with a detailed summary"""
+- NEVER ask clarifying questions — just do it"""
 
 
 # ---------------------------------------------------------------------------
@@ -838,8 +848,14 @@ async def _run_browser_agent_inner(
     await _send_screenshot(websocket, page, overlay)
 
     context_message = user_message
+    # Hint: if user wants flights, go directly to Google Flights (not Google Search)
+    lower_msg = user_message.lower()
+    if any(w in lower_msg for w in ["flight", "fly", "airline", "yyz", "dxb", "jfk", "lax", "lhr", "cdg"]):
+        context_message += "\n\nHINT: Navigate directly to https://www.google.com/travel/flights to search for flights. Do NOT use Google Search."
+    elif any(w in lower_msg for w in ["buy", "shop", "price", "cheap", "product", "amazon"]):
+        context_message += "\n\nHINT: Navigate directly to the relevant website to find actual products and prices. Do NOT just read Google search results."
     if page.url and page.url != "about:blank":
-        context_message = f"{user_message}\n\n[Current browser state]\n{current_analysis}"
+        context_message += f"\n\n[Current browser state]\n{current_analysis}"
 
     # Start CDP screencast — event-driven live streaming (replaces polling)
     screencast = CDPScreencast(websocket, page, overlay)
