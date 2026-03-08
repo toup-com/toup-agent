@@ -980,6 +980,18 @@ async def _run_browser_agent_inner(
         pass
 
     context_message = user_message
+
+    # ── Send plan preview to user ──
+    if classification.confidence >= 0.5 and classification.params:
+        plan_parts = [f"Category: {classification.category.replace('_', ' ').title()}"]
+        for k, v in classification.params.items():
+            plan_parts.append(f"{k.replace('_', ' ').title()}: {v}")
+        plan_text = " | ".join(plan_parts)
+        try:
+            await websocket.send_json({"type": "narration", "text": f"Plan: {plan_text}"})
+        except Exception:
+            pass
+
     if page.url and page.url != "about:blank":
         context_message += f"\n\n[Current browser state]\n{current_analysis}"
 
@@ -1000,6 +1012,8 @@ async def _run_browser_agent_inner(
             conversation.append({"role": "user", "content": context_message})
 
         max_steps = 30
+        consecutive_same_actions = 0
+        last_action_key = ""
 
         for step in range(max_steps):
             logger.warning("[WS Browser] Step %d/%d — calling LLM", step + 1, max_steps)
@@ -1045,6 +1059,22 @@ async def _run_browser_agent_inner(
 
                 logger.info("[WS Browser] Step %d: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:200])
 
+                # ── Stuck detection: if agent repeats the same action 3+ times, inject a hint ──
+                action_key = f"{fn_name}:{json.dumps(fn_args, sort_keys=True)[:100]}"
+                if action_key == last_action_key:
+                    consecutive_same_actions += 1
+                else:
+                    consecutive_same_actions = 0
+                    last_action_key = action_key
+
+                if consecutive_same_actions >= 2:
+                    # Inject a hint to try something different
+                    conversation.append({
+                        "role": "user",
+                        "content": "[SYSTEM] You are repeating the same action. This action is not working. Try a DIFFERENT approach: use a different selector, scroll to find the element, or try an alternative strategy.",
+                    })
+                    consecutive_same_actions = 0
+
                 # Narration: describe the action about to happen
                 _narration_map = {
                     "navigate": lambda a: f"Navigating to {a.get('url', '...')}",
@@ -1074,6 +1104,14 @@ async def _run_browser_agent_inner(
                     })
 
                 result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
+
+                # ── Validator: append verification prompt to tool result ──
+                if fn_name == "type_text":
+                    result += "\n\n[VERIFY] Look at the screenshot. Did the text appear in the correct field? Is there an autocomplete dropdown you need to select from?"
+                elif fn_name == "click":
+                    result += "\n\n[VERIFY] Look at the screenshot. Did the click have the expected effect? Did a dropdown open? Did the page change? Is there an overlay blocking the form?"
+                elif fn_name == "navigate":
+                    result += "\n\n[VERIFY] Did the page load correctly? Are there any overlays or popups to dismiss before proceeding?"
 
                 # Send cursor position AFTER executing (final position)
                 if fn_name in ("click", "type_text", "scroll") and overlay:
