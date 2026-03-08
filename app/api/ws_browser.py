@@ -1038,34 +1038,65 @@ async def _exec_browser_tool(
                     except Exception:
                         pass
 
-                # Fallback 2: JavaScript DOM search (case-insensitive)
+                # Fallback 2: JavaScript DOM search (case-insensitive, broad)
                 if not _option_clicked:
                     try:
                         clicked = await page.evaluate("""(optionText) => {
-                            const optLower = optionText.toLowerCase();
-                            const els = document.querySelectorAll(
+                            const optLower = optionText.toLowerCase().trim();
+
+                            // Strategy 1: Standard dropdown roles
+                            const roleEls = document.querySelectorAll(
                                 '[role="option"], [role="menuitem"], [role="listbox"] *, li, [class*="menu"] *, [class*="dropdown"] *'
                             );
-                            for (const el of els) {
+                            for (const el of roleEls) {
                                 const text = (el.textContent || '').trim().toLowerCase();
                                 if (text === optLower && el.offsetParent !== null) {
                                     el.click();
-                                    return true;
+                                    return 'exact-role';
                                 }
                             }
-                            // Partial match fallback
-                            for (const el of els) {
+
+                            // Strategy 2: Any visible element with matching text (covers Material Design)
+                            const allEls = document.querySelectorAll('*');
+                            let bestMatch = null;
+                            let bestLen = Infinity;
+                            for (const el of allEls) {
+                                if (el.offsetParent === null) continue;
+                                const text = (el.textContent || '').trim().toLowerCase();
+                                // Exact match on inner text (not children's text)
+                                const ownText = Array.from(el.childNodes)
+                                    .filter(n => n.nodeType === 3)
+                                    .map(n => n.textContent.trim().toLowerCase())
+                                    .join(' ');
+                                if (ownText === optLower) {
+                                    el.click();
+                                    return 'exact-own-text';
+                                }
+                                // Full textContent match — pick shortest (most specific)
+                                if (text === optLower && text.length < bestLen) {
+                                    bestMatch = el;
+                                    bestLen = text.length;
+                                }
+                            }
+                            if (bestMatch) {
+                                bestMatch.click();
+                                return 'exact-textcontent';
+                            }
+
+                            // Strategy 3: Partial match (contains)
+                            for (const el of roleEls) {
                                 const text = (el.textContent || '').trim().toLowerCase();
                                 if (text.includes(optLower) && el.offsetParent !== null) {
                                     el.click();
-                                    return true;
+                                    return 'partial';
                                 }
                             }
+
                             return false;
                         }""", option)
                         if clicked:
                             _option_clicked = True
-                            logger.warning("[SELECT_DROPDOWN] Option clicked via JS DOM search")
+                            logger.warning("[SELECT_DROPDOWN] Option clicked via JS DOM search (strategy: %s)", clicked)
                         else:
                             logger.warning("[SELECT_DROPDOWN] JS DOM search found no match for '%s'", option)
                     except Exception as e:
@@ -1082,9 +1113,20 @@ async def _exec_browser_tool(
             return f"Selected '{option}' from dropdown (trigger: '{trigger}'). Now on: {page.url} — {title}\n\n{analysis}"
 
         elif name == "done":
+            _done_summary = args.get("summary", "Task completed.")
+            _done_lower = _done_summary.lower()
+            _fail_indicators = ["could not", "couldn't", "unable to", "failed to", "sorry",
+                                "not able", "cannot", "can't", "wasn't able", "didn't work",
+                                "encountered an error", "blocked", "captcha", "unfortunately",
+                                "i apologize", "not possible", "didn't find", "no results"]
+            if any(fw in _done_lower for fw in _fail_indicators):
+                logger.warning("[DONE] ❌ Failure detected in done() summary: %s", _done_summary[:200])
+                return (f"ERROR: You tried to finish with a failure message. Do NOT call done() until you have "
+                        f"actual results. Your message was: '{_done_summary[:150]}'. "
+                        f"Try a different approach instead.")
             await overlay.hide_cursor()
             await overlay.set_active(False)
-            return args.get("summary", "Task completed.")
+            return _done_summary
 
         else:
             return f"Unknown tool: {name}"
@@ -1383,6 +1425,8 @@ async def _run_browser_agent_inner(
                     result += "\n\n[VERIFY] Look at the screenshot. Did the click have the expected effect? Did a dropdown open? Did the page change? Is there an overlay blocking the form?"
                 elif fn_name == "select_dropdown":
                     result += "\n\n[VERIFY] Look at the screenshot. Did the dropdown option get selected? Does the trigger button now show the new value?"
+                elif fn_name == "select_date":
+                    result += "\n\n[VERIFY] Look at the screenshot. Is the date highlighted on the calendar? If so, click 'Done' to confirm the date selection."
                 elif fn_name == "navigate":
                     result += "\n\n[VERIFY] Did the page load correctly? Are there any overlays or popups to dismiss before proceeding?"
 
@@ -1419,11 +1463,19 @@ async def _run_browser_agent_inner(
 
                 if fn_name == "done":
                     _summary = fn_args.get("summary", "Task completed.")
+
+                    # If the done() tool itself rejected (returned ERROR), force retry
+                    if result.startswith("ERROR:") and step < max_steps - 3:
+                        logger.warning("[STEP %d] ❌ done() rejected — failure detected, forcing retry", step + 1)
+                        _force_tool_next = True
+                        continue  # tool result already in conversation, LLM will see the error
+
+                    # Double-check: manual failure word detection as backup
                     _summary_lower = _summary.lower()
-                    # ── Failure detection: if agent tries to give up, force retry ──
                     _failure_words = ["could not", "couldn't", "unable to", "failed to", "sorry",
                                       "not able", "cannot", "can't", "wasn't able", "didn't work",
-                                      "encountered an error", "blocked", "captcha"]
+                                      "encountered an error", "blocked", "captcha", "unfortunately",
+                                      "i apologize", "not possible"]
                     _is_failure = any(fw in _summary_lower for fw in _failure_words)
                     if _is_failure and step < max_steps - 3:
                         logger.warning("[STEP %d] ❌ AGENT TRIED TO GIVE UP: %s — forcing retry", step + 1, _summary[:200])
