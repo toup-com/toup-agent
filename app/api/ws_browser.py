@@ -1007,8 +1007,40 @@ async def _exec_browser_tool(
                 if not _trigger_clicked:
                     return f"ERROR: Could not click dropdown trigger '{trigger}'"
 
-            # Step 2: Wait for dropdown to appear (crucial timing)
+            # Step 2: Wait for dropdown to appear
             await asyncio.sleep(random.uniform(0.6, 1.0))
+
+            # Google Flights specific: if no dropdown visible, try JS-based click on trigger
+            try:
+                _has_dropdown = await page.evaluate("""() => {
+                    const menus = document.querySelectorAll('[role="listbox"], [role="menu"], ul.VfPpkd-rymPhb');
+                    for (const m of menus) {
+                        const r = m.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return true;
+                    }
+                    return false;
+                }""")
+                if not _has_dropdown:
+                    logger.warning("[SELECT_DROPDOWN] No dropdown found after click, trying dispatchEvent approach")
+                    # Google Flights uses Material Design 3 buttons — they need mousedown+mouseup events
+                    await page.evaluate("""(triggerText) => {
+                        const btns = document.querySelectorAll('button, [role="button"]');
+                        for (const btn of btns) {
+                            const text = (btn.textContent || '').trim().toLowerCase();
+                            if (text.includes(triggerText.toLowerCase())) {
+                                // Dispatch full mouse event sequence
+                                btn.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+                                btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                                btn.dispatchEvent(new PointerEvent('pointerup', {bubbles: true}));
+                                btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                                btn.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                                return;
+                            }
+                        }
+                    }""", trigger)
+                    await asyncio.sleep(0.8)
+            except Exception as e:
+                logger.warning("[SELECT_DROPDOWN] Retry trigger click failed: %s", e)
 
             # Debug: log what's in any visible dropdown/menu
             try:
@@ -1216,6 +1248,9 @@ async def _exec_browser_tool(
             _done_summary = args.get("summary", "Task completed.")
             _done_lower = _done_summary.lower()
 
+            # Normalize smart quotes → ASCII for reliable matching
+            _done_lower = _done_lower.replace("\u2019", "'").replace("\u2018", "'").replace("\u201c", '"').replace("\u201d", '"')
+
             # Broad failure detection — catch ANY negative/incomplete phrasing
             _fail_indicators = [
                 "could not", "couldn't", "unable to", "failed to", "sorry",
@@ -1228,6 +1263,7 @@ async def _exec_browser_tool(
                 "wasn't successful", "not correctly", "incorrectly",
                 "did not work", "not working", "please retry", "try again",
                 "no flight", "no listing", "never loaded", "results did not",
+                "misfiring", "not stay stable", "not trustworthy",
             ]
             if any(fw in _done_lower for fw in _fail_indicators):
                 logger.warning("[DONE] ❌ Failure detected in done() summary: %s", _done_summary[:200])
@@ -1409,11 +1445,12 @@ async def _run_browser_agent_inner(
                 logger.warning("[STEP %d] LLM returned TEXT (no tool call): %s", step + 1, text[:300])
 
                 # ── Check if the text response is a failure/give-up — if so, force retry ──
-                _text_lower = text.lower()
+                _text_lower = text.lower().replace("\u2019", "'").replace("\u2018", "'")
                 _failure_words_text = ["could not", "couldn't", "unable to", "failed to", "sorry",
                                        "not able", "cannot", "can't", "wasn't able", "didn't work",
                                        "encountered an error", "blocked", "captcha", "i apologize",
-                                       "unfortunately", "not possible"]
+                                       "unfortunately", "not possible", "did not complete",
+                                       "didn't complete", "not successful", "misfiring"]
                 _is_text_failure = any(fw in _text_lower for fw in _failure_words_text)
                 if _is_text_failure and step < max_steps - 3:
                     logger.warning("[STEP %d] ❌ TEXT FAILURE DETECTED — forcing retry with tool_choice=required", step + 1)
@@ -1581,11 +1618,13 @@ async def _run_browser_agent_inner(
                         continue  # tool result already in conversation, LLM will see the error
 
                     # Double-check: manual failure word detection as backup
-                    _summary_lower = _summary.lower()
+                    _summary_lower = _summary.lower().replace("\u2019", "'").replace("\u2018", "'")
                     _failure_words = ["could not", "couldn't", "unable to", "failed to", "sorry",
                                       "not able", "cannot", "can't", "wasn't able", "didn't work",
                                       "encountered an error", "blocked", "captcha", "unfortunately",
-                                      "i apologize", "not possible"]
+                                      "i apologize", "not possible", "did not complete",
+                                      "didn't complete", "not successful", "misfiring",
+                                      "not stay stable", "not trustworthy"]
                     _is_failure = any(fw in _summary_lower for fw in _failure_words)
                     if _is_failure and step < max_steps - 3:
                         logger.warning("[STEP %d] ❌ AGENT TRIED TO GIVE UP: %s — forcing retry", step + 1, _summary[:200])
