@@ -266,6 +266,7 @@ BROWSER_TOOLS = [
     {"type": "function", "function": {"name": "type_text", "description": "Type text into an input field.", "parameters": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}, "clear": {"type": "boolean"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}}},
     {"type": "function", "function": {"name": "select_date", "description": "Select a date on a calendar/date picker. Use this instead of click for date selection.", "parameters": {"type": "object", "properties": {"date": {"type": "string", "description": "Date in YYYY-MM-DD format, e.g. 2026-03-19"}}, "required": ["date"]}}},
     {"type": "function", "function": {"name": "scroll", "description": "Scroll the page.", "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["up", "down"]}, "amount": {"type": "integer"}}}}},
+    {"type": "function", "function": {"name": "select_dropdown", "description": "Select an option from a dropdown menu. Atomically clicks the trigger to open the dropdown, then clicks the option. Use this for ANY dropdown (trip type, passenger count, cabin class, sort order, etc.).", "parameters": {"type": "object", "properties": {"trigger_text": {"type": "string", "description": "Text of the dropdown trigger button (e.g. 'Round trip', '1 passenger', 'Economy')"}, "option_text": {"type": "string", "description": "Text of the option to select (e.g. 'One way', '2 passengers', 'Business')"}}, "required": ["trigger_text", "option_text"]}}},
     {"type": "function", "function": {"name": "go_back", "description": "Go back to previous page.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "wait", "description": "Wait for page to load.", "parameters": {"type": "object", "properties": {"milliseconds": {"type": "integer"}}}}},
     {"type": "function", "function": {"name": "done", "description": "Task complete — include summary.", "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}},
@@ -289,7 +290,7 @@ Before interacting with a page, dismiss ANY visible popups or promotional overla
 1. LOOK at the screenshot CAREFULLY before EVERY action. Overlays covering the form? Dismiss FIRST.
 2. NEVER click hamburger menus, "Main menu", "Sign In", or account/profile links — only interact with FORM elements.
 3. NEVER navigate away from a page you're working on. Stay on the current site. If you accidentally navigate away, go back immediately.
-4. DROPDOWNS require TWO clicks: first click the current value (to OPEN the dropdown), then click the desired option from the list.
+4. DROPDOWNS: ALWAYS use `select_dropdown` tool for dropdowns. NEVER use two separate `click` calls — the dropdown will close between clicks.
 5. ONE action at a time. Screenshot → analyze → one action → next screenshot → repeat.
 6. Use the interactive elements list AND screenshot together.
 7. ALWAYS use a tool — never just talk.
@@ -299,6 +300,7 @@ Before interacting with a page, dismiss ANY visible popups or promotional overla
 ## Tools:
 - `click` — use `selector` (CSS preferred), `text` (visible text), or `index` (from elements list)
 - `type_text` — type into input fields. Use `selector` to target. `press_enter=true` to submit.
+- `select_dropdown` — MUST use for ANY dropdown selection. Atomically opens dropdown + clicks option in one step. Example: `select_dropdown(trigger_text="Round trip", option_text="One way")`
 - `scroll` — scroll down/up to see more content
 - `navigate` — ONLY to go to a NEW website
 - `select_date` — select a date in calendar pickers (YYYY-MM-DD format)
@@ -748,14 +750,16 @@ async def _exec_browser_tool(
                         return f"ERROR clicking '{selector}': {e}"
                 elif text:
                     try:
-                        # Try exact text first, then fuzzy — use .click() not
-                        # dispatch_event which fires at container center (wrong pos)
                         loc = page.get_by_text(text, exact=True).first
                         try:
                             await loc.click(timeout=3_000)
                         except Exception:
-                            loc = page.get_by_text(text, exact=False).first
-                            await loc.click(timeout=3_000)
+                            # Retry with force=True (Google Material ripple overlays intercept clicks)
+                            try:
+                                await loc.click(timeout=3_000, force=True)
+                            except Exception:
+                                loc = page.get_by_text(text, exact=False).first
+                                await loc.click(timeout=3_000, force=True)
                     except Exception as e:
                         return f"ERROR clicking text '{text}': {e}"
                 else:
@@ -946,6 +950,81 @@ async def _exec_browser_tool(
             await asyncio.sleep(ms / 1000)
             analysis = await _analyze_page(page)
             return f"Waited {ms}ms\n\n{analysis}"
+
+        elif name == "select_dropdown":
+            # Atomic dropdown selection: click trigger → wait → click option
+            # Solves the timing problem where dropdowns close during LLM round-trip
+            from app.agent.browser import human_click, get_text_element_center
+
+            trigger = args.get("trigger_text", "")
+            option = args.get("option_text", "")
+            if not trigger or not option:
+                return "ERROR: trigger_text and option_text are required"
+
+            cursor_pos = (overlay.x, overlay.y)
+
+            # Step 1: Click the trigger to open the dropdown
+            logger.warning("[SELECT_DROPDOWN] Clicking trigger: '%s'", trigger)
+            trigger_target = await get_text_element_center(page, trigger)
+            if trigger_target:
+                await human_click(page, trigger_target[0], trigger_target[1], from_pos=cursor_pos)
+                overlay.x, overlay.y = int(trigger_target[0]), int(trigger_target[1])
+            else:
+                # Fallback: try Playwright locator
+                try:
+                    loc = page.get_by_text(trigger, exact=True).first
+                    await loc.click(timeout=3_000)
+                except Exception:
+                    try:
+                        loc = page.get_by_text(trigger, exact=False).first
+                        await loc.click(timeout=3_000)
+                    except Exception as e:
+                        return f"ERROR: Could not click dropdown trigger '{trigger}': {e}"
+
+            # Step 2: Wait for dropdown to appear (crucial timing)
+            await asyncio.sleep(random.uniform(0.4, 0.7))
+
+            # Step 3: Click the option from the now-open dropdown
+            logger.warning("[SELECT_DROPDOWN] Clicking option: '%s'", option)
+            option_target = await get_text_element_center(page, option)
+            if option_target:
+                await human_click(page, option_target[0], option_target[1],
+                                  from_pos=(overlay.x, overlay.y))
+                overlay.x, overlay.y = int(option_target[0]), int(option_target[1])
+                await overlay.click_ripple(int(option_target[0]), int(option_target[1]))
+            else:
+                # Fallback: try Playwright locator with short timeout
+                try:
+                    loc = page.get_by_text(option, exact=True).first
+                    await loc.click(timeout=2_000)
+                except Exception:
+                    # Last resort: use JavaScript to find and click in the dropdown
+                    try:
+                        clicked = await page.evaluate("""(optionText) => {
+                            // Look for visible elements matching the option text
+                            const els = document.querySelectorAll(
+                                '[role="option"], [role="menuitem"], [role="listbox"] *, li, [class*="menu"] *'
+                            );
+                            for (const el of els) {
+                                const text = (el.textContent || '').trim();
+                                if (text === optionText && el.offsetParent !== null) {
+                                    el.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""", option)
+                        if not clicked:
+                            return f"ERROR: Dropdown opened but could not find option '{option}'"
+                    except Exception as e:
+                        return f"ERROR: Could not click option '{option}': {e}"
+
+            await asyncio.sleep(random.uniform(0.3, 0.5))
+            await _wait_stable(page)
+            await overlay.inject()
+            title = await page.title()
+            analysis = await _analyze_page(page)
+            return f"Selected '{option}' from dropdown (trigger: '{trigger}'). Now on: {page.url} — {title}\n\n{analysis}"
 
         elif name == "done":
             await overlay.hide_cursor()
@@ -1160,6 +1239,7 @@ async def _run_browser_agent_inner(
                     "navigate": lambda a: f"Navigating to {a.get('url', '...')}",
                     "click": lambda a: f"Clicking {a.get('text') or a.get('selector', 'element')}",
                     "type_text": lambda a: f'Typing "{(a.get("text", ""))[:40]}"',
+                    "select_dropdown": lambda a: f"Selecting '{a.get('option_text', '...')}' from dropdown",
                     "select_date": lambda a: f"Selecting date {a.get('date', '...')}",
                     "scroll": lambda a: f"Scrolling {a.get('direction', 'down')}",
                     "go_back": lambda _: "Going back",
@@ -1220,6 +1300,8 @@ async def _run_browser_agent_inner(
                     result += "\n\n[VERIFY] Look at the screenshot. Did the text appear in the correct field? Is there an autocomplete dropdown you need to select from?"
                 elif fn_name == "click":
                     result += "\n\n[VERIFY] Look at the screenshot. Did the click have the expected effect? Did a dropdown open? Did the page change? Is there an overlay blocking the form?"
+                elif fn_name == "select_dropdown":
+                    result += "\n\n[VERIFY] Look at the screenshot. Did the dropdown option get selected? Does the trigger button now show the new value?"
                 elif fn_name == "navigate":
                     result += "\n\n[VERIFY] Did the page load correctly? Are there any overlays or popups to dismiss before proceeding?"
 
@@ -1232,7 +1314,7 @@ async def _run_browser_agent_inner(
 
                 # Vision: attach screenshot for visual actions so LLM sees the page
                 # type_text included — LLM must see autocomplete dropdowns after typing
-                _visual_actions = {"navigate", "click", "scroll", "go_back", "type_text", "select_date"}
+                _visual_actions = {"navigate", "click", "scroll", "go_back", "type_text", "select_date", "select_dropdown"}
                 if fn_name in _visual_actions:
                     try:
                         _snap = await page.screenshot(type="png")

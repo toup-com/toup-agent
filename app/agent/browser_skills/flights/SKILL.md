@@ -12,22 +12,13 @@ description: Search and compare flights across airlines and OTAs.
 ### Step 1: Dismiss Overlays
 If you see "Try AI powered Flight Deals" or any promotional overlay, click "Got it", "No thanks", or the X button. Wait for it to close.
 
-### Step 2: Set Trip Type (TWO-STEP process — CRITICAL)
-The trip type selector is a DROPDOWN, not a single button. It requires TWO clicks:
-
-**Step 2a**: Click the button that currently says "Round trip" (this OPENS the dropdown menu).
-- Selector: `button[aria-label*="trip" i]` or click the text "Round trip"
-- After clicking, a dropdown menu appears with options: "Round trip", "One way", "Multi-city"
-
-**Step 2b**: NOW click "One way" from the OPEN dropdown menu.
-- The options are now VISIBLE in the dropdown — click the text "One way"
-- Wait for the dropdown to close and verify the button now says "One way"
-
-**COMMON MISTAKE**: Do NOT try to click "One way" without first opening the dropdown.
-The text "One way" exists in the DOM but is HIDDEN until the dropdown is open.
-If your click fails with "not visible", you forgot Step 2a.
-
+### Step 2: Set Trip Type
+Use the `select_dropdown` tool to change the trip type:
+- For one-way: `select_dropdown(trigger_text="Round trip", option_text="One way")`
+- For multi-city: `select_dropdown(trigger_text="Round trip", option_text="Multi-city")`
 - If round_trip → leave as is (skip Step 2)
+
+**IMPORTANT**: ALWAYS use `select_dropdown`, NEVER use two separate clicks.
 - Do NOT click hamburger menus, "Sign In", or navigation links
 
 ### Step 3: Fill Origin ("Where from?")
