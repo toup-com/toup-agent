@@ -1021,6 +1021,38 @@ async def _exec_browser_tool(
                 overlay.x, overlay.y = int(option_target[0]), int(option_target[1])
                 await overlay.click_ripple(int(option_target[0]), int(option_target[1]))
                 _option_clicked = True
+
+                # Verify the click registered — if dropdown is still open, try Playwright click
+                await asyncio.sleep(0.3)
+                try:
+                    _menu_still_visible = await page.evaluate("""() => {
+                        const menus = document.querySelectorAll('[role="listbox"], [role="menu"], ul.VfPpkd-rymPhb');
+                        for (const m of menus) {
+                            if (m.offsetParent !== null && m.getBoundingClientRect().height > 0) return true;
+                        }
+                        return false;
+                    }""")
+                    if _menu_still_visible:
+                        logger.warning("[SELECT_DROPDOWN] ⚠️ human_click didn't close dropdown, retrying with Playwright")
+                        try:
+                            loc = page.get_by_text(option, exact=True).first
+                            await loc.click(timeout=2_000, force=True)
+                            logger.warning("[SELECT_DROPDOWN] Retried with Playwright force=True")
+                        except Exception:
+                            # Try JS click as ultimate fallback
+                            await page.evaluate("""(optionText) => {
+                                const optLower = optionText.toLowerCase().trim();
+                                const els = document.querySelectorAll('li, [role="option"], [role="menuitem"]');
+                                for (const el of els) {
+                                    if ((el.textContent || '').trim().toLowerCase() === optLower && el.offsetParent !== null) {
+                                        el.click();
+                                        return;
+                                    }
+                                }
+                            }""", option)
+                            logger.warning("[SELECT_DROPDOWN] Retried with JS click fallback")
+                except Exception:
+                    pass
             else:
                 logger.warning("[SELECT_DROPDOWN] Text match failed for option '%s', trying fallbacks", option)
                 # Fallback 1: Playwright locator
@@ -1107,23 +1139,55 @@ async def _exec_browser_tool(
 
             await asyncio.sleep(random.uniform(0.3, 0.5))
             await _wait_stable(page)
+
+            # Verify: check if dropdown closed (option was selected)
+            # On Google Flights, a successful selection changes the button text
+            _verify_result = ""
+            try:
+                _still_open = await page.evaluate("""() => {
+                    // Check if a listbox/menu is still visible
+                    const menus = document.querySelectorAll('[role="listbox"], [role="menu"], ul.VfPpkd-rymPhb');
+                    for (const m of menus) {
+                        if (m.offsetParent !== null && m.getBoundingClientRect().height > 0) return true;
+                    }
+                    return false;
+                }""")
+                if _still_open:
+                    logger.warning("[SELECT_DROPDOWN] ⚠️ Dropdown still open after clicking option — clicking option again")
+                    # Try clicking Escape to close, then retry
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                    _verify_result = " (WARNING: dropdown may not have closed properly)"
+            except Exception:
+                pass
+
             await overlay.inject()
             title = await page.title()
             analysis = await _analyze_page(page)
-            return f"Selected '{option}' from dropdown (trigger: '{trigger}'). Now on: {page.url} — {title}\n\n{analysis}"
+            return f"Selected '{option}' from dropdown (trigger: '{trigger}').{_verify_result} Now on: {page.url} — {title}\n\n{analysis}"
 
         elif name == "done":
             _done_summary = args.get("summary", "Task completed.")
             _done_lower = _done_summary.lower()
-            _fail_indicators = ["could not", "couldn't", "unable to", "failed to", "sorry",
-                                "not able", "cannot", "can't", "wasn't able", "didn't work",
-                                "encountered an error", "blocked", "captcha", "unfortunately",
-                                "i apologize", "not possible", "didn't find", "no results"]
+
+            # Broad failure detection — catch ANY negative/incomplete phrasing
+            _fail_indicators = [
+                "could not", "couldn't", "unable to", "failed to", "sorry",
+                "not able", "cannot", "can't", "wasn't able", "didn't work",
+                "encountered an error", "blocked", "captcha", "unfortunately",
+                "i apologize", "not possible", "didn't find", "no results",
+                "did not complete", "didn't complete", "not successful",
+                "did not load", "didn't load", "no actual", "not valid",
+                "do not have", "don't have", "didn't get", "did not get",
+                "wasn't successful", "not correctly", "incorrectly",
+                "did not work", "not working", "please retry", "try again",
+                "no flight", "no listing", "never loaded", "results did not",
+            ]
             if any(fw in _done_lower for fw in _fail_indicators):
                 logger.warning("[DONE] ❌ Failure detected in done() summary: %s", _done_summary[:200])
                 return (f"ERROR: You tried to finish with a failure message. Do NOT call done() until you have "
-                        f"actual results. Your message was: '{_done_summary[:150]}'. "
-                        f"Try a different approach instead.")
+                        f"actual results (prices, airlines, times). Your message was: '{_done_summary[:150]}'. "
+                        f"Try a different approach — scroll down to see results, or re-search.")
             await overlay.hide_cursor()
             await overlay.set_active(False)
             return _done_summary
