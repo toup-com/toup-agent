@@ -473,71 +473,75 @@ async def _auto_dismiss_popups(page):
         dismissed = await page.evaluate("""() => {
             const dismissed = [];
 
-            // Common cookie/consent button selectors
-            const buttonSelectors = [
-                // Cookie consent
-                'button[id*="accept" i]', 'button[id*="cookie" i]',
-                'a[id*="accept" i]',
-                '[class*="cookie"] button', '[class*="consent"] button',
-                '[id*="consent"] button', '[id*="gdpr"] button',
-                '[class*="cookie-banner"] button',
-                '[data-testid*="accept" i]', '[data-testid*="cookie" i]',
-                // OneTrust (very common)
+            // Words that indicate WRONG buttons (settings/preferences panels)
+            const rejectWords = ['preferences', 'settings', 'customize', 'manage', 'options', 'more info', 'learn more', 'details', 'back'];
+
+            function isRejectButton(text) {
+                const t = text.toLowerCase();
+                return rejectWords.some(w => t.includes(w));
+            }
+
+            // High-priority: known accept button IDs/selectors
+            const acceptSelectors = [
                 '#onetrust-accept-btn-handler',
                 '.onetrust-accept-btn-handler',
-                // Cookiebot
                 '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
-                // Generic modal close
-                '[class*="modal"] [class*="close"]',
-                '[class*="dialog"] [class*="close"]',
-                '[class*="popup"] [class*="close"]',
-                '[class*="overlay"] [class*="close"]',
-                '[role="dialog"] button[aria-label*="close" i]',
-                '[role="dialog"] button[aria-label*="dismiss" i]',
+                '#CybotCookiebotDialogBodyButtonAccept',
+                'button[id*="accept" i]',
+                'a[id*="accept" i]',
+                '[data-testid*="accept" i]',
             ];
 
-            // Text-based matching for buttons
-            const textMatches = [
-                'accept', 'accept all', 'accept cookies', 'agree',
-                'got it', 'i agree', 'ok', 'allow', 'allow all',
-                'continue', 'dismiss',
-            ];
-
-            // Try selector-based first
-            for (const sel of buttonSelectors) {
+            for (const sel of acceptSelectors) {
                 const btn = document.querySelector(sel);
                 if (btn && btn.offsetParent !== null) {
-                    btn.click();
-                    dismissed.push('selector: ' + sel);
+                    const text = (btn.textContent || '').trim();
+                    if (!isRejectButton(text)) {
+                        btn.click();
+                        dismissed.push('accept-selector: ' + sel);
+                        return dismissed;
+                    }
                 }
             }
 
-            // Then text-based: find visible buttons/links with matching text
-            if (dismissed.length === 0) {
-                const allButtons = document.querySelectorAll('button, a[role="button"], [class*="btn"]');
+            // Text-based: find visible buttons with accept-like text
+            // Priority order matters — try most specific first
+            const acceptTexts = [
+                'accept all', 'accept cookies', 'accept all cookies',
+                'allow all', 'allow all cookies', 'i agree',
+                'accept', 'agree', 'allow',
+                'got it', 'ok', 'dismiss',
+                'save & continue', 'save and continue',
+                'continue',
+            ];
+
+            const allButtons = document.querySelectorAll('button, a[role="button"], [class*="btn"], [role="button"]');
+            for (const acceptText of acceptTexts) {
                 for (const btn of allButtons) {
                     const text = (btn.textContent || '').trim().toLowerCase();
-                    if (text.length < 30 && textMatches.some(t => text === t || text.startsWith(t))) {
+                    if (text.length > 40) continue;
+                    if (isRejectButton(text)) continue;
+                    if (text === acceptText || text.startsWith(acceptText + ' ')) {
                         if (btn.offsetParent !== null) {
                             btn.click();
                             dismissed.push('text: ' + text);
-                            break;
+                            return dismissed;
                         }
                     }
                 }
             }
 
-            // Also try to close modal overlays (like Emirates "Limited operations" popup)
+            // Modal close buttons (only for non-cookie modals)
             const closeButtons = document.querySelectorAll(
-                'button.close, .modal .close, [class*="modal"] button:not([class*="accept"]), ' +
-                'button[aria-label="Close"], button[aria-label="close"], ' +
-                '.modal-header button, [class*="dialog-close"]'
+                'button[aria-label="Close" i], button[aria-label="dismiss" i], ' +
+                '[role="dialog"] button[aria-label*="close" i]'
             );
             for (const btn of closeButtons) {
                 const text = (btn.textContent || '').trim().toLowerCase();
-                if (btn.offsetParent !== null && (text === 'close' || text === '×' || text === 'x' || text === '' || btn.getAttribute('aria-label')?.toLowerCase().includes('close'))) {
+                if (btn.offsetParent !== null && (text === '' || text === 'close' || text === '×' || text === 'x')) {
                     btn.click();
                     dismissed.push('modal-close: ' + (text || 'aria-close'));
+                    return dismissed;
                 }
             }
 
@@ -809,11 +813,9 @@ async def _run_browser_agent_inner(
     if page.url and page.url != "about:blank":
         context_message = f"{user_message}\n\n[Current browser state]\n{current_analysis}"
 
-    # Start live screenshot stream so user sees cursor/page in real-time
-    _stream_stop = asyncio.Event()
-    _stream_task = asyncio.create_task(
-        _screenshot_stream_loop(websocket, page, overlay, _stream_stop, fps=8)
-    )
+    # Start CDP screencast — event-driven live streaming (replaces polling)
+    screencast = CDPScreencast(websocket, page, overlay)
+    await screencast.start()
 
     try:
         # Build user message with vision screenshot
@@ -831,6 +833,13 @@ async def _run_browser_agent_inner(
 
         for step in range(max_steps):
             logger.warning("[WS Browser] Step %d/%d — calling LLM", step + 1, max_steps)
+
+            # Narration: tell the user what's happening during LLM thinking
+            await websocket.send_json({
+                "type": "narration",
+                "text": "Looking at the page..." if step == 0 else "Deciding next action...",
+            })
+
             tc_mode = "required" if step == 0 else "auto"
             try:
                 response = await client.chat.completions.create(
@@ -866,13 +875,41 @@ async def _run_browser_agent_inner(
 
                 logger.info("[WS Browser] Step %d: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:200])
 
+                # Narration: describe the action about to happen
+                _narration_map = {
+                    "navigate": lambda a: f"Navigating to {a.get('url', '...')}",
+                    "click": lambda a: f"Clicking {a.get('text') or a.get('selector', 'element')}",
+                    "type_text": lambda a: f'Typing "{(a.get("text", ""))[:40]}"',
+                    "scroll": lambda a: f"Scrolling {a.get('direction', 'down')}",
+                    "go_back": lambda _: "Going back",
+                    "wait": lambda _: "Waiting for page to load...",
+                    "done": lambda a: a.get("summary", "Done!"),
+                }
+                narr_fn = _narration_map.get(fn_name)
+                if narr_fn:
+                    await websocket.send_json({"type": "narration", "text": narr_fn(fn_args)})
+
                 await websocket.send_json({
                     "type": "tool_use",
                     "tool": fn_name,
                     "args": fn_args,
                 })
 
+                # Send cursor position BEFORE executing (so frontend animates cursor to target)
+                if fn_name in ("click", "type_text") and overlay:
+                    await websocket.send_json({
+                        "type": "cursor_move",
+                        "x": overlay.x, "y": overlay.y,
+                    })
+
                 result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
+
+                # Send cursor position AFTER executing (final position)
+                if fn_name in ("click", "type_text", "scroll") and overlay:
+                    await websocket.send_json({
+                        "type": "cursor_move",
+                        "x": overlay.x, "y": overlay.y,
+                    })
 
                 # Vision: attach screenshot for visual actions so LLM sees the page
                 _visual_actions = {"navigate", "click", "scroll", "go_back"}
@@ -909,12 +946,7 @@ async def _run_browser_agent_inner(
             "content": "I've taken many steps. Let me know if you'd like me to continue.",
         })
     finally:
-        _stream_stop.set()
-        _stream_task.cancel()
-        try:
-            await _stream_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        await screencast.stop()
         await overlay.hide_cursor()
         await overlay.set_active(False)
 
@@ -937,29 +969,108 @@ async def _send_screenshot(websocket: WebSocket, page, overlay: AgentOverlay):
         logger.warning("[WS Browser] Screenshot failed: %s", e)
 
 
-async def _screenshot_stream_loop(
-    websocket: WebSocket,
-    page,
-    overlay: AgentOverlay,
-    stop_event: asyncio.Event,
-    fps: float = 8,
-):
-    """Stream screenshots at ~fps while the agent is working, giving live view."""
-    interval = 1.0 / fps
-    while not stop_event.is_set():
+# ---------------------------------------------------------------------------
+# CDP Screencast — event-driven frame streaming (replaces screenshot polling)
+# Frames are sent only when the page actually renders (much more efficient
+# and lower latency than polling page.screenshot()).
+# ---------------------------------------------------------------------------
+
+class CDPScreencast:
+    """
+    Uses Chrome DevTools Protocol Page.startScreencast for live streaming.
+    Frames fire only when the page content changes — zero CPU waste on static pages.
+    Falls back to screenshot polling if CDP is unavailable.
+    """
+
+    def __init__(self, websocket: WebSocket, page, overlay: AgentOverlay):
+        self.ws = websocket
+        self.page = page
+        self.overlay = overlay
+        self._cdp = None
+        self._running = False
+        self._fallback = False
+        self._stop_event = asyncio.Event()
+        self._fallback_task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        """Start screencast — try CDP first, fall back to polling."""
+        self._running = True
+        self._stop_event.clear()
         try:
-            # JPEG for streaming — 5-10x smaller/faster than PNG
-            jpg_bytes = await page.screenshot(type="jpeg", quality=55)
-            b64 = base64.b64encode(jpg_bytes).decode("ascii")
-            await websocket.send_json({
-                "type": "screenshot",
-                "image": b64,
+            # Playwright / Patchright CDP session
+            self._cdp = await self.page.context.new_cdp_session(self.page)
+            self._cdp.on("Page.screencastFrame", self._on_frame)
+            await self._cdp.send("Page.startScreencast", {
                 "format": "jpeg",
-                "cursor": {"x": overlay.x, "y": overlay.y},
+                "quality": 60,
+                "maxWidth": 1280,
+                "maxHeight": 720,
+                "everyNthFrame": 1,
+            })
+            logger.info("[SCREENCAST] CDP screencast started")
+        except Exception as e:
+            logger.warning("[SCREENCAST] CDP unavailable (%s), falling back to polling", e)
+            self._fallback = True
+            self._fallback_task = asyncio.create_task(self._poll_loop())
+
+    async def stop(self):
+        """Stop screencast."""
+        self._running = False
+        self._stop_event.set()
+        if self._cdp and not self._fallback:
+            try:
+                await self._cdp.send("Page.stopScreencast")
+                await self._cdp.detach()
+            except Exception:
+                pass
+            self._cdp = None
+        if self._fallback_task:
+            self._fallback_task.cancel()
+            try:
+                await self._fallback_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def _on_frame(self, params: dict):
+        """CDP screencastFrame event handler — fires when page renders a new frame."""
+        if not self._running:
+            return
+        session_id = params.get("sessionId", 0)
+        b64_data = params.get("data", "")
+        # ACK immediately to get next frame (backpressure)
+        asyncio.create_task(self._ack_and_send(session_id, b64_data))
+
+    async def _ack_and_send(self, session_id: int, b64_data: str):
+        try:
+            # ACK the frame so CDP sends the next one
+            if self._cdp:
+                await self._cdp.send("Page.screencastFrameAck", {"sessionId": session_id})
+        except Exception:
+            pass
+        try:
+            await self.ws.send_json({
+                "type": "screenshot",
+                "image": b64_data,
+                "format": "jpeg",
             })
         except Exception:
-            pass  # page may be navigating — skip frame
-        await asyncio.sleep(interval)
+            pass
+
+    async def _poll_loop(self):
+        """Fallback: screenshot polling at 6 FPS if CDP is unavailable."""
+        interval = 1.0 / 6
+        while not self._stop_event.is_set():
+            try:
+                jpg_bytes = await self.page.screenshot(type="jpeg", quality=55)
+                b64 = base64.b64encode(jpg_bytes).decode("ascii")
+                await self.ws.send_json({
+                    "type": "screenshot",
+                    "image": b64,
+                    "format": "jpeg",
+                })
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
 
 
 async def _send_state(websocket: WebSocket, page, tab_manager):
