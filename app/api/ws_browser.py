@@ -280,17 +280,22 @@ BROWSER_SYSTEM_PROMPT = """You are an AI browser agent controlling a REAL web br
 - For shopping: go to the store website, search, and find actual product listings with prices.
 - Google search snippets and AI Overviews are NOT a substitute for using the website.
 
-## HANDLE POPUPS FIRST:
-Before interacting with a page, dismiss any visible popups:
+## HANDLE POPUPS AND OVERLAYS FIRST:
+Before interacting with a page, dismiss ANY visible popups or promotional overlays:
 - Cookie/privacy banners → click "Accept" or "Accept All" (NEVER "Cookie preferences" or "Manage")
-- Modal dialogs/overlays → click "Close" or the X button
+- Promotional overlays/banners (e.g. "Try AI powered Flight Deals", "What's new") → click "Got it", "Dismiss", "Close", "No thanks", or the X button
+- Modal dialogs → click "Close" or the X button
+- If a promotional overlay is covering the page, you MUST close it FIRST before filling any forms
+- LOOK at the screenshot — if there is ANY overlay/modal/banner on top of the form, dismiss it before typing
 
 ## RULES:
-1. LOOK at the screenshot FIRST. It shows EXACTLY what's on screen.
-2. NEVER navigate away from a page you're working on. Stay on the current site.
-3. ONE action at a time. Screenshot → one action → next screenshot → repeat.
-4. Use the interactive elements list AND screenshot together.
-5. ALWAYS use a tool — never just talk.
+1. LOOK at the screenshot CAREFULLY before EVERY action. Analyze what is ACTUALLY visible — are there any overlays, popups, promotional banners covering the form? If yes, dismiss them FIRST.
+2. UNDERSTAND THE FULL TASK before starting. Break it down: e.g. "find YYZ to DXB flight on March 19" means: (a) navigate to flights site, (b) fill "From" field, (c) fill "To" field, (d) set date, (e) search, (f) read results.
+3. NEVER navigate away from a page you're working on. Stay on the current site.
+4. ONE action at a time. Screenshot → analyze what you see → one action → next screenshot → repeat.
+5. Use the interactive elements list AND screenshot together.
+6. ALWAYS use a tool — never just talk.
+7. READ FIELD LABELS CAREFULLY. "Where from?" is origin. "Where to?" is destination. "Departure" is date. "Return" is return date. Do NOT confuse them.
 
 ## Tools:
 - `click` — use `selector` (CSS preferred), `text` (visible text), or `index` (from elements list)
@@ -514,6 +519,27 @@ async def _auto_dismiss_popups(page):
                 return rejectWords.some(w => t.includes(w));
             }
 
+            // Google Flights promotional overlay ("Try AI powered Flight Deals")
+            // These overlays have "Got it" or dismiss buttons
+            const promoSelectors = [
+                'button[jsname][data-idom-class]',  // Google's Material buttons in promo dialogs
+                '[role="dialog"] button',
+                '.modal button',
+                '[class*="promo"] button',
+                '[class*="overlay"] button',
+            ];
+            for (const sel of promoSelectors) {
+                const btns = document.querySelectorAll(sel);
+                for (const btn of btns) {
+                    const text = (btn.textContent || '').trim().toLowerCase();
+                    if (btn.offsetParent !== null && (text === 'got it' || text === 'no thanks' || text === 'dismiss' || text === 'not now' || text === 'skip' || text === 'maybe later')) {
+                        btn.click();
+                        dismissed.push('promo-dismiss: ' + text);
+                        return dismissed;
+                    }
+                }
+            }
+
             // High-priority: known accept button IDs/selectors
             const acceptSelectors = [
                 '#onetrust-accept-btn-handler',
@@ -631,7 +657,10 @@ async def _exec_browser_tool(
             await asyncio.sleep(2.0)
             await _auto_dismiss_popups(page)
             # Third pass: catch any remaining layers
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.5)
+            await _auto_dismiss_popups(page)
+            # Fourth pass: late-loading promo overlays (Google Flights, etc.)
+            await asyncio.sleep(2.0)
             await _auto_dismiss_popups(page)
 
             await overlay.inject()
