@@ -243,9 +243,12 @@ class AnthropicService:
                     if block.type == "text":
                         text_parts.append(block.text)
                     elif block.type == "tool_use":
+                        # Reverse-map CC tool names back to original names
+                        original_name = reverse_map.get(block.name, block.name) if reverse_map else block.name
                         tool_calls.append({
                             "id": block.id,
-                            "name": block.name,
+                            "name": original_name,
+                            "cc_name": block.name,  # Keep CC name for conversation
                             "input": block.input,
                         })
                 
