@@ -870,51 +870,97 @@ async def _exec_browser_tool(
             if _is_airport_field and _is_flights_page and not press_enter:
                 try:
                     _typed_lower = text_to_type.lower().strip()
+                    _typed_upper = text_to_type.upper().strip()
 
-                    # Wait a bit more for autocomplete results to load (nearby airports appear first)
+                    # Wait for autocomplete suggestions to appear
                     await asyncio.sleep(0.5)
 
-                    # Strategy 1: Click item that contains the typed text (most reliable)
+                    # Strategy 1: Use broad JS search across ALL clickable elements (not just li[role=option])
+                    # Google Flights uses various container types for airport suggestions
                     _ac_result = await page.evaluate("""(typedText) => {
                         const typed = typedText.toLowerCase();
-                        const allOptions = document.querySelectorAll('li[role="option"], ul[role="listbox"] li');
-                        const matching = [...allOptions].filter(el => {
+                        // Search broadly: any element that contains the typed text and looks like a suggestion
+                        const allElements = document.querySelectorAll('li, [role="option"], [data-ved], [jsname]');
+                        for (const el of allElements) {
                             const txt = el.textContent.trim().toLowerCase();
-                            return txt.length > 5 && txt.includes(typed);
-                        });
-                        if (matching.length > 0) {
-                            const first = matching[0];
-                            const text = first.textContent.trim().substring(0, 100);
-                            first.click();
-                            return 'MATCH:' + text;
+                            // Must contain the typed text AND be longer (actual airport name)
+                            if (txt.length > 10 && txt.includes(typed) && txt.includes('airport')) {
+                                el.click();
+                                return 'MATCH:' + el.textContent.trim().substring(0, 120);
+                            }
                         }
-                        const items = [...allOptions].map(el => el.textContent.trim().substring(0, 50));
-                        return 'NONE:' + items.join(' | ');
+                        // Strategy 2: find any element containing the 3-letter code in parentheses
+                        const codeUpper = typedText.toUpperCase();
+                        if (codeUpper.length === 3) {
+                            for (const el of allElements) {
+                                const txt = el.textContent.trim();
+                                if (txt.includes(codeUpper) && txt.length > 5 && txt.length < 200) {
+                                    // Verify it's not a trip type / cabin class item
+                                    const lower = txt.toLowerCase();
+                                    if (lower.includes('airport') || lower.includes('international') ||
+                                        lower.includes('city') || lower.includes('terminal')) {
+                                        el.click();
+                                        return 'CODE:' + txt.substring(0, 120);
+                                    }
+                                }
+                            }
+                        }
+                        // Debug: list what we can see
+                        const visible = [];
+                        for (const el of document.querySelectorAll('li, [role="option"]')) {
+                            const t = el.textContent.trim().substring(0, 60);
+                            if (t.length > 2 && !visible.includes(t)) visible.push(t);
+                            if (visible.length >= 10) break;
+                        }
+                        return 'NONE:' + visible.join(' | ');
                     }""", _typed_lower)
 
-                    if _ac_result.startswith("MATCH:"):
-                        _autocomplete_clicked = _ac_result[6:]
-                        logger.warning("[TYPE_TEXT] Auto-clicked airport match: %s", _autocomplete_clicked[:100])
+                    if _ac_result.startswith("MATCH:") or _ac_result.startswith("CODE:"):
+                        _autocomplete_clicked = _ac_result.split(":", 1)[1]
+                        logger.warning("[TYPE_TEXT] Auto-clicked airport: %s", _autocomplete_clicked[:120])
                         await asyncio.sleep(random.uniform(0.3, 0.5))
                         await _wait_stable(page)
                     else:
-                        # Strategy 2: Use keyboard to select — more reliable than DOM clicking
-                        # Press Enter to select the first autocomplete suggestion
-                        logger.warning("[TYPE_TEXT] No DOM match for '%s' (%s). Using keyboard Enter to select first suggestion.", text_to_type, _ac_result[:150])
-                        await page.keyboard.press("Enter")
-                        await asyncio.sleep(random.uniform(0.5, 0.8))
-                        await _wait_stable(page)
+                        # Strategy 3: Use Playwright text locator (more reliable for Angular-rendered content)
+                        logger.warning("[TYPE_TEXT] JS search failed for '%s' (%s). Trying Playwright text locator...", text_to_type, _ac_result[:150])
+                        try:
+                            # For 3-letter codes, search by the full airport name patterns
+                            _search_texts = []
+                            _code_to_city = {
+                                "YYZ": "Toronto", "DXB": "Dubai", "LHR": "London", "JFK": "New York",
+                                "LAX": "Los Angeles", "CDG": "Paris", "NRT": "Tokyo", "SIN": "Singapore",
+                                "HKG": "Hong Kong", "SYD": "Sydney", "FRA": "Frankfurt", "IST": "Istanbul",
+                                "BKK": "Bangkok", "DEL": "Delhi", "MUC": "Munich", "AMS": "Amsterdam",
+                                "BCN": "Barcelona", "FCO": "Rome", "ICN": "Seoul", "DOH": "Doha",
+                                "KUL": "Kuala Lumpur", "MEX": "Mexico", "YUL": "Montreal", "YVR": "Vancouver",
+                            }
+                            if _typed_upper in _code_to_city:
+                                _city = _code_to_city[_typed_upper]
+                                _search_texts = [f"{_city}", f"{_typed_upper}"]
+                            else:
+                                _search_texts = [text_to_type]
 
-                        # Check if the field now contains the expected value
-                        _field_val = await page.evaluate(f"""() => {{
-                            const el = document.querySelector('{selector}');
-                            return el ? el.value : '';
-                        }}""") if selector else ""
-                        if _field_val:
-                            _autocomplete_clicked = f"(keyboard Enter) → {_field_val}"
-                            logger.warning("[TYPE_TEXT] Keyboard Enter selected: %s", _field_val[:80])
-                        else:
-                            logger.warning("[TYPE_TEXT] Keyboard Enter did not select any airport for '%s'", text_to_type)
+                            _clicked = False
+                            for _st in _search_texts:
+                                try:
+                                    _loc = page.get_by_text(_st, exact=False).first
+                                    _loc_text = await _loc.text_content(timeout=2000)
+                                    # Verify it's an airport suggestion (not a button or other element)
+                                    if _loc_text and len(_loc_text) > 10 and any(w in _loc_text.lower() for w in ["airport", "international", _typed_lower]):
+                                        await _loc.click(timeout=3000)
+                                        _autocomplete_clicked = _loc_text[:100]
+                                        _clicked = True
+                                        logger.warning("[TYPE_TEXT] Playwright text click: %s", _autocomplete_clicked[:100])
+                                        await asyncio.sleep(random.uniform(0.3, 0.5))
+                                        await _wait_stable(page)
+                                        break
+                                except Exception:
+                                    continue
+
+                            if not _clicked:
+                                logger.warning("[TYPE_TEXT] All autocomplete strategies failed for '%s'", text_to_type)
+                        except Exception as _pw_err:
+                            logger.warning("[TYPE_TEXT] Playwright autocomplete failed: %s", _pw_err)
                 except Exception as _ac_err:
                     logger.warning("[TYPE_TEXT] Autocomplete auto-select failed: %s", _ac_err)
 
