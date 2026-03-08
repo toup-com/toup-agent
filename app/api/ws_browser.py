@@ -926,17 +926,19 @@ async def _screenshot_stream_loop(
     page,
     overlay: AgentOverlay,
     stop_event: asyncio.Event,
-    fps: float = 3,
+    fps: float = 8,
 ):
     """Stream screenshots at ~fps while the agent is working, giving live view."""
     interval = 1.0 / fps
     while not stop_event.is_set():
         try:
-            png_bytes = await page.screenshot(type="png")
-            b64 = base64.b64encode(png_bytes).decode("ascii")
+            # JPEG for streaming — 5-10x smaller/faster than PNG
+            jpg_bytes = await page.screenshot(type="jpeg", quality=55)
+            b64 = base64.b64encode(jpg_bytes).decode("ascii")
             await websocket.send_json({
                 "type": "screenshot",
                 "image": b64,
+                "format": "jpeg",
                 "cursor": {"x": overlay.x, "y": overlay.y},
             })
         except Exception:
