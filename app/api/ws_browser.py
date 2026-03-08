@@ -287,13 +287,14 @@ Before interacting with a page, dismiss ANY visible popups or promotional overla
 
 ## RULES:
 1. LOOK at the screenshot CAREFULLY before EVERY action. Overlays covering the form? Dismiss FIRST.
-2. NEVER click hamburger menus or "Main menu" — only interact with FORM elements.
-3. NEVER navigate away from a page you're working on. Stay on the current site.
-4. ONE action at a time. Screenshot → analyze → one action → next screenshot → repeat.
-5. Use the interactive elements list AND screenshot together.
-6. ALWAYS use a tool — never just talk.
-7. READ FIELD LABELS CAREFULLY before clicking.
-8. If you can't see the full form, SCROLL UP first.
+2. NEVER click hamburger menus, "Main menu", "Sign In", or account/profile links — only interact with FORM elements.
+3. NEVER navigate away from a page you're working on. Stay on the current site. If you accidentally navigate away, go back immediately.
+4. DROPDOWNS require TWO clicks: first click the current value (to OPEN the dropdown), then click the desired option from the list.
+5. ONE action at a time. Screenshot → analyze → one action → next screenshot → repeat.
+6. Use the interactive elements list AND screenshot together.
+7. ALWAYS use a tool — never just talk.
+8. READ FIELD LABELS CAREFULLY before clicking.
+9. If you can't see the full form, SCROLL UP first.
 
 ## Tools:
 - `click` — use `selector` (CSS preferred), `text` (visible text), or `index` (from elements list)
@@ -509,24 +510,40 @@ async def _auto_dismiss_popups(page):
                 return rejectWords.some(w => t.includes(w));
             }
 
-            // Google Flights promotional overlay ("Try AI powered Flight Deals")
-            // These overlays have "Got it" or dismiss buttons
-            const promoSelectors = [
-                'button[jsname][data-idom-class]',  // Google's Material buttons in promo dialogs
-                '[role="dialog"] button',
-                '.modal button',
-                '[class*="promo"] button',
-                '[class*="overlay"] button',
-            ];
-            for (const sel of promoSelectors) {
-                const btns = document.querySelectorAll(sel);
-                for (const btn of btns) {
-                    const text = (btn.textContent || '').trim().toLowerCase();
-                    if (btn.offsetParent !== null && (text === 'got it' || text === 'no thanks' || text === 'dismiss' || text === 'not now' || text === 'skip' || text === 'maybe later')) {
-                        btn.click();
-                        dismissed.push('promo-dismiss: ' + text);
-                        return dismissed;
+            // Promotional overlays — ONLY match elements that are clearly
+            // full-screen/modal overlays, NOT trip type dropdowns or menus.
+            // Strategy: find buttons with dismiss-like text ONLY inside elements
+            // that look like promotional overlays (large, covering viewport).
+            const dismissTexts = new Set(['got it', 'no thanks', 'dismiss', 'not now', 'skip', 'maybe later']);
+            const allBtns = document.querySelectorAll('button, [role="button"]');
+            for (const btn of allBtns) {
+                const text = (btn.textContent || '').trim().toLowerCase();
+                if (!dismissTexts.has(text)) continue;
+                if (btn.offsetParent === null) continue;
+                // Check if this button is inside a promo/modal overlay
+                // (ancestor that covers >50% of viewport OR has promo-like classes)
+                let isPromo = false;
+                let el = btn.parentElement;
+                while (el && el !== document.body) {
+                    const cls = (el.className || '').toString().toLowerCase();
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    // Check for overlay-like classes
+                    if (cls.match(/promo|overlay|banner|modal|consent|cookie|popup|interstitial/)) {
+                        isPromo = true; break;
                     }
+                    // Check for full-screen overlay (covers >40% of viewport)
+                    if (role === 'dialog' || role === 'alertdialog') {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > window.innerWidth * 0.4 && r.height > window.innerHeight * 0.3) {
+                            isPromo = true; break;
+                        }
+                    }
+                    el = el.parentElement;
+                }
+                if (isPromo) {
+                    btn.click();
+                    dismissed.push('promo-dismiss: ' + text);
+                    return dismissed;
                 }
             }
 
@@ -554,19 +571,21 @@ async def _auto_dismiss_popups(page):
             }
 
             // Text-based: find visible buttons with accept-like text
-            // Priority order matters — try most specific first
-            const acceptTexts = [
+            // SAFE texts — specific enough to not match legitimate UI
+            const safeAcceptTexts = [
                 'accept all', 'accept cookies', 'accept all cookies',
                 'allow all', 'allow all cookies', 'i agree',
                 'accept', 'agree', 'allow',
-                'got it', 'ok', 'dismiss',
                 'save & continue', 'save and continue',
-                'continue',
             ];
+            // UNSAFE texts — only match these inside cookie/consent containers
+            const unsafeAcceptTexts = ['got it', 'ok', 'dismiss', 'continue'];
 
-            const allButtons = document.querySelectorAll('button, a[role="button"], [class*="btn"], [role="button"]');
-            for (const acceptText of acceptTexts) {
-                for (const btn of allButtons) {
+            const allButtons2 = document.querySelectorAll('button, a[role="button"], [class*="btn"], [role="button"]');
+
+            // First pass: safe texts (match anywhere)
+            for (const acceptText of safeAcceptTexts) {
+                for (const btn of allButtons2) {
                     const text = (btn.textContent || '').trim().toLowerCase();
                     if (text.length > 40) continue;
                     if (isRejectButton(text)) continue;
@@ -574,6 +593,34 @@ async def _auto_dismiss_popups(page):
                         if (btn.offsetParent !== null) {
                             btn.click();
                             dismissed.push('text: ' + text);
+                            return dismissed;
+                        }
+                    }
+                }
+            }
+
+            // Second pass: unsafe texts — ONLY inside cookie/consent/overlay containers
+            for (const acceptText of unsafeAcceptTexts) {
+                for (const btn of allButtons2) {
+                    const text = (btn.textContent || '').trim().toLowerCase();
+                    if (text.length > 40) continue;
+                    if (isRejectButton(text)) continue;
+                    if (text === acceptText || text.startsWith(acceptText + ' ')) {
+                        if (btn.offsetParent === null) continue;
+                        // Check ancestor for consent/cookie context
+                        let inConsent = false;
+                        let anc = btn.parentElement;
+                        while (anc && anc !== document.body) {
+                            const cls = (anc.className || '').toString().toLowerCase();
+                            const id = (anc.id || '').toLowerCase();
+                            if ((cls + id).match(/cookie|consent|gdpr|privacy|banner|overlay|promo|popup|interstitial/)) {
+                                inConsent = true; break;
+                            }
+                            anc = anc.parentElement;
+                        }
+                        if (inConsent) {
+                            btn.click();
+                            dismissed.push('text-consent: ' + text);
                             return dismissed;
                         }
                     }
@@ -1144,6 +1191,27 @@ async def _run_browser_agent_inner(
                     _post_url = page.url
                     if fn_name != "navigate" and _post_url != _cur_url:
                         logger.warning("[STEP %d] ⚠️ URL CHANGED unexpectedly: %s → %s", step + 1, _cur_url, _post_url)
+
+                    # ── URL-based recovery: auto-navigate back if agent landed on wrong page ──
+                    _wrong_page_patterns = [
+                        ("/travel/flights/deals", "https://www.google.com/travel/flights"),
+                        ("/travel/flights/explore", "https://www.google.com/travel/flights"),
+                        ("accounts.google.com/", _cur_url),  # Sign-in redirect → go back to where we were
+                    ]
+                    for _bad_pattern, _recovery_url in _wrong_page_patterns:
+                        if _bad_pattern in (_post_url or "") and fn_name != "navigate":
+                            logger.warning("[STEP %d] 🔄 AUTO-RECOVERY: wrong page '%s' detected, navigating back to %s",
+                                           step + 1, _bad_pattern, _recovery_url)
+                            try:
+                                await page.goto(_recovery_url, wait_until="domcontentloaded", timeout=15_000)
+                            except Exception:
+                                pass
+                            await _wait_stable(page)
+                            await asyncio.sleep(1.0)
+                            await _auto_dismiss_popups(page)
+                            await overlay.inject()
+                            result = f"[AUTO-RECOVERY] You accidentally navigated to {_post_url}. Navigated back to {_recovery_url}. Continue with your task from here.\n\n" + await _analyze_page(page)
+                            break
                 except Exception:
                     pass
 
@@ -1187,10 +1255,31 @@ async def _run_browser_agent_inner(
                 await _send_state(websocket, page, tab_manager)
 
                 if fn_name == "done":
-                    logger.warning("[STEP %d] ✅ TASK COMPLETE: %s", step + 1, fn_args.get("summary", "")[:300])
+                    _summary = fn_args.get("summary", "Task completed.")
+                    _summary_lower = _summary.lower()
+                    # ── Failure detection: if agent tries to give up, force retry ──
+                    _failure_words = ["could not", "couldn't", "unable to", "failed to", "sorry",
+                                      "not able", "cannot", "can't", "wasn't able", "didn't work",
+                                      "encountered an error", "blocked", "captcha"]
+                    _is_failure = any(fw in _summary_lower for fw in _failure_words)
+                    if _is_failure and step < max_steps - 3:
+                        logger.warning("[STEP %d] ❌ AGENT TRIED TO GIVE UP: %s — forcing retry", step + 1, _summary[:200])
+                        # Remove the done tool result from conversation and inject retry message
+                        conversation.pop()  # Remove tool result
+                        conversation.pop()  # Remove assistant message with tool call
+                        conversation.append({
+                            "role": "user",
+                            "content": f"[SYSTEM] Do NOT give up. Your previous attempt failed: '{_summary[:200]}'. Try a DIFFERENT approach:\n"
+                                       f"1. Navigate directly to the target URL if you haven't already\n"
+                                       f"2. Try different selectors or scroll to find elements\n"
+                                       f"3. If current site is blocked, try an alternative website\n"
+                                       f"Continue working — do NOT call done() until you have actual results.",
+                        })
+                        continue
+                    logger.warning("[STEP %d] ✅ TASK COMPLETE: %s", step + 1, _summary[:300])
                     await websocket.send_json({
                         "type": "agent_message",
-                        "content": fn_args.get("summary", "Task completed."),
+                        "content": _summary,
                     })
                     return
 
