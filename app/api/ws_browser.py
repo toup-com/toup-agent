@@ -862,21 +862,22 @@ async def _exec_browser_tool(
             if press_enter:
                 await _wait_stable(page)
 
-            # ── Auto-click autocomplete for airport fields on Google Flights ──
+            # ── Auto-select autocomplete for airport fields on Google Flights ──
             _autocomplete_clicked = ""
             _cur_url = page.url or ""
             _is_airport_field = selector and ("where from" in (selector or "").lower() or "where to" in (selector or "").lower())
             _is_flights_page = "google.com/travel/flights" in _cur_url
             if _is_airport_field and _is_flights_page and not press_enter:
                 try:
-                    # Strategy: find the autocomplete suggestion that CONTAINS what we typed
-                    # This avoids clicking trip type/cabin class dropdown items
-                    _typed_upper = text_to_type.upper().strip()
+                    _typed_lower = text_to_type.lower().strip()
+
+                    # Wait a bit more for autocomplete results to load (nearby airports appear first)
+                    await asyncio.sleep(0.5)
+
+                    # Strategy 1: Click item that contains the typed text (most reliable)
                     _ac_result = await page.evaluate("""(typedText) => {
                         const typed = typedText.toLowerCase();
-                        // Find all list items with role=option
                         const allOptions = document.querySelectorAll('li[role="option"], ul[role="listbox"] li');
-                        // Strategy 1: find items containing the typed text (airport code/city name)
                         const matching = [...allOptions].filter(el => {
                             const txt = el.textContent.trim().toLowerCase();
                             return txt.length > 5 && txt.includes(typed);
@@ -887,30 +888,35 @@ async def _exec_browser_tool(
                             first.click();
                             return 'MATCH:' + text;
                         }
-                        // Strategy 2: find items containing "airport" or "international"
-                        const airportItems = [...allOptions].filter(el => {
-                            const txt = el.textContent.trim().toLowerCase();
-                            return txt.length > 10 && (txt.includes('airport') || txt.includes('international') || txt.includes('intl'));
-                        });
-                        if (airportItems.length > 0) {
-                            const first = airportItems[0];
-                            const text = first.textContent.trim().substring(0, 100);
-                            first.click();
-                            return 'AIRPORT:' + text;
-                        }
-                        // Debug: log what items ARE visible
                         const items = [...allOptions].map(el => el.textContent.trim().substring(0, 50));
                         return 'NONE:' + items.join(' | ');
-                    }""", _typed_upper)
-                    if _ac_result.startswith("MATCH:") or _ac_result.startswith("AIRPORT:"):
-                        _autocomplete_clicked = _ac_result.split(":", 1)[1]
-                        logger.warning("[TYPE_TEXT] Auto-clicked airport autocomplete: %s", _autocomplete_clicked[:100])
-                        await asyncio.sleep(random.uniform(0.5, 0.8))
+                    }""", _typed_lower)
+
+                    if _ac_result.startswith("MATCH:"):
+                        _autocomplete_clicked = _ac_result[6:]
+                        logger.warning("[TYPE_TEXT] Auto-clicked airport match: %s", _autocomplete_clicked[:100])
+                        await asyncio.sleep(random.uniform(0.3, 0.5))
                         await _wait_stable(page)
                     else:
-                        logger.warning("[TYPE_TEXT] No airport autocomplete match for '%s'. Visible items: %s", text_to_type, _ac_result[:200])
+                        # Strategy 2: Use keyboard to select — more reliable than DOM clicking
+                        # Press Enter to select the first autocomplete suggestion
+                        logger.warning("[TYPE_TEXT] No DOM match for '%s' (%s). Using keyboard Enter to select first suggestion.", text_to_type, _ac_result[:150])
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(random.uniform(0.5, 0.8))
+                        await _wait_stable(page)
+
+                        # Check if the field now contains the expected value
+                        _field_val = await page.evaluate(f"""() => {{
+                            const el = document.querySelector('{selector}');
+                            return el ? el.value : '';
+                        }}""") if selector else ""
+                        if _field_val:
+                            _autocomplete_clicked = f"(keyboard Enter) → {_field_val}"
+                            logger.warning("[TYPE_TEXT] Keyboard Enter selected: %s", _field_val[:80])
+                        else:
+                            logger.warning("[TYPE_TEXT] Keyboard Enter did not select any airport for '%s'", text_to_type)
                 except Exception as _ac_err:
-                    logger.warning("[TYPE_TEXT] Autocomplete auto-click failed: %s", _ac_err)
+                    logger.warning("[TYPE_TEXT] Autocomplete auto-select failed: %s", _ac_err)
 
             await overlay.inject()
 
