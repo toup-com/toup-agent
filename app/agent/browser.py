@@ -1001,22 +1001,45 @@ async def get_text_element_center(page, text: str) -> Optional[Tuple[float, floa
     try:
         box = await page.evaluate("""(text) => {
             const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            const isShort = text.length <= 3;  // Calendar dates, short labels
+            let bestMatch = null;
+            let bestLen = Infinity;
             while (walker.nextNode()) {
                 const node = walker.currentNode;
-                if (node.textContent && node.textContent.trim().toLowerCase().includes(text.toLowerCase())) {
+                const nodeText = (node.textContent || '').trim();
+                if (!nodeText) continue;
+                const lowerNode = nodeText.toLowerCase();
+                const lowerSearch = text.toLowerCase();
+                // For short text (dates like "19"), prefer exact match to avoid
+                // matching "19" inside "$619" or "2019"
+                let matches = false;
+                if (isShort) {
+                    // Exact match or starts with the number (e.g. "19\n$614")
+                    matches = lowerNode === lowerSearch ||
+                              lowerNode.startsWith(lowerSearch + '\\n') ||
+                              lowerNode.startsWith(lowerSearch + ' ');
+                } else {
+                    matches = lowerNode.includes(lowerSearch);
+                }
+                if (matches) {
                     const el = node.parentElement;
                     if (el) {
                         const r = el.getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) {
-                            return {
-                                x: r.left + r.width / 2 + (Math.random() - 0.5) * Math.min(r.width * 0.3, 8),
-                                y: r.top + r.height / 2 + (Math.random() - 0.5) * Math.min(r.height * 0.3, 4)
-                            };
+                        if (r.width > 0 && r.height > 0 && r.width < 800) {
+                            // Prefer the smallest matching element (most specific)
+                            const area = r.width * r.height;
+                            if (area < bestLen) {
+                                bestLen = area;
+                                bestMatch = {
+                                    x: r.left + r.width / 2,
+                                    y: r.top + r.height / 2
+                                };
+                            }
                         }
                     }
                 }
             }
-            return null;
+            return bestMatch;
         }""", text)
         if box:
             return (box["x"], box["y"])
