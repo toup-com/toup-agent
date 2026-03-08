@@ -294,11 +294,20 @@ You MUST dismiss ALL visible popups before interacting with the page behind them
 - `wait` — wait for page to load/update
 - `done` — call with summary when task is complete
 
+## AUTOCOMPLETE FIELDS (CRITICAL — airports, cities, etc.):
+When typing in a search/autocomplete field (like Google Flights, Skyscanner, etc.):
+1. Click the input field first
+2. Type the search text (e.g. "Toronto")
+3. STOP — do NOT move to the next field yet
+4. Look at the NEXT screenshot — you will see a dropdown with suggestions
+5. CLICK the correct suggestion from the dropdown list
+6. Only AFTER clicking the suggestion, move to the next field
+If you skip step 5 and just move on, the field won't be properly filled!
+
 ## Forms (flights, bookings, etc.):
-- Click each field, type the value, then move to next
-- Date pickers: click the correct date in the calendar directly
-- Dropdowns/autocomplete: type, wait for suggestions, click the right one
-- After filling all fields, click search/submit
+- For each field: click → type → WAIT for dropdown → click suggestion → next field
+- Date pickers: click the date field, then click the correct date in the calendar
+- After filling ALL fields, click the search/submit button
 
 ## Other rules:
 - STAY on the current website until done
@@ -713,15 +722,16 @@ async def _exec_browser_tool(
                     await asyncio.sleep(random.uniform(0.1, 0.3))
                     await page.keyboard.press("Enter")
 
-            await asyncio.sleep(random.uniform(0.15, 0.35))
+            # Wait for autocomplete/dropdown to appear after typing
+            await asyncio.sleep(random.uniform(0.8, 1.2))
             if press_enter:
                 await _wait_stable(page)
-                await overlay.inject()
+            await overlay.inject()
 
             result = f"Typed '{text_to_type[:60]}'" + (" + Enter" if press_enter else "")
-            if press_enter:
-                analysis = await _analyze_page(page)
-                result += f"\n\n{analysis}"
+            # ALWAYS analyze page after typing — LLM needs to see dropdown suggestions
+            analysis = await _analyze_page(page)
+            result += f"\n\nLOOK at the screenshot — if you see a dropdown/autocomplete list, click the correct suggestion BEFORE moving to the next field.\n\n{analysis}"
             return result
 
         elif name == "scroll":
@@ -925,7 +935,8 @@ async def _run_browser_agent_inner(
                     })
 
                 # Vision: attach screenshot for visual actions so LLM sees the page
-                _visual_actions = {"navigate", "click", "scroll", "go_back"}
+                # type_text included — LLM must see autocomplete dropdowns after typing
+                _visual_actions = {"navigate", "click", "scroll", "go_back", "type_text"}
                 if fn_name in _visual_actions:
                     try:
                         _snap = await page.screenshot(type="png")
