@@ -24,20 +24,25 @@ Use the `select_dropdown` tool to change the trip type:
 ### Step 3: Fill Origin ("Where from?")
 - Click the input field labeled "Where from?"
 - Type the origin airport code (e.g. "YYZ")
-- Wait for autocomplete dropdown to appear
-- Click the correct airport suggestion (e.g. "Toronto Pearson International Airport")
-- Verify it appears in the field before moving on
+- **WAIT** for the autocomplete dropdown to appear (look at the screenshot!)
+- **CLICK** the correct airport suggestion (e.g. "Toronto Pearson International Airport")
+- **VERIFY** it appears in the field before moving on
+- ⚠️ Do NOT skip clicking the autocomplete! The airport is not set until you click the suggestion.
 
 ### Step 4: Fill Destination ("Where to?")
 - Click the input field labeled "Where to?" — this is NEXT to origin, NOT the date field
 - Type the destination airport code (e.g. "DXB")
-- Wait for autocomplete → click correct suggestion
-- Verify it appears in the field
+- **WAIT** for the autocomplete dropdown to appear (look at the screenshot!)
+- **CLICK** the correct airport suggestion (e.g. "Dubai International Airport")
+- **VERIFY** it appears in the field
+- ⚠️ Do NOT skip clicking the autocomplete! The airport is not set until you click the suggestion.
+- ⚠️ Do NOT move to the date field until you have confirmed the destination is set.
 
 ### Step 5: Set Departure Date
 - Click the "Departure" date field to open the calendar
-- Use the `select_date` tool with YYYY-MM-DD format
-- Click "Done" to confirm
+- Use the `select_date` tool with YYYY-MM-DD format (e.g. "2026-03-27")
+- Click "Done" to confirm the date
+- ⚠️ ONLY use the `select_date` tool. Do NOT try to click calendar day numbers manually.
 
 ### Step 6: Set Return Date (if round-trip)
 - Click "Return" field → use `select_date` → click "Done"

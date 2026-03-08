@@ -967,19 +967,45 @@ async def _exec_browser_tool(
             logger.warning("[SELECT_DROPDOWN] Clicking trigger: '%s'", trigger)
             trigger_target = await get_text_element_center(page, trigger)
             if trigger_target:
+                logger.warning("[SELECT_DROPDOWN] Found trigger at (%d, %d)", trigger_target[0], trigger_target[1])
                 await human_click(page, trigger_target[0], trigger_target[1], from_pos=cursor_pos)
                 overlay.x, overlay.y = int(trigger_target[0]), int(trigger_target[1])
             else:
-                # Fallback: try Playwright locator
+                logger.warning("[SELECT_DROPDOWN] Text match failed for trigger '%s', trying fallbacks", trigger)
+                # Fallback 1: Playwright text locator
+                _trigger_clicked = False
                 try:
                     loc = page.get_by_text(trigger, exact=True).first
                     await loc.click(timeout=3_000)
+                    _trigger_clicked = True
+                    logger.warning("[SELECT_DROPDOWN] Trigger clicked via exact text locator")
                 except Exception:
                     try:
                         loc = page.get_by_text(trigger, exact=False).first
                         await loc.click(timeout=3_000)
-                    except Exception as e:
-                        return f"ERROR: Could not click dropdown trigger '{trigger}': {e}"
+                        _trigger_clicked = True
+                        logger.warning("[SELECT_DROPDOWN] Trigger clicked via fuzzy text locator")
+                    except Exception:
+                        pass
+
+                # Fallback 2: aria-label selector (for Google Flights trip type button)
+                if not _trigger_clicked:
+                    _aria_selectors = [
+                        f'button[aria-label*="{trigger}" i]',
+                        f'[role="button"][aria-label*="{trigger}" i]',
+                        f'button[aria-label*="trip" i]',  # Google Flights specific
+                    ]
+                    for _sel in _aria_selectors:
+                        try:
+                            await page.click(_sel, timeout=2_000)
+                            _trigger_clicked = True
+                            logger.warning("[SELECT_DROPDOWN] Trigger clicked via selector: %s", _sel)
+                            break
+                        except Exception:
+                            continue
+
+                if not _trigger_clicked:
+                    return f"ERROR: Could not click dropdown trigger '{trigger}'"
 
             # Step 2: Wait for dropdown to appear (crucial timing)
             await asyncio.sleep(random.uniform(0.4, 0.7))
@@ -987,37 +1013,66 @@ async def _exec_browser_tool(
             # Step 3: Click the option from the now-open dropdown
             logger.warning("[SELECT_DROPDOWN] Clicking option: '%s'", option)
             option_target = await get_text_element_center(page, option)
+            _option_clicked = False
             if option_target:
+                logger.warning("[SELECT_DROPDOWN] Found option at (%d, %d)", option_target[0], option_target[1])
                 await human_click(page, option_target[0], option_target[1],
                                   from_pos=(overlay.x, overlay.y))
                 overlay.x, overlay.y = int(option_target[0]), int(option_target[1])
                 await overlay.click_ripple(int(option_target[0]), int(option_target[1]))
+                _option_clicked = True
             else:
-                # Fallback: try Playwright locator with short timeout
+                logger.warning("[SELECT_DROPDOWN] Text match failed for option '%s', trying fallbacks", option)
+                # Fallback 1: Playwright locator
                 try:
                     loc = page.get_by_text(option, exact=True).first
                     await loc.click(timeout=2_000)
+                    _option_clicked = True
+                    logger.warning("[SELECT_DROPDOWN] Option clicked via exact text locator")
                 except Exception:
-                    # Last resort: use JavaScript to find and click in the dropdown
+                    try:
+                        loc = page.get_by_text(option, exact=False).first
+                        await loc.click(timeout=2_000)
+                        _option_clicked = True
+                        logger.warning("[SELECT_DROPDOWN] Option clicked via fuzzy text locator")
+                    except Exception:
+                        pass
+
+                # Fallback 2: JavaScript DOM search (case-insensitive)
+                if not _option_clicked:
                     try:
                         clicked = await page.evaluate("""(optionText) => {
-                            // Look for visible elements matching the option text
+                            const optLower = optionText.toLowerCase();
                             const els = document.querySelectorAll(
-                                '[role="option"], [role="menuitem"], [role="listbox"] *, li, [class*="menu"] *'
+                                '[role="option"], [role="menuitem"], [role="listbox"] *, li, [class*="menu"] *, [class*="dropdown"] *'
                             );
                             for (const el of els) {
-                                const text = (el.textContent || '').trim();
-                                if (text === optionText && el.offsetParent !== null) {
+                                const text = (el.textContent || '').trim().toLowerCase();
+                                if (text === optLower && el.offsetParent !== null) {
+                                    el.click();
+                                    return true;
+                                }
+                            }
+                            // Partial match fallback
+                            for (const el of els) {
+                                const text = (el.textContent || '').trim().toLowerCase();
+                                if (text.includes(optLower) && el.offsetParent !== null) {
                                     el.click();
                                     return true;
                                 }
                             }
                             return false;
                         }""", option)
-                        if not clicked:
-                            return f"ERROR: Dropdown opened but could not find option '{option}'"
+                        if clicked:
+                            _option_clicked = True
+                            logger.warning("[SELECT_DROPDOWN] Option clicked via JS DOM search")
+                        else:
+                            logger.warning("[SELECT_DROPDOWN] JS DOM search found no match for '%s'", option)
                     except Exception as e:
-                        return f"ERROR: Could not click option '{option}': {e}"
+                        logger.warning("[SELECT_DROPDOWN] JS DOM search failed: %s", e)
+
+                if not _option_clicked:
+                    return f"ERROR: Dropdown opened but could not find option '{option}'"
 
             await asyncio.sleep(random.uniform(0.3, 0.5))
             await _wait_stable(page)
@@ -1155,6 +1210,7 @@ async def _run_browser_agent_inner(
         max_steps = 30
         consecutive_same_actions = 0
         last_action_key = ""
+        _force_tool_next = False  # Set after retry injection to prevent LLM from responding with text
 
         for step in range(max_steps):
             logger.warning("-" * 60)
@@ -1174,7 +1230,8 @@ async def _run_browser_agent_inner(
                 "text": "Looking at the page..." if step == 0 else "Deciding next action...",
             })
 
-            tc_mode = "required" if step == 0 else "auto"
+            tc_mode = "required" if (step == 0 or _force_tool_next) else "auto"
+            _force_tool_next = False  # Reset after using
             try:
                 response = await client.chat.completions.create(
                     model=model,
@@ -1197,7 +1254,26 @@ async def _run_browser_agent_inner(
 
             if not msg.tool_calls:
                 text = msg.content or ""
-                logger.warning("[STEP %d] LLM returned TEXT (no tool call) — ending. Text: %s", step + 1, text[:300])
+                logger.warning("[STEP %d] LLM returned TEXT (no tool call): %s", step + 1, text[:300])
+
+                # ── Check if the text response is a failure/give-up — if so, force retry ──
+                _text_lower = text.lower()
+                _failure_words_text = ["could not", "couldn't", "unable to", "failed to", "sorry",
+                                       "not able", "cannot", "can't", "wasn't able", "didn't work",
+                                       "encountered an error", "blocked", "captcha", "i apologize",
+                                       "unfortunately", "not possible"]
+                _is_text_failure = any(fw in _text_lower for fw in _failure_words_text)
+                if _is_text_failure and step < max_steps - 3:
+                    logger.warning("[STEP %d] ❌ TEXT FAILURE DETECTED — forcing retry with tool_choice=required", step + 1)
+                    conversation.append({"role": "assistant", "content": text})
+                    conversation.append({
+                        "role": "user",
+                        "content": "[SYSTEM] Do NOT give up or explain failure. You MUST continue working on the task. "
+                                   "Use a tool NOW to take your next action. Try a different approach if the previous one failed.",
+                    })
+                    _force_tool_next = True
+                    continue
+
                 conversation.append({"role": "assistant", "content": text})
                 if text:
                     await websocket.send_json({"type": "agent_message", "content": text})
@@ -1297,7 +1373,12 @@ async def _run_browser_agent_inner(
 
                 # ── Validator: append verification prompt to tool result ──
                 if fn_name == "type_text":
-                    result += "\n\n[VERIFY] Look at the screenshot. Did the text appear in the correct field? Is there an autocomplete dropdown you need to select from?"
+                    _typed_text = fn_args.get("text", "").upper()
+                    _is_airport_code = len(_typed_text) == 3 and _typed_text.isalpha()
+                    if _is_airport_code:
+                        result += "\n\n[VERIFY] ⚠️ You typed an airport code. Look at the screenshot — there should be an autocomplete dropdown with airport suggestions. You MUST click the correct suggestion before proceeding. The airport is NOT set until you click the autocomplete option."
+                    else:
+                        result += "\n\n[VERIFY] Look at the screenshot. Did the text appear in the correct field? Is there an autocomplete dropdown you need to select from?"
                 elif fn_name == "click":
                     result += "\n\n[VERIFY] Look at the screenshot. Did the click have the expected effect? Did a dropdown open? Did the page change? Is there an overlay blocking the form?"
                 elif fn_name == "select_dropdown":
@@ -1357,6 +1438,7 @@ async def _run_browser_agent_inner(
                                        f"3. If current site is blocked, try an alternative website\n"
                                        f"Continue working — do NOT call done() until you have actual results.",
                         })
+                        _force_tool_next = True
                         continue
                     logger.warning("[STEP %d] ✅ TASK COMPLETE: %s", step + 1, _summary[:300])
                     await websocket.send_json({
