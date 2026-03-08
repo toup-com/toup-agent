@@ -1571,6 +1571,7 @@ async def _run_browser_agent_inner(
                     _wrong_page_patterns = [
                         ("/travel/flights/deals", "https://www.google.com/travel/flights"),
                         ("/travel/flights/explore", "https://www.google.com/travel/flights"),
+                        ("/travel/explore", "https://www.google.com/travel/flights"),  # Explore map view
                         ("accounts.google.com/", _cur_url),  # Sign-in redirect → go back to where we were
                     ]
                     for _bad_pattern, _recovery_url in _wrong_page_patterns:

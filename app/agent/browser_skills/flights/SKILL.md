@@ -5,21 +5,23 @@ description: Search and compare flights across airlines and OTAs.
 
 # Flight Search Skill
 
-## SITE: Navigate to https://www.google.com/travel/flights
+## SITE
+
+Navigate to the correct URL based on trip type:
+- **One-way**: `https://www.google.com/travel/flights?tfs=CBwQAQ`
+- **Round-trip**: `https://www.google.com/travel/flights`
+- **Multi-city**: `https://www.google.com/travel/flights?tfs=CBwQAw`
+
+The `tfs=CBwQAQ` parameter sets one-way mode directly in the URL — no need to interact with the trip type dropdown.
 
 ## STEP-BY-STEP PROCEDURE:
 
-### Step 1: Dismiss Overlays
+### Step 1: Navigate
+- Navigate to the correct URL above based on trip type
+- Wait for the page to load
+
+### Step 2: Dismiss Overlays
 If you see "Try AI powered Flight Deals" or any promotional overlay, click "Got it", "No thanks", or the X button. Wait for it to close.
-
-### Step 2: Set Trip Type
-Use the `select_dropdown` tool to change the trip type:
-- For one-way: `select_dropdown(trigger_text="Round trip", option_text="One way")`
-- For multi-city: `select_dropdown(trigger_text="Round trip", option_text="Multi-city")`
-- If round_trip → leave as is (skip Step 2)
-
-**IMPORTANT**: ALWAYS use `select_dropdown`, NEVER use two separate clicks.
-- Do NOT click hamburger menus, "Sign In", or navigation links
 
 ### Step 3: Fill Origin ("Where from?")
 - Click the input field labeled "Where from?"
@@ -48,7 +50,8 @@ Use the `select_dropdown` tool to change the trip type:
 - Click "Return" field → use `select_date` → click "Done"
 
 ### Step 7: Search
-- Click the "Search" button (aria-label="Search")
+- Click the "Search" button — use selector `button[aria-label="Search"]`
+- ⚠️ Make sure the calendar is CLOSED (click "Done" first) before clicking Search
 - Wait for results to load (3-5 seconds)
 
 ### Step 8: Read Results
@@ -63,9 +66,9 @@ Use the `select_dropdown` tool to change the trip type:
 - The "Explore" button is NOT the search button — look for "Search" specifically
 - Do NOT try to click individual date numbers — use the select_date tool
 - After filling origin, the NEXT field is "Where to?" (destination), NOT "Departure" (date)
+- If the calendar is still open, click "Done" BEFORE clicking Search
 
 ## SELECTOR HINTS:
-- Trip type dropdown button: button[aria-label*="trip" i] (click to OPEN dropdown, then click option)
 - Origin: input[aria-label*="Where from"]
 - Destination: input[aria-label*="Where to"]
 - Departure date: input[aria-label="Departure"]
@@ -75,5 +78,6 @@ Use the `select_dropdown` tool to change the trip type:
 ## CRITICAL WARNINGS:
 - NEVER click "Sign In" or any Google account link — stay on the flights form
 - NEVER click "Explore" — that's not the Search button
-- If you end up on /travel/flights/deals or /travel/flights/explore, navigate back to /travel/flights
-- If a dropdown doesn't open after clicking, try scrolling up — the element may be partially hidden
+- NEVER click any `button[jsname]` without checking it's actually the Search button
+- If you end up on /travel/flights/deals or /travel/flights/explore or /travel/explore, navigate back to the correct flights URL
+- If the form shows "Round trip" but you need "One way", navigate to the URL with `?tfs=CBwQAQ`
