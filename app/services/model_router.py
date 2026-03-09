@@ -6,9 +6,8 @@ cheapest model that can handle it well.
 
 Tiers (cost-optimized):
   - light:   Simple greetings, short Q&A, chit-chat, single-fact lookups  → gpt-4o-mini (cheapest)
-  - medium:  Multi-step tasks, summarization, moderate reasoning, tool use  → configured agent_model (GPT)
-  - heavy:   Complex coding, multi-file edits, deep analysis, planning,
-             long-form generation, math proofs, multi-tool orchestration   → Claude Opus 4.6
+  - medium:  Summarization, moderate reasoning, translations              → configured agent_model (GPT)
+  - heavy:   Any tool use, coding, analysis, planning, long-form, math   → Claude Opus 4.6
 
 Voice/real-time stays on OpenAI always (handled by ws_realtime.py).
 Only truly complex text tasks escalate to Claude Opus for best quality.
@@ -194,10 +193,10 @@ def classify_request(
     if heavy_matches > 0:
         signals["heavy_pattern"] = min(heavy_matches * 20, 60)
 
-    # ── 4. Tool-related keywords ──────────────────────────────────
+    # ── 4. Tool-related keywords → always heavy (tools need best model) ─
     tool_hits = sum(1 for kw in TOOL_KEYWORDS if kw in text_lower)
     if tool_hits > 0:
-        signals["tool_keywords"] = min(tool_hits * 8, 25)
+        signals["tool_keywords"] = 75  # Force heavy tier — tools need best reasoning
 
     # ── 5. Code indicators ────────────────────────────────────────
     code_hits = 0
@@ -234,7 +233,7 @@ def classify_request(
             )
         )
         if recent_tools > 0:
-            signals["recent_tool_use"] = 15
+            signals["recent_tool_use"] = 75  # Ongoing tool session → stay on heavy
 
     # ── 8. Media attachment ───────────────────────────────────────
     if has_media:
