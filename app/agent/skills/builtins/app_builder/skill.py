@@ -489,13 +489,28 @@ class AppBuilderSkill(Skill):
         """Call the LLM (OpenAI or Anthropic) for code generation."""
         from app.config import settings
 
-        # Try Anthropic first (stronger for code gen), but skip OAuth tokens
+        # Try Anthropic first (stronger for code gen)
         anthropic_key = settings.anthropic_api_key or ""
-        is_oauth = anthropic_key.startswith("sk-ant-oat")
-        if anthropic_key and not is_oauth:
+        if anthropic_key:
             try:
                 import anthropic
-                client = anthropic.AsyncAnthropic(api_key=anthropic_key)
+                import os
+                is_oauth = "sk-ant-oat" in anthropic_key
+                if is_oauth:
+                    # OAuth tokens need auth_token + beta headers
+                    # SDK auto-reads ANTHROPIC_API_KEY env → sends wrong X-Api-Key header
+                    os.environ.pop("ANTHROPIC_API_KEY", None)
+                    client = anthropic.AsyncAnthropic(
+                        auth_token=anthropic_key,
+                        default_headers={
+                            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+                            "user-agent": "claude-cli/2.1.2 (external, cli)",
+                            "x-app": "cli",
+                        },
+                    )
+                else:
+                    client = anthropic.AsyncAnthropic(api_key=anthropic_key)
+
                 response = await client.messages.create(
                     model="claude-sonnet-4-20250514",
                     max_tokens=8192,
