@@ -489,16 +489,13 @@ class AppBuilderSkill(Skill):
         """Call the LLM (OpenAI or Anthropic) for code generation."""
         from app.config import settings
 
-        # Try Anthropic first (stronger for code gen)
-        if settings.anthropic_api_key:
+        # Try Anthropic first (stronger for code gen), but skip OAuth tokens
+        anthropic_key = settings.anthropic_api_key or ""
+        is_oauth = anthropic_key.startswith("sk-ant-oat")
+        if anthropic_key and not is_oauth:
             try:
                 import anthropic
-                is_oauth = "sk-ant-oat" in (settings.anthropic_api_key or "")
-                if is_oauth:
-                    client = anthropic.AsyncAnthropic(auth_token=settings.anthropic_api_key)
-                else:
-                    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
+                client = anthropic.AsyncAnthropic(api_key=anthropic_key)
                 response = await client.messages.create(
                     model="claude-sonnet-4-20250514",
                     max_tokens=8192,
@@ -514,13 +511,14 @@ class AppBuilderSkill(Skill):
             try:
                 from openai import AsyncOpenAI
                 client = AsyncOpenAI(api_key=settings.openai_api_key)
+                model = settings.agent_model or "gpt-4o-mini"
                 response = await client.chat.completions.create(
-                    model=settings.agent_model or "gpt-4o-mini",
+                    model=model,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message},
                     ],
-                    max_tokens=8192,
+                    max_completion_tokens=8192,
                 )
                 return response.choices[0].message.content or ""
             except Exception as e:
