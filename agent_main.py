@@ -291,7 +291,8 @@ async def lifespan(app: FastAPI):
         try:
             from app.agent.app_manager import AppManager
             app_manager = AppManager()
-            restored = await app_manager.restore_on_startup()
+            from app.db.database import async_session_maker
+            restored = await app_manager.restore_on_startup(async_session_maker)
             set_app_manager(app_manager)
             if restored:
                 print(f"📱 App Manager: restored {restored} running app(s)")
