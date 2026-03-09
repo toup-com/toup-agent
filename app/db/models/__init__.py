@@ -36,6 +36,9 @@ from .document import Document, DocumentChunk, Media
 # Workflows
 from .workflow import Workflow
 
+# Apps & Build Jobs
+from .app import App, BuildJob
+
 # Agent runtime
 from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig
 
@@ -56,6 +59,7 @@ __all__ = [
     "Entity", "EntityLink", "EntityRelationship",
     "Document", "DocumentChunk", "Media",
     "Workflow",
+    "App", "BuildJob",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
     "VPSPlan", "VPSInstance", "Invite", "LLMBundleAllocation", "LLMUsageRecord",
 ]

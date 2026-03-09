@@ -36,6 +36,7 @@ from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.workflow_crud import router as workflow_crud_router
 from app.api.dashboard import router as dashboard_router
+from app.api.apps import router as apps_router, set_app_manager
 
 _app_start_time = None
 
@@ -210,6 +211,7 @@ async def lifespan(app: FastAPI):
     subagent_manager = None
     skill_loader = None
     agent_runner = None
+    app_manager = None
 
     try:
         from app.agent.telegram_bot import ToupTelegramBot
@@ -284,6 +286,29 @@ async def lifespan(app: FastAPI):
         workflow_engine = WorkflowEngine(agent_runner=agent_runner, tool_executor=tool_executor)
         set_workflow_engine(workflow_engine)
         print("⚡ Workflow engine initialized")
+
+        # ── App Manager + App Builder Skill ────────────────────
+        try:
+            from app.agent.app_manager import AppManager
+            app_manager = AppManager()
+            restored = await app_manager.restore_on_startup()
+            set_app_manager(app_manager)
+            if restored:
+                print(f"📱 App Manager: restored {restored} running app(s)")
+            else:
+                print("📱 App Manager ready")
+
+            # Register AppBuilderSkill
+            from app.agent.skills.builtins.app_builder.skill import AppBuilderSkill
+            from app.api.ws_chat import broadcast_to_user
+            builder_skill = AppBuilderSkill(
+                app_manager=app_manager,
+                ws_broadcast=broadcast_to_user,
+            )
+            await skill_loader.register_dynamic(builder_skill)
+            print("🏗️ App Builder skill registered")
+        except Exception as e:
+            print(f"⚠️ App Manager/Builder error: {e}")
 
         # ── Start Telegram bot (if configured) ────────────────
         if settings.telegram_bot_token:
@@ -529,6 +554,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
+    if app_manager:
+        try:
+            await app_manager.cleanup()
+            print("📱 App Manager cleaned up")
+        except Exception:
+            pass
+
     if skill_loader:
         try:
             await skill_loader.unload_all()
@@ -591,6 +623,7 @@ app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(workflow_crud_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
 app.include_router(ws_browser_router, prefix=settings.api_prefix)
+app.include_router(apps_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
 try:

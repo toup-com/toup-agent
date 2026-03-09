@@ -1,0 +1,574 @@
+"""
+App Manager — Manages Expo/Metro dev server processes for user-built apps.
+
+Handles the full lifecycle: scaffold, write files, install deps, start/stop
+Metro (mobile) + Expo Web, database setup, GitHub, and web publishing.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import shutil
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
+
+APPS_DIR = os.environ.get("TOUP_APPS_DIR", "/opt/toup-agent/apps")
+METRO_PORT_RANGE = (3001, 3050)
+WEB_PORT_RANGE = (4001, 4050)
+MAX_LOG_LINES = 500
+
+
+@dataclass
+class ManagedApp:
+    """In-memory state for a running app."""
+    app_id: str
+    metro_port: Optional[int] = None
+    web_port: Optional[int] = None
+    metro_process: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
+    web_process: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
+    log_buffer: deque = field(default_factory=lambda: deque(maxlen=MAX_LOG_LINES))
+    started_at: float = 0.0
+
+
+class AppManager:
+    """Manages Expo/Metro dev server processes for user-built apps."""
+
+    def __init__(self):
+        self._running: Dict[str, ManagedApp] = {}
+        self._used_metro_ports: Set[int] = set()
+        self._used_web_ports: Set[int] = set()
+        self._public_ip: Optional[str] = None
+        os.makedirs(APPS_DIR, exist_ok=True)
+
+    # ── Public IP ───────────────────────────────────────
+
+    async def _get_public_ip(self) -> str:
+        """Get VPS public IP (cached)."""
+        if self._public_ip:
+            return self._public_ip
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "--max-time", "5", "https://ifconfig.me",
+                stdout=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            ip = (stdout or b"").decode().strip()
+            if ip and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                self._public_ip = ip
+                return ip
+        except Exception:
+            pass
+        self._public_ip = "127.0.0.1"
+        return self._public_ip
+
+    # ── Core Lifecycle ──────────────────────────────────
+
+    async def scaffold_app(self, app_id: str, app_name: str) -> str:
+        """Create a new Expo app directory. Returns the app directory path."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+        if os.path.exists(app_dir):
+            logger.warning(f"App dir already exists: {app_dir}, removing")
+            shutil.rmtree(app_dir)
+
+        logger.info(f"[APP] Scaffolding {app_name} at {app_dir}")
+        # Create with npx create-expo-app
+        safe_name = re.sub(r"[^a-zA-Z0-9-]", "-", app_name.lower()).strip("-")[:30] or "app"
+        proc = await asyncio.create_subprocess_exec(
+            "npx", "create-expo-app@latest", safe_name,
+            "--template", "blank-typescript",
+            "--no-install",  # We'll install deps separately
+            cwd=APPS_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "npm_config_yes": "true"},
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        output = (stdout or b"").decode() + (stderr or b"").decode()
+
+        # Expo creates dir with the safe_name, rename to app_id
+        created_dir = os.path.join(APPS_DIR, safe_name)
+        if os.path.exists(created_dir) and created_dir != app_dir:
+            os.rename(created_dir, app_dir)
+        elif not os.path.exists(app_dir):
+            # Fallback: create manually
+            os.makedirs(app_dir, exist_ok=True)
+            logger.warning(f"[APP] Scaffold fallback — created empty dir. Output: {output[:500]}")
+
+        # Create storage directory
+        os.makedirs(os.path.join(app_dir, "storage"), exist_ok=True)
+
+        logger.info(f"[APP] Scaffolded {app_name} at {app_dir}")
+        return app_dir
+
+    async def write_app_files(self, app_id: str, files: Dict[str, str]) -> None:
+        """Write files dict to app directory on disk."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+        for file_path, content in files.items():
+            # Normalize path
+            rel_path = file_path.lstrip("/")
+            full_path = os.path.join(app_dir, rel_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        logger.info(f"[APP] Wrote {len(files)} files to {app_dir}")
+
+    async def install_deps(self, app_id: str, deps: Optional[List[str]] = None) -> str:
+        """Run npm install in app dir. Returns output."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+
+        # Base install
+        cmd = ["npm", "install"]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=app_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        output = (stdout or b"").decode()
+
+        # Install extra deps if any
+        if deps:
+            cmd2 = ["npm", "install"] + deps
+            proc2 = await asyncio.create_subprocess_exec(
+                *cmd2, cwd=app_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=300)
+            output += "\n" + (stdout2 or b"").decode()
+
+        logger.info(f"[APP] Installed deps for {app_id}")
+        return output[:2000]
+
+    async def start_metro(self, app_id: str) -> int:
+        """Start Metro bundler for mobile preview. Returns allocated port."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+        port = self._allocate_port(METRO_PORT_RANGE, self._used_metro_ports)
+
+        managed = self._running.get(app_id)
+        if not managed:
+            managed = ManagedApp(app_id=app_id)
+            self._running[app_id] = managed
+
+        # Kill existing metro if running
+        if managed.metro_process and managed.metro_process.returncode is None:
+            managed.metro_process.terminate()
+            await asyncio.sleep(1)
+
+        proc = await asyncio.create_subprocess_exec(
+            "npx", "expo", "start", "--port", str(port), "--lan",
+            cwd=app_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "EXPO_NO_TELEMETRY": "1", "CI": "1"},
+        )
+
+        managed.metro_port = port
+        managed.metro_process = proc
+        managed.started_at = time.time()
+        self._used_metro_ports.add(port)
+
+        # Start log reader
+        asyncio.create_task(self._read_output(managed, proc, "metro"))
+
+        # Wait for Metro to be ready (max 30s)
+        await self._wait_for_ready(managed, timeout=30)
+
+        logger.info(f"[APP] Metro started for {app_id} on port {port}")
+        return port
+
+    async def start_web(self, app_id: str) -> int:
+        """Start Expo web server. Returns allocated port."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+        port = self._allocate_port(WEB_PORT_RANGE, self._used_web_ports)
+
+        managed = self._running.get(app_id)
+        if not managed:
+            managed = ManagedApp(app_id=app_id)
+            self._running[app_id] = managed
+
+        # Kill existing web if running
+        if managed.web_process and managed.web_process.returncode is None:
+            managed.web_process.terminate()
+            await asyncio.sleep(1)
+
+        proc = await asyncio.create_subprocess_exec(
+            "npx", "expo", "start", "--web", "--port", str(port),
+            cwd=app_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
+        )
+
+        managed.web_port = port
+        managed.web_process = proc
+        self._used_web_ports.add(port)
+
+        # Start log reader
+        asyncio.create_task(self._read_output(managed, proc, "web"))
+
+        logger.info(f"[APP] Web server started for {app_id} on port {port}")
+        return port
+
+    async def stop_app(self, app_id: str) -> bool:
+        """Stop both Metro and web processes for an app."""
+        managed = self._running.get(app_id)
+        if not managed:
+            return False
+
+        stopped = False
+        for proc, port_set, port in [
+            (managed.metro_process, self._used_metro_ports, managed.metro_port),
+            (managed.web_process, self._used_web_ports, managed.web_port),
+        ]:
+            if proc and proc.returncode is None:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                stopped = True
+            if port:
+                port_set.discard(port)
+
+        managed.metro_process = None
+        managed.web_process = None
+        managed.metro_port = None
+        managed.web_port = None
+        del self._running[app_id]
+
+        logger.info(f"[APP] Stopped {app_id}")
+        return stopped
+
+    async def restart_app(self, app_id: str) -> Dict[str, Any]:
+        """Restart both Metro and web servers."""
+        await self.stop_app(app_id)
+        metro_port = await self.start_metro(app_id)
+        web_port = await self.start_web(app_id)
+        return {"metro_port": metro_port, "web_port": web_port}
+
+    async def get_logs(self, app_id: str, lines: int = 50) -> List[str]:
+        """Get recent logs from app's Metro + web processes."""
+        managed = self._running.get(app_id)
+        if not managed:
+            return []
+        return list(managed.log_buffer)[-lines:]
+
+    async def get_qr_url(self, app_id: str) -> Optional[str]:
+        """Get Expo Go QR URL for mobile preview."""
+        managed = self._running.get(app_id)
+        if not managed or not managed.metro_port:
+            return None
+        ip = await self._get_public_ip()
+        return f"exp://{ip}:{managed.metro_port}"
+
+    async def get_web_url(self, app_id: str) -> Optional[str]:
+        """Get web preview URL."""
+        managed = self._running.get(app_id)
+        if not managed or not managed.web_port:
+            return None
+        ip = await self._get_public_ip()
+        return f"http://{ip}:{managed.web_port}"
+
+    # ── Database & Storage ──────────────────────────────
+
+    async def setup_database(self, app_id: str, db_type: str = "sqlite") -> str:
+        """Set up database for the app. Returns db path/url."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+
+        if db_type == "sqlite":
+            # Create data directory and db file
+            data_dir = os.path.join(app_dir, "data")
+            os.makedirs(data_dir, exist_ok=True)
+            db_path = os.path.join(data_dir, "app.db")
+
+            # Generate helper file
+            db_helper = '''import * as SQLite from 'expo-sqlite';
+
+const db = SQLite.openDatabaseSync('app.db');
+
+export async function initDatabase(): Promise<void> {
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS _migrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+}
+
+export function getDatabase(): SQLite.SQLiteDatabase {
+  return db;
+}
+
+export async function runQuery(sql: string, params: any[] = []): Promise<any[]> {
+  const result = await db.getAllAsync(sql, params);
+  return result;
+}
+
+export async function runExec(sql: string): Promise<void> {
+  await db.execAsync(sql);
+}
+
+export default db;
+'''
+            lib_dir = os.path.join(app_dir, "src", "lib")
+            os.makedirs(lib_dir, exist_ok=True)
+            with open(os.path.join(lib_dir, "db.ts"), "w") as f:
+                f.write(db_helper)
+
+            logger.info(f"[APP] SQLite database set up for {app_id}")
+            return db_path
+
+        elif db_type == "supabase":
+            # Generate Supabase client helper
+            supabase_helper = '''import { createClient } from '@supabase/supabase-js';
+
+// Set these in your environment or replace directly
+const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || '';
+
+export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+export default supabase;
+'''
+            lib_dir = os.path.join(app_dir, "src", "lib")
+            os.makedirs(lib_dir, exist_ok=True)
+            with open(os.path.join(lib_dir, "supabase.ts"), "w") as f:
+                f.write(supabase_helper)
+
+            logger.info(f"[APP] Supabase client set up for {app_id}")
+            return "supabase"
+
+        return ""
+
+    async def setup_storage(self, app_id: str) -> str:
+        """Create storage directory for the app."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+        storage_dir = os.path.join(app_dir, "storage")
+        os.makedirs(storage_dir, exist_ok=True)
+        return storage_dir
+
+    # ── GitHub ──────────────────────────────────────────
+
+    async def create_github_repo(self, app_id: str, app_name: str) -> Dict[str, str]:
+        """Create a private GitHub repo and init git in app dir."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+        safe_name = re.sub(r"[^a-zA-Z0-9-]", "-", app_name.lower()).strip("-")[:40] or "app"
+
+        # Init git
+        await self._run_cmd(["git", "init"], cwd=app_dir)
+        await self._run_cmd(["git", "add", "."], cwd=app_dir)
+        await self._run_cmd(
+            ["git", "commit", "-m", f"Initial commit: {app_name}"],
+            cwd=app_dir,
+            env={**os.environ, "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
+                 "GIT_COMMITTER_NAME": "Toup Agent", "GIT_COMMITTER_EMAIL": "agent@toup.ai"},
+        )
+
+        # Try creating repo via gh CLI
+        try:
+            result = await self._run_cmd(
+                ["gh", "repo", "create", safe_name, "--private", "--source", app_dir, "--push"],
+                cwd=app_dir,
+                timeout=30,
+            )
+            # Parse repo URL from output
+            repo_url = ""
+            for line in result.split("\n"):
+                if "github.com" in line:
+                    repo_url = line.strip()
+                    break
+            if not repo_url:
+                repo_url = f"https://github.com/{safe_name}"
+
+            return {"repo_name": safe_name, "repo_url": repo_url}
+        except Exception as e:
+            logger.warning(f"[APP] GitHub repo creation failed (gh CLI may not be configured): {e}")
+            return {"repo_name": "", "repo_url": "", "error": str(e)}
+
+    async def push_to_github(self, app_id: str) -> str:
+        """Commit and push changes to GitHub."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+        await self._run_cmd(["git", "add", "."], cwd=app_dir)
+        await self._run_cmd(
+            ["git", "commit", "-m", f"Update app ({time.strftime('%Y-%m-%d %H:%M')})"],
+            cwd=app_dir,
+            env={**os.environ, "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
+                 "GIT_COMMITTER_NAME": "Toup Agent", "GIT_COMMITTER_EMAIL": "agent@toup.ai"},
+        )
+        result = await self._run_cmd(["git", "push"], cwd=app_dir, timeout=30)
+        return result
+
+    # ── Publishing ──────────────────────────────────────
+
+    async def publish_web(self, app_id: str, domain: Optional[str] = None) -> str:
+        """Export web build and serve. Returns URL."""
+        app_dir = os.path.join(APPS_DIR, app_id)
+
+        # Export static web build
+        await self._run_cmd(
+            ["npx", "expo", "export", "--platform", "web"],
+            cwd=app_dir, timeout=120,
+        )
+
+        dist_dir = os.path.join(app_dir, "dist")
+        if not os.path.exists(dist_dir):
+            raise RuntimeError("Web export failed — no dist/ directory created")
+
+        ip = await self._get_public_ip()
+
+        if domain:
+            # TODO: Configure Caddy/nginx reverse proxy for custom domain
+            logger.info(f"[APP] Custom domain {domain} requested — manual DNS setup required")
+            return f"https://{domain}"
+
+        # Serve via a simple static file server or existing web port
+        return f"http://{ip}:{self._running.get(app_id, ManagedApp(app_id=app_id)).web_port or 4001}"
+
+    # ── State Management ────────────────────────────────
+
+    def get_status(self, app_id: str) -> Optional[Dict[str, Any]]:
+        """Get status of an app."""
+        managed = self._running.get(app_id)
+        if not managed:
+            return None
+        return {
+            "app_id": app_id,
+            "metro_port": managed.metro_port,
+            "web_port": managed.web_port,
+            "metro_running": managed.metro_process is not None and managed.metro_process.returncode is None,
+            "web_running": managed.web_process is not None and managed.web_process.returncode is None,
+            "uptime": time.time() - managed.started_at if managed.started_at else 0,
+            "log_lines": len(managed.log_buffer),
+        }
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        """List all running apps."""
+        return [self.get_status(aid) for aid in self._running if self.get_status(aid)]
+
+    async def restore_on_startup(self, db_session_maker) -> int:
+        """Restore previously-running apps from DB on agent restart."""
+        from app.db.models import App as AppModel
+        from sqlalchemy import select
+
+        restored = 0
+        try:
+            async with db_session_maker() as db:
+                result = await db.execute(
+                    select(AppModel).where(AppModel.status.in_(["running", "ready"]))
+                )
+                apps = result.scalars().all()
+
+                for app_row in apps:
+                    app_dir = app_row.app_dir
+                    if not os.path.exists(app_dir):
+                        app_row.status = "error"
+                        app_row.metro_pid = None
+                        app_row.web_pid = None
+                        continue
+
+                    if app_row.status == "running":
+                        try:
+                            metro_port = await self.start_metro(app_row.id)
+                            web_port = await self.start_web(app_row.id)
+                            app_row.port = metro_port
+                            app_row.web_port = web_port
+                            managed = self._running.get(app_row.id)
+                            if managed and managed.metro_process:
+                                app_row.metro_pid = managed.metro_process.pid
+                            if managed and managed.web_process:
+                                app_row.web_pid = managed.web_process.pid
+                            restored += 1
+                        except Exception as e:
+                            logger.error(f"[APP] Failed to restore {app_row.id}: {e}")
+                            app_row.status = "error"
+
+                await db.commit()
+        except Exception as e:
+            logger.error(f"[APP] Failed to restore apps: {e}")
+
+        return restored
+
+    async def cleanup(self) -> None:
+        """Stop all running apps on shutdown."""
+        app_ids = list(self._running.keys())
+        for app_id in app_ids:
+            try:
+                await self.stop_app(app_id)
+            except Exception as e:
+                logger.error(f"[APP] Error stopping {app_id}: {e}")
+        logger.info(f"[APP] Cleaned up {len(app_ids)} app(s)")
+
+    # ── Internal Helpers ────────────────────────────────
+
+    def _allocate_port(self, port_range: Tuple[int, int], used: Set[int]) -> int:
+        """Find next free port in range."""
+        for port in range(port_range[0], port_range[1] + 1):
+            if port not in used:
+                return port
+        raise RuntimeError(f"No free ports in range {port_range[0]}-{port_range[1]}")
+
+    async def _read_output(self, managed: ManagedApp, proc: asyncio.subprocess.Process, label: str) -> None:
+        """Read stdout from a process and append to log buffer."""
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                managed.log_buffer.append(f"[{label}] {text}")
+        except Exception:
+            pass
+
+    async def _wait_for_ready(self, managed: ManagedApp, timeout: int = 30) -> None:
+        """Wait for Metro to report ready."""
+        start = time.time()
+        ready_patterns = ["Metro waiting on port", "Logs for your project", "Starting Metro", "Web is waiting on"]
+        while time.time() - start < timeout:
+            # Check recent logs for ready signal
+            for line in list(managed.log_buffer)[-10:]:
+                for pattern in ready_patterns:
+                    if pattern.lower() in line.lower():
+                        return
+            await asyncio.sleep(1)
+        logger.warning(f"[APP] Metro ready timeout for {managed.app_id} after {timeout}s")
+
+    async def _run_cmd(
+        self, cmd: List[str], cwd: str = "/tmp",
+        timeout: int = 60, env: Optional[dict] = None,
+    ) -> str:
+        """Run a shell command and return stdout."""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        output = (stdout or b"").decode()
+        if proc.returncode != 0:
+            err = (stderr or b"").decode()
+            logger.warning(f"[APP] Command failed: {' '.join(cmd)} → {err[:500]}")
+        return output
+
+    async def delete_app(self, app_id: str) -> bool:
+        """Stop app and delete its directory."""
+        await self.stop_app(app_id)
+        app_dir = os.path.join(APPS_DIR, app_id)
+        if os.path.exists(app_dir):
+            shutil.rmtree(app_dir)
+            logger.info(f"[APP] Deleted {app_dir}")
+            return True
+        return False

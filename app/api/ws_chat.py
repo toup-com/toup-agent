@@ -23,7 +23,7 @@ import asyncio
 import json
 import logging
 import sys
-from typing import Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +33,44 @@ from sqlalchemy import select
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# ── User WebSocket broadcast registry ────────────────────────────────
+# Maps user_id → list of asyncio.Queues (one per active WS connection).
+# Background tasks (e.g. app builder) push events here, and the WS
+# handler forwards them to the client.
+_user_ws_queues: Dict[str, List[asyncio.Queue]] = {}
+
+
+async def broadcast_to_user(user_id: str, event: dict) -> int:
+    """Push an event to all WebSocket connections for a user.
+    Returns number of connections that received the event."""
+    queues = _user_ws_queues.get(user_id, [])
+    sent = 0
+    for q in queues:
+        try:
+            q.put_nowait(event)
+            sent += 1
+        except asyncio.QueueFull:
+            pass  # Drop if client is slow
+    return sent
+
+
+def _register_ws_queue(user_id: str, queue: asyncio.Queue) -> None:
+    """Register a queue for a user's WebSocket connection."""
+    if user_id not in _user_ws_queues:
+        _user_ws_queues[user_id] = []
+    _user_ws_queues[user_id].append(queue)
+
+
+def _unregister_ws_queue(user_id: str, queue: asyncio.Queue) -> None:
+    """Unregister a queue when WebSocket disconnects."""
+    queues = _user_ws_queues.get(user_id, [])
+    try:
+        queues.remove(queue)
+    except ValueError:
+        pass
+    if not queues:
+        _user_ws_queues.pop(user_id, None)
 
 # ── Onboarding prompt ────────────────────────────────────────────────
 _ONBOARDING_TRIGGER = (
@@ -162,13 +200,32 @@ async def ws_chat(
 
         logger.info(f"[WS] Authenticated user: {user_id}")
 
-        # Main message loop
-        while True:
+        # Register broadcast queue for this connection
+        broadcast_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        _register_ws_queue(user_id, broadcast_queue)
+
+        async def _broadcast_reader():
+            """Forward broadcast events to this WebSocket."""
             try:
-                raw = await websocket.receive_text()
-            except WebSocketDisconnect:
-                logger.info(f"[WS] Client disconnected: {user_id}")
-                return
+                while True:
+                    event = await broadcast_queue.get()
+                    try:
+                        await websocket.send_json(event)
+                    except Exception:
+                        break
+            except asyncio.CancelledError:
+                pass
+
+        broadcast_task = asyncio.create_task(_broadcast_reader())
+
+        # Main message loop
+        try:
+            while True:
+                try:
+                    raw = await websocket.receive_text()
+                except WebSocketDisconnect:
+                    logger.info(f"[WS] Client disconnected: {user_id}")
+                    return
 
             try:
                 msg = json.loads(raw)
@@ -302,6 +359,10 @@ async def ws_chat(
                 logger.exception(f"[WS] Agent error for {user_id}")
                 _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
                 await websocket.send_json({"type": "error", "message": f"Agent error: {type(e).__name__}: {e}"})
+        finally:
+            # Clean up broadcast queue and task
+            broadcast_task.cancel()
+            _unregister_ws_queue(user_id, broadcast_queue)
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Disconnected: {user_id}")
