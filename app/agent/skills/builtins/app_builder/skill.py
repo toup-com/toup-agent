@@ -296,7 +296,8 @@ class AppBuilderSkill(Skill):
                                     detail=f"Generating {len(files_to_generate)} files...")
             try:
                 generated_files = await self._generate_code(
-                    description, app_name, files_to_generate, deps, db_type
+                    description, app_name, files_to_generate, deps, db_type,
+                    job_id=job_id, user_id=user_id,
                 )
                 await self._app_manager.write_app_files(app_id, generated_files)
 
@@ -462,13 +463,22 @@ class AppBuilderSkill(Skill):
         files: List[str],
         deps: List[str],
         db_type: str,
+        job_id: str = "",
+        user_id: str = "",
     ) -> Dict[str, str]:
         """Generate code for each file using LLM."""
         generated = {}
         all_files = json.dumps(files)
         all_deps = json.dumps(deps)
+        total = len(files)
 
-        for file_path in files:
+        for i, file_path in enumerate(files):
+            logger.info(f"[BUILD] Generating file {i+1}/{total}: {file_path}")
+            if job_id:
+                await self._update_step(
+                    job_id, user_id, "writing", "running",
+                    detail=f"File {i+1}/{total}: {file_path}"
+                )
             prompt = CODE_GEN_PROMPT.format(
                 file_path=file_path,
                 description=description,
@@ -477,16 +487,22 @@ class AppBuilderSkill(Skill):
                 all_deps=all_deps,
                 db_type=db_type,
             )
-            code = await self._call_llm(prompt, f"Generate code for {file_path}")
-
-            # Strip markdown fences if the LLM added them
-            code = self._strip_fences(code)
-            generated[file_path] = code
+            try:
+                code = await self._call_llm(prompt, f"Generate code for {file_path}")
+                # Strip markdown fences if the LLM added them
+                code = self._strip_fences(code)
+                generated[file_path] = code
+                logger.info(f"[BUILD] Generated {file_path} ({len(code)} chars)")
+            except Exception as e:
+                logger.error(f"[BUILD] Failed to generate {file_path}: {e}")
+                # Write a placeholder so the app still scaffolds
+                generated[file_path] = f"// Error generating {file_path}: {e}\nexport default function() {{ return null; }}"
 
         return generated
 
     async def _call_llm(self, system_prompt: str, user_message: str) -> str:
         """Call the LLM (OpenAI or Anthropic) for code generation."""
+        import time as _time
         from app.config import settings
 
         # Try Anthropic first (stronger for code gen)
@@ -497,8 +513,6 @@ class AppBuilderSkill(Skill):
                 import os
                 is_oauth = "sk-ant-oat" in anthropic_key
                 if is_oauth:
-                    # OAuth tokens need auth_token + beta headers
-                    # SDK auto-reads ANTHROPIC_API_KEY env → sends wrong X-Api-Key header
                     os.environ.pop("ANTHROPIC_API_KEY", None)
                     client = anthropic.AsyncAnthropic(
                         auth_token=anthropic_key,
@@ -511,12 +525,16 @@ class AppBuilderSkill(Skill):
                 else:
                     client = anthropic.AsyncAnthropic(api_key=anthropic_key)
 
+                logger.info(f"[BUILD] Calling Anthropic claude-opus-4-6 (oauth={is_oauth})...")
+                t0 = _time.time()
                 response = await client.messages.create(
                     model="claude-opus-4-6",
                     max_tokens=8192,
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_message}],
                 )
+                elapsed = _time.time() - t0
+                logger.info(f"[BUILD] Anthropic responded in {elapsed:.1f}s ({len(response.content[0].text)} chars)")
                 return response.content[0].text
             except Exception as e:
                 logger.warning(f"[BUILD] Anthropic call failed, falling back to OpenAI: {e}")
