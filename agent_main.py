@@ -687,14 +687,15 @@ async def agent_self_update():
                 pull_output = result.stderr.strip() or result.stdout.strip()
                 steps.append({"step": "git_fetch", "ok": False, "output": pull_output})
                 return {"success": False, "steps": steps, "error": "git fetch failed"}
+            # Reset to exact remote state (handles detached HEAD, local changes, etc.)
             result = subprocess.run(
-                ["git", "checkout", "-f", "origin/main"],
+                ["git", "reset", "--hard", "origin/main"],
                 cwd=agent_dir, capture_output=True, text=True, timeout=10,
             )
             pull_output = result.stdout.strip() or result.stderr.strip()
             steps.append({"step": "git_update", "ok": result.returncode == 0, "output": pull_output})
             if result.returncode != 0:
-                return {"success": False, "steps": steps, "error": "git checkout failed"}
+                return {"success": False, "steps": steps, "error": "git reset failed"}
     except Exception as e:
         return {"success": False, "steps": [{"step": "git_pull", "ok": False, "output": str(e)}]}
 
