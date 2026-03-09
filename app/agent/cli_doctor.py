@@ -229,7 +229,7 @@ async def _check_config() -> CheckResult:
         from app.config import settings
         issues = []
 
-        if settings.jwt_secret in ("hexbrain-dev-secret-change-in-production", "toup-dev-secret-change-in-production"):
+        if settings.jwt_secret == "toup-dev-secret-change-in-production":
             issues.append("JWT secret is still the default — change in production!")
 
         if not settings.openai_api_key:

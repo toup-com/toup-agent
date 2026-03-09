@@ -1,5 +1,5 @@
 """
-Tests for the HexBrain Memory System
+Tests for the Toup Memory System
 """
 
 import pytest

@@ -2199,7 +2199,7 @@ class TestLayer5CLI:
         import sys
         # Test that --help doesn't crash
         try:
-            sys.argv = ["hexbrain", "--help"]
+            sys.argv = ["toup", "--help"]
             main()
         except SystemExit:
             pass  # argparse calls sys.exit(0) on --help

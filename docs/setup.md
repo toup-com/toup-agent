@@ -1,4 +1,4 @@
-# HexBrain — Setup Guide
+# Toup — Setup Guide
 
 ## Prerequisites
 
@@ -12,8 +12,8 @@
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/toup-com/hex-brain.git
-cd hex-brain
+git clone https://github.com/toup-com/toup-platform.git
+cd toup-platform
 
 # 2. Create your .env file
 cp .env.example .env
@@ -53,7 +53,7 @@ All settings are controlled via environment variables in `.env`. See [`.env.exam
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
 | `TELEGRAM_ALLOWED_USER_IDS` | JSON array of allowed Telegram user IDs (empty = all) |
-| `TELEGRAM_USER_MAP` | JSON map of Telegram user ID → HexBrain user ID |
+| `TELEGRAM_USER_MAP` | JSON map of Telegram user ID → Toup user ID |
 
 ### Agent LLM
 
@@ -74,7 +74,7 @@ The database is auto-configured in Docker. For custom setups:
 
 | Variable | Default |
 |----------|---------|
-| `DATABASE_URL` | `postgresql+asyncpg://hexbrain:hexbrain_secret@db:5432/hexbrain` |
+| `DATABASE_URL` | `postgresql+asyncpg://toup:toup_secret@db:5432/toup` |
 
 ### Scheduler
 
@@ -90,9 +90,9 @@ When running via Docker Compose, three containers start:
 
 | Service | Container | Port | Description |
 |---------|-----------|------|-------------|
-| `db` | hexbrain-db | 5432 | PostgreSQL 16 + pgvector |
-| `backend` | hexbrain-backend | 8000 | FastAPI Python backend |
-| `frontend` | hexbrain-frontend | 80 | React + nginx |
+| `db` | toup-db | 5432 | PostgreSQL 16 + pgvector |
+| `backend` | toup-backend | 8000 | FastAPI Python backend |
+| `frontend` | toup-frontend | 80 | React + nginx |
 
 ## Volumes
 
@@ -117,7 +117,7 @@ docker compose logs backend --tail 20
 # You should see:
 # ✅ Database initialized
 # 🧩 Loaded 1 skill(s): ['toup']
-# 🤖 HexBrain Telegram bot started (polling mode)
+# 🤖 Toup Telegram bot started (polling mode)
 # Uvicorn running on http://0.0.0.0:8000
 ```
 
@@ -137,10 +137,10 @@ docker compose up -d
 ### Database connection issues
 ```bash
 # Check if DB is healthy
-docker compose exec db pg_isready -U hexbrain
+docker compose exec db pg_isready -U toup
 
 # Connect directly
-docker compose exec db psql -U hexbrain -d hexbrain
+docker compose exec db psql -U toup -d toup
 ```
 
 ### Port conflicts

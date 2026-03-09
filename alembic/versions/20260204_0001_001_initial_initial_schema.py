@@ -1,10 +1,10 @@
-"""Initial schema - baseline for existing HexBrain tables
+"""Initial schema - baseline for existing Toup tables
 
 Revision ID: 001_initial
 Revises: 
 Create Date: 2026-02-04
 
-This migration establishes the baseline schema for the HexBrain memory system.
+This migration establishes the baseline schema for the Toup memory system.
 It creates all the existing tables that were previously created via init_db.py.
 """
 from typing import Sequence, Union

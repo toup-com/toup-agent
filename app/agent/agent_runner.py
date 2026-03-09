@@ -119,6 +119,7 @@ class AgentRunner:
         user_id: str,
         session_id: Optional[str] = None,
         telegram_chat_id: Optional[int] = None,
+        channel: Optional[str] = None,
         on_text_chunk: Optional[OnTextChunk] = None,
         on_tool_start: Optional[OnToolStart] = None,
         on_tool_end: Optional[OnToolEnd] = None,
@@ -172,7 +173,7 @@ class AgentRunner:
 
         # ── Phase 1: Load from DB (short-lived session) ──────────
         async with async_session_maker() as db:
-            session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id)
+            session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel)
             session_id = session.id
 
             # Load user's disabled tools from AgentConfig
@@ -486,6 +487,7 @@ class AgentRunner:
         user_id: str,
         session_id: Optional[str],
         telegram_chat_id: Optional[int],
+        channel: Optional[str] = None,
     ):
         from sqlalchemy import select, and_
         from app.db.models import Conversation
@@ -531,9 +533,10 @@ class AgentRunner:
                     return session, False
 
         # Create new session
+        _channel = "telegram" if telegram_chat_id else (channel or "agent")
         session = Conversation(
             user_id=user_id,
-            channel="telegram" if telegram_chat_id else "agent",
+            channel=_channel,
             is_active=True,
             metadata_json=json.dumps({"telegram_chat_id": telegram_chat_id}) if telegram_chat_id else None,
         )

@@ -23,11 +23,11 @@ Usage:
   python -m tests.benchmark_retrieval
 
   # Or via docker exec:
-  docker exec hexbrain-backend python -m tests.benchmark_retrieval
+  docker exec toup-backend python -m tests.benchmark_retrieval
 
   # Run specific benchmark:
-  docker exec hexbrain-backend python -m tests.benchmark_retrieval --strategy vector
-  docker exec hexbrain-backend python -m tests.benchmark_retrieval --strategy hybrid
+  docker exec toup-backend python -m tests.benchmark_retrieval --strategy vector
+  docker exec toup-backend python -m tests.benchmark_retrieval --strategy hybrid
 """
 
 import asyncio
@@ -56,7 +56,7 @@ MEMORY_LABELS = {
     "3b72cc94-c1d1-4863-9ca5-7dff12938a00": "nariman-uses-claude-opus",
     # Projects
     "444dd6ec-57ca-46a9-94b8-dbbf5399bca1": "project-toup-travel",
-    "aeaa3095-77b9-454b-9d4e-029d5537d8df": "project-hexbrain",
+    "aeaa3095-77b9-454b-9d4e-029d5537d8df": "project-toup",
     "b3d6efec-73ca-4c8a-9e33-1c77e456a36b": "nariman-vps-hosting",
     # Goals
     "8a64dc65-a7e1-4459-9100-cb53ec0ce44e": "goal-mscac-uoft",
@@ -80,11 +80,11 @@ MEMORY_LABELS = {
     "f51094ab-064b-4db9-917d-f7df8c6ae701": "git-workflow-brain",
     "1a49fec4-f9f8-4b7c-a287-633d363ca41f": "memory-extraction-best",
     "43cb3f39-3d37-471d-8427-681dbde099f3": "vps-maintenance-tasks",
-    "49c2873d-f4f5-457b-95c3-681b6565ddbb": "update-hexbrain-code",
+    "49c2873d-f4f5-457b-95c3-681b6565ddbb": "update-toup-code",
     # Agent tools
     "1530a79d-f5be-4342-9513-0d42895e934d": "hex-tools-list",
     "345d4caf-37f6-464e-81f8-e666c328cb89": "vps-access-docker",
-    "4c646a0d-4eeb-43aa-bbed-3b4c70d254c7": "hexbrain-architecture",
+    "4c646a0d-4eeb-43aa-bbed-3b4c70d254c7": "toup-architecture",
     # Agent goals
     "7a7ecf9a-764f-4b91-8eee-023fbdc3a234": "goal-priorities-mscac",
     # Agent tools (misc)
@@ -150,20 +150,20 @@ BENCHMARK_QUERIES = [
         "query": "What projects am I working on?",
         "relevant_ids": {
             "444dd6ec-57ca-46a9-94b8-dbbf5399bca1",  # Toup travel platform
-            "aeaa3095-77b9-454b-9d4e-029d5537d8df",  # HexBrain
+            "aeaa3095-77b9-454b-9d4e-029d5537d8df",  # Toup
             "b3d6efec-73ca-4c8a-9e33-1c77e456a36b",  # VPS hosting multiple projects
         },
         "description": "All projects overview",
         "category": "projects",
     },
     {
-        "query": "Tell me about HexBrain",
+        "query": "Tell me about Toup",
         "relevant_ids": {
-            "aeaa3095-77b9-454b-9d4e-029d5537d8df",  # HexBrain is Nariman's AI platform
-            "4c646a0d-4eeb-43aa-bbed-3b4c70d254c7",  # HexBrain architecture
-            "bb52cecc-6794-481f-9477-6ac09299c9ef",  # Hex identity (built on HexBrain)
+            "aeaa3095-77b9-454b-9d4e-029d5537d8df",  # Toup is Nariman's AI platform
+            "4c646a0d-4eeb-43aa-bbed-3b4c70d254c7",  # Toup architecture
+            "bb52cecc-6794-481f-9477-6ac09299c9ef",  # Hex identity (built on Toup)
         },
-        "description": "HexBrain project details",
+        "description": "Toup project details",
         "category": "projects",
     },
     {
@@ -179,7 +179,7 @@ BENCHMARK_QUERIES = [
         "relevant_ids": {
             "b3d6efec-73ca-4c8a-9e33-1c77e456a36b",  # VPS hosting list
             "345d4caf-37f6-464e-81f8-e666c328cb89",  # VPS access + docker containers
-            "4c646a0d-4eeb-43aa-bbed-3b4c70d254c7",  # HexBrain architecture on VPS
+            "4c646a0d-4eeb-43aa-bbed-3b4c70d254c7",  # Toup architecture on VPS
         },
         "description": "VPS / infrastructure recall",
         "category": "projects",
@@ -227,10 +227,10 @@ BENCHMARK_QUERIES = [
 
     # ─── Technical / Agent Queries ───
     {
-        "query": "How do I deploy code to HexBrain?",
+        "query": "How do I deploy code to Toup?",
         "relevant_ids": {
             "64a9dafe-8534-4eb5-9702-6809b2e053be",  # Code deployment pattern: docker cp
-            "49c2873d-f4f5-457b-95c3-681b6565ddbb",  # Update HexBrain code process
+            "49c2873d-f4f5-457b-95c3-681b6565ddbb",  # Update Toup code process
         },
         "description": "Deployment process recall",
         "category": "technical",
@@ -315,8 +315,8 @@ BENCHMARK_QUERIES = [
     {
         "query": "PostgreSQL pgvector",
         "relevant_ids": {
-            "4c646a0d-4eeb-43aa-bbed-3b4c70d254c7",  # HexBrain architecture: PostgreSQL + pgvector
-            "345d4caf-37f6-464e-81f8-e666c328cb89",  # VPS access: hexbrain-db (pgvector)
+            "4c646a0d-4eeb-43aa-bbed-3b4c70d254c7",  # Toup architecture: PostgreSQL + pgvector
+            "345d4caf-37f6-464e-81f8-e666c328cb89",  # VPS access: toup-db (pgvector)
         },
         "description": "Exact keyword match test",
         "category": "keyword",
@@ -488,7 +488,7 @@ async def run_benchmark(
     from sqlalchemy.orm import sessionmaker
     from app.services.memory_service import MemoryService
 
-    DATABASE_URL = "postgresql+asyncpg://hexbrain:hexbrain_secret@hexbrain-db:5432/hexbrain"
+    DATABASE_URL = "postgresql+asyncpg://toup:toup_secret@toup-db:5432/toup"
     engine = create_async_engine(DATABASE_URL)
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
@@ -723,7 +723,7 @@ def test_metrics():
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="HexBrain Retrieval Benchmark Suite")
+    parser = argparse.ArgumentParser(description="Toup Retrieval Benchmark Suite")
     parser.add_argument("--strategy", type=str, default=None,
                         choices=["vector", "keyword", "graph", "temporal", "hybrid", "all"],
                         help="Strategy to benchmark (default: all)")

@@ -1,12 +1,12 @@
 ---
 name: Toup Workflow Skills
-description: Expert guidance for building HexBrain agentic workflows. Use when creating workflows, configuring nodes, connecting edges, validating, or troubleshooting workflow errors on the /work page.
+description: Expert guidance for building Toup agentic workflows. Use when creating workflows, configuring nodes, connecting edges, validating, or troubleshooting workflow errors on the /work page.
 version: 1.0.0
 ---
 
 # Toup Workflow Skills
 
-Expert knowledge for building production-ready HexBrain workflows using the hexbrain-workflows MCP server.
+Expert knowledge for building production-ready Toup workflows using the toup-workflows MCP server.
 
 ---
 

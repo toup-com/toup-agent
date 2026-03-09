@@ -1,8 +1,8 @@
-# HexBrain — Production Deployment Guide
+# Toup — Production Deployment Guide
 
 ## Overview
 
-HexBrain runs as three Docker containers:
+Toup runs as three Docker containers:
 - **db** — PostgreSQL 16 + pgvector
 - **backend** — Python 3.12 FastAPI (agent, API, Telegram bot)
 - **frontend** — React app served by nginx
@@ -15,8 +15,8 @@ Best for: personal use, small teams, evaluation.
 
 ```bash
 # 1. Clone and configure
-git clone https://github.com/toup-com/hex-brain.git
-cd hex-brain
+git clone https://github.com/toup-com/toup-platform.git
+cd toup-platform
 cp .env.example .env
 # Edit .env with your API keys
 
@@ -43,8 +43,8 @@ curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER
 
 # Clone and deploy
-git clone https://github.com/toup-com/hex-brain.git
-cd hex-brain
+git clone https://github.com/toup-com/toup-platform.git
+cd toup-platform
 cp .env.example .env
 # Edit .env
 
@@ -72,7 +72,7 @@ TELEGRAM_BOT_TOKEN=your-bot-token
 
 # Security — CHANGE THESE
 JWT_SECRET=generate-a-random-64-char-string
-DATABASE_URL=postgresql+asyncpg://hexbrain:STRONG_PASSWORD@db:5432/hexbrain
+DATABASE_URL=postgresql+asyncpg://toup:STRONG_PASSWORD@db:5432/toup
 
 # In docker-compose.yml, also change:
 # POSTGRES_PASSWORD=STRONG_PASSWORD
@@ -143,25 +143,25 @@ server {
 
 ```bash
 # Backup
-docker compose exec db pg_dump -U hexbrain hexbrain > backup_$(date +%Y%m%d).sql
+docker compose exec db pg_dump -U toup toup > backup_$(date +%Y%m%d).sql
 
 # Restore
-cat backup_20260207.sql | docker compose exec -T db psql -U hexbrain hexbrain
+cat backup_20260207.sql | docker compose exec -T db psql -U toup toup
 ```
 
 ### Automated Backups (cron)
 
 ```bash
 # Add to crontab
-0 3 * * * cd /path/to/hex-brain && docker compose exec -T db pg_dump -U hexbrain hexbrain | gzip > /backups/hexbrain_$(date +\%Y\%m\%d).sql.gz
+0 3 * * * cd /path/to/toup-platform && docker compose exec -T db pg_dump -U toup toup | gzip > /backups/toup_$(date +\%Y\%m\%d).sql.gz
 ```
 
 ### Volume Backup
 
 ```bash
 # Backup workspace and skills volumes
-docker run --rm -v hex-brain_agent_workspace:/data -v $(pwd):/backup alpine tar czf /backup/workspace.tar.gz -C /data .
-docker run --rm -v hex-brain_agent_skills:/data -v $(pwd):/backup alpine tar czf /backup/skills.tar.gz -C /data .
+docker run --rm -v toup-platform_agent_workspace:/data -v $(pwd):/backup alpine tar czf /backup/workspace.tar.gz -C /data .
+docker run --rm -v toup-platform_agent_skills:/data -v $(pwd):/backup alpine tar czf /backup/skills.tar.gz -C /data .
 ```
 
 ## Monitoring
@@ -179,7 +179,7 @@ Response:
   "database": "connected",
   "embedding_model": "text-embedding-3-small",
   "chat_model": "gpt-4o",
-  "platform": "HexBrain Agent Platform v5 — Toup Edition",
+  "platform": "Toup Agent Platform v5 — Toup Edition",
   "telegram_bot": "enabled",
   "agent_model": "gpt-5.2"
 }
@@ -216,7 +216,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/admin/cron
 ## Updating
 
 ```bash
-cd hex-brain
+cd toup-platform
 git pull
 
 # Rebuild and restart (zero-downtime for frontend)

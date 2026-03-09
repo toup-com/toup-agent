@@ -1,4 +1,4 @@
-# HexBrain Node Reference — Complete Catalog
+# Toup Node Reference — Complete Catalog
 
 All 25 node types with fields, handles, and configuration details.
 
@@ -125,7 +125,7 @@ All 25 node types with fields, handles, and configuration details.
 ## Action Nodes (5 nodes)
 
 ### action_memory_search
-**Search HexBrain memories by semantic similarity**
+**Search Toup memories by semantic similarity**
 - Inputs: `in`
 - Outputs: `out`
 - Fields:
@@ -135,7 +135,7 @@ All 25 node types with fields, handles, and configuration details.
 - Use: RAG, knowledge retrieval, context gathering
 
 ### action_memory_store
-**Save a new memory to HexBrain**
+**Save a new memory to Toup**
 - Inputs: `in`
 - Outputs: `out`
 - Fields:
@@ -166,7 +166,7 @@ All 25 node types with fields, handles, and configuration details.
 - ⚠️ **Security**: Be careful with user-provided input in commands
 
 ### action_send_telegram
-**Send a Telegram message via HexBrain bot**
+**Send a Telegram message via Toup bot**
 - Inputs: `in`
 - Outputs: `out`
 - Fields:

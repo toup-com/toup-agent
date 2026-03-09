@@ -421,7 +421,7 @@ class TestStructuredLogging(unittest.TestCase):
         from app.agent.structured_logging import StructuredFormatter
         fmt = StructuredFormatter()
         record = logging.LogRecord(
-            name="hexbrain.test", level=logging.INFO, pathname="", lineno=0,
+            name="toup.test", level=logging.INFO, pathname="", lineno=0,
             msg="test message", args=(), exc_info=None,
         )
         record.subsystem = "agent"

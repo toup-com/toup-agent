@@ -1,8 +1,8 @@
-# HexBrain — API Reference
+# Toup — API Reference
 
 ## Authentication
 
-HexBrain supports two authentication methods:
+Toup supports two authentication methods:
 
 ### JWT Tokens (Web/Frontend)
 

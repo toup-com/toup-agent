@@ -1,7 +1,7 @@
-HexBrain Database Migrations
+Toup Database Migrations
 =============================
 
-This directory contains Alembic migration scripts for the HexBrain memory system.
+This directory contains Alembic migration scripts for the Toup memory system.
 
 Usage:
 ------

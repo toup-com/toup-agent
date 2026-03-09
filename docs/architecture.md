@@ -1,10 +1,10 @@
-# HexBrain — System Architecture
+# Toup — System Architecture
 
 ## High-Level Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           HexBrain Platform                             │
+│                           Toup Platform                             │
 ├─────────────┬───────────────────┬──────────────────┬────────────────────┤
 │  Telegram   │   Web Chat (WS)   │  REST API v1     │  Frontend (React)  │
 │  Bot        │   /ws/chat         │  /api/v1/*       │  Brain Viz + Chat  │
@@ -211,7 +211,7 @@ User sends "I love pizza" via Telegram
 TelegramBot._handle_message()
     ├─ Download media (if any)
     ├─ Transcribe voice (Whisper)
-    ├─ Get HexBrain user ID (TelegramUserMapping)
+    ├─ Get Toup user ID (TelegramUserMapping)
     │
     ▼
 AgentRunner.run(message, user_id, session_id)

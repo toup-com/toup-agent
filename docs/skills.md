@@ -1,6 +1,6 @@
-# HexBrain — Building Skills (Plugins)
+# Toup — Building Skills (Plugins)
 
-Skills are modular plugins that extend the HexBrain agent with new tools, system prompt sections, and behaviors.
+Skills are modular plugins that extend the Toup agent with new tools, system prompt sections, and behaviors.
 
 ## Directory Structure
 
@@ -12,7 +12,7 @@ skills/
 ```
 
 Skills can live in two locations:
-1. **Built-in:** `backend/app/agent/skills/builtins/` — shipped with HexBrain
+1. **Built-in:** `backend/app/agent/skills/builtins/` — shipped with Toup
 2. **External:** `/app/skills/` (Docker volume `agent_skills`) — user-installed
 
 ## Creating a Skill
@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 
 
 class MySkill(Skill):
-    """My custom HexBrain skill."""
+    """My custom Toup skill."""
 
     meta = SkillMeta(
         name="my_skill",              # Unique slug (used as tool prefix)
@@ -93,7 +93,7 @@ class MySkill(Skill):
 **Docker (production):**
 Copy the skill folder into the `agent_skills` volume:
 ```bash
-docker cp skills/my_skill hexbrain-backend:/app/skills/my_skill
+docker cp skills/my_skill toup-backend:/app/skills/my_skill
 docker compose restart backend
 ```
 

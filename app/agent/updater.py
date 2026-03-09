@@ -105,7 +105,7 @@ class Updater:
         self._state = UpdateState.IDLE
         self._latest_info: Optional[VersionInfo] = None
         self._update_history: List[UpdateResult] = []
-        self._repo_path = os.environ.get("HEXBRAIN_REPO_PATH", "/app")
+        self._repo_path = os.environ.get("TOUP_REPO_PATH", "/app")
 
     @property
     def current_version(self) -> str:

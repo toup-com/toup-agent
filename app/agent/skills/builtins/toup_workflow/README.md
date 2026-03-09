@@ -2,7 +2,7 @@
 
 > **Version**: 1.0.0 | **Author**: Toup | **Category**: Workflow Building
 
-A comprehensive knowledge skill that teaches the HexBrain agent how to build, validate, and manage visual workflows using the 25 available node types and 16 MCP tools.
+A comprehensive knowledge skill that teaches the Toup agent how to build, validate, and manage visual workflows using the 25 available node types and 16 MCP tools.
 
 ## Inspired By
 

@@ -23,9 +23,9 @@ except ImportError:
     sys.exit(1)
 
 
-DEFAULT_BASE = os.environ.get("HEXBRAIN_URL", "http://localhost:8000")
-DEFAULT_USER = os.environ.get("HEXBRAIN_USER", "admin")
-DEFAULT_PASS = os.environ.get("HEXBRAIN_PASS", "")
+DEFAULT_BASE = os.environ.get("TOUP_URL", "http://localhost:8000")
+DEFAULT_USER = os.environ.get("TOUP_USER", "admin")
+DEFAULT_PASS = os.environ.get("TOUP_PASS", "")
 
 
 def get_token(base_url: str, username: str, password: str) -> str:

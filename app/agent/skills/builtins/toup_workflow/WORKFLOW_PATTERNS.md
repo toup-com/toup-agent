@@ -1,6 +1,6 @@
 # Workflow Patterns — Proven Architectures
 
-5 battle-tested patterns for building HexBrain workflows.
+5 battle-tested patterns for building Toup workflows.
 
 ---
 

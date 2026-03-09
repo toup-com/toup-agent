@@ -535,13 +535,13 @@ class TestTailscale:
     def test_configure(self):
         from app.agent.tailscale import TailscaleManager
         mgr = TailscaleManager()
-        config = mgr.configure(auth_key="tskey-xxx", hostname="hexbrain")
-        assert config.hostname == "hexbrain"
+        config = mgr.configure(auth_key="tskey-xxx", hostname="toup")
+        assert config.hostname == "toup"
 
     def test_connect(self):
         from app.agent.tailscale import TailscaleManager
         mgr = TailscaleManager()
-        mgr.configure(hostname="hexbrain", tailnet="mynet")
+        mgr.configure(hostname="toup", tailnet="mynet")
         loop = asyncio.get_event_loop()
         assert loop.run_until_complete(mgr.connect()) == True
         assert mgr.is_connected == True
@@ -549,7 +549,7 @@ class TestTailscale:
     def test_serve(self):
         from app.agent.tailscale import TailscaleManager
         mgr = TailscaleManager()
-        mgr.configure(hostname="hexbrain")
+        mgr.configure(hostname="toup")
         loop = asyncio.get_event_loop()
         loop.run_until_complete(mgr.connect())
         config = loop.run_until_complete(mgr.serve(port=8000, path="/api"))
@@ -559,7 +559,7 @@ class TestTailscale:
     def test_funnel(self):
         from app.agent.tailscale import TailscaleManager
         mgr = TailscaleManager()
-        mgr.configure(hostname="hexbrain")
+        mgr.configure(hostname="toup")
         loop = asyncio.get_event_loop()
         loop.run_until_complete(mgr.connect())
         config = loop.run_until_complete(mgr.funnel(port=8000))
@@ -568,12 +568,12 @@ class TestTailscale:
     def test_get_url(self):
         from app.agent.tailscale import TailscaleManager
         mgr = TailscaleManager()
-        mgr.configure(hostname="hexbrain", tailnet="mynet")
+        mgr.configure(hostname="toup", tailnet="mynet")
         loop = asyncio.get_event_loop()
         loop.run_until_complete(mgr.connect())
         loop.run_until_complete(mgr.serve(port=8000))
         url = mgr.get_url(8000)
-        assert "hexbrain" in url
+        assert "toup" in url
 
     def test_stop_serve(self):
         from app.agent.tailscale import TailscaleManager

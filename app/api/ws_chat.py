@@ -208,6 +208,7 @@ async def ws_chat(
 
             session_id = msg.get("session_id")
             model = msg.get("model")
+            channel = msg.get("channel")  # e.g. "mobile", "web"
 
             # Terminal activity: show user message
             _tprint(f"\n{_CYAN_BOLD} user {_RESET} {text}")
@@ -242,6 +243,7 @@ async def ws_chat(
                     user_message=text,
                     user_id=user_id,
                     session_id=session_id,
+                    channel=channel,
                     on_text_chunk=on_text_chunk,
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
