@@ -227,138 +227,138 @@ async def ws_chat(
                     logger.info(f"[WS] Client disconnected: {user_id}")
                     return
 
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
-                continue
-
-            msg_type = msg.get("type", "")
-
-            if msg_type == "ping":
-                await websocket.send_json({"type": "pong"})
-                continue
-
-            if msg_type != "message":
-                await websocket.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
-                continue
-
-            text = msg.get("text", "").strip()
-            if not text:
-                await websocket.send_json({"type": "error", "message": "Empty message"})
-                continue
-
-            # ── Onboarding trigger ──────────────────────────────
-            is_onboarding_msg = False
-            if text == "__ONBOARDING_START__":
-                from app.db.database import async_session_maker
-                from app.db.models import AgentConfig
-                async with async_session_maker() as _db:
-                    _cfg = (await _db.execute(
-                        select(AgentConfig).where(AgentConfig.user_id == user_id)
-                    )).scalar_one_or_none()
-                    if _cfg and _cfg.onboarding_completed:
-                        text = "Hello!"
-                    else:
-                        text = _ONBOARDING_TRIGGER
-                        is_onboarding_msg = True
-
-            session_id = msg.get("session_id")
-            model = msg.get("model")
-            channel = msg.get("channel")  # e.g. "mobile", "web"
-
-            # Terminal activity: show user message
-            _tprint(f"\n{_CYAN_BOLD} user {_RESET} {text}")
-
-            # Stream callbacks
-            async def on_text_chunk(chunk: str):
                 try:
-                    await websocket.send_json({"type": "text_chunk", "text": chunk})
-                except Exception:
-                    pass
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+                    continue
 
-            async def on_tool_start(tool_name: str):
-                _tprint(f"{_DIM}  ⚙ {tool_name}{_RESET}")
+                msg_type = msg.get("type", "")
+
+                if msg_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+                    continue
+
+                if msg_type != "message":
+                    await websocket.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
+                    continue
+
+                text = msg.get("text", "").strip()
+                if not text:
+                    await websocket.send_json({"type": "error", "message": "Empty message"})
+                    continue
+
+                # ── Onboarding trigger ──────────────────────────────
+                is_onboarding_msg = False
+                if text == "__ONBOARDING_START__":
+                    from app.db.database import async_session_maker
+                    from app.db.models import AgentConfig
+                    async with async_session_maker() as _db:
+                        _cfg = (await _db.execute(
+                            select(AgentConfig).where(AgentConfig.user_id == user_id)
+                        )).scalar_one_or_none()
+                        if _cfg and _cfg.onboarding_completed:
+                            text = "Hello!"
+                        else:
+                            text = _ONBOARDING_TRIGGER
+                            is_onboarding_msg = True
+
+                session_id = msg.get("session_id")
+                model = msg.get("model")
+                channel = msg.get("channel")  # e.g. "mobile", "web"
+
+                # Terminal activity: show user message
+                _tprint(f"\n{_CYAN_BOLD} user {_RESET} {text}")
+
+                # Stream callbacks
+                async def on_text_chunk(chunk: str):
+                    try:
+                        await websocket.send_json({"type": "text_chunk", "text": chunk})
+                    except Exception:
+                        pass
+
+                async def on_tool_start(tool_name: str):
+                    _tprint(f"{_DIM}  ⚙ {tool_name}{_RESET}")
+                    try:
+                        await websocket.send_json({"type": "tool_start", "tool": tool_name})
+                    except Exception:
+                        pass
+
+                async def on_tool_end(tool_name: str, summary: str):
+                    short = summary[:120] + "..." if len(summary) > 120 else summary
+                    # Collapse to single line for terminal readability
+                    short = short.replace("\n", " ")
+                    _tprint(f"{_DIM}  ✓ {tool_name}: {short}{_RESET}")
+                    try:
+                        await websocket.send_json({"type": "tool_end", "tool": tool_name, "summary": summary})
+                    except Exception:
+                        pass
+
+                # Run agent
                 try:
-                    await websocket.send_json({"type": "tool_start", "tool": tool_name})
-                except Exception:
-                    pass
+                    response = await _agent_runner.run(
+                        user_message=text,
+                        user_id=user_id,
+                        session_id=session_id,
+                        channel=channel,
+                        on_text_chunk=on_text_chunk,
+                        on_tool_start=on_tool_start,
+                        on_tool_end=on_tool_end,
+                        model_override=model,
+                        save_user_message=not is_onboarding_msg,
+                    )
 
-            async def on_tool_end(tool_name: str, summary: str):
-                short = summary[:120] + "..." if len(summary) > 120 else summary
-                # Collapse to single line for terminal readability
-                short = short.replace("\n", " ")
-                _tprint(f"{_DIM}  ✓ {tool_name}: {short}{_RESET}")
-                try:
-                    await websocket.send_json({"type": "tool_end", "tool": tool_name, "summary": summary})
-                except Exception:
-                    pass
+                    # Terminal activity: show agent response summary
+                    resp_preview = response.text[:200].replace("\n", " ")
+                    if len(response.text) > 200:
+                        resp_preview += "..."
+                    _tprint(f"{_GREEN_BOLD} agent {_RESET} {resp_preview}")
+                    _tprint(
+                        f"{_DIM}  ({response.tokens_total or 0} tokens, "
+                        f"{response.processing_time_ms or 0}ms, "
+                        f"{response.model or '?'}){_RESET}"
+                    )
 
-            # Run agent
-            try:
-                response = await _agent_runner.run(
-                    user_message=text,
-                    user_id=user_id,
-                    session_id=session_id,
-                    channel=channel,
-                    on_text_chunk=on_text_chunk,
-                    on_tool_start=on_tool_start,
-                    on_tool_end=on_tool_end,
-                    model_override=model,
-                    save_user_message=not is_onboarding_msg,
-                )
+                    # Check if onboarding just completed (agent stored the signal memory)
+                    for tc in response.tool_calls:
+                        if tc.get("name") == "memory_store":
+                            tc_content = (tc.get("input") or {}).get("content", "")
+                            if "onboarding complete" in tc_content.lower():
+                                try:
+                                    from app.db.database import async_session_maker
+                                    from app.db.models import AgentConfig
+                                    async with async_session_maker() as _db:
+                                        _cfg = (await _db.execute(
+                                            select(AgentConfig).where(AgentConfig.user_id == user_id)
+                                        )).scalar_one_or_none()
+                                        if _cfg:
+                                            _cfg.onboarding_completed = True
+                                            await _db.commit()
+                                            logger.info(f"[WS] Onboarding completed for user {user_id}")
+                                except Exception as e:
+                                    logger.warning(f"[WS] Failed to mark onboarding complete: {e}")
+                                break
 
-                # Terminal activity: show agent response summary
-                resp_preview = response.text[:200].replace("\n", " ")
-                if len(response.text) > 200:
-                    resp_preview += "..."
-                _tprint(f"{_GREEN_BOLD} agent {_RESET} {resp_preview}")
-                _tprint(
-                    f"{_DIM}  ({response.tokens_total or 0} tokens, "
-                    f"{response.processing_time_ms or 0}ms, "
-                    f"{response.model or '?'}){_RESET}"
-                )
+                    await websocket.send_json({
+                        "type": "done",
+                        "text": response.text,
+                        "session_id": response.session_id,
+                        "tokens": {
+                            "input": response.tokens_input,
+                            "output": response.tokens_output,
+                            "total": response.tokens_total,
+                        },
+                        "model": response.model,
+                        "tool_calls": len(response.tool_calls),
+                        "processing_time_ms": response.processing_time_ms,
+                    })
 
-                # Check if onboarding just completed (agent stored the signal memory)
-                for tc in response.tool_calls:
-                    if tc.get("name") == "memory_store":
-                        tc_content = (tc.get("input") or {}).get("content", "")
-                        if "onboarding complete" in tc_content.lower():
-                            try:
-                                from app.db.database import async_session_maker
-                                from app.db.models import AgentConfig
-                                async with async_session_maker() as _db:
-                                    _cfg = (await _db.execute(
-                                        select(AgentConfig).where(AgentConfig.user_id == user_id)
-                                    )).scalar_one_or_none()
-                                    if _cfg:
-                                        _cfg.onboarding_completed = True
-                                        await _db.commit()
-                                        logger.info(f"[WS] Onboarding completed for user {user_id}")
-                            except Exception as e:
-                                logger.warning(f"[WS] Failed to mark onboarding complete: {e}")
-                            break
-
-                await websocket.send_json({
-                    "type": "done",
-                    "text": response.text,
-                    "session_id": response.session_id,
-                    "tokens": {
-                        "input": response.tokens_input,
-                        "output": response.tokens_output,
-                        "total": response.tokens_total,
-                    },
-                    "model": response.model,
-                    "tool_calls": len(response.tool_calls),
-                    "processing_time_ms": response.processing_time_ms,
-                })
-
-            except asyncio.CancelledError:
-                await websocket.send_json({"type": "error", "message": "Request cancelled"})
-            except Exception as e:
-                logger.exception(f"[WS] Agent error for {user_id}")
-                _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
-                await websocket.send_json({"type": "error", "message": f"Agent error: {type(e).__name__}: {e}"})
+                except asyncio.CancelledError:
+                    await websocket.send_json({"type": "error", "message": "Request cancelled"})
+                except Exception as e:
+                    logger.exception(f"[WS] Agent error for {user_id}")
+                    _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
+                    await websocket.send_json({"type": "error", "message": f"Agent error: {type(e).__name__}: {e}"})
         finally:
             # Clean up broadcast queue and task
             broadcast_task.cancel()
