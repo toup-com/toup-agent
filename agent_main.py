@@ -41,7 +41,7 @@ from app.api.apps import router as apps_router, set_app_manager
 _app_start_time = None
 
 # ── Paths that skip API key auth (health checks, root) ─────────────
-_PUBLIC_PATHS = frozenset({"/", "/agent/health", "/docs", "/openapi.json", "/redoc"})
+_PUBLIC_PATHS = frozenset({"/", "/agent/health", "/agent/system", "/docs", "/openapi.json", "/redoc"})
 
 
 class AgentAPIKeyMiddleware:
