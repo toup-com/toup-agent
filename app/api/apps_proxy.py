@@ -7,10 +7,11 @@ The platform is a passthrough proxy only.
 
 import logging
 from typing import Optional, Tuple
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -84,6 +85,66 @@ async def list_jobs(current_user=Depends(get_current_user), db: AsyncSession = D
 async def get_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     agent_url, key = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, f"jobs/{job_id}")
+
+
+@router.delete("/jobs/{job_id}")
+async def delete_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    agent_url, key = _require(await _get_agent(current_user.id, db))
+    return await _proxy(agent_url, key, f"jobs/{job_id}", method="DELETE")
+
+
+# ── Web Preview Proxy ──────────────────────────────────────
+# Reverse-proxies the Expo web dev server through toup.ai so the
+# mobile app can load it over HTTPS without direct VPS port access.
+
+async def _get_app_web_port(app_id: str, agent_url: str, agent_api_key: str) -> int:
+    """Fetch the app's web_port from the VPS agent API."""
+    url = f"{agent_url}/api/apps/{app_id}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url, headers={"X-Agent-Key": agent_api_key})
+        if resp.status_code != 200:
+            raise HTTPException(404, "App not found")
+        data = resp.json()
+        web_port = data.get("web_port")
+        if not web_port:
+            raise HTTPException(503, "App web server not running")
+        return web_port
+
+
+@router.get("/{app_id}/preview/{path:path}")
+@router.get("/{app_id}/preview")
+async def preview_proxy(
+    app_id: str, request: Request,
+    path: str = "",
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reverse-proxy the Expo web dev server for in-app preview."""
+    agent_url, key = _require(await _get_agent(current_user.id, db))
+
+    # Get VPS IP from agent_url (e.g. "http://76.13.116.149:8001" → "76.13.116.149")
+    from urllib.parse import urlparse
+    vps_host = urlparse(agent_url).hostname
+
+    web_port = await _get_app_web_port(app_id, agent_url, key)
+    target = f"http://{vps_host}:{web_port}/{path}"
+
+    # Forward query string
+    if request.query_params:
+        target += f"?{urlencode(dict(request.query_params))}"
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(target)
+            content_type = resp.headers.get("content-type", "text/html")
+            return StreamingResponse(
+                iter([resp.content]),
+                status_code=resp.status_code,
+                media_type=content_type,
+            )
+    except Exception as e:
+        logger.warning("Preview proxy failed: %s → %s", target, e)
+        raise HTTPException(502, "App preview unreachable")
 
 
 @router.get("/{app_id}")
