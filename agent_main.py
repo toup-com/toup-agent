@@ -664,6 +664,80 @@ async def agent_health():
     }
 
 
+@app.get("/agent/system")
+async def agent_system_info():
+    """Return VPS system resource info (CPU, RAM, disk, OS)."""
+    import time as _time, os, shutil
+    uptime = _time.time() - _app_start_time if _app_start_time else 0
+
+    # CPU
+    cpu_count = os.cpu_count() or 1
+    load_1m = 0.0
+    try:
+        load_1m = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        pass
+
+    # Memory
+    mem_total_mb, mem_used_mb = 0, 0
+    try:
+        with open("/proc/meminfo") as f:
+            info = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1])
+            mem_total_mb = info.get("MemTotal", 0) // 1024
+            mem_avail_mb = info.get("MemAvailable", info.get("MemFree", 0)) // 1024
+            mem_used_mb = mem_total_mb - mem_avail_mb
+    except Exception:
+        pass
+
+    # Disk
+    disk_total_gb, disk_used_gb = 0, 0
+    try:
+        usage = shutil.disk_usage("/")
+        disk_total_gb = round(usage.total / (1024 ** 3), 1)
+        disk_used_gb = round(usage.used / (1024 ** 3), 1)
+    except Exception:
+        pass
+
+    # OS
+    os_name = "Linux"
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    os_name = line.split("=", 1)[1].strip().strip('"')
+                    break
+    except Exception:
+        pass
+
+    # Running apps count
+    apps_running = 0
+    try:
+        from app.agent.app_manager import app_manager as _am
+        if _am:
+            apps_running = len([a for a in _am._running.values() if a.metro_process or a.web_process])
+    except Exception:
+        pass
+
+    return {
+        "cpu_count": cpu_count,
+        "load_1m": round(load_1m, 2),
+        "mem_total_mb": mem_total_mb,
+        "mem_used_mb": mem_used_mb,
+        "disk_total_gb": disk_total_gb,
+        "disk_used_gb": disk_used_gb,
+        "os": os_name,
+        "hostname": os.uname().nodename if hasattr(os, "uname") else "unknown",
+        "uptime_seconds": round(uptime, 1),
+        "apps_running": apps_running,
+        "agent_model": settings.agent_model,
+        "version": "6.0.0",
+    }
+
+
 @app.post("/agent/update")
 async def agent_self_update():
     """Pull latest code, install deps, and restart the agent process.

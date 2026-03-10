@@ -67,6 +67,31 @@ def _require(info):
     return info
 
 
+# ── Server info ─────────────────────────────────────────────
+
+@router.get("/server")
+async def get_server_info(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Get VPS system info (CPU, RAM, disk, uptime, running apps)."""
+    agent_info = await _get_agent(current_user.id, db)
+    if not agent_info:
+        return JSONResponse(content={"status": "offline"}, status_code=200)
+    agent_url, key = agent_info
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{agent_url}/agent/system",
+                headers={"X-Agent-Key": key},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                data["status"] = "online"
+                data["ip"] = agent_url.replace("http://", "").replace("https://", "").split(":")[0]
+                return JSONResponse(content=data)
+    except Exception as e:
+        logger.warning("Server info proxy failed: %s", e)
+    return JSONResponse(content={"status": "offline"})
+
+
 # ── App endpoints ───────────────────────────────────────────
 
 @router.get("/")
