@@ -111,27 +111,54 @@ async def _get_app_web_port(app_id: str, agent_url: str, agent_api_key: str) -> 
         return web_port
 
 
+async def _get_user_from_token(token: str, db: AsyncSession):
+    """Validate JWT from query param for preview auth."""
+    from app.services.auth_service import decode_access_token
+    try:
+        user_id = decode_access_token(token)
+        if not user_id:
+            return None
+        return type("User", (), {"id": user_id})()
+    except Exception:
+        return None
+
+
 @router.get("/{app_id}/preview/{path:path}")
 @router.get("/{app_id}/preview")
 async def preview_proxy(
     app_id: str, request: Request,
     path: str = "",
-    current_user=Depends(get_current_user),
+    token: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Reverse-proxy the Expo web dev server for in-app preview."""
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    """Reverse-proxy the Expo web dev server for in-app preview.
 
-    # Get VPS IP from agent_url (e.g. "http://76.13.116.149:8001" → "76.13.116.149")
+    Auth via ?token=JWT (SFSafariViewController can't send Bearer headers).
+    """
+    # Try Bearer header first, then query param token
+    user = None
+    try:
+        user = await get_current_user(request, db)
+    except Exception:
+        pass
+    if not user and token:
+        user = await _get_user_from_token(token, db)
+    if not user:
+        raise HTTPException(401, "Not authenticated")
+
+    agent_info = await _get_agent(user.id, db)
+    agent_url, key = _require(agent_info)
+
     from urllib.parse import urlparse
     vps_host = urlparse(agent_url).hostname
 
     web_port = await _get_app_web_port(app_id, agent_url, key)
     target = f"http://{vps_host}:{web_port}/{path}"
 
-    # Forward query string
-    if request.query_params:
-        target += f"?{urlencode(dict(request.query_params))}"
+    # Forward query string (except our token param)
+    params = {k: v for k, v in request.query_params.items() if k != "token"}
+    if params:
+        target += f"?{urlencode(params)}"
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
