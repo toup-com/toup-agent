@@ -12,6 +12,7 @@ Endpoints:
 
   GET    /apps/jobs/               - List all build jobs
   GET    /apps/jobs/{job_id}       - Get build job details
+  GET    /apps/jobs/{job_id}/logs  - Get structured build logs
 """
 
 import json
@@ -171,6 +172,26 @@ async def get_job(job_id: str) -> JobResponse:
         return _job_to_response(job)
 
 
+@router.get("/jobs/{job_id}/logs")
+async def get_job_logs(job_id: str) -> Dict[str, Any]:
+    """Get structured build logs for a job."""
+    async with async_session_maker() as db:
+        job = await db.get(BuildJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        logs = []
+        try:
+            logs = json.loads(job.build_logs_json) if job.build_logs_json else []
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return {
+            "job_id": job_id,
+            "status": job.status,
+            "total_tokens": job.total_tokens or 0,
+            "logs": logs,
+        }
+
+
 @router.get("/{app_id}")
 async def get_app(app_id: str) -> AppResponse:
     """Get a specific app."""
@@ -272,16 +293,32 @@ async def push_github(app_id: str) -> Dict[str, str]:
     return {"result": result, "repo_url": app.github_url or ""}
 
 
+@router.delete("/jobs/{job_id}")
+async def delete_job(job_id: str) -> Dict[str, bool]:
+    """Delete a build job record."""
+    async with async_session_maker() as db:
+        job = await db.get(BuildJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        await db.delete(job)
+        await db.commit()
+    return {"ok": True}
+
+
 @router.delete("/{app_id}")
 async def delete_app(app_id: str) -> Dict[str, bool]:
-    """Delete an app (stop servers, remove files, remove DB records)."""
+    """Delete an app (stop servers, remove files, remove DB records + related jobs)."""
     if _app_manager:
         await _app_manager.delete_app(app_id)
 
     async with async_session_maker() as db:
+        # Delete related build jobs
+        from sqlalchemy import delete as sa_delete
+        await db.execute(sa_delete(BuildJob).where(BuildJob.app_id == app_id))
+
         app = await db.get(App, app_id)
         if app:
             await db.delete(app)
-            await db.commit()
+        await db.commit()
 
     return {"ok": True}

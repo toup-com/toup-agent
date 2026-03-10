@@ -56,7 +56,7 @@ class AppManager:
             return self._public_ip
         try:
             proc = await asyncio.create_subprocess_exec(
-                "curl", "-s", "--max-time", "5", "https://ifconfig.me",
+                "curl", "-s", "-4", "--max-time", "5", "https://ifconfig.me",
                 stdout=asyncio.subprocess.PIPE,
             )
             stdout, _ = await proc.communicate()

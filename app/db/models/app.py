@@ -34,6 +34,7 @@ class App(Base):
     github_repo: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)  # "user/repo-name"
     github_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     publish_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Custom domain or published URL
+    plan_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Approved plan from conversation
     platforms: Mapped[str] = mapped_column(String(50), default="web,ios")  # Comma-separated
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -53,5 +54,6 @@ class BuildJob(Base):
     model: Mapped[str] = mapped_column(String(50), default="")
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    build_logs_json: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of BuildLog entries
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

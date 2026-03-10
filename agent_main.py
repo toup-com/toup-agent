@@ -240,6 +240,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ App skill loading error: {e}")
 
+
         # Wire skill_loader to workflow CRUD for auto-registration
         try:
             from app.api.workflow_crud import set_skill_loader
@@ -308,6 +309,15 @@ async def lifespan(app: FastAPI):
             )
             await skill_loader.register_dynamic(builder_skill)
             print("🏗️ App Builder skill registered")
+
+            # Load filesystem-backed app skills for existing apps
+            try:
+                from app.agent.skills.builtins.app_builder.app_fs_skill import load_app_fs_skills_from_db
+                fs_count = await load_app_fs_skills_from_db(skill_loader, app_manager)
+                if fs_count:
+                    print(f"📱 Loaded {fs_count} filesystem app skill(s)")
+            except Exception as e:
+                print(f"⚠️ App FS skill loading error: {e}")
         except Exception as e:
             print(f"⚠️ App Manager/Builder error: {e}")
 

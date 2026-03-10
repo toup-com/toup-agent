@@ -106,6 +106,10 @@ async def init_db():
         "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS hetzner_vm_id VARCHAR(50)",
         # Target OS for remote deploy (linux/macos/windows)
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS target_os VARCHAR(20)",
+        # Build logs for app builder jobs
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS build_logs_json TEXT DEFAULT '[]'",
+        # Approved plan from conversational app builder
+        "ALTER TABLE apps ADD COLUMN IF NOT EXISTS plan_json TEXT",
     ]
     # Seed user-facing VPS plans — Hetzner Cloud CPX (AMD, Shared Regular Performance)
     # Location: ASH (Ashburn, Virginia, USA)
