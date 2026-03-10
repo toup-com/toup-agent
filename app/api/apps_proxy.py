@@ -134,8 +134,10 @@ async def preview_proxy(
     """Reverse-proxy the Expo web dev server for in-app preview.
 
     Auth via ?token=JWT (SFSafariViewController can't send Bearer headers).
+    Injects <base href> into HTML so sub-resources (JS bundles, etc.)
+    route back through this proxy instead of hitting toup.ai root.
     """
-    # Try Bearer header first, then query param token
+    # Try Bearer header first, then query param token, then cookie
     user = None
     try:
         user = await get_current_user(request, db)
@@ -143,6 +145,10 @@ async def preview_proxy(
         pass
     if not user and token:
         user = await _get_user_from_token(token, db)
+    if not user:
+        cookie_token = request.cookies.get("preview_token")
+        if cookie_token:
+            user = await _get_user_from_token(cookie_token, db)
     if not user:
         raise HTTPException(401, "Not authenticated")
 
@@ -164,11 +170,38 @@ async def preview_proxy(
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.get(target)
             content_type = resp.headers.get("content-type", "text/html")
-            return StreamingResponse(
-                iter([resp.content]),
+
+            body = resp.content
+
+            # For HTML responses (the initial page), inject <base href> so
+            # relative URLs like /index.ts.bundle resolve through the proxy
+            # path instead of toup.ai root.
+            if "text/html" in content_type:
+                base_href = f"/api/apps/{app_id}/preview/"
+                base_tag = f'<base href="{base_href}">'
+                html = body.decode("utf-8", errors="replace")
+                html = html.replace("<head>", f"<head>\n{base_tag}", 1)
+                body = html.encode("utf-8")
+
+            response = StreamingResponse(
+                iter([body]),
                 status_code=resp.status_code,
                 media_type=content_type,
             )
+
+            # Set auth cookie so sub-resource requests (JS bundles, etc.)
+            # are authenticated without needing ?token= on every URL.
+            if token and "text/html" in content_type:
+                response.set_cookie(
+                    key="preview_token",
+                    value=token,
+                    max_age=3600,
+                    httponly=True,
+                    samesite="none",
+                    secure=True,
+                )
+
+            return response
     except Exception as e:
         logger.warning("Preview proxy failed: %s → %s", target, e)
         raise HTTPException(502, "App preview unreachable")
