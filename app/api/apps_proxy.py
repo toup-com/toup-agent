@@ -6,6 +6,7 @@ The platform is a passthrough proxy only.
 """
 
 import logging
+import re
 from typing import Optional, Tuple
 from urllib.parse import urlencode
 
@@ -192,7 +193,7 @@ async def preview_proxy(
         target += f"?{urlencode(params)}"
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.get(target)
             content_type = resp.headers.get("content-type", "text/html")
 
@@ -201,11 +202,21 @@ async def preview_proxy(
             # For HTML responses (the initial page), inject <base href> so
             # relative URLs like /index.ts.bundle resolve through the proxy
             # path instead of toup.ai root.
+            # Also rewrite script src to include ?token= so sub-resource
+            # requests authenticate without relying on cookies (WebView
+            # may not send cookies for cross-origin sub-requests).
             if "text/html" in content_type:
                 base_href = f"/api/apps/{app_id}/preview/"
                 base_tag = f'<base href="{base_href}">'
                 html = body.decode("utf-8", errors="replace")
                 html = html.replace("<head>", f"<head>\n{base_tag}", 1)
+                # Inject token into script src URLs so bundle requests are authed
+                if token:
+                    def _add_token(m):
+                        src = m.group(1)
+                        sep = "&" if "?" in src else "?"
+                        return f'src="{src}{sep}token={token}"'
+                    html = re.sub(r'src="([^"]*\.bundle[^"]*)"', _add_token, html)
                 body = html.encode("utf-8")
 
             response = StreamingResponse(
