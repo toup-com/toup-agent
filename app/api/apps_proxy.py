@@ -210,13 +210,21 @@ async def preview_proxy(
                 base_tag = f'<base href="{base_href}">'
                 html = body.decode("utf-8", errors="replace")
                 html = html.replace("<head>", f"<head>\n{base_tag}", 1)
-                # Inject token into script src URLs so bundle requests are authed
-                if token:
-                    def _add_token(m):
-                        src = m.group(1)
+                # Rewrite absolute src="/..." to relative so <base href>
+                # routes them through the preview proxy path.
+                # Also inject ?token= so bundle requests are authenticated
+                # (WebView may not send cookies for sub-resource requests).
+                def _rewrite_src(m):
+                    src = m.group(1)
+                    # Strip leading / to make relative (so <base href> applies)
+                    if src.startswith("/"):
+                        src = src[1:]
+                    # Inject auth token
+                    if token:
                         sep = "&" if "?" in src else "?"
-                        return f'src="{src}{sep}token={token}"'
-                    html = re.sub(r'src="([^"]*\.bundle[^"]*)"', _add_token, html)
+                        src = f"{src}{sep}token={token}"
+                    return f'src="{src}"'
+                html = re.sub(r'src="(/[^"]*)"', _rewrite_src, html)
                 body = html.encode("utf-8")
 
             response = StreamingResponse(
