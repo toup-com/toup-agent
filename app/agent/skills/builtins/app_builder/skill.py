@@ -188,6 +188,10 @@ Rendering differences WILL cause visual bugs if you ignore these rules:
     crash with "Text strings must be rendered within a Text component". This includes
     conditional expressions: use `{{condition && <Text>text</Text>}}` not `{{condition && "text"}}`.
 
+12. Functions that use `await` MUST be declared `async`. Writing `export function getX(): Promise<T> {{ await ... }}`
+    is a SyntaxError — it MUST be `export async function getX(): Promise<T> {{ await ... }}`.
+    This is the #1 cause of build failures in database utility files.
+
 Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /components/AgentPlaceholder.tsx:
   Build a floating agent widget component. It renders a small circular avatar (40x40, position: absolute,
@@ -1605,6 +1609,37 @@ module.exports = config;
                     r"(Platform.OS !== 'web' && Vibration.vibrate())",
                     patched,
                 )
+
+            # 4. Non-async functions using await — LLMs write `function X(): Promise<T> { await ... }`
+            #    which is a SyntaxError. Add `async` to any `export function` that contains `await `.
+            if 'await ' in patched:
+                # Find all non-async exported functions and check if they contain await
+                def _add_async_to_awaiting_fns(code: str) -> str:
+                    lines = code.split('\n')
+                    result = []
+                    i = 0
+                    while i < len(lines):
+                        line = lines[i]
+                        # Match `export function X(` that is NOT already async
+                        if (_re.match(r'\s*export\s+function\s+\w+', line)
+                                and 'async' not in line):
+                            # Scan ahead to find the function body and check for await
+                            # Collect lines until we find the closing brace at the same indent
+                            fn_start = i
+                            brace_count = 0
+                            has_await = False
+                            for j in range(i, min(i + 100, len(lines))):
+                                brace_count += lines[j].count('{') - lines[j].count('}')
+                                if 'await ' in lines[j]:
+                                    has_await = True
+                                if brace_count <= 0 and j > fn_start:
+                                    break
+                            if has_await:
+                                lines[i] = line.replace('export function ', 'export async function ', 1)
+                        result.append(lines[i])
+                        i += 1
+                    return '\n'.join(result)
+                patched = _add_async_to_awaiting_fns(patched)
 
             if patched != original:
                 infra_files[fp] = patched
