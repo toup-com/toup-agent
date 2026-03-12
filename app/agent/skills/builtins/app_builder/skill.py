@@ -154,7 +154,10 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /App.tsx:
   Import AgentPlaceholder and render it as the LAST child inside NavigationContainer,
   positioned absolutely so it overlays all screens. Pass the navigation ref to agentBridge.
-  Example: after <Stack.Navigator>...</Stack.Navigator>, add <AgentPlaceholder />.
+  IMPORTANT: Only show AgentPlaceholder when NOT loaded through the platform (the platform shows
+  the user's real agent). Wrap it in a condition:
+  {{typeof window !== "undefined" && !(window as any).__TOUP_AUTH_TOKEN && <AgentPlaceholder />}}
+  Example: after <Stack.Navigator>...</Stack.Navigator>, add the conditional AgentPlaceholder.
 
 - For ANY screen file:
   Register that screen's agent actions in a useEffect via agentActions.registerAction().
