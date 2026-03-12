@@ -259,15 +259,6 @@ async def preview_proxy(
                     f'window.__TOUP_AUTH_TOKEN="{token or ""}";'
                     f'window.__TOUP_APP_ID="{app_id}";'
                     f'window.__TOUP_WS_URL="wss://toup.ai/api/ws/chat";'
-                    f'window.__toup_errors=[];'
-                    f'window.onerror=function(m,s,l,c,e){{'
-                    f'window.__toup_errors.push(m);'
-                    f'var d=document.getElementById("toup-err");'
-                    f'if(!d){{d=document.createElement("div");d.id="toup-err";'
-                    f'd.style.cssText="position:fixed;top:0;left:0;right:0;z-index:99999;background:#1a0000;color:#ff4444;padding:8px;font:11px monospace;max-height:40vh;overflow:auto;";'
-                    f'document.body.appendChild(d);}}'
-                    f'd.innerHTML+="<div>"+m+"</div>";'
-                    f'}};'
                     f'</script>'
                 )
                 html = body.decode("utf-8", errors="replace")

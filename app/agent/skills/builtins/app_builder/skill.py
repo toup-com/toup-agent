@@ -116,6 +116,13 @@ Rules:
 - For responsive design, use useWindowDimensions() and Platform.select()
 - If this file uses database, import from '../lib/db' (expo-sqlite helper)
 - For navigation, use @react-navigation/native-stack
+- React Navigation v7 theme MUST include `fonts` property. Example:
+  theme={{{{ dark: true, colors: {{ ... }}, fonts: {{
+    regular: {{ fontFamily: 'System', fontWeight: '400' as const }},
+    medium: {{ fontFamily: 'System', fontWeight: '500' as const }},
+    bold: {{ fontFamily: 'System', fontWeight: '700' as const }},
+    heavy: {{ fontFamily: 'System', fontWeight: '900' as const }},
+  }} }}}}
 - Make it fully functional — not a skeleton
 - Include proper error handling and loading states
 - Output ONLY the code — no markdown fences, no explanation
@@ -155,6 +162,12 @@ Rendering differences WILL cause visual bugs if you ignore these rules:
 
 6. Use Platform.select() for platform-specific behavior (font families, padding, shadows).
    Test values must work on both web and native — avoid native-only APIs without web fallbacks.
+
+7. Import/Export consistency: If a module uses `export default X`, import it as `import X from '...'`.
+   If it uses `export {{ X }}`, import as `import {{ X }} from '...'`. NEVER use named import syntax
+   `import {{ X }}` for a module that only has `export default`. This causes X to be undefined at runtime.
+   For lib files (agentBridge, database, etc.), always provide BOTH `export default` AND named `export {{ }}`
+   so either import style works.
 
 Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /components/AgentPlaceholder.tsx:
@@ -882,14 +895,28 @@ class AppBuilderSkill(Skill):
                 web_port = await self._app_manager.start_web(app_id)
                 await blog.success(f"Web server running on port {web_port}")
 
-                # ── Bundle validation ────────────────────────
+                # ── Bundle validation + auto-repair ──────────
                 await blog.info("Validating web bundle compilation...")
                 try:
                     await asyncio.sleep(3)  # Give Metro a moment to start
-                    bundle_ok = await self._validate_bundle(web_port, blog)
-                    if not bundle_ok:
-                        await blog.warn("Bundle has compilation errors — app may not render correctly")
-                    else:
+                    bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                    if not bundle_ok and bundle_errors:
+                        await blog.warn(f"Bundle has errors — attempting auto-repair...")
+                        # Try to fix the broken files
+                        repaired = await self._repair_bundle_errors(
+                            app_id, app_dir, bundle_errors, generated_files,
+                            description, name, deps, db_type, blog
+                        )
+                        if repaired:
+                            await asyncio.sleep(2)
+                            bundle_ok, _ = await self._validate_bundle(web_port, blog)
+                            if bundle_ok:
+                                await blog.success("Bundle repaired and compiles cleanly")
+                            else:
+                                await blog.warn("Bundle still has issues after repair — app may not render correctly")
+                        else:
+                            await blog.warn("Bundle has compilation errors — app may not render correctly")
+                    elif bundle_ok:
                         await blog.success("Bundle compiles cleanly")
                 except Exception as e:
                     await blog.warn(f"Bundle validation skipped: {e}")
@@ -1078,7 +1105,19 @@ class AppBuilderSkill(Skill):
 
             # ── Step 3: Install any new deps ───────────────────────
             blog.set_step("installing")
-            await self._update_step(job_id, user_id, "installing", "done", detail="No new deps needed")
+            # Scan generated code for new imports that aren't in current deps
+            new_deps = self._detect_new_deps(generated, deps)
+            if new_deps:
+                await blog.info(f"Installing {len(new_deps)} new dependencies: {', '.join(new_deps)}")
+                try:
+                    await self._app_manager.install_deps(app_id, new_deps)
+                    await blog.success(f"Installed {len(new_deps)} new deps")
+                except Exception as e:
+                    await blog.warn(f"Dep install failed (non-fatal): {e}")
+                await self._update_step(job_id, user_id, "installing", "done",
+                                        detail=f"Installed {len(new_deps)} deps")
+            else:
+                await self._update_step(job_id, user_id, "installing", "done", detail="No new deps needed")
 
             # ── Step 4: Restart servers ────────────────────────────
             blog.set_step("starting")
@@ -1292,7 +1331,21 @@ class AppBuilderSkill(Skill):
                     if blog:
                         await blog.error(f"Failed to generate {file_path}: {e}")
                     async with lock:
-                        generated[file_path] = f"// Error generating {file_path}: {e}\nexport default function() {{ return null; }}"
+                        # Show a visible error screen instead of blank white page
+                        generated[file_path] = (
+                            f"import React from 'react';\n"
+                            f"import {{ View, Text, StyleSheet }} from 'react-native';\n"
+                            f"export default function ErrorPlaceholder() {{\n"
+                            f"  return (\n"
+                            f"    <View style={{{{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#161B22' }}}}>\n"
+                            f"      <Text style={{{{ color: '#F85149', fontSize: 16, fontWeight: 'bold', marginBottom: 8 }}}}>Build Error</Text>\n"
+                            f"      <Text style={{{{ color: '#8B949E', fontSize: 13, textAlign: 'center', paddingHorizontal: 24 }}}}>\n"
+                            f"        Failed to generate {file_path.split('/')[-1]}. Please rebuild the app.\n"
+                            f"      </Text>\n"
+                            f"    </View>\n"
+                            f"  );\n"
+                            f"}}"
+                        )
                         completed += 1
 
                 if job_id:
@@ -1344,10 +1397,102 @@ module.exports = config;
                     if blog:
                         await blog.info(f"Patched {fp} for web-safe SQLite")
 
+        # Fix import/export mismatches: if a lib file only has `export default X`,
+        # add a named export too so `import { X }` also works
+        self._fix_import_export_mismatches(generated_files, infra_files)
+
+        # Fix React Navigation v7 theme — must include `fonts` property
+        import re as _re
+        for fp, code in {**generated_files, **infra_files}.items():
+            if 'NavigationContainer' in code and 'theme' in code and 'fonts' not in code:
+                fonts_block = (
+                    "          fonts: {\n"
+                    "            regular: { fontFamily: 'System', fontWeight: '400' as const },\n"
+                    "            medium: { fontFamily: 'System', fontWeight: '500' as const },\n"
+                    "            bold: { fontFamily: 'System', fontWeight: '700' as const },\n"
+                    "            heavy: { fontFamily: 'System', fontWeight: '900' as const },\n"
+                    "          },\n"
+                )
+                # Try multiple patterns to find where to insert fonts:
+                # Pattern 1: after the colors block closing brace (any last color prop)
+                patched = _re.sub(
+                    r'(colors:\s*\{[^}]*\},?\s*\n(\s+)\})',
+                    r'\1,\n' + fonts_block,
+                    code,
+                    count=1,
+                )
+                if patched == code:
+                    # Pattern 2: before the closing of the theme object
+                    # Find `theme={{ ... }}` and insert fonts before last `}`
+                    patched = _re.sub(
+                        r'(notification:[^\n]+\n\s+\},)',
+                        r'\1\n' + fonts_block,
+                        code,
+                        count=1,
+                    )
+                if patched == code:
+                    # Pattern 3: brute force — find the last `},` before `}}>`
+                    # and insert fonts after it
+                    patched = _re.sub(
+                        r'(border:[^\n]+\n\s+\},)',
+                        r'\1\n' + fonts_block,
+                        code,
+                        count=1,
+                    )
+                if patched != code:
+                    infra_files[fp] = patched
+                    if blog:
+                        await blog.info(f"Injected React Navigation v7 fonts into {fp}")
+
         if infra_files:
             await self._app_manager.write_app_files(app_id, infra_files)
             if blog:
                 await blog.info(f"Wrote {len(infra_files)} infrastructure files (metro config, web-safe DB)")
+
+    @staticmethod
+    def _fix_import_export_mismatches(generated_files: dict, infra_files: dict):
+        """Ensure lib files with only `export default X` also have named `export { X }`.
+
+        LLMs often generate `import { X } from './lib/X'` in one file but only
+        `export default X` in the lib file. This causes X to be undefined at
+        runtime, which crashes the app with a white page.
+        """
+        import re as _re
+
+        # Collect all named imports across all files
+        named_imports: dict[str, set[str]] = {}  # module_path -> set of names
+        for fp, code in generated_files.items():
+            for m in _re.finditer(r'import\s*\{([^}]+)\}\s*from\s*[\'"]([^\'"]+)[\'"]', code):
+                names = {n.strip().split(' as ')[0] for n in m.group(1).split(',') if n.strip()}
+                module = m.group(2)
+                named_imports.setdefault(module, set()).update(names)
+
+        # For each lib file, check if it has a default export but missing named exports
+        for fp, code in generated_files.items():
+            if fp in infra_files:
+                code = infra_files[fp]  # use already-patched version
+
+            # Find default export: `export default X;` or `export default function X`
+            default_match = _re.search(r'export\s+default\s+(\w+)\s*;', code)
+            if not default_match:
+                continue
+            default_name = default_match.group(1)
+
+            # Check if any file imports this name from this module path
+            needs_named = False
+            for module_path, names in named_imports.items():
+                # Resolve relative path to check if it points to this file
+                if default_name in names:
+                    needs_named = True
+                    break
+
+            if needs_named and f'export {{ {default_name} }}' not in code and f'export {{{default_name}}}' not in code:
+                # Add named export alongside default export
+                code = code.replace(
+                    f'export default {default_name};',
+                    f'export {{ {default_name} }};\nexport default {default_name};'
+                )
+                infra_files[fp] = code
 
     @staticmethod
     def _make_database_web_safe(code: str) -> str:
@@ -1690,7 +1835,7 @@ const _webDb = {
                     stack.pop()
             prev_char = ch
 
-        if len(stack) > 2:
+        if len(stack) > 0:
             return False, f"Unbalanced brackets: {len(stack)} unclosed ({stack[-3:]})"
 
         # Check for common truncation patterns
@@ -1704,7 +1849,7 @@ const _webDb = {
             'StyleSheet.create' in code and not code.rstrip().endswith('});') and code.count('StyleSheet.create') > 0,
         ]
 
-        if any(truncation_indicators) and len(stack) > 0:
+        if any(truncation_indicators):
             return False, f"Likely truncated: ends with '{last_line[-40:]}', {len(stack)} unclosed brackets"
 
         return True, ""
@@ -1807,30 +1952,143 @@ const _webDb = {
         logger.info(f"[BUILD] Auto-repaired {file_path}: closed {len(stack)} brackets")
         return code
 
-    async def _validate_bundle(self, web_port: int, blog=None) -> bool:
-        """Check if the web bundle compiles without TransformErrors."""
+    async def _repair_bundle_errors(
+        self, app_id: str, app_dir: str, bundle_errors: list,
+        generated_files: dict, description: str, app_name: str,
+        deps: list, db_type: str, blog=None,
+    ) -> bool:
+        """Attempt to regenerate files that caused bundle TransformErrors."""
+        if not bundle_errors:
+            return False
+
+        files_to_repair = set()
+        for err in bundle_errors:
+            fp = err.get("file", "")
+            # Convert absolute path to relative app path
+            if app_dir and app_dir in fp:
+                fp = "/" + fp.replace(app_dir, "").lstrip("/")
+            elif fp.startswith("/"):
+                # Try to match to a generated file
+                for gf in generated_files:
+                    if fp.endswith(gf.lstrip("/")):
+                        fp = gf
+                        break
+            if fp and fp in generated_files:
+                files_to_repair.add(fp)
+
+        if not files_to_repair:
+            if blog:
+                await blog.warn("Could not identify which files to repair from bundle errors")
+            return False
+
+        if blog:
+            await blog.info(f"Regenerating {len(files_to_repair)} broken files: {', '.join(files_to_repair)}")
+
+        # Read current file contents as context
+        existing = {}
+        for fp in files_to_repair:
+            abs_path = os.path.join(app_dir, fp.lstrip("/"))
+            if os.path.exists(abs_path):
+                try:
+                    with open(abs_path, 'r') as f:
+                        existing[fp] = f.read()
+                except Exception:
+                    pass
+
+        # Regenerate with error context
+        repaired = await self._generate_code(
+            description + "\n\nFIX THESE BUNDLE ERRORS: " + json.dumps([e["error"][:200] for e in bundle_errors[:3]]),
+            app_name, list(files_to_repair), deps, db_type,
+            blog=blog, existing_files=existing,
+        )
+
+        if repaired:
+            # Apply infra fixes to repaired files
+            await self._write_infra_files(app_id, repaired, blog)
+            await self._app_manager.write_app_files(app_id, repaired)
+            if blog:
+                await blog.success(f"Repaired {len(repaired)} files")
+            return True
+        return False
+
+    @staticmethod
+    def _detect_new_deps(generated_files: dict, existing_deps: list) -> list:
+        """Scan generated code for imports that aren't in the current dep list."""
+        import re as _re
+
+        # Known built-in / RN modules that don't need npm install
+        builtins = {
+            'react', 'react-native', 'react-dom', 'expo', 'react-native-web',
+            '@react-navigation/native', '@react-navigation/native-stack',
+            '@react-navigation/bottom-tabs', 'react-native-safe-area-context',
+            'react-native-screens', 'expo-sqlite', 'expo-status-bar',
+            'expo-constants', 'expo-linking', 'expo-router',
+        }
+
+        existing_set = set(existing_deps) | builtins
+        found_deps = set()
+
+        for code in generated_files.values():
+            # Match: import ... from 'package-name' or require('package-name')
+            for m in _re.finditer(r"""(?:from|require\()\s*['"]([^./][^'"]*?)['"]""", code):
+                pkg = m.group(1)
+                # Get the package name (handle scoped packages like @org/pkg)
+                if pkg.startswith('@'):
+                    parts = pkg.split('/')
+                    pkg_name = '/'.join(parts[:2]) if len(parts) >= 2 else pkg
+                else:
+                    pkg_name = pkg.split('/')[0]
+                if pkg_name not in existing_set:
+                    found_deps.add(pkg_name)
+
+        return list(found_deps)
+
+    async def _validate_bundle(self, web_port: int, blog=None) -> tuple:
+        """Check if the web bundle compiles without TransformErrors.
+
+        Returns (is_valid, error_details_list).
+        error_details_list contains dicts with 'file' and 'error' keys for each broken file.
+        """
         import aiohttp
+        import re as _re
 
         url = f"http://localhost:{web_port}/index.bundle?platform=web&dev=true"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                     if resp.status != 200:
                         if blog:
                             await blog.warn(f"Bundle request returned HTTP {resp.status}")
-                        return False
-                    # Read first 10KB to check for transform errors
-                    chunk = await resp.content.read(10240)
+                        # Try to read error body
+                        try:
+                            body = await resp.text()
+                            errors = []
+                            # Extract file path and error from Metro error response
+                            file_match = _re.search(r'(/[^\s:]+\.tsx?)', body)
+                            if file_match:
+                                errors.append({"file": file_match.group(1), "error": body[:500]})
+                            return False, errors
+                        except Exception:
+                            return False, []
+                    # Read up to 100KB to check for transform errors
+                    chunk = await resp.content.read(102400)
                     text = chunk.decode("utf-8", errors="replace")
-                    if "TransformError" in text and ("SyntaxError" in text or "has already been declared" in text):
-                        if blog:
-                            # Extract the error message
-                            lines = text.split("\n")
-                            error_lines = [l for l in lines if "Error" in l or "SyntaxError" in l][:3]
-                            await blog.error("Bundle TransformError:\n" + "\n".join(error_lines))
-                        return False
-                    return True
+                    errors = []
+                    if "TransformError" in text or "SyntaxError" in text:
+                        # Extract all error details
+                        lines = text.split("\n")
+                        for line in lines:
+                            if "TransformError" in line or "SyntaxError" in line:
+                                # Try to extract file path
+                                file_match = _re.search(r'(/[^\s:]+\.tsx?)', line)
+                                file_path = file_match.group(1) if file_match else "unknown"
+                                errors.append({"file": file_path, "error": line[:300]})
+                        if errors and blog:
+                            for e in errors[:3]:
+                                await blog.error(f"Bundle error in {e['file']}: {e['error'][:200]}")
+                        return len(errors) == 0, errors
+                    return True, []
         except Exception as e:
             if blog:
                 await blog.warn(f"Bundle validation request failed: {e}")
-            return False
+            return False, []
