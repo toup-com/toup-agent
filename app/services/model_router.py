@@ -44,7 +44,38 @@ class ModelTier:
 
 # Default tier configs — cost-optimized: GPT for light/medium, Claude only for heavy
 def _get_tiers() -> Dict[str, ModelTier]:
-    """Build tiers dynamically so medium tier always reflects current agent_model."""
+    """Build tiers dynamically based on LLM_MODE and available keys."""
+    # When LLM_MODE=anthropic (or only Anthropic key available), use Claude for all tiers
+    anthropic_only = (
+        settings.llm_mode == "anthropic"
+        or (settings.anthropic_api_key and not settings.openai_api_key)
+    )
+
+    if anthropic_only:
+        return {
+            "light": ModelTier(
+                name="light",
+                model="claude-haiku-4-5-20251001",
+                label="Claude Haiku 4.5",
+                cost_per_1k_input=0.0008,
+                cost_per_1k_output=0.004,
+            ),
+            "medium": ModelTier(
+                name="medium",
+                model="claude-sonnet-4-6",
+                label="Claude Sonnet 4.6",
+                cost_per_1k_input=0.003,
+                cost_per_1k_output=0.015,
+            ),
+            "heavy": ModelTier(
+                name="heavy",
+                model="claude-opus-4-6",
+                label="Claude Opus 4.6",
+                cost_per_1k_input=0.015,
+                cost_per_1k_output=0.075,
+            ),
+        }
+
     return {
         "light": ModelTier(
             name="light",
@@ -277,6 +308,17 @@ def classify_request(
             name=tier_name,
             model=fallback_model,
             label=f"{fallback_model} (fallback)",
+        )
+
+    # Reverse: if an OpenAI model is selected but no OpenAI key is set,
+    # fall back to Claude (prefer Sonnet for medium, Haiku for light)
+    if not _is_claude_model(tier.model) and not settings.openai_api_key and settings.anthropic_api_key:
+        claude_fallback = "claude-haiku-4-5-20251001" if tier_name == "light" else "claude-sonnet-4-6"
+        logger.info(f"[ROUTER] No OpenAI API key — overriding {tier.model} → {claude_fallback}")
+        tier = ModelTier(
+            name=tier_name,
+            model=claude_fallback,
+            label=f"{claude_fallback} (fallback)",
         )
 
     # Build reason
