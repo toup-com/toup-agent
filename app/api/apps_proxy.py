@@ -68,6 +68,20 @@ def _require(info):
     return info
 
 
+def _rewrite_app_urls(data):
+    """Replace raw VPS web_url with platform proxy path."""
+    def _fix(app: dict):
+        if isinstance(app, dict) and app.get("id"):
+            app["web_url"] = f"/api/apps/{app['id']}/preview/"
+        return app
+
+    if isinstance(data, list):
+        return [_fix(a) for a in data]
+    elif isinstance(data, dict):
+        return _fix(data)
+    return data
+
+
 # ── Server info ─────────────────────────────────────────────
 
 @router.get("/server")
@@ -98,7 +112,15 @@ async def get_server_info(current_user=Depends(get_current_user), db: AsyncSessi
 @router.get("/")
 async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     agent_url, key = _require(await _get_agent(current_user.id, db))
-    return await _proxy(agent_url, key, "")
+    url = f"{agent_url}/api/apps/"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers={"X-Agent-Key": key})
+            data = _rewrite_app_urls(resp.json())
+            return JSONResponse(content=data, status_code=resp.status_code)
+    except Exception as e:
+        logger.warning("Apps proxy list failed: %s", e)
+        raise HTTPException(502, "Agent unreachable")
 
 
 @router.get("/jobs/")
@@ -254,7 +276,15 @@ async def preview_proxy(
 @router.get("/{app_id}")
 async def get_app(app_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     agent_url, key = _require(await _get_agent(current_user.id, db))
-    return await _proxy(agent_url, key, app_id)
+    url = f"{agent_url}/api/apps/{app_id}"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers={"X-Agent-Key": key})
+            data = _rewrite_app_urls(resp.json())
+            return JSONResponse(content=data, status_code=resp.status_code)
+    except Exception as e:
+        logger.warning("Apps proxy get failed: %s", e)
+        raise HTTPException(502, "Agent unreachable")
 
 
 @router.post("/{app_id}/start")
