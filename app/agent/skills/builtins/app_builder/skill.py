@@ -1340,7 +1340,7 @@ class AppBuilderSkill(Skill):
                         generated[file_path] = code
                         completed += 1
                     if blog:
-                        await blog.file_written(file_path, len(code.encode()))
+                        await blog.file_written(file_path, len(code.encode()), code)
                 except Exception as e:
                     if blog:
                         await blog.error(f"Failed to generate {file_path}: {e}")

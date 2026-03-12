@@ -96,13 +96,21 @@ class BuildLogger:
             "cost_usd": round(cost_usd, 4),
         })
 
-    async def file_written(self, path: str, size_bytes: int):
-        """Log a file write operation."""
+    async def file_written(self, path: str, size_bytes: int, code: str = ""):
+        """Log a file write operation with optional code preview."""
         size_str = f"{size_bytes:,} bytes" if size_bytes < 10000 else f"{size_bytes / 1024:.1f} KB"
+        lines = code.split('\n') if code else []
+        total_lines = len(lines)
+        # Send first 40 lines as preview (enough to see structure)
+        preview = '\n'.join(lines[:40]) if lines else ""
+        if total_lines > 40:
+            preview += f"\n// ... {total_lines - 40} more lines"
         await self._log("info", f"Wrote {path}", size_str, {
             "type": "file_write",
             "path": path,
             "size_bytes": size_bytes,
+            "total_lines": total_lines,
+            "code_preview": preview,
         })
 
     async def command_run(self, cmd: str, exit_code: int = 0, duration_s: float = 0.0, output: str = ""):
