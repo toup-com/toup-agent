@@ -106,22 +106,43 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
   Build a floating agent widget component. It renders a small circular avatar (40x40, position: absolute,
   bottom: 24, right: 24, zIndex: 9999) with a pulsing border animation. When tapped, it expands into
   an inline chat panel (width: 340, height: 480, borderRadius: 16, dark background #1C2128).
-  The chat panel has: a header with "Agent" title + minimize button, a ScrollView for messages,
-  and a TextInput + send button at the bottom. Messages are sent/received via the agentBridge.
+  The chat panel has: a header with "Agent" title + minimize button + connection dot (green=connected, gray=disconnected),
+  a ScrollView for messages, and a TextInput + send button at the bottom.
+  Messages are sent/received via the agentBridge (sendMessage / onAgentMessage).
+  Show a typing indicator when agentBridge.onToolActivity fires (agent is using tools).
+  If agentBridge.isConnected is false, show "Connecting..." text in the header.
   In minimized state, show just the circle with a subtle glow effect.
   The component accepts: onMessage callback, agentColor prop (default #58A6FF).
   Use Animated API for smooth expand/collapse transitions.
 
 - If this is /lib/agentBridge.ts:
-  Export an AgentBridge class (singleton) with:
+  Export an AgentBridge class (singleton) that connects to the user's REAL AI agent via WebSocket.
+  On construction, read window.__TOUP_AUTH_TOKEN, window.__TOUP_APP_ID, window.__TOUP_WS_URL.
+  If all three globals exist, connect to WS_URL with ?token=AUTH_TOKEN query param.
+
+  Core methods:
   - currentScreen: string (updated by navigation listener)
   - navigate(screenName: string, params?: object): void — calls navigation ref
   - getScreens(): Array<{{name: string, description: string}}> — lists all screens
   - getActions(screenName?: string): Array<{{id: string, label: string, handler: string}}> — per-screen actions
-  - sendMessage(text: string): void — send to agent
-  - onAgentMessage(callback: (msg: string) => void): void — receive from agent
+  - sendMessage(text: string): void — sends {{"type":"message","text":text,"app_id":APP_ID,"channel":"app"}} over WebSocket
+  - onAgentMessage(callback: (msg: string) => void): void — register callback for agent responses
+  - onToolActivity(callback: (tool: string, done: boolean) => void): void — register callback for tool_start/tool_end
   - setNavigationRef(ref: any): void — store navigation container ref
-  Uses an EventEmitter pattern. Exposes window.__TOUP_AGENT_BRIDGE for external access (web).
+  - isConnected: boolean — tracks WebSocket connection state
+
+  WebSocket message handling:
+  - On {{"type":"text_chunk","text":"..."}} — accumulate chunks into a response buffer
+  - On {{"type":"done","text":"..."}} — fire onAgentMessage callbacks with the full text, clear buffer
+  - On {{"type":"app_navigate","screen":"...","params":{{}}}} — call this.navigate(screen, params)
+  - On {{"type":"tool_start","tool":"..."}} — fire onToolActivity callback (for typing indicator)
+  - On {{"type":"tool_end","tool":"..."}} — fire onToolActivity callback
+  - On {{"type":"error"}} — fire onAgentMessage with error text
+
+  Reconnect: if WS closes unexpectedly, reconnect with exponential backoff (1s, 2s, 4s, max 3 retries).
+  Expose window.__TOUP_AGENT_BRIDGE for external access (web).
+  Do NOT process messages locally or simulate responses. ALL messages go through the WebSocket to the real agent.
+  If WebSocket is not connected (globals missing), queue messages and show a fallback "Connecting..." message.
 
 - If this is /lib/agentActions.ts:
   Export a registry mapping screen names to available actions:

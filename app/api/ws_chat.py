@@ -265,7 +265,24 @@ async def ws_chat(
 
                 session_id = msg.get("session_id")
                 model = msg.get("model")
-                channel = msg.get("channel")  # e.g. "mobile", "web"
+                channel = msg.get("channel")  # e.g. "mobile", "web", "app"
+
+                # If message comes from inside a built app, prepend context
+                app_id_from_msg = msg.get("app_id")
+                if channel == "app" and app_id_from_msg:
+                    try:
+                        from app.db.database import async_session_maker
+                        from app.db.models import App
+                        async with async_session_maker() as _db:
+                            _app = await _db.get(App, app_id_from_msg)
+                            if _app:
+                                text = (
+                                    f"[The user is chatting from inside their '{_app.name}' app "
+                                    f"(slug: {_app.slug}). Use the app_{_app.slug.replace('-','_')}__* "
+                                    f"tools to help them interact with the app.]\n\n{text}"
+                                )
+                    except Exception as e:
+                        logger.warning(f"[WS] Failed to load app context: {e}")
 
                 # Terminal activity: show user message
                 _tprint(f"\n{_CYAN_BOLD} user {_RESET} {text}")

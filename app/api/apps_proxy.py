@@ -230,8 +230,17 @@ async def preview_proxy(
             if "text/html" in content_type:
                 base_href = f"/api/apps/{app_id}/preview/"
                 base_tag = f'<base href="{base_href}">'
+                # Inject agent bridge globals so the app can connect
+                # to the user's real agent via WebSocket
+                agent_globals = (
+                    f'<script>'
+                    f'window.__TOUP_AUTH_TOKEN="{token or ""}";'
+                    f'window.__TOUP_APP_ID="{app_id}";'
+                    f'window.__TOUP_WS_URL="wss://toup.ai/api/ws/chat";'
+                    f'</script>'
+                )
                 html = body.decode("utf-8", errors="replace")
-                html = html.replace("<head>", f"<head>\n{base_tag}", 1)
+                html = html.replace("<head>", f"<head>\n{base_tag}\n{agent_globals}", 1)
                 # Rewrite absolute src="/..." to relative so <base href>
                 # routes them through the preview proxy path.
                 # Also inject ?token= so bundle requests are authenticated
