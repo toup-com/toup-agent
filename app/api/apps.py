@@ -194,9 +194,14 @@ async def get_job_logs(job_id: str) -> Dict[str, Any]:
 
 @router.get("/{app_id}")
 async def get_app(app_id: str) -> AppResponse:
-    """Get a specific app."""
+    """Get a specific app by ID or slug."""
     async with async_session_maker() as db:
+        # Try by ID first
         app = await db.get(App, app_id)
+        # Fall back to slug lookup
+        if not app:
+            result = await db.execute(select(App).where(App.slug == app_id).limit(1))
+            app = result.scalar_one_or_none()
         if not app:
             raise HTTPException(status_code=404, detail="App not found")
         return await _app_to_response(app)

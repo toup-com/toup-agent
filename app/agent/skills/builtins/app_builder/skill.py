@@ -156,10 +156,11 @@ Output ONLY valid JSON (no markdown fences):
 
 
 def _slugify(name: str, suffix: str = "") -> str:
-    """Convert app name to a slug for tool naming."""
-    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:30]
+    """Convert app name to a URL-friendly slug (e.g. 'GRE Success Tracker' → 'GRE-Success-Tracker')."""
+    # Preserve original casing, replace non-alphanumeric with hyphens
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-")[:40]
     if suffix:
-        slug = f"{slug}_{suffix}"
+        slug = f"{slug}-{suffix}"
     return slug
 
 
@@ -315,7 +316,7 @@ class AppBuilderSkill(Skill):
 
         app_id = str(uuid.uuid4())
         job_id = str(uuid.uuid4())
-        slug = _slugify(name, app_id[:6])
+        slug = _slugify(name)
         apps_dir = self._app_manager.APPS_DIR if hasattr(self._app_manager, 'APPS_DIR') else "/opt/toup-agent/apps"
         app_dir = os.path.join(apps_dir, app_id)
 
