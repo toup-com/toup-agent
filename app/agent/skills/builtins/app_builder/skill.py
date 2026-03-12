@@ -116,13 +116,18 @@ Rules:
 - For responsive design, use useWindowDimensions() and Platform.select()
 - If this file uses database, import from '../lib/db' (expo-sqlite helper)
 - For navigation, use @react-navigation/native-stack
-- React Navigation v7 theme MUST include `fonts` property. Example:
-  theme={{{{ dark: true, colors: {{ ... }}, fonts: {{
-    regular: {{ fontFamily: 'System', fontWeight: '400' as const }},
-    medium: {{ fontFamily: 'System', fontWeight: '500' as const }},
-    bold: {{ fontFamily: 'System', fontWeight: '700' as const }},
-    heavy: {{ fontFamily: 'System', fontWeight: '900' as const }},
-  }} }}}}
+- React Navigation v7 REQUIRES a `theme` prop with `fonts` on NavigationContainer. Without it, the app
+  CRASHES with "Cannot read properties of undefined (reading 'bold')". ALWAYS add this theme prop:
+  <NavigationContainer theme={{{{ dark: true, colors: {{
+    primary: "#58A6FF", background: "#161B22", card: "#1C2128",
+    text: "#F0F2F5", border: "#30363D", notification: "#58A6FF",
+  }}, fonts: {{
+    regular: {{ fontFamily: "System", fontWeight: "400" }},
+    medium: {{ fontFamily: "System", fontWeight: "500" }},
+    bold: {{ fontFamily: "System", fontWeight: "700" }},
+    heavy: {{ fontFamily: "System", fontWeight: "900" }},
+  }} }}}}>
+  NEVER use <NavigationContainer> without the theme prop — it WILL crash.
 - Make it fully functional — not a skeleton
 - Include proper error handling and loading states
 - Output ONLY the code — no markdown fences, no explanation
@@ -912,7 +917,7 @@ class AppBuilderSkill(Skill):
                 # ── Bundle validation + auto-repair ──────────
                 await blog.info("Validating web bundle compilation...")
                 try:
-                    await asyncio.sleep(3)  # Give Metro a moment to start
+                    await self._wait_for_server(web_port, timeout=20)
                     bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
                     if not bundle_ok and bundle_errors:
                         await blog.warn(f"Bundle has errors — attempting auto-repair...")
@@ -1157,6 +1162,33 @@ class AppBuilderSkill(Skill):
                 await self._update_step(job_id, user_id, "starting", "done",
                                         detail=f"Restart skipped: {e}")
 
+            # ── Step 4b: Validate bundle after modification ──────
+            if web_port:
+                blog.set_step("validating")
+                await blog.info("Validating modified bundle...")
+                try:
+                    await self._wait_for_server(web_port, timeout=15)
+                    bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                    if not bundle_ok and bundle_errors:
+                        await blog.warn("Bundle has errors after modification — attempting repair...")
+                        repaired = await self._repair_bundle_errors(
+                            app_id, app_dir, bundle_errors, generated,
+                            changes, app_name, [], "none", blog
+                        )
+                        if repaired:
+                            await asyncio.sleep(2)
+                            bundle_ok, _ = await self._validate_bundle(web_port, blog)
+                            if bundle_ok:
+                                await blog.success("Bundle repaired and compiles cleanly")
+                            else:
+                                await blog.warn("Bundle still has issues after repair")
+                        else:
+                            await blog.warn("Bundle has compilation errors after modification")
+                    elif bundle_ok:
+                        await blog.success("Modified bundle compiles cleanly")
+                except Exception as e:
+                    await blog.warn(f"Bundle validation skipped: {e}")
+
             # ── Step 5: Ready! ─────────────────────────────────────
             blog.set_step("ready")
             await self._update_step(job_id, user_id, "ready", "done")
@@ -1345,21 +1377,7 @@ class AppBuilderSkill(Skill):
                     if blog:
                         await blog.error(f"Failed to generate {file_path}: {e}")
                     async with lock:
-                        # Show a visible error screen instead of blank white page
-                        generated[file_path] = (
-                            f"import React from 'react';\n"
-                            f"import {{ View, Text, StyleSheet }} from 'react-native';\n"
-                            f"export default function ErrorPlaceholder() {{\n"
-                            f"  return (\n"
-                            f"    <View style={{{{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#161B22' }}}}>\n"
-                            f"      <Text style={{{{ color: '#F85149', fontSize: 16, fontWeight: 'bold', marginBottom: 8 }}}}>Build Error</Text>\n"
-                            f"      <Text style={{{{ color: '#8B949E', fontSize: 13, textAlign: 'center', paddingHorizontal: 24 }}}}>\n"
-                            f"        Failed to generate {file_path.split('/')[-1]}. Please rebuild the app.\n"
-                            f"      </Text>\n"
-                            f"    </View>\n"
-                            f"  );\n"
-                            f"}}"
-                        )
+                        generated[file_path] = self._make_error_fallback(file_path)
                         completed += 1
 
                 if job_id:
@@ -1417,18 +1435,49 @@ module.exports = config;
 
         # Fix React Navigation v7 theme — must include `fonts` property
         import re as _re
+        FULL_THEME_PROP = (
+            '\n        theme={{\n'
+            '          dark: true,\n'
+            '          colors: {\n'
+            '            primary: "#58A6FF",\n'
+            '            background: "#161B22",\n'
+            '            card: "#1C2128",\n'
+            '            text: "#F0F2F5",\n'
+            '            border: "#30363D",\n'
+            '            notification: "#58A6FF",\n'
+            '          },\n'
+            '          fonts: {\n'
+            '            regular: { fontFamily: "System", fontWeight: "400" },\n'
+            '            medium: { fontFamily: "System", fontWeight: "500" },\n'
+            '            bold: { fontFamily: "System", fontWeight: "700" },\n'
+            '            heavy: { fontFamily: "System", fontWeight: "900" },\n'
+            '          },\n'
+            '        }}'
+        )
+        fonts_block = (
+            "          fonts: {\n"
+            "            regular: { fontFamily: 'System', fontWeight: '400' as const },\n"
+            "            medium: { fontFamily: 'System', fontWeight: '500' as const },\n"
+            "            bold: { fontFamily: 'System', fontWeight: '700' as const },\n"
+            "            heavy: { fontFamily: 'System', fontWeight: '900' as const },\n"
+            "          },\n"
+        )
         for fp, code in {**generated_files, **infra_files}.items():
-            if 'NavigationContainer' in code and 'theme' in code and 'fonts' not in code:
-                fonts_block = (
-                    "          fonts: {\n"
-                    "            regular: { fontFamily: 'System', fontWeight: '400' as const },\n"
-                    "            medium: { fontFamily: 'System', fontWeight: '500' as const },\n"
-                    "            bold: { fontFamily: 'System', fontWeight: '700' as const },\n"
-                    "            heavy: { fontFamily: 'System', fontWeight: '900' as const },\n"
-                    "          },\n"
+            if 'NavigationContainer' not in code:
+                continue
+
+            patched = code
+
+            if 'theme' not in code:
+                # Case 1: NavigationContainer has NO theme prop at all — add complete theme
+                patched = patched.replace(
+                    '<NavigationContainer',
+                    '<NavigationContainer' + FULL_THEME_PROP,
+                    1,
                 )
+            elif 'fonts' not in code:
+                # Case 2: Has theme but missing fonts — inject fonts block
                 # Try multiple patterns to find where to insert fonts:
-                # Pattern 1: after the colors block closing brace (any last color prop)
                 patched = _re.sub(
                     r'(colors:\s*\{[^}]*\},?\s*\n(\s+)\})',
                     r'\1,\n' + fonts_block,
@@ -1436,8 +1485,6 @@ module.exports = config;
                     count=1,
                 )
                 if patched == code:
-                    # Pattern 2: before the closing of the theme object
-                    # Find `theme={{ ... }}` and insert fonts before last `}`
                     patched = _re.sub(
                         r'(notification:[^\n]+\n\s+\},)',
                         r'\1\n' + fonts_block,
@@ -1445,8 +1492,6 @@ module.exports = config;
                         count=1,
                     )
                 if patched == code:
-                    # Pattern 3: brute force — find the last `},` before `}}>`
-                    # and insert fonts after it
                     patched = _re.sub(
                         r'(border:[^\n]+\n\s+\},)',
                         r'\1\n' + fonts_block,
@@ -1454,18 +1499,18 @@ module.exports = config;
                         count=1,
                     )
                 if patched == code:
-                    # Pattern 4: ultimate fallback — find any `},\n          }}` which is
-                    # the colors block end + theme object end, and insert fonts between
+                    # Ultimate fallback — insert before closing `}}`
                     patched = _re.sub(
                         r'(\},\s*\n\s*\}\}[\s>])',
                         fonts_block + r'\1',
                         code,
                         count=1,
                     )
-                if patched != code:
-                    infra_files[fp] = patched
-                    if blog:
-                        await blog.info(f"Injected React Navigation v7 fonts into {fp}")
+
+            if patched != code:
+                infra_files[fp] = patched
+                if blog:
+                    await blog.info(f"Injected React Navigation v7 fonts into {fp}")
 
         # Fix common LLM code generation mistakes that cause white pages
         self._fix_common_llm_mistakes(generated_files, infra_files, blog)
@@ -1493,8 +1538,7 @@ module.exports = config;
             patched = code
 
             # 1. Async component functions → remove async keyword
-            # Pattern: export default async function ScreenName(
-            # or: const ScreenName = async () => {  (at top level, used as component)
+            # Pattern a: export default async function ScreenName(
             patched = _re.sub(
                 r'export\s+default\s+async\s+function\s+(\w+)',
                 r'export default function \1',
@@ -1505,10 +1549,22 @@ module.exports = config;
                 r'export function \1',
                 patched,
             )
+            # Pattern b: const ScreenName = async () => { (arrow functions used as components)
+            # Only for screen/component files — don't touch lib/utils
+            if '/screens/' in fp or '/components/' in fp or fp == '/App.tsx':
+                patched = _re.sub(
+                    r'((?:export\s+)?const\s+\w+(?:Screen|Component|Page|View)\s*=\s*)async\s*\(',
+                    r'\1(',
+                    patched,
+                )
+                patched = _re.sub(
+                    r'((?:export\s+)?const\s+\w+(?:Screen|Component|Page|View)\s*=\s*)async\s*\(\)',
+                    r'\1()',
+                    patched,
+                )
 
             # 2. Mixing expo-router and NavigationContainer
             if 'expo-router' in patched and 'NavigationContainer' in patched:
-                # Remove expo-router imports — keep manual navigation
                 patched = _re.sub(
                     r'import\s+\{[^}]*\}\s+from\s+[\'"]expo-router[\'"];?\n?',
                     '',
@@ -1516,7 +1572,7 @@ module.exports = config;
                 )
 
             # 3. Guard platform-specific APIs that crash on web
-            # SecureStore — needs Platform.OS check
+            # SecureStore
             if "expo-secure-store" in patched and "Platform.OS" not in patched:
                 patched = patched.replace(
                     "import * as SecureStore from 'expo-secure-store';",
@@ -1525,6 +1581,29 @@ module.exports = config;
                     "if (Platform.OS !== 'web') {\n"
                     "  const mod = 'expo-secure-store'; SecureStore = require(mod);\n"
                     "}",
+                )
+
+            # Alert.alert() — crashes on web, wrap in Platform check
+            if 'Alert.alert(' in patched and "Platform.OS === 'web'" not in patched:
+                patched = _re.sub(
+                    r'Alert\.alert\(([^)]+)\)',
+                    r"(Platform.OS === 'web' ? window.alert(String(\1).split(',')[0]) : Alert.alert(\1))",
+                    patched,
+                )
+                # Ensure Platform is imported
+                if "import { Platform" not in patched and "Platform }" not in patched:
+                    patched = patched.replace(
+                        "from 'react-native';",
+                        "Platform } from 'react-native';",
+                        1,
+                    )
+
+            # Vibration — no-op on web
+            if 'Vibration.vibrate' in patched and "Platform.OS" not in patched:
+                patched = _re.sub(
+                    r'Vibration\.vibrate\([^)]*\)',
+                    r"(Platform.OS !== 'web' && Vibration.vibrate())",
+                    patched,
                 )
 
             if patched != original:
@@ -1832,6 +1911,70 @@ const _webDb = {
         return code
 
     @staticmethod
+    def _make_error_fallback(file_path: str) -> str:
+        """Generate a type-appropriate error fallback based on file type.
+
+        - Screen/component files → visible error placeholder component
+        - Library/utility files → stub module with no-op exports
+        - Config files → empty valid config
+        """
+        basename = os.path.basename(file_path)
+        name = basename.replace('.tsx', '').replace('.ts', '').replace('.jsx', '').replace('.js', '')
+
+        # Library/utility files — export a no-op stub, NOT a React component
+        if '/lib/' in file_path or '/utils/' in file_path or '/helpers/' in file_path:
+            if 'database' in name.lower() or 'db' in name.lower():
+                return (
+                    "// Database stub — generation failed, app runs without persistence\n"
+                    "import { Platform } from 'react-native';\n"
+                    "const mockDb = {\n"
+                    "  execAsync: async () => {},\n"
+                    "  runAsync: async () => ({ lastInsertRowid: 0, changes: 0 }),\n"
+                    "  getFirstAsync: async () => null,\n"
+                    "  getAllAsync: async () => [],\n"
+                    "};\n"
+                    "export async function getDatabase() { return mockDb; }\n"
+                    "export default { getDatabase };\n"
+                )
+            if 'bridge' in name.lower() or 'agent' in name.lower():
+                return (
+                    "// AgentBridge stub — generation failed\n"
+                    "const agentBridge = {\n"
+                    "  isConnected: false,\n"
+                    "  currentScreen: 'Home',\n"
+                    "  sendMessage: async () => {},\n"
+                    "  onAgentMessage: () => () => {},\n"
+                    "  onToolActivity: () => () => {},\n"
+                    "  setNavigationRef: () => {},\n"
+                    "  registerAction: () => {},\n"
+                    "};\n"
+                    "export { agentBridge };\n"
+                    "export const AgentBridge = agentBridge;\n"
+                    "export default agentBridge;\n"
+                )
+            # Generic library stub
+            return (
+                f"// Stub for {basename} — generation failed\n"
+                f"export default {{}};\n"
+            )
+
+        # Screen/component files — visible error placeholder
+        return (
+            f"import React from 'react';\n"
+            f"import {{ View, Text }} from 'react-native';\n"
+            f"export default function {name}() {{\n"
+            f"  return (\n"
+            f"    <View style={{{{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#161B22' }}}}>\n"
+            f"      <Text style={{{{ color: '#F85149', fontSize: 16, fontWeight: 'bold', marginBottom: 8 }}}}>Build Error</Text>\n"
+            f"      <Text style={{{{ color: '#8B949E', fontSize: 13, textAlign: 'center', paddingHorizontal: 24 }}}}>\n"
+            f"        Failed to generate {basename}. Please rebuild the app.\n"
+            f"      </Text>\n"
+            f"    </View>\n"
+            f"  );\n"
+            f"}}\n"
+        )
+
+    @staticmethod
     def _validate_syntax(code: str, file_path: str) -> tuple[bool, str]:
         """
         Validate generated code for truncation/syntax issues.
@@ -1939,99 +2082,64 @@ const _webDb = {
     def _auto_repair_syntax(code: str, file_path: str) -> str:
         """
         Best-effort auto-repair for truncated generated code.
-        Closes unclosed brackets and adds missing StyleSheet closure.
+
+        Strategy: Instead of appending closers (which produces garbage like `export default X;')})`),
+        truncate back to the last complete top-level statement, then add the missing
+        export default + StyleSheet if needed. This produces valid code that renders
+        an error placeholder rather than crashing the entire bundle.
         """
         ext = os.path.splitext(file_path)[1].lower()
         if ext not in ('.tsx', '.ts', '.jsx', '.js'):
             return code
 
-        # Count unclosed brackets
-        stack = []
-        in_string = False
-        string_char = None
-        escape_next = False
-        in_line_comment = False
-        in_block_comment = False
-        prev_char = ''
+        # Find the last valid top-level boundary: export default, StyleSheet.create, or closing `});`
+        lines = code.split('\n')
 
-        for ch in code:
-            if escape_next:
-                escape_next = False
-                prev_char = ch
-                continue
-            if ch == '\\' and in_string:
-                escape_next = True
-                prev_char = ch
-                continue
-            if ch == '\n':
-                in_line_comment = False
-                prev_char = ch
-                continue
-            if in_line_comment:
-                prev_char = ch
-                continue
-            if in_block_comment:
-                if prev_char == '*' and ch == '/':
-                    in_block_comment = False
-                prev_char = ch
-                continue
-            if ch == '/' and prev_char == '/':
-                in_line_comment = True
-                prev_char = ch
-                continue
-            if ch == '*' and prev_char == '/':
-                in_block_comment = True
-                prev_char = ch
-                continue
-            if in_string:
-                if ch == string_char:
-                    in_string = False
-                    string_char = None
-                prev_char = ch
-                continue
-            if ch in ('"', "'", '`'):
-                in_string = True
-                string_char = ch
-                prev_char = ch
-                continue
-            if ch in ('{', '(', '['):
-                stack.append(ch)
-            elif ch in ('}', ')', ']'):
-                expected = {'}': '{', ')': '(', ']': '['}[ch]
-                if stack and stack[-1] == expected:
-                    stack.pop()
-            prev_char = ch
+        # Find the last line that looks like a complete top-level statement
+        last_good_line = len(lines) - 1
+        for i in range(len(lines) - 1, -1, -1):
+            stripped = lines[i].strip()
+            # Good boundaries: export default, top-level closing, StyleSheet end
+            if stripped in ('});', '});', '});', '})', '});', '});'):
+                last_good_line = i
+                break
+            if stripped.startswith('export default ') and stripped.endswith(';'):
+                last_good_line = i
+                break
+            if stripped == '});' or stripped == '});':
+                last_good_line = i
+                break
 
-        if not stack:
-            return code
+        # Truncate to last good line
+        truncated_lines = lines[:last_good_line + 1]
+        truncated_code = '\n'.join(truncated_lines) + '\n'
 
-        # Close any unclosed string
-        if in_string and string_char:
-            code += string_char
+        # Check if there's an export default — if not, extract component name and add one
+        has_export_default = bool(re.search(r'export\s+default\s+', truncated_code))
+        if not has_export_default:
+            # Try to find the component function name
+            comp_match = re.search(r'(?:function|const)\s+(\w+Screen|\w+Component|\w+)\s*[\(\:=]', truncated_code)
+            comp_name = comp_match.group(1) if comp_match else None
 
-        # Trim the last incomplete line if it looks truncated
-        lines = code.rstrip().split('\n')
-        last_line = lines[-1].strip()
-        if last_line and last_line[-1].isalpha() and ':' not in last_line and '=' not in last_line:
-            # Last line is mid-token — remove it
-            lines = lines[:-1]
-            code = '\n'.join(lines) + '\n'
+            if comp_name:
+                truncated_code += f'\nexport default {comp_name};\n'
+            else:
+                # Can't determine component name — replace entire file with error placeholder
+                screen_name = os.path.basename(file_path).replace('.tsx', '').replace('.ts', '')
+                truncated_code = (
+                    f"import React from 'react';\n"
+                    f"import {{ View, Text }} from 'react-native';\n"
+                    f"export default function {screen_name}() {{\n"
+                    f"  return (\n"
+                    f"    <View style={{{{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#161B22' }}}}>\n"
+                    f"      <Text style={{{{ color: '#F85149', fontSize: 16 }}}}>Failed to generate this screen. Please rebuild.</Text>\n"
+                    f"    </View>\n"
+                    f"  );\n"
+                    f"}}\n"
+                )
 
-        # Close unclosed brackets in reverse order
-        closers = {'{': '}', '(': ')', '[': ']'}
-        repair_lines = []
-        for opener in reversed(stack):
-            repair_lines.append(closers[opener])
-
-        # Add a trailing semicolon if the last closer is ) and we're likely in StyleSheet.create
-        repair_suffix = ''.join(repair_lines)
-        if 'StyleSheet.create' in code and repair_suffix.endswith(')'):
-            repair_suffix += ';'
-
-        code = code.rstrip() + '\n' + repair_suffix + '\n'
-
-        logger.info(f"[BUILD] Auto-repaired {file_path}: closed {len(stack)} brackets")
-        return code
+        logger.info(f"[BUILD] Auto-repaired {file_path}: truncated to last valid statement")
+        return truncated_code
 
     async def _repair_bundle_errors(
         self, app_id: str, app_dir: str, bundle_errors: list,
@@ -2123,6 +2231,25 @@ const _webDb = {
                     found_deps.add(pkg_name)
 
         return list(found_deps)
+
+    @staticmethod
+    async def _wait_for_server(port: int, timeout: int = 15):
+        """Wait until a server is accepting connections on the given port."""
+        import aiohttp
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"http://localhost:{port}/",
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as resp:
+                        # Any response means server is up (even 404/500)
+                        return
+            except Exception:
+                await asyncio.sleep(1)
+        # Timeout — proceed anyway, bundle validation will catch errors
+        logger.warning(f"[BUILD] Server on port {port} not ready after {timeout}s, proceeding")
 
     async def _validate_bundle(self, web_port: int, blog=None) -> tuple:
         """Check if the web bundle compiles without TransformErrors.
