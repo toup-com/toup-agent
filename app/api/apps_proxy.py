@@ -259,6 +259,9 @@ async def preview_proxy(
                     f'window.__TOUP_AUTH_TOKEN="{token or ""}";'
                     f'window.__TOUP_APP_ID="{app_id}";'
                     f'window.__TOUP_WS_URL="wss://toup.ai/api/ws/chat";'
+                    f'window.onerror=function(m,s,l,c,e){{'
+                    f'document.body.innerHTML="<pre style=\\"color:red;padding:20px;font-size:12px\\">JS Error:\\n"+m+"\\n"+s+":"+l+":"+c+"\\n"+(e&&e.stack||"")+"</pre>";'
+                    f'}};'
                     f'</script>'
                 )
                 html = body.decode("utf-8", errors="replace")

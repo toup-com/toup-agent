@@ -59,6 +59,9 @@ Rules:
 - For responsive layout, plan to use useWindowDimensions
 - If the app needs charts, use react-native-chart-kit (NOT recharts — that's web-only)
 - Keep the file list focused — don't over-engineer
+- NEVER use emoji characters anywhere — they render as "?" in WebView. Use unicode symbols instead.
+- Tab bar icons MUST be visible — use <Text> with unicode symbols or @expo/vector-icons, NEVER empty <View> elements
+- Progress components should use 0-1 scale, not 0-100
 - ALWAYS include /lib/agentSkill.json — domain-specific agent skill manifest (see below)
 
 CRITICAL — Agent Skill Manifest:
@@ -116,6 +119,42 @@ Rules:
 - Make it fully functional — not a skeleton
 - Include proper error handling and loading states
 - Output ONLY the code — no markdown fences, no explanation
+- CRITICAL: The file MUST be syntactically complete — all brackets closed, all StyleSheet styles finished,
+  all exports present. If the file would be too long, SIMPLIFY the implementation instead of truncating.
+  A simpler complete file is far better than a complex truncated one.
+
+CRITICAL — Cross-Platform Rendering Rules:
+These apps run as Expo Web inside a WebView on mobile AND as web apps in browsers.
+Rendering differences WILL cause visual bugs if you ignore these rules:
+
+1. NEVER use emoji characters (e.g. 🔥📅💡👋). They render as "?" boxes in WebView on many devices.
+   Instead, use unicode symbols: ⌂ (\\u2302), ☐ (\\u2610), ✎ (\\u270E), ▲ (\\u25B2), ☰ (\\u2630),
+   ⭐ (\\u2B50), ★ (\\u2605), ▣ (\\u25A3), △ (\\u25B3). Wrap in JSX expressions: {{"\\u2605"}}.
+
+2. Tab bar icons MUST render visible content. NEVER use empty <View> elements as tab icons.
+   Use unicode text characters wrapped in <Text> with fontSize/color props, or use an icon library
+   like @expo/vector-icons. Example: <Text style={{{{ fontSize: 20, color: focused ? '#58A6FF' : '#8B949E' }}}}>{{\"\\u2302\"}}</Text>
+
+3. Progress bars / gauges: If using a ProgressBar component that clamps to 0-1 range internally,
+   pass values in 0-1 range (NOT 0-100). Double-check: Math.min((score - min) / (max - min), 1),
+   NOT Math.min(((score - min) / (max - min)) * 100, 100).
+
+4. All database operations MUST be wrapped in try/catch with graceful fallbacks.
+   Database may not be ready on first render — use loading states and default values.
+   For database files (lib/database.ts): Do NOT use `import * as SQLite from 'expo-sqlite'` directly.
+   Instead use conditional import with Platform check and web fallback mock:
+   ```
+   import {{ Platform }} from 'react-native';
+   let SQLite: any;
+   if (Platform.OS !== 'web') {{ const mod = 'expo-sqlite'; SQLite = require(mod); }}
+   ```
+   Then in getDatabase(), return an in-memory mock when Platform.OS === 'web'.
+
+5. React Rules of Hooks: ALL useState, useRef, useEffect, useMemo, useCallback calls
+   MUST appear before any conditional return statement. Never place hooks after early returns.
+
+6. Use Platform.select() for platform-specific behavior (font families, padding, shadows).
+   Test values must work on both web and native — avoid native-only APIs without web fallbacks.
 
 Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /components/AgentPlaceholder.tsx:
@@ -132,7 +171,11 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
   Use Animated API for smooth expand/collapse transitions.
 
 - If this is /lib/agentBridge.ts:
-  Export an AgentBridge class (singleton) that connects to the user's REAL AI agent via WebSocket.
+  Create a singleton instance (NOT a class with getInstance()). Export the instance directly:
+  `const AgentBridge = new AgentBridgeClass(); export {{ AgentBridge }};`
+  All other files import {{ AgentBridge }} and use it directly (e.g. AgentBridge.sendMessage()),
+  NOT AgentBridge.getInstance().sendMessage(). There is no getInstance() method.
+  The bridge connects to the user's REAL AI agent via WebSocket.
   On construction, read window.__TOUP_AUTH_TOKEN, window.__TOUP_APP_ID, window.__TOUP_WS_URL.
   If all three globals exist, connect to WS_URL with ?token=AUTH_TOKEN query param.
 
@@ -169,7 +212,9 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
 
 - If this is /App.tsx:
   Import AgentPlaceholder and render it as the LAST child inside NavigationContainer,
-  positioned absolutely so it overlays all screens. Pass the navigation ref to agentBridge.
+  positioned absolutely so it overlays all screens.
+  Import {{ AgentBridge }} from './lib/agentBridge' and use it directly (NOT .getInstance()).
+  Example: AgentBridge.setNavigationRef(ref), AgentBridge.sendMessage(msg), AgentBridge.currentScreen = name.
   IMPORTANT: Only show AgentPlaceholder when NOT loaded through the platform (the platform shows
   the user's real agent). Wrap it in a condition:
   {{typeof window !== "undefined" && !(window as any).__TOUP_AUTH_TOKEN && <AgentPlaceholder />}}
@@ -733,6 +778,9 @@ class AppBuilderSkill(Skill):
                 )
                 await self._app_manager.write_app_files(app_id, generated_files)
 
+                # Write essential infrastructure files (metro config, web-safe DB)
+                await self._write_infra_files(app_id, generated_files, blog)
+
                 total_bytes = sum(len(c.encode()) for c in generated_files.values())
                 await blog.success(f"Generated {len(generated_files)} files", f"{total_bytes:,} bytes total")
 
@@ -833,6 +881,18 @@ class AppBuilderSkill(Skill):
                 await blog.info("Starting Expo Web server...")
                 web_port = await self._app_manager.start_web(app_id)
                 await blog.success(f"Web server running on port {web_port}")
+
+                # ── Bundle validation ────────────────────────
+                await blog.info("Validating web bundle compilation...")
+                try:
+                    await asyncio.sleep(3)  # Give Metro a moment to start
+                    bundle_ok = await self._validate_bundle(web_port, blog)
+                    if not bundle_ok:
+                        await blog.warn("Bundle has compilation errors — app may not render correctly")
+                    else:
+                        await blog.success("Bundle compiles cleanly")
+                except Exception as e:
+                    await blog.warn(f"Bundle validation skipped: {e}")
 
                 qr_url = await self._app_manager.get_qr_url(app_id)
                 web_url = await self._app_manager.get_web_url(app_id)
@@ -1188,11 +1248,41 @@ class AppBuilderSkill(Skill):
                     prompt += existing_hint
 
                 try:
+                    # First attempt with default token limit
+                    max_tok = 8192
                     code = await self._call_llm(
                         prompt, f"Generate code for {file_path}",
                         blog=blog, purpose=f"Generate {file_path}",
+                        max_tokens=max_tok,
                     )
                     code = self._strip_fences(code)
+
+                    # Validate syntax — retry with higher token limit if truncated
+                    is_valid, error_msg = self._validate_syntax(code, file_path)
+                    if not is_valid:
+                        if blog:
+                            await blog.warn(f"Validation failed for {file_path}: {error_msg} — retrying with 16K tokens")
+                        # Retry with double token limit + explicit instruction not to truncate
+                        retry_prompt = prompt + (
+                            "\n\nCRITICAL: The previous generation was truncated/incomplete. "
+                            "You MUST output the COMPLETE file with ALL brackets closed, "
+                            "ALL StyleSheet styles defined, and ALL exports present. "
+                            "If the file is very long, simplify the implementation rather than truncating it."
+                        )
+                        code = await self._call_llm(
+                            retry_prompt, f"Generate code for {file_path} (retry — previous was truncated)",
+                            blog=blog, purpose=f"Retry {file_path} (truncated)",
+                            max_tokens=16384,
+                        )
+                        code = self._strip_fences(code)
+
+                        # Validate again
+                        is_valid2, error_msg2 = self._validate_syntax(code, file_path)
+                        if not is_valid2 and blog:
+                            await blog.warn(f"Retry still has issues for {file_path}: {error_msg2} — attempting auto-repair")
+                            # Auto-repair: close any unclosed brackets
+                            code = self._auto_repair_syntax(code, file_path)
+
                     async with lock:
                         generated[file_path] = code
                         completed += 1
@@ -1216,9 +1306,107 @@ class AppBuilderSkill(Skill):
         await asyncio.gather(*[_gen_one(i, fp) for i, fp in enumerate(files)])
         return generated
 
+    async def _write_infra_files(self, app_id: str, generated_files: dict, blog=None):
+        """Write essential infrastructure files that every app needs.
+
+        1. metro.config.js — stubs out expo-sqlite WASM on web (prevents crash)
+        2. Patches database files to use conditional import (web-safe)
+        """
+        infra_files = {}
+
+        # Metro config — stub out wa-sqlite on web to prevent SharedArrayBuffer crash
+        infra_files["/metro.config.js"] = """const { getDefaultConfig } = require('expo/metro-config');
+const config = getDefaultConfig(__dirname);
+
+const origResolveRequest = config.resolver.resolveRequest;
+config.resolver.resolveRequest = (context, moduleName, platform) => {
+  // On web: resolve .wasm files and expo-sqlite web internals to empty
+  if (platform === 'web') {
+    if (moduleName.endsWith('.wasm') || moduleName.includes('wa-sqlite')) {
+      return { type: 'empty' };
+    }
+  }
+  if (origResolveRequest) {
+    return origResolveRequest(context, moduleName, platform);
+  }
+  return context.resolveRequest(context, moduleName, platform);
+};
+
+module.exports = config;
+"""
+
+        # Patch any database file that directly imports expo-sqlite
+        for fp, code in generated_files.items():
+            if "import * as SQLite from 'expo-sqlite'" in code or 'import * as SQLite from "expo-sqlite"' in code:
+                patched = self._make_database_web_safe(code)
+                if patched != code:
+                    infra_files[fp] = patched
+                    if blog:
+                        await blog.info(f"Patched {fp} for web-safe SQLite")
+
+        if infra_files:
+            await self._app_manager.write_app_files(app_id, infra_files)
+            if blog:
+                await blog.info(f"Wrote {len(infra_files)} infrastructure files (metro config, web-safe DB)")
+
+    @staticmethod
+    def _make_database_web_safe(code: str) -> str:
+        """Replace direct expo-sqlite import with conditional import + web mock."""
+        import_line = "import * as SQLite from 'expo-sqlite';"
+        if import_line not in code:
+            import_line = 'import * as SQLite from "expo-sqlite";'
+        if import_line not in code:
+            return code
+
+        web_safe_import = """import { Platform } from 'react-native';
+
+// On web, use in-memory mock (expo-sqlite WASM doesn't bundle with Metro)
+let SQLite: any;
+if (Platform.OS !== 'web') {
+  // @ts-ignore - dynamic require to avoid Metro static analysis
+  const mod = 'expo-sqlite'; SQLite = require(mod);
+}
+
+// In-memory store for web preview
+const _webStore: Record<string, any[]> = {};
+const _webDb = {
+  execAsync: async (_sql: string) => { /* no-op for DDL on web */ },
+  getAllAsync: async (sql: string, _params?: any[]) => {
+    const table = sql.match(/from\\s+(\\w+)/i)?.[1] || 'default';
+    return _webStore[table] || [];
+  },
+  runAsync: async (_sql: string, _params?: any[]) => {
+    return { lastInsertRowId: 1, changes: 1 };
+  },
+  getFirstAsync: async (sql: string, _params?: any[]) => {
+    const table = sql.match(/from\\s+(\\w+)/i)?.[1] || 'default';
+    const rows = _webStore[table] || [];
+    return rows[0] || null;
+  },
+};"""
+
+        code = code.replace(import_line, web_safe_import, 1)
+
+        # Fix type annotations that reference SQLite.SQLiteDatabase
+        code = code.replace('SQLite.SQLiteDatabase', 'any')
+
+        # Patch getDatabase to return web mock on web platform
+        # Look for the openDatabaseAsync call and wrap it
+        if 'openDatabaseAsync' in code:
+            import re as _re
+            # Add Platform.OS web check before the try block in getDatabase
+            code = _re.sub(
+                r'(export async function getDatabase\(\)[^{]*\{[^}]*?)(\btry\b)',
+                r'\1if (Platform.OS === "web") { return _webDb as any; }\n  \2',
+                code,
+                count=1,
+            )
+
+        return code
+
     async def _call_llm(
         self, system_prompt: str, user_message: str, model: str = "claude-sonnet-4-6",
-        blog=None, purpose: str = "",
+        blog=None, purpose: str = "", max_tokens: int = 8192,
     ) -> str:
         """Call the LLM (Anthropic or OpenAI). Default: Sonnet for speed, Opus for planning."""
         import time as _time
@@ -1246,7 +1434,7 @@ class AppBuilderSkill(Skill):
                 t0 = _time.time()
                 response = await client.messages.create(
                     model=model,
-                    max_tokens=8192,
+                    max_tokens=max_tokens,
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_message}],
                 )
@@ -1254,6 +1442,7 @@ class AppBuilderSkill(Skill):
                 text = response.content[0].text
                 input_tok = getattr(response.usage, 'input_tokens', 0)
                 output_tok = getattr(response.usage, 'output_tokens', 0)
+                stop_reason = getattr(response, 'stop_reason', 'end_turn')
 
                 if blog:
                     await blog.llm_call(
@@ -1263,6 +1452,10 @@ class AppBuilderSkill(Skill):
                         output_tokens=output_tok,
                         duration_s=elapsed,
                     )
+
+                # Warn if output was truncated due to max_tokens
+                if stop_reason == "max_tokens" and blog:
+                    await blog.warn(f"LLM output truncated (hit {max_tokens} token limit)")
 
                 return text
             except Exception as e:
@@ -1283,7 +1476,7 @@ class AppBuilderSkill(Skill):
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message},
                     ],
-                    max_completion_tokens=8192,
+                    max_completion_tokens=max_tokens,
                 )
                 elapsed = _time.time() - t0
                 text = response.choices[0].message.content or ""
@@ -1411,3 +1604,233 @@ class AppBuilderSkill(Skill):
         if code.endswith("```"):
             code = code[:-3].rstrip()
         return code
+
+    @staticmethod
+    def _validate_syntax(code: str, file_path: str) -> tuple[bool, str]:
+        """
+        Validate generated code for truncation/syntax issues.
+        Returns (is_valid, error_description).
+        Checks:
+          1. Balanced brackets: { } ( ) [ ]
+          2. File ends properly (not mid-token)
+          3. TSX/JSX/TS/JS-specific: StyleSheet.create closed, export present
+        """
+        # Skip non-code files
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in ('.tsx', '.ts', '.jsx', '.js', '.json'):
+            return True, ""
+
+        if not code.strip():
+            return False, "Empty file"
+
+        # JSON validation
+        if ext == '.json':
+            try:
+                json.loads(code)
+                return True, ""
+            except json.JSONDecodeError as e:
+                return False, f"Invalid JSON: {e}"
+
+        # Check balanced brackets
+        stack = []
+        in_string = False
+        string_char = None
+        escape_next = False
+        in_line_comment = False
+        in_block_comment = False
+        prev_char = ''
+
+        for ch in code:
+            if escape_next:
+                escape_next = False
+                prev_char = ch
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                prev_char = ch
+                continue
+            if ch == '\n':
+                in_line_comment = False
+                prev_char = ch
+                continue
+            if in_line_comment:
+                prev_char = ch
+                continue
+            if in_block_comment:
+                if prev_char == '*' and ch == '/':
+                    in_block_comment = False
+                prev_char = ch
+                continue
+            if ch == '/' and prev_char == '/':
+                in_line_comment = True
+                if stack and stack[-1] == '/':
+                    pass  # don't track
+                prev_char = ch
+                continue
+            if ch == '*' and prev_char == '/':
+                in_block_comment = True
+                prev_char = ch
+                continue
+            if in_string:
+                if ch == string_char:
+                    in_string = False
+                    string_char = None
+                prev_char = ch
+                continue
+            if ch in ('"', "'", '`'):
+                in_string = True
+                string_char = ch
+                prev_char = ch
+                continue
+            if ch in ('{', '(', '['):
+                stack.append(ch)
+            elif ch in ('}', ')', ']'):
+                expected = {'}': '{', ')': '(', ']': '['}[ch]
+                if stack and stack[-1] == expected:
+                    stack.pop()
+            prev_char = ch
+
+        if len(stack) > 2:
+            return False, f"Unbalanced brackets: {len(stack)} unclosed ({stack[-3:]})"
+
+        # Check for common truncation patterns
+        stripped = code.rstrip()
+        # Ends mid-property (no semicolon, comma, bracket, or closing paren)
+        last_line = stripped.split('\n')[-1].strip() if stripped else ""
+        truncation_indicators = [
+            # Line ends with an identifier (no punctuation) — mid-token truncation
+            last_line and last_line[-1].isalpha() and not last_line.endswith(('return', 'true', 'false', 'null', 'undefined', 'break', 'continue')),
+            # Unclosed StyleSheet.create
+            'StyleSheet.create' in code and not code.rstrip().endswith('});') and code.count('StyleSheet.create') > 0,
+        ]
+
+        if any(truncation_indicators) and len(stack) > 0:
+            return False, f"Likely truncated: ends with '{last_line[-40:]}', {len(stack)} unclosed brackets"
+
+        return True, ""
+
+    @staticmethod
+    def _auto_repair_syntax(code: str, file_path: str) -> str:
+        """
+        Best-effort auto-repair for truncated generated code.
+        Closes unclosed brackets and adds missing StyleSheet closure.
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in ('.tsx', '.ts', '.jsx', '.js'):
+            return code
+
+        # Count unclosed brackets
+        stack = []
+        in_string = False
+        string_char = None
+        escape_next = False
+        in_line_comment = False
+        in_block_comment = False
+        prev_char = ''
+
+        for ch in code:
+            if escape_next:
+                escape_next = False
+                prev_char = ch
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                prev_char = ch
+                continue
+            if ch == '\n':
+                in_line_comment = False
+                prev_char = ch
+                continue
+            if in_line_comment:
+                prev_char = ch
+                continue
+            if in_block_comment:
+                if prev_char == '*' and ch == '/':
+                    in_block_comment = False
+                prev_char = ch
+                continue
+            if ch == '/' and prev_char == '/':
+                in_line_comment = True
+                prev_char = ch
+                continue
+            if ch == '*' and prev_char == '/':
+                in_block_comment = True
+                prev_char = ch
+                continue
+            if in_string:
+                if ch == string_char:
+                    in_string = False
+                    string_char = None
+                prev_char = ch
+                continue
+            if ch in ('"', "'", '`'):
+                in_string = True
+                string_char = ch
+                prev_char = ch
+                continue
+            if ch in ('{', '(', '['):
+                stack.append(ch)
+            elif ch in ('}', ')', ']'):
+                expected = {'}': '{', ')': '(', ']': '['}[ch]
+                if stack and stack[-1] == expected:
+                    stack.pop()
+            prev_char = ch
+
+        if not stack:
+            return code
+
+        # Close any unclosed string
+        if in_string and string_char:
+            code += string_char
+
+        # Trim the last incomplete line if it looks truncated
+        lines = code.rstrip().split('\n')
+        last_line = lines[-1].strip()
+        if last_line and last_line[-1].isalpha() and ':' not in last_line and '=' not in last_line:
+            # Last line is mid-token — remove it
+            lines = lines[:-1]
+            code = '\n'.join(lines) + '\n'
+
+        # Close unclosed brackets in reverse order
+        closers = {'{': '}', '(': ')', '[': ']'}
+        repair_lines = []
+        for opener in reversed(stack):
+            repair_lines.append(closers[opener])
+
+        # Add a trailing semicolon if the last closer is ) and we're likely in StyleSheet.create
+        repair_suffix = ''.join(repair_lines)
+        if 'StyleSheet.create' in code and repair_suffix.endswith(')'):
+            repair_suffix += ';'
+
+        code = code.rstrip() + '\n' + repair_suffix + '\n'
+
+        logger.info(f"[BUILD] Auto-repaired {file_path}: closed {len(stack)} brackets")
+        return code
+
+    async def _validate_bundle(self, web_port: int, blog=None) -> bool:
+        """Check if the web bundle compiles without TransformErrors."""
+        import aiohttp
+
+        url = f"http://localhost:{web_port}/index.bundle?platform=web&dev=true"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        if blog:
+                            await blog.warn(f"Bundle request returned HTTP {resp.status}")
+                        return False
+                    # Read first 10KB to check for transform errors
+                    chunk = await resp.content.read(10240)
+                    text = chunk.decode("utf-8", errors="replace")
+                    if "TransformError" in text and ("SyntaxError" in text or "has already been declared" in text):
+                        if blog:
+                            # Extract the error message
+                            lines = text.split("\n")
+                            error_lines = [l for l in lines if "Error" in l or "SyntaxError" in l][:3]
+                            await blog.error("Bundle TransformError:\n" + "\n".join(error_lines))
+                        return False
+                    return True
+        except Exception as e:
+            if blog:
+                await blog.warn(f"Bundle validation request failed: {e}")
+            return False
