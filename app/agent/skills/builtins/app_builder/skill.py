@@ -139,13 +139,19 @@ CRITICAL — Cross-Platform Rendering Rules:
 These apps run as Expo Web inside a WebView on mobile AND as web apps in browsers.
 Rendering differences WILL cause visual bugs if you ignore these rules:
 
-1. NEVER use emoji characters (e.g. 🔥📅💡👋). They render as "?" boxes in WebView on many devices.
-   Instead, use unicode symbols: ⌂ (\\u2302), ☐ (\\u2610), ✎ (\\u270E), ▲ (\\u25B2), ☰ (\\u2630),
-   ⭐ (\\u2B50), ★ (\\u2605), ▣ (\\u25A3), △ (\\u25B3). Wrap in JSX expressions: {{"\\u2605"}}.
+1. NEVER use emoji characters (e.g. 🔥📅💡👋) or raw unicode symbols (▲, ☐, ⌂, ☰, ★).
+   They render as ugly boxes or question marks on many devices.
+   ALWAYS use @expo/vector-icons for ALL icons. Import from Ionicons or MaterialCommunityIcons:
+   import {{ Ionicons }} from '@expo/vector-icons';
+   import {{ MaterialCommunityIcons }} from '@expo/vector-icons';
+   Usage: <Ionicons name="home" size={{24}} color="#58A6FF" />
+   Common icon names — Ionicons: home, settings, search, add, heart, star, person, notifications,
+   checkmark-circle, close-circle, trophy, fitness, book, calendar, time, flash, water.
+   MaterialCommunityIcons: dumbbell, run, food-apple, meditation, chart-line, fire, weight-lifter.
 
-2. Tab bar icons MUST render visible content. NEVER use empty <View> elements as tab icons.
-   Use unicode text characters wrapped in <Text> with fontSize/color props, or use an icon library
-   like @expo/vector-icons. Example: <Text style={{{{ fontSize: 20, color: focused ? '#58A6FF' : '#8B949E' }}}}>{{\"\\u2302\"}}</Text>
+2. Tab bar icons MUST use @expo/vector-icons components. NEVER use empty <View> or <Text> with unicode.
+   Example tab bar icon: <Ionicons name={{focused ? "home" : "home-outline"}} size={{24}} color={{color}} />
+   The `focused` and `color` props come from the tabBarIcon render function.
 
 3. Progress bars / gauges: If using a ProgressBar component that clamps to 0-1 range internally,
    pass values in 0-1 range (NOT 0-100). Double-check: Math.min((score - min) / (max - min), 1),
