@@ -169,6 +169,20 @@ Rendering differences WILL cause visual bugs if you ignore these rules:
    For lib files (agentBridge, database, etc.), always provide BOTH `export default` AND named `export {{ }}`
    so either import style works.
 
+8. NEVER use async component functions. `export default async function Screen()` returns a Promise,
+   not a React element — this causes an instant white page. Always use useEffect + useState for data fetching.
+
+9. NEVER mix expo-router with manual NavigationContainer. Use only @react-navigation/* with
+   createBottomTabNavigator/createNativeStackNavigator. Do NOT import from 'expo-router'.
+
+10. Platform-specific APIs that crash on web: expo-secure-store, Vibration, Alert.alert(),
+    react-native-reanimated (needs babel plugin). Always wrap in Platform.OS !== 'web' checks
+    or use conditional require().
+
+11. In React Native, ALL text MUST be inside <Text> components. Bare strings inside <View>
+    crash with "Text strings must be rendered within a Text component". This includes
+    conditional expressions: use `{{condition && <Text>text</Text>}}` not `{{condition && "text"}}`.
+
 Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /components/AgentPlaceholder.tsx:
   Build a floating agent widget component. It renders a small circular avatar (40x40, position: absolute,
@@ -1439,15 +1453,82 @@ module.exports = config;
                         code,
                         count=1,
                     )
+                if patched == code:
+                    # Pattern 4: ultimate fallback — find any `},\n          }}` which is
+                    # the colors block end + theme object end, and insert fonts between
+                    patched = _re.sub(
+                        r'(\},\s*\n\s*\}\}[\s>])',
+                        fonts_block + r'\1',
+                        code,
+                        count=1,
+                    )
                 if patched != code:
                     infra_files[fp] = patched
                     if blog:
                         await blog.info(f"Injected React Navigation v7 fonts into {fp}")
 
+        # Fix common LLM code generation mistakes that cause white pages
+        self._fix_common_llm_mistakes(generated_files, infra_files, blog)
+
         if infra_files:
             await self._app_manager.write_app_files(app_id, infra_files)
             if blog:
                 await blog.info(f"Wrote {len(infra_files)} infrastructure files (metro config, web-safe DB)")
+
+    @staticmethod
+    def _fix_common_llm_mistakes(generated_files: dict, infra_files: dict, blog=None):
+        """Detect and fix common LLM code generation mistakes that cause white pages.
+
+        Catches:
+        1. Async component functions (async function Screen → returns Promise, not element)
+        2. expo-router mixed with NavigationContainer (instant crash)
+        3. Platform-specific APIs without guards (SecureStore, Vibration on web)
+        """
+        import re as _re
+
+        for fp, code in {**generated_files, **infra_files}.items():
+            if not fp.endswith(('.tsx', '.ts', '.jsx', '.js')):
+                continue
+            original = code
+            patched = code
+
+            # 1. Async component functions → remove async keyword
+            # Pattern: export default async function ScreenName(
+            # or: const ScreenName = async () => {  (at top level, used as component)
+            patched = _re.sub(
+                r'export\s+default\s+async\s+function\s+(\w+)',
+                r'export default function \1',
+                patched,
+            )
+            patched = _re.sub(
+                r'export\s+async\s+function\s+(\w+)',
+                r'export function \1',
+                patched,
+            )
+
+            # 2. Mixing expo-router and NavigationContainer
+            if 'expo-router' in patched and 'NavigationContainer' in patched:
+                # Remove expo-router imports — keep manual navigation
+                patched = _re.sub(
+                    r'import\s+\{[^}]*\}\s+from\s+[\'"]expo-router[\'"];?\n?',
+                    '',
+                    patched,
+                )
+
+            # 3. Guard platform-specific APIs that crash on web
+            # SecureStore — needs Platform.OS check
+            if "expo-secure-store" in patched and "Platform.OS" not in patched:
+                patched = patched.replace(
+                    "import * as SecureStore from 'expo-secure-store';",
+                    "import { Platform } from 'react-native';\n"
+                    "let SecureStore: any;\n"
+                    "if (Platform.OS !== 'web') {\n"
+                    "  const mod = 'expo-secure-store'; SecureStore = require(mod);\n"
+                    "}",
+                )
+
+            if patched != original:
+                infra_files[fp] = patched
 
     @staticmethod
     def _fix_import_export_mismatches(generated_files: dict, infra_files: dict):
