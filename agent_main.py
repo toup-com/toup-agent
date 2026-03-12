@@ -39,6 +39,7 @@ from app.api.dashboard import router as dashboard_router
 from app.api.apps import router as apps_router, set_app_manager
 
 _app_start_time = None
+_skill_loader = None
 
 # ── Paths that skip API key auth (health checks, root) ─────────────
 _PUBLIC_PATHS = frozenset({"/", "/agent/health", "/agent/system", "/docs", "/openapi.json", "/redoc"})
@@ -231,15 +232,13 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ Skill loading error: {e}")
             skill_loader = SkillLoader()
 
-        # Load app skills from existing builder apps in DB
-        try:
-            from app.agent.skills.builtins.app_skill import load_app_skills_from_db
-            app_count = await load_app_skills_from_db(skill_loader)
-            if app_count:
-                print(f"📱 Loaded {app_count} app skill(s) from builder")
-        except Exception as e:
-            print(f"⚠️ App skill loading error: {e}")
+        # NOTE: Per-app AppSkill registration removed — use AppGatewaySkill instead
+        # (see app_builder block below)
 
+
+        # Store skill_loader at module level for /agent/capabilities endpoint
+        global _skill_loader
+        _skill_loader = skill_loader
 
         # Wire skill_loader to workflow CRUD for auto-registration
         try:
@@ -310,14 +309,40 @@ async def lifespan(app: FastAPI):
             await skill_loader.register_dynamic(builder_skill)
             print("🏗️ App Builder skill registered")
 
-            # Load filesystem-backed app skills for existing apps
+            # Register AppGatewaySkill (single skill, 12 tools for ALL apps)
+            from app.agent.skills.builtins.app_builder.app_gateway_skill import AppGatewaySkill
+            app_gateway = AppGatewaySkill()
+
+            # Load existing apps into the gateway (not as separate agent tools)
             try:
-                from app.agent.skills.builtins.app_builder.app_fs_skill import load_app_fs_skills_from_db
-                fs_count = await load_app_fs_skills_from_db(skill_loader, app_manager)
-                if fs_count:
-                    print(f"📱 Loaded {fs_count} filesystem app skill(s)")
+                from app.agent.skills.builtins.app_builder.app_fs_skill import AppFsSkill
+                from app.db.models import App
+                from sqlalchemy import select as sa_select
+                async with async_session_maker() as _db:
+                    result = await _db.execute(
+                        sa_select(App).where(App.status.in_(["running", "ready", "stopped"]))
+                    )
+                    db_apps = result.scalars().all()
+                    for db_app in db_apps:
+                        try:
+                            fs_skill = AppFsSkill(
+                                app_id=db_app.id,
+                                app_name=db_app.name,
+                                app_slug=db_app.slug,
+                                app_dir=db_app.app_dir,
+                                app_manager=app_manager,
+                            )
+                            app_gateway.register_app(db_app.slug, fs_skill)
+                        except Exception as e:
+                            logger.debug(f"[AppGateway] Skipping app {db_app.id}: {e}")
+                if db_apps:
+                    print(f"📱 App Gateway: {len(db_apps)} app(s) loaded")
             except Exception as e:
-                print(f"⚠️ App FS skill loading error: {e}")
+                print(f"⚠️ App Gateway loading error: {e}")
+
+            await skill_loader.register_dynamic(app_gateway)
+            builder_skill._app_gateway = app_gateway  # so builder can register new apps
+            print(f"📱 App Gateway skill registered ({len(app_gateway.get_tools())} tools for all apps)")
         except Exception as e:
             print(f"⚠️ App Manager/Builder error: {e}")
 
@@ -671,6 +696,49 @@ async def agent_health():
             "slack": "enabled" if settings.slack_bot_token else "disabled",
             "whatsapp": "enabled" if settings.whatsapp_phone_number_id else "disabled",
         },
+    }
+
+
+@app.get("/agent/capabilities")
+async def agent_capabilities():
+    """Return all loaded tools and skills (including dynamic app skills)."""
+    from app.agent.tool_definitions import get_agent_tools, get_extended_tools
+
+    # Core tools
+    core_tools = []
+    for t in get_agent_tools() + get_extended_tools():
+        core_tools.append({
+            "name": t["name"],
+            "description": t.get("description", ""),
+        })
+
+    # Skills (including app builder + per-app filesystem skills)
+    skills = []
+    if _skill_loader:
+        for s in _skill_loader.get_summary():
+            skills.append({
+                "name": s["name"],
+                "version": s.get("version", ""),
+                "description": s.get("description", ""),
+                "tools": s.get("tools", []),
+            })
+
+    # App domain actions (from agentSkill.json manifests)
+    app_actions = []
+    if _skill_loader:
+        app_skill = _skill_loader.skills.get("app")
+        if app_skill and hasattr(app_skill, 'get_app_actions_summary'):
+            app_actions = app_skill.get_app_actions_summary()
+
+    return {
+        "core_tools": core_tools,
+        "skills": skills,
+        "app_actions": app_actions,
+        "total_tools": (
+            len(core_tools)
+            + sum(len(s["tools"]) for s in skills)
+            + sum(len(a["actions"]) for a in app_actions)
+        ),
     }
 
 

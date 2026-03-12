@@ -107,6 +107,28 @@ async def get_server_info(current_user=Depends(get_current_user), db: AsyncSessi
     return JSONResponse(content={"status": "offline"})
 
 
+# ── Agent capabilities ──────────────────────────────────────
+
+@router.get("/capabilities")
+async def get_capabilities(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Fetch all loaded tools and skills from the VPS agent."""
+    agent_info = await _get_agent(current_user.id, db)
+    if not agent_info:
+        return JSONResponse(content={"core_tools": [], "skills": [], "total_tools": 0})
+    agent_url, key = agent_info
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{agent_url}/agent/capabilities",
+                headers={"X-Agent-Key": key},
+            )
+            if resp.status_code == 200:
+                return JSONResponse(content=resp.json())
+    except Exception as e:
+        logger.warning("Capabilities proxy failed: %s", e)
+    return JSONResponse(content={"core_tools": [], "skills": [], "total_tools": 0})
+
+
 # ── App endpoints ───────────────────────────────────────────
 
 @router.get("/")

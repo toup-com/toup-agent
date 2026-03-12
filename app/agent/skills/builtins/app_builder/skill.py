@@ -59,6 +59,22 @@ Rules:
 - For responsive layout, plan to use useWindowDimensions
 - If the app needs charts, use react-native-chart-kit (NOT recharts — that's web-only)
 - Keep the file list focused — don't over-engineer
+- ALWAYS include /lib/agentSkill.json — domain-specific agent skill manifest (see below)
+
+CRITICAL — Agent Skill Manifest:
+Every app MUST include /lib/agentSkill.json — this tells the agent what domain-specific
+operations it can perform within the app. The agent uses these to help users via
+`app__action` tool. Example for a GRE prep app:
+  {{"domain":"GRE Preparation","description":"Tools for GRE exam prep",
+    "actions":[{{"name":"get_progress","description":"Get user's study progress","type":"query",
+    "sql":"SELECT section, score, date FROM practice_results ORDER BY date DESC LIMIT 10","params":{{}}}},
+    {{"name":"get_vocabulary","description":"Get vocab words by difficulty","type":"query",
+    "sql":"SELECT word, definition FROM vocabulary WHERE difficulty = :level LIMIT :count",
+    "params":{{"level":{{"type":"string"}},"count":{{"type":"integer","default":10}}}}}},
+    {{"name":"add_study_session","description":"Log a study session","type":"mutation",
+    "sql":"INSERT INTO study_sessions (section, duration_min, notes) VALUES (:section, :duration, :notes)",
+    "params":{{"section":{{"type":"string"}},"duration":{{"type":"integer"}},"notes":{{"type":"string","default":""}}}}}},
+    {{"name":"go_to_practice","description":"Open practice test screen","type":"navigate","screen":"Practice","params":{{}}}}]}}
 
 CRITICAL — Agent Placeholder System:
 Every app is an "agentic app" — the user's AI agent must be able to work inside it.
@@ -161,6 +177,35 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
 
 - For ANY screen file:
   Register that screen's agent actions in a useEffect via agentActions.registerAction().
+
+- If this is /lib/agentSkill.json:
+  Generate a JSON manifest of domain-specific agent actions for this app.
+  The agent uses these via the `app__action` tool to help users.
+  Format:
+  {{
+    "domain": "<domain name, e.g. 'GRE Preparation'>",
+    "description": "<what these tools help the agent do within this app>",
+    "actions": [
+      {{
+        "name": "<snake_case_name>",
+        "description": "<what this action does>",
+        "type": "query" | "mutation" | "navigate",
+        "sql": "<SQL with :param_name placeholders (for query/mutation)>",
+        "screen": "<screen name (for navigate type only)>",
+        "params": {{
+          "<param_name>": {{"type": "string|integer|number|boolean", "description": "...", "default": <optional>}}
+        }}
+      }}
+    ]
+  }}
+  Rules:
+  - Generate 4-8 meaningful domain actions based on the app's purpose
+  - "query": SELECT — returns data. "mutation": INSERT/UPDATE/DELETE — modifies data. "navigate": opens a screen
+  - SQL MUST use the app's actual table/column names from the database schema in /lib/db.ts
+  - Use :param_name for parameterized queries (NEVER string concatenation)
+  - Make actions domain-level (score_test, get_progress) NOT generic CRUD (insert_row, select_all)
+  - Include at least 1 navigation action
+  - Output ONLY valid JSON — no markdown fences, no comments
 """
 
 MODIFY_ANALYSIS_PROMPT = """You are analyzing a modification request for an existing React Native/Expo app.
@@ -643,6 +688,10 @@ class AppBuilderSkill(Skill):
             app_name = plan.get("app_name", name)
             needs_db = plan.get("needs_database", False)
 
+            # Ensure agentSkill.json is always generated (domain-specific actions)
+            if "/lib/agentSkill.json" not in files_to_generate:
+                files_to_generate.append("/lib/agentSkill.json")
+
             await blog.info(f"Plan: {len(files_to_generate)} files, {len(deps)} deps, db={db_type}")
 
             # Save plan to DB
@@ -829,15 +878,15 @@ class AppBuilderSkill(Skill):
                     job.model = "claude-sonnet-4-6"
                     await db.commit()
 
-            # Register per-app filesystem skill
-            if self._skill_loader:
+            # Register app into the gateway (single skill, not per-app tools)
+            if hasattr(self, '_app_gateway') and self._app_gateway:
                 try:
                     from .app_fs_skill import AppFsSkill
                     app_fs_skill = AppFsSkill(app_id, name, slug, app_dir, self._app_manager)
-                    await self._skill_loader.register_dynamic(app_fs_skill)
-                    logger.info(f"[BUILD] Registered AppFsSkill for '{name}' ({slug})")
+                    self._app_gateway.register_app(slug, app_fs_skill)
+                    logger.info(f"[BUILD] Registered app '{name}' in gateway (slug: {slug})")
                 except Exception as e:
-                    logger.warning(f"[BUILD] Failed to register AppFsSkill: {e}")
+                    logger.warning(f"[BUILD] Failed to register app in gateway: {e}")
 
             # Broadcast app_ready
             if self._ws_broadcast:
