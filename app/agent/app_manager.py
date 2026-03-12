@@ -134,13 +134,14 @@ class AppManager:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
         output = (stdout or b"").decode()
 
-        # Install extra deps if any
+        # Install extra deps using `npx expo install` for version compatibility
         if deps:
-            cmd2 = ["npm", "install"] + deps
+            cmd2 = ["npx", "expo", "install"] + deps
             proc2 = await asyncio.create_subprocess_exec(
                 *cmd2, cwd=app_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "EXPO_NO_TELEMETRY": "1"},
             )
             stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=300)
             output += "\n" + (stdout2 or b"").decode()
@@ -215,7 +216,21 @@ class AppManager:
         # Start log reader
         asyncio.create_task(self._read_output(managed, proc, "web"))
 
-        logger.info(f"[APP] Web server started for {app_id} on port {port}")
+        # Wait for server to actually be ready (up to 30s)
+        import socket
+        for _ in range(30):
+            await asyncio.sleep(1)
+            if proc.returncode is not None:
+                logger.error(f"[APP] Web server for {app_id} exited early (code {proc.returncode})")
+                break
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    logger.info(f"[APP] Web server ready for {app_id} on port {port}")
+                    return port
+            except (OSError, ConnectionRefusedError):
+                continue
+
+        logger.warning(f"[APP] Web server for {app_id} on port {port} may not be ready yet")
         return port
 
     async def stop_app(self, app_id: str) -> bool:
@@ -274,12 +289,26 @@ class AppManager:
         return f"exp://{ip}:{managed.metro_port}"
 
     async def get_web_url(self, app_id: str) -> Optional[str]:
-        """Get web preview URL."""
+        """Get web preview URL (routed through platform proxy)."""
         managed = self._running.get(app_id)
         if not managed or not managed.web_port:
             return None
-        ip = await self._get_public_ip()
-        return f"http://{ip}:{managed.web_port}"
+        # Return clean platform proxy URL using slug
+        from app.config import settings
+        slug = await self._get_app_slug(app_id)
+        base = settings.platform_api_url.replace("/api", "")  # https://toup.ai
+        return f"{base}/workspace/apps/{slug or app_id}"
+
+    async def _get_app_slug(self, app_id: str) -> Optional[str]:
+        """Look up app slug from DB."""
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import App
+            async with async_session_maker() as db:
+                app = await db.get(App, app_id)
+                return app.slug if app else None
+        except Exception:
+            return None
 
     # ── Database & Storage ──────────────────────────────
 
