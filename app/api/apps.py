@@ -34,12 +34,19 @@ router = APIRouter(prefix="/apps", tags=["Apps"])
 
 # ── Module-level refs (set from agent_main.py) ──────────────────────
 _app_manager = None
+_app_gateway = None
 
 
 def set_app_manager(app_manager):
     """Wire the AppManager instance (called from agent_main.py lifespan)."""
     global _app_manager
     _app_manager = app_manager
+
+
+def set_app_gateway(gateway):
+    """Wire the AppGatewaySkill instance so delete can unregister apps."""
+    global _app_gateway
+    _app_gateway = gateway
 
 
 # ── Response schemas ────────────────────────────────────────────────
@@ -312,9 +319,24 @@ async def delete_job(job_id: str) -> Dict[str, bool]:
 
 @router.delete("/{app_id}")
 async def delete_app(app_id: str) -> Dict[str, bool]:
-    """Delete an app (stop servers, remove files, remove DB records + related jobs)."""
+    """Delete an app (stop servers, remove files, unregister skills, remove DB records + related jobs)."""
+    # Get slug before deleting so we can unregister from gateway
+    app_slug = None
+    async with async_session_maker() as db:
+        app = await db.get(App, app_id)
+        if app:
+            app_slug = app.slug
+
     if _app_manager:
         await _app_manager.delete_app(app_id)
+
+    # Unregister from AppGatewaySkill (removes tools + domain actions)
+    if _app_gateway and app_slug:
+        try:
+            _app_gateway.unregister_app(app_slug)
+            logger.info(f"[DELETE] Unregistered app '{app_slug}' from gateway")
+        except Exception as e:
+            logger.warning(f"[DELETE] Failed to unregister app '{app_slug}': {e}")
 
     async with async_session_maker() as db:
         # Delete related build jobs

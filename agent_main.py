@@ -36,7 +36,7 @@ from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.workflow_crud import router as workflow_crud_router
 from app.api.dashboard import router as dashboard_router
-from app.api.apps import router as apps_router, set_app_manager
+from app.api.apps import router as apps_router, set_app_manager, set_app_gateway
 
 _app_start_time = None
 _skill_loader = None
@@ -342,6 +342,7 @@ async def lifespan(app: FastAPI):
 
             await skill_loader.register_dynamic(app_gateway)
             builder_skill._app_gateway = app_gateway  # so builder can register new apps
+            set_app_gateway(app_gateway)  # so delete endpoint can unregister apps
             print(f"📱 App Gateway skill registered ({len(app_gateway.get_tools())} tools for all apps)")
         except Exception as e:
             print(f"⚠️ App Manager/Builder error: {e}")
