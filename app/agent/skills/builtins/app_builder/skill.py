@@ -2190,17 +2190,24 @@ const _webDb = {
                     client = anthropic.AsyncAnthropic(api_key=anthropic_key)
 
                 t0 = _time.time()
-                response = await client.messages.create(
+                # Use streaming — Anthropic requires it for large max_tokens
+                text = ""
+                input_tok = 0
+                output_tok = 0
+                stop_reason = "end_turn"
+                async with client.messages.stream(
                     model=model,
                     max_tokens=max_tokens,
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_message}],
-                )
+                ) as stream:
+                    async for chunk in stream.text_stream:
+                        text += chunk
+                    response = await stream.get_final_message()
+                    input_tok = getattr(response.usage, 'input_tokens', 0)
+                    output_tok = getattr(response.usage, 'output_tokens', 0)
+                    stop_reason = getattr(response, 'stop_reason', 'end_turn')
                 elapsed = _time.time() - t0
-                text = response.content[0].text
-                input_tok = getattr(response.usage, 'input_tokens', 0)
-                output_tok = getattr(response.usage, 'output_tokens', 0)
-                stop_reason = getattr(response, 'stop_reason', 'end_turn')
 
                 if blog:
                     await blog.llm_call(
