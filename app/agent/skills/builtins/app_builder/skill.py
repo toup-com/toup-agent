@@ -139,19 +139,20 @@ CRITICAL — Cross-Platform Rendering Rules:
 These apps run as Expo Web inside a WebView on mobile AND as web apps in browsers.
 Rendering differences WILL cause visual bugs if you ignore these rules:
 
-1. NEVER use emoji characters (e.g. 🔥📅💡👋) or raw unicode symbols (▲, ☐, ⌂, ☰, ★).
-   They render as ugly boxes or question marks on many devices.
-   ALWAYS use @expo/vector-icons for ALL icons. Import from Ionicons or MaterialCommunityIcons:
-   import {{ Ionicons }} from '@expo/vector-icons';
-   import {{ MaterialCommunityIcons }} from '@expo/vector-icons';
-   Usage: <Ionicons name="home" size={{24}} color="#58A6FF" />
-   Common icon names — Ionicons: home, settings, search, add, heart, star, person, notifications,
-   checkmark-circle, close-circle, trophy, fitness, book, calendar, time, flash, water.
-   MaterialCommunityIcons: dumbbell, run, food-apple, meditation, chart-line, fire, weight-lifter.
+1. Use EMOJI characters for ALL icons — they render perfectly on web, iOS, and Android with zero imports.
+   NEVER use @expo/vector-icons (breaks on Expo Web). NEVER use raw unicode symbols (▲, ☐, ⌂, ☰, ★).
+   Use emoji via <Text> elements. Examples:
+   - Navigation: 🏠 Home, 📋 List, 📊 Analytics, 📅 Calendar, ⚙️ Settings, 🔍 Search
+   - Actions: ➕ Add, ✏️ Edit, 🗑️ Delete, ✅ Done, ❌ Close, 💾 Save, 🔄 Refresh
+   - Status: ⭐ Favorite, ❤️ Heart, 🔥 Streak, 🏆 Trophy, 🎯 Target, 💪 Fitness
+   - Content: 📝 Note, 📖 Book, 🎵 Music, 📸 Photo, 🎬 Video, 💬 Chat, 🔔 Notification
+   - Health: 💧 Water, 🍎 Food, 🧘 Meditation, 🏃 Running, 😴 Sleep, 💊 Medicine
+   - Misc: ⏰ Timer, 📈 Chart, 🌙 Dark, ☀️ Light, 👤 Profile, 🔒 Lock, 🎨 Color
 
-2. Tab bar icons MUST use @expo/vector-icons components. NEVER use empty <View> or <Text> with unicode.
-   Example tab bar icon: <Ionicons name={{focused ? "home" : "home-outline"}} size={{24}} color={{color}} />
-   The `focused` and `color` props come from the tabBarIcon render function.
+2. Tab bar icons MUST use emoji in <Text> components. NEVER use empty <View> or icon libraries.
+   Example tab bar icon:
+   tabBarIcon: ({{ color }}) => <Text style={{{{ fontSize: 22 }}}}>🏠</Text>
+   Use different emoji for each tab to make them visually distinct.
 
 3. Progress bars / gauges: If using a ProgressBar component that clamps to 0-1 range internally,
    pass values in 0-1 range (NOT 0-100). Double-check: Math.min((score - min) / (max - min), 1),
