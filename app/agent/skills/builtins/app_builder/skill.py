@@ -84,9 +84,15 @@ operations it can perform within the app. The agent uses these to help users via
     "params":{{"section":{{"type":"string"}},"duration":{{"type":"integer"}},"notes":{{"type":"string","default":""}}}}}},
     {{"name":"go_to_practice","description":"Open practice test screen","type":"navigate","screen":"Practice","params":{{}}}}]}}
 
+CRITICAL — Error Boundary (prevents white screens):
+You MUST include /components/ErrorBoundary.tsx in EVERY plan.
+This is a class-based React component that wraps the entire app and catches runtime errors,
+showing a helpful error message + reload button instead of a blank white screen.
+
 CRITICAL — Agent Placeholder System:
 Every app is an "agentic app" — the user's AI agent must be able to work inside it.
 You MUST include these files in EVERY plan:
+  - /components/ErrorBoundary.tsx — Catches runtime errors, shows error screen instead of white page
   - /components/AgentPlaceholder.tsx — Floating agent widget that:
     - Shows the agent avatar as a small circle (docked/idle state)
     - Expands into an inline chat interface when tapped (active state)
@@ -285,6 +291,35 @@ Responsive Navigation (CRITICAL — every app MUST include this):
   In each Tab.Screen, the screen component should add paddingLeft: isDesktop ? 220 : 0 to its
   outermost ScrollView/View to account for the sidebar width. Since every screen already uses
   useWindowDimensions() for responsive layout, just add this padding.
+
+Error Boundary (CRITICAL — prevents white screens):
+- If this is /components/ErrorBoundary.tsx:
+  Build a React class component error boundary. This catches runtime errors and shows a user-friendly
+  error screen instead of a blank white page. Implementation:
+  - Class component extending React.Component<{{children: React.ReactNode}}, {{hasError: boolean, error: Error | null}}>
+  - static getDerivedStateFromError(error): return {{ hasError: true, error }}
+  - componentDidCatch(error, errorInfo): console.error('[ErrorBoundary]', error, errorInfo)
+  - When hasError is true, render a dark error screen (#161B22 background):
+    - Center-aligned: "⚠️" emoji (fontSize 48), "Something went wrong" title (white, 18px, bold),
+      error.message in gray (13px, max 3 lines), and a "Reload App" button (#58A6FF, rounded, Pressable)
+    - The reload button calls: this.setState({{ hasError: false, error: null }}) to retry rendering
+  - When hasError is false: return this.props.children
+  - Export as default
+
+- If this is /App.tsx:
+  Wrap the ENTIRE app (NavigationContainer + everything inside) with <ErrorBoundary>:
+  ```
+  import ErrorBoundary from './components/ErrorBoundary';
+  ...
+  return (
+    <ErrorBoundary>
+      <NavigationContainer theme={{...}}>
+        ...
+      </NavigationContainer>
+      <AgentPlaceholder />
+    </ErrorBoundary>
+  );
+  ```
 
 Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /components/AgentPlaceholder.tsx:
@@ -1056,29 +1091,30 @@ class AppBuilderSkill(Skill):
                 web_port = await self._app_manager.start_web(app_id)
                 await blog.success(f"Web server running on port {web_port}")
 
-                # ── Bundle validation + auto-repair ──────────
+                # ── Bundle validation + auto-repair (up to 2 rounds) ──────
                 await blog.info("Validating web bundle compilation...")
+                bundle_ok = False
                 try:
                     await self._wait_for_server(web_port, timeout=20)
-                    bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
-                    if not bundle_ok and bundle_errors:
-                        await blog.warn(f"Bundle has errors — attempting auto-repair...")
-                        # Try to fix the broken files
+                    for repair_round in range(2):
+                        bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                        if bundle_ok:
+                            await blog.success("Bundle compiles cleanly" if repair_round == 0 else "Bundle repaired and compiles cleanly")
+                            break
+                        if not bundle_errors:
+                            await blog.warn("Bundle validation failed but no specific errors found")
+                            break
+                        await blog.warn(f"Bundle has errors — auto-repair attempt {repair_round + 1}/2...")
                         repaired = await self._repair_bundle_errors(
                             app_id, app_dir, bundle_errors, generated_files,
                             description, name, deps, db_type, blog
                         )
-                        if repaired:
-                            await asyncio.sleep(2)
-                            bundle_ok, _ = await self._validate_bundle(web_port, blog)
-                            if bundle_ok:
-                                await blog.success("Bundle repaired and compiles cleanly")
-                            else:
-                                await blog.warn("Bundle still has issues after repair — app may not render correctly")
-                        else:
-                            await blog.warn("Bundle has compilation errors — app may not render correctly")
-                    elif bundle_ok:
-                        await blog.success("Bundle compiles cleanly")
+                        if not repaired:
+                            await blog.warn("Could not repair bundle errors")
+                            break
+                        await asyncio.sleep(3)  # wait for Metro to pick up fixed files
+                    if not bundle_ok:
+                        await blog.error("Bundle has compilation errors after repair attempts — app will show white screen")
                 except Exception as e:
                     await blog.warn(f"Bundle validation skipped: {e}")
 
@@ -1087,10 +1123,12 @@ class AppBuilderSkill(Skill):
                 await blog.info(f"QR URL: {qr_url}")
                 await blog.info(f"Web URL: {web_url}")
 
+                # Set status based on bundle validation result
+                final_status = "running" if bundle_ok else "error"
                 async with async_session_maker() as db:
                     app = await db.get(App, app_id)
                     if app:
-                        app.status = "running"
+                        app.status = final_status
                         app.port = metro_port
                         app.web_port = web_port
                         managed = self._app_manager._running.get(app_id)
@@ -1098,6 +1136,11 @@ class AppBuilderSkill(Skill):
                             app.metro_pid = managed.metro_process.pid if managed.metro_process else None
                             app.web_pid = managed.web_process.pid if managed.web_process else None
                         await db.commit()
+                if not bundle_ok:
+                    await blog.error("Build completed with errors — check bundle logs")
+                    await blog.persist()
+                    await self._fail_job(job_id, app_id, "Bundle compilation failed after auto-repair")
+                    return
 
                 await self._update_step(job_id, user_id, "starting", "done",
                                         detail=f"Metro:{metro_port} Web:{web_port}")
@@ -1304,30 +1347,37 @@ class AppBuilderSkill(Skill):
                 await self._update_step(job_id, user_id, "starting", "done",
                                         detail=f"Restart skipped: {e}")
 
-            # ── Step 4b: Validate bundle after modification ──────
+            # ── Step 4b: Validate bundle after modification (up to 2 rounds) ──
             if web_port:
                 blog.set_step("validating")
                 await blog.info("Validating modified bundle...")
+                bundle_ok = False
                 try:
                     await self._wait_for_server(web_port, timeout=15)
-                    bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
-                    if not bundle_ok and bundle_errors:
-                        await blog.warn("Bundle has errors after modification — attempting repair...")
+                    for repair_round in range(2):
+                        bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                        if bundle_ok:
+                            await blog.success("Modified bundle compiles cleanly" if repair_round == 0 else "Bundle repaired and compiles cleanly")
+                            break
+                        if not bundle_errors:
+                            await blog.warn("Bundle validation failed but no specific errors found")
+                            break
+                        await blog.warn(f"Bundle has errors — auto-repair attempt {repair_round + 1}/2...")
                         repaired = await self._repair_bundle_errors(
                             app_id, app_dir, bundle_errors, generated,
                             changes, app_name, [], "none", blog
                         )
-                        if repaired:
-                            await asyncio.sleep(2)
-                            bundle_ok, _ = await self._validate_bundle(web_port, blog)
-                            if bundle_ok:
-                                await blog.success("Bundle repaired and compiles cleanly")
-                            else:
-                                await blog.warn("Bundle still has issues after repair")
-                        else:
-                            await blog.warn("Bundle has compilation errors after modification")
-                    elif bundle_ok:
-                        await blog.success("Modified bundle compiles cleanly")
+                        if not repaired:
+                            break
+                        await asyncio.sleep(3)
+                    if not bundle_ok:
+                        await blog.error("Bundle has compilation errors after modification")
+                        # Update status to error
+                        async with async_session_maker() as db:
+                            app = await db.get(App, app_id)
+                            if app:
+                                app.status = "error"
+                                await db.commit()
                 except Exception as e:
                     await blog.warn(f"Bundle validation skipped: {e}")
 
@@ -1687,6 +1737,81 @@ module.exports = config;
                 if blog:
                     await blog.info(f"Injected React Navigation v7 fonts into {fp}")
 
+        # Ensure ErrorBoundary exists — prevents white screens from runtime errors
+        if "/components/ErrorBoundary.tsx" not in generated_files and "/components/ErrorBoundary.tsx" not in infra_files:
+            infra_files["/components/ErrorBoundary.tsx"] = '''import React from 'react';
+import { View, Text, Pressable, StyleSheet } from 'react-native';
+
+interface State { hasError: boolean; error: Error | null; }
+
+export default class ErrorBoundary extends React.Component<{children: React.ReactNode}, State> {
+  state: State = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error: Error): State {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error('[ErrorBoundary]', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <View style={styles.container}>
+          <Text style={styles.emoji}>⚠️</Text>
+          <Text style={styles.title}>Something went wrong</Text>
+          <Text style={styles.message} numberOfLines={3}>
+            {this.state.error?.message || 'An unexpected error occurred'}
+          </Text>
+          <Pressable
+            style={styles.button}
+            onPress={() => this.setState({ hasError: false, error: null })}
+          >
+            <Text style={styles.buttonText}>Reload App</Text>
+          </Pressable>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#161B22', justifyContent: 'center', alignItems: 'center', padding: 32 },
+  emoji: { fontSize: 48, marginBottom: 16 },
+  title: { color: '#F0F2F5', fontSize: 18, fontWeight: '700', marginBottom: 8 },
+  message: { color: '#8B949E', fontSize: 13, textAlign: 'center', lineHeight: 18, marginBottom: 24, maxWidth: 320 },
+  button: { backgroundColor: '#58A6FF', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 20 },
+  buttonText: { color: '#FFF', fontSize: 14, fontWeight: '600' },
+});
+'''
+            if blog:
+                await blog.info("Added ErrorBoundary component (prevents white screens)")
+
+        # Inject ErrorBoundary wrapper into App.tsx if not already present
+        for fp in ["/App.tsx"]:
+            code = infra_files.get(fp, generated_files.get(fp, ""))
+            if code and "ErrorBoundary" not in code and "NavigationContainer" in code:
+                # Add import
+                code = "import ErrorBoundary from './components/ErrorBoundary';\n" + code
+                # Wrap NavigationContainer with ErrorBoundary
+                code = code.replace("<NavigationContainer", "<ErrorBoundary>\n      <NavigationContainer", 1)
+                # Find the closing </NavigationContainer> and add </ErrorBoundary> after
+                # Handle both </NavigationContainer> patterns
+                if "</NavigationContainer>" in code:
+                    # Find last occurrence
+                    idx = code.rfind("</NavigationContainer>")
+                    close_tag = "</NavigationContainer>"
+                    # Find the end of the line containing the closing tag
+                    end_idx = code.find("\n", idx + len(close_tag))
+                    if end_idx == -1:
+                        end_idx = len(code)
+                    code = code[:end_idx] + "\n      </ErrorBoundary>" + code[end_idx:]
+                infra_files[fp] = code
+                if blog:
+                    await blog.info("Wrapped App.tsx with ErrorBoundary")
+
         # Fix common LLM code generation mistakes that cause white pages
         self._fix_common_llm_mistakes(generated_files, infra_files, blog)
 
@@ -1749,9 +1874,14 @@ module.exports = config;
             # 3. Guard platform-specific APIs that crash on web
             # SecureStore
             if "expo-secure-store" in patched and "Platform.OS" not in patched:
+                # Only add Platform import if not already present
+                platform_import_line = ""
+                rn_check = _re.findall(r'import\s*\{([^}]+)\}\s*from\s*[\'"]react-native[\'"]', patched)
+                if not any('Platform' in imp for imp in rn_check):
+                    platform_import_line = "import { Platform } from 'react-native';\n"
                 patched = patched.replace(
                     "import * as SecureStore from 'expo-secure-store';",
-                    "import { Platform } from 'react-native';\n"
+                    platform_import_line +
                     "let SecureStore: any;\n"
                     "if (Platform.OS !== 'web') {\n"
                     "  const mod = 'expo-secure-store'; SecureStore = require(mod);\n"
@@ -1765,13 +1895,21 @@ module.exports = config;
                     r"(Platform.OS === 'web' ? window.alert(String(\1).split(',')[0]) : Alert.alert(\1))",
                     patched,
                 )
-                # Ensure Platform is imported
-                if "import { Platform" not in patched and "Platform }" not in patched:
-                    patched = patched.replace(
-                        "from 'react-native';",
-                        "Platform } from 'react-native';",
-                        1,
+                # Ensure Platform is imported — safely add to existing react-native import
+                rn_imports = _re.findall(r'import\s*\{([^}]+)\}\s*from\s*[\'"]react-native[\'"]', patched)
+                already_has_platform = any('Platform' in imp for imp in rn_imports)
+                if not already_has_platform:
+                    def _add_platform_import(m):
+                        imports = m.group(1).rstrip().rstrip(',')
+                        return f"import {{ {imports}, Platform }} from 'react-native'"
+                    patched, n = _re.subn(
+                        r"import\s*\{([^}]+)\}\s*from\s*['\"]react-native['\"]",
+                        _add_platform_import,
+                        patched,
+                        count=1,
                     )
+                    if n == 0:
+                        patched = "import { Platform } from 'react-native';\n" + patched
 
             # Vibration — no-op on web
             if 'Vibration.vibrate' in patched and "Platform.OS" not in patched:
