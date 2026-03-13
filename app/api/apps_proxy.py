@@ -290,10 +290,19 @@ async def preview_proxy(
                 html = re.sub(r'src="(/[^"]*)"', _rewrite_src, html)
                 body = html.encode("utf-8")
 
+            # Ensure charset=utf-8 is in Content-Type for text responses.
+            # iOS WKWebView uses the HTTP header (not <meta charset>) to decode,
+            # and defaults to ASCII when charset is missing — corrupting emoji bytes.
+            resp_content_type = content_type
+            if "text/html" in content_type and "charset" not in content_type:
+                resp_content_type = "text/html; charset=utf-8"
+            elif "javascript" in content_type and "charset" not in content_type:
+                resp_content_type = content_type + "; charset=utf-8"
+
             response = StreamingResponse(
                 iter([body]),
                 status_code=resp.status_code,
-                media_type=content_type,
+                media_type=resp_content_type,
             )
 
             # Set auth cookie so sub-resource requests (JS bundles, etc.)
