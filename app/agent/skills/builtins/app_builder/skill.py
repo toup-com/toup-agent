@@ -185,6 +185,8 @@ Rendering differences WILL cause visual bugs if you ignore these rules:
    Example tab bar icon:
    tabBarIcon: ({{ color }}) => <Text style={{{{ fontSize: 22 }}}}>🏠</Text>
    Use different emoji for each tab to make them visually distinct.
+   CRITICAL: Tab screen labels must be PLAIN TEXT only (e.g. "Dashboard", not "🏠 Dashboard").
+   The emoji goes in tabBarIcon, NOT in the label. Putting emoji in both causes duplicate emojis in the sidebar.
 
 3. Progress bars / gauges: If using a ProgressBar component that clamps to 0-1 range internally,
    pass values in 0-1 range (NOT 0-100). Double-check: Math.min((score - min) / (max - min), 1),
@@ -788,12 +790,36 @@ class AppBuilderSkill(Skill):
             "can dock into the app and help the user. You'll have full access to navigate, read data, and "
             "perform actions within every app you build.\n\n"
             "## When the user wants to build an app, follow this process:\n\n"
-            "### Step 1: Understand Requirements\n"
-            "Ask 2-3 clarifying questions in a SINGLE message. Topics to cover:\n"
-            "- Key features (suggest 3-4 based on the app type)\n"
-            "- Data needs (save data locally with SQLite, or UI-only)\n"
-            "- Design preferences (dark/light, colors, style)\n\n"
-            "If the user gives a detailed enough description upfront, skip to Step 2.\n\n"
+            "### Step 1: Understand Requirements (10+ Questions)\n"
+            "Ask **at least 10 clarifying questions** in a SINGLE message to deeply understand what the user wants.\n"
+            "Pick the most relevant questions from this list based on the app type — aim for 10-12:\n\n"
+            "**Core & Purpose:**\n"
+            "1. Who is this app for? (personal use, team, public users)\n"
+            "2. What is the ONE main action users do most? (track, browse, create, schedule, learn)\n"
+            "3. What problem does this app solve? (productivity, learning, health, fun, organization)\n\n"
+            "**Features & Scope:**\n"
+            "4. Which features are must-have? (suggest 4-5 based on app type)\n"
+            "5. Any nice-to-have features? (suggest 3-4 extras)\n"
+            "6. Do you need notifications/reminders?\n"
+            "7. Do you need data visualization? (charts, progress bars, streaks, stats)\n\n"
+            "**Data & Storage:**\n"
+            "8. Should data persist between sessions? (SQLite database vs UI-only)\n"
+            "9. What data does the user create? (entries, notes, scores, schedules, uploads)\n"
+            "10. Any seed/default data needed? (categories, templates, starter content)\n\n"
+            "**Design & UX:**\n"
+            "11. Color theme preference? (suggest 3-4 palettes that match the app vibe)\n"
+            "12. Dark mode, light mode, or both?\n"
+            "13. How many main screens? (suggest based on app type: 3-6 typical)\n"
+            "14. Tab bar navigation or drawer/sidebar? (suggest best for the app type)\n"
+            "15. Any specific layout, style, or design inspiration?\n\n"
+            "**Smart Extras:**\n"
+            "16. Should the app have a dashboard/home screen with overview stats?\n"
+            "17. Any gamification? (streaks, achievements, points, levels, progress tracking)\n"
+            "18. Sort/filter/search on lists?\n"
+            "19. Import/export data? (CSV, share, backup)\n"
+            "20. Onboarding/welcome screen for first-time users?\n\n"
+            "Pick at least 10 of these based on the app type. You can add your own smart questions too.\n"
+            "If the user gives a very detailed description upfront, you may reduce to 8 but never less.\n\n"
             "**CRITICAL — EVERY question MUST have [[option]] buttons. NO exceptions.**\n"
             "- NEVER ask open-ended questions without buttons.\n"
             "- NEVER use bullet point lists (- option1, - option2) instead of buttons.\n"
