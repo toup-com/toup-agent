@@ -133,8 +133,8 @@ class ModelProviderRegistry:
             provider_type=ProviderType.ANTHROPIC,
             base_url="https://api.anthropic.com",
             api_key_env="ANTHROPIC_API_KEY",
-            models=["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"],
-            default_model="claude-sonnet-4-20250514",
+            models=["claude-opus-4-6", "claude-sonnet-4-20250514", "claude-3-5-haiku-20241022"],
+            default_model="claude-opus-4-6",
             priority=20,
         ))
 

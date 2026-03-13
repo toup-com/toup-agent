@@ -394,7 +394,7 @@ async def _stream_anthropic(messages: list[dict]):
     import anthropic
 
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    model = getattr(settings, "anthropic_model", "claude-sonnet-4-20250514")
+    model = getattr(settings, "anthropic_model", "claude-opus-4-6")
 
     system_msg = ""
     chat_messages = []
@@ -449,7 +449,7 @@ async def builder_chat(request: BuilderChatRequest, db: AsyncSession = Depends(g
         messages.append({"role": msg["role"], "content": msg["content"]})
 
     model_name = (
-        getattr(settings, "anthropic_model", "claude-sonnet-4-20250514")
+        getattr(settings, "anthropic_model", "claude-opus-4-6")
         if provider == "anthropic"
         else getattr(settings, "agent_model", "gpt-4o-mini")
     )
@@ -528,7 +528,7 @@ async def builder_suggestions(db: AsyncSession = Depends(get_db)):
             import anthropic
             client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
             # Use Haiku for fast, cheap suggestions (no need for Opus here)
-            model = "claude-haiku-4-5-20251001"
+            model = "claude-opus-4-6"
             resp = await client.messages.create(
                 model=model, max_tokens=300,
                 messages=[{"role": "user", "content": SUGGESTIONS_PROMPT.format(context=context)}],

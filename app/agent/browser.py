@@ -611,7 +611,7 @@ async def _vision_solve_image_captcha(screenshot_bytes: bytes, instruction: str)
                 "https://api.anthropic.com/v1/messages",
                 headers=_headers,
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-opus-4-6",
                     "max_tokens": 100,
                     "messages": [{
                         "role": "user",

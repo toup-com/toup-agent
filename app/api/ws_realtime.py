@@ -665,10 +665,8 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
     decision = classify_request(task)
     # Since the voice agent already decided this needs reasoning (called think),
     # treat "light" as at least "medium" — use the configured agent_model
-    if decision.tier == "light":
-        model_override = settings.agent_model  # e.g. gpt-5.2
-    else:
-        model_override = decision.model  # medium=agent_model, heavy=claude-opus-4-6
+    # All tiers use Opus 4.6 for now (routing disabled for testing)
+    model_override = decision.model  # always claude-opus-4-6
 
     logger.info(
         "[REALTIME] think: tier=%s, model=%s, reason=%s",

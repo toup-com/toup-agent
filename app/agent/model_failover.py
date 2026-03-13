@@ -10,7 +10,7 @@ Usage:
 
     chain = get_failover_chain()
     chain.configure([
-        {"model": "claude-sonnet-4-20250514", "provider": "anthropic"},
+        {"model": "claude-opus-4-6", "provider": "anthropic"},
         {"model": "gpt-4o", "provider": "openai"},
         {"model": "gpt-4o-mini", "provider": "openai"},
     ])
