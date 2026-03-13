@@ -1091,20 +1091,44 @@ class AppBuilderSkill(Skill):
                 web_port = await self._app_manager.start_web(app_id)
                 await blog.success(f"Web server running on port {web_port}")
 
-                # ── Bundle validation + auto-repair (up to 2 rounds) ──────
+                # ── Bundle validation + auto-repair (up to 3 rounds) ──────
                 await blog.info("Validating web bundle compilation...")
                 bundle_ok = False
                 try:
-                    await self._wait_for_server(web_port, timeout=20)
-                    for repair_round in range(2):
-                        bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                    for repair_round in range(3):
+                        # Check if web server is alive — if crashed, extract errors from log buffer
+                        managed_app = self._app_manager._running.get(app_id)
+                        web_alive = (managed_app and managed_app.web_process
+                                     and managed_app.web_process.returncode is None)
+
+                        if web_alive:
+                            await self._wait_for_server(web_port, timeout=20)
+                            bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                        else:
+                            bundle_ok = False
+                            bundle_errors = []
+                            await blog.warn("Web server crashed — extracting errors from process output...")
+                            # Extract errors from log_buffer (captured by _read_output)
+                            if managed_app and managed_app.log_buffer:
+                                import re as _re
+                                for line in list(managed_app.log_buffer)[-50:]:
+                                    if any(kw in line for kw in ('SyntaxError', 'TransformError', 'Error:', 'error:', 'Cannot find module', 'Unexpected token')):
+                                        file_match = _re.search(r'(/[^\s:]+\.tsx?)', line)
+                                        file_path = file_match.group(1) if file_match else "unknown"
+                                        bundle_errors.append({"file": file_path, "error": line[:300]})
+                            if not bundle_errors:
+                                await blog.warn("No specific errors in process output — dumping last 10 log lines")
+                                if managed_app and managed_app.log_buffer:
+                                    for line in list(managed_app.log_buffer)[-10:]:
+                                        await blog.info(f"  {line}")
+
                         if bundle_ok:
                             await blog.success("Bundle compiles cleanly" if repair_round == 0 else "Bundle repaired and compiles cleanly")
                             break
                         if not bundle_errors:
                             await blog.warn("Bundle validation failed but no specific errors found")
                             break
-                        await blog.warn(f"Bundle has errors — auto-repair attempt {repair_round + 1}/2...")
+                        await blog.warn(f"Bundle has errors — auto-repair attempt {repair_round + 1}/3...")
                         repaired = await self._repair_bundle_errors(
                             app_id, app_dir, bundle_errors, generated_files,
                             description, name, deps, db_type, blog
@@ -1112,7 +1136,16 @@ class AppBuilderSkill(Skill):
                         if not repaired:
                             await blog.warn("Could not repair bundle errors")
                             break
-                        await asyncio.sleep(3)  # wait for Metro to pick up fixed files
+                        # If server crashed, restart it after repair
+                        if not web_alive:
+                            await blog.info("Restarting web server after repair...")
+                            try:
+                                web_port = await self._app_manager.start_web(app_id)
+                                await blog.info(f"Web server restarted on port {web_port}")
+                            except Exception as restart_err:
+                                await blog.warn(f"Web server restart failed: {restart_err}")
+                        else:
+                            await asyncio.sleep(3)  # wait for Metro to pick up fixed files
                     if not bundle_ok:
                         await blog.error("Bundle has compilation errors after repair attempts — app will show white screen")
                 except Exception as e:
@@ -1347,29 +1380,50 @@ class AppBuilderSkill(Skill):
                 await self._update_step(job_id, user_id, "starting", "done",
                                         detail=f"Restart skipped: {e}")
 
-            # ── Step 4b: Validate bundle after modification (up to 2 rounds) ──
+            # ── Step 4b: Validate bundle after modification (up to 3 rounds) ──
             if web_port:
                 blog.set_step("validating")
                 await blog.info("Validating modified bundle...")
                 bundle_ok = False
                 try:
-                    await self._wait_for_server(web_port, timeout=15)
-                    for repair_round in range(2):
-                        bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                    for repair_round in range(3):
+                        managed_app = self._app_manager._running.get(app_id)
+                        web_alive = (managed_app and managed_app.web_process
+                                     and managed_app.web_process.returncode is None)
+                        if web_alive:
+                            await self._wait_for_server(web_port, timeout=15)
+                            bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                        else:
+                            bundle_ok, bundle_errors = False, []
+                            await blog.warn("Web server crashed — extracting errors from process output...")
+                            if managed_app and managed_app.log_buffer:
+                                import re as _re
+                                for line in list(managed_app.log_buffer)[-50:]:
+                                    if any(kw in line for kw in ('SyntaxError', 'TransformError', 'Error:', 'error:', 'Cannot find module', 'Unexpected token')):
+                                        file_match = _re.search(r'(/[^\s:]+\.tsx?)', line)
+                                        file_path = file_match.group(1) if file_match else "unknown"
+                                        bundle_errors.append({"file": file_path, "error": line[:300]})
                         if bundle_ok:
                             await blog.success("Modified bundle compiles cleanly" if repair_round == 0 else "Bundle repaired and compiles cleanly")
                             break
                         if not bundle_errors:
                             await blog.warn("Bundle validation failed but no specific errors found")
                             break
-                        await blog.warn(f"Bundle has errors — auto-repair attempt {repair_round + 1}/2...")
+                        await blog.warn(f"Bundle has errors — auto-repair attempt {repair_round + 1}/3...")
                         repaired = await self._repair_bundle_errors(
                             app_id, app_dir, bundle_errors, generated,
                             changes, app_name, [], "none", blog
                         )
                         if not repaired:
                             break
-                        await asyncio.sleep(3)
+                        if not web_alive:
+                            await blog.info("Restarting web server after repair...")
+                            try:
+                                web_port = await self._app_manager.start_web(app_id)
+                            except Exception:
+                                pass
+                        else:
+                            await asyncio.sleep(3)
                     if not bundle_ok:
                         await blog.error("Bundle has compilation errors after modification")
                         # Update status to error
