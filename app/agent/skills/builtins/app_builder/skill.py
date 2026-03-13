@@ -56,11 +56,13 @@ Rules:
 - For data persistence, use expo-sqlite (works offline on all platforms)
 - Include @react-navigation/native + @react-navigation/native-stack for navigation
 - Include react-native-safe-area-context and react-native-screens
-- For responsive layout, plan to use useWindowDimensions
+- For responsive layout, use useWindowDimensions + isDesktop check (width > 768)
+- On desktop: maxWidth 800px centered, 2-3 column grids. On mobile: single column full width.
 - If the app needs charts, use react-native-chart-kit (NOT recharts — that's web-only)
 - Keep the file list focused — don't over-engineer
-- NEVER use emoji characters anywhere — they render as "?" in WebView. Use unicode symbols instead.
-- Tab bar icons MUST be visible — use <Text> with unicode symbols or @expo/vector-icons, NEVER empty <View> elements
+- Use EMOJI characters for ALL icons (🏠📊⚙️ etc.) — works on all platforms with zero imports.
+  NEVER use @expo/vector-icons (breaks on Expo Web). NEVER use raw unicode symbols (▲☐⌂).
+- Tab bar icons MUST use emoji in <Text> components
 - Progress components should use 0-1 scale, not 0-100
 - ALWAYS include /lib/agentSkill.json — domain-specific agent skill manifest (see below)
 
@@ -113,7 +115,20 @@ Rules:
 - Use React Native components (View, Text, ScrollView, Pressable, TextInput, FlatList, etc.)
 - Use StyleSheet.create() for styles — dark theme (background: #161B22, text: #F0F2F5)
 - Accent color: #58A6FF (blue)
-- For responsive design, use useWindowDimensions() and Platform.select()
+- RESPONSIVE LAYOUT — these apps run on mobile (375px) AND desktop web (1200px+):
+  - Use useWindowDimensions() at the top of every screen
+  - Define: const isDesktop = width > 768;
+  - On DESKTOP (width > 768): constrain main content to maxWidth: 800, alignSelf: 'center'.
+    Use 2-3 column grid layouts for cards/lists (flexDirection: 'row', flexWrap: 'wrap').
+    Add more generous padding (24-32px).
+  - On MOBILE (width <= 768): single column, full width, standard mobile padding (16px).
+  - For tab navigation: use bottom tabs on both (React Navigation handles this well).
+  - Example responsive pattern:
+    const {{ width }} = useWindowDimensions();
+    const isDesktop = width > 768;
+    <View style={{{{ maxWidth: isDesktop ? 800 : undefined, alignSelf: 'center', width: '100%', padding: isDesktop ? 32 : 16 }}}}>
+  - Cards and grid items: use percentage widths on desktop (width: isDesktop ? '48%' : '100%')
+  - This is CRITICAL — the app preview on toup.ai is full-width desktop, not a phone frame
 - If this file uses database, import from '../lib/db' (expo-sqlite helper)
 - For navigation, use @react-navigation/native-stack
 - React Navigation v7 REQUIRES a `theme` prop with `fonts` on NavigationContainer. Without it, the app
@@ -1451,6 +1466,39 @@ config.resolver.resolveRequest = (context, moduleName, platform) => {
 
 module.exports = config;
 """
+
+        # Inject emoji font CSS — iOS WKWebView doesn't auto-fallback to emoji fonts.
+        # react-native-web sets font-family to "-apple-system,...,sans-serif" which lacks emoji.
+        # We inject a global <style> into index.html (or the Expo web template) to fix this.
+        index_html = os.path.join(
+            self._app_manager.APPS_DIR if hasattr(self._app_manager, 'APPS_DIR') else "/opt/toup-agent/apps",
+            app_id, "web", "index.html"
+        )
+        # Also try the root index.html (Expo web template)
+        root_index = os.path.join(
+            self._app_manager.APPS_DIR if hasattr(self._app_manager, 'APPS_DIR') else "/opt/toup-agent/apps",
+            app_id, "index.html"
+        )
+        emoji_css = (
+            '<style id="emoji-fix">'
+            '* { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, '
+            'Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", '
+            '"Noto Color Emoji" !important; }'
+            '</style>'
+        )
+        for html_path in (index_html, root_index):
+            if os.path.exists(html_path):
+                try:
+                    with open(html_path, 'r', encoding='utf-8') as f:
+                        html = f.read()
+                    if 'emoji-fix' not in html:
+                        html = html.replace('</head>', f'{emoji_css}\n</head>', 1)
+                        with open(html_path, 'w', encoding='utf-8') as f:
+                            f.write(html)
+                        if blog:
+                            await blog.info("Injected emoji font CSS for iOS WebView compatibility")
+                except Exception as e:
+                    logger.debug(f"[BUILD] Failed to inject emoji CSS: {e}")
 
         # Patch any database file that directly imports expo-sqlite
         for fp, code in generated_files.items():

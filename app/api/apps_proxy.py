@@ -261,8 +261,18 @@ async def preview_proxy(
                     f'window.__TOUP_WS_URL="wss://toup.ai/api/ws/chat";'
                     f'</script>'
                 )
+                # Emoji font CSS — iOS WKWebView doesn't auto-fallback to emoji fonts.
+                # react-native-web sets font-family to "-apple-system,...,sans-serif"
+                # which lacks emoji fallback, causing ? boxes on mobile.
+                emoji_css = (
+                    '<style id="emoji-fix">'
+                    '* { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, '
+                    'Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", '
+                    '"Noto Color Emoji" !important; }'
+                    '</style>'
+                )
                 html = body.decode("utf-8", errors="replace")
-                html = html.replace("<head>", f"<head>\n{base_tag}\n{agent_globals}", 1)
+                html = html.replace("<head>", f"<head>\n{base_tag}\n{agent_globals}\n{emoji_css}", 1)
                 # Rewrite absolute src="/..." to relative so <base href>
                 # routes them through the preview proxy path.
                 # Also inject ?token= so bundle requests are authenticated
