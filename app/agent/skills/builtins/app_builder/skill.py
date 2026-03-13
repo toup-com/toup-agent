@@ -166,6 +166,9 @@ Rules:
 - CRITICAL: The file MUST be syntactically complete — all brackets closed, all StyleSheet styles finished,
   all exports present. If the file would be too long, SIMPLIFY the implementation instead of truncating.
   A simpler complete file is far better than a complex truncated one.
+- CRITICAL: Keep data/seed files COMPACT. Maximum 50 items in any array (e.g. vocabulary lists, quiz banks,
+  sample data). If the app needs more data, generate 30-50 representative examples — not 100+.
+  Large data files get truncated by the token limit and break the app. Quality over quantity.
 
 CRITICAL — Cross-Platform Rendering Rules:
 These apps run as Expo Web inside a WebView on mobile AND as web apps in browsers.
@@ -1152,6 +1155,17 @@ class AppBuilderSkill(Skill):
                             await blog.success("Bundle compiles cleanly" if repair_round == 0 else "Bundle repaired and compiles cleanly")
                             break
                         if not bundle_errors:
+                            # No specific errors — might be a port conflict or transient crash
+                            # Try restarting the web server before giving up
+                            if repair_round < 2 and not web_alive:
+                                await blog.info("No code errors found — restarting web server...")
+                                try:
+                                    web_port = await self._app_manager.start_web(app_id)
+                                    await blog.info(f"Web server restarted on port {web_port}")
+                                    await asyncio.sleep(5)
+                                    continue  # Re-check on next round
+                                except Exception as restart_err:
+                                    await blog.warn(f"Web server restart failed: {restart_err}")
                             await blog.warn("Bundle validation failed but no specific errors found")
                             break
                         await blog.warn(f"Bundle has errors — auto-repair attempt {repair_round + 1}/3...")
@@ -1432,6 +1446,14 @@ class AppBuilderSkill(Skill):
                             await blog.success("Modified bundle compiles cleanly" if repair_round == 0 else "Bundle repaired and compiles cleanly")
                             break
                         if not bundle_errors:
+                            if repair_round < 2 and not web_alive:
+                                await blog.info("No code errors found — restarting web server...")
+                                try:
+                                    web_port = await self._app_manager.start_web(app_id)
+                                    await asyncio.sleep(5)
+                                    continue
+                                except Exception:
+                                    pass
                             await blog.warn("Bundle validation failed but no specific errors found")
                             break
                         await blog.warn(f"Bundle has errors — auto-repair attempt {repair_round + 1}/3...")
@@ -2556,9 +2578,13 @@ const _webDb = {
         last_line = stripped.split('\n')[-1].strip() if stripped else ""
         truncation_indicators = [
             # Line ends with an identifier (no punctuation) — mid-token truncation
-            last_line and last_line[-1].isalpha() and not last_line.endswith(('return', 'true', 'false', 'null', 'undefined', 'break', 'continue')),
-            # Unclosed StyleSheet.create
-            'StyleSheet.create' in code and not code.rstrip().endswith('});') and code.count('StyleSheet.create') > 0,
+            # But allow common valid endings like export statements
+            last_line and last_line[-1].isalpha() and not last_line.endswith((
+                'return', 'true', 'false', 'null', 'undefined', 'break', 'continue',
+            )) and not any(last_line.startswith(kw) for kw in ('export ', 'module.')),
+            # NOTE: StyleSheet.create check removed — bracket balance above catches
+            # genuinely unclosed StyleSheets. The old check flagged files ending
+            # with `export { X };` after the StyleSheet as truncated (false positive).
         ]
 
         if any(truncation_indicators):
