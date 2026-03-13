@@ -1648,22 +1648,43 @@ module.exports = config;
                     i = 0
                     while i < len(lines):
                         line = lines[i]
-                        # Match `export function X(` that is NOT already async
-                        if (_re.match(r'\s*export\s+function\s+\w+', line)
+                        # Match `export function X(` or `function X(` that is NOT already async
+                        if (_re.match(r'\s*(?:export\s+)?function\s+\w+', line)
                                 and 'async' not in line):
-                            # Scan ahead to find the function body and check for await
-                            # Collect lines until we find the closing brace at the same indent
+                            # Scan ahead to find the function body and check for await.
+                            # The function signature may span multiple lines with TS types
+                            # that contain { } (e.g. Promise<Array<{ key: string }>>).
+                            # Only start counting braces AFTER we've seen the first { that
+                            # follows a ) or > (the actual function body opening brace).
                             fn_start = i
+                            body_started = False
                             brace_count = 0
                             has_await = False
-                            for j in range(i, min(i + 100, len(lines))):
-                                brace_count += lines[j].count('{') - lines[j].count('}')
-                                if 'await ' in lines[j]:
+                            for j in range(i, min(i + 200, len(lines))):
+                                ln = lines[j]
+                                if not body_started:
+                                    # Look for the opening brace of the function body.
+                                    # It's the first { that appears after ) or > at line-end
+                                    # (not inside a type annotation like { key: string }).
+                                    stripped = ln.rstrip()
+                                    if stripped.endswith('{'):
+                                        body_started = True
+                                        brace_count = 1
+                                        # Check this line for await too
+                                        if 'await ' in ln:
+                                            has_await = True
+                                    continue
+                                # Inside function body — count braces
+                                brace_count += ln.count('{') - ln.count('}')
+                                if 'await ' in ln:
                                     has_await = True
-                                if brace_count <= 0 and j > fn_start:
+                                if brace_count <= 0:
                                     break
                             if has_await:
-                                lines[i] = line.replace('export function ', 'export async function ', 1)
+                                if 'export function ' in line:
+                                    lines[i] = line.replace('export function ', 'export async function ', 1)
+                                else:
+                                    lines[i] = _re.sub(r'(\s*)function\s+', r'\1async function ', line, count=1)
                         result.append(lines[i])
                         i += 1
                     return '\n'.join(result)
