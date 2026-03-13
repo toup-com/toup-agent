@@ -58,6 +58,9 @@ Rules:
 - Include react-native-safe-area-context and react-native-screens
 - For responsive layout, use useWindowDimensions + isDesktop check (width > 768)
 - On desktop: maxWidth 800px centered, 2-3 column grids. On mobile: single column full width.
+- RESPONSIVE NAVIGATION: On mobile show bottom tab bar. On desktop show a left sidebar instead.
+  Use createBottomTabNavigator with a custom tabBar prop that renders AdaptiveTabBar.
+  Include /components/AdaptiveTabBar.tsx in the file list.
 - If the app needs charts, use react-native-chart-kit (NOT recharts — that's web-only)
 - Keep the file list focused — don't over-engineer
 - Use EMOJI characters for ALL icons (🏠📊⚙️ etc.) — works on all platforms with zero imports.
@@ -122,13 +125,18 @@ Rules:
     Use 2-3 column grid layouts for cards/lists (flexDirection: 'row', flexWrap: 'wrap').
     Add more generous padding (24-32px).
   - On MOBILE (width <= 768): single column, full width, standard mobile padding (16px).
-  - For tab navigation: use bottom tabs on both (React Navigation handles this well).
-  - Example responsive pattern:
+  - Example responsive pattern for EVERY screen's root container:
     const {{ width }} = useWindowDimensions();
     const isDesktop = width > 768;
-    <View style={{{{ maxWidth: isDesktop ? 800 : undefined, alignSelf: 'center', width: '100%', padding: isDesktop ? 32 : 16 }}}}>
+    <ScrollView style={{{{ flex: 1, paddingLeft: isDesktop ? 220 : 0 }}}}>
+      <View style={{{{ maxWidth: isDesktop ? 800 : undefined, alignSelf: 'center', width: '100%', padding: isDesktop ? 32 : 16 }}}}>
+    The paddingLeft: 220 on desktop accounts for the sidebar navigation width.
   - Cards and grid items: use percentage widths on desktop (width: isDesktop ? '48%' : '100%')
   - This is CRITICAL — the app preview on toup.ai is full-width desktop, not a phone frame
+- RESPONSIVE NAVIGATION — bottom tabs on mobile, left sidebar on desktop:
+  - Use createBottomTabNavigator with `tabBar={{(props) => <AdaptiveTabBar {{...props}} appName={{"{app_name}"}} />}}`
+  - The AdaptiveTabBar component handles BOTH layouts (see below for /components/AdaptiveTabBar.tsx)
+  - NEVER hardcode bottom tabs without AdaptiveTabBar — it WILL look broken on desktop
 - If this file uses database, import from '../lib/db' (expo-sqlite helper)
 - For navigation, use @react-navigation/native-stack
 - React Navigation v7 REQUIRES a `theme` prop with `fonts` on NavigationContainer. Without it, the app
@@ -214,6 +222,65 @@ Rendering differences WILL cause visual bugs if you ignore these rules:
     is a SyntaxError — it MUST be `export async function getX(): Promise<T> {{ await ... }}`.
     This is the #1 cause of build failures in database utility files.
 
+Responsive Navigation (CRITICAL — every app MUST include this):
+- If this is /components/AdaptiveTabBar.tsx:
+  Build a responsive tab bar that renders as bottom tabs on mobile and a left sidebar on desktop.
+  It receives the standard React Navigation tabBar props: {{ state, descriptors, navigation, insets }}.
+  Plus an `appName` string prop.
+
+  Implementation:
+  - Call useWindowDimensions() to get width. const isDesktop = width > 768;
+  - Extract tabs from state.routes + descriptors (label, emoji icon, isFocused).
+  - On MOBILE (isDesktop === false): render a horizontal bottom tab bar:
+    - View with flexDirection: 'row', backgroundColor: '#1C2128', borderTopWidth: 1, borderTopColor: '#30363D'
+    - paddingBottom: insets.bottom (safe area), height: 60 + insets.bottom
+    - Each tab: Pressable with emoji icon + label, highlighted color when focused (#58A6FF vs #8B949E)
+  - On DESKTOP (isDesktop === true): render a vertical left sidebar:
+    - View with width: 220, backgroundColor: '#1C2128', borderRightWidth: 1, borderRightColor: '#30363D'
+    - App name as header: Text with fontSize 16, fontWeight '700', color '#F0F2F5', padding 20
+    - Each tab: Pressable row with emoji (fontSize 18) + label (fontSize 14), padding 14 16,
+      active tab has backgroundColor '#21262D' + borderRadius 8 + color '#58A6FF'
+    - marginTop: 8 between header and nav items
+  - On press: call navigation.navigate(route.name)
+
+  IMPORTANT: The App.tsx must wrap the Tab.Navigator inside a View with flexDirection: 'row' on desktop
+  so the sidebar sits left of the content. Pattern in App.tsx:
+
+  function AppLayout() {{
+    const {{ width }} = useWindowDimensions();
+    const isDesktop = width > 768;
+    return (
+      <View style={{{{ flex: 1, flexDirection: isDesktop ? 'row' : 'column' }}}}>
+        <Tab.Navigator
+          tabBar={{(props) => <AdaptiveTabBar {{...props}} appName="{app_name}" />}}
+          screenOptions={{{{
+            headerStyle: {{ backgroundColor: '#1C2128' }},
+            headerTintColor: '#F0F2F5',
+            tabBarStyle: {{ display: 'none' }},  // AdaptiveTabBar handles rendering
+          }}}}
+        >
+          {{/* Tab.Screen entries */}}
+        </Tab.Navigator>
+      </View>
+    );
+  }}
+
+  The AdaptiveTabBar itself handles the layout positioning:
+  - On mobile: it renders AFTER/BELOW the screen content (bottom of screen)
+  - On desktop: it renders BEFORE/LEFT of the screen content using position absolute or
+    by the parent flexDirection: 'row' layout
+
+  Actually simpler approach — the AdaptiveTabBar on desktop should use position: 'absolute', left: 0,
+  top: 0, bottom: 0, width: 220, and the Tab.Navigator screens should have paddingLeft: 220 on desktop.
+  On mobile, the tab bar is at the bottom (position: 'absolute', bottom: 0, left: 0, right: 0).
+
+  This avoids needing to restructure the parent layout. The Tab.Navigator renders normally,
+  and AdaptiveTabBar positions itself using absolute positioning.
+
+  In each Tab.Screen, the screen component should add paddingLeft: isDesktop ? 220 : 0 to its
+  outermost ScrollView/View to account for the sidebar width. Since every screen already uses
+  useWindowDimensions() for responsive layout, just add this padding.
+
 Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /components/AgentPlaceholder.tsx:
   Build a floating agent widget component. It renders a small circular avatar (40x40, position: absolute,
@@ -269,6 +336,8 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
   Export registerAction(screen, action) and getActions(screen) functions.
 
 - If this is /App.tsx:
+  Import AdaptiveTabBar from './components/AdaptiveTabBar' and use it as the tabBar prop:
+  `tabBar={{(props) => <AdaptiveTabBar {{...props}} appName="AppName" />}}`
   Import AgentPlaceholder and render it as the LAST child inside NavigationContainer,
   positioned absolutely so it overlays all screens.
   Import {{ AgentBridge }} from './lib/agentBridge' and use it directly (NOT .getInstance()).
@@ -276,7 +345,8 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
   IMPORTANT: Only show AgentPlaceholder when NOT loaded through the platform (the platform shows
   the user's real agent). Wrap it in a condition:
   {{typeof window !== "undefined" && !(window as any).__TOUP_AUTH_TOKEN && <AgentPlaceholder />}}
-  Example: after <Stack.Navigator>...</Stack.Navigator>, add the conditional AgentPlaceholder.
+  Example: after <Tab.Navigator>...</Tab.Navigator>, add the conditional AgentPlaceholder.
+  CRITICAL: Use createBottomTabNavigator with AdaptiveTabBar — NEVER render bottom tabs without it.
 
 - For ANY screen file:
   Register that screen's agent actions in a useEffect via agentActions.registerAction().
