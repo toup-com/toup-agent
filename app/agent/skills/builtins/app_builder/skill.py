@@ -1199,7 +1199,7 @@ class AppBuilderSkill(Skill):
                 if job:
                     job.status = "completed"
                     job.completed_at = datetime.utcnow()
-                    job.model = "claude-sonnet-4-6"
+                    job.model = "claude-opus-4-6"
                     await db.commit()
 
             # Register app into the gateway (single skill, not per-app tools)
@@ -1278,7 +1278,6 @@ class AppBuilderSkill(Skill):
                     changes=changes,
                 ),
                 "Analyze which files need modification.",
-                model="claude-opus-4-6",
                 blog=blog,
                 purpose="Modification analysis",
             )
@@ -1445,7 +1444,7 @@ class AppBuilderSkill(Skill):
                 if job:
                     job.status = "completed"
                     job.completed_at = datetime.utcnow()
-                    job.model = "claude-sonnet-4-6"
+                    job.model = "claude-opus-4-6"
                     await db.commit()
 
             if self._ws_broadcast:
@@ -1484,7 +1483,6 @@ class AppBuilderSkill(Skill):
             llm_response = await self._call_llm(
                 PLANNING_PROMPT.format(description=description, extra_context=extra_context),
                 "Plan this app and output JSON.",
-                model="claude-opus-4-6",
                 blog=blog,
                 purpose="App architecture planning",
             )
@@ -2168,10 +2166,10 @@ const _webDb = {
         return code
 
     async def _call_llm(
-        self, system_prompt: str, user_message: str, model: str = "claude-sonnet-4-6",
+        self, system_prompt: str, user_message: str, model: str = "claude-opus-4-6",
         blog=None, purpose: str = "", max_tokens: int = 8192,
     ) -> str:
-        """Call the LLM (Anthropic or OpenAI). Default: Sonnet for speed, Opus for planning."""
+        """Call the LLM (Anthropic). Using Opus 4.6 for all phases."""
         import time as _time
         from app.config import settings
 
