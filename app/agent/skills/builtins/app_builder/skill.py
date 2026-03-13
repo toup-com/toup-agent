@@ -1943,12 +1943,51 @@ const styles = StyleSheet.create({
                 )
 
             # Alert.alert() — crashes on web, wrap in Platform check
+            # Use balanced-paren matching (regex [^)]+ fails on nested parens / template literals)
             if 'Alert.alert(' in patched and "Platform.OS === 'web'" not in patched:
-                patched = _re.sub(
-                    r'Alert\.alert\(([^)]+)\)',
-                    r"(Platform.OS === 'web' ? window.alert(String(\1).split(',')[0]) : Alert.alert(\1))",
-                    patched,
-                )
+                result_parts = []
+                search_from = 0
+                while True:
+                    idx = patched.find('Alert.alert(', search_from)
+                    if idx == -1:
+                        result_parts.append(patched[search_from:])
+                        break
+                    result_parts.append(patched[search_from:idx])
+                    # Find balanced closing paren
+                    paren_start = idx + len('Alert.alert(') - 1  # index of '('
+                    depth = 0
+                    end = paren_start
+                    for ci in range(paren_start, len(patched)):
+                        if patched[ci] == '(':
+                            depth += 1
+                        elif patched[ci] == ')':
+                            depth -= 1
+                            if depth == 0:
+                                end = ci
+                                break
+                    if depth != 0:
+                        # Unbalanced — skip this occurrence
+                        result_parts.append(patched[idx:idx + len('Alert.alert(')])
+                        search_from = idx + len('Alert.alert(')
+                        continue
+                    full_call = patched[idx:end + 1]  # "Alert.alert(...)"
+                    args_inner = patched[paren_start + 1:end]  # everything inside parens
+                    # Extract first arg (title) for window.alert fallback — take up to first comma at depth 0
+                    first_arg_parts = []
+                    d = 0
+                    for ch in args_inner:
+                        if ch in ('(', '[', '{'):
+                            d += 1
+                        elif ch in (')', ']', '}'):
+                            d -= 1
+                        elif ch == ',' and d == 0:
+                            break
+                        first_arg_parts.append(ch)
+                    first_arg = ''.join(first_arg_parts).strip()
+                    replacement = f"(Platform.OS === 'web' ? window.alert({first_arg}) : {full_call})"
+                    result_parts.append(replacement)
+                    search_from = end + 1
+                patched = ''.join(result_parts)
                 # Ensure Platform is imported — safely add to existing react-native import
                 rn_imports = _re.findall(r'import\s*\{([^}]+)\}\s*from\s*[\'"]react-native[\'"]', patched)
                 already_has_platform = any('Platform' in imp for imp in rn_imports)
