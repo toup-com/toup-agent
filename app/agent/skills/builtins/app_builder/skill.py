@@ -87,11 +87,13 @@ operations it can perform within the app. The agent uses these to help users via
 CRITICAL — Agent Placeholder System:
 Every app is an "agentic app" — the user's AI agent must be able to work inside it.
 You MUST include these files in EVERY plan:
-  - /components/AgentPlaceholder.tsx — Floating agent widget (bottom-right corner) that:
-    - Shows the agent avatar as a small circle (idle state)
+  - /components/AgentPlaceholder.tsx — Floating agent widget that:
+    - Shows the agent avatar as a small circle (docked/idle state)
     - Expands into an inline chat interface when tapped (active state)
     - Is overlaid on EVERY screen via absolute positioning
-    - Can be docked (minimized) or expanded (full chat panel)
+    - RESPONSIVE POSITIONING: on mobile bottom: 80 (above tab bar), on desktop bottom: 24
+    - Must NEVER overlap the bottom tab bar or sidebar navigation
+    - The bottom tab bar must have paddingRight: 56 to avoid the agent button overlapping the last tab
   - /lib/agentBridge.ts — Bridge module that:
     - Exposes the current screen/route name to the agent
     - Provides a navigate(screenName, params?) function for agent-driven navigation
@@ -101,7 +103,7 @@ You MUST include these files in EVERY plan:
   - /lib/agentActions.ts — Screen-specific action registry:
     - Maps each screen to actions the agent can perform on it
     - E.g. HomeScreen → [addItem, searchItems, filterBy], SettingsScreen → [toggleTheme, exportData]
-The AgentPlaceholder MUST be rendered in EVERY screen's root layout (in App.tsx navigator).
+The AgentPlaceholder MUST be rendered in App.tsx (ALWAYS visible, never conditionally hidden).
 """
 
 CODE_GEN_PROMPT = """Generate the complete TypeScript code for {file_path} in a React Native/Expo app.
@@ -129,8 +131,9 @@ Rules:
     const {{ width }} = useWindowDimensions();
     const isDesktop = width > 768;
     <ScrollView style={{{{ flex: 1, paddingLeft: isDesktop ? 220 : 0 }}}}>
-      <View style={{{{ maxWidth: isDesktop ? 800 : undefined, alignSelf: 'center', width: '100%', padding: isDesktop ? 32 : 16 }}}}>
+      <View style={{{{ maxWidth: isDesktop ? 800 : undefined, alignSelf: 'center', width: '100%', padding: isDesktop ? 32 : 16, paddingBottom: isDesktop ? 32 : 100 }}}}>
     The paddingLeft: 220 on desktop accounts for the sidebar navigation width.
+    The paddingBottom: 100 on mobile accounts for the bottom tab bar (60px) + agent button above it.
   - Cards and grid items: use percentage widths on desktop (width: isDesktop ? '48%' : '100%')
   - This is CRITICAL — the app preview on toup.ai is full-width desktop, not a phone frame
 - RESPONSIVE NAVIGATION — bottom tabs on mobile, left sidebar on desktop:
@@ -234,6 +237,8 @@ Responsive Navigation (CRITICAL — every app MUST include this):
   - On MOBILE (isDesktop === false): render a horizontal bottom tab bar:
     - View with flexDirection: 'row', backgroundColor: '#1C2128', borderTopWidth: 1, borderTopColor: '#30363D'
     - paddingBottom: insets.bottom (safe area), height: 60 + insets.bottom
+    - paddingRight: 56 — reserve space on the right for the floating AgentPlaceholder button
+      so the last tab item is never hidden behind the agent button
     - Each tab: Pressable with emoji icon + label, highlighted color when focused (#58A6FF vs #8B949E)
   - On DESKTOP (isDesktop === true): render a vertical left sidebar:
     - View with width: 220, backgroundColor: '#1C2128', borderRightWidth: 1, borderRightColor: '#30363D'
@@ -283,17 +288,36 @@ Responsive Navigation (CRITICAL — every app MUST include this):
 
 Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /components/AgentPlaceholder.tsx:
-  Build a floating agent widget component. It renders a small circular avatar (40x40, position: absolute,
-  bottom: 24, right: 24, zIndex: 9999) with a pulsing border animation. When tapped, it expands into
-  an inline chat panel (width: 340, height: 480, borderRadius: 16, dark background #1C2128).
-  The chat panel has: a header with "Agent" title + minimize button + connection dot (green=connected, gray=disconnected),
-  a ScrollView for messages, and a TextInput + send button at the bottom.
-  Messages are sent/received via the agentBridge (sendMessage / onAgentMessage).
-  Show a typing indicator when agentBridge.onToolActivity fires (agent is using tools).
-  If agentBridge.isConnected is false, show "Connecting..." text in the header.
-  In minimized state, show just the circle with a subtle glow effect.
+  Build a floating agent widget component with TWO modes:
+
+  DOCKED MODE (default, minimized state):
+  - Small circular avatar button (44x44)
+  - Position: absolute, zIndex: 9999
+  - RESPONSIVE POSITIONING to avoid overlapping navigation:
+    - On MOBILE (width <= 768): bottom: 80 (ABOVE the 60px bottom tab bar + safe area), right: 16
+    - On DESKTOP (width > 768): bottom: 24, right: 24 (no bottom tab bar on desktop, sidebar is on left)
+  - Use useWindowDimensions() to determine isDesktop = width > 768
+  - Subtle pulsing border animation (2s loop, opacity 0.4 → 1.0)
+  - Background color: #58A6FF with slight glow/shadow
+  - Shows a small "chat" emoji (💬) or agent icon inside
+  - When agentBridge.isConnected: green dot indicator (8px, top-right corner of circle)
+
+  EXPANDED MODE (when tapped):
+  - Inline chat panel (width: 340, height: 480, borderRadius: 16, dark background #1C2128)
+  - On MOBILE: position absolute, bottom: 80, right: 8, left: 8, width: auto (full width minus margins)
+  - On DESKTOP: position absolute, bottom: 24, right: 24, fixed 340px width
+  - Header: "Agent" title + minimize button + connection dot (green=connected, gray=disconnected)
+  - ScrollView for messages
+  - TextInput + send button at the bottom
+  - Messages sent/received via agentBridge (sendMessage / onAgentMessage)
+  - Show typing indicator when agentBridge.onToolActivity fires
+  - If agentBridge.isConnected is false, show "Connecting..." text
+
   The component accepts: onMessage callback, agentColor prop (default #58A6FF).
   Use Animated API for smooth expand/collapse transitions.
+
+  CRITICAL: The docked button must NEVER overlap the bottom tab bar or sidebar navigation.
+  The bottom: 80 on mobile ensures it sits above the ~60px tab bar + safe area padding.
 
 - If this is /lib/agentBridge.ts:
   Create a singleton instance (NOT a class with getInstance()). Export the instance directly:
@@ -342,10 +366,11 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
   positioned absolutely so it overlays all screens.
   Import {{ AgentBridge }} from './lib/agentBridge' and use it directly (NOT .getInstance()).
   Example: AgentBridge.setNavigationRef(ref), AgentBridge.sendMessage(msg), AgentBridge.currentScreen = name.
-  IMPORTANT: Only show AgentPlaceholder when NOT loaded through the platform (the platform shows
-  the user's real agent). Wrap it in a condition:
-  {{typeof window !== "undefined" && !(window as any).__TOUP_AUTH_TOKEN && <AgentPlaceholder />}}
-  Example: after <Tab.Navigator>...</Tab.Navigator>, add the conditional AgentPlaceholder.
+  IMPORTANT: ALWAYS render AgentPlaceholder — it is a core part of every agentic app.
+  The AgentPlaceholder handles its own responsive positioning (above tab bar on mobile, bottom-right on desktop).
+  It connects to the user's real agent via the agentBridge WebSocket when available.
+  Example: after <Tab.Navigator>...</Tab.Navigator>, add <AgentPlaceholder />.
+  Do NOT conditionally hide it based on __TOUP_AUTH_TOKEN — it must ALWAYS be visible.
   CRITICAL: Use createBottomTabNavigator with AdaptiveTabBar — NEVER render bottom tabs without it.
 
 - For ANY screen file:
