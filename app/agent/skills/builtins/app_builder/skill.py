@@ -1577,21 +1577,18 @@ class AppBuilderSkill(Skill):
                     prompt += existing_hint
 
                 try:
-                    # First attempt with default token limit
-                    max_tok = 8192
                     code = await self._call_llm(
                         prompt, f"Generate code for {file_path}",
                         blog=blog, purpose=f"Generate {file_path}",
-                        max_tokens=max_tok,
+                        max_tokens=32000,
                     )
                     code = self._strip_fences(code)
 
-                    # Validate syntax — retry with higher token limit if truncated
+                    # Validate syntax — retry if truncated
                     is_valid, error_msg = self._validate_syntax(code, file_path)
                     if not is_valid:
                         if blog:
-                            await blog.warn(f"Validation failed for {file_path}: {error_msg} — retrying with 16K tokens")
-                        # Retry with double token limit + explicit instruction not to truncate
+                            await blog.warn(f"Validation failed for {file_path}: {error_msg} — retrying")
                         retry_prompt = prompt + (
                             "\n\nCRITICAL: The previous generation was truncated/incomplete. "
                             "You MUST output the COMPLETE file with ALL brackets closed, "
@@ -1601,7 +1598,7 @@ class AppBuilderSkill(Skill):
                         code = await self._call_llm(
                             retry_prompt, f"Generate code for {file_path} (retry — previous was truncated)",
                             blog=blog, purpose=f"Retry {file_path} (truncated)",
-                            max_tokens=16384,
+                            max_tokens=32000,
                         )
                         code = self._strip_fences(code)
 
@@ -2167,7 +2164,7 @@ const _webDb = {
 
     async def _call_llm(
         self, system_prompt: str, user_message: str, model: str = "claude-opus-4-6",
-        blog=None, purpose: str = "", max_tokens: int = 8192,
+        blog=None, purpose: str = "", max_tokens: int = 32000,
     ) -> str:
         """Call the LLM (Anthropic). Using Opus 4.6 for all phases."""
         import time as _time
@@ -2515,6 +2512,8 @@ const _webDb = {
                     stack.pop()
             prev_char = ch
 
+        if in_string:
+            return False, f"Unterminated string (started with {string_char!r}) — file is truncated"
         if len(stack) > 0:
             return False, f"Unbalanced brackets: {len(stack)} unclosed ({stack[-3:]})"
 
@@ -2612,18 +2611,24 @@ const _webDb = {
             # Convert absolute path to relative app path
             if app_dir and app_dir in fp:
                 fp = "/" + fp.replace(app_dir, "").lstrip("/")
-            elif fp.startswith("/"):
-                # Try to match to a generated file
-                for gf in generated_files:
-                    if fp.endswith(gf.lstrip("/")):
-                        fp = gf
-                        break
+            # Ensure leading slash for matching
+            if fp and not fp.startswith("/"):
+                fp = "/" + fp
+            # Direct match
             if fp and fp in generated_files:
                 files_to_repair.add(fp)
+                continue
+            # Fuzzy match: try matching by filename suffix
+            if fp:
+                fp_stripped = fp.lstrip("/")
+                for gf in generated_files:
+                    if gf.lstrip("/") == fp_stripped or gf.endswith("/" + fp_stripped.split("/")[-1]):
+                        files_to_repair.add(gf)
+                        break
 
         if not files_to_repair:
             if blog:
-                await blog.warn("Could not identify which files to repair from bundle errors")
+                await blog.warn(f"Could not identify which files to repair from bundle errors: {[e.get('file') for e in bundle_errors[:3]]}")
             return False
 
         if blog:
@@ -2723,14 +2728,31 @@ const _webDb = {
                     if resp.status != 200:
                         if blog:
                             await blog.warn(f"Bundle request returned HTTP {resp.status}")
-                        # Try to read error body
+                        # Try to read error body (Metro returns JSON with filename field)
                         try:
                             body = await resp.text()
                             errors = []
-                            # Extract file path and error from Metro error response
-                            file_match = _re.search(r'(/[^\s:]+\.tsx?)', body)
-                            if file_match:
-                                errors.append({"file": file_match.group(1), "error": body[:500]})
+                            # Try JSON parse first (Metro error format)
+                            try:
+                                import json as _json
+                                err_json = _json.loads(body)
+                                fname = err_json.get("filename", "")
+                                msg = err_json.get("message", body[:500])
+                                if fname:
+                                    # Normalize: ensure leading /
+                                    if not fname.startswith("/"):
+                                        fname = "/" + fname
+                                    errors.append({"file": fname, "error": msg[:500]})
+                                    if blog:
+                                        await blog.error(f"Bundle error in {fname}: {msg[:200]}")
+                            except (ValueError, TypeError):
+                                pass
+                            # Fallback: regex for absolute or relative paths
+                            if not errors:
+                                file_match = _re.search(r'["\s/]([a-zA-Z][^\s"]*\.tsx?)', body)
+                                if file_match:
+                                    fname = "/" + file_match.group(1).lstrip("/")
+                                    errors.append({"file": fname, "error": body[:500]})
                             return False, errors
                         except Exception:
                             return False, []
