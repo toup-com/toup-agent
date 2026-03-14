@@ -110,6 +110,10 @@ async def init_db():
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS build_logs_json TEXT DEFAULT '[]'",
         # Approved plan from conversational app builder
         "ALTER TABLE apps ADD COLUMN IF NOT EXISTS plan_json TEXT",
+        # Token limit pause/resume for build jobs
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS paused_at TIMESTAMP",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS resume_after TIMESTAMP",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS checkpoint_json TEXT",
     ]
     # Seed user-facing VPS plans — Hetzner Cloud CPX (AMD, Shared Regular Performance)
     # Location: ASH (Ashburn, Virginia, USA)

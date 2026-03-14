@@ -36,7 +36,7 @@ from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.workflow_crud import router as workflow_crud_router
 from app.api.dashboard import router as dashboard_router
-from app.api.apps import router as apps_router, set_app_manager, set_app_gateway
+from app.api.apps import router as apps_router, set_app_manager, set_app_gateway, set_app_builder_skill
 
 _app_start_time = None
 _skill_loader = None
@@ -307,6 +307,7 @@ async def lifespan(app: FastAPI):
                 ws_broadcast=broadcast_to_user,
             )
             await skill_loader.register_dynamic(builder_skill)
+            set_app_builder_skill(builder_skill)  # Wire for resume API endpoint
             print("🏗️ App Builder skill registered")
 
             # Register AppGatewaySkill (single skill, 12 tools for ALL apps)

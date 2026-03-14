@@ -35,6 +35,7 @@ router = APIRouter(prefix="/apps", tags=["Apps"])
 # ── Module-level refs (set from agent_main.py) ──────────────────────
 _app_manager = None
 _app_gateway = None
+_app_builder_skill = None
 
 
 def set_app_manager(app_manager):
@@ -47,6 +48,12 @@ def set_app_gateway(gateway):
     """Wire the AppGatewaySkill instance so delete can unregister apps."""
     global _app_gateway
     _app_gateway = gateway
+
+
+def set_app_builder_skill(skill):
+    """Wire the AppBuilderSkill instance for resume builds."""
+    global _app_builder_skill
+    _app_builder_skill = skill
 
 
 # ── Response schemas ────────────────────────────────────────────────
@@ -79,6 +86,8 @@ class JobResponse(BaseModel):
     model: str = ""
     total_tokens: int = 0
     error_message: Optional[str] = None
+    paused_at: Optional[str] = None
+    resume_after: Optional[str] = None
     created_at: str
     completed_at: Optional[str] = None
 
@@ -138,6 +147,8 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         model=job.model or "",
         total_tokens=job.total_tokens or 0,
         error_message=job.error_message,
+        paused_at=job.paused_at.isoformat() if getattr(job, 'paused_at', None) else None,
+        resume_after=job.resume_after.isoformat() if getattr(job, 'resume_after', None) else None,
         created_at=job.created_at.isoformat() if job.created_at else "",
         completed_at=job.completed_at.isoformat() if job.completed_at else None,
     )
@@ -197,6 +208,72 @@ async def get_job_logs(job_id: str) -> Dict[str, Any]:
             "total_tokens": job.total_tokens or 0,
             "logs": logs,
         }
+
+
+@router.post("/jobs/{job_id}/resume")
+async def resume_job(job_id: str) -> Dict[str, Any]:
+    """Resume a paused build job. Triggers background resume via app_builder skill."""
+    from datetime import datetime
+
+    async with async_session_maker() as db:
+        job = await db.get(BuildJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        if job.status != "paused":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job is not paused (status: {job.status}). Only paused jobs can be resumed."
+            )
+
+        # Check if enough time has passed
+        if job.resume_after and datetime.utcnow() < job.resume_after:
+            remaining = (job.resume_after - datetime.utcnow()).total_seconds()
+            return {
+                "ok": False,
+                "message": f"Token limit hasn't reset yet. Try again in {int(remaining)}s",
+                "resume_after": job.resume_after.isoformat(),
+                "retry_after_seconds": int(remaining),
+            }
+
+        # Load checkpoint
+        checkpoint = {}
+        try:
+            checkpoint = json.loads(job.checkpoint_json) if job.checkpoint_json else {}
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=500, detail="Could not load checkpoint data")
+
+        if not checkpoint:
+            raise HTTPException(status_code=500, detail="No checkpoint data found")
+
+        # Mark as running
+        job.status = "running"
+        job.paused_at = None
+        job.resume_after = None
+        await db.commit()
+
+        # Update app status
+        if job.app_id:
+            app = await db.get(App, job.app_id)
+            if app:
+                app.status = "building"
+                await db.commit()
+
+    # Trigger resume via the app_builder skill
+    import asyncio
+    if _app_builder_skill and hasattr(_app_builder_skill, '_resume_build_app'):
+        user_id = _get_user_id()
+        asyncio.create_task(
+            _app_builder_skill._resume_build_app(job_id, checkpoint, user_id)
+        )
+
+    return {
+        "ok": True,
+        "message": "Build resuming. Check the Jobs tab for progress.",
+        "job_id": job_id,
+        "checkpoint_step": checkpoint.get("current_step", "unknown"),
+        "completed_steps": checkpoint.get("completed_steps", []),
+    }
 
 
 @router.get("/{app_id}")

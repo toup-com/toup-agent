@@ -9,6 +9,7 @@ Tools:
   - app_builder__build_app    — Start build after plan approval
   - app_builder__get_status   — Check build progress
   - app_builder__modify_app   — Apply changes to an existing app
+  - app_builder__resume_build — Resume a paused build (after token limit)
 
 The conversational flow is driven by the system prompt section — no state machine.
 The agent asks questions, presents a plan, and only calls build_app after approval.
@@ -21,12 +22,21 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.skills.base import Skill, SkillContext, SkillMeta
 
 logger = logging.getLogger(__name__)
+
+
+class TokenLimitError(Exception):
+    """Raised when Claude API rate limit is hit during a build.
+    Carries retry-after info so the build can be paused and resumed."""
+    def __init__(self, retry_after_seconds: int = 300, message: str = ""):
+        self.retry_after_seconds = retry_after_seconds
+        self.message = message or f"Token limit reached. Resets in {retry_after_seconds}s"
+        super().__init__(self.message)
 
 
 # ── LLM prompts ─────────────────────────────────────────────────────
@@ -587,6 +597,23 @@ class AppBuilderSkill(Skill):
                     "required": ["app_id", "changes"],
                 },
             },
+            {
+                "name": "app_builder__resume_build",
+                "description": (
+                    "Resume a paused app build. Builds get paused when the token/rate limit is reached. "
+                    "This picks up exactly where the build left off — no re-doing completed steps."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "The paused build job ID to resume",
+                        },
+                    },
+                    "required": ["job_id"],
+                },
+            },
         ]
 
     # ── Tool Execution ─────────────────────────────────────────────
@@ -598,6 +625,7 @@ class AppBuilderSkill(Skill):
             "app_builder__build_app": self._exec_build_app,
             "app_builder__get_status": self._exec_get_status,
             "app_builder__modify_app": self._exec_modify_app,
+            "app_builder__resume_build": self._exec_resume_build,
         }
         handler = dispatch.get(tool_name)
         if not handler:
@@ -722,10 +750,88 @@ class AppBuilderSkill(Skill):
                     if app.github_url:
                         result += f"\nGitHub: {app.github_url}"
 
+            if job.status == "paused":
+                resume_after = job.resume_after
+                if resume_after:
+                    result += f"\nPaused at: {job.paused_at.isoformat() if job.paused_at else 'unknown'}"
+                    result += f"\nResumes after: {resume_after.isoformat()}"
+                    remaining = (resume_after - datetime.utcnow()).total_seconds()
+                    if remaining > 0:
+                        mins = int(remaining // 60)
+                        result += f"\nTime remaining: {mins}m {int(remaining % 60)}s"
+                    else:
+                        result += "\nReady to resume! Use `app_builder__resume_build`."
+
             if job.status == "failed":
                 result += f"\nError: {job.error_message or 'Unknown error'}"
 
             return result
+
+    async def _exec_resume_build(self, args: Dict[str, Any], ctx: SkillContext) -> str:
+        """Resume a paused build from checkpoint."""
+        from app.db.database import async_session_maker
+        from app.db.models import App, BuildJob
+
+        job_id = args.get("job_id", "")
+        if not job_id:
+            return "ERROR: job_id is required"
+
+        if not self._app_manager:
+            return "App builder is not available — app_manager not configured."
+
+        async with async_session_maker() as db:
+            job = await db.get(BuildJob, job_id)
+            if not job:
+                return f"Job '{job_id}' not found."
+
+            if job.status != "paused":
+                return f"Job is not paused (status: {job.status}). Only paused jobs can be resumed."
+
+            # Check if enough time has passed
+            if job.resume_after and datetime.utcnow() < job.resume_after:
+                remaining = (job.resume_after - datetime.utcnow()).total_seconds()
+                mins = int(remaining // 60)
+                return (
+                    f"Token limit hasn't reset yet. "
+                    f"Try again in {mins}m {int(remaining % 60)}s "
+                    f"(resets at {job.resume_after.strftime('%H:%M UTC')})"
+                )
+
+            checkpoint = {}
+            try:
+                checkpoint = json.loads(job.checkpoint_json) if job.checkpoint_json else {}
+            except (json.JSONDecodeError, TypeError):
+                return "ERROR: Could not load checkpoint data. The build state may be corrupted."
+
+            if not checkpoint:
+                return "ERROR: No checkpoint data found. Cannot resume this build."
+
+            # Mark job as running again
+            job.status = "running"
+            job.paused_at = None
+            job.resume_after = None
+            await db.commit()
+
+            app_id = checkpoint.get("app_id", job.app_id)
+            if app_id:
+                app = await db.get(App, app_id)
+                if app:
+                    app.status = "building"
+                    await db.commit()
+
+        user_id = ctx.user_id
+        completed_steps = checkpoint.get("completed_steps", [])
+
+        # Spawn background resume
+        asyncio.create_task(
+            self._resume_build_app(job_id, checkpoint, user_id)
+        )
+
+        return (
+            f"Resuming build! Skipping {len(completed_steps)} completed steps "
+            f"({', '.join(completed_steps)}). Continuing from '{checkpoint.get('current_step', 'unknown')}'.\n\n"
+            f"Use `app_builder__get_status` with job_id='{job_id}' to track progress."
+        )
 
     async def _exec_modify_app(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         """Modify an existing app based on user feedback."""
@@ -883,6 +989,8 @@ class AppBuilderSkill(Skill):
             "requirements and getting the user's approval on the plan.\n\n"
             "### Status Check\n"
             "Use `app_builder__get_status` with the job_id to check build progress.\n"
+            "If a build is **paused** due to token limits, tell the user their tokens need to reset.\n"
+            "Use `app_builder__resume_build` with the job_id to resume a paused build once tokens reset.\n"
             "After building, each app gets its own tools (file editing, DB queries, "
             "navigation, GitHub push, restart, etc.) under `app_{slug}__*`.\n\n"
             "### Agent Docking (after build)\n"
@@ -917,6 +1025,290 @@ class AppBuilderSkill(Skill):
             }
             for step_type, label in step_types
         ]
+
+    async def _resume_build_app(self, job_id: str, checkpoint: Dict, user_id: str):
+        """Resume a paused build from checkpoint — skips completed steps."""
+        from app.db.database import async_session_maker
+        from app.db.models import App, BuildJob
+        from .build_logger import BuildLogger
+
+        app_id = checkpoint.get("app_id", "")
+        name = checkpoint.get("name", "Unknown App")
+        description = checkpoint.get("description", "")
+        slug = checkpoint.get("slug", "")
+        app_dir = checkpoint.get("app_dir", "")
+        plan_context = checkpoint.get("plan_context")
+        design_notes = checkpoint.get("design_notes", "")
+        completed_steps = set(checkpoint.get("completed_steps", []))
+        current_step = checkpoint.get("current_step", "planning")
+
+        blog = BuildLogger(job_id, user_id, ws_broadcast=self._ws_broadcast)
+        blog.set_step("resume")
+        await blog.info(f"Resuming build for '{name}' from step: {current_step}")
+        await blog.info(f"Completed steps: {', '.join(completed_steps) if completed_steps else 'none'}")
+
+        try:
+            # ── Restore plan data from checkpoint ────────────────────
+            plan = checkpoint.get("plan")
+            if not plan and "planning" not in completed_steps:
+                # Need to redo planning
+                blog.set_step("planning")
+                await self._update_step(job_id, user_id, "planning", "running")
+                extra_context = checkpoint.get("extra_context", "")
+                plan = await self._step_plan(job_id, user_id, description, blog, extra_context)
+                if not plan:
+                    await blog.error("Planning failed on resume")
+                    await blog.persist()
+                    await self._fail_job(job_id, app_id, "Planning failed on resume")
+                    return
+                completed_steps.add("planning")
+
+            files_to_generate = checkpoint.get("files_to_generate", plan.get("files", ["/App.tsx"]) if plan else ["/App.tsx"])
+            deps = checkpoint.get("deps", plan.get("dependencies", []) if plan else [])
+            db_type = checkpoint.get("db_type", "none")
+            app_name = checkpoint.get("app_name", name)
+            needs_db = checkpoint.get("needs_db", False)
+
+            # ── Scaffolding (skip if done) ───────────────────────────
+            if "scaffolding" not in completed_steps:
+                blog.set_step("scaffolding")
+                await self._update_step(job_id, user_id, "scaffolding", "running")
+                await blog.info(f"Creating Expo project '{app_name}'...")
+                await self._app_manager.scaffold_app(app_id, app_name)
+                await blog.success("Expo project created")
+                await self._update_step(job_id, user_id, "scaffolding", "done")
+            else:
+                await blog.info("Scaffolding already done — skipping")
+
+            # ── Writing (resume partial if needed) ───────────────────
+            if "writing" not in completed_steps:
+                blog.set_step("writing")
+                existing_generated = checkpoint.get("generated_files", {})
+                pending_files = checkpoint.get("pending_files", files_to_generate)
+
+                # Filter out files already generated
+                if existing_generated:
+                    pending_files = [f for f in pending_files if f not in existing_generated]
+                    await blog.info(f"Resuming code gen: {len(existing_generated)} files done, {len(pending_files)} remaining")
+
+                if pending_files:
+                    await self._update_step(job_id, user_id, "writing", "running",
+                                            detail=f"Generating {len(pending_files)} remaining files...")
+                    new_files = await self._generate_code(
+                        description, app_name, pending_files, deps, db_type,
+                        job_id=job_id, user_id=user_id, blog=blog,
+                        design_notes=design_notes,
+                    )
+                    generated_files = {**existing_generated, **new_files}
+                else:
+                    generated_files = existing_generated
+
+                await self._app_manager.write_app_files(app_id, generated_files)
+                await self._write_infra_files(app_id, generated_files, blog)
+
+                async with async_session_maker() as db:
+                    app = await db.get(App, app_id)
+                    if app:
+                        app.files_json = json.dumps(generated_files)
+                        app.deps_json = json.dumps(deps)
+                        await db.commit()
+
+                await blog.success(f"Code generation complete: {len(generated_files)} files total")
+                await self._update_step(job_id, user_id, "writing", "done",
+                                        detail=f"Generated {len(generated_files)} files")
+            else:
+                generated_files = checkpoint.get("generated_files", {})
+                await blog.info("Code generation already done — skipping")
+
+            # ── Database (skip if done) ──────────────────────────────
+            if "database" not in completed_steps:
+                blog.set_step("database")
+                if needs_db and db_type != "none":
+                    await self._update_step(job_id, user_id, "database", "running")
+                    try:
+                        db_url = await self._app_manager.setup_database(app_id, db_type)
+                        storage_dir = await self._app_manager.setup_storage(app_id)
+                        async with async_session_maker() as db:
+                            app = await db.get(App, app_id)
+                            if app:
+                                app.db_type = db_type
+                                app.db_url = db_url
+                                app.storage_dir = storage_dir
+                                await db.commit()
+                        await blog.success(f"Database ready: {db_type}")
+                        await self._update_step(job_id, user_id, "database", "done")
+                    except Exception as e:
+                        await blog.warn(f"Database setup failed (non-fatal): {e}")
+                        await self._update_step(job_id, user_id, "database", "done", detail=f"Skipped: {e}")
+                else:
+                    await self._update_step(job_id, user_id, "database", "done", detail="Not needed")
+            else:
+                await blog.info("Database setup already done — skipping")
+
+            # ── Install deps (skip if done) ──────────────────────────
+            if "installing" not in completed_steps:
+                blog.set_step("installing")
+                await self._update_step(job_id, user_id, "installing", "running")
+                web_deps = ["react-dom", "react-native-web"]
+                all_deps = list(set((deps or []) + web_deps))
+                await blog.info(f"Installing {len(all_deps)} packages...")
+                await self._app_manager.install_deps(app_id, all_deps)
+                await blog.success("Dependencies installed")
+                await self._update_step(job_id, user_id, "installing", "done")
+            else:
+                await blog.info("Dependencies already installed — skipping")
+
+            # ── GitHub (skip if done) ────────────────────────────────
+            if "github" not in completed_steps:
+                blog.set_step("github")
+                await self._update_step(job_id, user_id, "github", "running")
+                try:
+                    repo_info = await self._app_manager.create_github_repo(app_id, app_name)
+                    github_url = repo_info.get("repo_url", "")
+                    async with async_session_maker() as db:
+                        app = await db.get(App, app_id)
+                        if app:
+                            app.github_url = github_url
+                            app.github_repo = repo_info.get("repo_name", "")
+                            await db.commit()
+                    await blog.success(f"GitHub repo created", github_url)
+                    await self._update_step(job_id, user_id, "github", "done",
+                                            detail=github_url or "Skipped")
+                except Exception as e:
+                    await blog.warn(f"GitHub failed (non-fatal): {e}")
+                    await self._update_step(job_id, user_id, "github", "done", detail=f"Skipped: {e}")
+            else:
+                await blog.info("GitHub already done — skipping")
+
+            # ── Start servers (always redo — they don't survive pause) ─
+            blog.set_step("starting")
+            await self._update_step(job_id, user_id, "starting", "running")
+
+            # Pre-flight dep check
+            await self._verify_deps_installed(app_dir, generated_files, deps, blog)
+
+            # Start servers
+            metro_port = await self._app_manager.start_metro(app_id)
+            await blog.success(f"Metro running on port {metro_port}")
+            web_port = await self._app_manager.start_web(app_id)
+            await blog.success(f"Web server running on port {web_port}")
+
+            # Bundle validation (simplified — same as _build_app step 7c)
+            bundle_ok = False
+            for repair_round in range(4):
+                managed_app = self._app_manager._running.get(app_id)
+                web_alive = (managed_app and managed_app.web_process
+                             and managed_app.web_process.returncode is None)
+                if web_alive:
+                    await self._wait_for_server(web_port, timeout=25)
+                    bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                else:
+                    bundle_ok = False
+                    bundle_errors = self._extract_errors_from_log_buffer(app_id)
+
+                if bundle_ok:
+                    await blog.success("Bundle compiles cleanly" if repair_round == 0 else f"Bundle repaired (round {repair_round})")
+                    break
+
+                await blog.warn(f"Repair round {repair_round + 1}/4...")
+                fixed = False
+                if bundle_errors:
+                    fixed = await self._fix_missing_deps(app_id, app_dir, bundle_errors, blog)
+                code_errors = [e for e in bundle_errors if e.get("file", "unknown") != "unknown"]
+                if code_errors:
+                    if await self._repair_bundle_errors(app_id, app_dir, code_errors, generated_files,
+                                                        description, name, deps, db_type, blog):
+                        fixed = True
+                if not fixed and not web_alive:
+                    try:
+                        web_port = await self._app_manager.start_web(app_id)
+                        await asyncio.sleep(5)
+                    except Exception:
+                        pass
+                if not fixed:
+                    break
+                if web_alive:
+                    await asyncio.sleep(4)
+                else:
+                    try:
+                        web_port = await self._app_manager.start_web(app_id)
+                    except Exception:
+                        pass
+
+            qr_url = await self._app_manager.get_qr_url(app_id)
+            web_url = await self._app_manager.get_web_url(app_id)
+            final_status = "running" if bundle_ok else "error"
+
+            async with async_session_maker() as db:
+                app = await db.get(App, app_id)
+                if app:
+                    app.status = final_status
+                    app.port = metro_port
+                    app.web_port = web_port
+                    managed = self._app_manager._running.get(app_id)
+                    if managed:
+                        app.metro_pid = managed.metro_process.pid if managed.metro_process else None
+                        app.web_pid = managed.web_process.pid if managed.web_process else None
+                    await db.commit()
+
+            if not bundle_ok:
+                await blog.error("Bundle compilation failed after repair")
+                await blog.persist()
+                await self._fail_job(job_id, app_id, "Bundle compilation failed after resume repair")
+                return
+
+            await self._update_step(job_id, user_id, "starting", "done",
+                                    detail=f"Metro:{metro_port} Web:{web_port}")
+
+            # ── Ready ────────────────────────────────────────────────
+            blog.set_step("ready")
+            await self._update_step(job_id, user_id, "ready", "done")
+
+            summary = blog.summary()
+            await blog.success(f"Build resumed & complete! {summary['total_tokens']:,} tokens used in resume")
+            await blog.persist()
+
+            async with async_session_maker() as db:
+                job = await db.get(BuildJob, job_id)
+                if job:
+                    job.status = "completed"
+                    job.completed_at = datetime.utcnow()
+                    job.checkpoint_json = None  # Clear checkpoint
+                    await db.commit()
+
+            # Register app in gateway
+            if hasattr(self, '_app_gateway') and self._app_gateway:
+                try:
+                    from .app_fs_skill import AppFsSkill
+                    app_fs_skill = AppFsSkill(app_id, name, slug, app_dir, self._app_manager)
+                    self._app_gateway.register_app(slug, app_fs_skill)
+                except Exception as e:
+                    logger.warning(f"[RESUME] Failed to register app in gateway: {e}")
+
+            # Broadcast app_ready
+            if self._ws_broadcast:
+                await self._ws_broadcast(user_id, {
+                    "type": "app_ready",
+                    "app_id": app_id,
+                    "name": name,
+                    "qr_url": qr_url,
+                    "web_url": web_url,
+                })
+
+            logger.info(f"[RESUME] Build resumed and complete for '{name}' (job={job_id})")
+
+        except TokenLimitError as e:
+            # Hit limit again during resume — re-pause with updated checkpoint
+            updated_checkpoint = checkpoint.copy()
+            updated_checkpoint["completed_steps"] = list(completed_steps)
+            logger.info(f"[RESUME] Token limit hit again for '{name}' — re-pausing")
+            await self._pause_job(job_id, app_id, user_id, e.retry_after_seconds, updated_checkpoint, blog)
+
+        except Exception as e:
+            logger.exception(f"[RESUME] Error resuming build for '{name}'")
+            await blog.error(f"Resume error: {e}")
+            await blog.persist()
+            await self._fail_job(job_id, app_id, f"Resume failed: {e}")
 
     async def _build_app(
         self,
@@ -956,6 +1348,22 @@ class AppBuilderSkill(Skill):
                 extra_context += f"\nDesign preferences: {design_notes}"
                 await blog.info(f"Design notes: {design_notes}")
 
+        # Checkpoint state — built up incrementally so pause can save progress
+        _checkpoint: Dict[str, Any] = {
+            "current_step": "planning",
+            "completed_steps": [],
+            "app_id": app_id,
+            "job_id": job_id,
+            "name": name,
+            "description": description,
+            "user_id": user_id,
+            "slug": slug,
+            "app_dir": app_dir,
+            "plan_context": plan_context,
+            "extra_context": extra_context,
+            "design_notes": design_notes,
+        }
+
         try:
             # ── Step 1: Planning ────────────────────────────────────
             plan = await self._step_plan(job_id, user_id, description, blog, extra_context)
@@ -976,6 +1384,18 @@ class AppBuilderSkill(Skill):
                 files_to_generate.append("/lib/agentSkill.json")
 
             await blog.info(f"Plan: {len(files_to_generate)} files, {len(deps)} deps, db={db_type}")
+
+            # Update checkpoint after planning
+            _checkpoint.update({
+                "current_step": "scaffolding",
+                "completed_steps": ["planning"],
+                "plan": plan,
+                "files_to_generate": files_to_generate,
+                "deps": deps,
+                "db_type": db_type,
+                "app_name": app_name,
+                "needs_db": needs_db,
+            })
 
             # Save plan to DB
             async with async_session_maker() as db:
@@ -1031,6 +1451,32 @@ class AppBuilderSkill(Skill):
 
                 await self._update_step(job_id, user_id, "writing", "done",
                                         detail=f"Generated {len(generated_files)} files")
+
+                # Update checkpoint after writing
+                _checkpoint.update({
+                    "current_step": "database",
+                    "completed_steps": ["planning", "scaffolding", "writing"],
+                    "generated_files": generated_files,
+                })
+            except TokenLimitError as e:
+                # Save partial code generation progress
+                partial = getattr(e, 'partial_files', {})
+                pending = getattr(e, 'pending_files', files_to_generate)
+                if partial:
+                    # Write partial files to disk so they survive pause
+                    await self._app_manager.write_app_files(app_id, partial)
+                    async with async_session_maker() as db:
+                        app = await db.get(App, app_id)
+                        if app:
+                            app.files_json = json.dumps(partial)
+                            await db.commit()
+                _checkpoint.update({
+                    "current_step": "writing",
+                    "generated_files": partial,
+                    "pending_files": pending,
+                })
+                await self._pause_job(job_id, app_id, user_id, e.retry_after_seconds, _checkpoint, blog)
+                return
             except Exception as e:
                 await blog.error(f"Code generation failed: {e}")
                 await blog.persist()
@@ -1062,6 +1508,9 @@ class AppBuilderSkill(Skill):
                 await blog.info("No database needed, skipping")
                 await self._update_step(job_id, user_id, "database", "done", detail="Not needed")
 
+            _checkpoint["completed_steps"] = ["planning", "scaffolding", "writing", "database"]
+            _checkpoint["current_step"] = "installing"
+
             # ── Step 5: Installing deps ─────────────────────────────
             blog.set_step("installing")
             await self._update_step(job_id, user_id, "installing", "running")
@@ -1084,6 +1533,9 @@ class AppBuilderSkill(Skill):
                 await self._fail_job(job_id, app_id, f"npm install failed: {e}")
                 return
 
+            _checkpoint["completed_steps"] = ["planning", "scaffolding", "writing", "database", "installing"]
+            _checkpoint["current_step"] = "github"
+
             # ── Step 6: GitHub ──────────────────────────────────────
             blog.set_step("github")
             await self._update_step(job_id, user_id, "github", "running")
@@ -1105,6 +1557,9 @@ class AppBuilderSkill(Skill):
                 await blog.warn(f"GitHub repo creation failed (non-fatal): {e}")
                 await self._update_step(job_id, user_id, "github", "done",
                                         detail=f"Skipped: {e}")
+
+            _checkpoint["completed_steps"] = ["planning", "scaffolding", "writing", "database", "installing", "github"]
+            _checkpoint["current_step"] = "starting"
 
             # ── Step 7: Starting servers + full auto-repair ─────────
             blog.set_step("starting")
@@ -1310,6 +1765,11 @@ class AppBuilderSkill(Skill):
                 })
 
             logger.info(f"[BUILD] Build complete for '{name}' (job={job_id})")
+
+        except TokenLimitError as e:
+            # Token/rate limit hit in any step — pause and save checkpoint
+            logger.info(f"[BUILD] Token limit hit for '{name}' — pausing (retry in {e.retry_after_seconds}s)")
+            await self._pause_job(job_id, app_id, user_id, e.retry_after_seconds, _checkpoint, blog)
 
         except Exception as e:
             logger.exception(f"[BUILD] Unexpected error building '{name}'")
@@ -1624,6 +2084,8 @@ class AppBuilderSkill(Skill):
             await self._update_step(job_id, user_id, "planning", "done",
                                     detail=plan_detail.strip())
             return plan
+        except TokenLimitError:
+            raise  # Let token limit propagate for pause/resume
         except Exception as e:
             if blog:
                 await blog.error(f"Planning failed: {e}")
@@ -1718,6 +2180,9 @@ class AppBuilderSkill(Skill):
                         completed += 1
                     if blog:
                         await blog.file_written(file_path, len(code.encode()), code)
+                except TokenLimitError:
+                    # Let token limit errors propagate — caller handles pause/resume
+                    raise
                 except Exception as e:
                     if blog:
                         await blog.error(f"Failed to generate {file_path}: {e}")
@@ -1733,7 +2198,17 @@ class AppBuilderSkill(Skill):
                         detail=f"File {current}/{total}: {file_path}"
                     )
 
-        await asyncio.gather(*[_gen_one(i, fp) for i, fp in enumerate(files)])
+        try:
+            await asyncio.gather(*[_gen_one(i, fp) for i, fp in enumerate(files)])
+        except TokenLimitError:
+            # Attach partial results to the exception so caller can checkpoint
+            err = TokenLimitError(
+                retry_after_seconds=300,
+                message=f"Token limit during code generation ({len(generated)}/{total} files done)"
+            )
+            err.partial_files = generated  # type: ignore[attr-defined]
+            err.pending_files = [f for f in files if f not in generated]  # type: ignore[attr-defined]
+            raise err
         return generated
 
     async def _write_infra_files(self, app_id: str, generated_files: dict, blog=None):
@@ -2327,6 +2802,24 @@ const _webDb = {
                     await blog.warn(f"LLM output truncated (hit {max_tokens} token limit)")
 
                 return text
+            except anthropic.RateLimitError as e:
+                # Token limit / rate limit — extract retry-after and raise for pause/resume
+                retry_after = 300  # default 5 minutes
+                try:
+                    retry_after = int(getattr(e.response, 'headers', {}).get('retry-after', 300))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                msg = f"Rate limit reached. Resets in {retry_after}s"
+                if blog:
+                    await blog.warn(msg)
+                raise TokenLimitError(retry_after_seconds=retry_after, message=msg)
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529:  # API overloaded
+                    raise TokenLimitError(retry_after_seconds=120, message="API overloaded, retry in 2min")
+                if blog:
+                    await blog.warn(f"Anthropic call failed (status {e.status_code}), falling back to OpenAI: {e}")
+                else:
+                    logger.warning(f"[BUILD] Anthropic call failed (status {e.status_code}), falling back to OpenAI: {e}")
             except Exception as e:
                 if blog:
                     await blog.warn(f"Anthropic call failed, falling back to OpenAI: {e}")
@@ -2436,6 +2929,48 @@ const _webDb = {
             if app:
                 app.status = "error"
                 await db.commit()
+
+    async def _pause_job(
+        self, job_id: str, app_id: str, user_id: str,
+        retry_after_seconds: int, checkpoint: Dict, blog,
+    ):
+        """Pause a build job due to token limit — save checkpoint for resume."""
+        from app.db.database import async_session_maker
+        from app.db.models import App, BuildJob
+
+        now = datetime.utcnow()
+        resume_at = now + timedelta(seconds=retry_after_seconds)
+
+        logger.info(f"[BUILD] Job {job_id} paused — token limit. Resume after {resume_at.isoformat()}")
+
+        async with async_session_maker() as db:
+            job = await db.get(BuildJob, job_id)
+            if job:
+                job.status = "paused"
+                job.paused_at = now
+                job.resume_after = resume_at
+                job.checkpoint_json = json.dumps(checkpoint)
+                await db.commit()
+
+            app = await db.get(App, app_id)
+            if app:
+                app.status = "paused"
+                await db.commit()
+
+        await blog.warn(f"Token limit reached — build paused. Resumes at {resume_at.strftime('%H:%M:%S UTC')}")
+        await blog.persist()
+
+        # Broadcast pause event via WebSocket
+        if self._ws_broadcast:
+            await self._ws_broadcast(user_id, {
+                "type": "job_paused",
+                "job_id": job_id,
+                "app_id": app_id,
+                "resume_after": resume_at.isoformat(),
+                "retry_after_seconds": retry_after_seconds,
+                "current_step": checkpoint.get("current_step", "unknown"),
+                "completed_steps": checkpoint.get("completed_steps", []),
+            })
 
     # ── Parsing helpers ─────────────────────────────────────────────
 
