@@ -382,6 +382,31 @@ async def push_github(app_id: str) -> Dict[str, str]:
     return {"result": result, "repo_url": app.github_url or ""}
 
 
+@router.post("/jobs/{job_id}/fix-steps")
+async def fix_job_steps(job_id: str) -> Dict[str, Any]:
+    """Fix stuck build steps — mark running/pending as done if job is completed."""
+    async with async_session_maker() as db:
+        job = await db.get(BuildJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        steps = []
+        try:
+            steps = json.loads(job.steps_json) if job.steps_json else []
+        except (json.JSONDecodeError, TypeError):
+            pass
+        fixed = 0
+        for s in steps:
+            if s.get("status") in ("running", "pending"):
+                s["status"] = "done"
+                fixed += 1
+        if fixed:
+            job.steps_json = json.dumps(steps)
+            if job.status in ("running", "queued"):
+                job.status = "completed"
+            await db.commit()
+        return {"ok": True, "fixed_steps": fixed}
+
+
 @router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str) -> Dict[str, bool]:
     """Delete a build job record."""

@@ -2911,7 +2911,7 @@ const _webDb = {
             })
 
     async def _fail_job(self, job_id: str, app_id: str, error_msg: str):
-        """Mark a job as failed."""
+        """Mark a job as failed and clean up stuck step statuses."""
         from app.db.database import async_session_maker
         from app.db.models import App, BuildJob
 
@@ -2923,6 +2923,26 @@ const _webDb = {
                 job.status = "failed"
                 job.error_message = error_msg
                 job.completed_at = datetime.utcnow()
+
+                # Clean up stuck steps: mark any "running" step as "failed"
+                try:
+                    steps = json.loads(job.steps_json) if job.steps_json else []
+                    for s in steps:
+                        if s.get("status") == "running":
+                            s["status"] = "failed"
+                            started = s.get("started_at")
+                            if started:
+                                try:
+                                    start_dt = datetime.fromisoformat(started)
+                                    s["duration_ms"] = int(
+                                        (datetime.utcnow() - start_dt).total_seconds() * 1000
+                                    )
+                                except Exception:
+                                    pass
+                    job.steps_json = json.dumps(steps)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
                 await db.commit()
 
             app = await db.get(App, app_id)
