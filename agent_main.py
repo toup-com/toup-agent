@@ -818,6 +818,358 @@ async def agent_system_info():
     }
 
 
+@app.post("/agent/diagnose")
+async def agent_diagnose():
+    """Comprehensive self-diagnostic — checks everything on the VPS.
+
+    Runs from inside the agent process, so no SSH needed.
+    Returns structured checks with auto-fix results.
+    """
+    import asyncio
+    import os
+    import shutil
+    import subprocess
+
+    agent_dir = os.environ.get("AGENT_DIR") or os.path.abspath(os.path.dirname(__file__))
+    checks = []
+
+    def add_check(name, status, detail, fixed=False):
+        checks.append({"name": name, "status": status, "detail": detail, "fixed": fixed})
+
+    # 1. Disk space
+    try:
+        usage = shutil.disk_usage("/")
+        free_mb = usage.free // (1024 * 1024)
+        if free_mb < 500:
+            # Try to free space
+            for cmd in [
+                "apt-get clean 2>/dev/null || true",
+                "journalctl --vacuum-time=1d 2>/dev/null || true",
+            ]:
+                subprocess.run(cmd, shell=True, capture_output=True, timeout=10)
+            usage_after = shutil.disk_usage("/")
+            free_after = usage_after.free // (1024 * 1024)
+            if free_after < 500:
+                add_check("disk_space", "error", f"Only {free_after}MB free (need 500MB+)")
+            else:
+                add_check("disk_space", "fixed", f"Freed space: {free_mb}MB → {free_after}MB", True)
+        else:
+            add_check("disk_space", "ok", f"{free_mb}MB available")
+    except Exception as e:
+        add_check("disk_space", "warning", str(e))
+
+    # 2. Memory usage
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        mem_used_pct = mem.percent
+        mem_avail_mb = mem.available // (1024 * 1024)
+        if mem_used_pct > 90:
+            add_check("memory", "warning", f"{mem_used_pct}% used, {mem_avail_mb}MB available")
+        else:
+            add_check("memory", "ok", f"{mem_used_pct}% used, {mem_avail_mb}MB available")
+    except ImportError:
+        # psutil not installed — use /proc/meminfo
+        try:
+            with open("/proc/meminfo") as f:
+                lines = f.readlines()
+            mem_info = {}
+            for line in lines[:5]:
+                parts = line.split(":")
+                mem_info[parts[0].strip()] = int(parts[1].strip().split()[0])
+            total = mem_info.get("MemTotal", 0)
+            avail = mem_info.get("MemAvailable", mem_info.get("MemFree", 0))
+            pct = round((1 - avail / max(total, 1)) * 100, 1)
+            add_check("memory", "ok" if pct < 90 else "warning", f"{pct}% used, {avail // 1024}MB available")
+        except Exception:
+            add_check("memory", "warning", "Could not check memory")
+
+    # 3. Git status — is code up to date?
+    try:
+        git_dir = os.path.join(agent_dir, ".git")
+        if os.path.isdir(git_dir):
+            subprocess.run(
+                ["git", "config", "--global", "--add", "safe.directory", agent_dir],
+                capture_output=True, timeout=5,
+            )
+            # Get local hash
+            r = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=agent_dir, capture_output=True, text=True, timeout=5,
+            )
+            local_hash = r.stdout.strip() if r.returncode == 0 else "unknown"
+
+            # Fetch remote
+            r = subprocess.run(
+                ["git", "fetch", "--depth", "1", "origin", "main"],
+                cwd=agent_dir, capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0:
+                r2 = subprocess.run(
+                    ["git", "rev-parse", "--short", "origin/main"],
+                    cwd=agent_dir, capture_output=True, text=True, timeout=5,
+                )
+                remote_hash = r2.stdout.strip() if r2.returncode == 0 else "unknown"
+                if local_hash == remote_hash:
+                    add_check("git_status", "ok", f"Up to date ({local_hash})")
+                else:
+                    add_check("git_status", "warning", f"Behind: local={local_hash} remote={remote_hash}")
+            else:
+                add_check("git_status", "warning", f"Fetch failed: {r.stderr.strip()[:100]}")
+        else:
+            add_check("git_status", "error", "No .git directory — code may not be managed by git")
+    except Exception as e:
+        add_check("git_status", "warning", str(e)[:100])
+
+    # 4. Database connectivity
+    try:
+        from app.db.database import async_session_maker
+        async with async_session_maker() as db:
+            from sqlalchemy import text
+            result = await db.execute(text("SELECT 1"))
+            result.scalar()
+        add_check("database", "ok", "Database is accessible")
+    except Exception as e:
+        add_check("database", "error", f"DB error: {str(e)[:150]}")
+
+    # 5. .env file — check required vars
+    try:
+        env_path = os.path.join(agent_dir, ".env")
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                env_content = f.read()
+            required = ["DATABASE_URL", "USER_ID", "AGENT_API_KEY", "RUN_MODE"]
+            missing = [v for v in required if f"{v}=" not in env_content]
+            if missing:
+                add_check("env_file", "warning", f"Missing vars: {', '.join(missing)}")
+            else:
+                add_check("env_file", "ok", "All required vars present")
+        else:
+            add_check("env_file", "error", "No .env file found")
+    except Exception as e:
+        add_check("env_file", "warning", str(e)[:100])
+
+    # 6. Python & venv
+    try:
+        import sys
+        py_ver = f"Python {sys.version.split()[0]}"
+        venv = os.path.join(agent_dir, "venv")
+        if os.path.exists(venv):
+            add_check("python", "ok", f"{py_ver}, venv exists")
+        else:
+            add_check("python", "warning", f"{py_ver}, but no venv directory")
+    except Exception as e:
+        add_check("python", "warning", str(e)[:100])
+
+    # 7. Systemd service
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "toup-agent"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            add_check("systemd_service", "ok", "toup-agent is active")
+        else:
+            # Try to check why it's not active
+            r2 = subprocess.run(
+                ["systemctl", "status", "toup-agent", "--no-pager"],
+                capture_output=True, text=True, timeout=5,
+            )
+            status_out = r2.stdout.strip()[:200] if r2.stdout else r.stdout.strip()
+            add_check("systemd_service", "warning", f"Status: {status_out}")
+    except FileNotFoundError:
+        add_check("systemd_service", "warning", "systemctl not found (not on systemd)")
+    except Exception as e:
+        add_check("systemd_service", "warning", str(e)[:100])
+
+    # 8. Port 8001 — are we actually listening
+    try:
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        result = sock.connect_ex(("127.0.0.1", 8001))
+        sock.close()
+        if result == 0:
+            add_check("port_8001", "ok", "Listening on port 8001")
+        else:
+            add_check("port_8001", "error", "Port 8001 not listening")
+    except Exception as e:
+        add_check("port_8001", "warning", str(e)[:100])
+
+    # 9. Uptime & process health
+    import time as _time
+    uptime = _time.time() - _app_start_time if _app_start_time else 0
+    add_check("uptime", "ok", f"{int(uptime)}s ({int(uptime // 3600)}h {int((uptime % 3600) // 60)}m)")
+
+    # 10. Recent errors from journal (last 5 min)
+    try:
+        r = subprocess.run(
+            ["journalctl", "-u", "toup-agent", "--no-pager", "-p", "err",
+             "--since", "5 minutes ago", "-n", "5", "--output", "cat"],
+            capture_output=True, text=True, timeout=5,
+        )
+        errors = r.stdout.strip()
+        if errors:
+            add_check("recent_errors", "warning", errors[:200])
+        else:
+            add_check("recent_errors", "ok", "No errors in last 5 minutes")
+    except Exception:
+        add_check("recent_errors", "ok", "Could not check journal (not critical)")
+
+    # 11. Network — can we reach GitHub and platform?
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get("https://api.github.com/zen")
+            if r.status_code == 200:
+                add_check("network", "ok", "Can reach GitHub")
+            else:
+                add_check("network", "warning", f"GitHub returned {r.status_code}")
+    except Exception as e:
+        add_check("network", "warning", f"Cannot reach GitHub: {str(e)[:80]}")
+
+    # 12. Chrome / browser (for web tools)
+    try:
+        r = subprocess.run(
+            ["google-chrome", "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            add_check("chrome", "ok", r.stdout.strip())
+        else:
+            r2 = subprocess.run(
+                ["google-chrome-stable", "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r2.returncode == 0:
+                add_check("chrome", "ok", r2.stdout.strip())
+            else:
+                add_check("chrome", "warning", "Chrome not found (will use Patchright Chromium)")
+    except FileNotFoundError:
+        add_check("chrome", "warning", "Chrome not installed")
+    except Exception:
+        add_check("chrome", "warning", "Could not check Chrome")
+
+    has_errors = any(c["status"] == "error" for c in checks)
+    return {
+        "success": not has_errors,
+        "method": "agent_self_diagnose",
+        "checks": checks,
+    }
+
+
+@app.post("/agent/diagnose-and-fix")
+async def agent_diagnose_and_fix():
+    """Diagnose AND auto-fix issues. Runs git pull, pip install, restarts if needed."""
+    import os
+    import subprocess
+
+    agent_dir = os.environ.get("AGENT_DIR") or os.path.abspath(os.path.dirname(__file__))
+    checks = []
+
+    def add_check(name, status, detail, fixed=False):
+        checks.append({"name": name, "status": status, "detail": detail, "fixed": fixed})
+
+    # 1. Git update
+    try:
+        subprocess.run(
+            ["git", "config", "--global", "--add", "safe.directory", agent_dir],
+            capture_output=True, timeout=5,
+        )
+        r = subprocess.run(
+            ["git", "fetch", "--depth", "1", "origin", "main"],
+            cwd=agent_dir, capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            r2 = subprocess.run(
+                ["git", "reset", "--hard", "origin/main"],
+                cwd=agent_dir, capture_output=True, text=True, timeout=10,
+            )
+            local_hash_r = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=agent_dir, capture_output=True, text=True, timeout=5,
+            )
+            local_hash = local_hash_r.stdout.strip() if local_hash_r.returncode == 0 else "?"
+            add_check("git_update", "fixed", f"Updated to {local_hash}", True)
+        else:
+            add_check("git_update", "error", f"Fetch failed: {r.stderr.strip()[:100]}")
+    except Exception as e:
+        add_check("git_update", "error", str(e)[:100])
+
+    # 2. Install dependencies
+    venv_pip = os.path.join(agent_dir, "venv", "bin", "pip")
+    req_file = os.path.join(agent_dir, "requirements.txt")
+    if os.path.exists(venv_pip) and os.path.exists(req_file):
+        try:
+            r = subprocess.run(
+                [venv_pip, "install", "-q", "-r", req_file],
+                cwd=agent_dir, capture_output=True, text=True, timeout=120,
+            )
+            if r.returncode == 0:
+                add_check("dependencies", "fixed", "pip install completed", True)
+            else:
+                add_check("dependencies", "error", f"pip install failed: {r.stderr.strip()[:150]}")
+        except Exception as e:
+            add_check("dependencies", "error", str(e)[:100])
+    else:
+        add_check("dependencies", "warning", "pip or requirements.txt not found")
+
+    # 3. Disk space cleanup
+    try:
+        import shutil
+        usage = shutil.disk_usage("/")
+        free_mb = usage.free // (1024 * 1024)
+        if free_mb < 500:
+            for cmd in [
+                "apt-get clean 2>/dev/null || true",
+                "journalctl --vacuum-time=1d 2>/dev/null || true",
+            ]:
+                subprocess.run(cmd, shell=True, capture_output=True, timeout=10)
+            usage_after = shutil.disk_usage("/")
+            free_after = usage_after.free // (1024 * 1024)
+            add_check("disk_space", "fixed", f"Freed space: {free_mb}MB → {free_after}MB", True)
+        else:
+            add_check("disk_space", "ok", f"{free_mb}MB available")
+    except Exception as e:
+        add_check("disk_space", "warning", str(e)[:100])
+
+    # 4. Database — run migrations (add missing columns)
+    try:
+        from app.db.database import init_db
+        await init_db()
+        add_check("database", "fixed", "Migrations applied", True)
+    except Exception as e:
+        add_check("database", "error", f"Migration failed: {str(e)[:150]}")
+
+    # 5. Schedule restart
+    import asyncio, sys
+    needs_restart = any(c["name"] == "git_update" and c["status"] == "fixed" for c in checks)
+    if needs_restart:
+        async def _delayed_restart():
+            await asyncio.sleep(1.5)
+            service_name = os.environ.get("SYSTEMD_SERVICE") or "toup-agent"
+            r = subprocess.run(
+                ["systemctl", "is-active", service_name],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                subprocess.Popen(["systemctl", "restart", service_name])
+            else:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        asyncio.get_event_loop().create_task(_delayed_restart())
+        add_check("restart", "fixed", "Scheduled restart in 1.5s", True)
+    else:
+        add_check("restart", "ok", "No restart needed")
+
+    has_errors = any(c["status"] == "error" for c in checks)
+    return {
+        "success": not has_errors,
+        "method": "agent_self_fix",
+        "checks": checks,
+    }
+
+
 @app.post("/agent/update")
 async def agent_self_update():
     """Pull latest code, install deps, and restart the agent process.
