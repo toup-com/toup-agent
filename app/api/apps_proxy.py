@@ -140,6 +140,179 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
 
 
 
+def _build_agent_widget_script(agent_name: str = "Agent") -> str:
+    """Build inline <style> + <script> for the floating agent chat widget.
+
+    Creates a polished floating orb button with expandable chat panel
+    that uses window.__TOUP_AGENT_BRIDGE for messaging.  Also hides
+    the generated AgentPlaceholder to prevent duplicate UI.
+    """
+    # HTML template — double quotes are safe inside JS single-quoted string
+    tpl = (
+        '<button id="taw-b"><div class="taw-orb"></div>'
+        '<div class="taw-dot"></div></button>'
+        '<div id="taw-p">'
+        '<div class="taw-h"><div class="taw-h-orb"></div>'
+        '<span class="taw-h-n">' + agent_name + '</span>'
+        '<div class="taw-h-dot"></div>'
+        '<button class="taw-x">\u2715</button></div>'
+        '<div id="taw-m"><div class="taw-empty">'
+        'Ask me anything!</div></div>'
+        '<div class="taw-iw">'
+        '<input id="taw-i" placeholder="Type a message..." autocomplete="off">'
+        '<button id="taw-s">\u2192</button></div>'
+        '</div>'
+    )
+    tpl_js = tpl.replace('\\', '\\\\').replace("'", "\\'")
+
+    parts = [
+        # ── CSS ──
+        '<style>',
+        '@keyframes taw-g{0%,100%{box-shadow:0 0 15px rgba(124,58,237,0.3)}'
+        '50%{box-shadow:0 0 25px rgba(124,58,237,0.5)}}',
+        '#taw{position:fixed;bottom:24px;right:24px;z-index:2147483647;'
+        'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;'
+        'font-size:13px;line-height:1.4}',
+        '@media(max-width:768px){#taw{bottom:80px;right:16px}}',
+        '#taw *{box-sizing:border-box;margin:0;padding:0}',
+        # Button
+        '#taw-b{display:flex;align-items:center;justify-content:center;'
+        'width:52px;height:52px;border-radius:50%;'
+        'background:linear-gradient(135deg,#7C3AED,#5B21B6);'
+        'border:none;cursor:pointer;position:relative;'
+        'animation:taw-g 3s ease-in-out infinite;transition:transform .2s}',
+        '#taw-b:hover{transform:scale(1.1)}',
+        '.taw-orb{width:26px;height:26px;border-radius:50%;'
+        'background:radial-gradient(circle at 35% 30%,'
+        'rgba(255,255,255,0.35),transparent 60%),'
+        'linear-gradient(135deg,#A78BFA,#7C3AED)}',
+        '.taw-dot{position:absolute;top:2px;right:2px;'
+        'width:12px;height:12px;border-radius:50%;border:2px solid #12121c}',
+        # Panel
+        '#taw-p{display:none;position:fixed;bottom:88px;right:24px;'
+        'width:360px;max-height:520px;background:#12121c;'
+        'border-radius:16px;border:1px solid #1e1e2e;'
+        'flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,0.5);'
+        'overflow:hidden}',
+        '@media(max-width:768px){#taw-p{bottom:140px;right:8px;'
+        'left:8px;width:auto;max-height:55vh}}',
+        '#taw-p.show{display:flex}',
+        # Header
+        '.taw-h{display:flex;align-items:center;padding:12px 14px;'
+        'border-bottom:1px solid #1e1e2e;background:#0e0e18;gap:8px}',
+        '.taw-h-orb{width:30px;height:30px;border-radius:50%;flex-shrink:0;'
+        'background:radial-gradient(circle at 35% 30%,'
+        'rgba(255,255,255,0.3),transparent 60%),'
+        'linear-gradient(135deg,#A78BFA,#7C3AED)}',
+        '.taw-h-n{color:#fff;font-size:14px;font-weight:600;flex:1}',
+        '.taw-h-dot{width:8px;height:8px;border-radius:50%}',
+        '.taw-x{width:26px;height:26px;border-radius:50%;border:none;'
+        'background:#1e1e2e;color:#9ca3af;cursor:pointer;font-size:14px;'
+        'display:flex;align-items:center;justify-content:center}',
+        '.taw-x:hover{background:#2a2a3e;color:#fff}',
+        # Messages
+        '#taw-m{flex:1;overflow-y:auto;padding:14px;display:flex;'
+        'flex-direction:column;gap:8px;min-height:200px;max-height:360px}',
+        '#taw-m::-webkit-scrollbar{width:4px}',
+        '#taw-m::-webkit-scrollbar-thumb{background:#2a2a3e;border-radius:2px}',
+        '.taw-msg{max-width:85%;padding:10px 14px;border-radius:14px;'
+        'font-size:13px;line-height:1.5;word-break:break-word}',
+        '.taw-msg.u{align-self:flex-end;background:#7C3AED;color:#fff;'
+        'border-bottom-right-radius:4px}',
+        '.taw-msg.a{align-self:flex-start;background:#1e1e2e;color:#e5e7eb;'
+        'border-bottom-left-radius:4px;white-space:pre-wrap}',
+        '.taw-msg.t{color:#6b7280;font-style:italic;font-size:12px}',
+        '.taw-empty{text-align:center;color:#6b7280;padding:40px 16px}',
+        # Input
+        '.taw-iw{display:flex;align-items:center;padding:10px 12px;'
+        'border-top:1px solid #1e1e2e;background:#0e0e18;gap:8px}',
+        '#taw-i{flex:1;background:#1e1e2e;border:1px solid #2a2a3e;'
+        'border-radius:20px;padding:8px 14px;color:#fff;font-size:13px;'
+        'outline:none;font-family:inherit;-webkit-appearance:none}',
+        '#taw-i::placeholder{color:#6b7280}',
+        '#taw-i:focus{border-color:#7C3AED}',
+        '#taw-s{width:34px;height:34px;border-radius:50%;border:none;'
+        'background:#7C3AED;color:#fff;cursor:pointer;font-size:16px;'
+        'flex-shrink:0;display:flex;align-items:center;'
+        'justify-content:center;-webkit-appearance:none}',
+        '#taw-s:hover{background:#6D28D9}',
+        '</style>',
+        # ── JS ──
+        '<script>',
+        'document.addEventListener("DOMContentLoaded",function(){',
+        'var B=window.__TOUP_AGENT_BRIDGE;if(!B)return;',
+        'window.__TOUP_AGENT_UI_INJECTED=true;',
+        # Create root
+        'var r=document.createElement("div");r.id="taw";',
+        "r.innerHTML='", tpl_js, "';",
+        'document.body.appendChild(r);',
+        # Element refs
+        'var btn=document.getElementById("taw-b"),'
+        'pnl=document.getElementById("taw-p"),'
+        'msgs=document.getElementById("taw-m"),'
+        'inp=document.getElementById("taw-i"),'
+        'sbtn=document.getElementById("taw-s"),'
+        'd1=r.querySelector(".taw-dot"),'
+        'd2=r.querySelector(".taw-h-dot");',
+        # Toggle
+        'btn.onclick=function(){'
+        'pnl.classList.add("show");btn.style.display="none";inp.focus()};',
+        'r.querySelector(".taw-x").onclick=function(){'
+        'pnl.classList.remove("show");btn.style.display=""};',
+        # Status polling
+        'function us(){'
+        'var c=B.isConnected?"#22c55e":"#6b7280";'
+        'd1.style.backgroundColor=c;d2.style.backgroundColor=c}',
+        'setInterval(us,2000);us();',
+        # Add message helper
+        'function am(t,s){'
+        'var e=msgs.querySelector(".taw-empty");if(e)e.remove();'
+        'var d=document.createElement("div");d.className="taw-msg "+s;'
+        'd.textContent=t;msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight}',
+        # Send
+        'function snd(){'
+        'var t=inp.value.trim();if(!t)return;'
+        'am(t,"u");B.sendMessage(t);inp.value="";'
+        'var tp=document.getElementById("taw-tp");if(!tp){'
+        'tp=document.createElement("div");'
+        'tp.className="taw-msg a t";tp.id="taw-tp";'
+        'tp.textContent="Thinking...";'
+        'msgs.appendChild(tp);msgs.scrollTop=msgs.scrollHeight}}',
+        'inp.addEventListener("keydown",function(e){'
+        'if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();snd()}});',
+        'sbtn.onclick=snd;',
+        # Receive messages
+        'B.onAgentMessage(function(t){'
+        'var tp=document.getElementById("taw-tp");if(tp)tp.remove();'
+        'am(t,"a")});',
+        # Tool activity → typing indicator
+        'B.onToolActivity(function(tool,done){'
+        'var tp=document.getElementById("taw-tp");'
+        'if(!done&&!tp){'
+        'tp=document.createElement("div");'
+        'tp.className="taw-msg a t";tp.id="taw-tp";'
+        'tp.textContent="Working...";'
+        'msgs.appendChild(tp);msgs.scrollTop=msgs.scrollHeight}'
+        'else if(done&&tp)tp.textContent="Almost done..."});',
+        # Hide generated AgentPlaceholder (scans positioned bottom-right elements)
+        'function hg(){'
+        'var all=document.body.getElementsByTagName("div");'
+        'for(var i=0;i<all.length;i++){'
+        'var el=all[i];if(el.closest("#taw"))continue;'
+        'try{var cs=getComputedStyle(el);'
+        'if((cs.position==="absolute"||cs.position==="fixed")'
+        '&&parseInt(cs.zIndex)>=9000){'
+        'var b=parseInt(cs.bottom),ri=parseInt(cs.right);'
+        'if(!isNaN(b)&&!isNaN(ri)&&b<=120&&ri<=60)'
+        'el.style.setProperty("display","none","important")'
+        '}}catch(e){}}}',
+        'setTimeout(hg,3000);setTimeout(hg,6000);',
+        '});',
+        '</script>',
+    ]
+    return ''.join(parts)
+
+
 # ── Agent proxy helpers ─────────────────────────────────────
 
 async def _get_agent(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]]:
@@ -390,8 +563,9 @@ async def preview_proxy(
                     '"Noto Color Emoji" !important; }'
                     '</style>'
                 )
+                agent_widget_script = _build_agent_widget_script()
                 html = body.decode("utf-8", errors="replace")
-                html = html.replace("<head>", f"<head>\n{meta_charset}\n{base_tag}\n{agent_bridge_script}\n{emoji_css}", 1)
+                html = html.replace("<head>", f"<head>\n{meta_charset}\n{base_tag}\n{agent_bridge_script}\n{agent_widget_script}\n{emoji_css}", 1)
                 # Rewrite absolute src="/..." to relative so <base href>
                 # routes them through the preview proxy path.
                 # Also inject ?token= so bundle requests are authenticated

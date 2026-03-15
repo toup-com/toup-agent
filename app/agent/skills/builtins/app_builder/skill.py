@@ -338,6 +338,18 @@ Error Boundary (CRITICAL — prevents white screens):
 
 Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /components/AgentPlaceholder.tsx:
+  IMPORTANT: The platform proxy injects its own polished agent widget.
+  Your component MUST check for it and skip rendering if present:
+  ```
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && (window as any).__TOUP_AGENT_UI_INJECTED) {
+    return null; // Platform-injected widget handles the UI
+  }
+  ```
+  Place this check AFTER all hooks but BEFORE the JSX return.
+  This ensures the injected widget (with proper WS connection and token refresh)
+  is used instead of the generated one when viewing through the platform proxy.
+  The generated component is still needed as a fallback for Expo Go native.
+
   Build a floating agent widget component with TWO modes:
 
   DOCKED MODE (default, minimized state):
