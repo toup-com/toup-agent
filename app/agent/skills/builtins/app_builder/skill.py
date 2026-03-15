@@ -370,37 +370,47 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
   The bottom: 80 on mobile ensures it sits above the ~60px tab bar + safe area padding.
 
 - If this is /lib/agentBridge.ts:
-  Create a singleton instance (NOT a class with getInstance()). Export the instance directly:
-  `const AgentBridge = new AgentBridgeClass(); export {{ AgentBridge }};`
-  All other files import {{ AgentBridge }} and use it directly (e.g. AgentBridge.sendMessage()),
-  NOT AgentBridge.getInstance().sendMessage(). There is no getInstance() method.
-  The bridge connects to the user's REAL AI agent via WebSocket.
-  On construction, read window.__TOUP_AUTH_TOKEN, window.__TOUP_APP_ID, window.__TOUP_WS_URL.
-  If all three globals exist, connect to WS_URL with ?token=AUTH_TOKEN query param.
+  IMPORTANT: The platform proxy injects a pre-built bridge as window.__TOUP_AGENT_BRIDGE.
+  Your code MUST check for it first and delegate to it if available.
 
-  Core methods:
+  Structure:
+  ```
+  // Check for injected bridge (set by platform proxy — deterministic, tested)
+  const injected = typeof window !== 'undefined' && (window as any).__TOUP_AGENT_BRIDGE;
+
+  // If injected bridge exists, create a thin wrapper that delegates to it
+  // but adds app-specific screens and actions metadata.
+  // If not (e.g. Expo Go native), create own WebSocket implementation.
+  ```
+
+  If `window.__TOUP_AGENT_BRIDGE` exists:
+  - Create AgentBridge as a wrapper that delegates sendMessage, onAgentMessage,
+    onToolActivity, setNavigationRef, navigate, destroy, and isConnected to the injected bridge.
+  - Add your own getScreens() and getActions() with the app-specific screen list and actions.
+  - Call injected.setScreens(screens) and injected.setActions(actionsMap) to register metadata.
+
+  If `window.__TOUP_AGENT_BRIDGE` does NOT exist (fallback for Expo Go native):
+  - Read window.__TOUP_AUTH_TOKEN, window.__TOUP_APP_ID, window.__TOUP_WS_URL.
+  - If all three globals exist, connect to WS_URL with ?token=AUTH_TOKEN query param.
+  - Implement own WebSocket connection with reconnect (exponential backoff, 1s→30s, unlimited retries).
+  - Handle messages: text_chunk (accumulate), done (fire callbacks), app_navigate, tool_start, tool_end, error.
+  - Queue messages when not connected.
+
+  Export as singleton: `const AgentBridge = ...; export {{ AgentBridge }}; export default AgentBridge;`
+  All other files import {{ AgentBridge }} and use it directly (NOT .getInstance()).
+
+  Core API (same whether injected or own implementation):
   - currentScreen: string (updated by navigation listener)
-  - navigate(screenName: string, params?: object): void — calls navigation ref
-  - getScreens(): Array<{{name: string, description: string}}> — lists all screens
-  - getActions(screenName?: string): Array<{{id: string, label: string, handler: string}}> — per-screen actions
-  - sendMessage(text: string): void — sends {{"type":"message","text":text,"app_id":APP_ID,"channel":"app"}} over WebSocket
-  - onAgentMessage(callback: (msg: string) => void): void — register callback for agent responses
-  - onToolActivity(callback: (tool: string, done: boolean) => void): void — register callback for tool_start/tool_end
-  - setNavigationRef(ref: any): void — store navigation container ref
-  - isConnected: boolean — tracks WebSocket connection state
+  - navigate(screenName: string, params?: object): void
+  - getScreens(): Array<{{name: string, description: string}}>
+  - getActions(screenName?: string): Array<{{id: string, label: string, handler: string}}>
+  - sendMessage(text: string): void — sends {{"type":"message","text":text,"app_id":APP_ID,"channel":"app"}}
+  - onAgentMessage(callback: (msg: string) => void): () => void — returns unsubscribe
+  - onToolActivity(callback: (tool: string, done: boolean) => void): () => void — returns unsubscribe
+  - setNavigationRef(ref: any): void
+  - isConnected: boolean
 
-  WebSocket message handling:
-  - On {{"type":"text_chunk","text":"..."}} — accumulate chunks into a response buffer
-  - On {{"type":"done","text":"..."}} — fire onAgentMessage callbacks with the full text, clear buffer
-  - On {{"type":"app_navigate","screen":"...","params":{{}}}} — call this.navigate(screen, params)
-  - On {{"type":"tool_start","tool":"..."}} — fire onToolActivity callback (for typing indicator)
-  - On {{"type":"tool_end","tool":"..."}} — fire onToolActivity callback
-  - On {{"type":"error"}} — fire onAgentMessage with error text
-
-  Reconnect: if WS closes unexpectedly, reconnect with exponential backoff (1s, 2s, 4s, max 3 retries).
-  Expose window.__TOUP_AGENT_BRIDGE for external access (web).
   Do NOT process messages locally or simulate responses. ALL messages go through the WebSocket to the real agent.
-  If WebSocket is not connected (globals missing), queue messages and show a fallback "Connecting..." message.
 
 - If this is /lib/agentActions.ts:
   Export a registry mapping screen names to available actions:
@@ -3057,15 +3067,18 @@ const _webDb = {
                 )
             if 'bridge' in name.lower() or 'agent' in name.lower():
                 return (
-                    "// AgentBridge stub — generation failed\n"
-                    "const agentBridge = {\n"
+                    "// AgentBridge stub — delegates to injected bridge if available\n"
+                    "const injected = typeof window !== 'undefined' && (window as any).__TOUP_AGENT_BRIDGE;\n"
+                    "const agentBridge = injected || {\n"
                     "  isConnected: false,\n"
                     "  currentScreen: 'Home',\n"
                     "  sendMessage: async () => {},\n"
                     "  onAgentMessage: () => () => {},\n"
                     "  onToolActivity: () => () => {},\n"
                     "  setNavigationRef: () => {},\n"
-                    "  registerAction: () => {},\n"
+                    "  navigate: () => {},\n"
+                    "  getScreens: () => [],\n"
+                    "  getActions: () => [],\n"
                     "};\n"
                     "export { agentBridge };\n"
                     "export const AgentBridge = agentBridge;\n"

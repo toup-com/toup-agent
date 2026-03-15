@@ -23,6 +23,123 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/apps", tags=["Apps Proxy"])
 
 
+def _build_agent_bridge_script(token: str, app_id: str) -> str:
+    """Build the inline <script> that creates a deterministic agent bridge.
+
+    This script runs in <head> BEFORE the Expo JS bundle loads.
+    It creates window.__TOUP_AGENT_BRIDGE with a full WebSocket bridge,
+    then clears window.__TOUP_AUTH_TOKEN so the LLM-generated agentBridge.ts
+    won't create a duplicate connection.
+    """
+    return (
+        "<script>"
+        "(function(){"
+        # ── Config ──
+        f'var T="{token}",A="{app_id}",U="wss://"+location.host+"/api/ws/chat";'
+        # ── Set globals for generated code that checks them ──
+        'window.__TOUP_APP_ID=A;'
+        'window.__TOUP_WS_URL=U;'
+        # ── Bridge state ──
+        'var ws=null,connected=false,buf="",q=[],'
+        'msgCbs=[],toolCbs=[],navRef=null,screens=[],actions={},'
+        'attempt=0,maxDelay=30000,hbTimer=null,reconTimer=null;'
+        # ── Connect ──
+        'function connect(){'
+        'if(!T)return;'
+        'try{ws=new WebSocket(U+"?token="+encodeURIComponent(T))}catch(e){return schedRecon()}'
+        'ws.onopen=function(){'
+        'connected=true;attempt=0;B.isConnected=true;'
+        'hbTimer=setInterval(function(){try{ws.send("ping")}catch(e){}},25000);'
+        'while(q.length){try{ws.send(JSON.stringify(q.shift()))}catch(e){}}'
+        '};'
+        'ws.onmessage=function(ev){'
+        'if(ev.data==="pong")return;'
+        'var d;try{d=JSON.parse(ev.data)}catch(e){return}'
+        'if(d.type==="text_chunk"){buf+=(d.text||"")}'
+        'else if(d.type==="done"){'
+        'var t=d.text||buf;buf="";'
+        'for(var i=0;i<msgCbs.length;i++)try{msgCbs[i](t)}catch(e){}'
+        '}'
+        'else if(d.type==="app_navigate"&&d.screen){B.navigate(d.screen,d.params||{})}'
+        'else if(d.type==="tool_start"){'
+        'for(var i=0;i<toolCbs.length;i++)try{toolCbs[i](d.tool||"",false)}catch(e){}'
+        '}'
+        'else if(d.type==="tool_end"){'
+        'for(var i=0;i<toolCbs.length;i++)try{toolCbs[i](d.tool||"",true)}catch(e){}'
+        '}'
+        'else if(d.type==="error"){'
+        'var m=d.text||d.message||"Error";'
+        'for(var i=0;i<msgCbs.length;i++)try{msgCbs[i](m)}catch(e){}'
+        '}'
+        '};'
+        'ws.onclose=function(ev){'
+        'cleanup();if(!ev.wasClean||ev.code!==1000)schedRecon()'
+        '};'
+        'ws.onerror=function(){cleanup();schedRecon()}'
+        '}'
+        # ── Reconnect ──
+        'function cleanup(){'
+        'connected=false;B.isConnected=false;ws=null;'
+        'if(hbTimer){clearInterval(hbTimer);hbTimer=null}'
+        '}'
+        'function schedRecon(){'
+        'if(reconTimer)return;'
+        'var delay=Math.min(1000*Math.pow(2,attempt),maxDelay);'
+        'attempt++;'
+        'reconTimer=setTimeout(function(){reconTimer=null;connect()},delay)'
+        '}'
+        # ── Bridge API ──
+        'var B={'
+        'isConnected:false,'
+        'currentScreen:"",'
+        'sendMessage:function(text){'
+        'var m={type:"message",text:text,app_id:A,channel:"app"};'
+        'if(ws&&ws.readyState===1)try{ws.send(JSON.stringify(m))}catch(e){q.push(m)}'
+        'else q.push(m)'
+        '},'
+        'onAgentMessage:function(cb){msgCbs.push(cb);return function(){'
+        'var i=msgCbs.indexOf(cb);if(i>=0)msgCbs.splice(i,1)}},'
+        'onToolActivity:function(cb){toolCbs.push(cb);return function(){'
+        'var i=toolCbs.indexOf(cb);if(i>=0)toolCbs.splice(i,1)}},'
+        'setNavigationRef:function(ref){navRef=ref},'
+        'navigate:function(screen,params){'
+        'try{if(navRef&&navRef.current)navRef.current.navigate(screen,params||{});'
+        'else if(navRef&&typeof navRef.navigate==="function")navRef.navigate(screen,params||{})'
+        '}catch(e){}'
+        '},'
+        'getScreens:function(){return screens},'
+        'setScreens:function(s){screens=s},'
+        'getActions:function(s){return s?actions[s]||[]:Object.values(actions).flat()},'
+        'setActions:function(a){actions=a},'
+        'destroy:function(){'
+        'if(reconTimer){clearTimeout(reconTimer);reconTimer=null}'
+        'if(hbTimer){clearInterval(hbTimer);hbTimer=null}'
+        'if(ws){ws.onclose=null;ws.onerror=null;ws.close();ws=null}'
+        'connected=false;B.isConnected=false;msgCbs=[];toolCbs=[];q=[]'
+        '}'
+        '};'
+        # ── PostMessage listener for config updates (token refresh) ──
+        'window.addEventListener("message",function(ev){'
+        'if(ev.data&&ev.data.type==="toup_agent_config"){'
+        'if(ev.data.token)T=ev.data.token;'
+        'if(ev.data.app_id)A=ev.data.app_id;'
+        'if(ev.data.ws_url)U=ev.data.ws_url;'
+        'if(!connected&&T){attempt=0;connect()}'
+        '}'
+        '});'
+        # ── Expose globally ──
+        'window.__TOUP_AGENT_BRIDGE=B;'
+        # Clear auth token so generated agentBridge.ts won't create
+        # a duplicate WebSocket connection (it checks this global).
+        'window.__TOUP_AUTH_TOKEN="";'
+        # ── Auto-connect ──
+        'if(T)connect()'
+        "})()"
+        "</script>"
+    )
+
+
+
 # ── Agent proxy helpers ─────────────────────────────────────
 
 async def _get_agent(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]]:
@@ -252,14 +369,12 @@ async def preview_proxy(
             if "text/html" in content_type:
                 base_href = f"/api/apps/{app_id}/preview/"
                 base_tag = f'<base href="{base_href}">'
-                # Inject agent bridge globals so the app can connect
-                # to the user's real agent via WebSocket
-                agent_globals = (
-                    f'<script>'
-                    f'window.__TOUP_AUTH_TOKEN="{token or ""}";'
-                    f'window.__TOUP_APP_ID="{app_id}";'
-                    f'window.__TOUP_WS_URL="wss://toup.ai/api/ws/chat";'
-                    f'</script>'
+                # Inject deterministic agent bridge — connects the app's
+                # AgentPlaceholder to the user's real agent via WebSocket.
+                # This runs BEFORE the Expo bundle, so window.__TOUP_AGENT_BRIDGE
+                # is ready when the generated agentBridge.ts loads.
+                agent_bridge_script = _build_agent_bridge_script(
+                    token or "", app_id
                 )
                 # Meta charset MUST be first in <head> — WKWebView uses it to
                 # decide text encoding before parsing any other content.
@@ -276,7 +391,7 @@ async def preview_proxy(
                     '</style>'
                 )
                 html = body.decode("utf-8", errors="replace")
-                html = html.replace("<head>", f"<head>\n{meta_charset}\n{base_tag}\n{agent_globals}\n{emoji_css}", 1)
+                html = html.replace("<head>", f"<head>\n{meta_charset}\n{base_tag}\n{agent_bridge_script}\n{emoji_css}", 1)
                 # Rewrite absolute src="/..." to relative so <base href>
                 # routes them through the preview proxy path.
                 # Also inject ?token= so bundle requests are authenticated
