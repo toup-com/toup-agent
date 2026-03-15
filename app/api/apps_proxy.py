@@ -129,9 +129,9 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         '});'
         # ── Expose globally ──
         'window.__TOUP_AGENT_BRIDGE=B;'
-        # Clear auth token so generated agentBridge.ts won't create
-        # a duplicate WebSocket connection (it checks this global).
-        'window.__TOUP_AUTH_TOKEN="";'
+        # Keep __TOUP_AUTH_TOKEN intact — existing apps' agentBridge.ts
+        # reads it to connect.  Both bridges may connect (ours + generated),
+        # but that's harmless.  Future apps delegate to the injected bridge.
         # ── Auto-connect ──
         'if(T)connect()'
         "})()"
