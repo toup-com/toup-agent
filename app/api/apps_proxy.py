@@ -140,22 +140,69 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
 
 
 
-def _build_agent_widget_script(agent_name: str = "Agent") -> str:
-    """Build inline <style> + <script> for the floating agent chat widget.
+def _hex_lighten(color: str, pct: int) -> str:
+    c = color.lstrip('#')
+    r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    f = pct / 100
+    return f'#{int(r+(255-r)*f):02x}{int(g+(255-g)*f):02x}{int(b+(255-b)*f):02x}'
 
-    Creates a polished floating orb button with expandable chat panel
-    that uses window.__TOUP_AGENT_BRIDGE for messaging.  Also hides
-    the generated AgentPlaceholder to prevent duplicate UI.
+
+def _hex_darken(color: str, pct: int) -> str:
+    c = color.lstrip('#')
+    r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    f = 1 - pct / 100
+    return f'#{int(r*f):02x}{int(g*f):02x}{int(b*f):02x}'
+
+
+def _hex_rgba(color: str, alpha: float) -> str:
+    c = color.lstrip('#')
+    r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    return f'rgba({r},{g},{b},{alpha})'
+
+
+def _build_agent_widget_script(
+    agent_name: str = "Agent",
+    agent_color: str = "#9B59B6",
+) -> str:
+    """Build inline <style> + <script> for the floating Orb agent widget.
+
+    Recreates the platform's Orb component (sphere with eyes, breathing,
+    blinking, 3D shading) in vanilla CSS/JS.  Injected by the preview proxy
+    so every app gets the same consistent agent UI.
     """
-    # HTML template — double quotes are safe inside JS single-quoted string
+    # Derived colors
+    cl = _hex_lighten(agent_color, 20)   # light body
+    cd = _hex_darken(agent_color, 35)    # dark overlay
+    cd15 = _hex_darken(agent_color, 15)
+    cd30 = _hex_darken(agent_color, 30)
+    cd45 = _hex_darken(agent_color, 45)
+    cl40 = _hex_lighten(agent_color, 40)  # specular highlight
+    glow = _hex_rgba(agent_color, 0.25)
+    glow2 = _hex_rgba(agent_color, 0.15)
+
+    # HTML template
     tpl = (
-        '<button id="taw-b"><div class="taw-orb"></div>'
-        '<div class="taw-dot"></div></button>'
+        # ── Orb button ──
+        '<button id="taw-b">'
+        '<div class="taw-ring"></div>'
+        '<div class="taw-ob">'
+        '<div class="taw-od"></div>'
+        '<div class="taw-o3"></div>'
+        '<div class="taw-oe">'
+        '<div class="taw-ey"><div class="taw-pu"><div class="taw-hi"></div></div></div>'
+        '<div class="taw-ey"><div class="taw-pu"><div class="taw-hi"></div></div></div>'
+        '</div>'
+        '</div>'
+        '<div class="taw-dot"></div>'
+        '</button>'
+        # ── Chat panel ──
         '<div id="taw-p">'
-        '<div class="taw-h"><div class="taw-h-orb"></div>'
-        '<span class="taw-h-n">' + agent_name + '</span>'
-        '<div class="taw-h-dot"></div>'
-        '<button class="taw-x">\u2715</button></div>'
+        '<div class="taw-h">'
+        '<div class="taw-ho"></div>'
+        '<span class="taw-hn">' + agent_name + '</span>'
+        '<div class="taw-hd"></div>'
+        '<button class="taw-x">\u2715</button>'
+        '</div>'
         '<div id="taw-m"><div class="taw-empty">'
         'Ask me anything!</div></div>'
         '<div class="taw-iw">'
@@ -168,27 +215,64 @@ def _build_agent_widget_script(agent_name: str = "Agent") -> str:
     parts = [
         # ── CSS ──
         '<style>',
-        '@keyframes taw-g{0%,100%{box-shadow:0 0 15px rgba(124,58,237,0.3)}'
-        '50%{box-shadow:0 0 25px rgba(124,58,237,0.5)}}',
+        # Keyframes
+        '@keyframes taw-breathe{0%,100%{transform:scale(1)}40%{transform:scale(1.06)}}',
+        '@keyframes taw-dark{0%,100%{opacity:0}40%{opacity:1}}',
+        '@keyframes taw-blink{0%,42%,44%,100%{transform:scaleY(1)}43%{transform:scaleY(0.05)}}',
+        f'@keyframes taw-ring-k{{0%{{transform:scale(1);opacity:0.4}}100%{{transform:scale(1.8);opacity:0}}}}',
+        # Root
         '#taw{position:fixed;bottom:24px;right:24px;z-index:2147483647;'
         'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;'
         'font-size:13px;line-height:1.4}',
         '@media(max-width:768px){#taw{bottom:80px;right:16px}}',
         '#taw *{box-sizing:border-box;margin:0;padding:0}',
-        # Button
-        '#taw-b{display:flex;align-items:center;justify-content:center;'
-        'width:52px;height:52px;border-radius:50%;'
-        'background:linear-gradient(135deg,#7C3AED,#5B21B6);'
-        'border:none;cursor:pointer;position:relative;'
-        'animation:taw-g 3s ease-in-out infinite;transition:transform .2s}',
-        '#taw-b:hover{transform:scale(1.1)}',
-        '.taw-orb{width:26px;height:26px;border-radius:50%;'
-        'background:radial-gradient(circle at 35% 30%,'
-        'rgba(255,255,255,0.35),transparent 60%),'
-        'linear-gradient(135deg,#A78BFA,#7C3AED)}',
-        '.taw-dot{position:absolute;top:2px;right:2px;'
+        # Orb button
+        '#taw-b{width:56px;height:56px;border-radius:50%;border:none;'
+        'cursor:pointer;padding:0;background:transparent;position:relative;'
+        'animation:taw-breathe 4s ease-in-out infinite}',
+        '#taw-b:hover{filter:brightness(1.1)}',
+        # Wave ring
+        f'.taw-ring{{position:absolute;inset:-4px;border-radius:50%;'
+        f'border:2px solid {agent_color};opacity:0;'
+        f'animation:taw-ring-k 2.5s ease-out infinite}}',
+        # Orb body
+        f'.taw-ob{{width:56px;height:56px;border-radius:50%;position:relative;'
+        f'overflow:hidden;'
+        f'background:radial-gradient(ellipse at 35% 40%,{cl40},{agent_color} 30%,'
+        f'{cd15} 55%,{cd30} 75%,{cd45} 90%);'
+        f'box-shadow:0 4px 20px rgba(0,0,0,0.35),0 0 25px {glow},'
+        f'inset 0 -2px 8px rgba(0,0,0,0.15)}}',
+        # Dark overlay (breathing color shift)
+        f'.taw-od{{position:absolute;inset:0;border-radius:50%;'
+        f'background:{cd};animation:taw-dark 4s ease-in-out infinite}}',
+        # 3D shading
+        '.taw-o3{position:absolute;inset:0;border-radius:50%;'
+        'background:'
+        'radial-gradient(ellipse at 32% 25%,rgba(255,255,255,0.18),'
+        'rgba(255,255,255,0.04) 30%,transparent 55%),'
+        'radial-gradient(ellipse at 50% 90%,rgba(0,0,0,0.22),transparent 50%),'
+        'radial-gradient(ellipse at 50% 50%,transparent 60%,'
+        'rgba(0,0,0,0.12) 80%,rgba(0,0,0,0.25) 100%)}',
+        # Eyes container
+        '.taw-oe{position:absolute;top:21px;left:0;right:0;'
+        'display:flex;justify-content:center;gap:7px;align-items:center}',
+        # Eye
+        '.taw-ey{width:16px;height:16px;border-radius:50%;'
+        'background:radial-gradient(circle at 45% 38%,#fff,#f0eef8 50%,#ddd8f0);'
+        'display:flex;align-items:center;justify-content:center;'
+        'animation:taw-blink 5s ease-in-out infinite}',
+        # Pupil
+        '.taw-pu{width:8px;height:8px;border-radius:50%;'
+        'background:radial-gradient(circle at 42% 38%,#312e81,#1e1b4b 50%,#0c0a1a);'
+        'position:relative}',
+        # Pupil highlight
+        '.taw-hi{position:absolute;top:1px;left:1px;'
+        'width:3px;height:3px;border-radius:50%;'
+        'background:rgba(255,255,255,0.85)}',
+        # Connection dot
+        '.taw-dot{position:absolute;top:0;right:0;'
         'width:12px;height:12px;border-radius:50%;border:2px solid #12121c}',
-        # Panel
+        # ── Panel ──
         '#taw-p{display:none;position:fixed;bottom:88px;right:24px;'
         'width:360px;max-height:520px;background:#12121c;'
         'border-radius:16px;border:1px solid #1e1e2e;'
@@ -199,13 +283,13 @@ def _build_agent_widget_script(agent_name: str = "Agent") -> str:
         '#taw-p.show{display:flex}',
         # Header
         '.taw-h{display:flex;align-items:center;padding:12px 14px;'
-        'border-bottom:1px solid #1e1e2e;background:#0e0e18;gap:8px}',
-        '.taw-h-orb{width:30px;height:30px;border-radius:50%;flex-shrink:0;'
-        'background:radial-gradient(circle at 35% 30%,'
-        'rgba(255,255,255,0.3),transparent 60%),'
-        'linear-gradient(135deg,#A78BFA,#7C3AED)}',
-        '.taw-h-n{color:#fff;font-size:14px;font-weight:600;flex:1}',
-        '.taw-h-dot{width:8px;height:8px;border-radius:50%}',
+        'border-bottom:1px solid #1e1e2e;background:#0e0e18;gap:10px}',
+        # Mini orb in header
+        f'.taw-ho{{width:28px;height:28px;border-radius:50%;flex-shrink:0;'
+        f'background:radial-gradient(ellipse at 35% 40%,{cl40},{agent_color} 40%,{cd30} 90%);'
+        f'box-shadow:0 0 10px {glow2}}}',
+        '.taw-hn{color:#fff;font-size:14px;font-weight:600;flex:1}',
+        '.taw-hd{width:8px;height:8px;border-radius:50%}',
         '.taw-x{width:26px;height:26px;border-radius:50%;border:none;'
         'background:#1e1e2e;color:#9ca3af;cursor:pointer;font-size:14px;'
         'display:flex;align-items:center;justify-content:center}',
@@ -217,8 +301,8 @@ def _build_agent_widget_script(agent_name: str = "Agent") -> str:
         '#taw-m::-webkit-scrollbar-thumb{background:#2a2a3e;border-radius:2px}',
         '.taw-msg{max-width:85%;padding:10px 14px;border-radius:14px;'
         'font-size:13px;line-height:1.5;word-break:break-word}',
-        '.taw-msg.u{align-self:flex-end;background:#7C3AED;color:#fff;'
-        'border-bottom-right-radius:4px}',
+        f'.taw-msg.u{{align-self:flex-end;background:{agent_color};color:#fff;'
+        f'border-bottom-right-radius:4px}}',
         '.taw-msg.a{align-self:flex-start;background:#1e1e2e;color:#e5e7eb;'
         'border-bottom-left-radius:4px;white-space:pre-wrap}',
         '.taw-msg.t{color:#6b7280;font-style:italic;font-size:12px}',
@@ -230,12 +314,12 @@ def _build_agent_widget_script(agent_name: str = "Agent") -> str:
         'border-radius:20px;padding:8px 14px;color:#fff;font-size:13px;'
         'outline:none;font-family:inherit;-webkit-appearance:none}',
         '#taw-i::placeholder{color:#6b7280}',
-        '#taw-i:focus{border-color:#7C3AED}',
-        '#taw-s{width:34px;height:34px;border-radius:50%;border:none;'
-        'background:#7C3AED;color:#fff;cursor:pointer;font-size:16px;'
-        'flex-shrink:0;display:flex;align-items:center;'
-        'justify-content:center;-webkit-appearance:none}',
-        '#taw-s:hover{background:#6D28D9}',
+        f'#taw-i:focus{{border-color:{agent_color}}}',
+        f'#taw-s{{width:34px;height:34px;border-radius:50%;border:none;'
+        f'background:{agent_color};color:#fff;cursor:pointer;font-size:16px;'
+        f'flex-shrink:0;display:flex;align-items:center;'
+        f'justify-content:center;-webkit-appearance:none}}',
+        f'#taw-s:hover{{background:{cd15}}}',
         '</style>',
         # ── JS ──
         '<script>',
@@ -253,7 +337,7 @@ def _build_agent_widget_script(agent_name: str = "Agent") -> str:
         'inp=document.getElementById("taw-i"),'
         'sbtn=document.getElementById("taw-s"),'
         'd1=r.querySelector(".taw-dot"),'
-        'd2=r.querySelector(".taw-h-dot");',
+        'd2=r.querySelector(".taw-hd");',
         # Toggle
         'btn.onclick=function(){'
         'pnl.classList.add("show");btn.style.display="none";inp.focus()};',
@@ -315,9 +399,14 @@ def _build_agent_widget_script(agent_name: str = "Agent") -> str:
 
 # ── Agent proxy helpers ─────────────────────────────────────
 
-async def _get_agent(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]]:
+async def _get_agent(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str, str]]:
+    """Return (agent_url, api_key, agent_color) or None."""
     result = await db.execute(
-        select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+        select(
+            AgentConfig.agent_url,
+            AgentConfig.agent_api_key,
+            AgentConfig.agent_color,
+        )
         .where(
             AgentConfig.user_id == user_id,
             AgentConfig.deploy_status == "active",
@@ -325,7 +414,7 @@ async def _get_agent(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]
     )
     row = result.first()
     if row and row.agent_url and row.agent_api_key:
-        return (row.agent_url, row.agent_api_key)
+        return (row.agent_url, row.agent_api_key, row.agent_color or "#9B59B6")
     return None
 
 
@@ -380,7 +469,7 @@ async def get_server_info(current_user=Depends(get_current_user), db: AsyncSessi
     agent_info = await _get_agent(current_user.id, db)
     if not agent_info:
         return JSONResponse(content={"status": "offline"}, status_code=200)
-    agent_url, key = agent_info
+    agent_url, key, _ = agent_info
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -405,7 +494,7 @@ async def get_capabilities(current_user=Depends(get_current_user), db: AsyncSess
     agent_info = await _get_agent(current_user.id, db)
     if not agent_info:
         return JSONResponse(content={"core_tools": [], "skills": [], "total_tools": 0})
-    agent_url, key = agent_info
+    agent_url, key, _ = agent_info
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -423,7 +512,7 @@ async def get_capabilities(current_user=Depends(get_current_user), db: AsyncSess
 
 @router.get("/")
 async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     url = f"{agent_url}/api/apps/"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -437,19 +526,19 @@ async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = D
 
 @router.get("/jobs/")
 async def list_jobs(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, "jobs/")
 
 
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, f"jobs/{job_id}")
 
 
 @router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, f"jobs/{job_id}", method="DELETE")
 
 
@@ -513,7 +602,7 @@ async def preview_proxy(
         raise HTTPException(401, "Not authenticated")
 
     agent_info = await _get_agent(user.id, db)
-    agent_url, key = _require(agent_info)
+    agent_url, key, agent_color = _require(agent_info)
 
     from urllib.parse import urlparse
     vps_host = urlparse(agent_url).hostname
@@ -563,7 +652,9 @@ async def preview_proxy(
                     '"Noto Color Emoji" !important; }'
                     '</style>'
                 )
-                agent_widget_script = _build_agent_widget_script()
+                agent_widget_script = _build_agent_widget_script(
+                    agent_color=agent_color
+                )
                 html = body.decode("utf-8", errors="replace")
                 html = html.replace("<head>", f"<head>\n{meta_charset}\n{base_tag}\n{agent_bridge_script}\n{agent_widget_script}\n{emoji_css}", 1)
                 # Rewrite absolute src="/..." to relative so <base href>
@@ -618,7 +709,7 @@ async def preview_proxy(
 
 @router.get("/{app_id}")
 async def get_app(app_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     url = f"{agent_url}/api/apps/{app_id}"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -632,19 +723,19 @@ async def get_app(app_id: str, current_user=Depends(get_current_user), db: Async
 
 @router.post("/{app_id}/start")
 async def start_app(app_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, f"{app_id}/start", method="POST", timeout=60.0)
 
 
 @router.post("/{app_id}/stop")
 async def stop_app(app_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, f"{app_id}/stop", method="POST")
 
 
 @router.post("/{app_id}/publish-web")
 async def publish_web(app_id: str, request: Request, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     body = None
     try:
         body = await request.json()
@@ -655,11 +746,11 @@ async def publish_web(app_id: str, request: Request, current_user=Depends(get_cu
 
 @router.post("/{app_id}/push-github")
 async def push_github(app_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, f"{app_id}/push-github", method="POST", timeout=60.0)
 
 
 @router.delete("/{app_id}")
 async def delete_app(app_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key = _require(await _get_agent(current_user.id, db))
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, app_id, method="DELETE")

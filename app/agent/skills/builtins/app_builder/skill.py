@@ -50,7 +50,7 @@ User wants: "{description}"
 
 Output ONLY valid JSON (no markdown fences, no explanation):
 {{
-  "files": ["/App.tsx", "/screens/HomeScreen.tsx", "/components/AgentPlaceholder.tsx", "/lib/agentBridge.ts", ...],
+  "files": ["/App.tsx", "/screens/HomeScreen.tsx", "/lib/agentBridge.ts", "/lib/agentActions.ts", ...],
   "dependencies": ["@react-navigation/native", "expo-sqlite", ...],
   "app_name": "TodoApp",
   "summary": "A todo app with ...",
@@ -99,17 +99,15 @@ You MUST include /components/ErrorBoundary.tsx in EVERY plan.
 This is a class-based React component that wraps the entire app and catches runtime errors,
 showing a helpful error message + reload button instead of a blank white screen.
 
-CRITICAL — Agent Placeholder System:
+CRITICAL — Agent Integration System:
 Every app is an "agentic app" — the user's AI agent must be able to work inside it.
+The platform proxy automatically injects the agent's Orb UI (floating chat widget with
+the user's real agent appearance, eyes, breathing animation, and live WebSocket connection).
+Do NOT generate any agent UI component — no AgentPlaceholder.tsx, no floating chat bubble.
+The proxy handles the agent UI for all apps automatically.
+
 You MUST include these files in EVERY plan:
   - /components/ErrorBoundary.tsx — Catches runtime errors, shows error screen instead of white page
-  - /components/AgentPlaceholder.tsx — Floating agent widget that:
-    - Shows the agent avatar as a small circle (docked/idle state)
-    - Expands into an inline chat interface when tapped (active state)
-    - Is overlaid on EVERY screen via absolute positioning
-    - RESPONSIVE POSITIONING: on mobile bottom: 80 (above tab bar), on desktop bottom: 24
-    - Must NEVER overlap the bottom tab bar or sidebar navigation
-    - The bottom tab bar must have paddingRight: 56 to avoid the agent button overlapping the last tab
   - /lib/agentBridge.ts — Bridge module that:
     - Exposes the current screen/route name to the agent
     - Provides a navigate(screenName, params?) function for agent-driven navigation
@@ -119,7 +117,7 @@ You MUST include these files in EVERY plan:
   - /lib/agentActions.ts — Screen-specific action registry:
     - Maps each screen to actions the agent can perform on it
     - E.g. HomeScreen → [addItem, searchItems, filterBy], SettingsScreen → [toggleTheme, exportData]
-The AgentPlaceholder MUST be rendered in App.tsx (ALWAYS visible, never conditionally hidden).
+Do NOT include /components/AgentPlaceholder.tsx — the proxy injects the agent UI.
 """
 
 CODE_GEN_PROMPT = """Generate the complete TypeScript code for {file_path} in a React Native/Expo app.
@@ -258,7 +256,7 @@ Responsive Navigation (CRITICAL — every app MUST include this):
   - On MOBILE (isDesktop === false): render a horizontal bottom tab bar:
     - View with flexDirection: 'row', backgroundColor: '#1C2128', borderTopWidth: 1, borderTopColor: '#30363D'
     - paddingBottom: insets.bottom (safe area), height: 60 + insets.bottom
-    - paddingRight: 56 — reserve space on the right for the floating AgentPlaceholder button
+    - paddingRight: 56 — reserve space on the right for the floating agent Orb
       so the last tab item is never hidden behind the agent button
     - Each tab: Pressable with emoji icon + label, highlighted color when focused (#58A6FF vs #8B949E)
   - On DESKTOP (isDesktop === true): render a vertical left sidebar:
@@ -331,55 +329,21 @@ Error Boundary (CRITICAL — prevents white screens):
       <NavigationContainer theme={{...}}>
         ...
       </NavigationContainer>
-      <AgentPlaceholder />
     </ErrorBoundary>
   );
   ```
+  Note: Do NOT render AgentPlaceholder — the platform proxy injects the agent Orb UI automatically.
 
-Agent Placeholder System (CRITICAL — every app is "agentic"):
+Agent Integration System (CRITICAL — every app is "agentic"):
 - If this is /components/AgentPlaceholder.tsx:
-  IMPORTANT: The platform proxy injects its own polished agent widget.
-  Your component MUST check for it and skip rendering if present:
+  DO NOT generate this file. The platform proxy injects the agent's Orb UI
+  automatically (floating sphere with eyes, breathing animation, chat panel,
+  live WebSocket connection). If this file is requested, return a minimal stub:
   ```
-  if (Platform.OS === 'web' && typeof window !== 'undefined' && (window as any).__TOUP_AGENT_UI_INJECTED) {
-    return null; // Platform-injected widget handles the UI
-  }
+  import React from 'react';
+  export default function AgentPlaceholder() { return null; }
   ```
-  Place this check AFTER all hooks but BEFORE the JSX return.
-  This ensures the injected widget (with proper WS connection and token refresh)
-  is used instead of the generated one when viewing through the platform proxy.
-  The generated component is still needed as a fallback for Expo Go native.
-
-  Build a floating agent widget component with TWO modes:
-
-  DOCKED MODE (default, minimized state):
-  - Small circular avatar button (44x44)
-  - Position: absolute, zIndex: 9999
-  - RESPONSIVE POSITIONING to avoid overlapping navigation:
-    - On MOBILE (width <= 768): bottom: 80 (ABOVE the 60px bottom tab bar + safe area), right: 16
-    - On DESKTOP (width > 768): bottom: 24, right: 24 (no bottom tab bar on desktop, sidebar is on left)
-  - Use useWindowDimensions() to determine isDesktop = width > 768
-  - Subtle pulsing border animation (2s loop, opacity 0.4 → 1.0)
-  - Background color: #58A6FF with slight glow/shadow
-  - Shows a small "chat" emoji (💬) or agent icon inside
-  - When agentBridge.isConnected: green dot indicator (8px, top-right corner of circle)
-
-  EXPANDED MODE (when tapped):
-  - Inline chat panel (width: 340, height: 480, borderRadius: 16, dark background #1C2128)
-  - On MOBILE: position absolute, bottom: 80, right: 8, left: 8, width: auto (full width minus margins)
-  - On DESKTOP: position absolute, bottom: 24, right: 24, fixed 340px width
-  - Header: "Agent" title + minimize button + connection dot (green=connected, gray=disconnected)
-  - ScrollView for messages
-  - TextInput + send button at the bottom
-  - Messages sent/received via agentBridge (sendMessage / onAgentMessage)
-  - Show typing indicator when agentBridge.onToolActivity fires
-  - If agentBridge.isConnected is false, show "Connecting..." text
-
-  The component accepts: onMessage callback, agentColor prop (default #58A6FF).
-  Use Animated API for smooth expand/collapse transitions.
-
-  CRITICAL: The docked button must NEVER overlap the bottom tab bar or sidebar navigation.
-  The bottom: 80 on mobile ensures it sits above the ~60px tab bar + safe area padding.
+  The injected Orb widget replaces this component entirely.
 
 - If this is /lib/agentBridge.ts:
   IMPORTANT: The platform proxy injects a pre-built bridge as window.__TOUP_AGENT_BRIDGE.
@@ -434,15 +398,13 @@ Agent Placeholder System (CRITICAL — every app is "agentic"):
 - If this is /App.tsx:
   Import AdaptiveTabBar from './components/AdaptiveTabBar' and use it as the tabBar prop:
   `tabBar={{(props) => <AdaptiveTabBar {{...props}} appName="AppName" />}}`
-  Import AgentPlaceholder and render it as the LAST child inside NavigationContainer,
-  positioned absolutely so it overlays all screens.
+  Do NOT import or render AgentPlaceholder — the platform proxy injects the agent UI automatically.
   Import {{ AgentBridge }} from './lib/agentBridge' and use it directly (NOT .getInstance()).
+  Pass the navigation ref to AgentBridge.setNavigationRef() so the agent can navigate screens.
   Example: AgentBridge.setNavigationRef(ref), AgentBridge.sendMessage(msg), AgentBridge.currentScreen = name.
-  IMPORTANT: ALWAYS render AgentPlaceholder — it is a core part of every agentic app.
-  The AgentPlaceholder handles its own responsive positioning (above tab bar on mobile, bottom-right on desktop).
-  It connects to the user's real agent via the agentBridge WebSocket when available.
-  Example: after <Tab.Navigator>...</Tab.Navigator>, add <AgentPlaceholder />.
-  Do NOT conditionally hide it based on __TOUP_AUTH_TOKEN — it must ALWAYS be visible.
+  Do NOT render AgentPlaceholder — the platform proxy injects the agent's Orb UI with live WebSocket
+  connection, proper appearance, and chat panel. The agent bridge still needs to be initialized
+  for navigation and screen metadata.
   CRITICAL: Use createBottomTabNavigator with AdaptiveTabBar — NEVER render bottom tabs without it.
 
 - For ANY screen file:
