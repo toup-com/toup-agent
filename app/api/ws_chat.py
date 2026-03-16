@@ -291,35 +291,20 @@ async def ws_chat(
                                     f"- Suggest helpful actions as [[Button Label]] chips.\n"
                                 )
                                 if _is_layer2:
-                                    # Layer 2 trigger — include app structure context
-                                    _plan = _app.plan_json or ""
-                                    _plan_ctx = ""
-                                    if _plan:
-                                        import json as _json
-                                        try:
-                                            _plan_data = _json.loads(_plan)
-                                            _screens = _plan_data.get("screens", [])
-                                            _features = _plan_data.get("features", [])
-                                            _db_type = _plan_data.get("db_type", "none")
-                                            _plan_ctx = (
-                                                f"\n- APP STRUCTURE from Layer 1 build:\n"
-                                                f"  Screens: {', '.join(_screens) if _screens else 'unknown'}\n"
-                                                f"  Features: {', '.join(_features) if _features else 'unknown'}\n"
-                                                f"  Database: {_db_type}\n"
-                                            )
-                                        except Exception:
-                                            pass
+                                    # Layer 2 trigger — audit-first deep customization
                                     _base_ctx += (
-                                        f"\n- LAYER 2 CUSTOMIZATION MODE: The user wants to personalize this app.\n"
-                                        f"  FIRST: Use app_{_slug_safe}__read_file to read the app's main files "
-                                        f"(App.tsx, screen components, database files) to understand the full structure.\n"
-                                        f"  THEN: Ask at least 10 targeted questions about their preferences, "
-                                        f"goals, and how they want to customize the app. Every question MUST have "
-                                        f"[[option]] buttons.\n"
-                                        f"  Questions must be SPECIFIC to what this app does — not generic.\n"
-                                        f"  AFTER answers: Use write_file and query_db to apply changes live.\n"
-                                        f"  Show progress as you edit. Confirm each change."
-                                        f"{_plan_ctx}"
+                                        f"\n- LAYER 2 CUSTOMIZATION MODE activated.\n"
+                                        f"  STEP 1 (SILENT): Use app_{_slug_safe}__read_file to read EVERY key file — "
+                                        f"App.tsx, all screen components, database/seed files, data constants, config files. "
+                                        f"Do NOT tell the user you are reading files. Do NOT expose paths or technical details.\n"
+                                        f"  As you read, identify: placeholder/demo data, shallow features, generic defaults, "
+                                        f"hardcoded content that should be personalized, missing functionality.\n"
+                                        f"  STEP 2: Ask 10+ questions that reference SPECIFIC things you found in the code. "
+                                        f"Example: 'I found 500 vocabulary words but they are all general — should I focus on your field?' "
+                                        f"NEVER ask generic onboarding questions (target score, test date, color theme — Layer 1 already did that). "
+                                        f"Every question MUST have [[option]] buttons on the NEXT LINE — buttons must be inline with their question, "
+                                        f"NOT collected at the end.\n"
+                                        f"  STEP 3: Apply changes with write_file/query_db. Show brief progress after each edit.\n"
                                     )
                                 text = f"{_base_ctx}]\n\n{text}"
                     except Exception as e:

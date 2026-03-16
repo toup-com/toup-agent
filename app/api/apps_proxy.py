@@ -395,35 +395,42 @@ def _build_agent_widget_script(
         'var c=B.isConnected?"#22c55e":"#6b7280";'
         'd1.style.backgroundColor=c;d2.style.backgroundColor=c}',
         'setInterval(us,2000);us();',
-        # Add message helper — parses [[buttons]] and basic markdown
+        # Add message helper — parses [[buttons]] inline per paragraph
         'function am(t,s){'
         'var e=msgs.querySelector(".taw-empty");if(e)e.remove();'
         'var d=document.createElement("div");d.className="taw-msg "+s;'
         # Strip [[reaction:EMOJI]] patterns
         't=t.replace(/\\[\\[reaction:[^\\]]*\\]\\]/g,"");'
-        # Extract [[button:LABEL|DATA]] and [[OPTION]] patterns
-        'var btns=[];'
-        't=t.replace(/\\[\\[button:([^|\\]]+)\\|([^\\]]+)\\]\\]/g,function(_,l,d){btns.push(l);return""});'
-        't=t.replace(/\\[\\[([^\\]]{1,50})\\]\\]/g,function(_,l){btns.push(l);return""});'
-        't=t.trim();'
-        # Sanitize HTML entities then render basic markdown
         'if(s==="a"){'
-        'var h=t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");'
+        # Split by double newline into paragraphs, render each with inline buttons
+        'var paras=t.split(/\\n\\n+/);'
+        'for(var pi=0;pi<paras.length;pi++){'
+        'var p=paras[pi],pbtns=[];'
+        'p=p.replace(/\\[\\[button:([^|\\]]+)\\|([^\\]]+)\\]\\]/g,function(_,l){pbtns.push(l);return""});'
+        'p=p.replace(/\\[\\[([^\\]]{1,50})\\]\\]/g,function(_,l){pbtns.push(l);return""});'
+        'p=p.trim();if(!p&&!pbtns.length)continue;'
+        # Sanitize + markdown
+        'var h=p.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");'
         'h=h.replace(/\\*\\*(.+?)\\*\\*/g,"<b>$1</b>");'
         'h=h.replace(/\\*(.+?)\\*/g,"<i>$1</i>");'
         'h=h.replace(/`([^`]+)`/g,"<code style=\\"background:#2a2a3e;padding:1px 4px;border-radius:3px\\">$1</code>");'
         'h=h.replace(/\\n/g,"<br>");'
-        'd.innerHTML=h;'
-        # Render button chips if any
-        'if(btns.length){'
-        'var cw=document.createElement("div");cw.className="taw-chips";'
-        'for(var i=0;i<btns.length;i++){(function(label){'
-        'var b=document.createElement("button");b.className="taw-chip";'
-        'b.textContent=label;b.onclick=function(){am(label,"u");B.sendMessage(label);'
+        'if(pi>0)h="<div style=\\"margin-top:10px\\">"+h+"</div>";'
+        'else h="<div>"+h+"</div>";'
+        # Render inline button chips for this paragraph
+        'if(pbtns.length){'
+        'h+="<div class=\\"taw-chips\\">";'
+        'for(var bi=0;bi<pbtns.length;bi++){'
+        'h+="<button class=\\"taw-chip\\" data-lbl=\\""+pbtns[bi].replace(/"/g,"&quot;")+"\\">"+pbtns[bi].replace(/&/g,"&amp;").replace(/</g,"&lt;")+"</button>"}'
+        'h+="</div>"}'
+        'd.innerHTML+=(d.innerHTML?"":"")+h}'
+        # Attach click handlers to all chip buttons
+        'var chips=d.querySelectorAll(".taw-chip");'
+        'for(var ci=0;ci<chips.length;ci++){(function(c){'
+        'c.onclick=function(){var l=c.getAttribute("data-lbl");am(l,"u");B.sendMessage(l);'
         'var tp=document.createElement("div");tp.className="taw-msg a t";tp.id="taw-tp";'
-        'tp.textContent="Thinking...";msgs.appendChild(tp);msgs.scrollTop=msgs.scrollHeight};'
-        'cw.appendChild(b)})(btns[i])}'
-        'd.appendChild(cw)}'
+        'tp.textContent="Thinking...";msgs.appendChild(tp);msgs.scrollTop=msgs.scrollHeight}'
+        '})(chips[ci])}'
         '}else{d.textContent=t}'
         'msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight}',
         # Send

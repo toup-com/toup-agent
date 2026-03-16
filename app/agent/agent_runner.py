@@ -782,10 +782,18 @@ class AgentRunner:
                 "# Action Buttons\n"
                 "You can offer clickable action buttons by including [[Label]] markers in your response.\n"
                 "These render as tappable chips in the chat UI. When the user taps one, it sends that label as a message.\n"
-                "Use buttons to suggest next actions:\n"
-                "Example: What would you like to do?\n"
-                "[[Show my progress]] [[Start a practice session]] [[Change settings]]\n"
-                "Keep button labels short (2-5 words). Use 2-4 buttons per message when relevant."
+                "CRITICAL PLACEMENT RULE: Place [[option]] buttons DIRECTLY on the line after each question.\n"
+                "NEVER collect all buttons at the end of the message. Each question gets its own buttons immediately below it.\n\n"
+                "CORRECT:\n"
+                "1. **Question one?**\n"
+                "[[Option A]] [[Option B]] [[Option C]]\n\n"
+                "2. **Question two?**\n"
+                "[[Option X]] [[Option Y]]\n\n"
+                "WRONG:\n"
+                "1. Question one?\n"
+                "2. Question two?\n"
+                "[[Option A]] [[Option B]] [[Option X]] [[Option Y]]\n\n"
+                "Keep button labels short (2-5 words). Use 2-4 buttons per question when relevant."
             )
         else:
             sections.append(
