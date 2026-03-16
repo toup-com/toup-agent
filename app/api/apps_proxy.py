@@ -432,14 +432,18 @@ def _build_agent_widget_script(
         'B.onAgentMessage(function(t){'
         'var tp=document.getElementById("taw-tp");if(tp)tp.remove();'
         'am(t,"a")});',
-        # Tool activity → typing indicator
+        # Tool activity → typing indicator with tool name
         'B.onToolActivity(function(tool,done){'
         'var tp=document.getElementById("taw-tp");'
         'if(!done&&!tp){'
         'tp=document.createElement("div");'
         'tp.className="taw-msg a t";tp.id="taw-tp";'
-        'tp.textContent="Working...";'
+        'var tn=tool?tool.replace(/^app_[a-z0-9_]+__/,"").replace(/_/g," "):"";'
+        'tp.innerHTML=tn?"&#x1f527; Using "+tn+"...":"Thinking...";'
         'msgs.appendChild(tp);msgs.scrollTop=msgs.scrollHeight}'
+        'else if(!done&&tp){'
+        'var tn2=tool?tool.replace(/^app_[a-z0-9_]+__/,"").replace(/_/g," "):"";'
+        'if(tn2)tp.innerHTML="&#x1f527; Using "+tn2+"..."}'
         'else if(done&&tp)tp.textContent="Almost done..."});',
         # Hide generated AgentPlaceholder (scans positioned bottom-right elements)
         # Uses MutationObserver + interval to catch late-rendered elements
