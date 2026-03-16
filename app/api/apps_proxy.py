@@ -5,6 +5,7 @@ App data (built apps, build jobs) lives on the user's VPS.
 The platform is a passthrough proxy only.
 """
 
+import json
 import logging
 import re
 from typing import Optional, Tuple
@@ -27,36 +28,51 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
     """Build the inline <script> that creates a deterministic agent bridge.
 
     This script runs in <head> BEFORE the Expo JS bundle loads.
-    It creates window.__TOUP_AGENT_BRIDGE with a full WebSocket bridge,
-    then clears window.__TOUP_AUTH_TOKEN so the LLM-generated agentBridge.ts
-    won't create a duplicate connection.
+    It creates window.__TOUP_AGENT_BRIDGE using HTTP fetch + SSE streaming
+    (not WebSocket) for maximum reliability through Cloudflare/Railway.
     """
     return (
         "<script>"
         "(function(){"
         # ── Config ──
-        f'var T="{token}",A="{app_id}",U="wss://"+location.host+"/api/ws/chat";'
+        f'var T="{token}",A="{app_id}";'
+        # Chat endpoint — same-origin HTTP POST, no WebSocket needed
+        'var chatUrl="/api/apps/"+A+"/chat";'
         # ── Set globals for generated code that checks them ──
         'window.__TOUP_APP_ID=A;'
-        'window.__TOUP_WS_URL=U;'
+        'window.__TOUP_WS_URL="";'
         # ── Bridge state ──
-        'var ws=null,connected=false,buf="",q=[],'
-        'msgCbs=[],toolCbs=[],navRef=null,screens=[],actions={},'
-        'attempt=0,maxDelay=30000,hbTimer=null,reconTimer=null;'
-        # ── Connect ──
-        'function connect(){'
-        'console.log("[ToupBridge] connect() T="+T.slice(0,20)+"… U="+U);'
-        'if(!T){console.warn("[ToupBridge] No token, skipping");return}'
-        'try{ws=new WebSocket(U+"?token="+encodeURIComponent(T))}catch(e){console.error("[ToupBridge] WS create error",e);return schedRecon()}'
-        'ws.onopen=function(){'
-        'console.log("[ToupBridge] WS connected!");'
-        'connected=true;attempt=0;B.isConnected=true;'
-        'hbTimer=setInterval(function(){try{ws.send("ping")}catch(e){}},25000);'
-        'while(q.length){try{ws.send(JSON.stringify(q.shift()))}catch(e){}}'
-        '};'
-        'ws.onmessage=function(ev){'
-        'if(ev.data==="pong")return;'
-        'var d;try{d=JSON.parse(ev.data)}catch(e){return}'
+        'var sending=false,msgCbs=[],toolCbs=[],navRef=null,screens=[],actions={};'
+        # ── Send message via HTTP POST + read SSE stream ──
+        'function send(text){'
+        'if(sending||!T)return;'
+        'sending=true;'
+        'var buf="";'
+        'for(var i=0;i<toolCbs.length;i++)try{toolCbs[i]("thinking",false)}catch(e){}'
+        'fetch(chatUrl+"?token="+encodeURIComponent(T),{'
+        'method:"POST",'
+        'headers:{"Content-Type":"application/json"},'
+        'body:JSON.stringify({text:text,session_id:"app-"+A})'
+        '}).then(function(r){'
+        'if(!r.ok)throw new Error("HTTP "+r.status);'
+        'B.isConnected=true;'  # successful HTTP = connected
+        'var reader=r.body.getReader(),dec=new TextDecoder(),partial="";'
+        'function pump(){'
+        'reader.read().then(function(result){'
+        'if(result.done){'
+        # Stream done — emit final text
+        'sending=false;'
+        'var final=buf;'
+        'if(final)for(var i=0;i<msgCbs.length;i++)try{msgCbs[i](final)}catch(e){}'
+        'for(var i=0;i<toolCbs.length;i++)try{toolCbs[i]("done",true)}catch(e){}'
+        'return}'
+        'partial+=dec.decode(result.value,{stream:true});'
+        'var lines=partial.split("\\n");'
+        'partial=lines.pop();'  # keep incomplete line
+        'for(var li=0;li<lines.length;li++){'
+        'var line=lines[li];'
+        'if(line.indexOf("data: ")!==0)continue;'
+        'var d;try{d=JSON.parse(line.slice(6))}catch(e){continue}'
         'if(d.type==="text_chunk"){buf+=(d.text||"")}'
         'else if(d.type==="done"){'
         'var t=d.text||buf;buf="";'
@@ -73,33 +89,37 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         'var m=d.text||d.message||"Error";'
         'for(var i=0;i<msgCbs.length;i++)try{msgCbs[i](m)}catch(e){}'
         '}'
-        '};'
-        'ws.onclose=function(ev){'
-        'console.warn("[ToupBridge] WS closed code="+ev.code+" reason="+ev.reason+" clean="+ev.wasClean);'
-        'cleanup();if(!ev.wasClean||ev.code!==1000)schedRecon()'
-        '};'
-        'ws.onerror=function(ev){console.error("[ToupBridge] WS error",ev);cleanup();schedRecon()}'
         '}'
-        # ── Reconnect ──
-        'function cleanup(){'
-        'connected=false;B.isConnected=false;ws=null;'
-        'if(hbTimer){clearInterval(hbTimer);hbTimer=null}'
+        'pump()'
+        '}).catch(function(e){sending=false;console.error("[ToupBridge]",e)})'
         '}'
-        'function schedRecon(){'
-        'if(reconTimer)return;'
-        'var delay=Math.min(1000*Math.pow(2,attempt),maxDelay);'
-        'attempt++;'
-        'reconTimer=setTimeout(function(){reconTimer=null;connect()},delay)'
+        'pump()'
+        '}).catch(function(e){'
+        'sending=false;'
+        'console.error("[ToupBridge] fetch error",e);'
+        'for(var i=0;i<msgCbs.length;i++)try{msgCbs[i]("Connection error. Try again.")}catch(e){}'
+        '})'
+        '}'
+        # ── Ping to verify connectivity on init ──
+        'function ping(){'
+        'if(!T)return;'
+        'fetch(chatUrl+"?token="+encodeURIComponent(T),{'
+        'method:"POST",'
+        'headers:{"Content-Type":"application/json"},'
+        'body:JSON.stringify({text:"ping",session_id:"app-"+A})'
+        '}).then(function(r){'
+        'B.isConnected=r.ok;'
+        'console.log("[ToupBridge] ping ok="+r.ok)'
+        '}).catch(function(){'
+        'B.isConnected=false;'
+        'console.warn("[ToupBridge] ping failed")'
+        '})'
         '}'
         # ── Bridge API ──
         'var B={'
         'isConnected:false,'
         'currentScreen:"",'
-        'sendMessage:function(text){'
-        'var m={type:"message",text:text,app_id:A,channel:"app"};'
-        'if(ws&&ws.readyState===1)try{ws.send(JSON.stringify(m))}catch(e){q.push(m)}'
-        'else q.push(m)'
-        '},'
+        'sendMessage:function(text){send(text)},'
         'onAgentMessage:function(cb){msgCbs.push(cb);return function(){'
         'var i=msgCbs.indexOf(cb);if(i>=0)msgCbs.splice(i,1)}},'
         'onToolActivity:function(cb){toolCbs.push(cb);return function(){'
@@ -114,30 +134,22 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         'setScreens:function(s){screens=s},'
         'getActions:function(s){return s?actions[s]||[]:Object.values(actions).flat()},'
         'setActions:function(a){actions=a},'
-        'destroy:function(){'
-        'if(reconTimer){clearTimeout(reconTimer);reconTimer=null}'
-        'if(hbTimer){clearInterval(hbTimer);hbTimer=null}'
-        'if(ws){ws.onclose=null;ws.onerror=null;ws.close();ws=null}'
-        'connected=false;B.isConnected=false;msgCbs=[];toolCbs=[];q=[]'
-        '}'
+        'destroy:function(){msgCbs=[];toolCbs=[]}'
         '};'
-        # ── PostMessage listener for config updates (token refresh) ──
+        # ── PostMessage listener for config/token updates ──
         'window.addEventListener("message",function(ev){'
         'if(ev.data&&ev.data.type==="toup_agent_config"){'
         'if(ev.data.token)T=ev.data.token;'
-        'if(ev.data.app_id)A=ev.data.app_id;'
-        'if(ev.data.ws_url)U=ev.data.ws_url;'
-        'if(!connected&&T){attempt=0;if(reconTimer){clearTimeout(reconTimer);reconTimer=null}connect()}'
+        'if(ev.data.app_id){A=ev.data.app_id;chatUrl="/api/apps/"+A+"/chat"}'
+        'if(T&&!B.isConnected)ping()'
         '}'
         '});'
         # ── Expose globally ──
         'window.__TOUP_AGENT_BRIDGE=B;'
-        # Keep __TOUP_AUTH_TOKEN intact — existing apps' agentBridge.ts
-        # reads it to connect.  Both bridges may connect (ours + generated),
-        # but that's harmless.  Future apps delegate to the injected bridge.
-        # ── Auto-connect ──
-        'console.log("[ToupBridge] init T="+(T?"yes("+T.length+")":"EMPTY")+" A="+A);'
-        'if(T)connect()'
+        'window.__TOUP_AUTH_TOKEN=T;'
+        # ── Auto-ping to verify connectivity ──
+        'console.log("[ToupBridge] HTTP mode, app="+A+" token="+(T?"yes":"no"));'
+        'if(T)ping()'
         "})()"
         "</script>"
     )
@@ -720,6 +732,119 @@ async def preview_proxy(
     except Exception as e:
         logger.warning("Preview proxy failed: %s → %s", target, e)
         raise HTTPException(502, "App preview unreachable")
+
+
+@router.post("/{app_id}/chat")
+async def app_chat_proxy(
+    app_id: str, request: Request,
+    token: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """HTTP→WebSocket chat proxy — bridge sends fetch(), we relay to VPS agent WS.
+
+    Browser can't reliably open WebSocket through Cloudflare→Railway→VPS chain,
+    but Railway CAN open WS to VPS directly (server-to-server).
+    So: browser POSTs here → we open WS to VPS agent → collect response → SSE back.
+    """
+    import asyncio
+
+    # Authenticate (same as preview_proxy)
+    user = None
+    try:
+        user = await get_current_user(request, db)
+    except Exception:
+        pass
+    if not user and token:
+        user = await _get_user_from_token(token, db)
+    if not user:
+        cookie_token = request.cookies.get("preview_token")
+        if cookie_token:
+            user = await _get_user_from_token(cookie_token, db)
+    if not user:
+        raise HTTPException(401, "Not authenticated")
+
+    agent_info = await _get_agent(user.id, db)
+    agent_url, key, _ = _require(agent_info)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+
+    text = body.get("text", "")
+    if not text:
+        raise HTTPException(400, "Missing 'text' field")
+
+    # Build WS URL to VPS agent
+    ws_url = agent_url.replace("https://", "wss://").replace("http://", "ws://")
+    if not ws_url.endswith("/"):
+        ws_url += "/api/ws/chat"
+    else:
+        ws_url += "api/ws/chat"
+    full_ws_url = f"{ws_url}?agent_key={key}"
+
+    session_id = body.get("session_id", f"app-{app_id}")
+
+    async def stream_via_ws():
+        try:
+            import websockets
+        except ImportError:
+            yield f"data: {json.dumps({'type': 'error', 'text': 'Server WebSocket library not available'})}\n\n"
+            return
+
+        try:
+            async with websockets.connect(
+                full_ws_url,
+                max_size=10 * 1024 * 1024,
+                open_timeout=15,
+                close_timeout=5,
+            ) as ws:
+                # Send the chat message
+                msg = json.dumps({
+                    "type": "message",
+                    "text": text,
+                    "session_id": session_id,
+                    "app_id": app_id,
+                    "channel": "app",
+                })
+                await ws.send(msg)
+
+                # Collect streaming response
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=120)
+                    except asyncio.TimeoutError:
+                        yield f"data: {json.dumps({'type': 'error', 'text': 'Agent response timeout'})}\n\n"
+                        break
+
+                    if raw == "pong":
+                        continue
+
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # Forward as SSE
+                    yield f"data: {raw}\n\n"
+
+                    # Stop after "done" or "error"
+                    if data.get("type") in ("done", "error"):
+                        break
+
+        except Exception as e:
+            logger.warning("App chat WS proxy error: %s", e)
+            yield f"data: {json.dumps({'type': 'error', 'text': f'Agent connection error: {e}'})}\n\n"
+
+    return StreamingResponse(
+        stream_via_ws(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{app_id}")
