@@ -236,10 +236,10 @@ def _build_agent_widget_script(
         '<div id="taw-m"><div class="taw-empty">'
         'Ask me anything!'
         '<div style="margin-top:12px">'
-        f'<button class="taw-chip taw-l2" onclick="this.parentElement.parentElement.remove();'
-        f'am(\'Customize this app for me — let\\'s build Layer 2!\',\'u\');'
-        f'B.sendMessage(\'Customize this app for me — let\\'s build Layer 2!\',{{layer2:true}})">'
-        f'\u2728 Customize this app</button>'
+        '<button class="taw-chip taw-l2" onclick="this.parentElement.parentElement.remove();'
+        "am('Customize this app for me!','u');"
+        "B.sendMessage('Customize this app for me!',{layer2:true})\">"
+        '\u2728 Customize this app</button>'
         '</div>'
         '</div></div>'
         '<div class="taw-iw">'
