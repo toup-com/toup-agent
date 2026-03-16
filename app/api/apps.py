@@ -88,6 +88,8 @@ class JobResponse(BaseModel):
     error_message: Optional[str] = None
     paused_at: Optional[str] = None
     resume_after: Optional[str] = None
+    layer: int = 1
+    layer2_changes: Optional[List[Dict[str, Any]]] = None
     created_at: str
     completed_at: Optional[str] = None
 
@@ -137,6 +139,13 @@ def _job_to_response(job: BuildJob) -> JobResponse:
     except (json.JSONDecodeError, TypeError):
         pass
 
+    layer2_changes = None
+    try:
+        if getattr(job, 'layer2_changes_json', None):
+            layer2_changes = json.loads(job.layer2_changes_json)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     return JobResponse(
         id=job.id,
         app_id=job.app_id,
@@ -149,6 +158,8 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         error_message=job.error_message,
         paused_at=job.paused_at.isoformat() if getattr(job, 'paused_at', None) else None,
         resume_after=job.resume_after.isoformat() if getattr(job, 'resume_after', None) else None,
+        layer=getattr(job, 'layer', 1) or 1,
+        layer2_changes=layer2_changes,
         created_at=job.created_at.isoformat() if job.created_at else "",
         completed_at=job.completed_at.isoformat() if job.completed_at else None,
     )

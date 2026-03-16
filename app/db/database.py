@@ -114,6 +114,9 @@ async def init_db():
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS paused_at TIMESTAMP",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS resume_after TIMESTAMP",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS checkpoint_json TEXT",
+        # Layer 2 support
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS layer INTEGER DEFAULT 1",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS layer2_changes_json TEXT",
     ]
     # Seed user-facing VPS plans — Hetzner Cloud CPX (AMD, Shared Regular Performance)
     # Location: ASH (Ashburn, Virginia, USA)

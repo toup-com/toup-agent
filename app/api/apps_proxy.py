@@ -46,15 +46,17 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         # ── Bridge state ──
         'var sending=false,msgCbs=[],toolCbs=[],navRef=null,screens=[],actions={};'
         # ── Send message via HTTP POST + read SSE stream ──
-        'function send(text){'
+        'function send(text,opts){'
         'if(sending||!T)return;'
         'sending=true;'
         'var buf="";'
+        'var payload={text:text,session_id:"app-"+A};'
+        'if(opts&&opts.layer2)payload.layer2=true;'
         'for(var i=0;i<toolCbs.length;i++)try{toolCbs[i]("thinking",false)}catch(e){}'
         'fetch(chatUrl+"?token="+encodeURIComponent(T),{'
         'method:"POST",'
         'headers:{"Content-Type":"application/json"},'
-        'body:JSON.stringify({text:text,session_id:"app-"+A})'
+        'body:JSON.stringify(payload)'
         '}).then(function(r){'
         'if(!r.ok)throw new Error("HTTP "+r.status);'
         'B.isConnected=true;'  # successful HTTP = connected
@@ -107,7 +109,7 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         'var B={'
         'isConnected:!!T,'
         'currentScreen:"",'
-        'sendMessage:function(text){send(text)},'
+        'sendMessage:function(text,opts){send(text,opts)},'
         'onAgentMessage:function(cb){msgCbs.push(cb);return function(){'
         'var i=msgCbs.indexOf(cb);if(i>=0)msgCbs.splice(i,1)}},'
         'onToolActivity:function(cb){toolCbs.push(cb);return function(){'
@@ -232,7 +234,14 @@ def _build_agent_widget_script(
         '<button class="taw-x">\u2715</button>'
         '</div>'
         '<div id="taw-m"><div class="taw-empty">'
-        'Ask me anything!</div></div>'
+        'Ask me anything!'
+        '<div style="margin-top:12px">'
+        f'<button class="taw-chip taw-l2" onclick="this.parentElement.parentElement.remove();'
+        f'am(\'Customize this app for me — let\\'s build Layer 2!\',\'u\');'
+        f'B.sendMessage(\'Customize this app for me — let\\'s build Layer 2!\',{{layer2:true}})">'
+        f'\u2728 Customize this app</button>'
+        '</div>'
+        '</div></div>'
         '<div class="taw-iw">'
         '<input id="taw-i" placeholder="Type a message..." autocomplete="off">'
         '<button id="taw-s">\u2192</button></div>'
@@ -342,6 +351,7 @@ def _build_agent_widget_script(
         f'font-size:12px;cursor:pointer;background:transparent;'
         f'font-family:inherit;transition:all 0.15s;-webkit-appearance:none}}',
         f'.taw-chip:hover{{background:{agent_color};color:#fff}}',
+        f'.taw-l2{{background:{agent_color}15;border-color:{agent_color}60;font-weight:500}}',
         # Input
         '.taw-iw{display:flex;align-items:center;padding:10px 12px;'
         'border-top:1px solid #1e1e2e;background:#0e0e18;gap:8px}',
@@ -854,13 +864,16 @@ async def app_chat_proxy(
                 close_timeout=5,
             ) as ws:
                 # Send the chat message
-                msg = json.dumps({
+                _chat_msg = {
                     "type": "message",
                     "text": text,
                     "session_id": session_id,
                     "app_id": app_id,
                     "channel": "app",
-                })
+                }
+                if body.get("layer2"):
+                    _chat_msg["layer2"] = True
+                msg = json.dumps(_chat_msg)
                 await ws.send(msg)
 
                 # Collect streaming response

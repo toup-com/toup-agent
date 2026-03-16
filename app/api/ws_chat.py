@@ -277,7 +277,8 @@ async def ws_chat(
                             _app = await _db.get(App, app_id_from_msg)
                             if _app:
                                 _slug_safe = _app.slug.replace('-', '_')
-                                text = (
+                                _is_layer2 = msg.get("layer2") or False
+                                _base_ctx = (
                                     f"[CONTEXT: The user is chatting from inside their '{_app.name}' app. "
                                     f"You are their in-app assistant.\n"
                                     f"- Be conversational and helpful. Greet naturally when they say hi.\n"
@@ -287,8 +288,40 @@ async def ws_chat(
                                     f"app_{_slug_safe}__query_db (read/write app data).\n"
                                     f"- When the user asks to change something in the app (UI, content, settings), "
                                     f"use write_file/query_db to make it happen.\n"
-                                    f"- Suggest helpful actions as [[Button Label]] chips.]\n\n{text}"
+                                    f"- Suggest helpful actions as [[Button Label]] chips.\n"
                                 )
+                                if _is_layer2:
+                                    # Layer 2 trigger — include app structure context
+                                    _plan = _app.plan_json or ""
+                                    _plan_ctx = ""
+                                    if _plan:
+                                        import json as _json
+                                        try:
+                                            _plan_data = _json.loads(_plan)
+                                            _screens = _plan_data.get("screens", [])
+                                            _features = _plan_data.get("features", [])
+                                            _db_type = _plan_data.get("db_type", "none")
+                                            _plan_ctx = (
+                                                f"\n- APP STRUCTURE from Layer 1 build:\n"
+                                                f"  Screens: {', '.join(_screens) if _screens else 'unknown'}\n"
+                                                f"  Features: {', '.join(_features) if _features else 'unknown'}\n"
+                                                f"  Database: {_db_type}\n"
+                                            )
+                                        except Exception:
+                                            pass
+                                    _base_ctx += (
+                                        f"\n- LAYER 2 CUSTOMIZATION MODE: The user wants to personalize this app.\n"
+                                        f"  FIRST: Use app_{_slug_safe}__read_file to read the app's main files "
+                                        f"(App.tsx, screen components, database files) to understand the full structure.\n"
+                                        f"  THEN: Ask at least 10 targeted questions about their preferences, "
+                                        f"goals, and how they want to customize the app. Every question MUST have "
+                                        f"[[option]] buttons.\n"
+                                        f"  Questions must be SPECIFIC to what this app does — not generic.\n"
+                                        f"  AFTER answers: Use write_file and query_db to apply changes live.\n"
+                                        f"  Show progress as you edit. Confirm each change."
+                                        f"{_plan_ctx}"
+                                    )
+                                text = f"{_base_ctx}]\n\n{text}"
                     except Exception as e:
                         logger.warning(f"[WS] Failed to load app context: {e}")
 
