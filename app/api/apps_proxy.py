@@ -45,9 +45,11 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         'attempt=0,maxDelay=30000,hbTimer=null,reconTimer=null;'
         # ── Connect ──
         'function connect(){'
-        'if(!T)return;'
-        'try{ws=new WebSocket(U+"?token="+encodeURIComponent(T))}catch(e){return schedRecon()}'
+        'console.log("[ToupBridge] connect() T="+T.slice(0,20)+"… U="+U);'
+        'if(!T){console.warn("[ToupBridge] No token, skipping");return}'
+        'try{ws=new WebSocket(U+"?token="+encodeURIComponent(T))}catch(e){console.error("[ToupBridge] WS create error",e);return schedRecon()}'
         'ws.onopen=function(){'
+        'console.log("[ToupBridge] WS connected!");'
         'connected=true;attempt=0;B.isConnected=true;'
         'hbTimer=setInterval(function(){try{ws.send("ping")}catch(e){}},25000);'
         'while(q.length){try{ws.send(JSON.stringify(q.shift()))}catch(e){}}'
@@ -73,9 +75,10 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         '}'
         '};'
         'ws.onclose=function(ev){'
+        'console.warn("[ToupBridge] WS closed code="+ev.code+" reason="+ev.reason+" clean="+ev.wasClean);'
         'cleanup();if(!ev.wasClean||ev.code!==1000)schedRecon()'
         '};'
-        'ws.onerror=function(){cleanup();schedRecon()}'
+        'ws.onerror=function(ev){console.error("[ToupBridge] WS error",ev);cleanup();schedRecon()}'
         '}'
         # ── Reconnect ──
         'function cleanup(){'
@@ -124,7 +127,7 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         'if(ev.data.token)T=ev.data.token;'
         'if(ev.data.app_id)A=ev.data.app_id;'
         'if(ev.data.ws_url)U=ev.data.ws_url;'
-        'if(!connected&&T){attempt=0;connect()}'
+        'if(!connected&&T){attempt=0;if(reconTimer){clearTimeout(reconTimer);reconTimer=null}connect()}'
         '}'
         '});'
         # ── Expose globally ──
@@ -133,6 +136,7 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         # reads it to connect.  Both bridges may connect (ours + generated),
         # but that's harmless.  Future apps delegate to the injected bridge.
         # ── Auto-connect ──
+        'console.log("[ToupBridge] init T="+(T?"yes("+T.length+")":"EMPTY")+" A="+A);'
         'if(T)connect()'
         "})()"
         "</script>"
@@ -586,10 +590,19 @@ async def preview_proxy(
     Injects <base href> into HTML so sub-resources (JS bundles, etc.)
     route back through this proxy instead of hitting toup.ai root.
     """
-    # Try Bearer header first, then query param token, then cookie
+    # Try Bearer header first, then query param token, then cookie.
+    # Also resolve the *actual* JWT so the injected bridge script always
+    # has a valid token for its WebSocket connection.
     user = None
+    resolved_token = token  # from query param
     try:
         user = await get_current_user(request, db)
+        # If authenticated via Bearer, extract the JWT from the header
+        # so we can pass it to the bridge script.
+        if user and not resolved_token:
+            auth_hdr = request.headers.get("authorization", "")
+            if auth_hdr.lower().startswith("bearer "):
+                resolved_token = auth_hdr[7:].strip()
     except Exception:
         pass
     if not user and token:
@@ -598,6 +611,8 @@ async def preview_proxy(
         cookie_token = request.cookies.get("preview_token")
         if cookie_token:
             user = await _get_user_from_token(cookie_token, db)
+            if not resolved_token:
+                resolved_token = cookie_token
     if not user:
         raise HTTPException(401, "Not authenticated")
 
@@ -636,7 +651,7 @@ async def preview_proxy(
                 # This runs BEFORE the Expo bundle, so window.__TOUP_AGENT_BRIDGE
                 # is ready when the generated agentBridge.ts loads.
                 agent_bridge_script = _build_agent_bridge_script(
-                    token or "", app_id
+                    resolved_token or "", app_id
                 )
                 # Meta charset MUST be first in <head> — WKWebView uses it to
                 # decide text encoding before parsing any other content.
@@ -667,9 +682,9 @@ async def preview_proxy(
                     if src.startswith("/"):
                         src = src[1:]
                     # Inject auth token
-                    if token:
+                    if resolved_token:
                         sep = "&" if "?" in src else "?"
-                        src = f"{src}{sep}token={token}"
+                        src = f"{src}{sep}token={resolved_token}"
                     return f'src="{src}"'
                 html = re.sub(r'src="(/[^"]*)"', _rewrite_src, html)
                 body = html.encode("utf-8")
@@ -691,10 +706,10 @@ async def preview_proxy(
 
             # Set auth cookie so sub-resource requests (JS bundles, etc.)
             # are authenticated without needing ?token= on every URL.
-            if token and "text/html" in content_type:
+            if resolved_token and "text/html" in content_type:
                 response.set_cookie(
                     key="preview_token",
-                    value=token,
+                    value=resolved_token,
                     max_age=3600,
                     httponly=True,
                     samesite="none",
