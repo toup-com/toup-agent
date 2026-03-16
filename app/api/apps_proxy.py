@@ -257,8 +257,9 @@ def _build_agent_widget_script(
         '@keyframes taw-dark{0%,100%{opacity:0}40%{opacity:1}}',
         '@keyframes taw-blink{0%,42%,44%,100%{transform:scaleY(1)}43%{transform:scaleY(0.05)}}',
         f'@keyframes taw-ring-k{{0%{{transform:scale(1);opacity:0.4}}100%{{transform:scale(1.8);opacity:0}}}}',
-        # Root
+        # Root — use -webkit-transform to force fixed positioning in WKWebView
         '#taw{position:fixed;bottom:24px;right:24px;z-index:2147483647;'
+        '-webkit-transform:translateZ(0);transform:translateZ(0);'
         'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;'
         'font-size:13px;line-height:1.4}',
         '@media(max-width:768px){#taw{bottom:70px;right:12px}}',
@@ -317,10 +318,11 @@ def _build_agent_widget_script(
         'width:12px;height:12px;border-radius:50%;border:2px solid #12121c}',
         # ── Panel ──
         '#taw-p{display:none;position:fixed;bottom:88px;right:24px;'
+        '-webkit-transform:translateZ(0);transform:translateZ(0);'
         'width:360px;max-height:520px;background:#12121c;'
         'border-radius:16px;border:1px solid #1e1e2e;'
         'flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,0.5);'
-        'overflow:hidden}',
+        'overflow:hidden;z-index:2147483647}',
         # Mobile: bottom sheet style — slides up from bottom, covers 65% of screen
         '@media(max-width:768px){#taw-p{'
         'bottom:0;left:0;right:0;width:100%;max-height:65vh;'
@@ -328,7 +330,9 @@ def _build_agent_widget_script(
         'box-shadow:0 -8px 40px rgba(0,0,0,0.6)}}',
         '#taw-p.show{display:flex}',
         # Mobile backdrop overlay — dims app content behind the sheet
-        '#taw-bk{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:2147483646}',
+        '#taw-bk{display:none;position:fixed;inset:0;'
+        '-webkit-transform:translateZ(0);transform:translateZ(0);'
+        'background:rgba(0,0,0,0.4);z-index:2147483646}',
         '@media(max-width:768px){#taw-bk.show{display:block}}',
         # Header
         '.taw-h{display:flex;align-items:center;padding:12px 14px;'
@@ -345,7 +349,9 @@ def _build_agent_widget_script(
         '.taw-x:hover{background:#2a2a3e;color:#fff}',
         # Messages
         '#taw-m{flex:1;overflow-y:auto;padding:14px;display:flex;'
-        'flex-direction:column;gap:8px;min-height:200px;max-height:360px}',
+        'flex-direction:column;gap:8px;min-height:200px;max-height:360px;'
+        '-webkit-overflow-scrolling:touch}',
+        '@media(max-width:768px){#taw-m{max-height:none;min-height:150px}}',
         '#taw-m::-webkit-scrollbar{width:4px}',
         '#taw-m::-webkit-scrollbar-thumb{background:#2a2a3e;border-radius:2px}',
         '.taw-msg{max-width:85%;padding:10px 14px;border-radius:14px;'
@@ -407,8 +413,23 @@ def _build_agent_widget_script(
         'd1=r.querySelector(".taw-dot"),'
         'd2=r.querySelector(".taw-hd");',
         # Toggle
-        'function openPanel(){pnl.classList.add("show");bk.classList.add("show");btn.style.display="none";inp.focus()}',
-        'function closePanel(){pnl.classList.remove("show");bk.classList.remove("show");btn.style.display=""}',
+        # Prevent body scroll when panel is open (critical for WebView)
+        'var savedScroll=0;',
+        'function openPanel(){'
+        'savedScroll=window.scrollY;'
+        'pnl.classList.add("show");bk.classList.add("show");btn.style.display="none";'
+        'document.body.style.overflow="hidden";'
+        'document.body.style.position="fixed";'
+        'document.body.style.top="-"+savedScroll+"px";'
+        'document.body.style.left="0";document.body.style.right="0";'
+        'inp.focus()}',
+        'function closePanel(){'
+        'pnl.classList.remove("show");bk.classList.remove("show");btn.style.display="";'
+        'document.body.style.overflow="";'
+        'document.body.style.position="";'
+        'document.body.style.top="";'
+        'document.body.style.left="";document.body.style.right="";'
+        'window.scrollTo(0,savedScroll)}',
         'btn.onclick=openPanel;',
         'r.querySelector(".taw-x").onclick=closePanel;',
         'bk.onclick=closePanel;',
