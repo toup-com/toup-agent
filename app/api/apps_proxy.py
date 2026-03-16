@@ -883,6 +883,92 @@ async def app_chat_proxy(
     if not text:
         raise HTTPException(400, "Missing 'text' field")
 
+    # ── Inject Layer 2 context on Platform side (belt-and-suspenders) ──
+    # This ensures the agent sees Layer 1 context even if VPS code is outdated.
+    if body.get("layer2"):
+        try:
+            from app.db.models import App, BuildJob
+            from sqlalchemy import select
+            _app = await db.get(App, app_id)
+            if _app:
+                _slug_safe = _app.slug.replace('-', '_')
+                # Load Layer 1 build job for this app
+                _l1_ctx_parts = []
+                _l1_result = await db.execute(
+                    select(BuildJob)
+                    .where(BuildJob.app_id == app_id, BuildJob.layer == 1)
+                    .order_by(BuildJob.created_at.desc())
+                    .limit(1)
+                )
+                _l1_job = _l1_result.scalar_one_or_none()
+                if _l1_job:
+                    _l1_ctx_parts.append(f'LAYER 1 BUILD REQUEST: "{_l1_job.prompt}"')
+                    if _l1_job.checkpoint_json:
+                        try:
+                            _ckpt = json.loads(_l1_job.checkpoint_json)
+                            _pc = _ckpt.get("plan_context") or {}
+                            _bits = []
+                            for k in ("screens", "features"):
+                                if _pc.get(k):
+                                    _bits.append(f"{k}: {', '.join(_pc[k])}")
+                            if _pc.get("db_type"):
+                                _bits.append(f"database: {_pc['db_type']}")
+                            if _pc.get("design_notes"):
+                                _bits.append(f"design: {_pc['design_notes']}")
+                            if _bits:
+                                _l1_ctx_parts.append(f"LAYER 1 CHOICES: {'; '.join(_bits)}")
+                            _ec = _ckpt.get("extra_context")
+                            if _ec:
+                                _l1_ctx_parts.append(f"LAYER 1 DETAILS: {_ec[:600]}")
+                        except Exception:
+                            pass
+                if _app.plan_json:
+                    try:
+                        _plan = json.loads(_app.plan_json)
+                        if _plan.get("summary"):
+                            _l1_ctx_parts.append(f"APP PLAN: {_plan['summary'][:500]}")
+                    except Exception:
+                        pass
+                if _app.description:
+                    _l1_ctx_parts.append(f"APP DESCRIPTION: {_app.description[:300]}")
+
+                # Build the Layer 2 instruction block
+                _l2_block = (
+                    f"[LAYER 2 CUSTOMIZATION — {_app.name}]\n"
+                    f"You are the in-app assistant for '{_app.name}'. Be conversational, helpful, natural.\n"
+                    f"NEVER mention internal details (SQLite, bridges, file paths, agent infrastructure).\n"
+                    f"Tools: app_{_slug_safe}__read_file, app_{_slug_safe}__write_file, "
+                    f"app_{_slug_safe}__query_db, app_{_slug_safe}__navigate.\n\n"
+                )
+                if _l1_ctx_parts:
+                    _l2_block += (
+                        "── WHAT LAYER 1 ALREADY ESTABLISHED (DO NOT RE-ASK) ──\n"
+                        + "\n".join(_l1_ctx_parts) + "\n"
+                        "── END LAYER 1 CONTEXT ──\n"
+                        "The above was ALREADY asked and answered. The app was ALREADY built with these parameters.\n"
+                        "You MUST NOT ask about any of these topics again. They are settled.\n\n"
+                    )
+                _l2_block += (
+                    "CRITICAL: Layer 2 is an EDIT LAYER on top of Layer 1. You are NOT rebuilding.\n"
+                    "Layer 1 already created a functional app. Your job: ENHANCE, FIX, EXTEND.\n\n"
+                    f"STEP 1 (SILENT): Use app_{_slug_safe}__read_file to read 3-5 key files "
+                    "(App.tsx, main screens, database/seed data). Do NOT tell the user you are reading files.\n"
+                    "Identify: placeholder data, shallow features, hardcoded content, missing functionality.\n\n"
+                    "STEP 2: Ask 10+ questions referencing SPECIFIC things you found in the code.\n"
+                    "Each question MUST cite something concrete (a number, a feature, actual content).\n"
+                    "FORBIDDEN TOPICS (Layer 1 handled): target score, test date, study hours, color theme, "
+                    "app name, test type, basic preferences, display name, weekly availability.\n"
+                    "GOOD questions reference code findings: 'I found 500 vocab words but they are all general...'\n"
+                    "Every question MUST have [[option]] buttons on the NEXT LINE.\n\n"
+                    "STEP 3 (AFTER user answers): IMMEDIATELY begin editing the app using write_file/query_db.\n"
+                    "Do NOT just acknowledge the answers — you MUST apply code changes based on them.\n"
+                    "Replace placeholder data, upgrade shallow features, add real content.\n"
+                    "Show progress after each edit. Be EFFICIENT — batch related changes.\n"
+                )
+                text = f"{_l2_block}\n\n{text}"
+        except Exception as e:
+            logger.warning("Failed to build Layer 2 context: %s", e)
+
     # Build WS URL to VPS agent
     ws_url = agent_url.replace("https://", "wss://").replace("http://", "ws://")
     if not ws_url.endswith("/"):
