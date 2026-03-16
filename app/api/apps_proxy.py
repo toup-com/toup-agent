@@ -39,8 +39,10 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         # Chat endpoint — same-origin HTTP POST, no WebSocket needed
         'var chatUrl="/api/apps/"+A+"/chat";'
         # ── Set globals for generated code that checks them ──
+        # __TOUP_WS_URL="" prevents the generated agentBridge from opening its own WS
         'window.__TOUP_APP_ID=A;'
         'window.__TOUP_WS_URL="";'
+        'try{Object.defineProperty(window,"__TOUP_WS_URL",{value:"",writable:false,configurable:false})}catch(e){}'
         # ── Bridge state ──
         'var sending=false,msgCbs=[],toolCbs=[],navRef=null,screens=[],actions={};'
         # ── Send message via HTTP POST + read SSE stream ──
@@ -130,9 +132,34 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         'B.isConnected=!!T'
         '}'
         '});'
-        # ── Expose globally ──
+        # ── Expose globally (non-writable so generated agentBridge.ts can't overwrite) ──
         'window.__TOUP_AGENT_BRIDGE=B;'
+        'try{Object.defineProperty(window,"__TOUP_AGENT_BRIDGE",{value:B,writable:false,configurable:false})}catch(e){}'
+        # Also lock __TOUP_AUTH_TOKEN — generated code reads it but we don't want it
+        # to create its own WS connection (we set __TOUP_WS_URL="" to prevent that)
         'window.__TOUP_AUTH_TOKEN=T;'
+        # ── Hide generated AgentPlaceholder as soon as it renders ──
+        # The generated app creates its own chat bubble (high z-index, bottom-right).
+        # We scan for it via computed styles and hide it immediately.
+        # This runs from <head> so starts observing before the Expo bundle loads.
+        'window.__TOUP_AGENT_UI_INJECTED=true;'
+        'function _hgScan(){'
+        'if(!document.body)return;'
+        'var all=document.body.getElementsByTagName("div");'
+        'for(var i=0;i<all.length;i++){'
+        'var el=all[i];if(el.id==="taw"||el.closest&&el.closest("#taw"))continue;'
+        'try{var cs=getComputedStyle(el);'
+        'if((cs.position==="absolute"||cs.position==="fixed")'
+        '&&parseInt(cs.zIndex)>=9000){'
+        'var bt=parseInt(cs.bottom),ri=parseInt(cs.right);'
+        'if(!isNaN(bt)&&!isNaN(ri)&&bt<=120&&ri<=60)'
+        'el.style.setProperty("display","none","important")'
+        '}}catch(e){}}}'
+        # Run scan frequently for first 10s, then use MutationObserver
+        'var _hgN=0,_hgT=setInterval(function(){'
+        '_hgScan();if(++_hgN>50)clearInterval(_hgT)},200);'
+        'try{new MutationObserver(function(){_hgScan()}).observe('
+        'document.documentElement,{childList:true,subtree:true})}catch(e){}'
         # HTTP mode — connected if token exists (each message is a new request)
         'console.log("[ToupBridge] HTTP mode, app="+A+" connected="+B.isConnected);'
         "})()"
@@ -392,11 +419,7 @@ def _build_agent_widget_script(
         'if(!isNaN(b)&&!isNaN(ri)&&b<=120&&ri<=60)'
         'el.style.setProperty("display","none","important")'
         '}}catch(e){}}}',
-        # Also inject a CSS rule that immediately hides any high-z bottom-right element
-        'var hgStyle=document.createElement("style");'
-        'hgStyle.textContent="div[style*=\\"z-index\\"][style*=\\"bottom\\"][style*=\\"right\\"]{display:none!important}";'
-        'document.head.appendChild(hgStyle);',
-        # Run hg() periodically for 15s to catch late renders, then use MutationObserver
+        # Run hg() periodically for 15s to catch late renders, plus MutationObserver
         'var hgCount=0,hgTimer=setInterval(function(){hg();if(++hgCount>15){clearInterval(hgTimer)}},1000);',
         'try{new MutationObserver(function(){hg()}).observe(document.body,{childList:true,subtree:true})}catch(e){}',
         '});',
