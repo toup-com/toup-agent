@@ -134,13 +134,22 @@ Rules:
 - Use React Native components (View, Text, ScrollView, Pressable, TextInput, FlatList, etc.)
 - Use StyleSheet.create() for styles — dark theme (background: #161B22, text: #F0F2F5)
 - Accent color: #58A6FF (blue)
-- RESPONSIVE LAYOUT — these apps run on mobile (375px) AND desktop web (1200px+):
+- MOBILE-FIRST RESPONSIVE LAYOUT — these apps run on MOBILE phones (375px) AND desktop web (1200px+):
   - Use useWindowDimensions() at the top of every screen
   - Define: const isDesktop = width > 768;
+  - MOBILE IS THE PRIMARY TARGET (width <= 768):
+    - Single column layout, full width
+    - Padding: 16px sides, paddingBottom: 100 (for tab bar + agent orb)
+    - All content MUST fit within 375px width — NEVER overflow horizontally
+    - Cards: width '100%', no fixed pixel widths wider than 340px
+    - Text: use flexShrink: 1 and numberOfLines to prevent overflow
+    - Touch targets: minimum 44px height for tappable elements
+    - Font sizes: titles 20-24px, body 14-16px, captions 11-12px
+    - ScrollView for ALL screens (content may exceed screen height)
+    - Wrap every screen in SafeAreaView or add paddingTop for status bar
   - On DESKTOP (width > 768): constrain main content to maxWidth: 800, alignSelf: 'center'.
     Use 2-3 column grid layouts for cards/lists (flexDirection: 'row', flexWrap: 'wrap').
     Add more generous padding (24-32px).
-  - On MOBILE (width <= 768): single column, full width, standard mobile padding (16px).
   - Example responsive pattern for EVERY screen's root container:
     const {{ width }} = useWindowDimensions();
     const isDesktop = width > 768;
@@ -149,7 +158,7 @@ Rules:
     The paddingLeft: 220 on desktop accounts for the sidebar navigation width.
     The paddingBottom: 100 on mobile accounts for the bottom tab bar (60px) + agent button above it.
   - Cards and grid items: use percentage widths on desktop (width: isDesktop ? '48%' : '100%')
-  - This is CRITICAL — the app preview on toup.ai is full-width desktop, not a phone frame
+  - CRITICAL: Test all layouts mentally at 375px width. Nothing should overflow or be cut off.
 - RESPONSIVE NAVIGATION — bottom tabs on mobile, left sidebar on desktop:
   - Use createBottomTabNavigator with `tabBar={{(props) => <AdaptiveTabBar {{...props}} appName={{"{app_name}"}} />}}`
   - The AdaptiveTabBar component handles BOTH layouts (see below for /components/AdaptiveTabBar.tsx)

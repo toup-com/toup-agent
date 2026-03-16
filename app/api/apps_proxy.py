@@ -261,12 +261,18 @@ def _build_agent_widget_script(
         '#taw{position:fixed;bottom:24px;right:24px;z-index:2147483647;'
         'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;'
         'font-size:13px;line-height:1.4}',
-        '@media(max-width:768px){#taw{bottom:80px;right:16px}}',
+        '@media(max-width:768px){#taw{bottom:70px;right:12px}}',
         '#taw *{box-sizing:border-box;margin:0;padding:0}',
         # Orb button
         '#taw-b{width:56px;height:56px;border-radius:50%;border:none;'
         'cursor:pointer;padding:0;background:transparent;position:relative;'
         'animation:taw-breathe 4s ease-in-out infinite}',
+        '@media(max-width:768px){#taw-b{width:44px;height:44px}'
+        '.taw-ob{width:44px!important;height:44px!important}'
+        '.taw-oe{top:16px!important;gap:5px!important}'
+        '.taw-ey{width:13px!important;height:13px!important}'
+        '.taw-pu{width:6px!important;height:6px!important}'
+        '.taw-hi{width:2px!important;height:2px!important}}',
         '#taw-b:hover{filter:brightness(1.1)}',
         # Wave ring
         f'.taw-ring{{position:absolute;inset:-4px;border-radius:50%;'
@@ -315,9 +321,15 @@ def _build_agent_widget_script(
         'border-radius:16px;border:1px solid #1e1e2e;'
         'flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,0.5);'
         'overflow:hidden}',
-        '@media(max-width:768px){#taw-p{bottom:140px;right:8px;'
-        'left:8px;width:auto;max-height:55vh}}',
+        # Mobile: bottom sheet style — slides up from bottom, covers 65% of screen
+        '@media(max-width:768px){#taw-p{'
+        'bottom:0;left:0;right:0;width:100%;max-height:65vh;'
+        'border-radius:16px 16px 0 0;border-bottom:none;'
+        'box-shadow:0 -8px 40px rgba(0,0,0,0.6)}}',
         '#taw-p.show{display:flex}',
+        # Mobile backdrop overlay — dims app content behind the sheet
+        '#taw-bk{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:2147483646}',
+        '@media(max-width:768px){#taw-bk.show{display:block}}',
         # Header
         '.taw-h{display:flex;align-items:center;padding:12px 14px;'
         'border-bottom:1px solid #1e1e2e;background:#0e0e18;gap:10px}',
@@ -381,6 +393,8 @@ def _build_agent_widget_script(
         'try{if(window.self!==window.top&&document.referrer.indexOf(window.location.host)>=0)return}catch(e){}',
         'window.__TOUP_AGENT_UI_INJECTED=true;',
         # Create root
+        'var bk=document.createElement("div");bk.id="taw-bk";'
+        'document.body.appendChild(bk);',
         'var r=document.createElement("div");r.id="taw";',
         "r.innerHTML='", tpl_js, "';",
         'document.body.appendChild(r);',
@@ -393,10 +407,11 @@ def _build_agent_widget_script(
         'd1=r.querySelector(".taw-dot"),'
         'd2=r.querySelector(".taw-hd");',
         # Toggle
-        'btn.onclick=function(){'
-        'pnl.classList.add("show");btn.style.display="none";inp.focus()};',
-        'r.querySelector(".taw-x").onclick=function(){'
-        'pnl.classList.remove("show");btn.style.display=""};',
+        'function openPanel(){pnl.classList.add("show");bk.classList.add("show");btn.style.display="none";inp.focus()}',
+        'function closePanel(){pnl.classList.remove("show");bk.classList.remove("show");btn.style.display=""}',
+        'btn.onclick=openPanel;',
+        'r.querySelector(".taw-x").onclick=closePanel;',
+        'bk.onclick=closePanel;',
         # Status polling
         'function us(){'
         'var c=B.isConnected?"#22c55e":"#6b7280";'
