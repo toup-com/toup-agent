@@ -350,8 +350,15 @@ def _build_agent_widget_script(
         f'border-radius:20px;border:1px solid {agent_color};color:{cl};'
         f'font-size:12px;cursor:pointer;background:transparent;'
         f'font-family:inherit;transition:all 0.15s;-webkit-appearance:none}}',
-        f'.taw-chip:hover{{background:{agent_color};color:#fff}}',
+        f'.taw-chip:hover{{background:{agent_color}22;color:#fff}}',
+        f'.taw-chip.sel{{background:{agent_color}40;color:#fff;border-color:{agent_color}}}',
         f'.taw-l2{{background:{agent_color}15;border-color:{agent_color}60;font-weight:500}}',
+        f'.taw-submit{{display:block;width:100%;margin-top:12px;padding:8px 0;border:none;'
+        f'border-radius:8px;background:linear-gradient(135deg,{agent_color},{cd15});'
+        f'color:#fff;font-size:12px;font-weight:500;cursor:pointer;font-family:inherit}}',
+        f'.taw-submit:hover{{filter:brightness(1.1)}}',
+        '.taw-anscount{color:#6b7280;font-size:11px;margin-top:10px;'
+        'padding-top:8px;border-top:1px solid #1e1e2e}',
         # Input
         '.taw-iw{display:flex;align-items:center;padding:10px 12px;'
         'border-top:1px solid #1e1e2e;background:#0e0e18;gap:8px}',
@@ -395,15 +402,17 @@ def _build_agent_widget_script(
         'var c=B.isConnected?"#22c55e":"#6b7280";'
         'd1.style.backgroundColor=c;d2.style.backgroundColor=c}',
         'setInterval(us,2000);us();',
-        # Add message helper — parses [[buttons]] inline per paragraph
+        # Add message helper — parses [[buttons]] inline per paragraph, form mode for multi-question
         'function am(t,s){'
         'var e=msgs.querySelector(".taw-empty");if(e)e.remove();'
         'var d=document.createElement("div");d.className="taw-msg "+s;'
         # Strip [[reaction:EMOJI]] patterns
         't=t.replace(/\\[\\[reaction:[^\\]]*\\]\\]/g,"");'
         'if(s==="a"){'
-        # Split by double newline into paragraphs, render each with inline buttons
-        'var paras=t.split(/\\n\\n+/);'
+        # Split by double newline into paragraphs, count button groups
+        'var paras=t.split(/\\n\\n+/),btnGroups=0,sel={};'
+        'for(var pc=0;pc<paras.length;pc++){if(/\\[\\[/.test(paras[pc]))btnGroups++}'
+        'var isForm=btnGroups>=2;'
         'for(var pi=0;pi<paras.length;pi++){'
         'var p=paras[pi],pbtns=[];'
         'p=p.replace(/\\[\\[button:([^|\\]]+)\\|([^\\]]+)\\]\\]/g,function(_,l){pbtns.push(l);return""});'
@@ -419,18 +428,46 @@ def _build_agent_widget_script(
         'else h="<div>"+h+"</div>";'
         # Render inline button chips for this paragraph
         'if(pbtns.length){'
-        'h+="<div class=\\"taw-chips\\">";'
+        'h+="<div class=\\"taw-chips\\" data-gi=\\""+pi+"\\">";'
         'for(var bi=0;bi<pbtns.length;bi++){'
-        'h+="<button class=\\"taw-chip\\" data-lbl=\\""+pbtns[bi].replace(/"/g,"&quot;")+"\\">"+pbtns[bi].replace(/&/g,"&amp;").replace(/</g,"&lt;")+"</button>"}'
+        'h+="<button class=\\"taw-chip\\" data-lbl=\\""+pbtns[bi].replace(/"/g,"&quot;")+"\\" data-gi=\\""+pi+"\\">"+pbtns[bi].replace(/&/g,"&amp;").replace(/</g,"&lt;")+"</button>"}'
         'h+="</div>"}'
         'd.innerHTML+=(d.innerHTML?"":"")+h}'
-        # Attach click handlers to all chip buttons
+        # Attach click handlers — form mode: toggle selection; single mode: send immediately
         'var chips=d.querySelectorAll(".taw-chip");'
+        'if(isForm){'
+        # Form mode: toggle selection, show submit button
         'for(var ci=0;ci<chips.length;ci++){(function(c){'
+        'c.onclick=function(){'
+        'var gi=c.getAttribute("data-gi"),lbl=c.getAttribute("data-lbl");'
+        # Deselect siblings in same group
+        'var grp=d.querySelectorAll(".taw-chip[data-gi=\\""+gi+"\\"]");'
+        'for(var si=0;si<grp.length;si++){if(grp[si]!==c)grp[si].classList.remove("sel")}'
+        # Toggle this one
+        'if(c.classList.contains("sel")){c.classList.remove("sel");delete sel[gi]}'
+        'else{c.classList.add("sel");sel[gi]=lbl}'
+        # Update counter + submit button
+        'var cnt=Object.keys(sel).length;'
+        'var cntEl=d.querySelector(".taw-anscount");'
+        'if(cntEl)cntEl.textContent=cnt+" of "+btnGroups+" answered";'
+        'var sb=d.querySelector(".taw-submit");if(sb)sb.style.display=cnt>0?"block":"none"}'
+        '})(chips[ci])}'
+        # Add counter + submit button
+        'd.innerHTML+="<div class=\\"taw-anscount\\">0 of "+btnGroups+" answered</div>";'
+        'd.innerHTML+="<button class=\\"taw-submit\\" style=\\"display:none\\">Send answers \\u2192</button>";'
+        'd.querySelector(".taw-submit").onclick=function(){'
+        'var ans=[];for(var k in sel)ans.push(sel[k]);'
+        'var combined=ans.join(", ");'
+        'am(combined,"u");B.sendMessage(combined);'
+        'var tp=document.createElement("div");tp.className="taw-msg a t";tp.id="taw-tp";'
+        'tp.textContent="Thinking...";msgs.appendChild(tp);msgs.scrollTop=msgs.scrollHeight}'
+        '}else{'
+        # Single mode: click sends immediately
+        'for(var ci2=0;ci2<chips.length;ci2++){(function(c){'
         'c.onclick=function(){var l=c.getAttribute("data-lbl");am(l,"u");B.sendMessage(l);'
         'var tp=document.createElement("div");tp.className="taw-msg a t";tp.id="taw-tp";'
         'tp.textContent="Thinking...";msgs.appendChild(tp);msgs.scrollTop=msgs.scrollHeight}'
-        '})(chips[ci])}'
+        '})(chips[ci2])}}'
         '}else{d.textContent=t}'
         'msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight}',
         # Send
