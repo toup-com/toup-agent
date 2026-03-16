@@ -193,7 +193,7 @@ class AgentRunner:
                 self.tools.user_disabled_tools = set()
                 self._disabled_tool_names = set()
 
-            system_prompt = await self._build_system_prompt(db, user_id, user_message)
+            system_prompt = await self._build_system_prompt(db, user_id, user_message, channel=channel)
             logger.info(f"[AGENT] System prompt length: {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
 
             history = await self._load_history(db, session_id)
@@ -552,6 +552,7 @@ class AgentRunner:
         db: AsyncSession,
         user_id: str,
         user_message: str,
+        channel: Optional[str] = None,
     ) -> str:
         """Build a rich system prompt from identities + memories + runtime context."""
         from sqlalchemy import select, and_
@@ -735,10 +736,11 @@ class AgentRunner:
         
         # 4. Runtime context
         now = datetime.utcnow()
+        _channel_label = channel or "telegram"
         sections.append(
             f"# Runtime Context\n"
             f"- Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-            f"- Channel: Telegram\n"
+            f"- Channel: {_channel_label}\n"
             f"- Workspace directory: {settings.agent_workspace_dir}\n"
             f"- Max tool iterations: {self.max_iterations}"
         )
@@ -763,39 +765,61 @@ class AgentRunner:
                 "full result in detail."
             )
 
-        # 5. Telegram formatting rules
-        sections.append(
-            "# Formatting Rules (IMPORTANT)\n"
-            "You are communicating via Telegram. Follow these rules strictly:\n"
-            "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
-            "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
-            "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
-            "- Write fractions as a/b, not \\frac{a}{b}.\n"
-            "- Telegram supports basic Markdown: **bold**, *italic*, `code`, ```code blocks```.\n"
-            "- Do NOT use tables or complex formatting.\n"
-            "- Keep responses concise and readable on mobile."
-        )
+        # 5. Formatting rules (channel-aware)
+        if _channel_label == "app":
+            sections.append(
+                "# Formatting Rules\n"
+                "You are chatting with the user inside their app. Follow these rules:\n"
+                "- Use simple Markdown: **bold**, *italic*, `code`.\n"
+                "- Do NOT use LaTeX math formatting.\n"
+                "- Use plain Unicode symbols for math: × ÷ √ → ⇒ ≤ ≥ ≠ ≈ ∞ π.\n"
+                "- Keep responses concise and conversational.\n"
+                "- Do NOT expose internal implementation details (databases, bridges, connections, file paths, error traces).\n"
+                "- When the user greets you, greet them back warmly and offer to help with the app.\n"
+                "- You have editing capabilities: you can modify the app's files, database, and navigation using your tools."
+            )
+            sections.append(
+                "# Action Buttons\n"
+                "You can offer clickable action buttons by including [[Label]] markers in your response.\n"
+                "These render as tappable chips in the chat UI. When the user taps one, it sends that label as a message.\n"
+                "Use buttons to suggest next actions:\n"
+                "Example: What would you like to do?\n"
+                "[[Show my progress]] [[Start a practice session]] [[Change settings]]\n"
+                "Keep button labels short (2-5 words). Use 2-4 buttons per message when relevant."
+            )
+        else:
+            sections.append(
+                "# Formatting Rules (IMPORTANT)\n"
+                "You are communicating via Telegram. Follow these rules strictly:\n"
+                "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
+                "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
+                "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
+                "- Write fractions as a/b, not \\frac{a}{b}.\n"
+                "- Telegram supports basic Markdown: **bold**, *italic*, `code`, ```code blocks```.\n"
+                "- Do NOT use tables or complex formatting.\n"
+                "- Keep responses concise and readable on mobile."
+            )
 
-        # 6. Reactions
-        sections.append(
-            "# Reactions\n"
-            "You can react to the user's message with an emoji by including [[reaction:EMOJI]] "
-            "anywhere in your response. It will be stripped before sending. "
-            "React sparingly — at most 1 reaction per 5-10 messages. "
-            "React when: something is genuinely funny (😂), you appreciate something (❤️), "
-            "simple acknowledgment (👍), interesting/thoughtful (🤔), impressive (🔥), "
-            "celebrating (🎉). Don't react to routine messages."
-        )
+            # Reactions (Telegram only)
+            sections.append(
+                "# Reactions\n"
+                "You can react to the user's message with an emoji by including [[reaction:EMOJI]] "
+                "anywhere in your response. It will be stripped before sending. "
+                "React sparingly — at most 1 reaction per 5-10 messages. "
+                "React when: something is genuinely funny (😂), you appreciate something (❤️), "
+                "simple acknowledgment (👍), interesting/thoughtful (🤔), impressive (🔥), "
+                "celebrating (🎉). Don't react to routine messages."
+            )
 
-        # 7. Inline buttons
-        sections.append(
-            "# Inline Buttons\n"
-            "You can add inline buttons to your message by including [[button:LABEL|CALLBACK_DATA]] "
-            "markers. They will be stripped from text and rendered as clickable Telegram buttons. "
-            "Use buttons when offering clear choices, confirmations, or actions. "
-            "Example: [[button:Yes|confirm_yes]] [[button:No|confirm_no]]\n"
-            "Keep callback_data short (max 64 chars). Don't overuse buttons — only when genuinely helpful."
-        )
+            # Inline buttons (Telegram only)
+            sections.append(
+                "# Inline Buttons\n"
+                "You can add inline buttons to your message by including [[button:LABEL|CALLBACK_DATA]] "
+                "markers. They will be stripped from text and rendered as clickable Telegram buttons. "
+                "Use buttons when offering clear choices, confirmations, or actions. "
+                "Example: [[button:Yes|confirm_yes]] [[button:No|confirm_no]]\n"
+                "Keep callback_data short (max 64 chars). Don't overuse buttons — only when genuinely helpful."
+            )
 
         # 8. Skill prompt sections
         if self.skill_loader:

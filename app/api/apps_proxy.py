@@ -335,6 +335,13 @@ def _build_agent_widget_script(
         'border-bottom-left-radius:4px;white-space:pre-wrap}',
         '.taw-msg.t{color:#6b7280;font-style:italic;font-size:12px}',
         '.taw-empty{text-align:center;color:#6b7280;padding:40px 16px}',
+        # Action button chips
+        '.taw-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}',
+        f'.taw-chip{{display:inline-flex;align-items:center;padding:6px 14px;'
+        f'border-radius:20px;border:1px solid {agent_color};color:{cl};'
+        f'font-size:12px;cursor:pointer;background:transparent;'
+        f'font-family:inherit;transition:all 0.15s;-webkit-appearance:none}}',
+        f'.taw-chip:hover{{background:{agent_color};color:#fff}}',
         # Input
         '.taw-iw{display:flex;align-items:center;padding:10px 12px;'
         'border-top:1px solid #1e1e2e;background:#0e0e18;gap:8px}',
@@ -353,6 +360,8 @@ def _build_agent_widget_script(
         '<script>',
         'document.addEventListener("DOMContentLoaded",function(){',
         'var B=window.__TOUP_AGENT_BRIDGE;if(!B)return;',
+        # Hide widget if inside platform iframe — parent React panel handles chat
+        'try{if(window.self!==window.top&&document.referrer.indexOf(window.location.host)>=0)return}catch(e){}',
         'window.__TOUP_AGENT_UI_INJECTED=true;',
         # Create root
         'var r=document.createElement("div");r.id="taw";',
@@ -376,11 +385,37 @@ def _build_agent_widget_script(
         'var c=B.isConnected?"#22c55e":"#6b7280";'
         'd1.style.backgroundColor=c;d2.style.backgroundColor=c}',
         'setInterval(us,2000);us();',
-        # Add message helper
+        # Add message helper — parses [[buttons]] and basic markdown
         'function am(t,s){'
         'var e=msgs.querySelector(".taw-empty");if(e)e.remove();'
         'var d=document.createElement("div");d.className="taw-msg "+s;'
-        'd.textContent=t;msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight}',
+        # Strip [[reaction:EMOJI]] patterns
+        't=t.replace(/\\[\\[reaction:[^\\]]*\\]\\]/g,"");'
+        # Extract [[button:LABEL|DATA]] and [[OPTION]] patterns
+        'var btns=[];'
+        't=t.replace(/\\[\\[button:([^|\\]]+)\\|([^\\]]+)\\]\\]/g,function(_,l,d){btns.push(l);return""});'
+        't=t.replace(/\\[\\[([^\\]]{1,50})\\]\\]/g,function(_,l){btns.push(l);return""});'
+        't=t.trim();'
+        # Sanitize HTML entities then render basic markdown
+        'if(s==="a"){'
+        'var h=t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");'
+        'h=h.replace(/\\*\\*(.+?)\\*\\*/g,"<b>$1</b>");'
+        'h=h.replace(/\\*(.+?)\\*/g,"<i>$1</i>");'
+        'h=h.replace(/`([^`]+)`/g,"<code style=\\"background:#2a2a3e;padding:1px 4px;border-radius:3px\\">$1</code>");'
+        'h=h.replace(/\\n/g,"<br>");'
+        'd.innerHTML=h;'
+        # Render button chips if any
+        'if(btns.length){'
+        'var cw=document.createElement("div");cw.className="taw-chips";'
+        'for(var i=0;i<btns.length;i++){(function(label){'
+        'var b=document.createElement("button");b.className="taw-chip";'
+        'b.textContent=label;b.onclick=function(){am(label,"u");B.sendMessage(label);'
+        'var tp=document.createElement("div");tp.className="taw-msg a t";tp.id="taw-tp";'
+        'tp.textContent="Thinking...";msgs.appendChild(tp);msgs.scrollTop=msgs.scrollHeight};'
+        'cw.appendChild(b)})(btns[i])}'
+        'd.appendChild(cw)}'
+        '}else{d.textContent=t}'
+        'msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight}',
         # Send
         'function snd(){'
         'var t=inp.value.trim();if(!t)return;'

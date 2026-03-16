@@ -276,10 +276,18 @@ async def ws_chat(
                         async with async_session_maker() as _db:
                             _app = await _db.get(App, app_id_from_msg)
                             if _app:
+                                _slug_safe = _app.slug.replace('-', '_')
                                 text = (
-                                    f"[The user is chatting from inside their '{_app.name}' app "
-                                    f"(slug: {_app.slug}). Use the app_{_app.slug.replace('-','_')}__* "
-                                    f"tools to help them interact with the app.]\n\n{text}"
+                                    f"[CONTEXT: The user is chatting from inside their '{_app.name}' app. "
+                                    f"You are their in-app assistant.\n"
+                                    f"- Be conversational and helpful. Greet naturally when they say hi.\n"
+                                    f"- NEVER mention internal details (SQLite, bridges, connections, file paths, agent infrastructure).\n"
+                                    f"- You have these app tools: app_{_slug_safe}__navigate (change screens), "
+                                    f"app_{_slug_safe}__read_file / app_{_slug_safe}__write_file (edit the app), "
+                                    f"app_{_slug_safe}__query_db (read/write app data).\n"
+                                    f"- When the user asks to change something in the app (UI, content, settings), "
+                                    f"use write_file/query_db to make it happen.\n"
+                                    f"- Suggest helpful actions as [[Button Label]] chips.]\n\n{text}"
                                 )
                     except Exception as e:
                         logger.warning(f"[WS] Failed to load app context: {e}")
