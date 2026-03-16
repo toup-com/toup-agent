@@ -419,14 +419,25 @@ async def ws_chat(
                     _tprint(f"{_DIM}  ✓ {tool_name}: {short}{_RESET}")
                     try:
                         event: dict = {"type": "tool_end", "tool": tool_name, "summary": summary}
-                        # Enrich with file data for write/edit operations (Layer 2 editor UI)
-                        if tool_input and ("write_file" in tool_name or "edit_file" in tool_name):
-                            event["file_path"] = tool_input.get("file_path", "")
-                            if "write_file" in tool_name and tool_input.get("content"):
-                                content = tool_input["content"]
-                                event["code"] = content[:50000]  # Cap at 50KB
-                                event["lines"] = content.count("\n") + 1
-                                event["size"] = len(content)
+                        # Enrich with file data for Layer 2 editor UI
+                        if tool_input:
+                            _tn = tool_name.lower()
+                            if "write_file" in _tn or "edit_file" in _tn:
+                                event["file_path"] = tool_input.get("file_path", "")
+                                event["file_action"] = "write"
+                                if "write_file" in _tn and tool_input.get("content"):
+                                    content = tool_input["content"]
+                                    event["code"] = content[:50000]
+                                    event["lines"] = content.count("\n") + 1
+                                    event["size"] = len(content)
+                            elif "read_file" in _tn:
+                                event["file_path"] = tool_input.get("file_path", "")
+                                event["file_action"] = "read"
+                                # Include the read content from the summary (tool output)
+                                if summary and len(summary) > 10:
+                                    event["code"] = summary[:50000]
+                                    event["lines"] = summary.count("\n") + 1
+                                    event["size"] = len(summary)
                         await websocket.send_json(event)
                     except Exception:
                         pass
