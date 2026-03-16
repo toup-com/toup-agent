@@ -100,24 +100,10 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         'for(var i=0;i<msgCbs.length;i++)try{msgCbs[i]("Connection error. Try again.")}catch(e){}'
         '})'
         '}'
-        # ── Ping to verify connectivity on init ──
-        'function ping(){'
-        'if(!T)return;'
-        'fetch(chatUrl+"?token="+encodeURIComponent(T),{'
-        'method:"POST",'
-        'headers:{"Content-Type":"application/json"},'
-        'body:JSON.stringify({text:"ping",session_id:"app-"+A})'
-        '}).then(function(r){'
-        'B.isConnected=r.ok;'
-        'console.log("[ToupBridge] ping ok="+r.ok)'
-        '}).catch(function(){'
-        'B.isConnected=false;'
-        'console.warn("[ToupBridge] ping failed")'
-        '})'
-        '}'
+        # (no ping needed — HTTP mode is always "connected" if token exists)
         # ── Bridge API ──
         'var B={'
-        'isConnected:false,'
+        'isConnected:!!T,'
         'currentScreen:"",'
         'sendMessage:function(text){send(text)},'
         'onAgentMessage:function(cb){msgCbs.push(cb);return function(){'
@@ -141,15 +127,14 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         'if(ev.data&&ev.data.type==="toup_agent_config"){'
         'if(ev.data.token)T=ev.data.token;'
         'if(ev.data.app_id){A=ev.data.app_id;chatUrl="/api/apps/"+A+"/chat"}'
-        'if(T&&!B.isConnected)ping()'
+        'B.isConnected=!!T'
         '}'
         '});'
         # ── Expose globally ──
         'window.__TOUP_AGENT_BRIDGE=B;'
         'window.__TOUP_AUTH_TOKEN=T;'
-        # ── Auto-ping to verify connectivity ──
-        'console.log("[ToupBridge] HTTP mode, app="+A+" token="+(T?"yes":"no"));'
-        'if(T)ping()'
+        # HTTP mode — connected if token exists (each message is a new request)
+        'console.log("[ToupBridge] HTTP mode, app="+A+" connected="+B.isConnected);'
         "})()"
         "</script>"
     )
@@ -395,6 +380,7 @@ def _build_agent_widget_script(
         'msgs.appendChild(tp);msgs.scrollTop=msgs.scrollHeight}'
         'else if(done&&tp)tp.textContent="Almost done..."});',
         # Hide generated AgentPlaceholder (scans positioned bottom-right elements)
+        # Uses MutationObserver + interval to catch late-rendered elements
         'function hg(){'
         'var all=document.body.getElementsByTagName("div");'
         'for(var i=0;i<all.length;i++){'
@@ -406,7 +392,13 @@ def _build_agent_widget_script(
         'if(!isNaN(b)&&!isNaN(ri)&&b<=120&&ri<=60)'
         'el.style.setProperty("display","none","important")'
         '}}catch(e){}}}',
-        'setTimeout(hg,3000);setTimeout(hg,6000);',
+        # Also inject a CSS rule that immediately hides any high-z bottom-right element
+        'var hgStyle=document.createElement("style");'
+        'hgStyle.textContent="div[style*=\\"z-index\\"][style*=\\"bottom\\"][style*=\\"right\\"]{display:none!important}";'
+        'document.head.appendChild(hgStyle);',
+        # Run hg() periodically for 15s to catch late renders, then use MutationObserver
+        'var hgCount=0,hgTimer=setInterval(function(){hg();if(++hgCount>15){clearInterval(hgTimer)}},1000);',
+        'try{new MutationObserver(function(){hg()}).observe(document.body,{childList:true,subtree:true})}catch(e){}',
         '});',
         '</script>',
     ]
