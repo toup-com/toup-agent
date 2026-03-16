@@ -1037,9 +1037,14 @@ class AppBuilderSkill(Skill):
             "- Add proper algorithms where simplified logic exists\n"
             "- Generate real content where placeholders exist\n\n"
             "Be EFFICIENT: write complete files rather than many small edits. Batch related changes.\n"
-            "Show brief progress after each edit. Changes are applied live.\n\n"
+            "Show brief progress after each edit. Changes are applied live.\n"
+            "NEVER use memory_store to save preferences instead of editing. ALWAYS use write_file.\n"
+            "NEVER tell the user you are 'storing preferences in memory' — that is an internal operation.\n\n"
             "**Step 4: Summary & Next Steps**\n"
-            "After all changes, summarize what was customized and suggest next steps:\n"
+            "After all changes, give a brief human-friendly summary:\n"
+            "'All done! Here's what I customized: [2-3 bullet points of key changes]. Try it out!'\n"
+            "NEVER expose internal operations (memory storage, file paths, DB queries) to the user.\n"
+            "Suggest next steps with buttons:\n"
             "[[Try the app now]] [[Make more changes]] [[Reset to default]]\n"
         )
 

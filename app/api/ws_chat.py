@@ -380,11 +380,16 @@ async def ws_chat(
                                         f"NOT collected at the end.\n\n"
                                         f"  STEP 3 (AFTER user answers): IMMEDIATELY begin editing the app using write_file/query_db.\n"
                                         f"  Do NOT just acknowledge the answers or offer action buttons — you MUST apply actual code changes.\n"
+                                        f"  Do NOT use memory_store to save preferences. Do NOT say 'let me store your preferences'.\n"
+                                        f"  INSTEAD: Use write_file to rewrite app files with the user's choices applied.\n"
                                         f"  Replace placeholder data with real content, upgrade features, add algorithms.\n"
                                         f"  Be EFFICIENT — use write_file to write complete files, batch related changes together.\n"
                                         f"  Show brief progress after each edit.\n"
                                         f"  IMPORTANT: You have a limited number of tool calls. Be efficient — don't waste iterations "
-                                        f"on unnecessary reads. Combine related edits into single write_file calls when possible.\n"
+                                        f"on unnecessary reads. Combine related edits into single write_file calls when possible.\n\n"
+                                        f"  STEP 4 (COMPLETION): Give a BRIEF human-friendly summary of what you customized.\n"
+                                        f"  NEVER expose internal operations (memory storage, file reading, database queries) to the user.\n"
+                                        f"  NEVER say 'let me store' or 'let me save to memory' — the user does not care about internals.\n"
                                     )
                                 text = f"{_base_ctx}]\n\n{text}"
                     except Exception as e:
