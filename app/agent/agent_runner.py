@@ -399,7 +399,7 @@ class AgentRunner:
                 await _hb.emit(HookEvent.AFTER_TOOL_CALL, {"tool": tc["name"], "result_len": len(result)})
                 if on_tool_end:
                     summary = result[:200] + "..." if len(result) > 200 else result
-                    await on_tool_end(tc["name"], summary)
+                    await on_tool_end(tc["name"], summary, tc.get("input"))
 
                 tool_results.append({
                     "type": "tool_result",

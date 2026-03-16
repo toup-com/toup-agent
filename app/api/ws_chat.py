@@ -294,8 +294,9 @@ async def ws_chat(
                                     # Layer 2 trigger — audit-first deep customization
                                     _base_ctx += (
                                         f"\n- LAYER 2 CUSTOMIZATION MODE activated.\n"
-                                        f"  STEP 1 (SILENT): Use app_{_slug_safe}__read_file to read EVERY key file — "
-                                        f"App.tsx, all screen components, database/seed files, data constants, config files. "
+                                        f"  STEP 1 (SILENT): Use app_{_slug_safe}__read_file to read the app's key files — "
+                                        f"App.tsx, main screen components, database/seed data, config/constants. "
+                                        f"Be EFFICIENT: read 3-5 key files, not every single file. "
                                         f"Do NOT tell the user you are reading files. Do NOT expose paths or technical details.\n"
                                         f"  As you read, identify: placeholder/demo data, shallow features, generic defaults, "
                                         f"hardcoded content that should be personalized, missing functionality.\n"
@@ -304,7 +305,11 @@ async def ws_chat(
                                         f"NEVER ask generic onboarding questions (target score, test date, color theme — Layer 1 already did that). "
                                         f"Every question MUST have [[option]] buttons on the NEXT LINE — buttons must be inline with their question, "
                                         f"NOT collected at the end.\n"
-                                        f"  STEP 3: Apply changes with write_file/query_db. Show brief progress after each edit.\n"
+                                        f"  STEP 3: Apply changes with write_file/query_db. Be EFFICIENT — use write_file to write "
+                                        f"complete files rather than many small edit_file calls. Batch related changes together. "
+                                        f"Show brief progress after each edit.\n"
+                                        f"  IMPORTANT: You have a limited number of tool calls. Be efficient — don't waste iterations "
+                                        f"on unnecessary reads. Combine related edits into single write_file calls when possible.\n"
                                     )
                                 text = f"{_base_ctx}]\n\n{text}"
                     except Exception as e:
@@ -327,13 +332,22 @@ async def ws_chat(
                     except Exception:
                         pass
 
-                async def on_tool_end(tool_name: str, summary: str):
+                async def on_tool_end(tool_name: str, summary: str, tool_input: dict = None):
                     short = summary[:120] + "..." if len(summary) > 120 else summary
                     # Collapse to single line for terminal readability
                     short = short.replace("\n", " ")
                     _tprint(f"{_DIM}  ✓ {tool_name}: {short}{_RESET}")
                     try:
-                        await websocket.send_json({"type": "tool_end", "tool": tool_name, "summary": summary})
+                        event: dict = {"type": "tool_end", "tool": tool_name, "summary": summary}
+                        # Enrich with file data for write/edit operations (Layer 2 editor UI)
+                        if tool_input and ("write_file" in tool_name or "edit_file" in tool_name):
+                            event["file_path"] = tool_input.get("file_path", "")
+                            if "write_file" in tool_name and tool_input.get("content"):
+                                content = tool_input["content"]
+                                event["code"] = content[:50000]  # Cap at 50KB
+                                event["lines"] = content.count("\n") + 1
+                                event["size"] = len(content)
+                        await websocket.send_json(event)
                     except Exception:
                         pass
 

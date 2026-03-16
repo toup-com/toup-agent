@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     agent_model: str = "gpt-5.4"  # Primary agent model
     agent_fallback_model: str = "gpt-4o"  # Fallback if primary model fails
     agent_max_tokens: int = 16000  # Max output tokens for agent
-    agent_max_tool_iterations: int = 20  # Max tool call loops before forcing stop
+    agent_max_tool_iterations: int = 40  # Max tool call loops before forcing stop
     agent_workspace_dir: str = "/app/workspace"  # Working directory for file operations
     brave_api_key: Optional[str] = None  # For web search
     skills_dir: str = "/app/skills"  # External skills directory

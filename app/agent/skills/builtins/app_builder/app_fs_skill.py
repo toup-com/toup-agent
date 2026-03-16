@@ -24,11 +24,51 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from app.agent.skills.base import Skill, SkillContext, SkillMeta
 
 logger = logging.getLogger(__name__)
+
+
+async def _record_layer2_change(app_id: str, file_path: str, action: str, summary: str):
+    """Append a Layer 2 change to the most recent build job for this app."""
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import BuildJob
+        from sqlalchemy import select
+
+        async with async_session_maker() as db:
+            # Find the most recent build job for this app
+            result = await db.execute(
+                select(BuildJob)
+                .where(BuildJob.app_id == app_id)
+                .order_by(BuildJob.created_at.desc())
+                .limit(1)
+            )
+            job = result.scalar_one_or_none()
+            if not job:
+                return
+
+            # Parse existing changes
+            changes = []
+            if job.layer2_changes_json:
+                try:
+                    changes = json.loads(job.layer2_changes_json)
+                except (json.JSONDecodeError, TypeError):
+                    changes = []
+
+            changes.append({
+                "file": file_path,
+                "action": action,
+                "summary": summary,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            job.layer2_changes_json = json.dumps(changes)
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to record Layer 2 change: {e}")
 
 
 class AppFsSkill(Skill):
@@ -288,11 +328,19 @@ class AppFsSkill(Skill):
             return "ERROR: content is required"
 
         abs_path = os.path.join(self.app_dir, file_path.lstrip("/"))
+        is_new = not os.path.exists(abs_path)
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
 
         try:
             with open(abs_path, 'w', encoding='utf-8') as f:
                 f.write(content)
+            # Track Layer 2 change
+            action = "create" if is_new else "edit"
+            lines = content.count('\n') + 1
+            await _record_layer2_change(
+                self.app_id, file_path, action,
+                f"{'Created' if is_new else 'Updated'} {file_path} ({lines} lines, {len(content)} chars)"
+            )
             return f"Wrote '{file_path}' ({len(content)} chars). Metro will auto-hot-reload."
         except Exception as e:
             return f"ERROR writing '{file_path}': {e}"
@@ -323,6 +371,11 @@ class AppFsSkill(Skill):
             with open(abs_path, 'w', encoding='utf-8') as f:
                 f.write(new_content)
 
+            # Track Layer 2 change
+            await _record_layer2_change(
+                self.app_id, file_path, "edit",
+                f"Edited {file_path} (replaced {len(old_text)} chars with {len(new_text)} chars)"
+            )
             return f"Edited '{file_path}'. Metro will auto-hot-reload."
         except Exception as e:
             return f"ERROR editing '{file_path}': {e}"
