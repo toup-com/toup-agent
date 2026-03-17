@@ -28,3 +28,4 @@ class User(Base):
     memories: Mapped[List["Memory"]] = relationship("Memory", back_populates="user")
     conversations: Mapped[List["Conversation"]] = relationship("Conversation", back_populates="user")
     identities: Mapped[List["Identity"]] = relationship("Identity", back_populates="user")
+    soul_config: Mapped[Optional["SoulConfig"]] = relationship("SoulConfig", back_populates="user", uselist=False)

@@ -1,0 +1,77 @@
+"""Compile structured soul config into system prompt text."""
+
+
+STYLE_INSTRUCTIONS = {
+    "casual": (
+        "Communicate casually like a close friend. Use humor naturally. "
+        "Keep responses conversational and approachable. "
+        "It's OK to use slang and informal language."
+    ),
+    "professional": (
+        "Communicate professionally and concisely. Be structured and clear. "
+        "Respect the user's time. Use proper grammar but don't be stiff."
+    ),
+    "mentor": (
+        "Communicate like a warm, patient mentor. Be encouraging. "
+        "Explain things thoroughly when needed. Celebrate the user's progress."
+    ),
+    "creative": (
+        "Communicate expressively and creatively. Use metaphors and analogies. "
+        "Think laterally. Bring energy and imagination to every response."
+    ),
+}
+
+TRAIT_INSTRUCTIONS = {
+    "uses_humor": "Use humor naturally in conversations.",
+    "stays_serious": "Keep a serious, focused tone.",
+    "uses_emoji": "Use emoji occasionally to add warmth.",
+    "no_emoji": "Don't use emoji in responses.",
+    "concise": "Keep responses concise and to the point.",
+    "detailed": "Give thorough, detailed explanations.",
+    "direct": "Be direct and honest, even when the truth is uncomfortable.",
+    "diplomatic": "Be diplomatic and gentle in delivery.",
+    "proactive": "Proactively suggest ideas and next steps without being asked.",
+    "reactive": "Only answer what's explicitly asked. Don't volunteer unsolicited suggestions.",
+    "references_past": "Reference past conversations and memories naturally. Show that you remember.",
+    "fresh_each_time": "Don't bring up past conversations unless the user asks.",
+    "asks_questions": "Ask clarifying questions when something is ambiguous.",
+    "assumes": "Make your best assumption and proceed rather than asking questions.",
+    "challenges": "Respectfully challenge the user's ideas when you see a flaw or better approach.",
+    "supportive": "Be supportive and encouraging. Focus on what's working.",
+}
+
+
+def compile_soul(config: dict) -> str:
+    """Compile structured soul config dict into system prompt text.
+
+    Args:
+        config: dict with keys: name, pronouns, style, traits, custom_instructions
+    Returns:
+        Multi-line string suitable for the Identity content field.
+    """
+    lines: list[str] = []
+
+    # Identity
+    name = config.get("name", "Agent")
+    lines.append(f"Your name is {name}.")
+
+    pronouns = config.get("pronouns", "they")
+    if pronouns and pronouns != "they":
+        lines.append(f"You use {pronouns}/{pronouns} pronouns for yourself.")
+
+    # Communication style
+    style = config.get("style", "casual")
+    lines.append(STYLE_INSTRUCTIONS.get(style, STYLE_INSTRUCTIONS["casual"]))
+
+    # Traits
+    for trait in config.get("traits", []):
+        instruction = TRAIT_INSTRUCTIONS.get(trait)
+        if instruction:
+            lines.append(instruction)
+
+    # Custom instructions
+    custom = config.get("custom_instructions", "").strip()
+    if custom:
+        lines.append(f"\nAdditional instructions from the user:\n{custom}")
+
+    return "\n".join(lines)

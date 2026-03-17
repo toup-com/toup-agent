@@ -42,6 +42,9 @@ from .app import App, BuildJob
 # Agent runtime
 from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig
 
+# Soul config
+from .soul_config import SoulConfig
+
 # Platform (VPS, invites, billing)
 from .platform import VPSPlan, VPSInstance, Invite, LLMBundleAllocation, LLMUsageRecord
 
@@ -61,5 +64,6 @@ __all__ = [
     "Workflow",
     "App", "BuildJob",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
+    "SoulConfig",
     "VPSPlan", "VPSInstance", "Invite", "LLMBundleAllocation", "LLMUsageRecord",
 ]

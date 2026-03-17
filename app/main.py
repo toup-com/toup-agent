@@ -19,6 +19,7 @@ from app.api.admin import system_router as admin_router, users_router as admin_u
 from app.api.documents import router as documents_router
 # NEW: Agent Platform routers
 from app.api.identity import router as identity_router
+from app.api.soul import router as soul_router
 from app.api.api_v1 import router as api_v1_router
 from app.api.graph import router as graph_router
 from app.api.feedback import router as feedback_router
@@ -363,6 +364,7 @@ app.include_router(admin_users_router, prefix=settings.api_prefix)
 app.include_router(invite_router, prefix=settings.api_prefix)
 # Brain core
 app.include_router(identity_router, prefix=settings.api_prefix)
+app.include_router(soul_router, prefix=settings.api_prefix)
 app.include_router(api_v1_router, prefix=settings.api_prefix)
 app.include_router(graph_router, prefix=settings.api_prefix)  # Entity graph API
 app.include_router(feedback_router, prefix=settings.api_prefix)  # Phase 5: Retrieval feedback

@@ -841,6 +841,49 @@ class ChatStreamChunk(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+# ============ Soul Config Schemas ============
+
+VALID_SOUL_STYLES = {"casual", "professional", "mentor", "creative"}
+
+VALID_SOUL_TRAITS = {
+    # Tone
+    "uses_humor", "stays_serious",
+    "uses_emoji", "no_emoji",
+    "concise", "detailed",
+    "direct", "diplomatic",
+    # Behavior
+    "proactive", "reactive",
+    "references_past", "fresh_each_time",
+    "asks_questions", "assumes",
+    "challenges", "supportive",
+}
+
+
+class SoulConfigUpdate(BaseModel):
+    """Request to save/update soul configuration"""
+    name: str = Field(min_length=1, max_length=50)
+    color: str = Field(default="#9B59B6", pattern=r"^#[0-9A-Fa-f]{6}$")
+    pronouns: str = Field(default="they")
+    style: str = Field(default="casual")
+    traits: List[str] = Field(default_factory=list)
+    custom_instructions: str = Field(default="", max_length=500)
+
+
+class SoulConfigResponse(BaseModel):
+    """Response with soul configuration"""
+    name: str
+    color: str
+    pronouns: str
+    style: str
+    traits: List[str]
+    custom_instructions: str
+    compiled_text: str
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # Forward references
 MemoryWithRelations.model_rebuild()
 SessionWithMessages.model_rebuild()
