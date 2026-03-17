@@ -159,14 +159,15 @@ class DecayService:
         self,
         memory_id: str,
         user_id: str,
-        access_context: str = "recall"
+        access_context: str = "recall",
+        similarity_score: float = 0.5,
     ) -> Optional[Memory]:
         """
         Reinforce a memory (strengthen it) when accessed or recalled.
-        
-        This implements spaced repetition principles:
-        - Each access increases strength
-        - More recent memories get larger boosts
+
+        Implements adaptive spaced-repetition:
+        - Longer gap since last recall → bigger boost (log-based)
+        - Higher similarity match → stronger reinforcement
         - Diminishing returns for very frequent access
         """
         result = await self.db.execute(
@@ -179,40 +180,46 @@ class DecayService:
             )
         )
         memory = result.scalar_one_or_none()
-        
+
         if not memory:
             return None
-        
-        old_strength = memory.strength
+
         now = datetime.utcnow()
-        
-        # Calculate reinforcement boost based on current strength
-        # Lower strength = larger boost (helping weak memories more)
-        strength_factor = 1 - memory.strength  # 0 to 1, higher for weaker memories
-        boost = self.REINFORCEMENT_BOOST * (1 + strength_factor)
-        
-        # Diminishing returns for very frequent access
+
+        # Cooldown: skip reinforcement if last reinforced within 1 hour
         if memory.last_reinforced_at:
-            hours_since_last = (now - memory.last_reinforced_at).total_seconds() / 3600
-            if hours_since_last < 1:
-                boost *= 0.1  # Very small boost for rapid re-access
-            elif hours_since_last < 24:
-                boost *= 0.5  # Reduced boost within same day
-        
+            hours_since = (now - memory.last_reinforced_at).total_seconds() / 3600
+            if hours_since < 1.0:
+                return memory  # Already reinforced recently, skip
+
+        old_strength = memory.strength
+
+        # Spaced repetition: longer gap = bigger boost (log-based)
+        last = memory.last_reinforced_at or memory.created_at
+        days_since = max((now - last).total_seconds() / 86400, 0.01)
+
+        # log(days+1)/log(31) gives: <1hr→~0.0, 1day→~0.2, 7days→~0.57, 30days→~1.0
+        time_factor = min(math.log(days_since + 1) / math.log(31), 1.0)
+        base_boost = 0.05 + (0.45 * time_factor)  # Range: 0.05 to 0.50
+
+        # Similarity factor: higher match = stronger reinforcement
+        sim_factor = 0.5 + (0.5 * min(similarity_score, 1.0))  # Range: 0.5 to 1.0
+
+        boost = base_boost * sim_factor
+
         # Apply boost
         new_strength = min(old_strength + boost, self.MAX_STRENGTH)
-        
+
         # Update memory
         memory.strength = new_strength
         memory.last_reinforced_at = now
         memory.last_accessed_at = now
         memory.access_count += 1
-        
+
         # Adjust decay rate based on access pattern (frequent access = slower decay)
-        # This implements the spacing effect
         if memory.access_count > 5:
             memory.decay_rate = max(0.05, memory.decay_rate * 0.95)
-        
+
         # Log reinforcement event
         await self._log_event(
             memory_id=memory.id,
@@ -222,12 +229,14 @@ class DecayService:
                 "old_strength": round(old_strength, 4),
                 "new_strength": round(new_strength, 4),
                 "boost_amount": round(new_strength - old_strength, 4),
+                "time_factor": round(time_factor, 3),
+                "similarity_score": round(similarity_score, 3),
                 "access_context": access_context,
                 "access_count": memory.access_count,
             },
             trigger_source="api"
         )
-        
+
         await self.db.commit()
         return memory
     

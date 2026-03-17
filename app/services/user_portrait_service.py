@@ -1,0 +1,147 @@
+"""
+User Portrait Service — builds and caches a synthesized user profile.
+
+Instead of dumping 15 scattered memory fragments into the system prompt,
+this service creates a coherent 3-5 sentence portrait of who the user is,
+what they're working on, and what matters to them.
+
+The portrait is regenerated:
+- Every hour (TTL-based cache)
+- When explicitly requested
+"""
+
+import logging
+import time
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, func
+
+from app.db.models import Memory
+
+logger = logging.getLogger(__name__)
+
+# Categories that form the user portrait
+PORTRAIT_CATEGORIES = {
+    "identity": "Basic identity (name, age, background)",
+    "work": "Professional context",
+    "goals": "Current goals and aspirations",
+    "preferences": "Key preferences and style",
+    "knowledge": "Expertise and skills",
+    "projects": "Active projects",
+}
+
+# In-memory cache: {user_id: {"summary": str, "raw": dict, "ts": float}}
+_portrait_cache: Dict[str, dict] = {}
+_CACHE_TTL_SECONDS = 3600  # 1 hour
+
+
+class UserPortraitService:
+    """Builds and maintains an evolving user portrait from memory categories."""
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def build_portrait(self, user_id: str) -> Dict:
+        """Build a structured user portrait from high-strength memories."""
+        portrait_parts: Dict[str, List[str]] = {}
+
+        for category in PORTRAIT_CATEGORIES:
+            result = await self.db.execute(
+                select(Memory.content, Memory.strength)
+                .where(
+                    and_(
+                        Memory.user_id == user_id,
+                        Memory.brain_type == "user",
+                        Memory.category == category,
+                        Memory.is_deleted == False,
+                        Memory.is_active == True,
+                        Memory.strength >= 0.3,
+                    )
+                )
+                .order_by(Memory.strength.desc(), Memory.importance.desc())
+                .limit(5)
+            )
+            rows = result.all()
+            if rows:
+                portrait_parts[category] = [row.content for row in rows]
+
+        if not portrait_parts:
+            return {"summary": "", "raw": {}, "updated_at": None}
+
+        # Synthesize a coherent portrait via LLM
+        summary = await self._synthesize(portrait_parts)
+
+        return {
+            "summary": summary,
+            "raw": portrait_parts,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+
+    async def get_or_build_portrait(self, user_id: str) -> str:
+        """Get cached portrait or build a new one. Cache for 1 hour."""
+        cached = _portrait_cache.get(user_id)
+        if cached and (time.time() - cached["ts"]) < _CACHE_TTL_SECONDS:
+            return cached["summary"]
+
+        portrait = await self.build_portrait(user_id)
+        summary = portrait["summary"]
+
+        if summary:
+            _portrait_cache[user_id] = {
+                "summary": summary,
+                "ts": time.time(),
+            }
+
+        return summary
+
+    def invalidate_cache(self, user_id: str):
+        """Invalidate the cached portrait for a user."""
+        _portrait_cache.pop(user_id, None)
+
+    # ------------------------------------------------------------------
+
+    async def _synthesize(self, parts: Dict[str, List[str]]) -> str:
+        """Ask Claude to synthesize a coherent user portrait."""
+        formatted = ""
+        for category, contents in parts.items():
+            label = PORTRAIT_CATEGORIES.get(category, category)
+            formatted += f"\n{label}:\n"
+            for c in contents:
+                formatted += f"  - {c}\n"
+
+        prompt = (
+            "Based on these facts about a user, write a concise user portrait "
+            "in 3-5 sentences. Focus on: who they are, what they're working on, "
+            "and what matters to them.\n"
+            "Do NOT list facts — write a flowing description as if describing a friend.\n"
+            "Do NOT start with 'The user' — use their name if known, otherwise 'They'.\n\n"
+            f"Facts by category:{formatted}\n"
+            "Write ONLY the portrait, nothing else."
+        )
+
+        try:
+            from app.services.llm_service import get_llm_service
+            llm = get_llm_service()
+            resp = await llm.complete(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=300,
+            )
+            text = resp.content.strip()
+            if len(text) > 20:
+                return text
+        except Exception as e:
+            logger.warning(f"Portrait synthesis failed: {e}")
+
+        # Fallback: concatenate top facts
+        lines = []
+        for contents in parts.values():
+            lines.extend(contents[:2])
+        return ". ".join(lines[:5])
+
+
+def get_user_portrait_service(db: AsyncSession) -> UserPortraitService:
+    """Factory function."""
+    return UserPortraitService(db)

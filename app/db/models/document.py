@@ -104,7 +104,7 @@ class DocumentChunk(Base):
 
     # Embedding
     embedding_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    embedding = Column(Vector(1536), nullable=True) if Vector else None
+    embedding = Column(Vector(), nullable=True) if Vector else None
 
     # Metadata
     metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

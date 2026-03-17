@@ -14,8 +14,27 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.postgresql import ARRAY, TSVECTOR
 
 try:
-    from pgvector.sqlalchemy import Vector
+    from pgvector.sqlalchemy import Vector as _PgVector
 except ImportError:
-    Vector = None  # Fallback for environments without pgvector
+    _PgVector = None  # Fallback for environments without pgvector
+
+
+def _get_embedding_dim() -> int:
+    """Get configured embedding dimension (avoids circular import at class-body time)."""
+    try:
+        from app.config import settings
+        return settings.embedding_dimension
+    except Exception:
+        return 1536  # safe default
+
+
+def Vector(dim: int = 0):
+    """Return a pgvector Vector column type with the configured dimension."""
+    if _PgVector is None:
+        return None
+    if dim <= 0:
+        dim = _get_embedding_dim()
+    return _PgVector(dim)
+
 
 Base = declarative_base()

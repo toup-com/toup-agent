@@ -58,9 +58,8 @@ class MemoryExtractor:
     ]
     
     FACT_PATTERNS = [
-        r"(?:i|I)\s+(?:am|work as|work at|live in|study at)\s+(.+?)(?:\.|$)",
-        r"(?:my|My)\s+(?:name|job|age|birthday|email|phone)\s+is\s+(.+?)(?:\.|$)",
-        r"(.+?)\s+is\s+(?:a|an|the)\s+(.+?)(?:\.|$)",
+        r"(?:i|I)\s+(?:am|work as|work at|live in|study at)\s+(.{5,80}?)(?:\.|$)",
+        r"(?:my|My)\s+(?:name|job|age|birthday|email|phone)\s+is\s+(.{2,60}?)(?:\.|$)",
     ]
     
     EVENT_PATTERNS = [
@@ -76,8 +75,8 @@ class MemoryExtractor:
     ]
     
     PROJECT_PATTERNS = [
-        r"(?:working on|building|creating|developing)\s+(?:a|an|the)?\s*(.+?)(?:\.|$)",
-        r"(?:project|app|application|website|system)\s+(?:called|named)?\s*['\"]?(\w+)['\"]?",
+        r"(?:i'm |i am |we're |we are )?(?:working on|building|creating|developing)\s+(?:a|an|the)\s+(.{10,80}?)(?:\.|$)",
+        r"(?:project|app|application|website|system)\s+(?:called|named)\s+['\"]?([A-Z][\w\s]{2,30})['\"]?",
     ]
     
     HEALTH_PATTERNS = [
@@ -228,7 +227,7 @@ class MemoryExtractor:
             matches = re.findall(pattern, combined_text, re.IGNORECASE)
             for match in matches[:1]:
                 content = match if isinstance(match, str) else " ".join(match)
-                if len(content.strip()) > 2:
+                if self._is_quality_content(content):
                     memories.append(self._create_memory(
                         content=f"Project: {content.strip()}",
                         original_text=content,
@@ -242,7 +241,7 @@ class MemoryExtractor:
             matches = re.findall(pattern, combined_text, re.IGNORECASE)
             for match in matches[:1]:
                 content = match if isinstance(match, str) else " ".join(match)
-                if len(content.strip()) > 2:
+                if self._is_quality_content(content):
                     memories.append(self._create_memory(
                         content=f"Health: {content.strip()}",
                         original_text=content,
@@ -256,7 +255,7 @@ class MemoryExtractor:
             matches = re.findall(pattern, combined_text, re.IGNORECASE)
             for match in matches[:1]:
                 content = match if isinstance(match, str) else " ".join(match)
-                if len(content.strip()) > 2:
+                if self._is_quality_content(content):
                     memories.append(self._create_memory(
                         content=f"Food: {content.strip()}",
                         original_text=content,
@@ -270,7 +269,7 @@ class MemoryExtractor:
             matches = re.findall(pattern, combined_text, re.IGNORECASE)
             for match in matches[:1]:
                 content = match if isinstance(match, str) else " ".join(match)
-                if len(content.strip()) > 2:
+                if self._is_quality_content(content):
                     memories.append(self._create_memory(
                         content=f"Travel: {content.strip()}",
                         original_text=content,
@@ -284,7 +283,7 @@ class MemoryExtractor:
             matches = re.findall(pattern, combined_text, re.IGNORECASE)
             for match in matches[:1]:
                 content = match if isinstance(match, str) else " ".join(match)
-                if len(content.strip()) > 2:
+                if self._is_quality_content(content):
                     memories.append(self._create_memory(
                         content=f"Learning: {content.strip()}",
                         original_text=content,
@@ -298,7 +297,7 @@ class MemoryExtractor:
             matches = re.findall(pattern, combined_text, re.IGNORECASE)
             for match in matches[:1]:
                 content = match if isinstance(match, str) else " ".join(match)
-                if len(content.strip()) > 2:
+                if self._is_quality_content(content):
                     memories.append(self._create_memory(
                         content=f"Schedule: {content.strip()}",
                         original_text=content,
@@ -312,7 +311,7 @@ class MemoryExtractor:
             matches = re.findall(pattern, combined_text, re.IGNORECASE)
             for match in matches[:1]:
                 content = match if isinstance(match, str) else " ".join(match)
-                if len(content.strip()) > 2:
+                if self._is_quality_content(content):
                     memories.append(self._create_memory(
                         content=f"Media: {content.strip()}",
                         original_text=content,
@@ -482,22 +481,45 @@ class MemoryExtractor:
     
     @staticmethod
     def _is_quality_content(content: str) -> bool:
-        """Check if extracted content meets minimum quality bar."""
+        """Check if extracted content meets minimum quality bar.
+
+        Must be strict — garbage memories are worse than no memories.
+        """
         text = content.strip() if isinstance(content, str) else " ".join(content).strip()
-        # Too short
-        if len(text) < 5:
+        # Too short — meaningful facts need at least 10 chars
+        if len(text) < 10:
             return False
-        # Fewer than 2 words
-        if text.count(" ") < 1:
+        # Fewer than 3 words — can't be a meaningful sentence
+        if text.count(" ") < 2:
             return False
-        # Just a question
+        # Just a question — questions aren't facts to remember
         if text.endswith("?"):
             return False
-        # Common garbage patterns
-        garbage = {"it", "that", "this", "yes", "no", "ok", "sure", "thanks",
-                    "hi", "hello", "hey", "can you", "please", "had", "the"}
-        if text.lower().strip().rstrip(".!,") in garbage:
+        # Common garbage patterns (expanded)
+        garbage = {
+            "it", "that", "this", "yes", "no", "ok", "sure", "thanks",
+            "hi", "hello", "hey", "can you", "please", "had", "the",
+            "which", "what", "how", "who", "where", "when", "why",
+            "something", "anything", "nothing", "new items", "into new items",
+            "help and label", "memory and timeline", "component and app",
+            "change something", "a something", "into something",
+        }
+        normalized = text.lower().strip().rstrip(".!,)]}")
+        if normalized in garbage:
             return False
+        # Reject if mostly non-alpha (code/syntax fragments)
+        alpha_ratio = sum(1 for c in text if c.isalpha()) / max(len(text), 1)
+        if alpha_ratio < 0.5:
+            return False
+        # Reject fragments that look like assistant output, not user facts
+        assistant_markers = [
+            "here's", "here is", "i'll help", "let me", "i can help",
+            "sure,", "of course", "certainly", "you can", "you should",
+            "track your", "track it in", "track its",
+        ]
+        for marker in assistant_markers:
+            if normalized.startswith(marker):
+                return False
         return True
 
     def _deduplicate_memories(self, memories: List[ExtractedMemory]) -> List[ExtractedMemory]:
@@ -590,9 +612,9 @@ ASSISTANT RESPONSE:
 7. **Schema-enforced entities**: For each entity, identify the best matching schema_type from the list above (PersonEntity, OrganizationEntity, ProjectEntity, PlaceEntity, EventEntity, TopicEntity, ToolEntity). Fill in as many fields as the conversation provides. If unsure, use "type" only (backward compatible).
 
 Extract as many memories as the conversation warrants (up to {max_memories}). Do NOT artificially limit — if there are 10 distinct facts, extract all 10. Return ONLY valid JSON:
-{{{{
+{{
   "memories": [
-    {{{{
+    {{
       "content": "Complete standalone sentence describing the memory",
       "summary": "Brief summary (max 100 chars)",
       "category": "one of the valid categories listed above",
@@ -600,70 +622,72 @@ Extract as many memories as the conversation warrants (up to {max_memories}). Do
       "importance": 0.7,
       "confidence": 0.9,
       "entities": [
-        {{{{
+        {{
           "name": "Alice",
           "type": "person",
           "schema_type": "PersonEntity",
-          "data": {{{{"name": "Alice", "relationship_to_user": "friend", "occupation": "engineer", "organization": "Google"}}}}
-        }}}},
-        {{{{
+          "data": {{"name": "Alice", "relationship_to_user": "friend", "occupation": "engineer", "organization": "Google"}}
+        }},
+        {{
           "name": "Google",
           "type": "organization",
           "schema_type": "OrganizationEntity",
-          "data": {{{{"name": "Google", "org_type": "company", "industry": "technology"}}}}
-        }}}}
+          "data": {{"name": "Google", "org_type": "company", "industry": "technology"}}
+        }}
       ],
       "tags": ["tag1", "tag2"]
-    }}}}
+    }}
   ]
-}}}}
+}}
 
-If the conversation is just casual chat, commands, or questions with nothing worth remembering long-term, return {{{{"memories": []}}}}. It is BETTER to extract nothing than to extract garbage."""
+If the conversation is just casual chat, commands, or questions with nothing worth remembering long-term, return {{"memories": []}}. It is BETTER to extract nothing than to extract garbage."""
 
         try:
             response = await llm.complete_with_json(
-                messages=[{{"role": "user", "content": extraction_prompt}}],
-                temperature=0.3,  # Lower temperature for more consistent extraction
-                max_tokens=3000  # Increased to accommodate up to 15 memories
+                messages=[{"role": "user", "content": extraction_prompt}],
+                temperature=0.3,
+                max_tokens=3000,
             )
-            
-            # Parse the response
-            result = json.loads(response.content)
+
+            # Parse the response — strip markdown fences if present (Anthropic)
+            raw = response.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            result = json.loads(raw)
             memories = []
-            
-            # Valid categories for validation
-            valid_categories = {{
+
+            valid_categories = {
                 "identity", "preferences", "beliefs", "emotions", "people",
                 "places", "family", "experiences", "projects", "schedule",
                 "work", "learning", "knowledge", "tools", "media", "health",
                 "habits", "food", "travel", "goals"
-            }}
-            
+            }
+
             for mem_data in result.get("memories", [])[:max_memories]:
                 content = mem_data.get("content", "").strip()
-                
+
                 # Quality filters — skip garbage
                 if not content or len(content) < 15:
-                    continue  # Too short to be meaningful
+                    continue
                 if content.count(" ") < 3:
-                    continue  # Fewer than 4 words
+                    continue
                 if content.endswith("?"):
-                    continue  # Questions aren't memories
-                
+                    continue
+
                 # Validate category
                 category_str = mem_data.get("category", "context").lower()
                 if category_str not in valid_categories:
                     category_str = "context"
                 category = self._string_to_category(category_str)
-                
-                # Map memory type string to enum
+
                 type_str = mem_data.get("memory_type", "fact").lower()
                 memory_type = self._string_to_memory_type(type_str)
-                
+
                 importance = float(mem_data.get("importance", 0.5))
                 if importance < 0.3:
-                    continue  # Below minimum quality bar
-                
+                    continue
+
                 memories.append(ExtractedMemory(
                     content=content,
                     summary=mem_data.get("summary", "")[:100],
@@ -673,15 +697,15 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                     confidence=float(mem_data.get("confidence", 0.8)),
                     entities=mem_data.get("entities", []),
                     tags=mem_data.get("tags", []),
-                    metadata={{"brain_type": brain_type, "extracted_by": "llm"}}
+                    metadata={"brain_type": brain_type, "extracted_by": "llm"},
                 ))
-            
+
             return memories
-            
+
         except Exception as e:
             # Log error and fall back to rule-based extraction
             import logging
-            logging.warning(f"LLM extraction failed, falling back to rules: {{e}}")
+            logging.warning(f"LLM extraction failed, falling back to rules: {e}")
             return self.extract_memories(user_message, assistant_response, max_memories)
     
     async def extract_relationships_with_llm(
@@ -727,53 +751,57 @@ ASSISTANT RESPONSE:
 - Confidence: 0.9+ for explicit statements, 0.6-0.8 for strong implications
 
 Return ONLY valid JSON:
-{{{{
+{{
   "relationships": [
-    {{{{
+    {{
       "source": "Alice",
       "source_type": "person",
       "target": "Google",
       "target_type": "organization",
       "relationship": "works_at",
       "confidence": 0.9,
-      "properties": {{{{"role": "software engineer", "since": "2023"}}}}
-    }}}}
+      "properties": {{"role": "software engineer", "since": "2023"}}
+    }}
   ]
-}}}}
+}}
 
-If no entity relationships are found, return {{{{"relationships": []}}}}."""
+If no entity relationships are found, return {{"relationships": []}}."""
 
         try:
             response = await llm.complete_with_json(
-                messages=[{{"role": "user", "content": prompt}}],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=1000
+                max_tokens=1000,
             )
-            
-            result = json.loads(response.content)
+
+            raw = response.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            result = json.loads(raw)
             relationships = []
-            
+
             for rel in result.get("relationships", []):
                 source = rel.get("source", "").strip()
                 target = rel.get("target", "").strip()
                 relationship = rel.get("relationship", "").strip()
-                
+
                 if source and target and relationship and len(source) > 1 and len(target) > 1:
-                    relationships.append({{
+                    relationships.append({
                         "source": source,
                         "source_type": rel.get("source_type", "unknown"),
                         "target": target,
                         "target_type": rel.get("target_type", "unknown"),
                         "relationship": relationship,
                         "confidence": float(rel.get("confidence", 0.7)),
-                        "properties": rel.get("properties", {{}}),
-                    }})
-            
+                        "properties": rel.get("properties", {}),
+                    })
+
             return relationships
-            
+
         except Exception as e:
             import logging
-            logging.warning(f"LLM relationship extraction failed: {{e}}")
+            logging.warning(f"LLM relationship extraction failed: {e}")
             return []
 
     def _string_to_category(self, category_str: str) -> MemoryCategory:

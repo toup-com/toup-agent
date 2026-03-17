@@ -118,6 +118,47 @@ async def init_db():
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS layer INTEGER DEFAULT 1",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS layer2_changes_json TEXT",
     ]
+
+    # Vector dimension migration: if embedding_dimension changed (e.g. 1536 → 384),
+    # drop and recreate the pgvector columns. Old embeddings are invalidated anyway
+    # since they came from a different model.
+    from app.config import settings as _cfg
+    _dim = _cfg.embedding_dimension
+    _vec_migration = [
+        # Memories
+        f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memories' AND column_name='embedding') THEN "
+        f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='memories'::regclass AND attname='embedding') != {_dim} THEN "
+        f"EXECUTE 'ALTER TABLE memories DROP COLUMN embedding'; "
+        f"EXECUTE 'ALTER TABLE memories ADD COLUMN embedding vector({_dim})'; "
+        f"END IF; END IF; END $$",
+        # Entities
+        f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='entities' AND column_name='embedding') THEN "
+        f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='entities'::regclass AND attname='embedding') != {_dim} THEN "
+        f"EXECUTE 'ALTER TABLE entities DROP COLUMN embedding'; "
+        f"EXECUTE 'ALTER TABLE entities ADD COLUMN embedding vector({_dim})'; "
+        f"END IF; END IF; END $$",
+        # Messages
+        f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='embedding') THEN "
+        f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='messages'::regclass AND attname='embedding') != {_dim} THEN "
+        f"EXECUTE 'ALTER TABLE messages DROP COLUMN embedding'; "
+        f"EXECUTE 'ALTER TABLE messages ADD COLUMN embedding vector({_dim})'; "
+        f"END IF; END IF; END $$",
+        # Document chunks
+        f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='document_chunks' AND column_name='embedding') THEN "
+        f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='document_chunks'::regclass AND attname='embedding') != {_dim} THEN "
+        f"EXECUTE 'ALTER TABLE document_chunks DROP COLUMN embedding'; "
+        f"EXECUTE 'ALTER TABLE document_chunks ADD COLUMN embedding vector({_dim})'; "
+        f"END IF; END IF; END $$",
+    ]
+    _alter_statements.extend(_vec_migration)
+
+    # Ensure HNSW index exists on memories.embedding (may be lost after dimension migration)
+    _alter_statements.append(
+        f"CREATE INDEX IF NOT EXISTS ix_memories_embedding_hnsw "
+        f"ON memories USING hnsw (embedding vector_cosine_ops) "
+        f"WITH (m = 16, ef_construction = 64)"
+    )
+
     # Seed user-facing VPS plans — Hetzner Cloud CPX (AMD, Shared Regular Performance)
     # Location: ASH (Ashburn, Virginia, USA)
     # NOTE: CPX11 (2GB RAM) too small for local embeddings + PostgreSQL + Python

@@ -1968,11 +1968,26 @@ class MemoryService:
                 logger.info(
                     f"[HYBRID] Re-ranked {len(scored_memories)}→{len(reranked)} candidates"
                 )
-                return reranked
+                scored_memories = reranked
         except Exception as e:
             logger.warning(f"[HYBRID] Re-ranker failed, using score-based ranking: {e}")
+            scored_memories = scored_memories[:limit]
 
-        return scored_memories[:limit]
+        # Auto-reinforce top retrieved memories (spaced repetition)
+        try:
+            from app.services.decay_service import DecayService
+            decay_svc = DecayService(self.db)
+            for mem in scored_memories[:5]:
+                await decay_svc.reinforce_memory(
+                    memory_id=mem["id"],
+                    user_id=user_id,
+                    access_context="retrieval",
+                    similarity_score=mem.get("similarity_score", 0.5),
+                )
+        except Exception as e:
+            logger.warning(f"[HYBRID] Auto-reinforcement failed (non-fatal): {e}")
+
+        return scored_memories
 
     async def _vector_search(
         self,

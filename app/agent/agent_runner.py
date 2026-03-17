@@ -656,32 +656,105 @@ class AgentRunner:
         # 3. Retrieve relevant user memories (hybrid search: vector + keyword + graph)
         try:
             from app.services.memory_service import MemoryService
-            
+            from app.services.query_classifier import classify_query
+
             mem_svc = MemoryService(db)
-            logger.info(f'[AGENT] Hybrid searching user memories for: "{user_message[:80]}"')
-            
+            classification = classify_query(user_message)
+            logger.info(f'[AGENT] Query classified as: {classification["type"]} — searching user memories for: "{user_message[:80]}"')
+
+            search_strategies = classification.get("strategies") or ["vector", "keyword", "graph"]
+            search_categories = classification.get("categories")
+
             memories = await mem_svc.hybrid_search(
                 user_id=user_id,
                 query=user_message,
                 limit=15,
                 min_similarity=0.1,
-                strategies=["vector", "keyword", "graph"],
+                strategies=search_strategies,
+                categories=search_categories,
             )
+            # If entity hint detected, prepend entity-graph results
+            if classification.get("entity_hint"):
+                try:
+                    entity_mems = await mem_svc.search_by_entity_graph(
+                        user_id=user_id,
+                        entity_name=classification["entity_hint"],
+                        depth=2,
+                        limit=5,
+                    )
+                    existing_ids = {m["id"] for m in memories}
+                    for em in entity_mems:
+                        if em["id"] not in existing_ids:
+                            memories.insert(0, em)
+                    if entity_mems:
+                        logger.info(f"[AGENT] Entity search for '{classification['entity_hint']}' added {len(entity_mems)} results")
+                except Exception as e:
+                    logger.warning(f"Entity graph search failed: {e}")
+
             # Filter to user brain only (agent brain already loaded above)
             user_memories = [m for m in memories if m.get("brain_type") == "user"]
             # Phase 5: Store retrieved memories for feedback loop
             self._last_retrieved_memories = user_memories
             logger.info(f"[AGENT] Found {len(user_memories)} relevant user memories (hybrid)")
-            
+
+            # Build structured memory context
+            memory_sections = []
+
+            # A. User Portrait (synthesized identity — always first)
+            try:
+                from app.services.user_portrait_service import UserPortraitService
+                portrait_svc = UserPortraitService(db)
+                portrait = await portrait_svc.get_or_build_portrait(user_id)
+                if portrait:
+                    memory_sections.append(f"## Who this user is\n{portrait}")
+                    logger.info(f"[AGENT] Portrait loaded ({len(portrait)} chars)")
+            except Exception as e:
+                logger.warning(f"Portrait generation failed: {e}")
+
             if user_memories:
-                mem_lines = ["# User Brain (Relevant Memories)"]
-                for i, m in enumerate(user_memories, 1):
-                    cat = m.get("category", "")
-                    content = m.get("content", "")
+                # B. Core facts (high-strength semantic memories)
+                core_facts = [
+                    m for m in user_memories
+                    if m.get("strength", 0) >= 0.7
+                    and m.get("memory_type") not in ("event", "conversation")
+                ]
+                if core_facts:
+                    memory_sections.append("## Core facts about this user")
+                    for m in core_facts[:5]:
+                        memory_sections.append(f"- {m.get('content', '')}")
+
+                # C. Relevant memories from search (excluding core facts already shown)
+                core_ids = {m.get("id") for m in core_facts}
+                regular = [m for m in user_memories if m.get("id") not in core_ids]
+                if regular:
+                    memory_sections.append("\n## Relevant to this conversation")
+                    for i, m in enumerate(regular[:10], 1):
+                        cat = m.get("category", "")
+                        content = m.get("content", "")
+                        age = self._format_memory_age(m.get("created_at"))
+                        memory_sections.append(f"{i}. [{cat}] {content} ({age})")
+
+                for m in user_memories:
                     score = m.get("similarity_score", 0)
-                    logger.info(f"[AGENT]   Memory {i}: [{cat}] ({score:.2f}) {content[:80]}")
-                    mem_lines.append(f"{i}. [{cat}] (relevance: {score:.2f}) {content}")
-                sections.append("\n".join(mem_lines))
+                    logger.info(f"[AGENT]   Memory: [{m.get('category','')}] ({score:.2f}) {m.get('content','')[:80]}")
+
+            # D. Related entities
+            try:
+                entity_data = await mem_svc.get_entities(user_id=user_id, limit=8)
+                if entity_data:
+                    entity_lines = ["\n## People and things the user has mentioned"]
+                    for e in entity_data[:8]:
+                        desc = e.get("entity_type", "")
+                        name = e.get("name", "")
+                        if name:
+                            entity_lines.append(f"- {name} ({desc})")
+                    if len(entity_lines) > 1:
+                        memory_sections.append("\n".join(entity_lines))
+            except Exception:
+                pass
+
+            if memory_sections:
+                sections.append("# User Brain\n" + "\n".join(memory_sections))
         except Exception as e:
             logger.warning(f"Memory retrieval failed in agent prompt: {e}")
         
@@ -983,21 +1056,40 @@ class AgentRunner:
                 logger.info(f"Memory {action}: {stored.content[:50]}...")
                 count += 1
                 
-                # Phase 4: Upsert entities with schema-enforced data
+                # Phase 4: Upsert entities with schema-enforced data + create EntityLinks
                 if mem.entities:
                     from app.services.memory_service import MemoryService as _MemSvc
+                    from app.db.models import EntityLink as _EL
                     _ms = _MemSvc(db)
                     for ent in mem.entities:
                         ent_name = ent.get("name", "").strip()
                         if not ent_name or len(ent_name) < 2:
                             continue
-                        await _ms._upsert_entity(
+                        entity_obj = await _ms._upsert_entity(
                             user_id=user_id,
                             name=ent_name,
                             entity_type=ent.get("type", "unknown"),
                             schema_type=ent.get("schema_type"),
                             attributes=ent.get("data"),
                         )
+                        # Create EntityLink connecting this memory to the entity
+                        if entity_obj and stored:
+                            import uuid as _uuid
+                            from sqlalchemy import select as _sel, and_ as _and
+                            existing_link = await db.execute(
+                                _sel(_EL).where(_and(
+                                    _EL.memory_id == stored.id,
+                                    _EL.entity_id == entity_obj.id,
+                                ))
+                            )
+                            if not existing_link.scalar_one_or_none():
+                                db.add(_EL(
+                                    id=str(_uuid.uuid4()),
+                                    memory_id=stored.id,
+                                    entity_id=entity_obj.id,
+                                    role=ent.get("role", "mentioned"),
+                                ))
+                    await db.flush()
             
             # P3: Extract entity relationships and store them
             try:
@@ -1022,12 +1114,48 @@ class AgentRunner:
                     logger.info(f"Extracted {len(relationships)} entity relationships")
             except Exception as e:
                 logger.warning(f"Entity relationship extraction failed (non-fatal): {e}")
-            
+
+            # Invalidate portrait cache if memories were created
+            if count >= 3:
+                try:
+                    from app.services.user_portrait_service import UserPortraitService
+                    UserPortraitService(db).invalidate_cache(user_id)
+                    logger.info(f"Portrait cache invalidated after {count} new memories")
+                except Exception as e:
+                    logger.debug(f"Portrait cache invalidation failed (non-fatal): {e}")
+
             return count
         except Exception as e:
             logger.warning(f"Agent memory extraction failed: {e}")
             return 0
     
+    @staticmethod
+    def _format_memory_age(created_at_str) -> str:
+        """Format memory age as human-readable string."""
+        if not created_at_str:
+            return ""
+        try:
+            if isinstance(created_at_str, str):
+                dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            else:
+                dt = created_at_str
+            age = datetime.utcnow() - dt.replace(tzinfo=None)
+            days = age.days
+            if days == 0:
+                return "today"
+            elif days == 1:
+                return "yesterday"
+            elif days < 7:
+                return f"{days}d ago"
+            elif days < 30:
+                return f"{days // 7}w ago"
+            elif days < 365:
+                return f"{days // 30}mo ago"
+            else:
+                return f"{days // 365}y ago"
+        except Exception:
+            return ""
+
     # ------------------------------------------------------------------
     # Media handling (OpenAI vision format)
     # ------------------------------------------------------------------

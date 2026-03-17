@@ -1,19 +1,16 @@
 """
-LLM Service - OpenAI API wrapper for chat completions
+LLM Service - Multi-provider wrapper for chat completions.
 
-Provides:
-- Chat completion with token tracking
-- Streaming support
-- Error handling and retries
-- Model selection and configuration
+Supports:
+- Anthropic Claude (preferred when ANTHROPIC_API_KEY is set)
+- OpenAI (fallback)
+- Token tracking, retries, streaming
 """
 
 import asyncio
 import logging
 from dataclasses import dataclass
 from typing import AsyncGenerator, List, Dict, Any, Optional
-from openai import AsyncOpenAI, APIError, RateLimitError, APIConnectionError
-import tiktoken
 
 from app.config import settings
 
@@ -39,47 +36,67 @@ class StreamChunk:
     finish_reason: Optional[str] = None
 
 
+def _should_use_anthropic(api_key: Optional[str] = None) -> bool:
+    """Decide whether to use Anthropic backend.
+    If caller passes an explicit OpenAI key, use OpenAI.
+    Otherwise prefer Anthropic when its key is available."""
+    if api_key:
+        return False  # Explicit per-user OpenAI key
+    return bool(settings.anthropic_api_key)
+
+
 class LLMService:
     """
-    OpenAI LLM Service for chat completions.
-    
-    Handles:
-    - Chat completions (streaming and non-streaming)
-    - Token counting and tracking
-    - Retry logic for transient errors
-    - Model configuration
+    Multi-provider LLM Service for chat completions.
+
+    Automatically uses Anthropic Claude when ANTHROPIC_API_KEY is set,
+    falls back to OpenAI otherwise. This ensures memory extraction,
+    deduplication, and consolidation work without a valid OpenAI key.
     """
-    
+
     def __init__(self, api_key: Optional[str] = None):
-        self.client = AsyncOpenAI(api_key=api_key or settings.openai_api_key)
-        self.default_model = settings.default_model
+        self._use_anthropic = _should_use_anthropic(api_key)
+        self._anthropic_svc = None
+        self._openai_client = None
+
+        if self._use_anthropic:
+            logger.info("LLMService: using Anthropic backend")
+            from app.services.anthropic_service import AnthropicService
+            self._anthropic_svc = AnthropicService()
+            self.default_model = settings.agent_model or "claude-sonnet-4-6"
+        else:
+            from openai import AsyncOpenAI
+            self._openai_client = AsyncOpenAI(api_key=api_key or settings.openai_api_key)
+            self.default_model = settings.default_model
+
         self.default_temperature = settings.temperature
         self.default_max_tokens = settings.max_tokens
-        
-        # Initialize tokenizer for the default model
+
+        # Initialize tokenizer
         try:
+            import tiktoken
             self._encoding = tiktoken.encoding_for_model(self.default_model)
-        except KeyError:
-            # Fall back to cl100k_base for newer models
-            self._encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            try:
+                import tiktoken
+                self._encoding = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                self._encoding = None
     
     def count_tokens(self, text: str) -> int:
         """Count tokens in a text string."""
-        return len(self._encoding.encode(text))
-    
+        if self._encoding:
+            return len(self._encoding.encode(text))
+        return len(text) // 4  # rough estimate
+
     def count_message_tokens(self, messages: List[Dict[str, str]]) -> int:
-        """
-        Count tokens in a list of messages.
-        
-        Accounts for message formatting overhead.
-        """
+        """Count tokens in a list of messages."""
         total = 0
         for message in messages:
-            # Each message has overhead: role + content wrapper
-            total += 4  # Approximate overhead per message
+            total += 4
             total += self.count_tokens(message.get("content", ""))
             total += self.count_tokens(message.get("role", ""))
-        total += 2  # Priming tokens
+        total += 2
         return total
     
     async def complete(
@@ -90,41 +107,68 @@ class LLMService:
         max_tokens: Optional[int] = None,
         **kwargs
     ) -> LLMResponse:
-        """
-        Generate a chat completion.
-        
-        Args:
-            messages: List of message dicts with 'role' and 'content'
-            model: Model to use (defaults to settings.default_chat_model)
-            temperature: Temperature for sampling (0-2)
-            max_tokens: Maximum tokens to generate
-            **kwargs: Additional parameters passed to OpenAI
-        
-        Returns:
-            LLMResponse with content and token usage
-        """
+        """Generate a chat completion (Anthropic or OpenAI)."""
         model = model or self.default_model
         temperature = temperature if temperature is not None else self.default_temperature
         max_tokens = max_tokens or self.default_max_tokens
-        
-        # Retry logic for transient errors
+
+        if self._use_anthropic:
+            return await self._complete_anthropic(messages, model, temperature, max_tokens)
+        return await self._complete_openai(messages, model, temperature, max_tokens, **kwargs)
+
+    async def _complete_anthropic(
+        self, messages, model, temperature, max_tokens
+    ) -> LLMResponse:
+        """Use AnthropicService for completion."""
+        # Separate system message from conversation
+        system = ""
+        conv_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system = msg.get("content", "")
+            else:
+                conv_messages.append(msg)
+
+        # Ensure we have at least one user message
+        if not conv_messages:
+            conv_messages = [{"role": "user", "content": ""}]
+
+        resp = await self._anthropic_svc.create_message(
+            messages=conv_messages,
+            system=system,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return LLMResponse(
+            content=resp.content,
+            model=resp.model,
+            tokens_prompt=resp.tokens_input,
+            tokens_completion=resp.tokens_output,
+            tokens_total=resp.tokens_total,
+            finish_reason=resp.stop_reason,
+        )
+
+    async def _complete_openai(
+        self, messages, model, temperature, max_tokens, **kwargs
+    ) -> LLMResponse:
+        """Use OpenAI for completion."""
+        from openai import APIError, RateLimitError, APIConnectionError
+
         max_retries = 3
         retry_delay = 1.0
-        
+
         for attempt in range(max_retries):
             try:
-                response = await self.client.chat.completions.create(
+                response = await self._openai_client.chat.completions.create(
                     model=model,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     **kwargs
                 )
-                
-                # Extract response data
                 choice = response.choices[0]
                 usage = response.usage
-                
                 return LLMResponse(
                     content=choice.message.content or "",
                     model=response.model,
@@ -133,23 +177,16 @@ class LLMService:
                     tokens_total=usage.total_tokens,
                     finish_reason=choice.finish_reason
                 )
-                
             except RateLimitError as e:
                 if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2 ** attempt)
-                    logger.warning(f"Rate limited, retrying in {wait_time}s: {e}")
-                    await asyncio.sleep(wait_time)
+                    await asyncio.sleep(retry_delay * (2 ** attempt))
                 else:
                     raise
-            
             except APIConnectionError as e:
                 if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2 ** attempt)
-                    logger.warning(f"Connection error, retrying in {wait_time}s: {e}")
-                    await asyncio.sleep(wait_time)
+                    await asyncio.sleep(retry_delay * (2 ** attempt))
                 else:
                     raise
-            
             except APIError as e:
                 logger.error(f"OpenAI API error: {e}")
                 raise
@@ -162,56 +199,33 @@ class LLMService:
         max_tokens: Optional[int] = None,
         **kwargs
     ) -> AsyncGenerator[StreamChunk, None]:
-        """
-        Generate a streaming chat completion.
-        
-        Args:
-            messages: List of message dicts with 'role' and 'content'
-            model: Model to use
-            temperature: Temperature for sampling
-            max_tokens: Maximum tokens to generate
-            **kwargs: Additional parameters
-        
-        Yields:
-            StreamChunk objects with content and metadata
-        """
+        """Generate a streaming chat completion (OpenAI only for now)."""
+        if self._use_anthropic:
+            # For Anthropic, fall back to non-streaming and yield result at once
+            resp = await self.complete(messages, model, temperature, max_tokens)
+            yield StreamChunk(content=resp.content, is_final=True, finish_reason=resp.finish_reason)
+            return
+
         model = model or self.default_model
         temperature = temperature if temperature is not None else self.default_temperature
         max_tokens = max_tokens or self.default_max_tokens
-        
+
         try:
-            stream = await self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-                **kwargs
+            stream = await self._openai_client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature,
+                max_tokens=max_tokens, stream=True, **kwargs
             )
-            
             async for chunk in stream:
                 if chunk.choices:
                     choice = chunk.choices[0]
-                    delta = choice.delta
-                    
-                    if delta.content:
-                        yield StreamChunk(
-                            content=delta.content,
-                            is_final=False,
-                            finish_reason=None
-                        )
-                    
+                    if choice.delta.content:
+                        yield StreamChunk(content=choice.delta.content, is_final=False)
                     if choice.finish_reason:
-                        yield StreamChunk(
-                            content="",
-                            is_final=True,
-                            finish_reason=choice.finish_reason
-                        )
-        
+                        yield StreamChunk(content="", is_final=True, finish_reason=choice.finish_reason)
         except Exception as e:
             logger.error(f"Streaming error: {e}")
             raise
-    
+
     async def complete_with_json(
         self,
         messages: List[Dict[str, str]],
@@ -220,18 +234,13 @@ class LLMService:
         max_tokens: Optional[int] = None,
         **kwargs
     ) -> LLMResponse:
-        """
-        Generate a completion with JSON response format.
-        
-        Useful for structured extraction tasks.
-        """
+        """Generate a completion expecting JSON response."""
+        if self._use_anthropic:
+            # Anthropic doesn't have response_format — the prompt already asks for JSON
+            return await self.complete(messages, model, temperature, max_tokens)
         return await self.complete(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-            **kwargs
+            messages=messages, model=model, temperature=temperature,
+            max_tokens=max_tokens, response_format={"type": "json_object"}, **kwargs
         )
 
 

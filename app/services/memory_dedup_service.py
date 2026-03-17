@@ -147,7 +147,7 @@ class MemoryDedupService:
             if existing:
                 reinforced = await self._reinforce_existing_memory(existing, new_memory)
                 return reinforced, "reinforced"
-        
+
         elif decision['action'] == 'merge':
             # Related with new info, merge them
             try:
@@ -160,8 +160,21 @@ class MemoryDedupService:
                 return merged, "merged"
             except Exception as e:
                 logger.error(f"Merge failed: {e}, creating new memory instead")
-        
-        # decision['action'] == 'new' or merge failed - create new memory
+
+        elif decision['action'] == 'contradiction_update':
+            # New info contradicts/supersedes old — create new, mark old as superseded
+            try:
+                superseded = await self._supersede_with_new(
+                    old_memory_id=top_match['id'],
+                    new_memory_data=new_memory,
+                    user_id=user_id,
+                    reason=decision.get('reason', 'Updated information'),
+                )
+                return superseded, "contradiction_updated"
+            except Exception as e:
+                logger.error(f"Supersede failed: {e}, creating new memory instead")
+
+        # decision['action'] == 'new' or merge/supersede failed - create new memory
         memory = await self.memory_service.create_memory(
             user_id=user_id,
             memory_data=new_memory,
@@ -217,6 +230,61 @@ class MemoryDedupService:
         
         return memory
     
+    async def _supersede_with_new(
+        self,
+        old_memory_id: str,
+        new_memory_data: MemoryCreate,
+        user_id: str,
+        reason: str = "Updated information",
+    ) -> Memory:
+        """
+        Mark old memory as superseded and create the replacement.
+
+        Used when new information contradicts the old (e.g., user changed jobs).
+        The old memory is kept for history but excluded from active search.
+        """
+        # Create the new memory
+        new_memory = await self.memory_service.create_memory(
+            user_id=user_id,
+            memory_data=new_memory_data,
+            deduplicate=False,
+        )
+
+        # Mark old memory as superseded
+        old_memory = await self._get_memory_by_id(old_memory_id)
+        if old_memory:
+            old_memory.superseded_by = new_memory.id
+            old_memory.is_active = False
+            old_memory.strength = max((old_memory.strength or 0.5) * 0.3, 0.1)
+            old_memory.updated_at = datetime.utcnow()
+
+            # Add to history
+            history = json.loads(old_memory.history_json) if old_memory.history_json else []
+            history.append({
+                "date": datetime.utcnow().isoformat(),
+                "content": old_memory.canonical_content or old_memory.content,
+                "source": "contradiction_update",
+                "action": "superseded",
+                "change_summary": reason,
+                "superseded_by": new_memory.id,
+            })
+            old_memory.history_json = json.dumps(history)
+
+            # Track lineage on the new memory
+            merged_from = json.loads(new_memory.merged_from_json) if new_memory.merged_from_json else []
+            if old_memory_id not in merged_from:
+                merged_from.append(old_memory_id)
+                new_memory.merged_from_json = json.dumps(merged_from)
+
+            await self.db.commit()
+            await self.db.refresh(new_memory)
+
+            logger.info(
+                f"Superseded memory {old_memory_id} → {new_memory.id}: {reason}"
+            )
+
+        return new_memory
+
     async def _merge_memories(
         self,
         existing_memory_id: str,
@@ -320,8 +388,14 @@ Decide ONE of these actions:
 2. "merge" - The new information ADDS DETAILS to the SAME SPECIFIC TOPIC.
    Example: "I love pizza" vs "I love pepperoni pizza from Dominos" → merge (both about pizza preference)
    Example: "I play basketball" vs "I play basketball as point guard on Saturdays" → merge (both about basketball)
-   
-3. "new" - The information is about a DIFFERENT topic, even if about the same person.
+
+3. "contradiction_update" - The new information CONTRADICTS or SUPERSEDES the existing one.
+   The user's facts have changed (new job, moved cities, changed preference, updated a goal).
+   Example: "I work at Google" vs "I just joined Apple" → contradiction_update
+   Example: "I live in NYC" vs "I moved to London" → contradiction_update
+   Example: "My goal is to learn Python" vs "I've mastered Python, now learning Rust" → contradiction_update
+
+4. "new" - The information is about a DIFFERENT topic, even if about the same person.
    Example: "My name is John" vs "I love pizza" → new (name vs food = different topics)
    Example: "I love pizza" vs "I have a dog named Max" → new (food vs pet = different topics)
    Example: "I play basketball" vs "My favorite movie is Inception" → new (sport vs movie = different topics)
@@ -332,20 +406,24 @@ Only merge if they are about the SAME SPECIFIC TOPIC (e.g., both about food, bot
 
 Respond in JSON:
 {{
-    "action": "duplicate|merge|new",
+    "action": "duplicate|merge|contradiction_update|new",
     "reason": "Brief explanation"
 }}"""
 
         try:
             response = await self.llm_service.complete_with_json(
                 messages=[{"role": "user", "content": prompt}],
-                model="gpt-4o-mini"  # Fast and cheap for decisions
             )
-            
-            # Parse response
+
+            # Parse response — strip markdown fences if present
             if hasattr(response, 'content'):
                 import json as json_module
-                parsed = json_module.loads(response.content)
+                import re as re_module
+                raw = response.content.strip()
+                if raw.startswith("```"):
+                    raw = re_module.sub(r"^```(?:json)?\s*", "", raw)
+                    raw = re_module.sub(r"\s*```$", "", raw)
+                parsed = json_module.loads(raw)
             else:
                 parsed = response
             
@@ -353,7 +431,7 @@ Respond in JSON:
             reason = parsed.get("reason", "")
             
             # Validate action
-            if action not in ["duplicate", "merge", "new"]:
+            if action not in ["duplicate", "merge", "contradiction_update", "new"]:
                 action = "new"
             
             return {"action": action, "reason": reason}
@@ -404,13 +482,17 @@ Rules:
         try:
             response = await self.llm_service.complete_with_json(
                 messages=[{"role": "user", "content": prompt}],
-                model="gpt-4o-mini"  # Use cheaper model for merging
             )
-            
-            # Parse JSON response
+
+            # Parse JSON response — strip markdown fences if present
             if hasattr(response, 'content'):
                 import json as json_module
-                parsed = json_module.loads(response.content)
+                import re as re_module
+                raw = response.content.strip()
+                if raw.startswith("```"):
+                    raw = re_module.sub(r"^```(?:json)?\s*", "", raw)
+                    raw = re_module.sub(r"\s*```$", "", raw)
+                parsed = json_module.loads(raw)
             else:
                 parsed = response
             

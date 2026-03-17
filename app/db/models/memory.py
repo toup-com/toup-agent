@@ -52,7 +52,7 @@ class Memory(Base):
     embedding_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Native pgvector column
-    embedding = Column(Vector(1536), nullable=True) if Vector else None
+    embedding = Column(Vector(), nullable=True) if Vector else None
 
     # Full-text search vector (auto-updated by PostgreSQL trigger)
     search_vector = Column(TSVECTOR, nullable=True)

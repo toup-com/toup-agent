@@ -28,7 +28,7 @@ class Entity(Base):
 
     # Embedding for the entity
     embedding_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    embedding = Column(Vector(1536), nullable=True) if Vector else None
+    embedding = Column(Vector(), nullable=True) if Vector else None
 
     # Schema-enforced extraction type
     schema_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)

@@ -1,46 +1,92 @@
-"""Embedding service for generating vector embeddings"""
+"""Embedding service for generating vector embeddings.
+
+Supports OpenAI and local (sentence-transformers) models.
+Auto-falls back to local model when OpenAI key is unavailable.
+"""
 
 import json
+import logging
 from typing import List, Optional
 import numpy as np
 from functools import lru_cache
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
+# Default local model — small (80MB), fast, 384 dims
+LOCAL_DEFAULT_MODEL = "all-MiniLM-L6-v2"
+
 
 class EmbeddingService:
     """Service for generating text embeddings using OpenAI or local models"""
-    
+
     _instance: Optional["EmbeddingService"] = None
     _model = None
     _openai_client = None
-    
+    _resolved_provider: Optional[str] = None
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
-    
+
+    @property
+    def provider(self) -> str:
+        """Resolve actual provider: use OpenAI only if explicitly configured AND key exists."""
+        if self._resolved_provider is None:
+            if settings.embedding_provider == "openai" and settings.openai_api_key:
+                self._resolved_provider = "openai"
+            else:
+                self._resolved_provider = "local"
+                if settings.embedding_provider == "openai":
+                    logger.warning(
+                        "OPENAI_API_KEY not set — falling back to local embedding model"
+                    )
+        return self._resolved_provider
+
     @property
     def is_openai(self) -> bool:
-        return settings.embedding_provider == "openai"
-    
+        return self.provider == "openai"
+
+    @property
+    def model_name(self) -> str:
+        if self.is_openai:
+            return settings.embedding_model
+        # For local: use configured model or default
+        if settings.embedding_provider == "local" and settings.embedding_model != "text-embedding-3-small":
+            return settings.embedding_model
+        return LOCAL_DEFAULT_MODEL
+
+    @property
+    def dimension(self) -> int:
+        """Return the embedding dimension for the active model."""
+        if self.is_openai:
+            return settings.embedding_dimension
+        # For local models, query the model itself
+        model = self.local_model
+        if model:
+            return model.get_sentence_embedding_dimension()
+        return 384  # default for all-MiniLM-L6-v2
+
     @property
     def openai_client(self):
         if self._openai_client is None and self.is_openai:
             from openai import OpenAI
             self._openai_client = OpenAI(api_key=settings.openai_api_key)
-            print(f"OpenAI client initialized for model: {settings.embedding_model}")
+            logger.info(f"OpenAI embedding client initialized: {self.model_name}")
         return self._openai_client
-    
+
     @property
     def local_model(self):
         if self._model is None and not self.is_openai:
             from sentence_transformers import SentenceTransformer
-            print(f"Loading local embedding model: {settings.embedding_model}")
-            self._model = SentenceTransformer(settings.embedding_model)
-            print(f"Model loaded. Embedding dimension: {self._model.get_sentence_embedding_dimension()}")
+            name = self.model_name
+            logger.info(f"Loading local embedding model: {name}")
+            self._model = SentenceTransformer(name)
+            logger.info(f"Model loaded. Dimension: {self._model.get_sentence_embedding_dimension()}")
         return self._model
-    
+
     def _get_openai_client(self, api_key: Optional[str] = None):
         """Get OpenAI client, using per-user key override if provided."""
         if api_key:
@@ -49,30 +95,22 @@ class EmbeddingService:
         return self.openai_client
 
     def embed(self, text: str, api_key: Optional[str] = None) -> List[float]:
-        """Generate embedding for a single text. Accepts optional per-user API key."""
+        """Generate embedding for a single text."""
         if self.is_openai:
             client = self._get_openai_client(api_key)
-            response = client.embeddings.create(
-                model=settings.embedding_model,
-                input=text
-            )
+            response = client.embeddings.create(model=self.model_name, input=text)
             return response.data[0].embedding
         else:
             embedding = self.local_model.encode(text, convert_to_numpy=True)
             return embedding.tolist()
 
     def embed_batch(self, texts: List[str], api_key: Optional[str] = None) -> List[List[float]]:
-        """Generate embeddings for multiple texts. Accepts optional per-user API key."""
+        """Generate embeddings for multiple texts."""
         if not texts:
             return []
-
         if self.is_openai:
             client = self._get_openai_client(api_key)
-            response = client.embeddings.create(
-                model=settings.embedding_model,
-                input=texts
-            )
-            # Sort by index to maintain order
+            response = client.embeddings.create(model=self.model_name, input=texts)
             sorted_data = sorted(response.data, key=lambda x: x.index)
             return [item.embedding for item in sorted_data]
         else:

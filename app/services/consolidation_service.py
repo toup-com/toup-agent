@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, or_, func
 
 from app.db.models import Memory, MemoryEvent, MemoryEventType, MemoryLevel, memory_relationships
 from app.services.embedding_service import EmbeddingService, get_embedding_service
@@ -33,9 +33,15 @@ class ConsolidationService:
     
     # Minimum access count before considering consolidation
     MIN_ACCESS_COUNT = 3
-    
+
     # Minimum age before considering consolidation (days)
-    MIN_AGE_DAYS = 1
+    MIN_AGE_DAYS = 7
+
+    # Must have been accessed within this many days (still relevant)
+    MAX_LAST_ACCESS_DAYS = 7
+
+    # Minimum strength to be eligible (not decayed away)
+    MIN_CONSOLIDATION_STRENGTH = 0.3
     
     # Similarity threshold for grouping memories
     SIMILARITY_THRESHOLD = 0.7
@@ -61,16 +67,32 @@ class ConsolidationService:
         Returns (memories_considered, groups_found, memories_consolidated).
         """
         # Find episodic memories eligible for consolidation
-        cutoff_date = datetime.utcnow() - timedelta(days=self.MIN_AGE_DAYS)
-        
-        query = select(Memory).where(
-            and_(
-                Memory.user_id == user_id,
-                Memory.is_deleted == False,
-                Memory.memory_level == "episodic",
-                Memory.access_count >= self.MIN_ACCESS_COUNT if not force else True,
-                Memory.created_at <= cutoff_date if not force else True,
+        now = datetime.utcnow()
+        cutoff_date = now - timedelta(days=self.MIN_AGE_DAYS)
+        recent_cutoff = now - timedelta(days=self.MAX_LAST_ACCESS_DAYS)
+
+        conditions = [
+            Memory.user_id == user_id,
+            Memory.is_deleted == False,
+            Memory.is_active == True,
+            Memory.memory_level == "episodic",
+        ]
+        if not force:
+            conditions.extend([
+                Memory.access_count >= self.MIN_ACCESS_COUNT,
+                Memory.created_at <= cutoff_date,           # At least 7 days old
+                Memory.strength >= self.MIN_CONSOLIDATION_STRENGTH,  # Not decayed away
+            ])
+            # Must have been accessed recently (still relevant)
+            conditions.append(
+                or_(
+                    Memory.last_reinforced_at >= recent_cutoff,
+                    Memory.last_accessed_at >= recent_cutoff,
+                )
             )
+
+        query = select(Memory).where(
+            and_(*conditions)
         ).order_by(Memory.access_count.desc()).limit(self.MAX_MEMORIES_PER_RUN)
         
         result = await self.db.execute(query)
@@ -201,7 +223,7 @@ class ConsolidationService:
     ) -> int:
         """
         Consolidate a group of similar episodic memories.
-        
+
         Options:
         1. Create a new semantic memory summarizing the group
         2. Promote the most important episodic memory to semantic
@@ -209,10 +231,14 @@ class ConsolidationService:
         """
         if len(group) < self.MIN_GROUP_SIZE:
             return 0
-        
+
+        # Quality gate: verify these memories represent a stable fact
+        if not await self._is_stable_for_consolidation(group):
+            return 0
+
         # Find the most important/accessed memory in the group
         primary = max(group, key=lambda m: m.importance * m.access_count)
-        
+
         # Check if there's already a semantic memory linked to this group
         existing_semantic = await self._find_linked_semantic(group)
         
@@ -310,6 +336,36 @@ class ConsolidationService:
         
         return consolidated_count
     
+    async def _is_stable_for_consolidation(self, group: List[Memory]) -> bool:
+        """Quality gate: verify the memory group represents a stable fact, not a transient topic."""
+        contents = [m.content for m in group]
+        try:
+            from app.services.llm_service import get_llm_service
+            llm = get_llm_service()
+            prompt = (
+                "These are episodic memories from different sessions about the same topic:\n\n"
+                + "\n".join(f"- {c}" for c in contents)
+                + "\n\nIs this a stable, consolidated FACT about the user "
+                "(like 'user works at X' or 'user prefers Y'), or is it a transient "
+                "conversation topic that happened to come up multiple times?\n\n"
+                "Reply with ONLY one word: 'stable' or 'transient'."
+            )
+            resp = await llm.complete(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=10,
+            )
+            verdict = resp.content.strip().lower()
+            if "transient" in verdict:
+                import logging
+                logging.info(f"Consolidation quality gate rejected group: transient topic")
+                return False
+            return True
+        except Exception as e:
+            import logging
+            logging.warning(f"Consolidation quality gate failed, allowing by default: {e}")
+            return True  # Allow consolidation if LLM check fails
+
     async def _create_consolidated_content(
         self,
         group: List[Memory],

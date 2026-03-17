@@ -19,10 +19,10 @@ class Settings(BaseSettings):
     def DATABASE_URL(self) -> str:
         return self.database_url
     
-    # Embedding
-    embedding_provider: str = "openai"  # "openai" or "local"
-    embedding_model: str = "text-embedding-3-small"  # OpenAI model or local model name
-    embedding_dimension: int = 1536  # 1536 for text-embedding-3-small, 384 for all-MiniLM-L6-v2
+    # Embedding — "openai" requires OPENAI_API_KEY, "local" uses sentence-transformers
+    embedding_provider: str = "local"  # "openai" or "local"
+    embedding_model: str = "all-MiniLM-L6-v2"  # Local model (384 dims) or OpenAI model name
+    embedding_dimension: int = 384  # 384 for all-MiniLM-L6-v2, 1536 for text-embedding-3-small
     openai_api_key: Optional[str] = None  # Set via OPENAI_API_KEY env var
     
     # LLM Settings (for chat)
@@ -78,8 +78,8 @@ class Settings(BaseSettings):
     deepseek_api_key: Optional[str] = None
 
     # Agent Runtime
-    agent_model: str = "gpt-5.4"  # Primary agent model
-    agent_fallback_model: str = "gpt-4o"  # Fallback if primary model fails
+    agent_model: str = "claude-sonnet-4-6"  # Primary agent model
+    agent_fallback_model: str = "claude-haiku-4-5-20251001"  # Fallback if primary model fails
     agent_max_tokens: int = 16000  # Max output tokens for agent
     agent_max_tool_iterations: int = 40  # Max tool call loops before forcing stop
     agent_workspace_dir: str = "/app/workspace"  # Working directory for file operations
