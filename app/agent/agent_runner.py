@@ -573,16 +573,18 @@ class AgentRunner:
         logger.info(f"[AGENT] Building system prompt for user: {user_id}")
         logger.info(f"[AGENT] Found {len(identities)} identities")
         
+        has_soul_identity = False
         for identity in identities:
             if identity.identity_type == IdentityType.SOUL.value:
                 sections.append(f"# Core Identity\n{identity.content}")
+                has_soul_identity = True
             elif identity.identity_type == IdentityType.AGENT_INSTRUCTIONS.value:
                 sections.append(f"# Behavioral Guidelines\n{identity.content}")
             elif identity.identity_type == IdentityType.USER_PROFILE.value:
                 sections.append(f"# About the User\n{identity.content}")
             elif identity.identity_type == IdentityType.TOOLS.value:
                 sections.append(f"# Tool Guidelines\n{identity.content}")
-        
+
         # 2. Load agent brain memories (permanent identity/skills/patterns)
         try:
             from app.services.memory_service import MemoryService
@@ -595,12 +597,21 @@ class AgentRunner:
                 limit=50,
             )
             if agent_memories:
-                agent_lines = ["# Agent Brain (Permanent Knowledge)"]
-                for m in agent_memories:
-                    cat = m.get("category", "")
-                    content = m.get("content", "")
-                    agent_lines.append(f"- [{cat}] {content}")
-                sections.append("\n".join(agent_lines))
+                # If Soul identity exists, filter out agent_soul memories to avoid
+                # conflicting identity (e.g. old onboarding "My name is Toup" vs
+                # Soul config "Your name is Aria")
+                if has_soul_identity:
+                    agent_memories = [
+                        m for m in agent_memories
+                        if m.get("category") != "agent_soul"
+                    ]
+                if agent_memories:
+                    agent_lines = ["# Agent Brain (Permanent Knowledge)"]
+                    for m in agent_memories:
+                        cat = m.get("category", "")
+                        content = m.get("content", "")
+                        agent_lines.append(f"- [{cat}] {content}")
+                    sections.append("\n".join(agent_lines))
                 logger.info(f"[AGENT] Loaded {len(agent_memories)} agent brain memories")
         except Exception as e:
             logger.warning(f"Agent brain load failed: {e}")
@@ -632,7 +643,7 @@ class AgentRunner:
                 select(AgentConfig).where(AgentConfig.user_id == user_id)
             )
             _agent_cfg = _cfg_result.scalar_one_or_none()
-            if _agent_cfg and not _agent_cfg.onboarding_completed:
+            if _agent_cfg and not _agent_cfg.onboarding_completed and not has_soul_identity:
                 sections.append(
                     "# Onboarding Mode (ACTIVE)\n"
                     "You are in onboarding mode — this is a new user who just set up their agent. "
