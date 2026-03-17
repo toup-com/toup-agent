@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 
 from app.db import get_db
-from app.db.models import Identity, User
+from app.db.models import Identity, User, AgentConfig
 from app.db.models.soul_config import SoulConfig
 from app.schemas import (
     SoulConfigUpdate, SoulConfigResponse,
@@ -143,6 +143,15 @@ async def save_soul(
             is_active=True,
         )
         db.add(identity)
+
+    # Sync color + name to AgentConfig (used by floating orb, app proxy, etc.)
+    ac_result = await db.execute(
+        select(AgentConfig).where(AgentConfig.user_id == current_user.id)
+    )
+    agent_cfg = ac_result.scalar_one_or_none()
+    if agent_cfg:
+        agent_cfg.agent_color = req.color
+        agent_cfg.agent_name = req.name
 
     await db.commit()
     await db.refresh(config)
