@@ -248,7 +248,7 @@ async def ws_chat(
                     await websocket.send_json({"type": "error", "message": "Empty message"})
                     continue
 
-                # ── Onboarding trigger ──────────────────────────────
+                # ── Onboarding trigger (DEPRECATED — Soul page is now the onboarding)
                 is_onboarding_msg = False
                 if text == "__ONBOARDING_START__":
                     from app.db.database import async_session_maker
@@ -260,8 +260,9 @@ async def ws_chat(
                         if _cfg and _cfg.onboarding_completed:
                             text = "Hello!"
                         else:
-                            text = _ONBOARDING_TRIGGER
-                            is_onboarding_msg = True
+                            # Redirect to Soul page instead of running text onboarding
+                            await websocket.send_json({"type": "redirect", "url": "/agent/soul?onboarding=true"})
+                            continue
 
                 session_id = msg.get("session_id")
                 model = msg.get("model")

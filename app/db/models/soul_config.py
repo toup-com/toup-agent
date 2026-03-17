@@ -1,6 +1,7 @@
 """SoulConfig model — structured agent personality configuration."""
 
 from datetime import datetime
+from typing import Optional
 import uuid
 
 from sqlalchemy import String, Text, DateTime, Boolean, ForeignKey, Index, JSON
@@ -35,6 +36,9 @@ class SoulConfig(Base):
 
     # Compiled text (cached output of compile_soul)
     compiled_text: Mapped[str] = mapped_column(Text, default="")
+
+    # VPS sync tracking (engineering monitoring only)
+    vps_soul_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

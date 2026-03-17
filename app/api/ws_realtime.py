@@ -833,15 +833,11 @@ async def _finalize_onboarding(user_id: str) -> str:
         identity_content = "\n".join(identity_sections)
 
         # ── 4. Write .md files to VPS ──
-        await send_tool_call(user_id, "write_file", {
-            "path": "/opt/toup-agent/saul.md",
-            "content": saul_content,
-        })
-        await send_tool_call(user_id, "write_file", {
-            "path": "/opt/toup-agent/identity.md",
-            "content": identity_content,
-        })
-        logger.info("[REALTIME] Wrote saul.md + identity.md to VPS for user %s", user_id[:8])
+        # DEPRECATED: saul.md / identity.md no longer used — Identity table is source of truth.
+        # Soul page now writes directly to Identity table via PUT /api/soul + soul sync.
+        # await send_tool_call(user_id, "write_file", {"path": "/opt/toup-agent/saul.md", "content": saul_content})
+        # await send_tool_call(user_id, "write_file", {"path": "/opt/toup-agent/identity.md", "content": identity_content})
+        logger.info("[REALTIME] Skipped saul.md/identity.md write (deprecated) for user %s", user_id[:8])
 
         # ── 5. Upsert Identity records on VPS via HTTP API ──
         if vps:

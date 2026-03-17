@@ -117,6 +117,8 @@ async def init_db():
         # Layer 2 support
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS layer INTEGER DEFAULT 1",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS layer2_changes_json TEXT",
+        # VPS soul sync tracking
+        "ALTER TABLE soul_configs ADD COLUMN IF NOT EXISTS vps_soul_synced_at TIMESTAMP",
     ]
 
     # Vector dimension migration: if embedding_dimension changed (e.g. 1536 → 384),

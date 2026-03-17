@@ -7,7 +7,8 @@ PUT  /api/soul/sync  → agent-side endpoint to receive soul sync from platform
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -153,23 +154,69 @@ async def save_soul(
         select(AgentConfig).where(AgentConfig.user_id == current_user.id)
     )
     agent_cfg = ac_result.scalar_one_or_none()
+    onboarding_was_done = False
     if agent_cfg:
+        onboarding_was_done = agent_cfg.onboarding_completed
         agent_cfg.agent_color = req.color
         agent_cfg.agent_name = req.name
+        # Complete onboarding on first soul save (Soul page IS the onboarding)
+        if not agent_cfg.onboarding_completed:
+            agent_cfg.onboarding_completed = True
+            logger.info(f"[SOUL] Onboarding completed via Soul page for user {current_user.id}")
+
+    # Deactivate old onboarding-created agent_soul memories to prevent conflicts
+    try:
+        from sqlalchemy import update
+        from app.db.models.memory import Memory
+        deactivated = await db.execute(
+            update(Memory).where(
+                and_(
+                    Memory.user_id == current_user.id,
+                    Memory.brain_type == "agent",
+                    Memory.category == "agent_soul",
+                    Memory.is_active == True,
+                )
+            ).values(is_active=False, updated_at=datetime.utcnow())
+        )
+        if deactivated.rowcount:
+            logger.info(f"[SOUL] Deactivated {deactivated.rowcount} old agent_soul memories for user {current_user.id}")
+    except Exception as e:
+        logger.warning(f"[SOUL] Failed to deactivate old agent_soul memories: {e}")
+
+    # Track whether onboarding was just completed in this save
+    onboarding_just_completed = (
+        agent_cfg
+        and agent_cfg.onboarding_completed
+        and not onboarding_was_done
+    )
 
     await db.commit()
     await db.refresh(config)
 
-    # Push compiled soul to agent VPS (fire-and-forget)
+    # ── VPS sync (invisible to user) ──
     if agent_cfg and agent_cfg.agent_url and agent_cfg.agent_api_key:
-        import asyncio
-        asyncio.create_task(_push_soul_to_agent(
-            agent_url=agent_cfg.agent_url,
-            agent_api_key=agent_cfg.agent_api_key,
-            user_id=current_user.id,
-            name=req.name,
-            compiled_text=compiled_text,
-        ))
+        try:
+            vps_synced = await _sync_soul_to_vps(
+                agent_url=agent_cfg.agent_url,
+                agent_api_key=agent_cfg.agent_api_key,
+                user_id=current_user.id,
+                name=req.name,
+                compiled_text=compiled_text,
+                deactivate_agent_soul_memories=True,
+                agent_config_updates={
+                    "onboarding_completed": True,
+                    "agent_name": req.name,
+                    "agent_color": req.color,
+                } if onboarding_just_completed else {
+                    "agent_name": req.name,
+                    "agent_color": req.color,
+                },
+            )
+            if vps_synced:
+                config.vps_soul_synced_at = datetime.now(timezone.utc)
+                await db.commit()
+        except Exception as e:
+            logger.error(f"[SOUL] VPS sync failed for user {current_user.id}: {e}")
 
     return SoulConfigResponse(
         name=config.name,
@@ -183,32 +230,49 @@ async def save_soul(
     )
 
 
-async def _push_soul_to_agent(
+async def _sync_soul_to_vps(
     agent_url: str, agent_api_key: str,
     user_id: str, name: str, compiled_text: str,
-):
-    """Push compiled soul to the agent VPS so it creates a local Identity record."""
+    deactivate_agent_soul_memories: bool = False,
+    agent_config_updates: Optional[dict] = None,
+) -> bool:
+    """Sync compiled soul + related data to the user's VPS agent.
+
+    Calls PUT /api/soul/sync on the VPS agent which handles:
+    - Upsert Identity(type='soul') record
+    - Optionally deactivate old agent_soul memories
+    - Optionally update AgentConfig fields (name, color, onboarding)
+
+    Returns True on success, False on failure. Never raises.
+    """
     import httpx
     url = f"{agent_url}/api/soul/sync"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.put(url, json={
                 "user_id": user_id,
                 "name": name,
                 "compiled_text": compiled_text,
+                "deactivate_agent_soul_memories": deactivate_agent_soul_memories,
+                "agent_config_updates": agent_config_updates,
             }, headers={"X-Agent-Key": agent_api_key})
             if resp.status_code == 200:
-                logger.info(f"[SOUL] Synced soul to agent at {agent_url}")
+                logger.info(f"[SOUL] Synced soul to VPS at {agent_url}")
+                return True
             else:
-                logger.warning(f"[SOUL] Agent soul sync failed: {resp.status_code} {resp.text}")
+                logger.error(f"[SOUL] VPS soul sync failed: {resp.status_code} {resp.text}")
+                return False
     except Exception as e:
-        logger.warning(f"[SOUL] Agent soul sync error: {e}")
+        logger.error(f"[SOUL] VPS soul sync error: {e}")
+        return False
 
 
 class SoulSyncRequest(BaseModel):
     user_id: str
     name: str
     compiled_text: str
+    deactivate_agent_soul_memories: bool = False
+    agent_config_updates: Optional[dict] = None
 
 
 @router.put("/sync")
@@ -217,7 +281,13 @@ async def sync_soul(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Agent-side endpoint: receive soul sync from platform and upsert local Identity."""
+    """Agent-side endpoint: receive soul sync from platform.
+
+    Handles:
+    1. Upsert Identity(type='soul') in local DB
+    2. Optionally deactivate old agent_soul memories
+    3. Optionally update AgentConfig fields (name, color, onboarding)
+    """
     from app.config import settings
 
     # Auth: only accept from platform via agent key
@@ -225,7 +295,7 @@ async def sync_soul(
     if not settings.agent_api_key or agent_key != settings.agent_api_key:
         raise HTTPException(401, "Invalid agent key")
 
-    # Upsert Identity(type='soul') in the agent's local DB
+    # 1. Upsert Identity(type='soul') in the agent's local DB
     id_result = await db.execute(
         select(Identity).where(
             and_(
@@ -251,6 +321,43 @@ async def sync_soul(
         )
         db.add(identity)
 
+    # 2. Deactivate old agent_soul memories (prevents conflict with Soul config)
+    memories_deactivated = 0
+    if req.deactivate_agent_soul_memories:
+        try:
+            from sqlalchemy import update as sql_update
+            from app.db.models.memory import Memory
+            result = await db.execute(
+                sql_update(Memory).where(
+                    and_(
+                        Memory.user_id == req.user_id,
+                        Memory.brain_type == "agent",
+                        Memory.category == "agent_soul",
+                        Memory.is_active == True,
+                    )
+                ).values(is_active=False, updated_at=datetime.utcnow())
+            )
+            memories_deactivated = result.rowcount
+            if memories_deactivated:
+                logger.info(f"[SOUL] Deactivated {memories_deactivated} agent_soul memories on VPS for user {req.user_id}")
+        except Exception as e:
+            logger.warning(f"[SOUL] Failed to deactivate agent_soul memories on VPS: {e}")
+
+    # 3. Update AgentConfig fields if provided
+    if req.agent_config_updates:
+        try:
+            ac_result = await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == req.user_id)
+            )
+            ac = ac_result.scalar_one_or_none()
+            if ac:
+                for field, value in req.agent_config_updates.items():
+                    if hasattr(ac, field):
+                        setattr(ac, field, value)
+                logger.info(f"[SOUL] Updated AgentConfig on VPS: {list(req.agent_config_updates.keys())}")
+        except Exception as e:
+            logger.warning(f"[SOUL] Failed to update AgentConfig on VPS: {e}")
+
     await db.commit()
     logger.info(f"[SOUL] Synced soul identity for user {req.user_id}: {req.name}")
-    return {"status": "ok"}
+    return {"status": "ok", "memories_deactivated": memories_deactivated}

@@ -554,13 +554,26 @@ class AgentRunner:
         user_message: str,
         channel: Optional[str] = None,
     ) -> str:
-        """Build a rich system prompt from identities + memories + runtime context."""
+        """Build a rich system prompt from identities + memories + runtime context.
+
+        Section order (most → least behavioral influence):
+          1. Core Identity (soul)
+          2. User Brain (portrait + facts + memories + entities)
+          3. Skills
+          4. Environment & Capabilities
+          5. Runtime Context
+          6. Formatting Rules (channel-specific)
+          7. Onboarding (CONDITIONAL — only if not completed)
+        """
         from sqlalchemy import select, and_
         from app.db.models import Identity, IdentityType
-        
-        sections: List[str] = []
-        
-        # 1. Load identities
+
+        # Named section buckets — assembled in order at the end
+        section_parts: Dict[str, str] = {}
+
+        logger.info(f"[AGENT] Building system prompt for user: {user_id}")
+
+        # ── 1. Load identities ──────────────────────────────────────
         result = await db.execute(
             select(Identity).where(
                 and_(
@@ -570,101 +583,74 @@ class AgentRunner:
             ).order_by(Identity.priority.desc())
         )
         identities = result.scalars().all()
-        logger.info(f"[AGENT] Building system prompt for user: {user_id}")
         logger.info(f"[AGENT] Found {len(identities)} identities")
-        
+
         has_soul_identity = False
+        identity_parts = []
         for identity in identities:
             if identity.identity_type == IdentityType.SOUL.value:
-                sections.append(f"# Core Identity\n{identity.content}")
+                identity_parts.insert(0, f"# Core Identity\n{identity.content}")
                 has_soul_identity = True
             elif identity.identity_type == IdentityType.AGENT_INSTRUCTIONS.value:
-                sections.append(f"# Behavioral Guidelines\n{identity.content}")
+                identity_parts.append(f"# Behavioral Guidelines\n{identity.content}")
             elif identity.identity_type == IdentityType.USER_PROFILE.value:
-                sections.append(f"# About the User\n{identity.content}")
+                identity_parts.append(f"# About the User\n{identity.content}")
             elif identity.identity_type == IdentityType.TOOLS.value:
-                sections.append(f"# Tool Guidelines\n{identity.content}")
+                identity_parts.append(f"# Tool Guidelines\n{identity.content}")
 
-        # 2. Load agent brain memories (permanent identity/skills/patterns)
-        try:
-            from app.services.memory_service import MemoryService
-            mem_svc = MemoryService(db)
-            
-            # Agent brain: load ALL active agent memories (soul, skills, tools, patterns, procedures, decisions)
-            agent_memories = await mem_svc.get_memories_by_brain_type(
-                user_id=user_id,
-                brain_type="agent",
-                limit=50,
-            )
-            if agent_memories:
-                # If Soul identity exists, filter out agent_soul memories to avoid
-                # conflicting identity (e.g. old onboarding "My name is Toup" vs
-                # Soul config "Your name is Aria")
-                if has_soul_identity:
-                    agent_memories = [
-                        m for m in agent_memories
-                        if m.get("category") != "agent_soul"
-                    ]
-                if agent_memories:
-                    agent_lines = ["# Agent Brain (Permanent Knowledge)"]
-                    for m in agent_memories:
-                        cat = m.get("category", "")
-                        content = m.get("content", "")
-                        agent_lines.append(f"- [{cat}] {content}")
-                    sections.append("\n".join(agent_lines))
-                logger.info(f"[AGENT] Loaded {len(agent_memories)} agent brain memories")
-        except Exception as e:
-            logger.warning(f"Agent brain load failed: {e}")
+        # Default identity if no Soul exists
+        if not has_soul_identity:
+            identity_parts.insert(0, (
+                "# Core Identity\n"
+                "Your name is Toup. You are an intelligent AI assistant with persistent memory.\n"
+                "Communicate in a friendly, helpful manner. Be concise but thorough. "
+                "Ask clarifying questions when needed."
+            ))
+            logger.warning(f"No soul config found for user {user_id}, using default")
 
-        # 2a. Load work brain memories (workflows, SOPs, operational knowledge)
-        try:
-            from app.services.memory_service import MemoryService
-            work_mem_svc = MemoryService(db)
-            work_memories = await work_mem_svc.get_memories_by_brain_type(
-                user_id=user_id,
-                brain_type="work",
-                limit=50,
-            )
-            if work_memories:
-                work_lines = ["# Work Brain (Workflows & Operational Knowledge)"]
-                for m in work_memories:
-                    cat = m.get("category", "")
-                    content = m.get("content", "")
-                    work_lines.append(f"- [{cat}] {content}")
-                sections.append("\n".join(work_lines))
-                logger.info(f"[AGENT] Loaded {len(work_memories)} work brain memories")
-        except Exception as e:
-            logger.warning(f"Work brain load failed: {e}")
+        section_parts["identity"] = "\n\n".join(identity_parts)
 
-        # 2b. Onboarding mode — inject instructions when onboarding not yet completed
-        try:
-            from app.db.models import AgentConfig
-            _cfg_result = await db.execute(
-                select(AgentConfig).where(AgentConfig.user_id == user_id)
-            )
-            _agent_cfg = _cfg_result.scalar_one_or_none()
-            if _agent_cfg and not _agent_cfg.onboarding_completed and not has_soul_identity:
-                sections.append(
-                    "# Onboarding Mode (ACTIVE)\n"
-                    "You are in onboarding mode — this is a new user who just set up their agent. "
-                    "You do NOT have a name yet. The user will choose your name.\n\n"
-                    "Your goal is to learn three things through natural conversation, IN THIS ORDER:\n"
-                    "1. **YOUR NAME** (FIRST!) — Ask: 'What would you like to call me?' "
-                    "Store with: memory_store(brain_type='agent', category='agent_soul', content='My name is <NAME>')\n"
-                    "2. **Their name** — Ask: 'And what's your name?' "
-                    "Store with: memory_store(brain_type='user', category='identity', content='User name: <NAME>')\n"
-                    "3. **What they need you for** — Ask: 'What do you need me to help you with?' "
-                    "Store with: memory_store(brain_type='user', category='goals', content='...')\n\n"
-                    "IMPORTANT: Do NOT introduce yourself with any name. Start by asking what they'd like to call you. "
-                    "Ask ONE question at a time. Be warm and conversational. "
-                    "Use memory_store to save each piece of info as you learn it. "
-                    "Once you have all three, store a final memory: "
-                    "memory_store(brain_type='agent', category='agent_decisions', content='Onboarding complete. I know the user and they know me.')"
+        # ── 2. Agent Brain — disabled (Soul page is source of truth) ──
+        agent_memories = []
+        AGENT_BRAIN_ENABLED = os.environ.get("AGENT_BRAIN_ENABLED", "false").lower() == "true"
+        if AGENT_BRAIN_ENABLED:
+            try:
+                from app.services.memory_service import MemoryService
+                mem_svc = MemoryService(db)
+                agent_memories = await mem_svc.get_memories_by_brain_type(
+                    user_id=user_id, brain_type="agent", limit=50,
                 )
-        except Exception as e:
-            logger.warning(f"Onboarding check failed: {e}")
+                if agent_memories:
+                    if has_soul_identity:
+                        agent_memories = [m for m in agent_memories if m.get("category") != "agent_soul"]
+                    if agent_memories:
+                        lines = ["# Agent Brain (Permanent Knowledge)"]
+                        for m in agent_memories:
+                            lines.append(f"- [{m.get('category','')}] {m.get('content','')}")
+                        section_parts["agent_brain"] = "\n".join(lines)
+                    logger.info(f"[AGENT] Loaded {len(agent_memories)} agent brain memories")
+            except Exception as e:
+                logger.warning(f"Agent brain load failed: {e}")
 
-        # 3. Retrieve relevant user memories (hybrid search: vector + keyword + graph)
+        # ── 2a. Work Brain — disabled ──
+        WORK_BRAIN_ENABLED = os.environ.get("WORK_BRAIN_ENABLED", "false").lower() == "true"
+        if WORK_BRAIN_ENABLED:
+            try:
+                from app.services.memory_service import MemoryService
+                work_mem_svc = MemoryService(db)
+                work_memories = await work_mem_svc.get_memories_by_brain_type(
+                    user_id=user_id, brain_type="work", limit=50,
+                )
+                if work_memories:
+                    lines = ["# Work Brain (Workflows & Operational Knowledge)"]
+                    for m in work_memories:
+                        lines.append(f"- [{m.get('category','')}] {m.get('content','')}")
+                    section_parts["work_brain"] = "\n".join(lines)
+                    logger.info(f"[AGENT] Loaded {len(work_memories)} work brain memories")
+            except Exception as e:
+                logger.warning(f"Work brain load failed: {e}")
+
+        # ── 3. Retrieve relevant user memories (hybrid search) ──────
         try:
             from app.services.memory_service import MemoryService
             from app.services.query_classifier import classify_query
@@ -677,21 +663,15 @@ class AgentRunner:
             search_categories = classification.get("categories")
 
             memories = await mem_svc.hybrid_search(
-                user_id=user_id,
-                query=user_message,
-                limit=15,
-                min_similarity=0.1,
-                strategies=search_strategies,
+                user_id=user_id, query=user_message, limit=15,
+                min_similarity=0.1, strategies=search_strategies,
                 categories=search_categories,
             )
-            # If entity hint detected, prepend entity-graph results
             if classification.get("entity_hint"):
                 try:
                     entity_mems = await mem_svc.search_by_entity_graph(
-                        user_id=user_id,
-                        entity_name=classification["entity_hint"],
-                        depth=2,
-                        limit=5,
+                        user_id=user_id, entity_name=classification["entity_hint"],
+                        depth=2, limit=5,
                     )
                     existing_ids = {m["id"] for m in memories}
                     for em in entity_mems:
@@ -702,16 +682,13 @@ class AgentRunner:
                 except Exception as e:
                     logger.warning(f"Entity graph search failed: {e}")
 
-            # Filter to user brain only (agent brain already loaded above)
             user_memories = [m for m in memories if m.get("brain_type") == "user"]
-            # Phase 5: Store retrieved memories for feedback loop
             self._last_retrieved_memories = user_memories
             logger.info(f"[AGENT] Found {len(user_memories)} relevant user memories (hybrid)")
 
-            # Build structured memory context
             memory_sections = []
 
-            # A. User Portrait (synthesized identity — always first)
+            # A. User Portrait
             try:
                 from app.services.user_portrait_service import UserPortraitService
                 portrait_svc = UserPortraitService(db)
@@ -723,7 +700,7 @@ class AgentRunner:
                 logger.warning(f"Portrait generation failed: {e}")
 
             if user_memories:
-                # B. Core facts (high-strength semantic memories)
+                # B. Core facts
                 core_facts = [
                     m for m in user_memories
                     if m.get("strength", 0) >= 0.7
@@ -734,7 +711,7 @@ class AgentRunner:
                     for m in core_facts[:5]:
                         memory_sections.append(f"- {m.get('content', '')}")
 
-                # C. Relevant memories from search (excluding core facts already shown)
+                # C. Relevant memories
                 core_ids = {m.get("id") for m in core_facts}
                 regular = [m for m in user_memories if m.get("id") not in core_ids]
                 if regular:
@@ -765,41 +742,18 @@ class AgentRunner:
                 pass
 
             if memory_sections:
-                sections.append("# User Brain\n" + "\n".join(memory_sections))
+                section_parts["user_brain"] = "# User Brain\n" + "\n".join(memory_sections)
         except Exception as e:
             logger.warning(f"Memory retrieval failed in agent prompt: {e}")
-        
-        # 3. Default identity if none exists — use agent brain memory for name
-        if not identities:
-            # Check if the agent has a stored name from onboarding
-            agent_name = None
-            if agent_memories:
-                for m in agent_memories:
-                    content = (m.get("content") or "").lower()
-                    if "my name is" in content or m.get("category") == "agent_soul":
-                        raw = m.get("content", "")
-                        if "my name is" in raw.lower():
-                            agent_name = raw.lower().split("my name is")[-1].strip().rstrip(".").strip().title()
-                        elif raw.strip() and not raw.startswith("User"):
-                            agent_name = raw.strip()
-                        if agent_name:
-                            break
-            if agent_name:
-                sections.insert(0, (
-                    f"# Core Identity\n"
-                    f"Your name is {agent_name}. You are an intelligent AI assistant with persistent memory.\n"
-                    f"Be helpful, proactive, and concise. Use tools when they help answer the question."
-                ))
-            else:
-                sections.insert(0, (
-                    "# Core Identity\n"
-                    "You are an intelligent AI assistant with persistent memory.\n"
-                    "If you don't know your name yet, ask the user what they'd like to call you.\n"
-                    "Be helpful, proactive, and concise. Use tools when they help answer the question."
-                ))
 
-        # 3b. Always include capabilities section — the agent must know what it can do
-        sections.append(
+        # ── 4. Skills ──────────────────────────────────────────────
+        if self.skill_loader:
+            skill_parts = self.skill_loader.get_all_system_prompt_sections()
+            if skill_parts:
+                section_parts["skills"] = "\n\n".join(skill_parts)
+
+        # ── 5. Environment & Capabilities ──────────────────────────
+        section_parts["environment"] = (
             "# Your Environment & Capabilities\n"
             "You are running as an agent service ON the user's server/VPS. "
             "This means:\n"
@@ -817,41 +771,24 @@ class AgentRunner:
             "You can also delete or modify memories by using `exec` with psql commands.\n\n"
             "When the user asks you to do something on their system, USE your tools — don't say you can't."
         )
-        
-        # 4. Runtime context
+
+        # ── 6. Runtime context ─────────────────────────────────────
         now = datetime.utcnow()
         _channel_label = channel or "telegram"
-        sections.append(
-            f"# Runtime Context\n"
-            f"- Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-            f"- Channel: {_channel_label}\n"
-            f"- Workspace directory: {settings.agent_workspace_dir}\n"
-            f"- Max tool iterations: {self.max_iterations}"
-        )
-
-        # 4b. Lane context
+        runtime_lines = [
+            f"# Runtime Context",
+            f"- Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+            f"- Channel: {_channel_label}",
+            f"- Workspace directory: {settings.agent_workspace_dir}",
+            f"- Max tool iterations: {self.max_iterations}",
+        ]
         if hasattr(self, "_current_lane") and self._current_lane != "main":
-            sections.append(
-                f"# Execution Lane\n"
-                f"You are running in the **{self._current_lane}** lane."
-            )
+            runtime_lines.append(f"- Execution lane: {self._current_lane}")
+        section_parts["runtime"] = "\n".join(runtime_lines)
 
-        # 4c. Activation prompt (set via /activation command)
-        if hasattr(self, '_activation_prompt') and self._activation_prompt:
-            sections.append(f"# Activation Prompt\n{self._activation_prompt}")
-
-        # 4d. Verbose mode flag
-        if hasattr(self, '_verbose_mode') and self._verbose_mode:
-            sections.append(
-                "# Verbose Mode\n"
-                "VERBOSE MODE IS ON. When calling tools, explain what you are doing "
-                "and why before each tool call. After each tool call, summarize the "
-                "full result in detail."
-            )
-
-        # 5. Formatting rules (channel-aware)
+        # ── 7. Formatting rules (channel-aware) ───────────────────
         if _channel_label == "app":
-            sections.append(
+            section_parts["formatting"] = (
                 "# Formatting Rules\n"
                 "You are chatting with the user inside their app. Follow these rules:\n"
                 "- Use simple Markdown: **bold**, *italic*, `code`.\n"
@@ -860,9 +797,7 @@ class AgentRunner:
                 "- Keep responses concise and conversational.\n"
                 "- Do NOT expose internal implementation details (databases, bridges, connections, file paths, error traces).\n"
                 "- When the user greets you, greet them back warmly and offer to help with the app.\n"
-                "- You have editing capabilities: you can modify the app's files, database, and navigation using your tools."
-            )
-            sections.append(
+                "- You have editing capabilities: you can modify the app's files, database, and navigation using your tools.\n\n"
                 "# Action Buttons\n"
                 "You can offer clickable action buttons by including [[Label]] markers in your response.\n"
                 "These render as tappable chips in the chat UI. When the user taps one, it sends that label as a message.\n"
@@ -880,7 +815,7 @@ class AgentRunner:
                 "Keep button labels short (2-5 words). Use 2-4 buttons per question when relevant."
             )
         else:
-            sections.append(
+            section_parts["formatting"] = (
                 "# Formatting Rules (IMPORTANT)\n"
                 "You are communicating via Telegram. Follow these rules strictly:\n"
                 "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
@@ -889,22 +824,14 @@ class AgentRunner:
                 "- Write fractions as a/b, not \\frac{a}{b}.\n"
                 "- Telegram supports basic Markdown: **bold**, *italic*, `code`, ```code blocks```.\n"
                 "- Do NOT use tables or complex formatting.\n"
-                "- Keep responses concise and readable on mobile."
-            )
-
-            # Reactions (Telegram only)
-            sections.append(
+                "- Keep responses concise and readable on mobile.\n\n"
                 "# Reactions\n"
                 "You can react to the user's message with an emoji by including [[reaction:EMOJI]] "
                 "anywhere in your response. It will be stripped before sending. "
                 "React sparingly — at most 1 reaction per 5-10 messages. "
                 "React when: something is genuinely funny (😂), you appreciate something (❤️), "
                 "simple acknowledgment (👍), interesting/thoughtful (🤔), impressive (🔥), "
-                "celebrating (🎉). Don't react to routine messages."
-            )
-
-            # Inline buttons (Telegram only)
-            sections.append(
+                "celebrating (🎉). Don't react to routine messages.\n\n"
                 "# Inline Buttons\n"
                 "You can add inline buttons to your message by including [[button:LABEL|CALLBACK_DATA]] "
                 "markers. They will be stripped from text and rendered as clickable Telegram buttons. "
@@ -913,11 +840,69 @@ class AgentRunner:
                 "Keep callback_data short (max 64 chars). Don't overuse buttons — only when genuinely helpful."
             )
 
-        # 8. Skill prompt sections
-        if self.skill_loader:
-            for skill_section in self.skill_loader.get_all_system_prompt_sections():
-                sections.append(skill_section)
-        
+        # ── 8. Onboarding (CONDITIONAL) ────────────────────────────
+        try:
+            from app.db.models import AgentConfig
+            _cfg_result = await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == user_id)
+            )
+            _agent_cfg = _cfg_result.scalar_one_or_none()
+            if _agent_cfg and not _agent_cfg.onboarding_completed and not has_soul_identity:
+                section_parts["onboarding"] = (
+                    "# Onboarding Mode (ACTIVE)\n"
+                    "You are in onboarding mode — this is a new user who just set up their agent. "
+                    "You do NOT have a name yet. The user will choose your name.\n\n"
+                    "Your goal is to learn three things through natural conversation, IN THIS ORDER:\n"
+                    "1. **YOUR NAME** (FIRST!) — Ask: 'What would you like to call me?' "
+                    "Store with: memory_store(brain_type='agent', category='agent_soul', content='My name is <NAME>')\n"
+                    "2. **Their name** — Ask: 'And what's your name?' "
+                    "Store with: memory_store(brain_type='user', category='identity', content='User name: <NAME>')\n"
+                    "3. **What they need you for** — Ask: 'What do you need me to help you with?' "
+                    "Store with: memory_store(brain_type='user', category='goals', content='...')\n\n"
+                    "IMPORTANT: Do NOT introduce yourself with any name. Start by asking what they'd like to call you. "
+                    "Ask ONE question at a time. Be warm and conversational. "
+                    "Use memory_store to save each piece of info as you learn it. "
+                    "Once you have all three, store a final memory: "
+                    "memory_store(brain_type='agent', category='agent_decisions', content='Onboarding complete. I know the user and they know me.')"
+                )
+        except Exception as e:
+            logger.warning(f"Onboarding check failed: {e}")
+
+        # ── 9. Activation / verbose (optional) ─────────────────────
+        if hasattr(self, '_activation_prompt') and self._activation_prompt:
+            section_parts["activation"] = f"# Activation Prompt\n{self._activation_prompt}"
+        if hasattr(self, '_verbose_mode') and self._verbose_mode:
+            section_parts["verbose"] = (
+                "# Verbose Mode\n"
+                "VERBOSE MODE IS ON. When calling tools, explain what you are doing "
+                "and why before each tool call. After each tool call, summarize the "
+                "full result in detail."
+            )
+
+        # ── Assemble in order ──────────────────────────────────────
+        SECTION_ORDER = [
+            "identity",       # WHO the agent is
+            "user_brain",     # WHO the user is
+            "agent_brain",    # Agent brain (disabled by default)
+            "work_brain",     # Work brain (disabled by default)
+            "skills",         # WHAT the agent can do
+            "environment",    # WHAT the agent has access to
+            "runtime",        # WHEN/WHERE
+            "formatting",     # HOW to respond
+            "onboarding",     # Temporary onboarding instructions
+            "activation",     # Optional activation prompt
+            "verbose",        # Optional verbose mode
+        ]
+
+        sections = [section_parts[k] for k in SECTION_ORDER if k in section_parts]
+
+        # Log section sizes for debugging
+        for name, text in section_parts.items():
+            tokens_est = len(text) // 4
+            logger.debug(f"Prompt [{name}]: ~{tokens_est} tokens")
+        total = sum(len(v) for v in section_parts.values()) // 4
+        logger.info(f"[AGENT] System prompt: {len(section_parts)} sections, ~{total} tokens est.")
+
         return "\n\n".join(sections)
     
     # ------------------------------------------------------------------
