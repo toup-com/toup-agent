@@ -7,7 +7,7 @@ class BrainType(str, Enum):
     """Types of brains in the Toup system"""
     USER = "user"       # User's personal memories
     AGENT = "agent"     # Agent's learned knowledge
-    WORK = "work"       # Workflows and operational processes
+    WORK = "work"       # Operational processes
 
 
 class MemoryCategory(str, Enum):
@@ -48,7 +48,6 @@ BrainRegion = MemoryCategory
 
 class WorkCategory(str, Enum):
     """Memory categories for WORK brain - operational knowledge"""
-    WORKFLOW = "workflow"        # Multi-step processes
     PROCESS = "process"         # Business processes
 
 

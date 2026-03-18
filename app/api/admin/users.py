@@ -274,7 +274,7 @@ async def delete_user(
         Identity, Conversation, Message, Memory, Entity, EntityLink,
         EntityRelationship, BrainStats, MemoryEvent, RetrievalEvent,
         Document, DocumentChunk, Media, CronJob, TelegramUserMapping,
-        AgentError, Workflow, ApiKey, VPSInstance, AgentConfig,
+        AgentError, ApiKey, VPSInstance, AgentConfig,
         LLMBundleAllocation, LLMUsageRecord,
     )
 
@@ -335,7 +335,7 @@ async def delete_user(
         Identity, MemoryEvent, Memory,
         Conversation, Entity, BrainStats,
         Document, Media, CronJob,
-        TelegramUserMapping, Workflow, ApiKey, VPSInstance,
+        TelegramUserMapping, ApiKey, VPSInstance,
         AgentConfig, LLMBundleAllocation, LLMUsageRecord,
     ]:
         await db.execute(sa_delete(model).where(model.user_id == user_id))

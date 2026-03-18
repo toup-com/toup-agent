@@ -3,7 +3,7 @@ App MCP Server — exposes builder app tools via FastMCP.
 
 Mounted at /api/app-mcp on the agent. Provides MCP tools for
 external clients (Claude Desktop, other agents) to interact
-with user-built apps (both DB-backed AppSkill and filesystem-backed AppFsSkill).
+with user-built filesystem-backed apps (AppFsSkill).
 """
 
 from __future__ import annotations
@@ -25,22 +25,17 @@ _skill_loader = None
 
 
 def set_mcp_skill_loader(loader):
-    """Wire the skill loader so MCP tools can dispatch to AppSkill/AppFsSkill instances."""
+    """Wire the skill loader so MCP tools can dispatch to AppFsSkill instances."""
     global _skill_loader
     _skill_loader = loader
 
 
 def _get_app_skill(app_slug: str):
-    """Find an AppSkill or AppFsSkill by slug."""
+    """Find an AppFsSkill by slug."""
     if not _skill_loader:
         return None
     skill_name = f"app_{app_slug}"
     return _skill_loader.get_skill(skill_name)
-
-
-def _is_fs_skill(skill) -> bool:
-    """Check if a skill is a filesystem-backed AppFsSkill."""
-    return hasattr(skill, "app_dir") and hasattr(skill, "_app_manager")
 
 
 @app_mcp.tool()
@@ -48,22 +43,13 @@ async def list_apps() -> dict:
     """List all builder apps and their tool namespaces."""
     if not _skill_loader:
         return {"apps": []}
-    from app.agent.skills.builtins.app_skill import AppSkill
     try:
         from app.agent.skills.builtins.app_builder.app_fs_skill import AppFsSkill
     except ImportError:
         AppFsSkill = None
     apps = []
     for name, skill in _skill_loader.skills.items():
-        if isinstance(skill, AppSkill):
-            apps.append({
-                "slug": skill.app_slug,
-                "name": skill.app_name,
-                "skill_name": skill.meta.name,
-                "type": "db",
-                "workflow_id": skill.workflow_id,
-            })
-        elif AppFsSkill and isinstance(skill, AppFsSkill):
+        if AppFsSkill and isinstance(skill, AppFsSkill):
             apps.append({
                 "slug": skill.app_slug,
                 "name": skill.app_name,
@@ -76,15 +62,11 @@ async def list_apps() -> dict:
 
 @app_mcp.tool()
 async def app_list_files(app_slug: str) -> dict:
-    """List all files in a builder app (works for both DB and filesystem apps)."""
+    """List all files in a builder app."""
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if _is_fs_skill(skill):
-        result = await skill.execute_tool(f"app_{app_slug}__list_files", {})
-        return result
-    files, _ = await skill._get_app_data()
-    return {"files": {p: len(c) for p, c in files.items()}}
+    return await skill.execute_tool(f"app_{app_slug}__list_files", {})
 
 
 @app_mcp.tool()
@@ -93,12 +75,7 @@ async def app_read_file(app_slug: str, file_path: str) -> dict:
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if _is_fs_skill(skill):
-        return await skill.execute_tool(f"app_{app_slug}__read_file", {"path": file_path})
-    files, _ = await skill._get_app_data()
-    if file_path not in files:
-        return {"error": f"File '{file_path}' not found", "available": list(files.keys())}
-    return {"path": file_path, "content": files[file_path]}
+    return await skill.execute_tool(f"app_{app_slug}__read_file", {"path": file_path})
 
 
 @app_mcp.tool()
@@ -107,22 +84,15 @@ async def app_write_file(app_slug: str, file_path: str, content: str) -> dict:
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if _is_fs_skill(skill):
-        return await skill.execute_tool(f"app_{app_slug}__write_file", {"path": file_path, "content": content})
-    ok = await skill._write_app_files({file_path: content})
-    if ok:
-        return {"success": True, "path": file_path, "chars": len(content)}
-    return {"error": f"Failed to write '{file_path}'"}
+    return await skill.execute_tool(f"app_{app_slug}__write_file", {"path": file_path, "content": content})
 
 
 @app_mcp.tool()
 async def app_edit_file(app_slug: str, file_path: str, old_text: str, new_text: str) -> dict:
-    """Search-and-replace edit on a file in a filesystem-backed app."""
+    """Search-and-replace edit on a file in a builder app."""
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if not _is_fs_skill(skill):
-        return {"error": "edit_file only supported for filesystem-backed apps"}
     return await skill.execute_tool(f"app_{app_slug}__edit_file", {
         "path": file_path, "old_text": old_text, "new_text": new_text,
     })
@@ -134,60 +104,42 @@ async def app_get_structure(app_slug: str) -> dict:
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if _is_fs_skill(skill):
-        return await skill.execute_tool(f"app_{app_slug}__status", {})
-    files, deps = await skill._get_app_data()
-    return {
-        "name": skill.app_name,
-        "workflow_id": skill.workflow_id,
-        "files": list(files.keys()),
-        "file_count": len(files),
-        "dependencies": deps,
-        "dependency_count": len(deps),
-    }
+    return await skill.execute_tool(f"app_{app_slug}__status", {})
 
 
 @app_mcp.tool()
 async def app_query_db(app_slug: str, sql: str) -> dict:
-    """Execute a SQL query against a filesystem app's SQLite database."""
+    """Execute a SQL query against an app's SQLite database."""
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if not _is_fs_skill(skill):
-        return {"error": "query_db only supported for filesystem-backed apps"}
     return await skill.execute_tool(f"app_{app_slug}__query_db", {"sql": sql})
 
 
 @app_mcp.tool()
 async def app_logs(app_slug: str, lines: int = 50) -> dict:
-    """Tail Metro/web server logs for a filesystem app."""
+    """Tail Metro/web server logs for an app."""
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if not _is_fs_skill(skill):
-        return {"error": "logs only supported for filesystem-backed apps"}
     return await skill.execute_tool(f"app_{app_slug}__logs", {"lines": lines})
 
 
 @app_mcp.tool()
 async def app_restart(app_slug: str) -> dict:
-    """Restart Metro/web servers for a filesystem app."""
+    """Restart Metro/web servers for an app."""
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if not _is_fs_skill(skill):
-        return {"error": "restart only supported for filesystem-backed apps"}
     return await skill.execute_tool(f"app_{app_slug}__restart", {})
 
 
 @app_mcp.tool()
 async def app_status(app_slug: str) -> dict:
-    """Get status of a filesystem app (processes, ports, URLs, disk usage)."""
+    """Get status of an app (processes, ports, URLs, disk usage)."""
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if not _is_fs_skill(skill):
-        return {"error": "status only supported for filesystem-backed apps"}
     return await skill.execute_tool(f"app_{app_slug}__status", {})
 
 
@@ -197,8 +149,6 @@ async def app_navigate(app_slug: str, screen: str = "", params: dict = {}) -> di
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if not _is_fs_skill(skill):
-        return {"error": "navigate only supported for filesystem-backed apps"}
     tool_args = {}
     if screen:
         tool_args["screen"] = screen
@@ -209,10 +159,8 @@ async def app_navigate(app_slug: str, screen: str = "", params: dict = {}) -> di
 
 @app_mcp.tool()
 async def app_git_push(app_slug: str, message: str = "Update from MCP") -> dict:
-    """Commit and push changes for a filesystem app to GitHub."""
+    """Commit and push changes for an app to GitHub."""
     skill = _get_app_skill(app_slug)
     if not skill:
         return {"error": f"App '{app_slug}' not found"}
-    if not _is_fs_skill(skill):
-        return {"error": "git_push only supported for filesystem-backed apps"}
     return await skill.execute_tool(f"app_{app_slug}__git_push", {"message": message})

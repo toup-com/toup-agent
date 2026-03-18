@@ -33,9 +33,6 @@ from .entity import Entity, EntityLink, EntityRelationship
 # Documents & Media
 from .document import Document, DocumentChunk, Media
 
-# Workflows
-from .workflow import Workflow
-
 # Apps & Build Jobs
 from .app import App, BuildJob
 
@@ -61,7 +58,6 @@ __all__ = [
     "Memory", "memory_relationships", "BrainStats", "MemoryEvent", "RetrievalEvent",
     "Entity", "EntityLink", "EntityRelationship",
     "Document", "DocumentChunk", "Media",
-    "Workflow",
     "App", "BuildJob",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
     "SoulConfig",

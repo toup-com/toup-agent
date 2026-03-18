@@ -34,7 +34,6 @@ from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
-from app.api.workflow_crud import router as workflow_crud_router
 from app.api.dashboard import router as dashboard_router
 from app.api.soul import router as soul_router
 from app.api.apps import router as apps_router, set_app_manager, set_app_gateway, set_app_builder_skill
@@ -241,13 +240,6 @@ async def lifespan(app: FastAPI):
         global _skill_loader
         _skill_loader = skill_loader
 
-        # Wire skill_loader to workflow CRUD for auto-registration
-        try:
-            from app.api.workflow_crud import set_skill_loader
-            set_skill_loader(skill_loader)
-        except Exception:
-            pass
-
         # Wire skill_loader to App MCP server
         try:
             from app.agent.app_mcp_server import set_mcp_skill_loader
@@ -280,13 +272,6 @@ async def lifespan(app: FastAPI):
         set_api_v1_refs(agent_runner, skill_loader)
         set_realtime_refs(tool_executor, agent_runner)
         set_ws_browser_refs(agent_runner, skill_loader)
-
-        # Wire workflow execution engine
-        from app.agent.workspace.engine import WorkflowEngine
-        from app.api.workflow_crud import set_workflow_engine
-        workflow_engine = WorkflowEngine(agent_runner=agent_runner, tool_executor=tool_executor)
-        set_workflow_engine(workflow_engine)
-        print("⚡ Workflow engine initialized")
 
         # ── App Manager + App Builder Skill ────────────────────
         try:
@@ -659,7 +644,6 @@ app.include_router(api_v1_router, prefix=settings.api_prefix)
 app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
-app.include_router(workflow_crud_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
 app.include_router(ws_browser_router, prefix=settings.api_prefix)
 app.include_router(apps_router, prefix=settings.api_prefix)

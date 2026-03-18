@@ -16,8 +16,6 @@ from app.db.models import (
     AgentConfig,
     LLMBundleAllocation,
     LLMUsageRecord,
-    # Workflows
-    Workflow,
 )
 from app.db.database import get_db, init_db, drop_db, async_session_maker, engine
 
@@ -62,8 +60,6 @@ __all__ = [
     "AgentConfig",
     "LLMBundleAllocation",
     "LLMUsageRecord",
-    # Workflows
-    "Workflow",
     # Database
     "get_db",
     "init_db",

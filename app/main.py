@@ -34,8 +34,6 @@ from app.api.doctor import router as doctor_router
 from app.api.voice import router as voice_router, set_voice_refs
 # VPS provisioning
 from app.api.vps import router as vps_router
-# Workflows
-from app.api.workflows import router as workflows_router
 # Dashboard proxy
 from app.api.dashboard_proxy import router as dashboard_proxy_router
 # Combined checkout
@@ -379,8 +377,6 @@ app.include_router(doctor_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 # VPS provisioning
 app.include_router(vps_router, prefix=settings.api_prefix)
-# Workflows (proxied to VPS agent)
-app.include_router(workflows_router, prefix=settings.api_prefix)
 # Dashboard (proxied to VPS agent)
 app.include_router(dashboard_proxy_router, prefix=settings.api_prefix)
 # Combined checkout

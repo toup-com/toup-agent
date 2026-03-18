@@ -58,8 +58,7 @@ class AgentCategory(str, Enum):
 
 
 class WorkCategory(str, Enum):
-    """Memory categories for WORK brain - workflows and operations"""
-    WORKFLOW = "workflow"           # 🔄 Multi-step processes
+    """Memory categories for WORK brain - operations"""
     PROCESS = "process"             # ⚡ Business processes
 
 
