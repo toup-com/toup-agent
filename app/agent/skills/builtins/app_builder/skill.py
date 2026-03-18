@@ -2815,7 +2815,7 @@ const _webDb = {
                     client = anthropic.AsyncAnthropic(
                         auth_token=anthropic_key,
                         default_headers={
-                            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+                            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
                             "user-agent": "claude-cli/2.1.2 (external, cli)",
                             "x-app": "cli",
                         },
