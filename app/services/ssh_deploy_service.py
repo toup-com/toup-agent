@@ -715,7 +715,7 @@ if ! command -v psql &>/dev/null; then
   echo "  Installing PostgreSQL..."
   if [[ "$OSTYPE" == "darwin"* ]]; then
     if command -v brew &>/dev/null; then
-      brew install postgresql@16 pgvector
+      brew install postgresql@16
       brew services start postgresql@16
     else
       echo "  Homebrew is required to install PostgreSQL on macOS."
@@ -727,19 +727,29 @@ if ! command -v psql &>/dev/null; then
     sudo apt-get install -y postgresql postgresql-contrib
     sudo systemctl start postgresql
     sudo systemctl enable postgresql
-    # Install pgvector extension
-    sudo apt-get install -y postgresql-16-pgvector 2>/dev/null || \
-    sudo apt-get install -y postgresql-15-pgvector 2>/dev/null || \
-    sudo apt-get install -y postgresql-14-pgvector 2>/dev/null || {
-      echo "  Building pgvector from source..."
-      sudo apt-get install -y postgresql-server-dev-all build-essential
-      cd /tmp && git clone https://github.com/pgvector/pgvector.git
-      cd pgvector && make && sudo make install
-      cd / && rm -rf /tmp/pgvector
-    }
   fi
 else
   echo "  PostgreSQL already installed: $(psql --version)"
+fi
+
+# Install pgvector (needed regardless of whether PostgreSQL was just installed)
+echo "  Ensuring pgvector is installed..."
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  if command -v brew &>/dev/null; then
+    brew install pgvector 2>/dev/null || true
+  fi
+else
+  PG_MAJOR=$(psql --version 2>/dev/null | grep -oP '\d+' | head -1)
+  sudo apt-get install -y "postgresql-${PG_MAJOR}-pgvector" 2>/dev/null || \
+  sudo apt-get install -y postgresql-16-pgvector 2>/dev/null || \
+  sudo apt-get install -y postgresql-15-pgvector 2>/dev/null || \
+  sudo apt-get install -y postgresql-14-pgvector 2>/dev/null || {
+    echo "  Building pgvector from source..."
+    sudo apt-get install -y postgresql-server-dev-all build-essential
+    cd /tmp && git clone https://github.com/pgvector/pgvector.git
+    cd pgvector && make && sudo make install
+    cd / && rm -rf /tmp/pgvector
+  }
 fi
 
 # Create database and user

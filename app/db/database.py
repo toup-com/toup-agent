@@ -69,6 +69,14 @@ async def get_db() -> AsyncSession:
 
 async def init_db():
     """Initialize database tables and add any missing columns."""
+    # Ensure pgvector extension exists before create_all tries to use VECTOR columns
+    async with engine.begin() as conn:
+        from sqlalchemy import text
+        try:
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        except Exception:
+            pass  # pgvector not installed — vector columns will fail, but non-vector tables still work
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
