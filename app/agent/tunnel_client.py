@@ -144,6 +144,30 @@ class AgentTunnelClient:
                         # Execute tool in background (don't block the message loop)
                         asyncio.create_task(self._handle_tool_call(ws, msg))
 
+                    elif msg_type == "config_update":
+                        # Live settings sync: platform pushes updated .env
+                        env_content = msg.get("env_content", "")
+                        if env_content:
+                            logger.info("[TUNNEL-CLIENT] Config update received — writing .env and restarting...")
+                            print("📥 Settings updated from toup.ai — syncing config...")
+                            try:
+                                self._write_env(env_content)
+                                await ws.send(json.dumps({"type": "status", "status": "config_written"}))
+                                print("✅ Config synced — restarting agent...")
+                            except Exception as e:
+                                logger.exception("[TUNNEL-CLIENT] Failed to write .env: %s", e)
+                                print(f"❌ Failed to write .env: {e}")
+                                try:
+                                    await ws.send(json.dumps({"type": "status", "status": "config_error", "error": str(e)}))
+                                except Exception:
+                                    pass
+                                continue
+                        else:
+                            logger.warning("[TUNNEL-CLIENT] Empty config_update — treating as restart")
+                            print("🔄 Restart signal from toup.ai...")
+                        import os
+                        os._exit(0)  # Service manager auto-restarts with new .env
+
                     elif msg_type == "restart":
                         logger.info("[TUNNEL-CLIENT] Restart command received — restarting agent...")
                         print("🔄 Settings changed on toup.ai — restarting agent...")
@@ -161,6 +185,43 @@ class AgentTunnelClient:
 
         self._connected = False
         print("🔌 Disconnected from toup.ai tunnel")
+
+    def _write_env(self, env_content: str):
+        """Write updated .env file to the agent's working directory.
+
+        Finds the .env file relative to the agent's working directory
+        (same directory as agent_main.py). Creates a backup before overwriting.
+        """
+        import os
+        import shutil
+
+        # Find .env path: check cwd first, then script directory
+        candidates = [
+            os.path.join(os.getcwd(), ".env"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"),
+        ]
+
+        env_path = None
+        for c in candidates:
+            c = os.path.normpath(c)
+            if os.path.exists(c):
+                env_path = c
+                break
+
+        # Default to cwd if no existing .env found
+        if not env_path:
+            env_path = os.path.join(os.getcwd(), ".env")
+
+        # Backup existing .env
+        if os.path.exists(env_path):
+            backup_path = env_path + ".bak"
+            shutil.copy2(env_path, backup_path)
+            logger.info("[TUNNEL-CLIENT] Backed up .env to %s", backup_path)
+
+        # Write new .env
+        with open(env_path, "w") as f:
+            f.write(env_content)
+        logger.info("[TUNNEL-CLIENT] Wrote updated .env to %s (%d bytes)", env_path, len(env_content))
 
     async def _handle_tool_call(self, ws, msg: dict):
         """Execute a tool call from the platform and send the result back."""

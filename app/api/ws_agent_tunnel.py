@@ -19,6 +19,7 @@ Protocol:
     { "type": "ping" }                              — heartbeat
     { "type": "tool_call", "id": "...", "tool_name": "...", "arguments": {...} }
     { "type": "restart" }                            — graceful restart (settings changed)
+    { "type": "config_update", "env_content": "..." } — write .env + restart (live settings sync)
 """
 
 import asyncio
@@ -127,6 +128,29 @@ async def send_restart(user_id: str) -> bool:
         return True
     except Exception as e:
         logger.warning("[TUNNEL] Failed to send restart to %s: %s", user_id[:8], e)
+        return False
+
+
+async def send_config_update(user_id: str, env_content: str) -> bool:
+    """Send updated .env content to the terminal agent via tunnel.
+
+    The agent will write the new .env and restart to pick up changes.
+    This is the mechanism that makes Agent Settings a live control panel.
+    """
+    tunnel = _tunnels.get(user_id)
+    if not tunnel:
+        logger.info("[TUNNEL] No active tunnel for %s — cannot push config", user_id[:8])
+        return False
+
+    try:
+        await tunnel.ws.send_json({
+            "type": "config_update",
+            "env_content": env_content,
+        })
+        logger.info("[TUNNEL] Sent config_update to agent %s (%d bytes)", user_id[:8], len(env_content))
+        return True
+    except Exception as e:
+        logger.warning("[TUNNEL] Failed to send config_update to %s: %s", user_id[:8], e)
         return False
 
 
