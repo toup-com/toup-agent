@@ -148,6 +148,12 @@ class AgentTunnelClient:
                         # Live settings sync: platform pushes updated .env
                         env_content = msg.get("env_content", "")
                         if env_content:
+                            # Check if .env actually changed — avoid restart loop on connect sync
+                            existing = self._read_current_env()
+                            if existing and existing.strip() == env_content.strip():
+                                logger.info("[TUNNEL-CLIENT] Config unchanged — skipping restart")
+                                await ws.send(json.dumps({"type": "status", "status": "config_unchanged"}))
+                                continue
                             logger.info("[TUNNEL-CLIENT] Config update received — writing .env and restarting...")
                             print("📥 Settings updated from toup.ai — syncing config...")
                             try:
@@ -188,6 +194,23 @@ class AgentTunnelClient:
 
         self._connected = False
         print("🔌 Disconnected from toup.ai tunnel")
+
+    def _read_current_env(self) -> str | None:
+        """Read the current .env file content, or None if not found."""
+        import os
+        candidates = [
+            os.path.join(os.getcwd(), ".env"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"),
+        ]
+        for c in candidates:
+            c = os.path.normpath(c)
+            if os.path.exists(c):
+                try:
+                    with open(c) as f:
+                        return f.read()
+                except Exception:
+                    return None
+        return None
 
     def _write_env(self, env_content: str):
         """Write updated .env file to the agent's working directory.

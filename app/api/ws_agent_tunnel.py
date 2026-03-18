@@ -296,6 +296,27 @@ async def agent_tunnel_ws(
 
     await websocket.send_json({"type": "connected", "user_id": user_id})
 
+    # ── Push latest config on connect (sync keys saved while agent was offline) ──
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import AgentConfig
+        from sqlalchemy import select as _sel
+        async with async_session_maker() as _db:
+            _result = await _db.execute(
+                _sel(AgentConfig).where(AgentConfig.user_id == user_id)
+            )
+            _cfg = _result.scalars().first()
+            if _cfg:
+                from app.api.agent_setup import _build_env
+                _env = _build_env(_cfg, user_id)
+                await websocket.send_json({
+                    "type": "config_update",
+                    "env_content": _env,
+                })
+                logger.info("[TUNNEL] Pushed config sync on connect for %s", user_id[:8])
+    except Exception as _e:
+        logger.warning("[TUNNEL] Config sync on connect failed for %s: %s", user_id[:8], _e)
+
     # ── Heartbeat task ──
     async def heartbeat():
         while True:
