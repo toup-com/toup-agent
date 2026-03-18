@@ -69,16 +69,33 @@ async def get_db() -> AsyncSession:
 
 async def init_db():
     """Initialize database tables and add any missing columns."""
+    from sqlalchemy import text
+    import logging
+    _logger = logging.getLogger(__name__)
+
     # Ensure pgvector extension exists before create_all tries to use VECTOR columns
+    _has_pgvector = False
     async with engine.begin() as conn:
-        from sqlalchemy import text
         try:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            _has_pgvector = True
         except Exception:
-            pass  # pgvector not installed — vector columns will fail, but non-vector tables still work
+            _logger.warning("pgvector extension not available — vector columns will be skipped")
 
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        try:
+            await conn.run_sync(Base.metadata.create_all)
+        except Exception as _e:
+            if "vector" in str(_e).lower() and not _has_pgvector:
+                _logger.warning("create_all failed due to missing vector type — creating tables individually")
+                # Create tables one by one, skipping those that need vector
+                for table in Base.metadata.sorted_tables:
+                    try:
+                        await conn.run_sync(table.create, checkfirst=True)
+                    except Exception:
+                        _logger.warning("Skipped table %s (likely needs pgvector)", table.name)
+            else:
+                raise
 
     # Add missing columns to existing tables (create_all only creates new tables)
     _alter_statements = [

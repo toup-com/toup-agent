@@ -734,22 +734,53 @@ fi
 
 # Install pgvector (needed regardless of whether PostgreSQL was just installed)
 echo "  Ensuring pgvector is installed..."
+_pgvector_ok=false
 if [[ "$OSTYPE" == "darwin"* ]]; then
+  # Find pg_config for the installed PostgreSQL version
+  PG_CONFIG=$(find /opt/homebrew/Cellar/postgresql* /usr/local/Cellar/postgresql* -name pg_config 2>/dev/null | head -1)
+  if [ -z "$PG_CONFIG" ]; then
+    PG_CONFIG=$(command -v pg_config 2>/dev/null || true)
+  fi
+
+  # Try brew first (works if user has the default postgresql formula)
   if command -v brew &>/dev/null; then
-    brew install pgvector 2>/dev/null || true
+    if brew install pgvector 2>/dev/null; then
+      _pgvector_ok=true
+    fi
+  fi
+
+  # If brew didn't work (e.g. user has postgresql@14), build from source
+  if [ "$_pgvector_ok" = false ] && [ -n "$PG_CONFIG" ]; then
+    echo "  Building pgvector from source for $(${PG_CONFIG} --version)..."
+    cd /tmp && rm -rf pgvector_build
+    if git clone --branch v0.8.0 --depth 1 https://github.com/pgvector/pgvector.git pgvector_build 2>/dev/null; then
+      cd pgvector_build
+      if make PG_CONFIG="$PG_CONFIG" 2>/dev/null && make PG_CONFIG="$PG_CONFIG" install 2>/dev/null; then
+        _pgvector_ok=true
+      fi
+    fi
+    cd / && rm -rf /tmp/pgvector_build
   fi
 else
-  PG_MAJOR=$(psql --version 2>/dev/null | grep -oP '\d+' | head -1)
+  PG_MAJOR=$(psql --version 2>/dev/null | grep -oE '[0-9]+' | head -1)
   sudo apt-get install -y "postgresql-${PG_MAJOR}-pgvector" 2>/dev/null || \
   sudo apt-get install -y postgresql-16-pgvector 2>/dev/null || \
   sudo apt-get install -y postgresql-15-pgvector 2>/dev/null || \
   sudo apt-get install -y postgresql-14-pgvector 2>/dev/null || {
     echo "  Building pgvector from source..."
     sudo apt-get install -y postgresql-server-dev-all build-essential
-    cd /tmp && git clone https://github.com/pgvector/pgvector.git
-    cd pgvector && make && sudo make install
-    cd / && rm -rf /tmp/pgvector
+    cd /tmp && rm -rf pgvector_build
+    git clone --branch v0.8.0 --depth 1 https://github.com/pgvector/pgvector.git pgvector_build
+    cd pgvector_build && make && sudo make install
+    cd / && rm -rf /tmp/pgvector_build
   }
+  _pgvector_ok=true
+fi
+
+if [ "$_pgvector_ok" = true ]; then
+  echo "  pgvector installed"
+else
+  echo "  ⚠ pgvector could not be installed (vector search will be unavailable)"
 fi
 
 # Create database and user
@@ -852,7 +883,7 @@ echo "  Dependencies installed"
 {pg_install_section}
 # ── Write .env ───────────────────────────────────────────
 echo ""
-echo "[4/7] Writing configuration..."
+echo "[5/7] Writing configuration..."
 
 cat > "$BACKEND_ROOT/.env" << 'TOUP_ENV_EOF'
 {env_content}
@@ -861,7 +892,7 @@ echo "  Configuration saved to $BACKEND_ROOT/.env"
 
 # ── Stop existing agent ──────────────────────────────────
 echo ""
-echo "[5/6] Stopping existing agent..."
+echo "[6/7] Stopping existing agent..."
 
 # Stop old PID-based process if exists
 if [ -f "$AGENT_DIR/agent.pid" ]; then
@@ -887,7 +918,7 @@ sleep 1
 
 # ── Create CLI helper ─────────────────────────────────────
 echo ""
-echo "[6/6] Setting up CLI..."
+echo "[7/7] Setting up CLI..."
 
 UVICORN="$AGENT_DIR/venv/bin/uvicorn"
 BACKEND_DIR="$BACKEND_ROOT"
