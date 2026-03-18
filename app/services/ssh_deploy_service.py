@@ -1214,7 +1214,7 @@ def generate_env_content(
     groq_api_key: str = "",
     xai_api_key: str = "",
     deepseek_api_key: str = "",
-    agent_model: str = "gpt-5.2",
+    agent_model: str = "claude-sonnet-4-6",
     llm_mode: str = "manual",
     telegram_bot_token: str = "",
     discord_bot_token: str = "",
