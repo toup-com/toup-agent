@@ -1286,13 +1286,17 @@ def generate_env_content(
         "SKILLS_DIR=./skills",
     ])
 
-    # Embedding (must match platform)
+    # Embedding — use OpenAI if user has key, otherwise local
+    if openai_api_key:
+        _emb_provider, _emb_model, _emb_dim = "openai", "text-embedding-3-small", 1536
+    else:
+        _emb_provider, _emb_model, _emb_dim = "local", "all-MiniLM-L6-v2", 384
     lines.extend([
         "",
         "# --- Embedding ---",
-        f"EMBEDDING_PROVIDER={settings.embedding_provider}",
-        f"EMBEDDING_MODEL={settings.embedding_model}",
-        f"EMBEDDING_DIMENSION={settings.embedding_dimension}",
+        f"EMBEDDING_PROVIDER={_emb_provider}",
+        f"EMBEDDING_MODEL={_emb_model}",
+        f"EMBEDDING_DIMENSION={_emb_dim}",
     ])
 
     # Channels
