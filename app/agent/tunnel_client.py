@@ -168,6 +168,9 @@ class AgentTunnelClient:
                         import os
                         os._exit(0)  # Service manager auto-restarts with new .env
 
+                    elif msg_type == "http_forward":
+                        asyncio.create_task(self._handle_http_forward(ws, msg))
+
                     elif msg_type == "restart":
                         logger.info("[TUNNEL-CLIENT] Restart command received — restarting agent...")
                         print("🔄 Settings changed on toup.ai — restarting agent...")
@@ -222,6 +225,44 @@ class AgentTunnelClient:
         with open(env_path, "w") as f:
             f.write(env_content)
         logger.info("[TUNNEL-CLIENT] Wrote updated .env to %s (%d bytes)", env_path, len(env_content))
+
+    async def _handle_http_forward(self, ws, msg: dict):
+        """Forward an HTTP request to the local agent server and return the result."""
+        call_id = msg.get("id", "")
+        method = msg.get("method", "GET")
+        path = msg.get("path", "/")
+        body = msg.get("body")
+
+        try:
+            import httpx
+            # Agent runs on localhost — use the same port from settings
+            from app.config import settings
+            port = getattr(settings, 'port', 8001)
+            url = f"http://127.0.0.1:{port}{path}"
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                if method == "GET":
+                    resp = await client.get(url)
+                elif method == "POST":
+                    resp = await client.post(url, json=body or {})
+                elif method == "DELETE":
+                    resp = await client.delete(url)
+                else:
+                    resp = await client.get(url)
+
+                result = resp.text
+        except Exception as e:
+            logger.warning("[TUNNEL-CLIENT] HTTP forward failed: %s %s → %s", method, path, e)
+            result = json.dumps({"error": str(e)})
+
+        try:
+            await ws.send(json.dumps({
+                "type": "tool_result",
+                "id": call_id,
+                "result": result,
+            }))
+        except Exception:
+            pass
 
     async def _handle_tool_call(self, ws, msg: dict):
         """Execute a tool call from the platform and send the result back."""

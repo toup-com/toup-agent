@@ -581,7 +581,7 @@ async def _get_agent(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str,
 async def _proxy(
     agent_url: str, agent_api_key: str, path: str,
     method: str = "GET", body: Optional[dict] = None,
-    timeout: float = 30.0,
+    timeout: float = 10.0,
 ):
     url = f"{agent_url}/api/apps/{path}"
     try:
@@ -672,21 +672,50 @@ async def get_capabilities(current_user=Depends(get_current_user), db: AsyncSess
 
 @router.get("/")
 async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
+    from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
+
+    # Try tunnel first (works for NAT'd / self-hosted agents)
+    if is_agent_connected(current_user.id):
+        try:
+            result = await send_http_forward(current_user.id, "GET", "/api/apps/")
+            if result is not None:
+                data = _rewrite_app_urls(result)
+                return JSONResponse(content=data)
+        except Exception as e:
+            logger.debug("Tunnel forward failed, falling back to HTTP: %s", e)
+
+    # Fall back to direct HTTP (VPS-deployed agents with public IPs)
+    agent_info = await _get_agent(current_user.id, db)
+    if not agent_info:
+        return JSONResponse(content=[])  # No agent configured
+    agent_url, key, _ = agent_info
     url = f"{agent_url}/api/apps/"
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, headers={"X-Agent-Key": key})
             data = _rewrite_app_urls(resp.json())
             return JSONResponse(content=data, status_code=resp.status_code)
     except Exception as e:
         logger.warning("Apps proxy list failed: %s", e)
-        raise HTTPException(502, "Agent unreachable")
+        return JSONResponse(content=[])  # Return empty list, not 502
 
 
 @router.get("/jobs/")
 async def list_jobs(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
+    from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
+
+    if is_agent_connected(current_user.id):
+        try:
+            result = await send_http_forward(current_user.id, "GET", "/api/apps/jobs/")
+            if result is not None:
+                return JSONResponse(content=result)
+        except Exception:
+            pass
+
+    agent_info = await _get_agent(current_user.id, db)
+    if not agent_info:
+        return JSONResponse(content=[])
+    agent_url, key, _ = agent_info
     return await _proxy(agent_url, key, "jobs/")
 
 

@@ -111,6 +111,46 @@ async def send_tool_call(user_id: str, tool_name: str, arguments: dict) -> str:
         _pending_calls.pop(call_id, None)
 
 
+async def send_http_forward(
+    user_id: str, method: str, path: str, headers: dict | None = None, body: dict | None = None,
+    timeout: float = 15.0,
+) -> dict | None:
+    """Forward an HTTP request through the tunnel to the agent.
+
+    Used when the agent is behind NAT and can't be reached directly.
+    Returns the parsed JSON response, or None on failure.
+    """
+    tunnel = _tunnels.get(user_id)
+    if not tunnel:
+        return None
+
+    call_id = str(uuid.uuid4())
+    future: asyncio.Future = asyncio.get_event_loop().create_future()
+    _pending_calls[call_id] = future
+
+    try:
+        await tunnel.ws.send_json({
+            "type": "http_forward",
+            "id": call_id,
+            "method": method,
+            "path": path,
+            "headers": headers or {},
+            "body": body,
+        })
+        result = await asyncio.wait_for(future, timeout=timeout)
+        if isinstance(result, str):
+            return json.loads(result)
+        return result
+    except asyncio.TimeoutError:
+        logger.warning("[TUNNEL] HTTP forward %s %s timed out for %s", method, path, user_id[:8])
+        return None
+    except Exception as e:
+        logger.warning("[TUNNEL] HTTP forward failed: %s", e)
+        return None
+    finally:
+        _pending_calls.pop(call_id, None)
+
+
 async def send_restart(user_id: str) -> bool:
     """Send a restart command to the terminal agent via tunnel.
 
