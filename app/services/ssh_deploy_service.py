@@ -439,11 +439,14 @@ echo "[OK] Git: $(git --version)"
 echo "[STEP] Setting up agent code..."
 if [ -d "{AGENT_DIR}/.git" ]; then
     echo "Updating existing agent code..."
-    cd {AGENT_DIR} && git pull --ff-only 2>&1 || true
+    cd {AGENT_DIR}
+    git checkout main 2>/dev/null || true
+    git branch --set-upstream-to=origin/main main 2>/dev/null || true
+    git pull origin main --ff-only 2>&1 || true
 else
     echo "Cloning agent repository..."
     mkdir -p {AGENT_DIR}
-    git clone {AGENT_REPO} {AGENT_DIR} 2>&1
+    git clone -b main {AGENT_REPO} {AGENT_DIR} 2>&1
 fi
 echo "[OK] Agent code ready"
 
@@ -586,10 +589,13 @@ sudo mkdir -p "$AGENT_DIR" 2>/dev/null || mkdir -p "$AGENT_DIR"
 sudo chown $(whoami) "$AGENT_DIR" 2>/dev/null || true
 if [ -d "$AGENT_DIR/.git" ]; then
     echo "Updating existing agent code..."
-    cd "$AGENT_DIR" && git pull --ff-only 2>&1 || true
+    cd "$AGENT_DIR"
+    git checkout main 2>/dev/null || true
+    git branch --set-upstream-to=origin/main main 2>/dev/null || true
+    git pull origin main --ff-only 2>&1 || true
 else
     echo "Cloning agent repository..."
-    git clone {AGENT_REPO} "$AGENT_DIR" 2>&1
+    git clone -b main {AGENT_REPO} "$AGENT_DIR" 2>&1
 fi
 echo "[OK] Agent code ready"
 
@@ -802,10 +808,13 @@ echo "[2/7] Setting up agent code..."
 
 if [ -d "$AGENT_DIR/.git" ]; then
   echo "  Updating existing installation..."
-  cd "$AGENT_DIR" && git pull --ff-only
+  cd "$AGENT_DIR"
+  git checkout main 2>/dev/null || true
+  git branch --set-upstream-to=origin/main main 2>/dev/null || true
+  git pull origin main --ff-only
 else
   echo "  Cloning agent repository..."
-  git clone "$REPO" "$AGENT_DIR"
+  git clone -b main "$REPO" "$AGENT_DIR"
 fi
 
 # Auto-detect repo structure (flat vs nested)
@@ -914,7 +923,9 @@ _status() {{
 
 _update() {{
   echo "Updating Toup Agent..."
-  cd "$AGENT_DIR" && git pull --ff-only
+  cd "$AGENT_DIR"
+  git branch --set-upstream-to=origin/main main 2>/dev/null || true
+  git pull origin main --ff-only
   echo "Installing dependencies..."
   "$AGENT_DIR/venv/bin/pip" install -q -r "$BACKEND_DIR/requirements.txt"
   echo "Updated! Run: ~/toup-agent/toup start"
@@ -1048,7 +1059,9 @@ Write-Host "[2/6] Setting up agent code..."
 if (Test-Path "$AGENT_DIR\\.git") {{
     Write-Host "  Updating existing installation..."
     Push-Location $AGENT_DIR
-    git pull --ff-only
+    git checkout main 2>$null
+    git branch --set-upstream-to=origin/main main 2>$null
+    git pull origin main --ff-only
     Pop-Location
 }} else {{
     Write-Host "  Cloning agent repository..."
