@@ -88,14 +88,29 @@ async def init_db():
         except Exception as _e:
             if "vector" in str(_e).lower() and not _has_pgvector:
                 _logger.warning("create_all failed due to missing vector type — creating tables individually")
-                # Create tables one by one, skipping those that need vector
-                for table in Base.metadata.sorted_tables:
-                    try:
-                        await conn.run_sync(table.create, checkfirst=True)
-                    except Exception:
-                        _logger.warning("Skipped table %s (likely needs pgvector)", table.name)
             else:
                 raise
+
+    # If create_all failed due to missing vector, create tables one by one
+    # in a FRESH connection (the old transaction is in an aborted state).
+    if not _has_pgvector:
+        # Identify tables that have VECTOR columns so we can skip only those
+        _vector_tables = set()
+        for table in Base.metadata.sorted_tables:
+            for col in table.columns:
+                if "vector" in str(col.type).lower():
+                    _vector_tables.add(table.name)
+                    break
+
+        async with engine.begin() as conn:
+            for table in Base.metadata.sorted_tables:
+                if table.name in _vector_tables:
+                    _logger.info("Skipping table %s (needs pgvector)", table.name)
+                    continue
+                try:
+                    await conn.run_sync(table.create, checkfirst=True)
+                except Exception:
+                    _logger.warning("Failed to create table %s", table.name)
 
     # Add missing columns to existing tables (create_all only creates new tables)
     _alter_statements = [

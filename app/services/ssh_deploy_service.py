@@ -709,7 +709,7 @@ def generate_setup_script(env_content: str) -> str:
         pg_install_section = r'''
 # ── Install PostgreSQL + pgvector (local mode) ──────────
 echo ""
-echo "[4/8] Setting up local PostgreSQL + pgvector..."
+echo "[4/7] Setting up local PostgreSQL + pgvector..."
 
 if ! command -v psql &>/dev/null; then
   echo "  Installing PostgreSQL..."
@@ -742,9 +742,12 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     PG_CONFIG=$(command -v pg_config 2>/dev/null || true)
   fi
 
-  # Try brew first (works if user has the default postgresql formula)
+  # Try brew first — but verify the .so ends up in the right PG lib dir
   if command -v brew &>/dev/null; then
-    if brew install pgvector </dev/null >/dev/null 2>&1; then
+    brew install pgvector </dev/null >/dev/null 2>&1 || true
+    # Check if vector.so exists in the PG lib directory for this pg_config
+    _pg_lib_dir=$("$PG_CONFIG" --pkglibdir 2>/dev/null || true)
+    if [ -n "$_pg_lib_dir" ] && [ -f "$_pg_lib_dir/vector.so" ]; then
       _pgvector_ok=true
       echo "  pgvector installed via Homebrew"
     fi
