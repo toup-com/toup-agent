@@ -276,6 +276,7 @@ async def delete_user(
         Document, DocumentChunk, Media, CronJob, TelegramUserMapping,
         AgentError, ApiKey, VPSInstance, AgentConfig,
         LLMBundleAllocation, LLMUsageRecord,
+        App, BuildJob, SoulConfig,
     )
 
     # Safety: cannot delete yourself
@@ -330,13 +331,18 @@ async def delete_user(
     # Also delete any retrieval_events by user_id (covers orphans)
     await db.execute(sa_delete(RetrievalEvent).where(RetrievalEvent.user_id == user_id))
 
+    # Build jobs depend on apps — delete first
+    await db.execute(sa_delete(BuildJob).where(BuildJob.user_id == user_id))
+    # Apps
+    await db.execute(sa_delete(App).where(App.user_id == user_id))
+
     # Now delete all direct user_id tables (order: children before parents)
     for model in [
         Identity, MemoryEvent, Memory,
         Conversation, Entity, BrainStats,
         Document, Media, CronJob,
         TelegramUserMapping, ApiKey, VPSInstance,
-        AgentConfig, LLMBundleAllocation, LLMUsageRecord,
+        AgentConfig, SoulConfig, LLMBundleAllocation, LLMUsageRecord,
     ]:
         await db.execute(sa_delete(model).where(model.user_id == user_id))
 
