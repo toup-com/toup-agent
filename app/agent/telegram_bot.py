@@ -435,10 +435,26 @@ class ToupTelegramBot:
             return
 
         # Ensure user mapping exists (creates session on first message)
-        await self._get_toup_user_id(update.effective_user.id, telegram_user=update.effective_user)
+        toup_user_id = await self._get_toup_user_id(update.effective_user.id, telegram_user=update.effective_user)
+
+        # Read agent name from config (fallback to "Toup")
+        bot_name = "Toup"
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import AgentConfig
+            from sqlalchemy import select
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(AgentConfig.agent_name).where(AgentConfig.user_id == toup_user_id)
+                )
+                row = result.scalar_one_or_none()
+                if row:
+                    bot_name = row
+        except Exception:
+            pass
 
         await update.message.reply_text(
-            "👋 Hey! I'm your <b>Toup</b> AI assistant.\n\n"
+            f"👋 Hey! I'm your <b>{bot_name}</b> AI assistant.\n\n"
             "Send me a message, photo, voice note, or file and I'll help.\n\n"
             "Type /help to see all commands.",
             parse_mode="HTML",
