@@ -240,15 +240,20 @@ class AgentTunnelClient:
             port = getattr(settings, 'port', 8001)
             url = f"http://127.0.0.1:{port}{path}"
 
+            # Authenticate with the agent's own API key
+            fwd_headers = {}
+            if getattr(settings, 'agent_api_key', None):
+                fwd_headers["X-Agent-Key"] = settings.agent_api_key
+
             async with httpx.AsyncClient(timeout=10) as client:
                 if method == "GET":
-                    resp = await client.get(url)
+                    resp = await client.get(url, headers=fwd_headers)
                 elif method == "POST":
-                    resp = await client.post(url, json=body or {})
+                    resp = await client.post(url, headers=fwd_headers, json=body or {})
                 elif method == "DELETE":
-                    resp = await client.delete(url)
+                    resp = await client.delete(url, headers=fwd_headers)
                 else:
-                    resp = await client.get(url)
+                    resp = await client.get(url, headers=fwd_headers)
 
                 result = resp.text
         except Exception as e:
