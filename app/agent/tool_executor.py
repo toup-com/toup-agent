@@ -92,6 +92,70 @@ DESTRUCTIVE_PATTERNS = [
     # discard output, which is standard practice for suppressing noise.
 ]
 
+# ── App Building Pipeline Guard ──────────────────────────────────────
+# Patterns that indicate the agent is trying to build an app outside
+# the official App Builder pipeline.  These are checked in exec and
+# write_file to redirect the agent to app_builder__build_app.
+
+# exec commands that look like app scaffolding
+_APP_BUILD_EXEC_PATTERNS = [
+    r"\bnpx\s+(create-expo-app|expo\s+init|create-react-native-app|create-react-app|create-next-app)\b",
+    r"\bexpo\s+init\b",
+    r"\bnpm\s+init\s+.*react",
+    r"\byarn\s+create\s+(expo|react)",
+]
+
+# File paths that indicate manual app construction
+_APP_BUILD_FILE_PATTERNS = [
+    r"App\.tsx$",
+    r"app\.json$",
+    r"/screens/\w+Screen\.tsx$",
+    r"/components/\w+\.tsx$",
+    r"package\.json$",
+    r"babel\.config\.\w+$",
+    r"metro\.config\.\w+$",
+    r"tsconfig\.json$",
+]
+
+_PIPELINE_REDIRECT_MSG = (
+    "BLOCKED: You are trying to build an app manually. This is not allowed.\n\n"
+    "You MUST use the `app_builder__build_app` tool to build apps. "
+    "The App Builder pipeline handles scaffolding, code generation, GitHub repos, "
+    "preview servers, and live progress tracking automatically.\n\n"
+    "Steps:\n"
+    "1. Ask the user 10+ clarifying questions about their app\n"
+    "2. Present a structured plan\n"
+    "3. Call `app_builder__build_app` with the plan details\n\n"
+    "Do NOT use exec, write_file, or edit_file to create app projects."
+)
+
+
+def _is_app_building_exec(command: str) -> bool:
+    """Check if an exec command is trying to scaffold/build an app project."""
+    for pattern in _APP_BUILD_EXEC_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            return True
+    return False
+
+
+def _is_app_building_write(file_path: str, content: str) -> bool:
+    """Check if a write_file call is manually creating app project files."""
+    # Only flag if the content looks like a React/Expo app file
+    # (not just any .tsx file — check for app-specific imports)
+    for pattern in _APP_BUILD_FILE_PATTERNS:
+        if re.search(pattern, file_path):
+            # Verify content looks like app scaffolding (not editing an existing app)
+            app_indicators = [
+                "react-native", "expo", "react-navigation",
+                "StyleSheet.create", "NavigationContainer",
+                "createBottomTabNavigator", "createNativeStackNavigator",
+                '"expo":', '"react-native":', "import React",
+            ]
+            indicator_count = sum(1 for ind in app_indicators if ind in content)
+            if indicator_count >= 2:
+                return True
+    return False
+
 
 class ToolExecutor:
     """Executes agent tools and returns results as strings."""
@@ -266,6 +330,11 @@ class ToolExecutor:
             if re.search(pattern, command):
                 return f"ERROR: Blocked dangerous command pattern: {pattern}"
 
+        # Pipeline guard — block app scaffolding commands
+        if _is_app_building_exec(command):
+            logger.warning(f"[PIPELINE-GUARD] Blocked app-building exec: {command[:100]}")
+            return _PIPELINE_REDIRECT_MSG
+
         # Destructive command check — requires explicit user confirmation
         confirmed = inp.get("confirmed", False)
         if not confirmed:
@@ -277,7 +346,7 @@ class ToolExecutor:
                         f"Tell the user exactly what will be deleted and ask 'Are you sure?'. "
                         f"Only if they clearly say yes, re-call exec with confirmed=true."
                     )
-        
+
         # Bootstrap workspace on first use
         default_ws = self._ensure_workspace()
         workdir = inp.get("workdir", default_ws)
@@ -481,7 +550,12 @@ class ToolExecutor:
         self._ensure_workspace()
         path = self._resolve_path(inp.get("path", ""))
         content = inp.get("content", "")
-        
+
+        # Pipeline guard — block manual app file creation
+        if _is_app_building_write(path, content):
+            logger.warning(f"[PIPELINE-GUARD] Blocked app-building write_file: {path}")
+            return _PIPELINE_REDIRECT_MSG
+
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:

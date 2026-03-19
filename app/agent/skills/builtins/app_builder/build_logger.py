@@ -29,6 +29,18 @@ logger = logging.getLogger(__name__)
 class BuildLogger:
     """Captures structured logs for a single build job and broadcasts them."""
 
+    # Model context windows for token budget tracking
+    _MODEL_CONTEXT = {
+        "claude-opus-4-6": 200_000,
+        "claude-sonnet-4-5-20250514": 200_000,
+        "claude-sonnet-4-20250514": 200_000,
+        "gpt-5.2": 400_000,
+        "gpt-5": 128_000,
+        "gpt-4o": 128_000,
+        "gpt-4o-mini": 128_000,
+    }
+    _DEFAULT_CONTEXT = 200_000
+
     def __init__(
         self,
         job_id: str,
@@ -45,6 +57,11 @@ class BuildLogger:
         self._step_start: float = time.time()
         self._total_tokens = 0
         self._total_cost_usd = 0.0
+        # Token budget tracking for auto-compaction
+        self._session_input_tokens = 0
+        self._session_output_tokens = 0
+        self._compaction_count = 0
+        self._model_context_window = self._DEFAULT_CONTEXT
 
     @property
     def logs(self) -> List[Dict[str, Any]]:
@@ -74,6 +91,22 @@ class BuildLogger:
     async def debug(self, message: str, detail: str = "", meta: Optional[Dict] = None):
         await self._log("debug", message, detail, meta)
 
+    def set_model(self, model: str):
+        """Set the model being used so we can track context budget accurately."""
+        self._model_context_window = self._MODEL_CONTEXT.get(model, self._DEFAULT_CONTEXT)
+
+    @property
+    def context_usage_pct(self) -> float:
+        """Current session token usage as a percentage of model context window."""
+        if self._model_context_window <= 0:
+            return 0.0
+        return (self._session_input_tokens + self._session_output_tokens) / self._model_context_window * 100
+
+    @property
+    def needs_compaction(self) -> bool:
+        """True when session token usage exceeds 80% of model context window."""
+        return self.context_usage_pct >= 80.0
+
     async def llm_call(
         self,
         model: str,
@@ -87,14 +120,36 @@ class BuildLogger:
         total = input_tokens + output_tokens
         self._total_tokens += total
         self._total_cost_usd += cost_usd
-        await self._log("info", f"LLM: {purpose}", f"{model} · {total:,} tokens · {duration_s:.1f}s", {
+        self._session_input_tokens += input_tokens
+        self._session_output_tokens += output_tokens
+
+        usage_pct = self.context_usage_pct
+        detail = f"{model} · {total:,} tokens · {duration_s:.1f}s"
+        if usage_pct >= 50:
+            detail += f" · Session: {usage_pct:.0f}%"
+
+        await self._log("info", f"LLM: {purpose}", detail, {
             "type": "llm_call",
             "model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "duration_s": round(duration_s, 2),
             "cost_usd": round(cost_usd, 4),
+            "session_usage_pct": round(usage_pct, 1),
         })
+
+        # Broadcast context usage update when above 50%
+        if usage_pct >= 50 and self._ws_broadcast:
+            try:
+                await self._ws_broadcast(self.user_id, {
+                    "type": "job_context",
+                    "job_id": self.job_id,
+                    "usage_pct": round(usage_pct, 1),
+                    "total_tokens": self._session_input_tokens + self._session_output_tokens,
+                    "context_window": self._model_context_window,
+                })
+            except Exception:
+                pass
 
     async def file_written(self, path: str, size_bytes: int, code: str = ""):
         """Log a file write operation with full code content."""
@@ -168,6 +223,50 @@ class BuildLogger:
                     await db.commit()
         except Exception as e:
             logger.warning(f"[BUILD] Failed to persist logs: {e}")
+
+    async def compact_session(self, build_state: Dict[str, Any]):
+        """
+        Auto-compact the build session when context usage is high.
+
+        Resets the session token counters and logs a compaction event.
+        The build_state dict should contain current progress info so the
+        build can continue seamlessly after compaction.
+        """
+        self._compaction_count += 1
+        old_usage = self.context_usage_pct
+        # Reset session counters (the build continues with fresh context)
+        self._session_input_tokens = 0
+        self._session_output_tokens = 0
+
+        state_summary = (
+            f"Compaction #{self._compaction_count}: "
+            f"was at {old_usage:.0f}% ({self._total_tokens:,} total tokens used). "
+            f"Build step: {build_state.get('current_step', '?')}, "
+            f"completed: {', '.join(build_state.get('completed_steps', []))}"
+        )
+
+        await self._log("info", f"Auto-compaction #{self._compaction_count} — context reset", state_summary, {
+            "type": "compaction",
+            "count": self._compaction_count,
+            "old_usage_pct": round(old_usage, 1),
+            "total_tokens_so_far": self._total_tokens,
+            "build_state": build_state,
+        })
+
+        # Broadcast compaction event
+        if self._ws_broadcast:
+            try:
+                await self._ws_broadcast(self.user_id, {
+                    "type": "job_context",
+                    "job_id": self.job_id,
+                    "usage_pct": 0.0,
+                    "total_tokens": 0,
+                    "context_window": self._model_context_window,
+                    "compaction_count": self._compaction_count,
+                    "message": f"Context compacted (#{self._compaction_count}). Continuing build...",
+                })
+            except Exception:
+                pass
 
     def summary(self) -> Dict[str, Any]:
         """Return a summary of the build."""

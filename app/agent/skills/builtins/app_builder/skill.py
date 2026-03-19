@@ -887,10 +887,15 @@ class AppBuilderSkill(Skill):
     def get_system_prompt_section(self) -> Optional[str]:
         return (
             "# App Builder\n"
-            "**MANDATORY**: When the user wants to build an app, you MUST use the `app_builder__build_app` tool. "
-            "NEVER build apps manually with exec/write_file — the app builder has a full pipeline that handles "
-            "scaffolding, code generation, GitHub repos, preview servers, and live progress tracking. "
-            "Building manually will bypass the preview, progress UI, and deployment pipeline.\n\n"
+            "## CRITICAL RULE — READ THIS FIRST\n"
+            "You MUST use the `app_builder__build_app` tool for ALL app creation. NO EXCEPTIONS.\n"
+            "Do NOT use exec, write_file, or edit_file to create apps, projects, or code files.\n"
+            "Do NOT run npx create-expo-app, expo init, npm init, or any scaffolding command.\n"
+            "Do NOT manually create package.json, App.tsx, screens, components, or config files.\n"
+            "The pipeline guard WILL BLOCK these attempts and return an error.\n\n"
+            "ANY request that involves building, creating, or making an app — regardless of how "
+            "the user phrases it (\"make me\", \"create\", \"build\", \"I need\", \"can you make\", "
+            "\"I want\", etc.) — MUST go through the App Builder pipeline below.\n\n"
             "You can build cross-platform **agentic apps** (iPhone, iPad, Web) using React Native/Expo.\n"
             "Every app you build includes an **Agent Placeholder** — a floating widget where YOU (the agent) "
             "can dock into the app and help the user. You'll have full access to navigate, read data, and "
@@ -1381,11 +1386,13 @@ class AppBuilderSkill(Skill):
         plan_context: Optional[Dict] = None,
     ):
         """Background task that orchestrates the full build pipeline."""
+        from app.config import settings
         from app.db.database import async_session_maker
         from app.db.models import App, BuildJob
         from .build_logger import BuildLogger
 
         blog = BuildLogger(job_id, user_id, ws_broadcast=self._ws_broadcast)
+        blog.set_model(settings.agent_model or "claude-opus-4-6")
         blog.set_step("init")
         await blog.info(f"Starting build for '{name}'", f"app={app_id}")
         await blog.info(f"User prompt: {description[:200]}{'...' if len(description) > 200 else ''}")
@@ -2165,7 +2172,12 @@ class AppBuilderSkill(Skill):
         design_notes: str = "",
         existing_files: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
-        """Generate code for all files using LLM — parallel with semaphore."""
+        """Generate code for all files using LLM — parallel with semaphore.
+
+        Includes auto-compaction: when session token usage exceeds 80%,
+        the logger's session counters are reset so the build can continue
+        without hitting context/rate limits.
+        """
         generated = {}
         all_files = json.dumps(files)
         all_deps = json.dumps(deps)
@@ -2240,6 +2252,16 @@ class AppBuilderSkill(Skill):
                         completed += 1
                     if blog:
                         await blog.file_written(file_path, len(code.encode()), code)
+                        # Auto-compaction check: if session usage > 80%, compact and continue
+                        if blog.needs_compaction:
+                            async with lock:
+                                _state = {
+                                    "current_step": "writing",
+                                    "completed_steps": ["planning", "scaffolding"],
+                                    "files_done": list(generated.keys()),
+                                    "files_remaining": [f for f in files if f not in generated],
+                                }
+                            await blog.compact_session(_state)
                 except TokenLimitError:
                     # Let token limit errors propagate — caller handles pause/resume
                     raise

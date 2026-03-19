@@ -208,11 +208,16 @@ class AgentRunner:
         else:
             messages.append({"role": "user", "content": user_message})
 
-        # Context window management
+        # Context window management — initial check
         if needs_compaction(system_prompt, messages, settings.agent_model):
             logger.info(f"[AGENT] Context compaction triggered ({len(messages)} messages)")
             messages = await compact_messages(messages, settings.agent_model)
             logger.info(f"[AGENT] After compaction: {len(messages)} messages, ~{estimate_messages_tokens(messages)} tokens")
+
+        # Context tracking helper
+        from app.agent.context_manager import get_context_window
+        _context_window = get_context_window(settings.agent_model)
+        _compaction_count = 0
 
         # ── Phase 2: Agent loop (no DB connection held) ──────────
         total_input = 0
@@ -408,6 +413,39 @@ class AgentRunner:
                 })
 
             messages.append({"role": "user", "content": tool_results})
+
+            # ── Mid-loop context compaction ──────────────────────
+            # Check if context is getting large and compact if needed.
+            # This prevents the agent from hard-stopping mid-conversation.
+            _msg_tokens = estimate_messages_tokens(messages)
+            _sys_tokens = estimate_tokens(system_prompt)
+            _total_ctx = _msg_tokens + _sys_tokens
+            _usage_ratio = _total_ctx / _context_window if _context_window > 0 else 0
+
+            # Broadcast context usage when above 50%
+            if _usage_ratio >= 0.50 and on_tool_progress:
+                _pct = round(_usage_ratio * 100)
+                try:
+                    await on_tool_progress("__context__", f"Session: {_pct}%")
+                except Exception:
+                    pass
+
+            # Auto-compact at 80% to keep the conversation going
+            if _usage_ratio >= 0.80:
+                _compaction_count += 1
+                logger.info(f"[AGENT] Mid-loop compaction #{_compaction_count} at {_usage_ratio:.0%} ({_total_ctx:,} tokens)")
+                messages = await compact_messages(messages, settings.agent_model)
+                _after = estimate_messages_tokens(messages)
+                logger.info(f"[AGENT] After compaction: {len(messages)} messages, ~{_after:,} tokens")
+                # Inject continuation marker so the agent picks up seamlessly
+                messages.insert(0, {
+                    "role": "user",
+                    "content": (
+                        "[This session was auto-compacted to free up context space. "
+                        "Earlier conversation has been summarized above. "
+                        "Continue seamlessly from where you left off.]"
+                    ),
+                })
 
         else:
             # Max iterations reached
