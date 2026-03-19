@@ -607,6 +607,58 @@ class AppBuilderSkill(Skill):
                     "required": ["job_id"],
                 },
             },
+            {
+                "name": "app_builder__research_category",
+                "description": (
+                    "Research an app category via web search after the user picks a direction from "
+                    "the 3 options in Layer 0. Returns research-informed questions with [[option]] buttons. "
+                    "Call this AFTER the user selects a direction, BEFORE asking technical questions."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "original_idea": {
+                            "type": "string",
+                            "description": "The user's original app idea (e.g. 'I want a fitness app')",
+                        },
+                        "chosen_direction": {
+                            "type": "string",
+                            "description": "The direction the user chose from the 3 options (e.g. 'A workout tracker with exercise logging and progress charts')",
+                        },
+                    },
+                    "required": ["original_idea", "chosen_direction"],
+                },
+            },
+            {
+                "name": "app_builder__gather_requirements",
+                "description": (
+                    "Generate technical/implementation questions after the user answers research questions. "
+                    "Returns 5-7 technical questions with [[option]] buttons covering UI, data, screens, etc. "
+                    "Call this AFTER the user answers the research questions from app_builder__research_category."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "original_idea": {
+                            "type": "string",
+                            "description": "The user's original app idea",
+                        },
+                        "chosen_direction": {
+                            "type": "string",
+                            "description": "The direction the user chose from Layer 0",
+                        },
+                        "research_context": {
+                            "type": "string",
+                            "description": "The research questions that were asked (from app_builder__research_category)",
+                        },
+                        "research_answers": {
+                            "type": "string",
+                            "description": "The user's answers to the research questions",
+                        },
+                    },
+                    "required": ["original_idea", "chosen_direction", "research_context", "research_answers"],
+                },
+            },
         ]
 
     # ── Tool Execution ─────────────────────────────────────────────
@@ -619,6 +671,8 @@ class AppBuilderSkill(Skill):
             "app_builder__get_status": self._exec_get_status,
             "app_builder__modify_app": self._exec_modify_app,
             "app_builder__resume_build": self._exec_resume_build,
+            "app_builder__research_category": self._exec_research_category,
+            "app_builder__gather_requirements": self._exec_gather_requirements,
         }
         handler = dispatch.get(tool_name)
         if not handler:
@@ -882,6 +936,73 @@ class AppBuilderSkill(Skill):
             f"Track progress in the **Jobs** tab."
         )
 
+    # ── Sub-Agent Handlers ────────────────────────────────────────
+
+    async def _exec_research_category(self, args: Dict[str, Any], ctx: SkillContext) -> str:
+        """Run the Research Sub-Agent: web search + LLM to generate research-informed questions."""
+        from .research_agent import run_research
+
+        original_idea = args.get("original_idea", "")
+        chosen_direction = args.get("chosen_direction", "")
+
+        if not original_idea or not chosen_direction:
+            return "ERROR: original_idea and chosen_direction are required"
+
+        try:
+            questions = await run_research(
+                original_idea=original_idea,
+                chosen_direction=chosen_direction,
+                call_llm=self._call_llm,
+            )
+            return (
+                "RESEARCH COMPLETE. Present these research-informed questions to the user exactly as formatted below. "
+                "Do NOT add extra questions or rephrase — just present them in a friendly way with a brief intro like "
+                "'I researched apps in this space — here are some questions based on what I found:'\n\n"
+                f"{questions}"
+            )
+        except Exception as exc:
+            logger.exception("Research agent failed")
+            return (
+                f"Research agent encountered an error: {exc}\n"
+                "Fall back to asking 5 general research-style questions with [[option]] buttons about "
+                "the app category — cover: key features, target audience, content approach, "
+                "engagement model, and differentiators."
+            )
+
+    async def _exec_gather_requirements(self, args: Dict[str, Any], ctx: SkillContext) -> str:
+        """Run the Building Sub-Agent: generate technical/implementation questions."""
+        from .building_agent import run_building_questions
+
+        original_idea = args.get("original_idea", "")
+        chosen_direction = args.get("chosen_direction", "")
+        research_context = args.get("research_context", "")
+        research_answers = args.get("research_answers", "")
+
+        if not original_idea or not chosen_direction:
+            return "ERROR: original_idea and chosen_direction are required"
+
+        try:
+            questions = await run_building_questions(
+                original_idea=original_idea,
+                chosen_direction=chosen_direction,
+                research_context=research_context,
+                research_answers=research_answers,
+                call_llm=self._call_llm,
+            )
+            return (
+                "REQUIREMENTS GATHERED. Present these technical questions to the user exactly as formatted below. "
+                "Do NOT add extra questions or rephrase — just present them with a brief intro like "
+                "'Now let me ask about the technical details:'\n\n"
+                f"{questions}"
+            )
+        except Exception as exc:
+            logger.exception("Building agent failed")
+            return (
+                f"Building agent encountered an error: {exc}\n"
+                "Fall back to asking 5 technical questions with [[option]] buttons about: "
+                "UI style/theme, key screens, data storage, navigation style, and platform priority."
+            )
+
     # ── System Prompt ──────────────────────────────────────────────
 
     def get_system_prompt_section(self) -> Optional[str]:
@@ -900,74 +1021,58 @@ class AppBuilderSkill(Skill):
             "Every app you build includes an **Agent Placeholder** — a floating widget where YOU (the agent) "
             "can dock into the app and help the user. You'll have full access to navigate, read data, and "
             "perform actions within every app you build.\n\n"
-            "## When the user wants to build an app, follow this process:\n\n"
-            "### Step 1: Understand Requirements (10+ Questions)\n"
-            "Ask **at least 10 clarifying questions** in a SINGLE message to deeply understand what the user wants.\n"
-            "Pick the most relevant questions from this list based on the app type — aim for 10-12:\n\n"
-            "**Core & Purpose:**\n"
-            "1. Who is this app for? (personal use, team, public users)\n"
-            "2. What is the ONE main action users do most? (track, browse, create, schedule, learn)\n"
-            "3. What problem does this app solve? (productivity, learning, health, fun, organization)\n\n"
-            "**Features & Scope:**\n"
-            "4. Which features are must-have? (suggest 4-5 based on app type)\n"
-            "5. Any nice-to-have features? (suggest 3-4 extras)\n"
-            "6. Do you need notifications/reminders?\n"
-            "7. Do you need data visualization? (charts, progress bars, streaks, stats)\n\n"
-            "**Data & Storage:**\n"
-            "8. Should data persist between sessions? (SQLite database vs UI-only)\n"
-            "9. What data does the user create? (entries, notes, scores, schedules, uploads)\n"
-            "10. Any seed/default data needed? (categories, templates, starter content)\n\n"
-            "**Design & UX:**\n"
-            "11. Color theme preference? (suggest 3-4 palettes that match the app vibe)\n"
-            "12. Dark mode, light mode, or both?\n"
-            "13. How many main screens? (suggest based on app type: 3-6 typical)\n"
-            "14. Tab bar navigation or drawer/sidebar? (suggest best for the app type)\n"
-            "15. Any specific layout, style, or design inspiration?\n\n"
-            "**Smart Extras:**\n"
-            "16. Should the app have a dashboard/home screen with overview stats?\n"
-            "17. Any gamification? (streaks, achievements, points, levels, progress tracking)\n"
-            "18. Sort/filter/search on lists?\n"
-            "19. Import/export data? (CSV, share, backup)\n"
-            "20. Onboarding/welcome screen for first-time users?\n\n"
-            "Pick at least 10 of these based on the app type. You can add your own smart questions too.\n"
-            "If the user gives a very detailed description upfront, you may reduce to 8 but never less.\n\n"
-            "**CRITICAL — EVERY question MUST have [[option]] buttons. NO exceptions.**\n"
-            "- NEVER ask open-ended questions without buttons.\n"
-            "- NEVER use bullet point lists (- option1, - option2) instead of buttons.\n"
-            "- EVERY question gets 2-5 clickable [[option]] buttons on the NEXT LINE.\n"
-            "- The user interacts ONLY through buttons — they cannot type free text answers.\n\n"
-            "**Format rules:**\n"
-            "- Place [[option]] buttons DIRECTLY on the line after each question.\n"
-            "- NEVER collect all buttons at the end.\n"
-            "- Keep question text SHORT (one line). Put context in the buttons, not the question.\n\n"
-            "CORRECT:\n"
+
+            "## When the user wants to build an app, follow this EXACT multi-layer process:\n\n"
+
+            "### Layer 0: Help the User Understand What They Want (3 Direction Cards)\n"
+            "Most users don't know exactly what they want. When the user gives a vague build prompt "
+            "(e.g. 'I want a fitness app', 'build me a todo app', 'make something for cooking'), "
+            "do NOT jump to questions. Instead:\n\n"
+            "1. Interpret their vague idea\n"
+            "2. Present **exactly 3 distinct directions** the app could take\n"
+            "3. Each direction should be meaningfully different — not just variations of the same thing\n\n"
+            "Format the 3 directions like this:\n"
             "```\n"
-            "1. **What's your current level?**\n"
-            "[[Beginner]] [[Intermediate]] [[Advanced]] [[Not sure]]\n"
-            "\n"
-            "2. **Which features do you want?**\n"
-            "[[Feature A]] [[Feature B]] [[Feature C]] [[All of them]]\n"
-            "\n"
-            "3. **Save data locally?**\n"
-            "[[Yes, save my data]] [[No, UI only]]\n"
+            "I can take this in a few different directions! Pick the one that resonates:\n\n"
+            "**1. [Short Title]** — [1-2 sentence description of what this app would be]\n"
+            "[[Pick this one]]\n\n"
+            "**2. [Short Title]** — [1-2 sentence description]\n"
+            "[[Pick this one]]\n\n"
+            "**3. [Short Title]** — [1-2 sentence description]\n"
+            "[[Pick this one]]\n"
             "```\n\n"
-            "WRONG (open-ended question without buttons):\n"
-            "```\n"
-            "1. What's your current level? Are you starting from scratch?\n"
-            "\n"
-            "2. **Which features?**\n"
-            "[[Feature A]] [[Feature B]]\n"
-            "```\n\n"
-            "WRONG (bullet list instead of buttons):\n"
-            "```\n"
-            "Which sections do you want to focus on?\n"
-            "- Reading practice\n"
-            "- Listening practice\n"
-            "- Writing practice\n"
-            "[[Reading]] [[Listening]]\n"
-            "```\n\n"
+            "RULES for Layer 0:\n"
+            "- ALWAYS present exactly 3 options, no more, no less\n"
+            "- Each option MUST have a [[Pick this one]] button (or similar short clickable text)\n"
+            "- Make the 3 directions genuinely different (e.g. for 'fitness app': workout tracker vs personal trainer vs social fitness challenge)\n"
+            "- Keep descriptions short — 1-2 sentences max\n"
+            "- Do NOT ask any questions yet — just present the 3 cards\n"
+            "- If the user's description is already very specific and detailed (3+ sentences with clear features), "
+            "you may skip Layer 0 and go directly to Layer 1A\n\n"
+
+            "### Layer 1A: Research Agent (5+ Research-Informed Questions)\n"
+            "After the user picks a direction, call `app_builder__research_category` with:\n"
+            "- `original_idea`: the user's original prompt\n"
+            "- `chosen_direction`: the direction they picked (title + description)\n\n"
+            "This tool researches the app category via web search and returns 5-7 research-informed questions "
+            "with [[option]] buttons. Present these questions to the user EXACTLY as returned.\n"
+            "Add a brief friendly intro like: 'I did some research on apps like this — here are some "
+            "questions based on what I found:'\n\n"
+            "Wait for the user to answer ALL research questions before proceeding.\n\n"
+
+            "### Layer 1B: Building Agent (5+ Technical Questions)\n"
+            "After the user answers the research questions, call `app_builder__gather_requirements` with:\n"
+            "- `original_idea`: the user's original prompt\n"
+            "- `chosen_direction`: the direction from Layer 0\n"
+            "- `research_context`: the research questions that were asked\n"
+            "- `research_answers`: the user's answers to the research questions\n\n"
+            "This tool returns 5-7 technical/implementation questions with [[option]] buttons. "
+            "Present these to the user EXACTLY as returned.\n"
+            "Add a brief intro like: 'Great choices! Now some technical details:'\n\n"
+            "Wait for the user to answer ALL technical questions before proceeding.\n\n"
+
             "### Step 2: Present Plan\n"
-            "After gathering requirements, present a structured plan:\n"
+            "After ALL questions from both Layer 1A and 1B are answered, present a structured plan:\n"
             "- **App name** and 1-2 sentence summary\n"
             "- **Screens**: List each screen with its purpose\n"
             "- **Features**: List each feature\n"
@@ -977,24 +1082,41 @@ class AppBuilderSkill(Skill):
             "- **Platforms**: web + mobile\n\n"
             "Ask: \"Does this plan look good?\"\n"
             "[[Build it!]] [[Change something]]\n\n"
+
             "### Step 3: Build (ONLY after explicit approval)\n"
             "Call `app_builder__build_app` with ALL the context from the conversation.\n"
             "Include screens, features, design_notes, and db_type from the discussion.\n"
             "Tell the user to check the **Jobs** tab for live progress.\n\n"
+
             "### Step 4: Preview & Iterate\n"
             "After build completes, share the preview URL and QR code.\n"
             "Ask: \"How does it look?\"\n"
             "[[Looks great!]] [[Change colors]] [[Add a feature]] [[Rebuild it]]\n"
             "If they want changes, use `app_builder__modify_app` with their feedback.\n"
             "This only regenerates affected files — much faster than a full rebuild.\n\n"
-            "**IMPORTANT**: NEVER call app_builder__build_app without first discussing "
-            "requirements and getting the user's approval on the plan.\n\n"
+
+            "**IMPORTANT**: NEVER call app_builder__build_app without first going through "
+            "Layer 0 → Layer 1A → Layer 1B → Plan approval. Never skip layers.\n\n"
+
+            "**CRITICAL — ALL questions MUST have [[option]] buttons. NO exceptions.**\n"
+            "- NEVER ask open-ended questions without buttons.\n"
+            "- NEVER use bullet point lists (- option1, - option2) instead of buttons.\n"
+            "- EVERY question gets 2-5 clickable [[option]] buttons on the NEXT LINE.\n"
+            "- The user interacts ONLY through buttons — they should complete the entire pre-build "
+            "flow by clicking, not typing.\n\n"
+
+            "**Format rules for ALL questions (Layer 0, 1A, 1B):**\n"
+            "- Place [[option]] buttons DIRECTLY on the line after each question.\n"
+            "- NEVER collect all buttons at the end.\n"
+            "- Keep question text SHORT (one line). Put context in the buttons, not the question.\n\n"
+
             "### Status Check\n"
             "Use `app_builder__get_status` with the job_id to check build progress.\n"
             "If a build is **paused** due to token limits, tell the user their tokens need to reset.\n"
             "Use `app_builder__resume_build` with the job_id to resume a paused build once tokens reset.\n"
             "After building, each app gets its own tools (file editing, DB queries, "
             "navigation, GitHub push, restart, etc.) under `app_{slug}__*`.\n\n"
+
             "### Agent Docking (after build)\n"
             "Once an app is built, you can dock into it using the app's tools:\n"
             "- `app_{slug}__navigate` — change pages/screens within the app\n"
@@ -1002,6 +1124,7 @@ class AppBuilderSkill(Skill):
             "- `app_{slug}__query_db` — read/write the app's database\n"
             "- The user sees your agent placeholder on every screen of their app\n"
             "- When the user says 'go to my app' or 'open the todo app', use navigate to go to the right screen\n\n"
+
             "### Layer 2: User-Driven Customization (Edit Layer on Top of Layer 1)\n"
             "Every app has two layers:\n"
             "- **Layer 1** — The base app you built. Already functional with the user's basic preferences applied.\n"
