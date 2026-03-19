@@ -887,6 +887,10 @@ class AppBuilderSkill(Skill):
     def get_system_prompt_section(self) -> Optional[str]:
         return (
             "# App Builder\n"
+            "**MANDATORY**: When the user wants to build an app, you MUST use the `app_builder__build_app` tool. "
+            "NEVER build apps manually with exec/write_file — the app builder has a full pipeline that handles "
+            "scaffolding, code generation, GitHub repos, preview servers, and live progress tracking. "
+            "Building manually will bypass the preview, progress UI, and deployment pipeline.\n\n"
             "You can build cross-platform **agentic apps** (iPhone, iPad, Web) using React Native/Expo.\n"
             "Every app you build includes an **Agent Placeholder** — a floating widget where YOU (the agent) "
             "can dock into the app and help the user. You'll have full access to navigate, read data, and "
