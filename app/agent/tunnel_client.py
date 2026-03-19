@@ -154,12 +154,12 @@ class AgentTunnelClient:
                                 logger.info("[TUNNEL-CLIENT] Config unchanged — skipping restart")
                                 await ws.send(json.dumps({"type": "status", "status": "config_unchanged"}))
                                 continue
-                            logger.info("[TUNNEL-CLIENT] Config update received — writing .env and restarting...")
+                            logger.info("[TUNNEL-CLIENT] Config update received — writing .env and reloading...")
                             print("📥 Settings updated from toup.ai — syncing config...")
                             try:
                                 self._write_env(env_content)
                                 await ws.send(json.dumps({"type": "status", "status": "config_written"}))
-                                print("✅ Config synced — restarting agent...")
+                                print("✅ Config synced — reloading settings...")
                             except Exception as e:
                                 logger.exception("[TUNNEL-CLIENT] Failed to write .env: %s", e)
                                 print(f"❌ Failed to write .env: {e}")
@@ -169,23 +169,22 @@ class AgentTunnelClient:
                                     pass
                                 continue
                         else:
-                            logger.warning("[TUNNEL-CLIENT] Empty config_update — treating as restart")
-                            print("🔄 Restart signal from toup.ai...")
-                        import os
-                        os._exit(0)  # Service manager auto-restarts with new .env
+                            logger.warning("[TUNNEL-CLIENT] Empty config_update — skipping")
+                            continue
+                        # Hot-reload settings from updated .env instead of os._exit()
+                        self._reload_settings()
 
                     elif msg_type == "http_forward":
                         asyncio.create_task(self._handle_http_forward(ws, msg))
 
                     elif msg_type == "restart":
-                        logger.info("[TUNNEL-CLIENT] Restart command received — restarting agent...")
-                        print("🔄 Settings changed on toup.ai — restarting agent...")
+                        logger.info("[TUNNEL-CLIENT] Restart command received — reloading settings...")
+                        print("🔄 Settings changed on toup.ai — reloading...")
                         try:
                             await ws.send(json.dumps({"type": "status", "status": "restarting"}))
                         except Exception:
                             pass
-                        import os
-                        os._exit(0)  # Service manager auto-restarts
+                        self._reload_settings()
 
                     elif msg_type == "error":
                         logger.error("[TUNNEL-CLIENT] Platform error: %s", msg.get("message"))
@@ -248,6 +247,43 @@ class AgentTunnelClient:
         with open(env_path, "w") as f:
             f.write(env_content)
         logger.info("[TUNNEL-CLIENT] Wrote updated .env to %s (%d bytes)", env_path, len(env_content))
+
+    def _reload_settings(self):
+        """Hot-reload settings from .env without restarting the process.
+
+        Clears the lru_cache on get_settings so the next access picks up new values.
+        Also updates os.environ from the new .env so pydantic-settings reads them.
+        """
+        import os
+        from dotenv import load_dotenv
+
+        # Find the .env path
+        candidates = [
+            os.path.join(os.getcwd(), ".env"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"),
+        ]
+        env_path = None
+        for c in candidates:
+            c = os.path.normpath(c)
+            if os.path.exists(c):
+                env_path = c
+                break
+
+        if env_path:
+            load_dotenv(env_path, override=True)
+            logger.info("[TUNNEL-CLIENT] Reloaded env vars from %s", env_path)
+
+        # Clear the settings cache so next access creates fresh Settings
+        try:
+            from app.config import get_settings
+            get_settings.cache_clear()
+            # Re-import to force re-creation
+            import app.config
+            app.config.settings = get_settings()
+            logger.info("[TUNNEL-CLIENT] Settings reloaded (model=%s)", app.config.settings.agent_model)
+            print(f"✅ Settings reloaded (model={app.config.settings.agent_model})")
+        except Exception as e:
+            logger.warning("[TUNNEL-CLIENT] Failed to reload settings: %s", e)
 
     async def _handle_http_forward(self, ws, msg: dict):
         """Forward an HTTP request to the local agent server and return the result."""

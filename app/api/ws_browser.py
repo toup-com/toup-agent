@@ -1506,7 +1506,7 @@ async def _run_browser_agent_inner(
     import base64 as _b64mod
 
     # ── LLM provider: use Anthropic Claude if regular API key available, else OpenAI ──
-    _ant_key = settings.anthropic_api_key or ""
+    _ant_key = (settings.anthropic_api_key or "").strip()
     _use_claude = _ant_key and _ant_key.startswith("sk-ant-api")
     if _use_claude:
         from anthropic import AsyncAnthropic

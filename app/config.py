@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import model_validator
 from functools import lru_cache
 from typing import Optional
 
@@ -257,6 +258,25 @@ class Settings(BaseSettings):
         "claude-sonnet-4-5-20250514": {"input": 0.003, "output": 0.015},
         "claude-sonnet-4-20250514": {"input": 0.003, "output": 0.015},
     }
+
+    # Strip whitespace from API key fields on load (users often paste with spaces)
+    _KEY_FIELDS = {
+        "openai_api_key", "anthropic_api_key", "google_api_key",
+        "mistral_api_key", "groq_api_key", "xai_api_key", "deepseek_api_key",
+        "telegram_bot_token", "discord_bot_token", "slack_bot_token",
+        "slack_app_token", "brave_api_key", "elevenlabs_api_key",
+        "cohere_api_key", "agent_api_key", "toup_token",
+    }
+
+    @model_validator(mode="after")
+    def _strip_api_keys(self) -> "Settings":
+        for field in self._KEY_FIELDS:
+            val = getattr(self, field, None)
+            if isinstance(val, str):
+                stripped = val.strip()
+                if stripped != val:
+                    object.__setattr__(self, field, stripped)
+        return self
 
     class Config:
         env_file = ".env"

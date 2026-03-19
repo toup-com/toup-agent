@@ -55,7 +55,7 @@ class AnthropicService:
     """
     
     def __init__(self):
-        api_key = settings.anthropic_api_key
+        api_key = (settings.anthropic_api_key or "").strip()
         if not api_key:
             logger.warning("ANTHROPIC_API_KEY not set — AnthropicService will fail on calls")
         

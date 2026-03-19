@@ -2097,8 +2097,9 @@ class AppBuilderSkill(Skill):
         await self._update_step(job_id, user_id, "planning", "running")
 
         try:
+            _desc_words = len(description.split())
             if blog:
-                await blog.info("Calling Claude Opus for app architecture planning...")
+                await blog.info(f"Planning with Claude Opus 4.6 ({_desc_words} word description)...")
             llm_response = await self._call_llm(
                 PLANNING_PROMPT.format(description=description, extra_context=extra_context),
                 "Plan this app and output JSON.",
@@ -2804,7 +2805,7 @@ const _webDb = {
         import time as _time
         from app.config import settings
 
-        anthropic_key = settings.anthropic_api_key or ""
+        anthropic_key = (settings.anthropic_api_key or "").strip()
         if anthropic_key:
             try:
                 import anthropic
@@ -2823,20 +2824,39 @@ const _webDb = {
                 else:
                     client = anthropic.AsyncAnthropic(api_key=anthropic_key)
 
+                # OAuth tokens require Claude Code identity prefix in system prompt
+                if is_oauth:
+                    _sys = [
+                        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
+                        {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}},
+                    ]
+                else:
+                    _sys = system_prompt
+
                 t0 = _time.time()
                 # Use streaming — Anthropic requires it for large max_tokens
                 text = ""
                 input_tok = 0
                 output_tok = 0
                 stop_reason = "end_turn"
+                _last_progress = t0
+                _chunk_count = 0
                 async with client.messages.stream(
                     model=model,
                     max_tokens=max_tokens,
-                    system=system_prompt,
+                    system=_sys,
                     messages=[{"role": "user", "content": user_message}],
                 ) as stream:
                     async for chunk in stream.text_stream:
                         text += chunk
+                        _chunk_count += 1
+                        # Log progress every 10 seconds so user knows it's working
+                        _now = _time.time()
+                        if blog and (_now - _last_progress) >= 10:
+                            _elapsed_s = int(_now - t0)
+                            _words = len(text.split())
+                            await blog.info(f"LLM generating... {_elapsed_s}s elapsed, ~{_words} words so far")
+                            _last_progress = _now
                     response = await stream.get_final_message()
                     input_tok = getattr(response.usage, 'input_tokens', 0)
                     output_tok = getattr(response.usage, 'output_tokens', 0)
@@ -2885,7 +2905,9 @@ const _webDb = {
             try:
                 from openai import AsyncOpenAI
                 client = AsyncOpenAI(api_key=settings.openai_api_key)
-                oai_model = settings.agent_model or "gpt-4o-mini"
+                # Only use agent_model if it's an OpenAI model; otherwise default
+                _am = settings.agent_model or ""
+                oai_model = _am if _am.startswith(("gpt-", "o1", "o3", "o4")) else "gpt-4o-mini"
                 t0 = _time.time()
                 response = await client.chat.completions.create(
                     model=oai_model,
