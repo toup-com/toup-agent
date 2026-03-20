@@ -477,6 +477,13 @@ async def ws_chat(
 
                 stop_task = asyncio.create_task(_wait_for_stop())
 
+                # Helper to safely send on WS (may be closed)
+                async def _safe_send(data: dict):
+                    try:
+                        await websocket.send_json(data)
+                    except RuntimeError:
+                        pass  # WS already closed
+
                 try:
                     response = await agent_task
                     stop_task.cancel()
@@ -512,7 +519,7 @@ async def ws_chat(
                                     logger.warning(f"[WS] Failed to mark onboarding complete: {e}")
                                 break
 
-                    await websocket.send_json({
+                    await _safe_send({
                         "type": "done",
                         "text": response.text,
                         "session_id": response.session_id,
@@ -528,11 +535,11 @@ async def ws_chat(
 
                 except asyncio.CancelledError:
                     stop_task.cancel()
-                    await websocket.send_json({"type": "stopped", "message": "Generation stopped"})
+                    await _safe_send({"type": "stopped", "message": "Generation stopped"})
                 except Exception as e:
                     logger.exception(f"[WS] Agent error for {user_id}")
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
-                    await websocket.send_json({"type": "error", "message": f"Agent error: {type(e).__name__}: {e}"})
+                    await _safe_send({"type": "error", "message": f"Agent error: {type(e).__name__}: {e}"})
         finally:
             # Clean up broadcast queue and task
             broadcast_task.cancel()

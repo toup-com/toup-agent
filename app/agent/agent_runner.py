@@ -453,7 +453,7 @@ class AgentRunner:
                 final_text = text_buf or "I've reached the maximum number of tool iterations. Here's what I have so far."
 
         # ── Phase 3: Save to DB (short-lived session) ────────────
-        memories_count = 0
+        # Save messages synchronously (fast, needed for conversation continuity)
         async with async_session_maker() as db:
             await self._save_messages(
                 db=db,
@@ -467,34 +467,45 @@ class AgentRunner:
                 processing_time_ms=int((time.time() - start) * 1000),
                 save_user_message=save_user_message,
             )
-
-            if settings.auto_extract_memories and final_text:
-                memories_count = await self._extract_memories(
-                    db=db,
-                    user_id=user_id,
-                    user_message=user_message,
-                    assistant_response=final_text,
-                )
-
-            try:
-                from app.services.retrieval_feedback import get_retrieval_feedback
-                feedback_svc = get_retrieval_feedback(db)
-                await feedback_svc.log_retrieval_feedback(
-                    user_id=user_id,
-                    query=user_message,
-                    retrieved_memories=self._last_retrieved_memories,
-                    response=final_text,
-                    conversation_id=session_id,
-                    strategies_used=["vector", "keyword", "graph"],
-                )
-            except Exception as e:
-                logger.warning(f"[AGENT] Feedback logging failed (non-fatal): {e}")
-
             await db.commit()
+
+        # ── Phase 3b: Background tasks (memory extraction, feedback) ──
+        # These are slow (LLM calls) — run in background so response returns immediately
+        async def _background_post_processing():
+            try:
+                async with async_session_maker() as bg_db:
+                    if settings.auto_extract_memories and final_text:
+                        mem_count = await self._extract_memories(
+                            db=bg_db,
+                            user_id=user_id,
+                            user_message=user_message,
+                            assistant_response=final_text,
+                        )
+                        logger.info(f"[AGENT] Background: extracted {mem_count} memories")
+
+                    try:
+                        from app.services.retrieval_feedback import get_retrieval_feedback
+                        feedback_svc = get_retrieval_feedback(bg_db)
+                        await feedback_svc.log_retrieval_feedback(
+                            user_id=user_id,
+                            query=user_message,
+                            retrieved_memories=self._last_retrieved_memories,
+                            response=final_text,
+                            conversation_id=session_id,
+                            strategies_used=["vector", "keyword", "graph"],
+                        )
+                    except Exception as e:
+                        logger.warning(f"[AGENT] Feedback logging failed (non-fatal): {e}")
+
+                    await bg_db.commit()
+            except Exception as e:
+                logger.warning(f"[AGENT] Background post-processing failed (non-fatal): {e}")
+
+        asyncio.create_task(_background_post_processing())
 
         elapsed = int((time.time() - start) * 1000)
         logger.info(f"[AGENT] Response: {final_text[:100]}...")
-        logger.info(f"[AGENT] Tokens: in={total_input} out={total_output} | Tools: {len(all_tool_calls)} | Memories: {memories_count} | Time: {elapsed}ms")
+        logger.info(f"[AGENT] Tokens: in={total_input} out={total_output} | Tools: {len(all_tool_calls)} | Time: {elapsed}ms")
 
         # Hook: agent run complete
         await _hb.emit(HookEvent.AGENT_END, {
