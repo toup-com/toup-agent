@@ -2325,7 +2325,7 @@ class MemoryService:
 
                 UNION ALL
 
-                -- Forward edges: source → target
+                -- Bidirectional edges: traverse both directions in one recursive term
                 SELECT
                     e2.id AS entity_id,
                     e2.name AS entity_name,
@@ -2336,26 +2336,14 @@ class MemoryService:
                     gw.entity_id AS from_entity_id,
                     gw.entity_name AS from_entity_name
                 FROM graph_walk gw
-                JOIN entity_relationships er ON er.source_entity_id = gw.entity_id
-                JOIN entities e2 ON e2.id = er.target_entity_id
-                WHERE gw.depth < :max_depth
-                  AND er.user_id = :user_id
-
-                UNION ALL
-
-                -- Reverse edges: target → source (bidirectional traversal)
-                SELECT
-                    e2.id AS entity_id,
-                    e2.name AS entity_name,
-                    e2.entity_type AS entity_type,
-                    gw.depth + 1 AS depth,
-                    er.relationship_type,
-                    er.relationship_label,
-                    gw.entity_id AS from_entity_id,
-                    gw.entity_name AS from_entity_name
-                FROM graph_walk gw
-                JOIN entity_relationships er ON er.target_entity_id = gw.entity_id
-                JOIN entities e2 ON e2.id = er.source_entity_id
+                JOIN entity_relationships er
+                    ON er.source_entity_id = gw.entity_id
+                    OR er.target_entity_id = gw.entity_id
+                JOIN entities e2
+                    ON e2.id = CASE
+                        WHEN er.source_entity_id = gw.entity_id THEN er.target_entity_id
+                        ELSE er.source_entity_id
+                    END
                 WHERE gw.depth < :max_depth
                   AND er.user_id = :user_id
             )
