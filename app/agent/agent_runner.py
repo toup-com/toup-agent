@@ -474,32 +474,36 @@ class AgentRunner:
         async def _background_post_processing():
             try:
                 async with async_session_maker() as bg_db:
-                    if settings.auto_extract_memories and final_text:
-                        mem_count = await self._extract_memories(
-                            db=bg_db,
-                            user_id=user_id,
-                            user_message=user_message,
-                            assistant_response=final_text,
-                        )
-                        logger.info(f"[AGENT] Background: extracted {mem_count} memories")
-
                     try:
-                        from app.services.retrieval_feedback import get_retrieval_feedback
-                        feedback_svc = get_retrieval_feedback(bg_db)
-                        await feedback_svc.log_retrieval_feedback(
-                            user_id=user_id,
-                            query=user_message,
-                            retrieved_memories=self._last_retrieved_memories,
-                            response=final_text,
-                            conversation_id=session_id,
-                            strategies_used=["vector", "keyword", "graph"],
-                        )
-                    except Exception as e:
-                        logger.warning(f"[AGENT] Feedback logging failed (non-fatal): {e}")
+                        if settings.auto_extract_memories and final_text:
+                            mem_count = await self._extract_memories(
+                                db=bg_db,
+                                user_id=user_id,
+                                user_message=user_message,
+                                assistant_response=final_text,
+                            )
+                            logger.info(f"[AGENT] Background: extracted {mem_count} memories")
 
-                    await bg_db.commit()
+                        try:
+                            from app.services.retrieval_feedback import get_retrieval_feedback
+                            feedback_svc = get_retrieval_feedback(bg_db)
+                            await feedback_svc.log_retrieval_feedback(
+                                user_id=user_id,
+                                query=user_message,
+                                retrieved_memories=self._last_retrieved_memories,
+                                response=final_text,
+                                conversation_id=session_id,
+                                strategies_used=["vector", "keyword", "graph"],
+                            )
+                        except Exception as e:
+                            logger.warning(f"[AGENT] Feedback logging failed (non-fatal): {e}")
+
+                        await bg_db.commit()
+                    except Exception as e:
+                        await bg_db.rollback()
+                        logger.warning(f"[AGENT] Background post-processing failed (non-fatal): {e}")
             except Exception as e:
-                logger.warning(f"[AGENT] Background post-processing failed (non-fatal): {e}")
+                logger.warning(f"[AGENT] Background session error (non-fatal): {e}")
 
         asyncio.create_task(_background_post_processing())
 
