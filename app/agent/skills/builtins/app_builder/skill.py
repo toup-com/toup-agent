@@ -3013,6 +3013,9 @@ const _webDb = {
                     client = anthropic.AsyncAnthropic(
                         auth_token=anthropic_key,
                         default_headers={
+                            # Must pretend to be Claude Code for OAuth token validity.
+                            # Do NOT include interleaved-thinking — it puts code in
+                            # thinking blocks, leaving only stubs in text_stream.
                             "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
                             "user-agent": "claude-cli/2.1.2 (external, cli)",
                             "x-app": "cli",
@@ -3021,7 +3024,7 @@ const _webDb = {
                 else:
                     client = anthropic.AsyncAnthropic(api_key=anthropic_key)
 
-                # OAuth tokens require Claude Code identity prefix in system prompt
+                # OAuth tokens require Claude Code identity prefix
                 if is_oauth:
                     _sys = [
                         {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
@@ -3058,6 +3061,25 @@ const _webDb = {
                     input_tok = getattr(response.usage, 'input_tokens', 0)
                     output_tok = getattr(response.usage, 'output_tokens', 0)
                     stop_reason = getattr(response, 'stop_reason', 'end_turn')
+
+                    # Safety net: if text_stream yielded garbage/stub, extract
+                    # from ALL content blocks (thinking blocks may contain real code)
+                    if len(text.strip()) < 100:
+                        all_text_parts = []
+                        for block in response.content:
+                            if hasattr(block, 'text') and block.text:
+                                all_text_parts.append(block.text)
+                            elif hasattr(block, 'thinking') and block.thinking:
+                                all_text_parts.append(block.thinking)
+                        combined = "\n".join(all_text_parts)
+                        if len(combined.strip()) > len(text.strip()):
+                            if blog:
+                                await blog.warn(
+                                    f"text_stream was short ({len(text)} chars), "
+                                    f"recovered {len(combined)} chars from content blocks"
+                                )
+                            text = combined
+
                 elapsed = _time.time() - t0
 
                 if blog:
