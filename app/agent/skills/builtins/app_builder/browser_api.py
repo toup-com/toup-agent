@@ -275,15 +275,18 @@ async def _bing_search(query: str, count: int) -> List[Dict[str, str]]:
                 const snippetEl = item.querySelector('.b_caption p') || item.querySelector('p');
                 if (!h2a || !h2a.innerText) continue;
 
-                // Bing wraps URLs in /ck/a? redirects — extract real URL from cite element
-                const cite = item.querySelector('cite');
+                // Extract URL: prefer h2a.href (Bing redirect), fall back to cite text
                 let url = '';
-                if (cite) {
-                    // cite shows "https://example.com › path › page" — reconstruct URL
-                    const parts = cite.innerText.trim();
-                    url = parts.replace(/\\s*›\\s*/g, '/');
-                    // Ensure protocol
-                    if (!url.startsWith('http')) url = 'https://' + url;
+                const rawHref = h2a.getAttribute('href') || '';
+                if (rawHref.startsWith('http') && !rawHref.includes('bing.com/ck/')) {
+                    url = rawHref;
+                } else {
+                    // cite shows "example.com › path › page" — reconstruct URL
+                    const cite = item.querySelector('cite');
+                    if (cite) {
+                        url = cite.innerText.trim().replace(/\s*›\s*/g, '/');
+                        if (!url.startsWith('http')) url = 'https://' + url;
+                    }
                 }
 
                 if (url && !url.includes('bing.com')) {

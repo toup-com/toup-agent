@@ -698,7 +698,7 @@ class AppBuilderSkill(Skill):
 
         app_id = str(uuid.uuid4())
         job_id = str(uuid.uuid4())
-        slug = _slugify(name)
+        base_slug = _slugify(name)
         apps_dir = self._app_manager.APPS_DIR if hasattr(self._app_manager, 'APPS_DIR') else "/opt/toup-agent/apps"
         app_dir = os.path.join(apps_dir, app_id)
 
@@ -712,6 +712,17 @@ class AppBuilderSkill(Skill):
         }
 
         async with async_session_maker() as db:
+            # Deduplicate slug — append numeric suffix if collision
+            from sqlalchemy import select as sa_select
+            slug = base_slug
+            for attempt in range(1, 100):
+                existing = await db.execute(
+                    sa_select(App.id).where(App.slug == slug).limit(1)
+                )
+                if not existing.scalar():
+                    break
+                slug = f"{base_slug}-{attempt}"
+
             app = App(
                 id=app_id,
                 user_id=user_id,
@@ -2350,6 +2361,23 @@ class AppBuilderSkill(Skill):
                     )
                     code = self._strip_fences(code)
 
+                    # Reject garbage/stub responses (e.g. "return null;")
+                    stripped = code.strip().rstrip(";").strip()
+                    if len(stripped) < 50 or stripped in ("return null", "null", "undefined", "export default null"):
+                        if blog:
+                            await blog.warn(f"Garbage response for {file_path}: '{stripped[:60]}' — retrying")
+                        code = await self._call_llm(
+                            prompt + (
+                                "\n\nCRITICAL: You returned a stub/garbage response like 'return null'. "
+                                "You MUST generate the COMPLETE, real implementation for this file. "
+                                "Output ONLY the full source code, no placeholders."
+                            ),
+                            f"Generate code for {file_path} (retry — garbage response)",
+                            blog=blog, purpose=f"Retry {file_path} (garbage)",
+                            max_tokens=32000,
+                        )
+                        code = self._strip_fences(code)
+
                     # Validate syntax — retry if truncated
                     is_valid, error_msg = self._validate_syntax(code, file_path)
                     if not is_valid:
@@ -3045,50 +3073,16 @@ const _webDb = {
             except anthropic.APIStatusError as e:
                 if e.status_code == 529:  # API overloaded
                     raise TokenLimitError(retry_after_seconds=120, message="API overloaded, retry in 2min")
+                # All other Anthropic errors — fail the build, no fallback to weaker models
                 if blog:
-                    await blog.warn(f"Anthropic call failed (status {e.status_code}), falling back to OpenAI: {e}")
-                else:
-                    logger.warning(f"[BUILD] Anthropic call failed (status {e.status_code}), falling back to OpenAI: {e}")
+                    await blog.error(f"Anthropic call failed (status {e.status_code}): {e}")
+                raise
             except Exception as e:
                 if blog:
-                    await blog.warn(f"Anthropic call failed, falling back to OpenAI: {e}")
-                else:
-                    logger.warning(f"[BUILD] Anthropic call failed, falling back to OpenAI: {e}")
-
-        if settings.openai_api_key:
-            try:
-                from openai import AsyncOpenAI
-                client = AsyncOpenAI(api_key=settings.openai_api_key)
-                # Only use agent_model if it's an OpenAI model; otherwise default
-                _am = settings.agent_model or ""
-                oai_model = _am if _am.startswith(("gpt-", "o1", "o3", "o4")) else "gpt-4o-mini"
-                t0 = _time.time()
-                response = await client.chat.completions.create(
-                    model=oai_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message},
-                    ],
-                    max_completion_tokens=max_tokens,
-                )
-                elapsed = _time.time() - t0
-                text = response.choices[0].message.content or ""
-                usage = response.usage
-                if blog and usage:
-                    await blog.llm_call(
-                        model=oai_model,
-                        purpose=purpose or user_message[:50],
-                        input_tokens=usage.prompt_tokens or 0,
-                        output_tokens=usage.completion_tokens or 0,
-                        duration_s=elapsed,
-                    )
-                return text
-            except Exception as e:
-                if blog:
-                    await blog.error(f"OpenAI call failed: {e}")
+                    await blog.error(f"Anthropic call failed: {e}")
                 raise
 
-        raise RuntimeError("No LLM provider configured (need ANTHROPIC_API_KEY or OPENAI_API_KEY)")
+        raise RuntimeError("No LLM provider configured (need ANTHROPIC_API_KEY)")
 
     async def _update_step(
         self,

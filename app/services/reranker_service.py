@@ -193,11 +193,9 @@ class RerankerService:
 
         We batch all candidates into a single prompt asking for relevance
         scores 0-10 for each, keeping costs low (~$0.0005 per call).
+        Uses OpenAI directly — the LLMService routes through Anthropic when
+        ANTHROPIC_API_KEY is set, which can't handle gpt-4o-mini.
         """
-        from app.services.llm_service import get_llm_service
-
-        llm = get_llm_service()
-
         # Build numbered document list
         doc_lines = []
         for i, c in enumerate(candidates):
@@ -218,14 +216,18 @@ Documents:
 Return ONLY valid JSON: {{"scores": [{{"index": 0, "score": 7.5}}, ...]}}"""
 
         try:
-            response = await llm.complete_with_json(
-                messages=[{"role": "user", "content": prompt}],
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=self.openai_api_key)
+            oai_resp = await client.chat.completions.create(
                 model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=2000,
+                response_format={"type": "json_object"},
             )
+            response_text = oai_resp.choices[0].message.content or "{}"
 
-            result = json.loads(response.content)
+            result = json.loads(response_text)
             score_map: Dict[int, float] = {}
             for entry in result.get("scores", []):
                 idx = int(entry.get("index", -1))
