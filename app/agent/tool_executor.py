@@ -692,21 +692,33 @@ class ToolExecutor:
             return f"ERROR: {exc}"
     
     # ------------------------------------------------------------------
-    # 7. web_search
+    # 7. web_search  (uses platform's stealth browser API)
     # ------------------------------------------------------------------
     async def _tool_web_search(self, inp: Dict[str, Any]) -> str:
         query = inp.get("query", "")
         count = min(int(inp.get("count", 5)), 10)
-        
+
         if not query:
             return "ERROR: query is required"
-        
-        # Try Brave Search first, fallback to DuckDuckGo HTML
+
+        # Primary: stealth headless browser (Google → Bing → DDG)
+        try:
+            from app.agent.skills.builtins.app_builder.browser_api import search_formatted
+            return await search_formatted(query, count)
+        except Exception as exc:
+            logger.warning("[web_search] Browser search failed, falling back to httpx: %s", exc)
+
+        # Fallback: Brave API if configured
         if settings.brave_api_key:
-            return await self._brave_search(query, count)
-        return await self._ddg_search(query, count)
-    
-    async def _brave_search(self, query: str, count: int) -> str:
+            try:
+                return await self._brave_search_fallback(query, count)
+            except Exception as exc:
+                logger.warning("[web_search] Brave fallback failed: %s", exc)
+
+        # Last resort: DuckDuckGo HTML scrape
+        return await self._ddg_search_fallback(query, count)
+
+    async def _brave_search_fallback(self, query: str, count: int) -> str:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 "https://api.search.brave.com/res/v1/web/search",
@@ -719,11 +731,11 @@ class ToolExecutor:
             )
             resp.raise_for_status()
             data = resp.json()
-        
+
         results = data.get("web", {}).get("results", [])
         if not results:
             return "No results found."
-        
+
         lines = []
         for i, r in enumerate(results[:count], 1):
             lines.append(f"{i}. {r.get('title', '')}")
@@ -731,9 +743,9 @@ class ToolExecutor:
             lines.append(f"   {r.get('description', '')}")
             lines.append("")
         return "\n".join(lines)
-    
-    async def _ddg_search(self, query: str, count: int) -> str:
-        """Fallback search via DuckDuckGo HTML (no API key needed)."""
+
+    async def _ddg_search_fallback(self, query: str, count: int) -> str:
+        """Last-resort search via DuckDuckGo HTML (no API key, no browser)."""
         try:
             async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
                 resp = await client.get(
@@ -742,14 +754,14 @@ class ToolExecutor:
                     headers={"User-Agent": "Mozilla/5.0 (Toup Agent)"},
                 )
                 resp.raise_for_status()
-            
+
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
             results = soup.select(".result")[:count]
-            
+
             if not results:
                 return "No results found."
-            
+
             lines = []
             for i, r in enumerate(results, 1):
                 title_el = r.select_one(".result__title a")
@@ -762,20 +774,32 @@ class ToolExecutor:
                 lines.append(f"   {snippet}")
                 lines.append("")
             return "\n".join(lines)
-        
+
         except Exception as exc:
             return f"ERROR: DuckDuckGo search failed: {exc}"
     
     # ------------------------------------------------------------------
-    # 8. web_fetch
+    # 8. web_fetch  (uses platform's stealth browser API)
     # ------------------------------------------------------------------
     async def _tool_web_fetch(self, inp: Dict[str, Any]) -> str:
         url = inp.get("url", "")
         max_chars = int(inp.get("max_chars", 10000))
-        
+
         if not url:
             return "ERROR: url is required"
-        
+
+        # Primary: stealth headless browser (renders JS, bypasses bot detection)
+        try:
+            from app.agent.skills.builtins.app_builder.browser_api import read_page
+            text = await read_page(url)
+            if text and not text.startswith("(failed"):
+                if len(text) > max_chars:
+                    text = text[:max_chars] + "\n... (truncated)"
+                return text
+        except Exception as exc:
+            logger.warning("[web_fetch] Browser read_page failed, falling back to httpx: %s", exc)
+
+        # Fallback: plain httpx (for simple pages, APIs, text/JSON)
         try:
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
                 resp = await client.get(
@@ -783,38 +807,29 @@ class ToolExecutor:
                     headers={"User-Agent": "Mozilla/5.0 (Toup Agent)"},
                 )
                 resp.raise_for_status()
-            
+
             content_type = resp.headers.get("content-type", "")
-            
-            # If it's plain text or JSON, return directly
+
             if "text/plain" in content_type or "application/json" in content_type:
-                text = resp.text[:max_chars]
-                return text
-            
-            # Parse HTML
+                return resp.text[:max_chars]
+
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
-            
-            # Remove scripts, styles, nav, footer
             for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
                 tag.decompose()
-            
-            # Try article/main content first
+
             main = soup.find("article") or soup.find("main") or soup.find("body")
             if main is None:
                 return "(empty page)"
-            
+
             text = main.get_text(separator="\n", strip=True)
-            
-            # Collapse multiple blank lines
             import re as _re
             text = _re.sub(r"\n{3,}", "\n\n", text)
-            
+
             if len(text) > max_chars:
                 text = text[:max_chars] + "\n... (truncated)"
-            
             return text or "(empty page)"
-        
+
         except httpx.HTTPStatusError as exc:
             return f"ERROR: HTTP {exc.response.status_code} for {url}"
         except Exception as exc:

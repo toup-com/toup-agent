@@ -16,7 +16,7 @@ import asyncio
 import logging
 import re
 from typing import Dict, List, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 
 logger = logging.getLogger(__name__)
 
@@ -174,12 +174,12 @@ async def read_page(url: str, timeout_ms: int = NAV_TIMEOUT_MS) -> str:
 
 
 async def search(query: str, count: int = 5) -> List[Dict[str, str]]:
-    """Search Google and extract results.
+    """Search the web and extract results.
 
-    Uses a headless stealth browser to navigate Google search.
+    Uses a headless stealth browser. Tries Google first, then Bing,
+    then DuckDuckGo HTML scrape (httpx, no browser) as last resort.
+
     Returns list of {title, url, snippet} dicts.
-
-    Falls back to DuckDuckGo if Google fails.
     """
     results = await _google_search(query, count)
     if results:
@@ -187,7 +187,7 @@ async def search(query: str, count: int = 5) -> List[Dict[str, str]]:
     results = await _bing_search(query, count)
     if results:
         return results
-    return await _ddg_search(query, count)
+    return await _ddg_html_search(query, count)
 
 
 async def _google_search(query: str, count: int) -> List[Dict[str, str]]:
@@ -195,21 +195,22 @@ async def _google_search(query: str, count: int) -> List[Dict[str, str]]:
     cleanup = None
     try:
         page, cleanup = await _get_page()
-        search_url = f"https://www.google.com/search?q={quote_plus(query)}&num={count + 5}"
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        await asyncio.sleep(1.5)
+        search_url = f"https://www.google.com/search?q={quote_plus(query)}&num={count + 5}&hl=en"
+        await page.goto(search_url, wait_until="load", timeout=NAV_TIMEOUT_MS)
+        await asyncio.sleep(2)
+
+        # Scroll down to trigger lazy-loaded results
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+        await asyncio.sleep(0.5)
 
         results = await page.evaluate("""(count) => {
             const results = [];
-            // Strategy 1: Find all h3 elements (Google result titles) and walk up to container
             const h3s = document.querySelectorAll('h3');
             for (const h3 of h3s) {
                 if (results.length >= count) break;
-                // Walk up to find the link wrapper
                 let container = h3.closest('a[href^="http"]') || h3.parentElement?.closest('a[href^="http"]');
                 let linkEl = container || h3.parentElement?.querySelector('a[href^="http"]');
                 if (!linkEl) {
-                    // Try finding link as sibling or ancestor
                     let walk = h3.parentElement;
                     for (let i = 0; i < 5 && walk; i++) {
                         linkEl = walk.querySelector('a[href^="http"]');
@@ -218,7 +219,6 @@ async def _google_search(query: str, count: int) -> List[Dict[str, str]]:
                     }
                 }
                 if (linkEl && h3.innerText) {
-                    // Find snippet near the h3
                     let snippet = '';
                     let walk = h3.parentElement;
                     for (let i = 0; i < 5 && walk; i++) {
@@ -234,7 +234,6 @@ async def _google_search(query: str, count: int) -> List[Dict[str, str]]:
                         walk = walk.parentElement;
                     }
                     const url = linkEl.href || '';
-                    // Skip Google internal links
                     if (url.includes('google.com/search') || url.includes('accounts.google')) continue;
                     results.push({
                         title: h3.innerText,
@@ -259,26 +258,39 @@ async def _google_search(query: str, count: int) -> List[Dict[str, str]]:
 
 
 async def _bing_search(query: str, count: int) -> List[Dict[str, str]]:
-    """Fallback: search Bing (more permissive with headless browsers)."""
+    """Fallback: search Bing via headless browser."""
     cleanup = None
     try:
         page, cleanup = await _get_page()
-        search_url = f"https://www.bing.com/search?q={quote_plus(query)}&count={count + 5}"
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        await asyncio.sleep(1.5)
+        search_url = f"https://www.bing.com/search?q={quote_plus(query)}&count={count + 5}&setlang=en&cc=US"
+        await page.goto(search_url, wait_until="load", timeout=NAV_TIMEOUT_MS)
+        await asyncio.sleep(2)
 
         results = await page.evaluate("""(count) => {
             const results = [];
             const items = document.querySelectorAll('li.b_algo, .b_algo');
             for (const item of items) {
                 if (results.length >= count) break;
-                const linkEl = item.querySelector('h2 a, a[href^="http"]');
-                const snippetEl = item.querySelector('.b_caption p, p');
-                if (linkEl && linkEl.innerText) {
+                const h2a = item.querySelector('h2 a');
+                const snippetEl = item.querySelector('.b_caption p') || item.querySelector('p');
+                if (!h2a || !h2a.innerText) continue;
+
+                // Bing wraps URLs in /ck/a? redirects — extract real URL from cite element
+                const cite = item.querySelector('cite');
+                let url = '';
+                if (cite) {
+                    // cite shows "https://example.com › path › page" — reconstruct URL
+                    const parts = cite.innerText.trim();
+                    url = parts.replace(/\\s*›\\s*/g, '/');
+                    // Ensure protocol
+                    if (!url.startsWith('http')) url = 'https://' + url;
+                }
+
+                if (url && !url.includes('bing.com')) {
                     results.push({
-                        title: linkEl.innerText || '',
-                        url: linkEl.href || '',
-                        snippet: snippetEl ? snippetEl.innerText : ''
+                        title: h2a.innerText,
+                        url: url,
+                        snippet: snippetEl ? snippetEl.innerText.substring(0, 300) : ''
                     });
                 }
             }
@@ -297,62 +309,60 @@ async def _bing_search(query: str, count: int) -> List[Dict[str, str]]:
             await cleanup()
 
 
-async def _ddg_search(query: str, count: int) -> List[Dict[str, str]]:
-    """Fallback: search DuckDuckGo via the headless browser (JS version)."""
-    cleanup = None
-    try:
-        page, cleanup = await _get_page()
-        search_url = f"https://duckduckgo.com/?q={quote_plus(query)}"
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        await asyncio.sleep(3)  # DDG JS needs time to render
+async def _ddg_html_search(query: str, count: int) -> List[Dict[str, str]]:
+    """Last-resort fallback: DuckDuckGo HTML via httpx (no browser needed).
 
-        results = await page.evaluate("""(count) => {
-            const results = [];
-            // DDG result articles
-            const articles = document.querySelectorAll('article, [data-testid="result"]');
-            for (const article of articles) {
-                if (results.length >= count) break;
-                const linkEl = article.querySelector('a[href^="http"]');
-                const titleEl = article.querySelector('h2, h3, [data-testid="result-title"]');
-                const snippetEl = article.querySelector('[data-result="snippet"], .result__snippet, span');
-                if (linkEl && (titleEl || linkEl.innerText)) {
-                    const url = linkEl.href || '';
-                    if (url.includes('duckduckgo.com')) continue;
-                    results.push({
-                        title: (titleEl || linkEl).innerText || '',
-                        url: url,
-                        snippet: snippetEl ? snippetEl.innerText : ''
-                    });
-                }
-            }
-            // Fallback: try finding any h2 with links (generic)
-            if (results.length === 0) {
-                const h2s = document.querySelectorAll('h2');
-                for (const h2 of h2s) {
-                    if (results.length >= count) break;
-                    const link = h2.closest('a[href^="http"]') || h2.querySelector('a[href^="http"]');
-                    if (link && h2.innerText && !link.href.includes('duckduckgo.com')) {
-                        results.push({
-                            title: h2.innerText,
-                            url: link.href,
-                            snippet: ''
-                        });
-                    }
-                }
-            }
-            return results;
-        }""", count)
+    The JS version of DDG blocks headless browsers, so we use the
+    old-school HTML-only version with httpx.
+    """
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/137.0.0.0 Safari/537.36"
+                    ),
+                },
+            )
+            resp.raise_for_status()
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        items = soup.select(".result, .result--main")[:count]
+
+        if not items:
+            return []
+
+        results = []
+        for r in items:
+            title_el = r.select_one(".result__title a, .result__a")
+            snippet_el = r.select_one(".result__snippet")
+            if not title_el:
+                continue
+            title = title_el.get_text(strip=True)
+            href = title_el.get("href", "")
+            # DDG wraps URLs in a redirect — extract actual URL
+            if "uddg=" in href:
+                try:
+                    href = unquote(href.split("uddg=")[1].split("&")[0])
+                except Exception:
+                    pass
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            if title and href.startswith("http"):
+                results.append({"title": title, "url": href, "snippet": snippet})
 
         if results:
-            logger.info("[BROWSER_API] DuckDuckGo search: %d results for '%s'", len(results), query[:50])
-        return results or []
+            logger.info("[BROWSER_API] DDG HTML search: %d results for '%s'", len(results), query[:50])
+        return results
 
     except Exception as exc:
-        logger.warning("[BROWSER_API] DuckDuckGo search failed: %s", exc)
+        logger.warning("[BROWSER_API] DDG HTML search failed: %s", exc)
         return []
-    finally:
-        if cleanup:
-            await cleanup()
 
 
 async def search_formatted(query: str, count: int = 5) -> str:

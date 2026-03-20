@@ -459,6 +459,11 @@ echo "Installing dependencies (this may take a minute)..."
 {AGENT_DIR}/venv/bin/pip install -q -r {AGENT_DIR}/requirements.txt 2>&1
 echo "[OK] Dependencies installed"
 
+# Install headless Chromium for browser API (search, page reading)
+echo "Installing browser engine..."
+{AGENT_DIR}/venv/bin/python -m patchright install chromium 2>&1 || {AGENT_DIR}/venv/bin/python -m playwright install chromium 2>&1 || echo "[WARN] Browser install failed — web search will use fallback"
+echo "[OK] Browser engine ready"
+
 # Write .env
 echo "[STEP] Writing configuration..."
 cat > {AGENT_DIR}/.env << 'TOUP_ENV_EOF'
@@ -888,6 +893,10 @@ fi
 echo "  Installing dependencies (this may take a minute)..."
 "$AGENT_DIR/venv/bin/pip" install -q -r "$BACKEND_ROOT/requirements.txt"
 echo "  Dependencies installed"
+
+echo "  Installing browser engine..."
+"$AGENT_DIR/venv/bin/python" -m patchright install chromium 2>/dev/null || "$AGENT_DIR/venv/bin/python" -m playwright install chromium 2>/dev/null || echo "  (browser engine skipped — web search will use fallback)"
+echo "  Browser engine ready"
 {pg_install_section}
 # ── Write .env ───────────────────────────────────────────
 echo ""
