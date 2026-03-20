@@ -443,9 +443,9 @@ async def ws_chat(
                     except Exception:
                         pass
 
-                # Run agent
-                try:
-                    response = await _agent_runner.run(
+                # Run agent in a task so we can cancel it if user sends "stop"
+                async def _run_agent():
+                    return await _agent_runner.run(
                         user_message=text,
                         user_id=user_id,
                         session_id=session_id,
@@ -456,6 +456,34 @@ async def ws_chat(
                         model_override=model,
                         save_user_message=not is_onboarding_msg,
                     )
+
+                agent_task = asyncio.create_task(_run_agent())
+
+                # Listen for "stop" messages while agent is running
+                async def _listen_for_stop():
+                    while not agent_task.done():
+                        try:
+                            stop_raw = await asyncio.wait_for(
+                                websocket.receive_text(), timeout=0.5
+                            )
+                            stop_msg = json.loads(stop_raw)
+                            if stop_msg.get("type") == "stop":
+                                agent_task.cancel()
+                                logger.info(f"[WS] Agent stopped by user: {user_id}")
+                                return True
+                            elif stop_msg.get("type") == "ping":
+                                await websocket.send_json({"type": "pong"})
+                        except asyncio.TimeoutError:
+                            continue
+                        except (WebSocketDisconnect, Exception):
+                            break
+                    return False
+
+                stop_listener = asyncio.create_task(_listen_for_stop())
+
+                try:
+                    response = await agent_task
+                    stop_listener.cancel()
 
                     # Terminal activity: show agent response summary
                     resp_preview = response.text[:200].replace("\n", " ")
@@ -503,7 +531,8 @@ async def ws_chat(
                     })
 
                 except asyncio.CancelledError:
-                    await websocket.send_json({"type": "error", "message": "Request cancelled"})
+                    stop_listener.cancel()
+                    await websocket.send_json({"type": "stopped", "message": "Generation stopped"})
                 except Exception as e:
                     logger.exception(f"[WS] Agent error for {user_id}")
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
