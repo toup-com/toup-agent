@@ -487,6 +487,10 @@ async def ws_chat(
                 try:
                     response = await agent_task
                     stop_task.cancel()
+                    try:
+                        await stop_task  # Wait for stop task to actually finish
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
                     # Terminal activity: show agent response summary
                     resp_preview = response.text[:200].replace("\n", " ")
@@ -535,8 +539,17 @@ async def ws_chat(
 
                 except asyncio.CancelledError:
                     stop_task.cancel()
+                    try:
+                        await stop_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                     await _safe_send({"type": "stopped", "message": "Generation stopped"})
                 except Exception as e:
+                    stop_task.cancel()
+                    try:
+                        await stop_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                     logger.exception(f"[WS] Agent error for {user_id}")
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
                     await _safe_send({"type": "error", "message": f"Agent error: {type(e).__name__}: {e}"})
