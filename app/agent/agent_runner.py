@@ -524,7 +524,7 @@ class AgentRunner:
             tokens_total=total_input + total_output,
             model=model_used,
             processing_time_ms=elapsed,
-            memories_extracted=memories_count,
+            memories_extracted=0,  # extracted in background
         )
     
     # ------------------------------------------------------------------
