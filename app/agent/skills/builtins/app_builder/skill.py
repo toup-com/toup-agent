@@ -2364,21 +2364,34 @@ class AppBuilderSkill(Skill):
                     code = self._strip_fences(code)
 
                     # Reject garbage/stub responses (e.g. "return null;")
-                    stripped = code.strip().rstrip(";").strip()
-                    if len(stripped) < 50 or stripped in ("return null", "null", "undefined", "export default null"):
+                    def _is_garbage(c: str) -> bool:
+                        s = c.strip().rstrip(";").strip()
+                        return len(s) < 50 or s in ("return null", "null", "undefined", "export default null")
+
+                    if _is_garbage(code):
                         if blog:
-                            await blog.warn(f"Garbage response for {file_path}: '{stripped[:60]}' — retrying")
-                        code = await self._call_llm(
-                            prompt + (
-                                "\n\nCRITICAL: You returned a stub/garbage response like 'return null'. "
-                                "You MUST generate the COMPLETE, real implementation for this file. "
-                                "Output ONLY the full source code, no placeholders."
-                            ),
-                            f"Generate code for {file_path} (retry — garbage response)",
-                            blog=blog, purpose=f"Retry {file_path} (garbage)",
-                            max_tokens=32000,
-                        )
-                        code = self._strip_fences(code)
+                            await blog.warn(f"Garbage response for {file_path}: '{code.strip()[:60]}' — retrying")
+                        try:
+                            code = await self._call_llm(
+                                prompt + (
+                                    "\n\nCRITICAL: You returned a stub/garbage response like 'return null'. "
+                                    "You MUST generate the COMPLETE, real implementation for this file. "
+                                    "Output ONLY the full source code, no placeholders."
+                                ),
+                                f"Generate code for {file_path} (retry — garbage response)",
+                                blog=blog, purpose=f"Retry {file_path} (garbage)",
+                                max_tokens=32000,
+                            )
+                            code = self._strip_fences(code)
+                        except Exception as retry_err:
+                            if blog:
+                                await blog.warn(f"Retry also failed for {file_path}: {retry_err}")
+
+                        # If still garbage after retry, use error fallback
+                        if _is_garbage(code):
+                            if blog:
+                                await blog.warn(f"Still garbage after retry for {file_path} — using fallback")
+                            code = self._make_error_fallback(file_path)
 
                     # Validate syntax — retry if truncated
                     is_valid, error_msg = self._validate_syntax(code, file_path)
@@ -3000,7 +3013,7 @@ const _webDb = {
                     client = anthropic.AsyncAnthropic(
                         auth_token=anthropic_key,
                         default_headers={
-                            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+                            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
                             "user-agent": "claude-cli/2.1.2 (external, cli)",
                             "x-app": "cli",
                         },
