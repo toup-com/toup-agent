@@ -443,47 +443,43 @@ async def ws_chat(
                     except Exception:
                         pass
 
-                # Run agent in a task so we can cancel it if user sends "stop"
-                async def _run_agent():
-                    return await _agent_runner.run(
-                        user_message=text,
-                        user_id=user_id,
-                        session_id=session_id,
-                        channel=channel,
-                        on_text_chunk=on_text_chunk,
-                        on_tool_start=on_tool_start,
-                        on_tool_end=on_tool_end,
-                        model_override=model,
-                        save_user_message=not is_onboarding_msg,
-                    )
+                # Run agent — use a task so we can cancel on disconnect
+                agent_task = asyncio.create_task(_agent_runner.run(
+                    user_message=text,
+                    user_id=user_id,
+                    session_id=session_id,
+                    channel=channel,
+                    on_text_chunk=on_text_chunk,
+                    on_tool_start=on_tool_start,
+                    on_tool_end=on_tool_end,
+                    model_override=model,
+                    save_user_message=not is_onboarding_msg,
+                ))
 
-                agent_task = asyncio.create_task(_run_agent())
-
-                # Listen for "stop" messages while agent is running
-                async def _listen_for_stop():
-                    while not agent_task.done():
-                        try:
-                            stop_raw = await asyncio.wait_for(
-                                websocket.receive_text(), timeout=0.5
-                            )
-                            stop_msg = json.loads(stop_raw)
-                            if stop_msg.get("type") == "stop":
+                # Wait for agent to finish, but also listen for stop via a receiver task
+                async def _wait_for_stop():
+                    """Read WS messages while agent runs. Cancel agent on 'stop'."""
+                    try:
+                        while not agent_task.done():
+                            raw2 = await websocket.receive_text()
+                            try:
+                                m2 = json.loads(raw2)
+                            except json.JSONDecodeError:
+                                continue
+                            if m2.get("type") == "stop":
                                 agent_task.cancel()
                                 logger.info(f"[WS] Agent stopped by user: {user_id}")
-                                return True
-                            elif stop_msg.get("type") == "ping":
+                                return
+                            elif m2.get("type") == "ping":
                                 await websocket.send_json({"type": "pong"})
-                        except asyncio.TimeoutError:
-                            continue
-                        except (WebSocketDisconnect, Exception):
-                            break
-                    return False
+                    except (WebSocketDisconnect, asyncio.CancelledError):
+                        pass
 
-                stop_listener = asyncio.create_task(_listen_for_stop())
+                stop_task = asyncio.create_task(_wait_for_stop())
 
                 try:
                     response = await agent_task
-                    stop_listener.cancel()
+                    stop_task.cancel()
 
                     # Terminal activity: show agent response summary
                     resp_preview = response.text[:200].replace("\n", " ")
@@ -531,7 +527,7 @@ async def ws_chat(
                     })
 
                 except asyncio.CancelledError:
-                    stop_listener.cancel()
+                    stop_task.cancel()
                     await websocket.send_json({"type": "stopped", "message": "Generation stopped"})
                 except Exception as e:
                     logger.exception(f"[WS] Agent error for {user_id}")
