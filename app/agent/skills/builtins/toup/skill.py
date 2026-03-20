@@ -342,8 +342,10 @@ class ToupSkill(Skill):
             "- `toup__changeset` — Plan code changes as a structured changeset\n"
             "- `toup__review_diff` — Review a code diff for bugs, security, style\n"
             "- `toup__plan_sprint` — Break an epic into sprint tasks\n\n"
-            "Use these tools proactively when the user asks about building software, "
-            "planning features, reviewing code, or scaffolding projects."
+            "**IMPORTANT:** Do NOT use these tools when the user asks to BUILD or CREATE an app. "
+            "All app creation MUST go through the App Builder (`app_builder__build_app`). "
+            "Only use toup tools for planning/reviewing EXISTING software, analyzing diffs, "
+            "or breaking work into sprints — never for building new applications."
         )
 
     # ------------------------------------------------------------------
