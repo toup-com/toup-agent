@@ -1495,6 +1495,7 @@ class AppBuilderSkill(Skill):
             if self._ws_broadcast:
                 await self._ws_broadcast(user_id, {
                     "type": "app_ready",
+                    "job_id": job_id,
                     "app_id": app_id,
                     "name": name,
                     "qr_url": qr_url,
@@ -1969,6 +1970,7 @@ class AppBuilderSkill(Skill):
             if self._ws_broadcast:
                 await self._ws_broadcast(user_id, {
                     "type": "app_ready",
+                    "job_id": job_id,
                     "app_id": app_id,
                     "name": name,
                     "qr_url": qr_url,
@@ -2230,6 +2232,7 @@ class AppBuilderSkill(Skill):
                 web_url = await self._app_manager.get_web_url(app_id) if self._app_manager else ""
                 await self._ws_broadcast(user_id, {
                     "type": "app_ready",
+                    "job_id": job_id,
                     "app_id": app_id,
                     "name": app_name,
                     "qr_url": qr_url,
@@ -3195,11 +3198,17 @@ const _webDb = {
             await db.commit()
 
         if self._ws_broadcast and step_dict:
+            # Count completed vs total steps for progress tracking
+            total = len(steps) if steps else 0
+            completed = sum(1 for s in steps if s.get("status") == "done") if steps else 0
             await self._ws_broadcast(user_id, {
                 "type": "job_update",
                 "job_id": job_id,
+                "name": job.title.replace("Build: ", "") if job and job.title else "App Build",
                 "status": job.status if job else "running",
-                "step": step_dict,
+                "step": step_dict.get("label") or step_dict.get("name") or step_dict.get("type", ""),
+                "total_steps": total,
+                "completed_steps": completed,
             })
 
     async def _fail_job(self, job_id: str, app_id: str, error_msg: str):
