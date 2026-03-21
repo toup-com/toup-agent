@@ -438,6 +438,9 @@ async def ws_chat(
                     except Exception:
                         pass
 
+                # Collect build job info during tool execution for later persistence
+                _pending_job_cards: list = []
+
                 async def on_tool_end(tool_name: str, summary: str, tool_input: dict = None):
                     short = summary[:120] + "..." if len(summary) > 120 else summary
                     # Collapse to single line for terminal readability
@@ -467,6 +470,17 @@ async def ws_chat(
                         await websocket.send_json(event)
                     except Exception:
                         pass
+
+                    # Capture build job info for persistence after agent completes
+                    if tool_name == "app_builder__build_app" and summary:
+                        import re
+                        _jid_m = re.search(r"Job ID:\s*([a-f0-9-]+)", summary, re.I)
+                        _jnm_m = re.search(r"Building '([^']+)'", summary)
+                        if _jid_m:
+                            _pending_job_cards.append({
+                                "job_id": _jid_m.group(1),
+                                "job_name": _jnm_m.group(1) if _jnm_m else "App Build",
+                            })
 
                 # Run agent — use a task so we can cancel on disconnect
                 agent_task = asyncio.create_task(_agent_runner.run(
@@ -547,6 +561,33 @@ async def ws_chat(
                                 except Exception as e:
                                     logger.warning(f"[WS] Failed to mark onboarding complete: {e}")
                                 break
+
+                    # Persist any build job card messages to the session
+                    if _pending_job_cards and response.session_id:
+                        try:
+                            from app.db.database import async_session_maker
+                            from app.db.models import Message as MsgModel
+                            async with async_session_maker() as _jdb:
+                                for _jc in _pending_job_cards:
+                                    _jmid = f"job-{_jc['job_id']}"
+                                    _existing = await _jdb.execute(
+                                        select(MsgModel).where(MsgModel.id == _jmid)
+                                    )
+                                    if not _existing.scalar_one_or_none():
+                                        _jdb.add(MsgModel(
+                                            id=_jmid,
+                                            conversation_id=response.session_id,
+                                            role="job",
+                                            content=json.dumps({
+                                                "job_id": _jc["job_id"],
+                                                "job_name": _jc["job_name"],
+                                            }),
+                                        ))
+                                await _jdb.commit()
+                                logger.info(f"[WS] Persisted {len(_pending_job_cards)} job card(s) to session {response.session_id}")
+                        except Exception as _je:
+                            logger.warning(f"[WS] Failed to persist job cards: {_je}")
+                        _pending_job_cards.clear()
 
                     await _safe_send({
                         "type": "done",

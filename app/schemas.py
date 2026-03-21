@@ -803,6 +803,14 @@ class ChatMessageResponse(BaseModel):
     model_used: Optional[str] = None
     memories_retrieved: Optional[List[str]] = None
     processing_time_ms: Optional[int] = None
+    # Job card fields (role == 'job')
+    job_id: Optional[str] = None
+    job_name: Optional[str] = None
+    job_status: Optional[str] = None
+    job_step: Optional[str] = None
+    job_total_steps: Optional[int] = None
+    job_completed_steps: Optional[int] = None
+    job_app_id: Optional[str] = None
 
     class Config:
         from_attributes = True
