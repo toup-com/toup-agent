@@ -589,7 +589,7 @@ async def ws_chat(
                             logger.warning(f"[WS] Failed to persist job cards: {_je}")
                         _pending_job_cards.clear()
 
-                    await _safe_send({
+                    _done_payload = {
                         "type": "done",
                         "text": response.text,
                         "session_id": response.session_id,
@@ -601,7 +601,11 @@ async def ws_chat(
                         "model": response.model,
                         "tool_calls": len(response.tool_calls),
                         "processing_time_ms": response.processing_time_ms,
-                    })
+                    }
+                    # Include any build jobs triggered during this run
+                    if _pending_job_cards:
+                        _done_payload["build_jobs"] = list(_pending_job_cards)
+                    await _safe_send(_done_payload)
 
                 except asyncio.CancelledError:
                     stop_task.cancel()
