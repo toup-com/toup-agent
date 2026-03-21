@@ -3201,7 +3201,7 @@ const _webDb = {
             # Count completed vs total steps for progress tracking
             total = len(steps) if steps else 0
             completed = sum(1 for s in steps if s.get("status") == "done") if steps else 0
-            await self._ws_broadcast(user_id, {
+            payload = {
                 "type": "job_update",
                 "job_id": job_id,
                 "name": job.title.replace("Build: ", "") if job and job.title else "App Build",
@@ -3209,7 +3209,14 @@ const _webDb = {
                 "step": step_dict.get("label") or step_dict.get("name") or step_dict.get("type", ""),
                 "total_steps": total,
                 "completed_steps": completed,
-            })
+            }
+            logger.info(f"[BUILD_STEP] Broadcasting job_update: job={job_id[:8]} step={step_type}/{status} user={user_id}")
+            sent = await self._ws_broadcast(user_id, payload)
+            logger.info(f"[BUILD_STEP] Broadcast sent to {sent} connections")
+        elif not self._ws_broadcast:
+            logger.warning(f"[BUILD_STEP] _ws_broadcast is None! Cannot send job_update for job={job_id[:8]}")
+        elif not step_dict:
+            logger.warning(f"[BUILD_STEP] step_dict is None for step_type={step_type} in job={job_id[:8]}")
 
     async def _fail_job(self, job_id: str, app_id: str, error_msg: str):
         """Mark a job as failed and clean up stuck step statuses."""

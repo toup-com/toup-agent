@@ -51,7 +51,9 @@ async def broadcast_to_user(user_id: str, event: dict) -> int:
             q.put_nowait(event)
             sent += 1
         except asyncio.QueueFull:
-            pass  # Drop if client is slow
+            logger.warning(f"[BROADCAST] Queue full for user {user_id}, dropping event type={event.get('type')}")
+    etype = event.get("type", "?")
+    logger.info(f"[BROADCAST] user={user_id} type={etype} queues={len(queues)} sent={sent}")
     return sent
 
 
