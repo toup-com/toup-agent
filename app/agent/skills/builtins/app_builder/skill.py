@@ -350,7 +350,7 @@ Agent Integration System (CRITICAL — every app is "agentic"):
   live WebSocket connection). If this file is requested, return a minimal stub:
   ```
   import React from 'react';
-  export default function AgentPlaceholder() { return null; }
+  export default function AgentPlaceholder() {{ return null; }}
   ```
   The injected Orb widget replaces this component entirely.
 
@@ -1686,6 +1686,9 @@ class AppBuilderSkill(Skill):
                 await self._pause_job(job_id, app_id, user_id, e.retry_after_seconds, _checkpoint, blog)
                 return
             except Exception as e:
+                import traceback as _tb
+                logger.error(f"[BUILD] Code generation exception: type={type(e).__name__}, repr={repr(e)}")
+                logger.error(f"[BUILD] Traceback:\n{''.join(_tb.format_exception(type(e), e, e.__traceback__))}")
                 await blog.error(f"Code generation failed: {e}")
                 await blog.persist()
                 await self._fail_job(job_id, app_id, f"Code generation failed: {e}")
@@ -2026,11 +2029,14 @@ class AppBuilderSkill(Skill):
             await blog.info(f"Current app has {len(file_list)} files")
 
             # Ask Opus which files need changes
+            def _esc_fmt(s: str) -> str:
+                return s.replace("{", "{{").replace("}", "}}")
+
             analysis_response = await self._call_llm(
                 MODIFY_ANALYSIS_PROMPT.format(
-                    app_name=app_name,
-                    file_list=json.dumps(file_list[:100]),
-                    changes=changes,
+                    app_name=_esc_fmt(app_name),
+                    file_list=_esc_fmt(json.dumps(file_list[:100])),
+                    changes=_esc_fmt(changes),
                 ),
                 "Analyze which files need modification.",
                 blog=blog,
@@ -2253,8 +2259,11 @@ class AppBuilderSkill(Skill):
             _desc_words = len(description.split())
             if blog:
                 await blog.info(f"Planning with Claude Opus 4.6 ({_desc_words} word description)...")
+            def _esc_plan(s: str) -> str:
+                return s.replace("{", "{{").replace("}", "}}")
+
             llm_response = await self._call_llm(
-                PLANNING_PROMPT.format(description=description, extra_context=extra_context),
+                PLANNING_PROMPT.format(description=_esc_plan(description), extra_context=_esc_plan(extra_context)),
                 "Plan this app and output JSON.",
                 blog=blog,
                 purpose="App architecture planning",
@@ -2344,14 +2353,19 @@ class AppBuilderSkill(Skill):
                         f"```\n{existing_files[file_path][:4000]}\n```"
                     )
 
+                # Escape curly braces in LLM-generated content to prevent
+                # KeyError from .format() (e.g. "{ return null; }" in design notes)
+                def _esc(s: str) -> str:
+                    return s.replace("{", "{{").replace("}", "}}")
+
                 prompt = CODE_GEN_PROMPT.format(
                     file_path=file_path,
-                    description=description,
-                    app_name=app_name,
-                    all_files=all_files,
-                    all_deps=all_deps,
+                    description=_esc(description),
+                    app_name=_esc(app_name),
+                    all_files=_esc(all_files),
+                    all_deps=_esc(all_deps),
                     db_type=db_type,
-                    design_notes=design_section,
+                    design_notes=_esc(design_section),
                 )
                 if existing_hint:
                     prompt += existing_hint
