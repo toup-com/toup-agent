@@ -747,6 +747,19 @@ class AppBuilderSkill(Skill):
             db.add(job)
             await db.commit()
 
+        # Broadcast initial job_update immediately (before background task starts)
+        if self._ws_broadcast:
+            print(f"[BUILD] Sending initial job_update: job={job_id[:8]} name={name} user={user_id[:8]}", flush=True)
+            await self._ws_broadcast(user_id, {
+                "type": "job_update",
+                "job_id": job_id,
+                "name": name,
+                "status": "queued",
+                "step": "Starting build...",
+                "total_steps": 8,
+                "completed_steps": 0,
+            })
+
         # Spawn background build
         asyncio.create_task(
             self._build_app(job_id, app_id, name, description, user_id, slug, app_dir, plan_context)

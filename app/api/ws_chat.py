@@ -113,6 +113,25 @@ def _tprint(msg: str) -> None:
 
 router = APIRouter(tags=["WebSocket Chat"])
 
+
+@router.get("/debug/broadcast-test")
+async def debug_broadcast_test():
+    """DEBUG: Send a test job_update event to all connected WS clients."""
+    from app.config import settings
+    user_id = settings.user_id
+    queues_count = len(_user_ws_queues.get(user_id, []))
+    event = {
+        "type": "job_update",
+        "job_id": "test-debug-job-001",
+        "name": "Debug Test Build",
+        "status": "running",
+        "step": "Testing broadcast...",
+        "total_steps": 5,
+        "completed_steps": 2,
+    }
+    sent = await broadcast_to_user(user_id, event)
+    return {"user_id": user_id[:8], "queues": queues_count, "sent": sent, "event_type": "job_update"}
+
 # References set at startup
 _agent_runner = None
 _skill_loader = None
