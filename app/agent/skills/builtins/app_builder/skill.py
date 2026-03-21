@@ -2745,18 +2745,33 @@ const styles = StyleSheet.create({
                 r'export function \1',
                 patched,
             )
-            # Pattern b: const ScreenName = async () => { (arrow functions used as components)
-            # Only for screen/component files — don't touch lib/utils
-            if '/screens/' in fp or '/components/' in fp or fp == '/App.tsx':
+            # Pattern b: const ComponentName = async () => { (arrow functions used as components)
+            # Any .tsx/.jsx file with a PascalCase name is likely a component — don't touch lib/utils
+            is_component_file = (
+                '/screens/' in fp or '/components/' in fp
+                or fp.endswith('/App.tsx') or fp.endswith('/App.jsx')
+                or (fp.endswith(('.tsx', '.jsx')) and not any(
+                    d in fp for d in ('/lib/', '/utils/', '/hooks/', '/services/', '/api/')
+                ))
+            )
+            if is_component_file:
+                # Catch any PascalCase arrow function (starts with uppercase letter)
                 patched = _re.sub(
-                    r'((?:export\s+)?const\s+\w+(?:Screen|Component|Page|View)\s*=\s*)async\s*\(',
+                    r'((?:export\s+(?:default\s+)?)?const\s+[A-Z]\w*\s*=\s*)async\s*\(',
                     r'\1(',
                     patched,
                 )
                 patched = _re.sub(
-                    r'((?:export\s+)?const\s+\w+(?:Screen|Component|Page|View)\s*=\s*)async\s*\(\)',
+                    r'((?:export\s+(?:default\s+)?)?const\s+[A-Z]\w*\s*=\s*)async\s*\(\)',
                     r'\1()',
                     patched,
+                )
+                # Pattern c: async function ComponentName (without export, PascalCase = component)
+                patched = _re.sub(
+                    r'^(\s*)async\s+function\s+([A-Z]\w*)\s*\(',
+                    r'\1function \2(',
+                    patched,
+                    flags=_re.MULTILINE,
                 )
 
             # 2. Mixing expo-router and NavigationContainer
