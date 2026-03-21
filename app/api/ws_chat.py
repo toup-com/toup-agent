@@ -53,7 +53,7 @@ async def broadcast_to_user(user_id: str, event: dict) -> int:
         except asyncio.QueueFull:
             logger.warning(f"[BROADCAST] Queue full for user {user_id}, dropping event type={event.get('type')}")
     etype = event.get("type", "?")
-    logger.info(f"[BROADCAST] user={user_id} type={etype} queues={len(queues)} sent={sent}")
+    print(f"[BROADCAST] user={user_id[:8]} type={etype} queues={len(queues)} sent={sent}", flush=True)
     return sent
 
 
@@ -211,12 +211,16 @@ async def ws_chat(
             try:
                 while True:
                     event = await broadcast_queue.get()
+                    etype = event.get("type", "?")
+                    print(f"[BROADCAST_READER] Forwarding event type={etype} to WS for user={user_id[:8]}", flush=True)
                     try:
                         await websocket.send_json(event)
-                    except Exception:
+                        print(f"[BROADCAST_READER] Sent OK: type={etype}", flush=True)
+                    except Exception as e:
+                        print(f"[BROADCAST_READER] Send FAILED: type={etype} error={e}", flush=True)
                         break
             except asyncio.CancelledError:
-                pass
+                print(f"[BROADCAST_READER] Cancelled for user={user_id[:8]}", flush=True)
 
         broadcast_task = asyncio.create_task(_broadcast_reader())
 
