@@ -284,12 +284,12 @@ BROWSER_SYSTEM_PROMPT = """You are an AI browser agent controlling a REAL web br
 - You have a REAL browser — navigate to the actual website and USE it.
 - Search snippets and AI Overviews are NOT a substitute for using the website.
 
-## SEARCH — NEVER USE GOOGLE.COM:
-- Google blocks automated browsers with CAPTCHAs. NEVER navigate to google.com.
-- For searching: navigate to https://duckduckgo.com and search there, OR go directly to the target site.
+## SEARCH — AVOID GOOGLE SEARCH (use target sites directly):
+- Google Search may trigger CAPTCHAs. For searching, prefer navigating directly to the target site.
 - For YouTube videos: navigate directly to https://www.youtube.com and search there.
 - For shopping: navigate directly to the retailer's website (amazon.com, etc.)
-- For flights: navigate directly to https://www.google.com/travel/flights (this specific Google URL works).
+- For flights: navigate directly to https://www.google.com/travel/flights.
+- For general searches: use https://duckduckgo.com if you need a search engine.
 
 ## HANDLE POPUPS AND OVERLAYS FIRST:
 Before interacting with a page, dismiss ANY visible popups or promotional overlays:
@@ -300,10 +300,10 @@ Before interacting with a page, dismiss ANY visible popups or promotional overla
 
 ## MEDIA PLAYBACK — USE play_media TOOL:
 When the user asks to "play" a song, video, or any media:
-1. Navigate to YouTube and search for the content
-2. Find the video and get its YouTube URL from the page
-3. Call the `play_media` tool with the YouTube URL — this sends an embedded player directly to the user's browser so they can hear it
-4. Do NOT click Play buttons on the page — use the `play_media` tool instead
+1. Navigate to https://www.youtube.com and search for the content
+2. Once you see the search results with the correct video, call `play_media` with the video URL (or just call it without a URL — it will click the first video automatically)
+3. `play_media` will: navigate to the video page, skip any ads, click play, AND send an embedded player to the user's browser
+4. The user will see the video playing in the browser AND hear audio via the embedded player
 5. After calling `play_media`, call `done` to finish
 
 ## RULES:
@@ -1481,24 +1481,82 @@ async def _exec_browser_tool(
 
         elif name == "play_media":
             media_url = args.get("url", "")
-            # Extract YouTube video ID
             import re as _re
+
+            # If we're on YouTube search results, extract video ID from the page
+            video_id = None
             _yt_match = _re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})', media_url)
             if _yt_match:
                 video_id = _yt_match.group(1)
-                # Send embed event to frontend — user's browser plays it directly
+
+            # If no video ID in URL, try to find and click the first video on the page
+            if not video_id:
                 try:
-                    await websocket.send_json({
-                        "type": "media_play",
-                        "provider": "youtube",
-                        "video_id": video_id,
-                        "url": f"https://www.youtube.com/watch?v={video_id}",
-                    })
+                    # On YouTube search results page — click first video
+                    _first_video = await page.query_selector('a#video-title, ytd-video-renderer a#thumbnail')
+                    if _first_video:
+                        _href = await _first_video.get_attribute('href') or ''
+                        _vid_m = _re.search(r'v=([a-zA-Z0-9_-]{11})', _href)
+                        if _vid_m:
+                            video_id = _vid_m.group(1)
                 except Exception:
                     pass
-                return f"Playing YouTube video (ID: {video_id}) for the user via embedded player. The user can hear it in their browser. You can now call done()."
-            else:
-                return f"Could not extract video ID from URL: {media_url}. Return the URL to the user instead."
+
+            if not video_id:
+                return "Could not find a video to play. Navigate to a YouTube video page first, or provide a YouTube URL."
+
+            # Navigate the browser to the actual video page so the user sees it
+            _video_url = f"https://www.youtube.com/watch?v={video_id}"
+            try:
+                await page.goto(_video_url, wait_until="domcontentloaded", timeout=15_000)
+            except Exception:
+                pass
+            await _wait_stable(page)
+            await asyncio.sleep(1)
+
+            # Skip ads if present
+            for _ad_try in range(3):
+                try:
+                    _skip = await page.query_selector(
+                        'button.ytp-skip-ad-button, button.ytp-ad-skip-button, '
+                        'button.ytp-ad-skip-button-modern, [class*="skip-button"]'
+                    )
+                    if _skip and await _skip.is_visible():
+                        await _skip.click()
+                        await asyncio.sleep(0.5)
+                        break
+                    _ad_badge = await page.query_selector('.ytp-ad-badge, .ad-showing')
+                    if _ad_badge and await _ad_badge.is_visible():
+                        await asyncio.sleep(3)
+                        continue
+                    break
+                except Exception:
+                    break
+
+            # Click play if video is paused
+            try:
+                _play_btn = await page.query_selector('button.ytp-play-button[aria-label*="Play"]')
+                if _play_btn and await _play_btn.is_visible():
+                    await _play_btn.click()
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+            # Send embed to frontend so user hears audio
+            try:
+                await websocket.send_json({
+                    "type": "media_play",
+                    "provider": "youtube",
+                    "video_id": video_id,
+                    "url": _video_url,
+                })
+            except Exception:
+                pass
+
+            # Update overlay
+            await overlay.inject()
+
+            return f"Navigated to and playing '{_video_url}'. The video is visible in the browser and an embedded player was sent to the user. Call done() now."
 
         elif name == "done":
             _done_summary = args.get("summary", "Task completed.")
