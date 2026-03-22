@@ -270,6 +270,7 @@ _BROWSER_TOOLS_DEF = [
     {"name": "select_dropdown", "description": "Select an option from a dropdown menu. Atomically clicks the trigger to open the dropdown, then clicks the option. Use this for ANY dropdown (trip type, passenger count, cabin class, sort order, etc.).", "input_schema": {"type": "object", "properties": {"trigger_text": {"type": "string", "description": "Text of the dropdown trigger button (e.g. 'Round trip', '1 passenger', 'Economy')"}, "option_text": {"type": "string", "description": "Text of the option to select (e.g. 'One way', '2 passengers', 'Business')"}}, "required": ["trigger_text", "option_text"]}},
     {"name": "go_back", "description": "Go back to previous page.", "input_schema": {"type": "object", "properties": {}}},
     {"name": "wait", "description": "Wait for page to load.", "input_schema": {"type": "object", "properties": {"milliseconds": {"type": "integer"}}}},
+    {"name": "play_media", "description": "Play a YouTube video or audio for the user. Extracts the video and sends an embedded player to the user's browser. Use this instead of clicking Play buttons.", "input_schema": {"type": "object", "properties": {"url": {"type": "string", "description": "YouTube URL (e.g. https://www.youtube.com/watch?v=...)"}}, "required": ["url"]}},
     {"name": "done", "description": "Task complete — include summary.", "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}},
 ]
 # OpenAI format conversion
@@ -297,13 +298,13 @@ Before interacting with a page, dismiss ANY visible popups or promotional overla
 - Modal dialogs → click "Close" or the X button
 - If ANY overlay is covering the form, dismiss it FIRST before typing
 
-## MEDIA PLAYBACK — IMPORTANT:
-You are a REMOTE browser on a server — the user CANNOT hear audio from this browser.
+## MEDIA PLAYBACK — USE play_media TOOL:
 When the user asks to "play" a song, video, or any media:
-1. Search and FIND the content (navigate to YouTube, Spotify, SoundCloud, etc.)
-2. Get the DIRECT URL of the video/song page
-3. Call `done` with the URL and tell the user: "Here's the link — open it in your browser to play: [URL]"
-4. Do NOT try to click Play buttons — audio doesn't reach the user from this browser.
+1. Navigate to YouTube and search for the content
+2. Find the video and get its YouTube URL from the page
+3. Call the `play_media` tool with the YouTube URL — this sends an embedded player directly to the user's browser so they can hear it
+4. Do NOT click Play buttons on the page — use the `play_media` tool instead
+5. After calling `play_media`, call `done` to finish
 
 ## RULES:
 1. LOOK at the screenshot CAREFULLY before EVERY action. Overlays covering the form? Dismiss FIRST.
@@ -698,6 +699,43 @@ async def _exec_browser_tool(
             await _wait_stable(page)
             # Human-like pause after page load (Atlas behavior)
             await asyncio.sleep(random.uniform(0.3, 0.8))
+
+            # ── Auto-skip YouTube ads ──
+            _page_url = page.url or ""
+            if "youtube.com/watch" in _page_url:
+                for _ad_attempt in range(3):
+                    try:
+                        # Check for skip button (appears after 5s on skippable ads)
+                        _skip = await page.query_selector(
+                            'button.ytp-skip-ad-button, button.ytp-ad-skip-button, '
+                            'button.ytp-ad-skip-button-modern, [class*="skip-button"]'
+                        )
+                        if _skip and await _skip.is_visible():
+                            await _skip.click()
+                            logger.info("[BROWSER] Skipped YouTube ad")
+                            await asyncio.sleep(0.5)
+                            break
+                        # Check if an ad is playing (ad badge visible)
+                        _ad_badge = await page.query_selector('.ytp-ad-badge, .ytp-ad-text, div.ad-showing')
+                        if _ad_badge and await _ad_badge.is_visible():
+                            logger.info("[BROWSER] YouTube ad playing, waiting for skip button...")
+                            await asyncio.sleep(3)  # Wait for skip button to appear
+                            continue
+                        break  # No ad detected
+                    except Exception:
+                        break
+                # Dismiss YouTube popups (consent, premium prompts)
+                for _popup_sel in [
+                    'button[aria-label="No thanks"]', 'button[aria-label="Dismiss"]',
+                    'tp-yt-paper-dialog #dismiss-button', 'button.yt-spec-button-shape-next--filled[aria-label]',
+                ]:
+                    try:
+                        _popup = await page.query_selector(_popup_sel)
+                        if _popup and await _popup.is_visible():
+                            await _popup.click()
+                            await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
 
             # ── Auto-solve captchas ──
             from app.agent.browser import detect_captcha, solve_captcha
@@ -1440,6 +1478,27 @@ async def _exec_browser_tool(
             title = await page.title()
             analysis = await _analyze_page(page)
             return f"Selected '{option}' from dropdown (trigger: '{trigger}').{_verify_result} Now on: {page.url} — {title}\n\n{analysis}"
+
+        elif name == "play_media":
+            media_url = args.get("url", "")
+            # Extract YouTube video ID
+            import re as _re
+            _yt_match = _re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})', media_url)
+            if _yt_match:
+                video_id = _yt_match.group(1)
+                # Send embed event to frontend — user's browser plays it directly
+                try:
+                    await websocket.send_json({
+                        "type": "media_play",
+                        "provider": "youtube",
+                        "video_id": video_id,
+                        "url": f"https://www.youtube.com/watch?v={video_id}",
+                    })
+                except Exception:
+                    pass
+                return f"Playing YouTube video (ID: {video_id}) for the user via embedded player. The user can hear it in their browser. You can now call done()."
+            else:
+                return f"Could not extract video ID from URL: {media_url}. Return the URL to the user instead."
 
         elif name == "done":
             _done_summary = args.get("summary", "Task completed.")
