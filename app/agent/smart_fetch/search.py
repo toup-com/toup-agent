@@ -1,10 +1,14 @@
 """
 Toup Search — Multi-engine search without a browser.
 
-Queries multiple search engines that don't aggressively CAPTCHA:
-  1. DuckDuckGo HTML (no CAPTCHA, no API key)
-  2. Bing Web Search (lighter bot detection)
-  3. Mojeek (independent engine, no CAPTCHA)
+Queries multiple search engines — Google first (best results), then fallbacks:
+  1. Google (via local Whoogle instance — self-hosted Google proxy, no CAPTCHA)
+  2. DuckDuckGo HTML (no CAPTCHA, no API key)
+  3. Bing Web Search (lighter bot detection)
+  4. Mojeek (independent engine, no CAPTCHA)
+
+Whoogle is a self-hosted Google frontend that queries Google server-side
+without triggering CAPTCHAs. It's installed as part of the agent provisioning.
 
 All engines are queried via simple HTTP requests with proper headers.
 No browser, no headless Chrome, no Playwright — just httpx.
@@ -49,7 +53,67 @@ class SearchResponse:
 
 
 # ──────────────────────────────────────────────────────────────
-# DuckDuckGo HTML search (primary — most reliable, no CAPTCHA)
+# Google via Whoogle (primary — best results, self-hosted proxy)
+# ──────────────────────────────────────────────────────────────
+
+WHOOGLE_URL = "http://127.0.0.1:5000"
+
+
+async def _search_google_whoogle(query: str, count: int = 10) -> SearchResponse:
+    """Search Google via local Whoogle instance (self-hosted, no CAPTCHA).
+
+    Whoogle is installed during agent provisioning and runs on port 5000.
+    It queries Google server-side, strips tracking, returns clean results.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(
+                f"{WHOOGLE_URL}/search",
+                params={"q": query},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+
+        # Whoogle wraps results in div.ZINbbc or standard Google-like structure
+        for div in soup.select("div.ZINbbc, div.g, div.tF2Cxc, div.fP1Qef")[:count]:
+            link = div.select_one("a[href]")
+            if not link:
+                continue
+            url = link.get("href", "")
+            # Skip internal whoogle links
+            if not url.startswith("http"):
+                continue
+
+            # Title: first <h3> or <a> text
+            title_el = div.select_one("h3") or link
+            title = title_el.get_text(strip=True) if title_el else ""
+
+            # Snippet: various possible containers
+            snippet_el = (
+                div.select_one("div.BNeawe.s3v9rd, div.VwiC3b, span.aCOpRe, div.s3v9rd")
+                or div.select_one("div:not(:has(a)):not(:has(h3))")
+            )
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+
+            if title and url:
+                results.append(SearchResult(
+                    title=title, url=url, snippet=snippet, source="google"
+                ))
+
+        return SearchResponse(results=results, source="google")
+    except httpx.ConnectError:
+        logger.info("[ToupSearch] Whoogle not running on port 5000, skipping Google")
+        return SearchResponse(error="Whoogle not available", source="google")
+    except Exception as e:
+        logger.warning("[ToupSearch] Google/Whoogle failed: %s", e)
+        return SearchResponse(error=str(e), source="google")
+
+
+# ──────────────────────────────────────────────────────────────
+# DuckDuckGo HTML search (secondary — most reliable fallback)
 # ──────────────────────────────────────────────────────────────
 
 async def _search_duckduckgo(query: str, count: int = 10) -> SearchResponse:
@@ -165,7 +229,7 @@ async def toup_search(query: str, count: int = 5) -> str:
     Priority: DuckDuckGo → Bing → Mojeek.
     Falls through to the next engine if one fails or returns no results.
     """
-    engines = [_search_duckduckgo, _search_bing, _search_mojeek]
+    engines = [_search_google_whoogle, _search_duckduckgo, _search_bing, _search_mojeek]
 
     for engine in engines:
         resp = await engine(query, count)

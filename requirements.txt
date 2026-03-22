@@ -76,6 +76,10 @@ patchright>=1.0.0  # Drop-in Playwright replacement that bypasses CDP detection
 # MCP Server
 fastmcp==2.9.2
 
+# Smart Fetch (API-first search, page reading, video search)
+trafilatura>=2.0.0
+yt-dlp>=2025.1.0
+
 # Dev
 black==24.1.0
 ruff==0.1.14

@@ -496,6 +496,33 @@ systemctl enable {SYSTEMD_UNIT}
 systemctl restart {SYSTEMD_UNIT}
 echo "[OK] Service started"
 
+# ── Whoogle (self-hosted Google search proxy) ──
+echo "[STEP] Setting up Whoogle search..."
+if ! [ -d /opt/whoogle-venv ]; then
+    python3 -m venv /opt/whoogle-venv
+    /opt/whoogle-venv/bin/pip install -q whoogle-search cachetools 2>&1
+fi
+cat > /etc/systemd/system/whoogle.service << 'WHOOGLE_EOF'
+[Unit]
+Description=Whoogle Search (self-hosted Google proxy)
+After=network.target
+
+[Service]
+Type=simple
+Environment=WHOOGLE_PORT=5000
+Environment=WHOOGLE_HOST=127.0.0.1
+ExecStart=/opt/whoogle-venv/bin/whoogle-search
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+WHOOGLE_EOF
+systemctl daemon-reload
+systemctl enable whoogle
+systemctl start whoogle
+echo "[OK] Whoogle search running on port 5000"
+
 # Verify agent health
 echo "[STEP] Verifying agent health..."
 for i in $(seq 1 6); do
