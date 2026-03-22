@@ -1542,12 +1542,21 @@ async def _exec_browser_tool(
             except Exception:
                 pass
 
+            # Get video title from page
+            _video_title = "YouTube Video"
+            try:
+                _video_title = await page.title()
+                _video_title = _video_title.replace(" - YouTube", "").strip()
+            except Exception:
+                pass
+
             # Send embed to frontend so user hears audio
             try:
                 await websocket.send_json({
                     "type": "media_play",
                     "provider": "youtube",
                     "video_id": video_id,
+                    "title": _video_title,
                     "url": _video_url,
                 })
             except Exception:
