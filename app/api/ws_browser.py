@@ -270,7 +270,7 @@ _BROWSER_TOOLS_DEF = [
     {"name": "select_dropdown", "description": "Select an option from a dropdown menu. Atomically clicks the trigger to open the dropdown, then clicks the option. Use this for ANY dropdown (trip type, passenger count, cabin class, sort order, etc.).", "input_schema": {"type": "object", "properties": {"trigger_text": {"type": "string", "description": "Text of the dropdown trigger button (e.g. 'Round trip', '1 passenger', 'Economy')"}, "option_text": {"type": "string", "description": "Text of the option to select (e.g. 'One way', '2 passengers', 'Business')"}}, "required": ["trigger_text", "option_text"]}},
     {"name": "go_back", "description": "Go back to previous page.", "input_schema": {"type": "object", "properties": {}}},
     {"name": "wait", "description": "Wait for page to load.", "input_schema": {"type": "object", "properties": {"milliseconds": {"type": "integer"}}}},
-    {"name": "play_media", "description": "Play a YouTube video or audio for the user. Extracts the video and sends an embedded player to the user's browser. Use this instead of clicking Play buttons.", "input_schema": {"type": "object", "properties": {"url": {"type": "string", "description": "YouTube URL (e.g. https://www.youtube.com/watch?v=...)"}}, "required": ["url"]}},
+    {"name": "play_media", "description": "Play a YouTube video or audio for the user. Searches YouTube server-side and sends an embedded player directly to the user's browser. Do NOT navigate to YouTube first — this tool handles everything.", "input_schema": {"type": "object", "properties": {"url": {"type": "string", "description": "YouTube URL or search query (e.g. 'tm bax dokhtar bandar' or 'https://youtube.com/watch?v=...')"}}, "required": ["url"]}},
     {"name": "done", "description": "Task complete — include summary.", "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}},
 ]
 # OpenAI format conversion
@@ -300,11 +300,11 @@ Before interacting with a page, dismiss ANY visible popups or promotional overla
 
 ## MEDIA PLAYBACK — USE play_media TOOL:
 When the user asks to "play" a song, video, or any media:
-1. Navigate to https://www.youtube.com and search for the content
-2. Once you see the search results with the correct video, call `play_media` with the video URL (or just call it without a URL — it will click the first video automatically)
-3. `play_media` will: navigate to the video page, skip any ads, click play, AND send an embedded player to the user's browser
-4. The user will see the video playing in the browser AND hear audio via the embedded player
-5. After calling `play_media`, call `done` to finish
+1. Call `play_media` with a search query like `play_media(url="tm bax dokhtar bandar")` — do NOT navigate to YouTube first
+2. `play_media` searches YouTube server-side (via yt-dlp, no browser needed) and sends an embedded player to the user
+3. The user hears audio directly in their browser — no browser navigation needed
+4. After calling `play_media`, call `done` to finish
+5. Do NOT navigate to youtube.com — `play_media` handles everything without the browser
 
 ## RULES:
 1. LOOK at the screenshot CAREFULLY before EVERY action. Overlays covering the form? Dismiss FIRST.
@@ -1480,92 +1480,75 @@ async def _exec_browser_tool(
             return f"Selected '{option}' from dropdown (trigger: '{trigger}').{_verify_result} Now on: {page.url} — {title}\n\n{analysis}"
 
         elif name == "play_media":
-            media_url = args.get("url", "")
+            # Extract video info via yt-dlp SERVER-SIDE — never navigate browser to YouTube.
+            # This avoids CAPTCHAs entirely. The frontend plays via YouTube embed iframe.
             import re as _re
+            _query = args.get("url", "") or args.get("query", "")
 
-            # If we're on YouTube search results, extract video ID from the page
             video_id = None
-            _yt_match = _re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})', media_url)
+            _video_title = "YouTube Video"
+
+            # Check if it's already a YouTube URL with video ID
+            _yt_match = _re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})', _query)
             if _yt_match:
                 video_id = _yt_match.group(1)
 
-            # If no video ID in URL, try to find and click the first video on the page
+            # If on YouTube search results, try to extract video ID from page
+            if not video_id and page:
+                _page_url = page.url or ""
+                if "youtube.com" in _page_url:
+                    try:
+                        _first_link = await page.query_selector('a#video-title, ytd-video-renderer a#thumbnail')
+                        if _first_link:
+                            _href = await _first_link.get_attribute('href') or ''
+                            _vid_m = _re.search(r'v=([a-zA-Z0-9_-]{11})', _href)
+                            if _vid_m:
+                                video_id = _vid_m.group(1)
+                            _title_el = await page.query_selector(f'a#video-title[href*="{video_id}"]') if video_id else None
+                            if _title_el:
+                                _video_title = (await _title_el.inner_text()).strip()
+                    except Exception:
+                        pass
+
+            # If still no video ID, use yt-dlp to search (no browser needed)
             if not video_id:
                 try:
-                    # On YouTube search results page — click first video
-                    _first_video = await page.query_selector('a#video-title, ytd-video-renderer a#thumbnail')
-                    if _first_video:
-                        _href = await _first_video.get_attribute('href') or ''
-                        _vid_m = _re.search(r'v=([a-zA-Z0-9_-]{11})', _href)
-                        if _vid_m:
-                            video_id = _vid_m.group(1)
-                except Exception:
-                    pass
-
-            if not video_id:
-                return "Could not find a video to play. Navigate to a YouTube video page first, or provide a YouTube URL."
-
-            # Navigate the browser to the actual video page so the user sees it
-            _video_url = f"https://www.youtube.com/watch?v={video_id}"
-            try:
-                await page.goto(_video_url, wait_until="domcontentloaded", timeout=15_000)
-            except Exception:
-                pass
-            await _wait_stable(page)
-            await asyncio.sleep(1)
-
-            # Skip ads if present
-            for _ad_try in range(3):
-                try:
-                    _skip = await page.query_selector(
-                        'button.ytp-skip-ad-button, button.ytp-ad-skip-button, '
-                        'button.ytp-ad-skip-button-modern, [class*="skip-button"]'
+                    import subprocess, json as _json
+                    _ytdlp = "/opt/toup-agent/venv/bin/yt-dlp"
+                    _search_q = _query or "music video"
+                    _proc = await asyncio.wait_for(
+                        asyncio.create_subprocess_exec(
+                            _ytdlp, f"ytsearch1:{_search_q}",
+                            "--dump-json", "--flat-playlist", "--no-download", "--no-warnings", "--quiet",
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                        ),
+                        timeout=20,
                     )
-                    if _skip and await _skip.is_visible():
-                        await _skip.click()
-                        await asyncio.sleep(0.5)
-                        break
-                    _ad_badge = await page.query_selector('.ytp-ad-badge, .ad-showing')
-                    if _ad_badge and await _ad_badge.is_visible():
-                        await asyncio.sleep(3)
-                        continue
-                    break
-                except Exception:
-                    break
+                    _stdout, _ = await _proc.communicate()
+                    if _proc.returncode == 0 and _stdout:
+                        _data = _json.loads(_stdout.decode().strip().split("\n")[0])
+                        video_id = _data.get("id", "")
+                        _video_title = _data.get("title", "YouTube Video")
+                except Exception as _e:
+                    logger.warning("[play_media] yt-dlp search failed: %s", _e)
 
-            # Click play if video is paused
-            try:
-                _play_btn = await page.query_selector('button.ytp-play-button[aria-label*="Play"]')
-                if _play_btn and await _play_btn.is_visible():
-                    await _play_btn.click()
-                    await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            if not video_id:
+                return "Could not find a video to play. Try providing a YouTube URL or a more specific search query."
 
-            # Get video title from page
-            _video_title = "YouTube Video"
-            try:
-                _video_title = await page.title()
-                _video_title = _video_title.replace(" - YouTube", "").strip()
-            except Exception:
-                pass
-
-            # Send embed to frontend so user hears audio
+            # Send embed to frontend — user's browser plays directly from YouTube CDN
+            # NO browser navigation to youtube.com — avoids CAPTCHAs entirely
             try:
                 await websocket.send_json({
                     "type": "media_play",
                     "provider": "youtube",
                     "video_id": video_id,
                     "title": _video_title,
-                    "url": _video_url,
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
                 })
             except Exception:
                 pass
 
-            # Update overlay
-            await overlay.inject()
-
-            return f"Navigated to and playing '{_video_url}'. The video is visible in the browser and an embedded player was sent to the user. Call done() now."
+            return f"Playing '{_video_title}' for the user via embedded YouTube player in their browser. The user can hear it now. Call done() to finish."
 
         elif name == "done":
             _done_summary = args.get("summary", "Task completed.")
