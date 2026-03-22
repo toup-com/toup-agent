@@ -752,7 +752,12 @@ async def _exec_browser_tool(
             # Warn agent if captcha is still present after solving attempt
             captcha_after = await detect_captcha(page)
             if captcha_after:
-                analysis = f"WARNING: Page shows a {captcha_after['type']} captcha that could not be auto-solved.\n\n{analysis}"
+                analysis = (
+                    f"CAPTCHA BLOCKED: This site is showing a {captcha_after['type']} captcha that could not be solved automatically.\n"
+                    f"DO NOT retry or loop — tell the user: \"This site is blocking automated access. "
+                    f"Here's the direct link so you can open it in your browser: {page.url}\"\n"
+                    f"Then STOP browsing this site and move on.\n\n{analysis}"
+                )
             return f"Navigated to {page.url} — {title}\n\n{analysis}"
 
         elif name == "click":
@@ -1444,6 +1449,17 @@ async def _exec_browser_tool(
                 "not yet displayed", "not displayed", "still in the date",
                 "remained set as round", "remained stuck",
             ]
+            # Allow graceful exit when site is CAPTCHA-blocked — don't force retry
+            _captcha_exit = any(w in _done_lower for w in [
+                "captcha", "blocked", "bot detection", "automated access",
+                "unusual traffic", "verify you are human", "not a robot",
+            ])
+            if _captcha_exit:
+                logger.info("[DONE] Agent exiting due to CAPTCHA/block — providing URL to user")
+                await overlay.hide_cursor()
+                await overlay.set_active(False)
+                return _done_summary
+
             if any(fw in _done_lower for fw in _fail_indicators):
                 logger.warning("[DONE] ❌ Failure detected in done() summary: %s", _done_summary[:200])
                 return (f"ERROR: You tried to finish with a failure message. Do NOT call done() until you have "

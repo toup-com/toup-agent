@@ -701,12 +701,14 @@ class ToolExecutor:
         if not query:
             return "ERROR: query is required"
 
-        # Primary: stealth headless browser (Google → Bing → DDG)
+        # ── API-first: multi-engine search without a browser (no CAPTCHA) ──
         try:
-            from app.agent.skills.builtins.app_builder.browser_api import search_formatted
-            return await search_formatted(query, count)
+            from app.agent.smart_fetch.search import toup_search
+            result = await toup_search(query, count)
+            if result and "No search results" not in result:
+                return result
         except Exception as exc:
-            logger.warning("[web_search] Browser search failed, falling back to httpx: %s", exc)
+            logger.warning("[web_search] Smart search failed: %s", exc)
 
         # Fallback: Brave API if configured
         if settings.brave_api_key:
@@ -715,8 +717,14 @@ class ToolExecutor:
             except Exception as exc:
                 logger.warning("[web_search] Brave fallback failed: %s", exc)
 
-        # Last resort: DuckDuckGo HTML scrape
-        return await self._ddg_search_fallback(query, count)
+        # Last resort: headless browser (may trigger CAPTCHA)
+        try:
+            from app.agent.skills.builtins.app_builder.browser_api import search_formatted
+            return await search_formatted(query, count)
+        except Exception as exc:
+            logger.warning("[web_search] Browser search also failed: %s", exc)
+
+        return "No search results found."
 
     async def _brave_search_fallback(self, query: str, count: int) -> str:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -788,7 +796,17 @@ class ToolExecutor:
         if not url:
             return "ERROR: url is required"
 
-        # Primary: stealth headless browser (renders JS, bypasses bot detection)
+        # ── API-first: httpx + readability extraction (no browser, no CAPTCHA) ──
+        try:
+            from app.agent.smart_fetch.reader import toup_read_page
+            text = await toup_read_page(url, max_chars)
+            if text:  # Non-empty = success; empty = JS-rendered, needs browser
+                return text
+            logger.info("[web_fetch] Page appears JS-rendered, trying browser")
+        except Exception as exc:
+            logger.warning("[web_fetch] Smart reader failed: %s", exc)
+
+        # Fallback: stealth headless browser (for JS-rendered pages)
         try:
             from app.agent.skills.builtins.app_builder.browser_api import read_page
             text = await read_page(url)
@@ -797,43 +815,9 @@ class ToolExecutor:
                     text = text[:max_chars] + "\n... (truncated)"
                 return text
         except Exception as exc:
-            logger.warning("[web_fetch] Browser read_page failed, falling back to httpx: %s", exc)
+            logger.warning("[web_fetch] Browser read_page also failed: %s", exc)
 
-        # Fallback: plain httpx (for simple pages, APIs, text/JSON)
-        try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                resp = await client.get(
-                    url,
-                    headers={"User-Agent": "Mozilla/5.0 (Toup Agent)"},
-                )
-                resp.raise_for_status()
-
-            content_type = resp.headers.get("content-type", "")
-
-            if "text/plain" in content_type or "application/json" in content_type:
-                return resp.text[:max_chars]
-
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
-                tag.decompose()
-
-            main = soup.find("article") or soup.find("main") or soup.find("body")
-            if main is None:
-                return "(empty page)"
-
-            text = main.get_text(separator="\n", strip=True)
-            import re as _re
-            text = _re.sub(r"\n{3,}", "\n\n", text)
-
-            if len(text) > max_chars:
-                text = text[:max_chars] + "\n... (truncated)"
-            return text or "(empty page)"
-
-        except httpx.HTTPStatusError as exc:
-            return f"ERROR: HTTP {exc.response.status_code} for {url}"
-        except Exception as exc:
-            return f"ERROR: {exc}"
+        return f"ERROR: Could not read {url}"
     
     # ------------------------------------------------------------------
     # 9. send_file — send a document to the user via Telegram
