@@ -684,6 +684,7 @@ async def _exec_browser_tool(
     args: Dict[str, Any],
     page,
     overlay: AgentOverlay,
+    websocket=None,
 ) -> str:
     try:
         if name == "navigate":
@@ -1901,7 +1902,7 @@ async def _run_browser_agent_inner(
                         "x": overlay.x, "y": overlay.y,
                     })
 
-                result = await _exec_browser_tool(fn_name, fn_args, page, overlay)
+                result = await _exec_browser_tool(fn_name, fn_args, page, overlay, websocket=websocket)
                 logger.warning("[STEP %d] RESULT: %s", step + 1, result[:500])
 
                 # Log page URL after action (detect if navigation happened unexpectedly)
