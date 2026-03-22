@@ -1480,63 +1480,62 @@ async def _exec_browser_tool(
             return f"Selected '{option}' from dropdown (trigger: '{trigger}').{_verify_result} Now on: {page.url} — {title}\n\n{analysis}"
 
         elif name == "play_media":
-            # Extract video info via yt-dlp SERVER-SIDE — never navigate browser to YouTube.
-            # This avoids CAPTCHAs entirely. The frontend plays via YouTube embed iframe.
+            # Search and play via yt-dlp SERVER-SIDE — browser is NEVER involved.
             import re as _re
-            _query = args.get("url", "") or args.get("query", "")
+            import shutil
+            _query = args.get("url", "") or args.get("query", "") or ""
+            logger.info("[play_media] Called with query: '%s'", _query)
 
             video_id = None
             _video_title = "YouTube Video"
 
-            # Check if it's already a YouTube URL with video ID
+            # If it's a YouTube URL, extract video ID directly
             _yt_match = _re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})', _query)
             if _yt_match:
                 video_id = _yt_match.group(1)
+                logger.info("[play_media] Extracted video ID from URL: %s", video_id)
 
-            # If on YouTube search results, try to extract video ID from page
-            if not video_id and page:
-                _page_url = page.url or ""
-                if "youtube.com" in _page_url:
-                    try:
-                        _first_link = await page.query_selector('a#video-title, ytd-video-renderer a#thumbnail')
-                        if _first_link:
-                            _href = await _first_link.get_attribute('href') or ''
-                            _vid_m = _re.search(r'v=([a-zA-Z0-9_-]{11})', _href)
-                            if _vid_m:
-                                video_id = _vid_m.group(1)
-                            _title_el = await page.query_selector(f'a#video-title[href*="{video_id}"]') if video_id else None
-                            if _title_el:
-                                _video_title = (await _title_el.inner_text()).strip()
-                    except Exception:
-                        pass
-
-            # If still no video ID, use yt-dlp to search (no browser needed)
+            # Otherwise: yt-dlp search (server-side, no browser)
             if not video_id:
+                # Strip URLs like google.com — they're not useful search queries
+                _search_q = _query
+                if _search_q.startswith("http"):
+                    _search_q = ""
+                if not _search_q:
+                    # Try to get the user's original message from the conversation
+                    _search_q = "music"
+                    logger.warning("[play_media] Empty query after URL stripping, using fallback")
+
+                _ytdlp = shutil.which("yt-dlp") or "/opt/toup-agent/venv/bin/yt-dlp"
+                logger.info("[play_media] Searching via yt-dlp: '%s' (binary: %s)", _search_q, _ytdlp)
+
                 try:
-                    import subprocess, json as _json
-                    _ytdlp = "/opt/toup-agent/venv/bin/yt-dlp"
-                    _search_q = _query or "music video"
+                    import json as _json
                     _proc = await asyncio.wait_for(
                         asyncio.create_subprocess_exec(
                             _ytdlp, f"ytsearch1:{_search_q}",
                             "--dump-json", "--flat-playlist", "--no-download", "--no-warnings", "--quiet",
                             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                         ),
-                        timeout=20,
+                        timeout=25,
                     )
-                    _stdout, _ = await _proc.communicate()
+                    _stdout, _stderr = await _proc.communicate()
+                    logger.info("[play_media] yt-dlp exit=%d stdout=%d bytes stderr=%d bytes",
+                                _proc.returncode, len(_stdout), len(_stderr))
                     if _proc.returncode == 0 and _stdout:
                         _data = _json.loads(_stdout.decode().strip().split("\n")[0])
                         video_id = _data.get("id", "")
                         _video_title = _data.get("title", "YouTube Video")
+                        logger.info("[play_media] Found: id=%s title=%s", video_id, _video_title)
+                    else:
+                        logger.warning("[play_media] yt-dlp failed: %s", _stderr.decode()[:200] if _stderr else "no output")
                 except Exception as _e:
-                    logger.warning("[play_media] yt-dlp search failed: %s", _e)
+                    logger.warning("[play_media] yt-dlp error: %s", _e)
 
             if not video_id:
-                return "Could not find a video to play. Try providing a YouTube URL or a more specific search query."
+                return f"Could not find a video for '{_query}'. Provide a song name or YouTube URL."
 
-            # Send embed to frontend — user's browser plays directly from YouTube CDN
-            # NO browser navigation to youtube.com — avoids CAPTCHAs entirely
+            # Send embed to frontend — NO browser navigation
             try:
                 await websocket.send_json({
                     "type": "media_play",
@@ -1545,10 +1544,11 @@ async def _exec_browser_tool(
                     "title": _video_title,
                     "url": f"https://www.youtube.com/watch?v={video_id}",
                 })
-            except Exception:
-                pass
+                logger.info("[play_media] Sent media_play event: %s - %s", video_id, _video_title)
+            except Exception as _e:
+                logger.warning("[play_media] Failed to send WS event: %s", _e)
 
-            return f"Playing '{_video_title}' for the user via embedded YouTube player in their browser. The user can hear it now. Call done() to finish."
+            return f"Now playing '{_video_title}' for the user via embedded YouTube player. The user can hear it in their browser. Call done() now."
 
         elif name == "done":
             _done_summary = args.get("summary", "Task completed.")
