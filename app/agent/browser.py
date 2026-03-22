@@ -1241,8 +1241,18 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
     profile = profile or _active_profile
 
     async with _lock:
-        if _browser and _browser.is_connected():
-            return _browser
+        if _browser:
+            # Browser object has is_connected(), persistent context doesn't
+            try:
+                if hasattr(_browser, 'is_connected') and _browser.is_connected():
+                    return _browser
+                elif hasattr(_browser, 'pages'):
+                    # Persistent context — check if it's still alive by accessing pages
+                    _ = _browser.pages
+                    return _browser
+            except Exception:
+                _browser = None
+                _context = None
         try:
             # Patchright = patched Playwright that bypasses CDP detection (Cloudflare, Google captchas)
             # Falls back to regular Playwright if not installed
@@ -1308,39 +1318,51 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 else:
                     logger.info("[BROWSER] No BROWSER_PROXY set, launching without proxy")
 
-                if real_chrome:
-                    _browser = await _playwright.chromium.launch(
-                        executable_path=real_chrome,
-                        headless=not use_headed,
-                        args=launch_args,
-                        proxy=browser_proxy_arg,
-                    )
-                    mode = "headed + Xvfb" if use_headed else "headless=new"
-                    logger.info("[BROWSER] Real Chrome launched (%s): %s", mode, real_chrome)
-                else:
-                    _browser = await _playwright.chromium.launch(
-                        headless=not use_headed,
-                        args=launch_args,
-                        proxy=browser_proxy_arg,
-                    )
-                    mode = "headed + Xvfb" if use_headed else "headless=new"
-                    logger.info("[BROWSER] Chromium launched (%s + Patchright stealth)", mode)
+                # Persistent profile — stores cookies, localStorage, history across sessions.
+                # This dramatically reduces CAPTCHA triggers (sites see a returning user).
+                import os
+                _user_data_dir = os.path.join(
+                    os.environ.get("AGENT_DIR", os.getcwd()),
+                    "browser_profile",
+                )
+                os.makedirs(_user_data_dir, exist_ok=True)
 
-            # Create a stealth context — all tabs share this context
-            _context = await _browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                user_agent=STEALTH_USER_AGENT,
-                java_script_enabled=True,
-                ignore_https_errors=True,
-                locale="en-US",
-                timezone_id="America/New_York",
-                color_scheme="light",
-            )
+                _persistent_args = dict(
+                    user_data_dir=_user_data_dir,
+                    headless=not use_headed,
+                    args=launch_args,
+                    viewport={"width": 1280, "height": 720},
+                    user_agent=STEALTH_USER_AGENT,
+                    java_script_enabled=True,
+                    ignore_https_errors=True,
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    color_scheme="light",
+                    proxy=browser_proxy_arg,
+                )
+
+                if real_chrome:
+                    _context = await _playwright.chromium.launch_persistent_context(
+                        **_persistent_args,
+                        executable_path=real_chrome,
+                    )
+                    mode = "headed + Xvfb" if use_headed else "headless=new"
+                    logger.info("[BROWSER] Real Chrome launched persistent (%s): %s", mode, real_chrome)
+                else:
+                    _context = await _playwright.chromium.launch_persistent_context(
+                        **_persistent_args,
+                    )
+                    mode = "headed + Xvfb" if use_headed else "headless=new"
+                    logger.info("[BROWSER] Chromium launched persistent (%s + Patchright stealth)", mode)
+
+                # launch_persistent_context returns a BrowserContext directly (no separate Browser)
+                _browser = _context  # For is_connected() checks
+
             _context.set_default_timeout(30_000)
 
             # Inject stealth scripts into every new page
             await _context.add_init_script(STEALTH_INIT_SCRIPT)
-            logger.info("[BROWSER] Stealth context created")
+            logger.info("[BROWSER] Stealth persistent context created (profile: %s)", _user_data_dir)
 
             _active_profile = profile
             return _browser
@@ -1357,12 +1379,19 @@ async def shutdown_browser():
     """Gracefully close the browser, all tabs, Playwright instance, and Xvfb."""
     global _browser, _context, _playwright
     await _tab_manager.close_all()
+    # For persistent context, _browser IS _context — close only once
     if _context:
-        await _context.close()
+        try:
+            await _context.close()
+        except Exception:
+            pass
         _context = None
-    if _browser:
-        await _browser.close()
-        _browser = None
+    if _browser and _browser is not _context:
+        try:
+            await _browser.close()
+        except Exception:
+            pass
+    _browser = None
     if _playwright:
         await _playwright.stop()
         _playwright = None
