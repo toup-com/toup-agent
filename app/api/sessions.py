@@ -253,7 +253,26 @@ async def get_session(
     # Add messages if included
     if include_messages and session.messages:
         messages = session.messages[:message_limit]
-        response_dict["messages"] = [_message_to_response(m) for m in messages]
+        # Look up BuildJob status for job card messages
+        build_jobs = {}
+        job_ids = []
+        for m in messages:
+            if m.role == "job":
+                try:
+                    meta = json.loads(m.content) if m.content else {}
+                    jid = meta.get("job_id")
+                    if jid:
+                        job_ids.append(jid)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        if job_ids:
+            from app.db.models import BuildJob
+            bj_result = await db.execute(
+                select(BuildJob).where(BuildJob.id.in_(job_ids))
+            )
+            for bj in bj_result.scalars().all():
+                build_jobs[bj.id] = bj
+        response_dict["messages"] = [_message_to_response(m, build_jobs) for m in messages]
     else:
         response_dict["messages"] = []
     
@@ -419,11 +438,31 @@ async def get_session_messages(
         .offset(offset)
         .limit(limit)
     )
-    
+
     result = await db.execute(query)
     messages = result.scalars().all()
-    
-    return [_message_to_response(m) for m in messages]
+
+    # Look up BuildJob status for any job card messages
+    build_jobs = {}
+    job_ids = []
+    for m in messages:
+        if m.role == "job":
+            try:
+                meta = json.loads(m.content) if m.content else {}
+                jid = meta.get("job_id")
+                if jid:
+                    job_ids.append(jid)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    if job_ids:
+        from app.db.models import BuildJob
+        bj_result = await db.execute(
+            select(BuildJob).where(BuildJob.id.in_(job_ids))
+        )
+        for bj in bj_result.scalars().all():
+            build_jobs[bj.id] = bj
+
+    return [_message_to_response(m, build_jobs) for m in messages]
 
 
 @router.post("/{session_id}/messages", response_model=ChatMessageResponse, status_code=status.HTTP_201_CREATED)
@@ -507,7 +546,7 @@ def _session_to_response(session: Conversation) -> SessionResponse:
     )
 
 
-def _message_to_response(message: Message) -> ChatMessageResponse:
+def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessageResponse:
     """Convert Message model to ChatMessageResponse."""
     memories_retrieved = None
     if message.memories_retrieved_json:
@@ -515,8 +554,8 @@ def _message_to_response(message: Message) -> ChatMessageResponse:
             memories_retrieved = json.loads(message.memories_retrieved_json)
         except json.JSONDecodeError:
             memories_retrieved = None
-    
-    return ChatMessageResponse(
+
+    resp = dict(
         id=message.id,
         role=message.role,
         content=message.content,
@@ -525,5 +564,34 @@ def _message_to_response(message: Message) -> ChatMessageResponse:
         tokens_completion=message.tokens_completion,
         model_used=message.model_used,
         memories_retrieved=memories_retrieved,
-        processing_time_ms=message.processing_time_ms
+        processing_time_ms=message.processing_time_ms,
     )
+
+    # Enrich job card messages with current BuildJob status
+    if message.role == "job":
+        try:
+            job_meta = json.loads(message.content) if message.content else {}
+        except (json.JSONDecodeError, TypeError):
+            job_meta = {}
+        job_id = job_meta.get("job_id", "")
+        resp["job_id"] = job_id
+        resp["job_name"] = job_meta.get("job_name", "App Build")
+        resp["content"] = ""  # Don't expose raw JSON to frontend
+        if build_jobs and job_id in build_jobs:
+            bj = build_jobs[job_id]
+            resp["job_status"] = bj.status
+            resp["job_app_id"] = bj.app_id
+            # Use title as name if stored name is generic
+            if resp["job_name"] == "App Build" and bj.title:
+                resp["job_name"] = bj.title.replace("Build: ", "")
+            try:
+                steps = json.loads(bj.steps_json) if bj.steps_json else []
+                completed = sum(1 for s in steps if s.get("status") == "completed")
+                resp["job_total_steps"] = len(steps)
+                resp["job_completed_steps"] = completed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        else:
+            resp["job_status"] = job_meta.get("job_status", "completed")
+
+    return ChatMessageResponse(**resp)
