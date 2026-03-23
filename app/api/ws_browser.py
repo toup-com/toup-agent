@@ -1481,74 +1481,91 @@ async def _exec_browser_tool(
             return f"Selected '{option}' from dropdown (trigger: '{trigger}').{_verify_result} Now on: {page.url} — {title}\n\n{analysis}"
 
         elif name == "play_media":
-            # Search and play via yt-dlp SERVER-SIDE — browser is NEVER involved.
             import re as _re
-            import shutil
+            import json as _json
             _query = args.get("query", "") or args.get("url", "") or ""
-            # Strip any URLs the agent might pass (like the current page URL)
             if _query.startswith("http") and "youtube.com/watch" not in _query and "youtu.be/" not in _query:
                 _query = ""
-            logger.info("[play_media] Called with query: '%s'", _query)
-
+            logger.info("[play_media] query='%s'", _query)
             if not _query:
-                return "ERROR: Provide a song name or artist to search for. Example: play_media(query='tm bax dokhtar bandar')"
+                return "ERROR: Provide a song name. Example: play_media(query='tm bax dokhtar bandar')"
 
             video_id = None
             _video_title = "YouTube Video"
 
-            # If it's a YouTube URL, extract video ID directly
+            # 1. Direct YouTube URL
             _yt_match = _re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})', _query)
             if _yt_match:
                 video_id = _yt_match.group(1)
-                logger.info("[play_media] Extracted video ID from URL: %s", video_id)
+                logger.info("[play_media] URL video_id=%s", video_id)
 
-            # Otherwise: yt-dlp search (server-side, no browser)
+            # 2. YouTube search via httpx (fast, no yt-dlp dependency)
             if not video_id:
-                _search_q = _query
-
-                _ytdlp = shutil.which("yt-dlp") or "/opt/toup-agent/venv/bin/yt-dlp"
-                logger.info("[play_media] Searching via yt-dlp: '%s' (binary: %s)", _search_q, _ytdlp)
-
                 try:
-                    import json as _json
-                    _proc = await asyncio.wait_for(
-                        asyncio.create_subprocess_exec(
-                            _ytdlp, f"ytsearch1:{_search_q}",
-                            "--dump-json", "--flat-playlist", "--no-download", "--no-warnings", "--quiet",
-                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                        ),
-                        timeout=25,
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient(timeout=10, follow_redirects=True) as _hc:
+                        _resp = await _hc.get(
+                            "https://www.youtube.com/results",
+                            params={"search_query": _query},
+                            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36"},
+                        )
+                    # YouTube embeds search results as JSON in page
+                    _id_matches = _re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', _resp.text)
+                    if _id_matches:
+                        video_id = _id_matches[0]
+                        # Try to extract title
+                        _title_m = _re.search(r'"title":\{"runs":\[\{"text":"([^"]+)"\}', _resp.text)
+                        if _title_m:
+                            _video_title = _title_m.group(1)
+                        logger.info("[play_media] httpx found: id=%s title=%s", video_id, _video_title)
+                except Exception as _e:
+                    logger.warning("[play_media] httpx YouTube search failed: %s", _e)
+
+            # 3. Fallback: yt-dlp search
+            if not video_id:
+                try:
+                    _ytdlp = "/opt/toup-agent/venv/bin/yt-dlp"
+                    _proc = await asyncio.create_subprocess_exec(
+                        _ytdlp, f"ytsearch1:{_query}",
+                        "--dump-json", "--flat-playlist", "--no-download", "--no-warnings", "--quiet",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                     )
-                    _stdout, _stderr = await _proc.communicate()
-                    logger.info("[play_media] yt-dlp exit=%d stdout=%d bytes stderr=%d bytes",
-                                _proc.returncode, len(_stdout), len(_stderr))
+                    try:
+                        _stdout, _stderr = await asyncio.wait_for(_proc.communicate(), timeout=15)
+                    except asyncio.TimeoutError:
+                        _proc.kill()
+                        logger.warning("[play_media] yt-dlp timed out")
+                        _stdout, _stderr = b"", b""
                     if _proc.returncode == 0 and _stdout:
                         _data = _json.loads(_stdout.decode().strip().split("\n")[0])
                         video_id = _data.get("id", "")
                         _video_title = _data.get("title", "YouTube Video")
-                        logger.info("[play_media] Found: id=%s title=%s", video_id, _video_title)
-                    else:
-                        logger.warning("[play_media] yt-dlp failed: %s", _stderr.decode()[:200] if _stderr else "no output")
+                        logger.info("[play_media] yt-dlp found: id=%s title=%s", video_id, _video_title)
                 except Exception as _e:
                     logger.warning("[play_media] yt-dlp error: %s", _e)
 
             if not video_id:
-                return f"Could not find a video for '{_query}'. Provide a song name or YouTube URL."
+                return f"Could not find a video for '{_query}'. Try a different search term."
 
-            # Send embed to frontend — NO browser navigation
-            try:
-                await websocket.send_json({
-                    "type": "media_play",
-                    "provider": "youtube",
-                    "video_id": video_id,
-                    "title": _video_title,
-                    "url": f"https://www.youtube.com/watch?v={video_id}",
-                })
-                logger.info("[play_media] Sent media_play event: %s - %s", video_id, _video_title)
-            except Exception as _e:
-                logger.warning("[play_media] Failed to send WS event: %s", _e)
+            # Send embed to frontend
+            if websocket:
+                try:
+                    await websocket.send_json({
+                        "type": "media_play",
+                        "provider": "youtube",
+                        "video_id": video_id,
+                        "title": _video_title,
+                        "url": f"https://www.youtube.com/watch?v={video_id}",
+                    })
+                    logger.info("[play_media] SENT media_play: %s - %s", video_id, _video_title)
+                except Exception as _e:
+                    logger.warning("[play_media] WS send failed: %s", _e)
+                    return f"Found '{_video_title}' but could not send to player. YouTube URL: https://www.youtube.com/watch?v={video_id}"
+            else:
+                logger.warning("[play_media] No websocket available!")
+                return f"Found '{_video_title}' but websocket not available. URL: https://www.youtube.com/watch?v={video_id}"
 
-            return f"Now playing '{_video_title}' for the user via embedded YouTube player. The user can hear it in their browser. Call done() now."
+            return f"Now playing '{_video_title}' in the user's browser. Call done() now."
 
         elif name == "done":
             _done_summary = args.get("summary", "Task completed.")
