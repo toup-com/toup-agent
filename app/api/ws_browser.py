@@ -1637,11 +1637,12 @@ async def _run_browser_agent(
     user_message: str,
     conversation: List[Dict[str, Any]],
     overlay: AgentOverlay,
+    model_override: str = None,
 ):
     try:
         await _run_browser_agent_inner(
             websocket, page, tab_manager, browser_mod,
-            user_message, conversation, overlay,
+            user_message, conversation, overlay, model_override=model_override,
         )
     except Exception as e:
         logger.exception("[WS Browser] Agent loop crashed")
@@ -1659,21 +1660,32 @@ async def _run_browser_agent_inner(
     user_message: str,
     conversation: List[Dict[str, Any]],
     overlay: AgentOverlay,
+    model_override: str = None,
 ):
     import base64 as _b64mod
 
     # ── LLM provider: use Anthropic Claude if regular API key available, else OpenAI ──
     _ant_key = (settings.anthropic_api_key or "").strip()
-    _use_claude = _ant_key and _ant_key.startswith("sk-ant-api")
-    if _use_claude:
+    _use_claude = _ant_key and (_ant_key.startswith("sk-ant-api") or _ant_key.startswith("sk-ant-oat"))
+
+    # Model override from frontend selector
+    _requested_model = model_override or "claude-opus-4-6"
+    _is_openai_model = _requested_model.startswith("gpt-") or _requested_model.startswith("o1-") or _requested_model.startswith("o3-")
+
+    if _is_openai_model:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        model = _requested_model
+        _llm_provider = "openai"
+    elif _use_claude:
         from anthropic import AsyncAnthropic
         client = AsyncAnthropic(api_key=_ant_key)
-        model = "claude-opus-4-6"
+        model = _requested_model
         _llm_provider = "anthropic"
     else:
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=settings.openai_api_key)
-        model = "gpt-5.4"
+        model = _requested_model if _is_openai_model else "gpt-5.4"
         _llm_provider = "openai"
 
     logger.warning("=" * 80)
@@ -2326,6 +2338,7 @@ async def ws_browser(
 
                 elif action == "chat":
                     message = data.get("message", "").strip()
+                    _chat_model = data.get("model")  # Model override from frontend selector
                     if not message:
                         continue
                     if not browser_available:
@@ -2347,6 +2360,7 @@ async def ws_browser(
                             _run_browser_agent(
                                 websocket, active_page, tab_manager, browser_mod,
                                 message, conversation, overlay,
+                                model_override=_chat_model,
                             )
                         )
 
