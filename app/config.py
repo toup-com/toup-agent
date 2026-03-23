@@ -234,12 +234,6 @@ class Settings(BaseSettings):
     browser_proxy: str = ""  # e.g. "http://user:pass@proxy.example.com:8080"
     captcha_solver_enabled: bool = True  # Auto-solve captchas on navigation
 
-    # ── Browser Location & Locale (set via .env or agent stores from user profile) ──
-    browser_latitude: Optional[float] = None   # User's latitude for geolocation
-    browser_longitude: Optional[float] = None  # User's longitude for geolocation
-    browser_timezone: str = ""                  # e.g. "America/Toronto"
-    browser_locale: str = ""                    # e.g. "en-CA"
-
     # ── Agent Spawn Policies ─────────────────────────────────
     allow_agents: list[str] = []  # If non-empty, only these agent IDs can be spawned
 
