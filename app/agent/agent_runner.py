@@ -741,6 +741,36 @@ class AgentRunner:
 
             memory_sections = []
 
+            # A0. User Essentials — always load location, email, contact info
+            try:
+                essentials = await mem_svc.hybrid_search(
+                    user_id=user_id,
+                    query="user location address city email contact phone",
+                    limit=10,
+                    min_similarity=0.15,
+                    categories=["identity", "locations", "preferences", "contact"],
+                )
+                essential_items = [m for m in essentials if m.get("brain_type") == "user"]
+                if essential_items:
+                    memory_sections.append("## User Profile Essentials")
+                    for m in essential_items[:8]:
+                        memory_sections.append(f"- {m.get('content', '')}")
+                    memory_sections.append("")
+                    logger.info(f"[AGENT] Loaded {len(essential_items)} essential profile memories")
+                else:
+                    # Remind agent to ask for essentials if not stored yet
+                    memory_sections.append(
+                        "## User Profile Essentials\n"
+                        "No location or email stored yet. When relevant (e.g. ordering food, booking travel, "
+                        "signing up for services), ask the user for their:\n"
+                        "- Location (city, address)\n"
+                        "- Email address\n"
+                        "Then store with: memory_store(content='User lives in ...', category='locations', brain_type='user', importance=0.9)\n"
+                        "and memory_store(content='User email: ...', category='identity', brain_type='user', importance=0.9)\n"
+                    )
+            except Exception as e:
+                logger.warning(f"Essentials search failed: {e}")
+
             # A. User Portrait
             try:
                 from app.services.user_portrait_service import UserPortraitService

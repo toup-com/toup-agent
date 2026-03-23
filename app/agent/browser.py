@@ -1327,6 +1327,24 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 )
                 os.makedirs(_user_data_dir, exist_ok=True)
 
+                # Load user location from config for geolocation + timezone
+                _geo = None
+                _tz = "America/New_York"
+                _locale = "en-US"
+                try:
+                    _browser_tz = getattr(settings, "browser_timezone", "") or ""
+                    _browser_lat = getattr(settings, "browser_latitude", None)
+                    _browser_lng = getattr(settings, "browser_longitude", None)
+                    _browser_locale = getattr(settings, "browser_locale", "") or ""
+                    if _browser_tz:
+                        _tz = _browser_tz
+                    if _browser_lat and _browser_lng:
+                        _geo = {"latitude": float(_browser_lat), "longitude": float(_browser_lng)}
+                    if _browser_locale:
+                        _locale = _browser_locale
+                except Exception:
+                    pass
+
                 _persistent_args = dict(
                     user_data_dir=_user_data_dir,
                     headless=not use_headed,
@@ -1335,10 +1353,12 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                     user_agent=STEALTH_USER_AGENT,
                     java_script_enabled=True,
                     ignore_https_errors=True,
-                    locale="en-US",
-                    timezone_id="America/New_York",
+                    locale=_locale,
+                    timezone_id=_tz,
                     color_scheme="light",
                     proxy=browser_proxy_arg,
+                    geolocation=_geo,
+                    permissions=["geolocation"] if _geo else [],
                 )
 
                 if real_chrome:

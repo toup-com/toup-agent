@@ -279,6 +279,11 @@ BROWSER_TOOLS_ANTHROPIC = _BROWSER_TOOLS_DEF
 
 BROWSER_SYSTEM_PROMPT = """You are an AI browser agent controlling a REAL web browser. You can SEE the page via screenshots attached to each message.
 
+## USER PROFILE:
+{user_profile}
+
+When filling forms that need a location (delivery address, pickup, flights, etc.), use the user's stored location automatically. When signing into services, use the user's stored email. If no location/email is stored, ask the user.
+
 ## CRITICAL — YOU MUST USE THE ACTUAL WEBSITE:
 - NEVER just read search results or AI Overviews and call it done.
 - You have a REAL browser — navigate to the actual website and USE it.
@@ -1690,10 +1695,30 @@ async def _run_browser_agent_inner(
     current_analysis = await _analyze_page(page)
     await _send_screenshot(websocket, page, overlay)
 
+    # ── Load user profile essentials (location, email) for the browser agent ──
+    _user_profile = "No profile data stored yet."
+    try:
+        from app.db.database import async_session_maker
+        from app.services.memory_service import MemoryService
+        async with async_session_maker() as _pdb:
+            _psvc = MemoryService(_pdb)
+            _essentials = await _psvc.hybrid_search(
+                user_id=user_id, query="user location address city email phone",
+                limit=8, min_similarity=0.15,
+                categories=["identity", "locations", "preferences", "contact"],
+            )
+            _items = [m.get("content", "") for m in _essentials if m.get("brain_type") == "user" and m.get("content")]
+            if _items:
+                _user_profile = "\n".join(f"- {c}" for c in _items[:6])
+    except Exception as _e:
+        logger.warning("[BROWSER AGENT] Profile load failed: %s", _e)
+
+    _base_prompt = BROWSER_SYSTEM_PROMPT.replace("{user_profile}", _user_profile)
+
     # ── Skill system: classify message and load domain-specific knowledge ──
     from app.agent.browser_skills import SkillRegistry
     registry = SkillRegistry()
-    system_prompt, classification = registry.build_augmented_prompt(BROWSER_SYSTEM_PROMPT, user_message)
+    system_prompt, classification = registry.build_augmented_prompt(_base_prompt, user_message)
     logger.warning("[BROWSER AGENT] Skill: category=%s confidence=%.2f params=%s",
                    classification.category, classification.confidence, classification.params)
     logger.warning("[BROWSER AGENT] System prompt length: %d chars", len(system_prompt))
