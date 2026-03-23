@@ -270,7 +270,7 @@ _BROWSER_TOOLS_DEF = [
     {"name": "select_dropdown", "description": "Select an option from a dropdown menu. Atomically clicks the trigger to open the dropdown, then clicks the option. Use this for ANY dropdown (trip type, passenger count, cabin class, sort order, etc.).", "input_schema": {"type": "object", "properties": {"trigger_text": {"type": "string", "description": "Text of the dropdown trigger button (e.g. 'Round trip', '1 passenger', 'Economy')"}, "option_text": {"type": "string", "description": "Text of the option to select (e.g. 'One way', '2 passengers', 'Business')"}}, "required": ["trigger_text", "option_text"]}},
     {"name": "go_back", "description": "Go back to previous page.", "input_schema": {"type": "object", "properties": {}}},
     {"name": "wait", "description": "Wait for page to load.", "input_schema": {"type": "object", "properties": {"milliseconds": {"type": "integer"}}}},
-    {"name": "play_media", "description": "Play a YouTube video or audio for the user. Searches YouTube server-side and sends an embedded player directly to the user's browser. Do NOT navigate to YouTube first — this tool handles everything.", "input_schema": {"type": "object", "properties": {"url": {"type": "string", "description": "YouTube URL or search query (e.g. 'tm bax dokhtar bandar' or 'https://youtube.com/watch?v=...')"}}, "required": ["url"]}},
+    {"name": "play_media", "description": "Play a song or video for the user. Pass the song name/artist as the query. Searches YouTube automatically and plays it in the user's browser. Do NOT navigate to YouTube — this tool does everything server-side.", "input_schema": {"type": "object", "properties": {"query": {"type": "string", "description": "Song name and artist to search for (e.g. 'tm bax dokhtar bandar', 'Adele Hello')"}}, "required": ["query"]}},
     {"name": "done", "description": "Task complete — include summary.", "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}},
 ]
 # OpenAI format conversion
@@ -300,11 +300,11 @@ Before interacting with a page, dismiss ANY visible popups or promotional overla
 
 ## MEDIA PLAYBACK — USE play_media TOOL:
 When the user asks to "play" a song, video, or any media:
-1. Call `play_media` with a search query like `play_media(url="tm bax dokhtar bandar")` — do NOT navigate to YouTube first
-2. `play_media` searches YouTube server-side (via yt-dlp, no browser needed) and sends an embedded player to the user
-3. The user hears audio directly in their browser — no browser navigation needed
-4. After calling `play_media`, call `done` to finish
-5. Do NOT navigate to youtube.com — `play_media` handles everything without the browser
+1. Call `play_media(query="SONG NAME ARTIST")` immediately — example: `play_media(query="tm bax dokhtar bandar")`
+2. Do NOT navigate to YouTube or Google first. Do NOT search in the browser. Just call play_media directly.
+3. play_media searches YouTube server-side and sends audio directly to the user's browser
+4. After calling play_media successfully, call done() to finish
+5. NEVER pass a URL as the query — pass the SONG NAME (e.g. "Adele Hello", "tm bax dokhtar bandar")
 
 ## RULES:
 1. LOOK at the screenshot CAREFULLY before EVERY action. Overlays covering the form? Dismiss FIRST.
@@ -1484,8 +1484,14 @@ async def _exec_browser_tool(
             # Search and play via yt-dlp SERVER-SIDE — browser is NEVER involved.
             import re as _re
             import shutil
-            _query = args.get("url", "") or args.get("query", "") or ""
+            _query = args.get("query", "") or args.get("url", "") or ""
+            # Strip any URLs the agent might pass (like the current page URL)
+            if _query.startswith("http") and "youtube.com/watch" not in _query and "youtu.be/" not in _query:
+                _query = ""
             logger.info("[play_media] Called with query: '%s'", _query)
+
+            if not _query:
+                return "ERROR: Provide a song name or artist to search for. Example: play_media(query='tm bax dokhtar bandar')"
 
             video_id = None
             _video_title = "YouTube Video"
@@ -1498,14 +1504,7 @@ async def _exec_browser_tool(
 
             # Otherwise: yt-dlp search (server-side, no browser)
             if not video_id:
-                # Strip URLs like google.com — they're not useful search queries
                 _search_q = _query
-                if _search_q.startswith("http"):
-                    _search_q = ""
-                if not _search_q:
-                    # Try to get the user's original message from the conversation
-                    _search_q = "music"
-                    logger.warning("[play_media] Empty query after URL stripping, using fallback")
 
                 _ytdlp = shutil.which("yt-dlp") or "/opt/toup-agent/venv/bin/yt-dlp"
                 logger.info("[play_media] Searching via yt-dlp: '%s' (binary: %s)", _search_q, _ytdlp)
