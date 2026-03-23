@@ -482,6 +482,28 @@ async def ws_chat(
                                 "job_name": _jnm_m.group(1) if _jnm_m else "App Build",
                             })
 
+                # Handle media attachments (images/files from frontend)
+                _media_paths = []
+                _media_items = msg.get("media", [])
+                if _media_items and isinstance(_media_items, list):
+                    import tempfile, base64 as _b64
+                    for _mi in _media_items[:5]:  # Max 5 attachments
+                        try:
+                            _mtype = _mi.get("type", "image/png")
+                            _mdata = _mi.get("data", "")
+                            if not _mdata:
+                                continue
+                            _ext = {
+                                "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+                                "image/webp": ".webp", "application/pdf": ".pdf",
+                            }.get(_mtype, ".bin")
+                            _tf = tempfile.NamedTemporaryFile(delete=False, suffix=_ext)
+                            _tf.write(_b64.b64decode(_mdata))
+                            _tf.close()
+                            _media_paths.append(_tf.name)
+                        except Exception as _me:
+                            logger.warning("[WS] Failed to process media attachment: %s", _me)
+
                 # Run agent — use a task so we can cancel on disconnect
                 agent_task = asyncio.create_task(_agent_runner.run(
                     user_message=text,
@@ -493,6 +515,7 @@ async def ws_chat(
                     on_tool_end=on_tool_end,
                     model_override=model,
                     save_user_message=not is_onboarding_msg,
+                    media_paths=_media_paths if _media_paths else None,
                 ))
 
                 # Wait for agent to finish, but also listen for stop via a receiver task
