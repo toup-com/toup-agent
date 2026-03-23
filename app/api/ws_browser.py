@@ -2349,6 +2349,22 @@ async def ws_browser(
                         await asyncio.sleep(0.5)
                         await _send_screenshot(websocket, active_page, overlay)
 
+                elif action == "stop":
+                    # Stop the running agent task
+                    if chat_task and not chat_task.done():
+                        chat_task.cancel()
+                        try:
+                            await chat_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        chat_task = None
+                        logger.info("[WS BROWSER] Agent stopped by user")
+                        await websocket.send_json({"type": "agent_message", "content": "Stopped."})
+                        if active_page and overlay:
+                            await overlay.hide_cursor()
+                            await overlay.set_active(False)
+                    continue
+
                 elif action == "chat":
                     message = data.get("message", "").strip()
                     if not message:
@@ -2365,8 +2381,15 @@ async def ws_browser(
                         overlay = AgentOverlay(active_page, websocket)
 
                     if chat_task and not chat_task.done():
-                        await websocket.send_json({"type": "error", "message": "Agent is still working"})
-                    else:
+                        # Stop current task and start the new one
+                        chat_task.cancel()
+                        try:
+                            await chat_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        chat_task = None
+                        logger.info("[WS BROWSER] Previous task cancelled for new message")
+                    # Start new task (or first task)
                         await websocket.send_json({"type": "agent_thinking"})
                         chat_task = asyncio.create_task(
                             _run_browser_agent(
