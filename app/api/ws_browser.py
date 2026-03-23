@@ -2004,7 +2004,9 @@ async def _run_browser_agent_inner(
                         "content": tool_content,
                     })
 
-                await _send_state(websocket, page, tab_manager)
+                # Skip sending screenshot state for non-visual tools
+                if fn_name not in ("done", "play_media"):
+                    await _send_state(websocket, page, tab_manager)
 
                 if fn_name == "done":
                     _summary = fn_args.get("summary", "Task completed.")
