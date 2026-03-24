@@ -2424,10 +2424,10 @@ async def ws_browser(
                         overlay = AgentOverlay(active_page, websocket)
 
                     # Persist browser messages to the chat session DB
+                    print(f"[BROWSER PERSIST] Saving user message: '{message[:50]}' user_id={user_id}", flush=True)
                     try:
                         from app.db.database import async_session_maker
                         from app.db.models import Message as MsgModel, Conversation
-                        from datetime import datetime
                         import uuid as _uuid
                         async with async_session_maker() as _pdb:
                             # Create or reuse a browser session for today
@@ -2442,6 +2442,7 @@ async def ws_browser(
                                 await _pdb.commit()
                                 await _pdb.refresh(_bsess)
                                 _browser_session_id = _bsess.id
+                                print(f"[BROWSER PERSIST] Created session: {_browser_session_id}", flush=True)
                             # Save user message
                             _pdb.add(MsgModel(
                                 id=str(_uuid.uuid4()),
@@ -2450,7 +2451,9 @@ async def ws_browser(
                                 content=message,
                             ))
                             await _pdb.commit()
+                            print(f"[BROWSER PERSIST] Saved user message to session {_browser_session_id}", flush=True)
                     except Exception as _pe:
+                        print(f"[BROWSER PERSIST] FAILED: {type(_pe).__name__}: {_pe}", flush=True)
                         logger.warning("[WS Browser] Failed to persist user message: %s", _pe)
 
                     if chat_task and not chat_task.done():
