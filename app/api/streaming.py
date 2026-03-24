@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from pydantic import BaseModel
 from sqlalchemy import select, and_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -107,3 +107,41 @@ async def disconnect_credential(
     )
     await db.commit()
     return {"status": "disconnected", "channel": channel}
+
+
+@router.get("/credentials/internal/{channel}")
+async def get_credential_internal(
+    channel: str,
+    user_id: str = Query(...),
+    x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Internal endpoint for the agent to fetch credentials (with password).
+    Auth: X-Agent-Key must match the user's agent config."""
+    if not x_agent_key:
+        raise HTTPException(status_code=401, detail="X-Agent-Key required")
+
+    from app.db.models import AgentConfig, StreamingCredential
+
+    # Verify agent key belongs to this user
+    cfg = await db.execute(
+        select(AgentConfig).where(
+            and_(AgentConfig.user_id == user_id, AgentConfig.agent_api_key == x_agent_key)
+        )
+    )
+    if not cfg.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Invalid agent key")
+
+    result = await db.execute(
+        select(StreamingCredential).where(
+            and_(
+                StreamingCredential.user_id == user_id,
+                StreamingCredential.channel == channel,
+            )
+        )
+    )
+    cred = result.scalar_one_or_none()
+    if not cred:
+        raise HTTPException(status_code=404, detail=f"No {channel} credentials found")
+
+    return {"channel": cred.channel, "email": cred.email, "password": cred.password}

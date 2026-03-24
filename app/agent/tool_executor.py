@@ -2381,41 +2381,47 @@ class ToolExecutor:
         return f"Now playing \"{video_title}\"\nhttps://www.youtube.com/watch?v={video_id}"
 
     async def _play_netflix(self, query: str) -> str:
-        """Play content on Netflix via the browser agent."""
+        """Play content on Netflix — fetch credentials from platform API."""
         user_id = self._current_user_id
         if not user_id:
             return "ERROR: No user context"
 
-        # Fetch Netflix credentials from DB
         try:
-            from app.db.database import async_session_maker
-            from app.db.models import StreamingCredential
-            from sqlalchemy import select, and_
+            import httpx
+            from app.config import settings
 
-            async with async_session_maker() as db:
-                result = await db.execute(
-                    select(StreamingCredential).where(
-                        and_(
-                            StreamingCredential.user_id == user_id,
-                            StreamingCredential.channel == "netflix",
-                        )
-                    )
+            platform_url = getattr(settings, 'platform_api_url', 'https://toup.ai/api')
+            agent_key = getattr(settings, 'agent_api_key', '')
+
+            if not agent_key:
+                return "ERROR: Agent API key not configured"
+
+            # Fetch Netflix credentials from platform
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{platform_url}/streaming/credentials/internal/netflix",
+                    params={"user_id": user_id},
+                    headers={"X-Agent-Key": agent_key},
                 )
-                cred = result.scalar_one_or_none()
 
-            if not cred:
+            if resp.status_code == 404:
                 return (
                     "Netflix is not connected. Ask the user to go to the Movies page "
                     "and connect their Netflix account first."
                 )
+            if resp.status_code != 200:
+                logger.warning("[play_media] Platform returned %d: %s", resp.status_code, resp.text[:200])
+                return "ERROR: Could not fetch Netflix credentials from platform."
 
-            # Send task to the browser agent via WS tunnel
+            cred = resp.json()
+
+            # Send task to browser agent via WS broadcast
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(user_id, {
                 "type": "netflix_play",
                 "query": query,
-                "email": cred.email,
-                "password": cred.password,
+                "email": cred["email"],
+                "password": cred["password"],
             })
             return f"Searching Netflix for \"{query}\"... The browser agent will handle playback."
 
