@@ -2286,6 +2286,7 @@ async def ws_browser(
     agent_key: Optional[str] = Query(None),
 ):
     await websocket.accept()
+    print("[BROWSER WS] Connection accepted!", flush=True)
     user_id: Optional[str] = None
 
     if agent_key and settings.agent_api_key and agent_key == settings.agent_api_key:
