@@ -126,8 +126,9 @@ async def list_sessions(
             # Merge platform-local sessions (voice + browser) into proxy response
             # These channels run on the platform, not the VPS agent, so their
             # sessions are stored in the platform DB and must be merged manually.
+            # Only merge on the first page to avoid duplicates across pagination.
             local_channels = {"voice", "web"}
-            if channel is None or channel in local_channels:
+            if offset == 0 and (channel is None or channel in local_channels):
                 try:
                     merge_channels = [channel] if channel else list(local_channels)
                     local_conditions = [

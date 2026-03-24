@@ -1642,12 +1642,21 @@ async def _run_browser_agent(
     user_id_for_save: str = None,
 ):
     _agent_response = ""
+    _media_info: Optional[dict] = None  # Capture media_play events for chat persistence
     # Intercept agent_message sends to capture the response text
     _original_send = websocket.send_json
     async def _capturing_send(data, **kwargs):
-        nonlocal _agent_response
-        if isinstance(data, dict) and data.get("type") == "agent_message":
-            _agent_response = data.get("content", "")
+        nonlocal _agent_response, _media_info
+        if isinstance(data, dict):
+            if data.get("type") == "agent_message":
+                _agent_response = data.get("content", "")
+            elif data.get("type") == "media_play":
+                _media_info = {
+                    "provider": data.get("provider", "youtube"),
+                    "video_id": data.get("video_id"),
+                    "title": data.get("title"),
+                    "url": data.get("url"),
+                }
         return await _original_send(data, **kwargs)
     websocket.send_json = _capturing_send  # type: ignore
 
@@ -1669,15 +1678,31 @@ async def _run_browser_agent(
         if session_id and _agent_response and user_id_for_save:
             try:
                 from app.db.database import async_session_maker
-                from app.db.models import Message as MsgModel
+                from app.db.models import Message as MsgModel, Conversation
+                from sqlalchemy import update as _upd
+                from datetime import datetime as _dt
                 import uuid as _uuid
                 async with async_session_maker() as _pdb:
+                    _save_content = _agent_response
+                    # Append YouTube URL so the chat page auto-embeds the player
+                    if _media_info and _media_info.get("video_id"):
+                        _yt_url = _media_info.get("url") or f"https://www.youtube.com/watch?v={_media_info['video_id']}"
+                        if _yt_url not in _save_content:
+                            _save_content = f"{_save_content}\n{_yt_url}"
                     _pdb.add(MsgModel(
                         id=str(_uuid.uuid4()),
                         conversation_id=session_id,
                         role="assistant",
-                        content=_agent_response,
+                        content=_save_content,
                     ))
+                    await _pdb.execute(
+                        _upd(Conversation)
+                        .where(Conversation.id == session_id)
+                        .values(
+                            message_count=Conversation.message_count + 1,
+                            updated_at=_dt.utcnow(),
+                        )
+                    )
                     await _pdb.commit()
             except Exception as _pe:
                 logger.warning("[WS Browser] Failed to persist agent response: %s", _pe)
@@ -2497,6 +2522,17 @@ async def ws_browser(
                                 role="user",
                                 content=message,
                             ))
+                            # Update session stats
+                            from sqlalchemy import update as _upd
+                            from datetime import datetime as _dt
+                            await _pdb.execute(
+                                _upd(Conversation)
+                                .where(Conversation.id == _browser_session_id)
+                                .values(
+                                    message_count=Conversation.message_count + 1,
+                                    updated_at=_dt.utcnow(),
+                                )
+                            )
                             await _pdb.commit()
                             print(f"[BROWSER PERSIST] Saved user message to session {_browser_session_id}", flush=True)
                     except Exception as _pe:
