@@ -133,29 +133,34 @@ class NetflixStream:
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         # Wait for CDP to be ready
-        for _ in range(20):
+        for attempt in range(30):
             try:
                 async with httpx.AsyncClient() as c:
-                    r = await c.get(f"http://localhost:{self.cdp_port}/json/version", timeout=2)
+                    r = await c.get(f"http://127.0.0.1:{self.cdp_port}/json/version", timeout=2)
                     if r.status_code == 200:
+                        logger.info("[NF] CDP ready after %d attempts", attempt + 1)
                         return
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
-        raise RuntimeError("Chrome CDP not ready")
+            await asyncio.sleep(1)
+        raise RuntimeError("Chrome CDP not ready after 30s")
 
     # ── Netflix Automation via CDP ─────────────────────────────────
 
     async def _cdp_send(self, ws_url: str, method: str, params: dict = None) -> dict:
         """Send a CDP command via WebSocket."""
         import websockets
-        async with websockets.connect(ws_url, max_size=10_000_000) as ws:
-            msg = {"id": 1, "method": method, "params": params or {}}
-            await ws.send(json.dumps(msg))
-            while True:
-                resp = json.loads(await ws.recv())
-                if resp.get("id") == 1:
-                    return resp.get("result", {})
+        try:
+            async with websockets.connect(ws_url, max_size=10_000_000, open_timeout=10) as ws:
+                msg = {"id": 1, "method": method, "params": params or {}}
+                await ws.send(json.dumps(msg))
+                async for raw in ws:
+                    resp = json.loads(raw)
+                    if resp.get("id") == 1:
+                        return resp.get("result", {})
+        except Exception as e:
+            logger.warning("[NF] CDP send failed (%s): %s", method, e)
+            return {}
 
     async def _cdp_evaluate(self, ws_url: str, expression: str) -> any:
         """Evaluate JS in the browser."""
@@ -171,14 +176,19 @@ class NetflixStream:
         await asyncio.sleep(3)
 
     async def _get_page_ws(self) -> str:
-        """Get the WebSocket URL for the first browser page."""
-        async with httpx.AsyncClient() as c:
-            r = await c.get(f"http://localhost:{self.cdp_port}/json")
-            pages = r.json()
-            for p in pages:
-                if p.get("type") == "page":
-                    return p["webSocketDebuggerUrl"]
-        raise RuntimeError("No CDP page found")
+        """Get the WebSocket URL for the first browser page (with retries)."""
+        for attempt in range(10):
+            try:
+                async with httpx.AsyncClient() as c:
+                    r = await c.get(f"http://127.0.0.1:{self.cdp_port}/json", timeout=3)
+                    pages = r.json()
+                    for p in pages:
+                        if p.get("type") == "page":
+                            return p["webSocketDebuggerUrl"]
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        raise RuntimeError("No CDP page found after 10 retries")
 
     async def _netflix_login_and_play(self, query: str, email: str, password: str):
         """Login to Netflix and navigate to content."""
