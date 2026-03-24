@@ -1,21 +1,21 @@
 """
-Netflix Streaming Service — plays Netflix on VPS Chrome (Widevine DRM)
-and streams video+audio to user via HLS.
+Netflix Streaming — Chrome (Widevine) + FFmpeg → HLS.
 
-Architecture:
-  1. PulseAudio virtual sink captures Chrome audio
-  2. Chrome (real, with Widevine) plays Netflix on Xvfb display
-  3. FFmpeg captures Xvfb + PulseAudio → HLS segments
-  4. Segments served via HTTP → hls.js on frontend
+Handles login, profile selection, and content playback automatically
+via Chrome DevTools Protocol (CDP).
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -23,59 +23,58 @@ HLS_SEGMENT_DURATION = 1
 HLS_PLAYLIST_SIZE = 5
 FFMPEG_FRAMERATE = 24
 FFMPEG_VIDEO_BITRATE = "2500k"
-FFMPEG_AUDIO_BITRATE = "128k"
 
 
 class NetflixStream:
-    """Manages a single Netflix streaming session."""
-
     def __init__(self, stream_id: str):
         self.stream_id = stream_id
         self.hls_dir = Path(tempfile.mkdtemp(prefix=f"nf-{stream_id}-"))
         self.display: Optional[str] = None
+        self.cdp_port: Optional[int] = None
         self.xvfb_proc: Optional[asyncio.subprocess.Process] = None
         self.chrome_proc: Optional[asyncio.subprocess.Process] = None
         self.ffmpeg_proc: Optional[asyncio.subprocess.Process] = None
         self.running = False
-        self._pulse_sink = f"nf_{stream_id[:8]}"
 
-    async def start(self, netflix_url: str, email: str, password: str, profile: str = "") -> str:
-        """Start the Netflix stream. Returns HLS playlist path."""
+    async def start(self, search_query: str, email: str, password: str) -> str:
+        """Start Netflix stream. Returns HLS dir path."""
         try:
             self.running = True
 
             # 1. Xvfb
             self.display = await self._start_xvfb()
-            logger.info("[NF-STREAM] Xvfb on %s", self.display)
+            logger.info("[NF] Xvfb on %s", self.display)
 
-            # 2. PulseAudio virtual sink
-            await self._setup_pulseaudio()
-            logger.info("[NF-STREAM] PulseAudio ready")
+            # 2. Setup PulseAudio
+            await self._setup_pulse()
 
-            # 3. Chrome → Netflix
-            await self._start_chrome(netflix_url)
-            logger.info("[NF-STREAM] Chrome launched on %s", netflix_url)
+            # 3. Launch Chrome with CDP
+            self.cdp_port = 9300 + hash(self.stream_id) % 100
+            await self._start_chrome()
+            logger.info("[NF] Chrome on CDP port %d", self.cdp_port)
 
-            # 4. FFmpeg capture → HLS
+            # 4. Automate Netflix login + navigate to content
+            await self._netflix_login_and_play(search_query, email, password)
+            logger.info("[NF] Netflix playing")
+
+            # 5. FFmpeg capture → HLS
             await self._start_ffmpeg()
-            logger.info("[NF-STREAM] FFmpeg capturing → %s", self.hls_dir)
+            logger.info("[NF] FFmpeg capturing")
 
-            # Wait for first segment
+            # Wait for first HLS segment
             playlist = self.hls_dir / "stream.m3u8"
-            for _ in range(30):
+            for _ in range(20):
                 if playlist.exists() and playlist.stat().st_size > 0:
                     return str(playlist)
                 await asyncio.sleep(1)
-
-            raise RuntimeError("HLS playlist not created within timeout")
+            raise RuntimeError("HLS not ready in time")
 
         except Exception as e:
-            logger.exception("[NF-STREAM] Start failed: %s", e)
+            logger.exception("[NF] Start failed")
             await self.stop()
             raise
 
     async def stop(self):
-        """Stop all processes."""
         self.running = False
         for name in ["ffmpeg_proc", "chrome_proc", "xvfb_proc"]:
             proc = getattr(self, name, None)
@@ -83,158 +82,218 @@ class NetflixStream:
                 try:
                     proc.terminate()
                     await asyncio.wait_for(proc.wait(), timeout=5)
-                except (asyncio.TimeoutError, ProcessLookupError):
+                except Exception:
                     try:
                         proc.kill()
-                    except ProcessLookupError:
+                    except Exception:
                         pass
-        # Cleanup HLS files
         await asyncio.sleep(1)
         shutil.rmtree(self.hls_dir, ignore_errors=True)
 
+    # ── Infrastructure ─────────────────────────────────────────────
+
     async def _start_xvfb(self) -> str:
-        for num in range(120, 150):
-            display = f":{num}"
+        for num in range(120, 160):
             if os.path.exists(f"/tmp/.X{num}-lock"):
                 continue
             self.xvfb_proc = await asyncio.create_subprocess_exec(
-                "Xvfb", display, "-screen", "0", "1280x720x24", "-ac", "-nolisten", "tcp",
+                "Xvfb", f":{num}", "-screen", "0", "1280x720x24", "-ac",
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.sleep(0.5)
             if self.xvfb_proc.returncode is None:
-                return display
-        raise RuntimeError("No free Xvfb display")
+                return f":{num}"
+        raise RuntimeError("No free display")
 
-    async def _setup_pulseaudio(self):
-        """Ensure PulseAudio is running and create a virtual sink."""
-        env = os.environ.copy()
-        env["DISPLAY"] = self.display
-        env["HOME"] = "/root"
-
-        # Create pulse cookie dir
+    async def _setup_pulse(self):
+        env = {"HOME": "/root", "DISPLAY": self.display}
         os.makedirs("/root/.config/pulse", exist_ok=True)
-
-        # Start PulseAudio if not running (--start is idempotent)
-        proc = await asyncio.create_subprocess_exec(
+        await (await asyncio.create_subprocess_exec(
             "pulseaudio", "--start", "--daemonize=yes",
-            env=env,
+            env={**os.environ, **env},
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
-        await asyncio.sleep(0.5)
+        )).wait()
 
-        # Load null sink for this stream
-        proc = await asyncio.create_subprocess_exec(
-            "pactl", "load-module", "module-null-sink",
-            f"sink_name={self._pulse_sink}",
-            f"sink_properties=device.description=Netflix_{self.stream_id[:8]}",
-            env=env,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
-
-        # Set as default sink so Chrome uses it
-        proc = await asyncio.create_subprocess_exec(
-            "pactl", "set-default-sink", self._pulse_sink,
-            env=env,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
-
-    async def _start_chrome(self, netflix_url: str):
-        """Launch real Chrome with Widevine on the Xvfb display."""
-        env = os.environ.copy()
-        env["DISPLAY"] = self.display
-        env["HOME"] = "/root"
-
-        chrome_bin = (
-            shutil.which("google-chrome-stable")
-            or shutil.which("google-chrome")
-            or "/opt/google/chrome/google-chrome"
-        )
-
-        chrome_data = f"/tmp/nf-chrome-{self.stream_id[:8]}"
-        os.makedirs(chrome_data, exist_ok=True)
-
-        args = [
-            chrome_bin,
-            "--no-sandbox",
-            "--disable-gpu",
-            "--window-size=1280,720",
-            "--start-maximized",
-            "--disable-dev-shm-usage",
-            "--disable-infobars",
-            "--disable-extensions",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--autoplay-policy=no-user-gesture-required",
-            "--disable-features=TranslateUI",
-            f"--user-data-dir={chrome_data}",
-            netflix_url,
-        ]
+    async def _start_chrome(self):
+        env = {**os.environ, "DISPLAY": self.display, "HOME": "/root"}
+        chrome = shutil.which("google-chrome-stable") or "/opt/google/chrome/google-chrome"
+        data_dir = "/tmp/nf-chrome-shared"  # shared across streams for cookie persistence
+        os.makedirs(data_dir, exist_ok=True)
 
         self.chrome_proc = await asyncio.create_subprocess_exec(
-            *args, env=env,
+            chrome,
+            "--no-sandbox", "--disable-gpu", "--window-size=1280,720",
+            "--disable-dev-shm-usage", "--disable-infobars", "--disable-extensions",
+            "--autoplay-policy=no-user-gesture-required",
+            "--disable-features=TranslateUI",
+            f"--remote-debugging-port={self.cdp_port}",
+            f"--user-data-dir={data_dir}",
+            "about:blank",
+            env=env,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
-        # Wait for page load
-        await asyncio.sleep(6)
+        # Wait for CDP to be ready
+        for _ in range(20):
+            try:
+                async with httpx.AsyncClient() as c:
+                    r = await c.get(f"http://localhost:{self.cdp_port}/json/version", timeout=2)
+                    if r.status_code == 200:
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        raise RuntimeError("Chrome CDP not ready")
+
+    # ── Netflix Automation via CDP ─────────────────────────────────
+
+    async def _cdp_send(self, ws_url: str, method: str, params: dict = None) -> dict:
+        """Send a CDP command via WebSocket."""
+        import websockets
+        async with websockets.connect(ws_url, max_size=10_000_000) as ws:
+            msg = {"id": 1, "method": method, "params": params or {}}
+            await ws.send(json.dumps(msg))
+            while True:
+                resp = json.loads(await ws.recv())
+                if resp.get("id") == 1:
+                    return resp.get("result", {})
+
+    async def _cdp_evaluate(self, ws_url: str, expression: str) -> any:
+        """Evaluate JS in the browser."""
+        result = await self._cdp_send(ws_url, "Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+        })
+        return result.get("result", {}).get("value")
+
+    async def _cdp_navigate(self, ws_url: str, url: str):
+        """Navigate to URL and wait for load."""
+        await self._cdp_send(ws_url, "Page.navigate", {"url": url})
+        await asyncio.sleep(3)
+
+    async def _get_page_ws(self) -> str:
+        """Get the WebSocket URL for the first browser page."""
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"http://localhost:{self.cdp_port}/json")
+            pages = r.json()
+            for p in pages:
+                if p.get("type") == "page":
+                    return p["webSocketDebuggerUrl"]
+        raise RuntimeError("No CDP page found")
+
+    async def _netflix_login_and_play(self, query: str, email: str, password: str):
+        """Login to Netflix and navigate to content."""
+        ws_url = await self._get_page_ws()
+
+        # Navigate to Netflix
+        await self._cdp_navigate(ws_url, "https://www.netflix.com/browse")
+        await asyncio.sleep(2)
+
+        # Refresh ws_url after navigation (page might change)
+        ws_url = await self._get_page_ws()
+
+        # Check current URL — are we logged in?
+        current_url = await self._cdp_evaluate(ws_url, "window.location.href")
+        logger.info("[NF] Current URL: %s", current_url)
+
+        # If on login page, do login
+        if current_url and "/login" in str(current_url):
+            logger.info("[NF] Login required, automating...")
+
+            # Fill email
+            await self._cdp_evaluate(ws_url, f"""
+                document.querySelector('input[name="userLoginId"]').value = '{email}';
+                document.querySelector('input[name="userLoginId"]').dispatchEvent(new Event('input', {{bubbles: true}}));
+            """)
+            await asyncio.sleep(0.5)
+
+            # Fill password
+            await self._cdp_evaluate(ws_url, f"""
+                document.querySelector('input[name="password"]').value = '{password}';
+                document.querySelector('input[name="password"]').dispatchEvent(new Event('input', {{bubbles: true}}));
+            """)
+            await asyncio.sleep(0.5)
+
+            # Click sign in
+            await self._cdp_evaluate(ws_url, """
+                document.querySelector('button[data-uia="login-submit-button"]').click();
+            """)
+            await asyncio.sleep(5)
+
+            # Refresh ws_url after login redirect
+            ws_url = await self._get_page_ws()
+            current_url = await self._cdp_evaluate(ws_url, "window.location.href")
+            logger.info("[NF] After login URL: %s", current_url)
+
+        # If on profile picker, click first profile
+        if current_url and ("/profiles" in str(current_url) or "/browse" in str(current_url)):
+            await asyncio.sleep(1)
+            ws_url = await self._get_page_ws()
+            await self._cdp_evaluate(ws_url, """
+                const profiles = document.querySelectorAll('.profile-icon, [data-profile-guid], .choose-profile .profile');
+                if (profiles.length > 0) profiles[0].click();
+            """)
+            await asyncio.sleep(3)
+
+        # Navigate to search for the content
+        ws_url = await self._get_page_ws()
+        search_url = f"https://www.netflix.com/search?q={quote(query)}"
+        await self._cdp_navigate(ws_url, search_url)
+        await asyncio.sleep(3)
+
+        # Click first result to start playing
+        ws_url = await self._get_page_ws()
+        await self._cdp_evaluate(ws_url, """
+            // Click first title card in search results
+            const cards = document.querySelectorAll('.title-card, .slider-item, [data-uia="title-card"]');
+            if (cards.length > 0) {
+                const link = cards[0].querySelector('a') || cards[0];
+                link.click();
+            }
+        """)
+        await asyncio.sleep(2)
+
+        # Try to click play button if visible
+        ws_url = await self._get_page_ws()
+        await self._cdp_evaluate(ws_url, """
+            const playBtn = document.querySelector('[data-uia="play-button"], .playLink, .maturity-rating-overlay button');
+            if (playBtn) playBtn.click();
+        """)
+        await asyncio.sleep(2)
+
+    # ── FFmpeg ─────────────────────────────────────────────────────
 
     async def _start_ffmpeg(self):
-        """FFmpeg captures Xvfb display + PulseAudio → HLS."""
         playlist = str(self.hls_dir / "stream.m3u8")
         seg_pattern = str(self.hls_dir / "seg_%03d.ts")
+        env = {**os.environ, "DISPLAY": self.display, "HOME": "/root"}
 
-        # Try capturing audio from PulseAudio monitor; if it fails, video-only
+        # Try with audio first
         args = [
             "ffmpeg", "-y",
-            # Video: X11 grab
-            "-f", "x11grab",
-            "-video_size", "1280x720",
-            "-framerate", str(FFMPEG_FRAMERATE),
-            "-i", self.display,
-            # Audio: PulseAudio monitor (may fail silently)
-            "-f", "pulse",
-            "-i", f"{self._pulse_sink}.monitor",
-            # Video encoding
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-b:v", FFMPEG_VIDEO_BITRATE,
-            "-g", str(FFMPEG_FRAMERATE),
-            "-sc_threshold", "0",
+            "-f", "x11grab", "-video_size", "1280x720",
+            "-framerate", str(FFMPEG_FRAMERATE), "-i", self.display,
+            "-f", "pulse", "-i", "default",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-b:v", FFMPEG_VIDEO_BITRATE, "-g", str(FFMPEG_FRAMERATE),
             "-pix_fmt", "yuv420p",
-            # Audio encoding
-            "-c:a", "aac",
-            "-b:a", FFMPEG_AUDIO_BITRATE,
-            "-ar", "44100",
-            # HLS output
-            "-f", "hls",
-            "-hls_time", str(HLS_SEGMENT_DURATION),
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-f", "hls", "-hls_time", str(HLS_SEGMENT_DURATION),
             "-hls_list_size", str(HLS_PLAYLIST_SIZE),
             "-hls_flags", "delete_segments+append_list",
             "-hls_segment_filename", seg_pattern,
             playlist,
         ]
 
-        env = os.environ.copy()
-        env["DISPLAY"] = self.display
-        env["HOME"] = "/root"
-
         self.ffmpeg_proc = await asyncio.create_subprocess_exec(
             *args, env=env,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
-
-        # Check if FFmpeg started OK
         await asyncio.sleep(2)
+
+        # If audio fails, retry video-only
         if self.ffmpeg_proc.returncode is not None:
-            stderr = (await self.ffmpeg_proc.stderr.read()).decode(errors="replace")[:500]
-            logger.warning("[NF-STREAM] FFmpeg failed (trying video-only): %s", stderr)
-            # Retry without audio
-            args_no_audio = [
+            logger.warning("[NF] FFmpeg with audio failed, retrying video-only")
+            args_vo = [
                 "ffmpeg", "-y",
                 "-f", "x11grab", "-video_size", "1280x720",
                 "-framerate", str(FFMPEG_FRAMERATE), "-i", self.display,
@@ -248,34 +307,37 @@ class NetflixStream:
                 playlist,
             ]
             self.ffmpeg_proc = await asyncio.create_subprocess_exec(
-                *args_no_audio, env=env,
+                *args_vo, env=env,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
             )
 
 
-# ── Global stream manager ─────────────────────────────────────────
+# ── Manager ────────────────────────────────────────────────────────
 
-_active_streams: dict[str, NetflixStream] = {}
+_active: dict[str, NetflixStream] = {}
 
 
-async def start_netflix_stream(
-    stream_id: str, netflix_url: str,
-    email: str, password: str, profile: str = "",
-) -> str:
-    if stream_id in _active_streams:
+async def start_netflix_stream(stream_id: str, netflix_url: str, email: str, password: str, **kw) -> str:
+    if stream_id in _active:
         await stop_netflix_stream(stream_id)
+    # Extract search query from URL or use as-is
+    query = netflix_url
+    if "search?q=" in netflix_url:
+        query = netflix_url.split("search?q=")[-1].replace("%20", " ").replace("+", " ")
+    elif "/watch/" in netflix_url or "/title/" in netflix_url:
+        query = netflix_url  # pass URL directly
     stream = NetflixStream(stream_id)
-    _active_streams[stream_id] = stream
-    await stream.start(netflix_url, email, password, profile)
+    _active[stream_id] = stream
+    await stream.start(query, email, password)
     return str(stream.hls_dir)
 
 
 async def stop_netflix_stream(stream_id: str):
-    stream = _active_streams.pop(stream_id, None)
-    if stream:
-        await stream.stop()
+    s = _active.pop(stream_id, None)
+    if s:
+        await s.stop()
 
 
 def get_stream_hls_dir(stream_id: str) -> Optional[Path]:
-    stream = _active_streams.get(stream_id)
-    return stream.hls_dir if stream else None
+    s = _active.get(stream_id)
+    return s.hls_dir if s else None

@@ -2381,73 +2381,39 @@ class ToolExecutor:
         return f"Now playing \"{video_title}\"\nhttps://www.youtube.com/watch?v={video_id}"
 
     async def _play_netflix(self, query: str) -> str:
-        """Find exact Netflix title via DuckDuckGo and auto-play it."""
-        import httpx
+        """Stream Netflix content via VPS Chrome + FFmpeg → HLS."""
         import re as _re
-        from urllib.parse import quote
+        import httpx
 
         user_id = self._current_user_id
         if not user_id:
             return "ERROR: No user context"
 
         try:
-            # Parse season/episode from query
+            # Parse season/episode
             se_match = _re.search(r'S(\d+)\s*E(\d+)', query, _re.IGNORECASE)
             season_match = _re.search(r'season\s*(\d+)', query, _re.IGNORECASE)
             episode_match = _re.search(r'episode?\s*(\d+)', query, _re.IGNORECASE)
             if se_match:
-                season_num = int(se_match.group(1))
-                episode_num = int(se_match.group(2))
+                season_num, episode_num = int(se_match.group(1)), int(se_match.group(2))
             else:
                 season_num = int(season_match.group(1)) if season_match else None
                 episode_num = int(episode_match.group(1)) if episode_match else None
 
-            # Clean query — remove netflix/season/episode text
+            # Clean query
             clean_query = _re.sub(
                 r'(?:season|episode?|from netflix|netflix|on netflix|play me|play|S\d+E?\d*)\s*\d*',
                 '', query, flags=_re.IGNORECASE
             ).strip()
             clean_query = _re.sub(r'\s+', ' ', clean_query).strip()
+            if season_num and episode_num:
+                search_query = f"{clean_query} season {season_num} episode {episode_num}"
+            elif season_num:
+                search_query = f"{clean_query} season {season_num}"
+            else:
+                search_query = clean_query
 
-            netflix_id = None
             title = clean_query
-
-            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-                # DuckDuckGo HTML search — reliable, no rate limiting
-                search_query = f"{clean_query} site:netflix.com"
-                resp = await client.get(
-                    "https://html.duckduckgo.com/html/",
-                    params={"q": search_query},
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                    },
-                )
-
-                # Extract Netflix IDs from results
-                ids = _re.findall(r'netflix\.com/(?:title|watch)/(\d+)', resp.text)
-                if ids:
-                    netflix_id = ids[0]
-                    logger.info("[play_netflix] DuckDuckGo found Netflix ID: %s", netflix_id)
-
-                # Extract title from search result links
-                title_match = _re.search(
-                    r'class="result__a"[^>]*>(?:Watch\s+)?([^<|]+?)(?:\s*\||\s*[-–])\s*Netflix',
-                    resp.text,
-                )
-                if title_match:
-                    import html as _html
-                    title = _html.unescape(title_match.group(1).strip())
-
-            if not netflix_id:
-                return (
-                    f"Could not find \"{clean_query}\" on Netflix. "
-                    f"It may not be available. Want me to play it on YouTube instead?"
-                )
-
-            # /watch/ URL auto-plays, /title/ shows details page
-            netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
-
-            # Episode info for display
             episode_info = ""
             if season_num and episode_num:
                 episode_info = f" — Season {season_num}, Episode {episode_num}"
@@ -2459,54 +2425,56 @@ class ToolExecutor:
             platform_url = getattr(_settings, 'platform_api_url', 'https://toup.ai/api')
             agent_key = getattr(_settings, 'agent_api_key', '')
 
-            cred_email = ""
-            cred_password = ""
+            cred_email, cred_password = "", ""
             if agent_key:
                 try:
-                    async with httpx.AsyncClient(timeout=10) as _cred_client:
-                        _cred_resp = await _cred_client.get(
+                    async with httpx.AsyncClient(timeout=10) as c:
+                        r = await c.get(
                             f"{platform_url}/streaming/credentials/internal/netflix",
                             params={"user_id": user_id},
                             headers={"X-Agent-Key": agent_key},
                         )
-                    if _cred_resp.status_code == 200:
-                        _cred = _cred_resp.json()
-                        cred_email = _cred.get("email", "")
-                        cred_password = _cred.get("password", "")
-                except Exception as _e:
-                    logger.warning("[play_netflix] Credential fetch failed: %s", _e)
+                    if r.status_code == 200:
+                        d = r.json()
+                        cred_email = d.get("email", "")
+                        cred_password = d.get("password", "")
+                except Exception as e:
+                    logger.warning("[play_netflix] Cred fetch: %s", e)
 
-            # Start the HLS stream on this agent
+            if not cred_email:
+                return "Netflix not connected. Ask the user to connect Netflix on the Movies page."
+
+            # Start HLS stream (Chrome → Netflix → FFmpeg → HLS)
+            stream_id = f"nf-{hash(search_query) % 100000}"
+            hls_url = ""
             try:
                 from app.services.netflix_stream import start_netflix_stream
-                stream_id = f"nf-{netflix_id}"
-                hls_dir = await start_netflix_stream(
+                await start_netflix_stream(
                     stream_id=stream_id,
-                    netflix_url=netflix_url,
+                    netflix_url=search_query,  # pass search query, not URL
                     email=cred_email,
                     password=cred_password,
                 )
                 hls_url = f"/api/netflix-stream/{stream_id}/stream.m3u8"
-            except Exception as _e:
-                logger.warning("[play_netflix] Stream start failed: %s, falling back to URL", _e)
-                hls_url = ""
+                logger.info("[play_netflix] Stream ready: %s", hls_url)
+            except Exception as e:
+                logger.exception("[play_netflix] Stream failed: %s", e)
 
             # Broadcast to frontend
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(user_id, {
                 "type": "netflix_stream",
                 "title": f"{title}{episode_info}",
-                "netflix_id": netflix_id,
+                "stream_id": stream_id,
                 "hls_url": hls_url,
-                "fallback_url": netflix_url,
+                "fallback_url": f"https://www.netflix.com/search?q={clean_query.replace(' ', '+')}",
             })
-            logger.info("[play_netflix] Stream started: %s → %s", title, hls_url or netflix_url)
 
-            return (
-                f"Now streaming \"{title}\"{episode_info} from Netflix.\n"
-                f"{netflix_url}"
-            )
+            if hls_url:
+                return f"Now streaming \"{title}\"{episode_info} from Netflix in the Toup player."
+            else:
+                return f"Netflix stream couldn't start. Opening Netflix in your browser instead."
 
         except Exception as e:
             logger.warning("[play_netflix] Error: %s", e)
-            return f"ERROR: Netflix search failed: {e}"
+            return f"ERROR: {e}"
