@@ -2335,6 +2335,7 @@ async def ws_browser(
                 continue
 
             action = data.get("action", "")
+            print(f"[BROWSER] action={action}", flush=True)
 
             try:
                 if action == "tab_open":
@@ -2408,6 +2409,7 @@ async def ws_browser(
                         await _send_screenshot(websocket, active_page, overlay)
 
                 elif action == "chat":
+                    print(f"[BROWSER] Chat action received!", flush=True)
                     message = data.get("message", "").strip()
                     _chat_model = data.get("model")  # Model override from frontend selector
                     if not message:
