@@ -238,45 +238,109 @@ class NetflixStream:
         current_url = await self._cdp_evaluate(ws_url, "window.location.href")
         logger.info("[NF] Current URL: %s", current_url)
 
-        # If on login page, do login using xdotool Tab + type (no mouse coordinates needed)
+        # If on login page, do login using CDP + React internal setter
         if current_url and "/login" in str(current_url):
-            logger.info("[NF] Login required, using xdotool Tab+type...")
+            logger.info("[NF] Login required...")
 
-            env_xdo = {**os.environ, "DISPLAY": self.display}
+            # Use React's internal property setter to set input values
+            # This triggers React's onChange handler properly
+            await self._cdp_evaluate(ws_url, f"""
+                (function() {{
+                    function setReactValue(el, value) {{
+                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value'
+                        ).set;
+                        nativeInputValueSetter.call(el, value);
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
 
-            async def xdo(*args):
-                p = await asyncio.create_subprocess_exec(
-                    "xdotool", *args, env=env_xdo,
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                )
-                await p.wait()
+                    // Find email input
+                    var emailInput = document.querySelector('input[name="userLoginId"]')
+                        || document.querySelector('input[type="email"]')
+                        || document.querySelector('input[data-uia="login-field"]')
+                        || document.querySelector('input[autocomplete="email"]')
+                        || document.querySelector('#id_userLoginId');
+                    if (!emailInput) {{
+                        // Try finding any visible input
+                        var inputs = document.querySelectorAll('input[type="text"], input[type="email"], input:not([type])');
+                        for (var i = 0; i < inputs.length; i++) {{
+                            if (inputs[i].offsetParent !== null) {{ emailInput = inputs[i]; break; }}
+                        }}
+                    }}
 
-            # Tab into email field (Tab cycles through page elements)
-            await xdo("key", "Tab")
-            await asyncio.sleep(0.5)
-            await xdo("key", "Tab")
-            await asyncio.sleep(0.5)
-
-            # Type email
-            await xdo("type", "--clearmodifiers", "--delay", "30", email)
+                    if (emailInput) {{
+                        emailInput.focus();
+                        setReactValue(emailInput, '{email}');
+                        console.log('EMAIL SET: ' + emailInput.value);
+                    }} else {{
+                        console.log('EMAIL INPUT NOT FOUND');
+                    }}
+                }})();
+            """)
             await asyncio.sleep(1)
 
-            # Press Enter to submit (clicks Continue)
-            await xdo("key", "Return")
+            # Click submit button
+            await self._cdp_evaluate(ws_url, """
+                (function() {
+                    var btns = document.querySelectorAll('button');
+                    for (var i = 0; i < btns.length; i++) {
+                        var text = btns[i].textContent.toLowerCase().trim();
+                        if (text === 'continue' || text === 'sign in' || text === 'next') {
+                            btns[i].click();
+                            return;
+                        }
+                    }
+                    // Fallback: submit any form
+                    var form = document.querySelector('form');
+                    if (form) form.submit();
+                })();
+            """)
             await asyncio.sleep(4)
 
-            # Now on password page — Tab to password field
-            await xdo("key", "Tab")
-            await asyncio.sleep(0.5)
-            await xdo("key", "Tab")
-            await asyncio.sleep(0.5)
+            # Password page
+            ws_url = await self._get_page_ws()
+            await self._cdp_evaluate(ws_url, f"""
+                (function() {{
+                    function setReactValue(el, value) {{
+                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value'
+                        ).set;
+                        nativeInputValueSetter.call(el, value);
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
 
-            # Type password
-            await xdo("type", "--clearmodifiers", "--delay", "30", password)
+                    var pwInput = document.querySelector('input[name="password"]')
+                        || document.querySelector('input[type="password"]')
+                        || document.querySelector('input[data-uia="password-field"]');
+                    if (!pwInput) {{
+                        var inputs = document.querySelectorAll('input[type="password"]');
+                        if (inputs.length > 0) pwInput = inputs[0];
+                    }}
+                    if (pwInput) {{
+                        pwInput.focus();
+                        setReactValue(pwInput, '{password}');
+                    }}
+                }})();
+            """)
             await asyncio.sleep(1)
 
-            # Press Enter to sign in
-            await xdo("key", "Return")
+            # Click sign in
+            await self._cdp_evaluate(ws_url, """
+                (function() {
+                    var btns = document.querySelectorAll('button');
+                    for (var i = 0; i < btns.length; i++) {
+                        var text = btns[i].textContent.toLowerCase().trim();
+                        if (text === 'sign in' || text === 'continue' || text === 'log in') {
+                            btns[i].click();
+                            return;
+                        }
+                    }
+                    var form = document.querySelector('form');
+                    if (form) form.submit();
+                })();
+            """)
             await asyncio.sleep(6)
 
             ws_url = await self._get_page_ws()
