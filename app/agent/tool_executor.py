@@ -2454,19 +2454,56 @@ class ToolExecutor:
             elif season_num:
                 episode_info = f" — Season {season_num}"
 
-            # Broadcast netflix_card to auto-open in user's browser
+            # Fetch Netflix credentials from platform
+            from app.config import settings as _settings
+            platform_url = getattr(_settings, 'platform_api_url', 'https://toup.ai/api')
+            agent_key = getattr(_settings, 'agent_api_key', '')
+
+            cred_email = ""
+            cred_password = ""
+            if agent_key:
+                try:
+                    async with httpx.AsyncClient(timeout=10) as _cred_client:
+                        _cred_resp = await _cred_client.get(
+                            f"{platform_url}/streaming/credentials/internal/netflix",
+                            params={"user_id": user_id},
+                            headers={"X-Agent-Key": agent_key},
+                        )
+                    if _cred_resp.status_code == 200:
+                        _cred = _cred_resp.json()
+                        cred_email = _cred.get("email", "")
+                        cred_password = _cred.get("password", "")
+                except Exception as _e:
+                    logger.warning("[play_netflix] Credential fetch failed: %s", _e)
+
+            # Start the HLS stream on this agent
+            try:
+                from app.services.netflix_stream import start_netflix_stream
+                stream_id = f"nf-{netflix_id}"
+                hls_dir = await start_netflix_stream(
+                    stream_id=stream_id,
+                    netflix_url=netflix_url,
+                    email=cred_email,
+                    password=cred_password,
+                )
+                hls_url = f"/api/netflix-stream/{stream_id}/stream.m3u8"
+            except Exception as _e:
+                logger.warning("[play_netflix] Stream start failed: %s, falling back to URL", _e)
+                hls_url = ""
+
+            # Broadcast to frontend
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(user_id, {
-                "type": "netflix_card",
+                "type": "netflix_stream",
                 "title": f"{title}{episode_info}",
                 "netflix_id": netflix_id,
-                "url": netflix_url,
-                "media_type": "tv" if season_num else "movie",
+                "hls_url": hls_url,
+                "fallback_url": netflix_url,
             })
-            logger.info("[play_netflix] Auto-playing: %s → %s", title, netflix_url)
+            logger.info("[play_netflix] Stream started: %s → %s", title, hls_url or netflix_url)
 
             return (
-                f"Now playing \"{title}\"{episode_info} on Netflix.\n"
+                f"Now streaming \"{title}\"{episode_info} from Netflix.\n"
                 f"{netflix_url}"
             )
 

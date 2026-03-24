@@ -647,6 +647,12 @@ app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
 app.include_router(ws_browser_router, prefix=settings.api_prefix)
 app.include_router(apps_router, prefix=settings.api_prefix)
+# Netflix streaming (HLS)
+try:
+    from app.api.ws_netflix import router as netflix_stream_router
+    app.include_router(netflix_stream_router, prefix=settings.api_prefix)
+except ImportError as e:
+    print(f"⚠️ Netflix stream not mounted: {e}")
 app.include_router(soul_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
