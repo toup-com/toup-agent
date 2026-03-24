@@ -205,44 +205,96 @@ class NetflixStream:
         current_url = await self._cdp_evaluate(ws_url, "window.location.href")
         logger.info("[NF] Current URL: %s", current_url)
 
-        # If on login page, do login
+        # If on login page, do login (Netflix 2-step: email → Continue → password → Sign In)
         if current_url and "/login" in str(current_url):
             logger.info("[NF] Login required, automating...")
 
-            # Fill email
+            # Step 1: Fill email and click Continue
             await self._cdp_evaluate(ws_url, f"""
-                document.querySelector('input[name="userLoginId"]').value = '{email}';
-                document.querySelector('input[name="userLoginId"]').dispatchEvent(new Event('input', {{bubbles: true}}));
+                (function() {{
+                    // Try new login flow (email input)
+                    var emailInput = document.querySelector('input[name="userLoginId"]')
+                        || document.querySelector('input[type="email"]')
+                        || document.querySelector('input[autocomplete="email"]')
+                        || document.querySelector('input[data-uia="login-field"]');
+                    if (emailInput) {{
+                        emailInput.focus();
+                        emailInput.value = '{email}';
+                        emailInput.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        emailInput.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }}
+                }})();
             """)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
 
-            # Fill password
-            await self._cdp_evaluate(ws_url, f"""
-                document.querySelector('input[name="password"]').value = '{password}';
-                document.querySelector('input[name="password"]').dispatchEvent(new Event('input', {{bubbles: true}}));
-            """)
-            await asyncio.sleep(0.5)
-
-            # Click sign in
+            # Click Continue/Next button
             await self._cdp_evaluate(ws_url, """
-                document.querySelector('button[data-uia="login-submit-button"]').click();
+                (function() {
+                    var btn = document.querySelector('button[data-uia="login-submit-button"]')
+                        || document.querySelector('button[type="submit"]')
+                        || document.querySelector('.login-button');
+                    if (btn) btn.click();
+                })();
             """)
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
-            # Refresh ws_url after login redirect
+            # Step 2: Fill password (may be on same page or new page)
+            ws_url = await self._get_page_ws()
+            await self._cdp_evaluate(ws_url, f"""
+                (function() {{
+                    var pwInput = document.querySelector('input[name="password"]')
+                        || document.querySelector('input[type="password"]')
+                        || document.querySelector('input[data-uia="password-field"]');
+                    if (pwInput) {{
+                        pwInput.focus();
+                        pwInput.value = '{password}';
+                        pwInput.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        pwInput.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }}
+                }})();
+            """)
+            await asyncio.sleep(1)
+
+            # Click Sign In
+            await self._cdp_evaluate(ws_url, """
+                (function() {
+                    var btn = document.querySelector('button[data-uia="login-submit-button"]')
+                        || document.querySelector('button[type="submit"]')
+                        || document.querySelector('.login-button');
+                    if (btn) btn.click();
+                })();
+            """)
+            await asyncio.sleep(6)
+
             ws_url = await self._get_page_ws()
             current_url = await self._cdp_evaluate(ws_url, "window.location.href")
             logger.info("[NF] After login URL: %s", current_url)
 
         # If on profile picker, click first profile
-        if current_url and ("/profiles" in str(current_url) or "/browse" in str(current_url)):
-            await asyncio.sleep(1)
+        current_url = str(current_url or "")
+        if "/profiles" in current_url or "/browse" in current_url or "Who" in (await self._cdp_evaluate(ws_url, "document.title") or ""):
+            logger.info("[NF] Profile picker detected, clicking first profile...")
+            await asyncio.sleep(2)
             ws_url = await self._get_page_ws()
             await self._cdp_evaluate(ws_url, """
-                const profiles = document.querySelectorAll('.profile-icon, [data-profile-guid], .choose-profile .profile');
-                if (profiles.length > 0) profiles[0].click();
+                (function() {
+                    // Try multiple selectors for profile picker
+                    var selectors = [
+                        '.profile-link',
+                        '.profile-icon',
+                        '[data-profile-guid]',
+                        '.choose-profile .profile',
+                        'li.profile a',
+                        '.list-profiles a',
+                        '.list-profiles-container a',
+                    ];
+                    for (var i = 0; i < selectors.length; i++) {
+                        var els = document.querySelectorAll(selectors[i]);
+                        if (els.length > 0) { els[0].click(); return; }
+                    }
+                })();
             """)
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
 
         # Navigate to search for the content
         ws_url = await self._get_page_ws()
