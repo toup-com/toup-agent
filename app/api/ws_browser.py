@@ -1710,7 +1710,20 @@ async def _run_browser_agent_inner(
         _llm_provider = "openai"
     elif _use_claude:
         from anthropic import AsyncAnthropic
-        client = AsyncAnthropic(api_key=_ant_key)
+        _is_oauth = "sk-ant-oat" in _ant_key
+        if _is_oauth:
+            import os
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            client = AsyncAnthropic(
+                auth_token=_ant_key,
+                default_headers={
+                    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                    "user-agent": "claude-cli/2.1.2 (external, cli)",
+                    "x-app": "cli",
+                },
+            )
+        else:
+            client = AsyncAnthropic(api_key=_ant_key)
         model = _requested_model
         _llm_provider = "anthropic"
     else:
