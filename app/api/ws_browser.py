@@ -2317,6 +2317,50 @@ async def ws_browser(
     _browser_session_id: Optional[str] = None  # DB session for persistence
     conversation: List[Dict[str, Any]] = []
 
+    # ── Load previous browser chat session & send history to frontend ──
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import Message as MsgModel, Conversation
+        from sqlalchemy import select as _sel
+        from sqlalchemy import and_ as _and
+        async with async_session_maker() as _hdb:
+            _last = (
+                await _hdb.execute(
+                    _sel(Conversation)
+                    .where(
+                        _and(
+                            Conversation.user_id == user_id,
+                            Conversation.channel == "web",
+                            Conversation.title == "Browser",
+                        )
+                    )
+                    .order_by(Conversation.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if _last:
+                _browser_session_id = _last.id
+                _hist = (
+                    await _hdb.execute(
+                        _sel(MsgModel)
+                        .where(MsgModel.conversation_id == _browser_session_id)
+                        .order_by(MsgModel.created_at.asc())
+                        .limit(100)
+                    )
+                ).scalars().all()
+                if _hist:
+                    _history_msgs = [
+                        {"role": m.role, "content": m.content, "timestamp": m.created_at.isoformat()}
+                        for m in _hist
+                    ]
+                    # Rebuild conversation context for the LLM too
+                    for m in _hist:
+                        conversation.append({"role": m.role, "content": m.content})
+                    await websocket.send_json({"type": "chat_history", "messages": _history_msgs})
+                    print(f"[BROWSER] Sent {len(_history_msgs)} history messages from session {_browser_session_id}", flush=True)
+    except Exception as _he:
+        print(f"[BROWSER] Failed to load chat history: {_he}", flush=True)
+
     try:
         while True:
             raw = await websocket.receive_text()

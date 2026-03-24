@@ -123,43 +123,45 @@ async def list_sessions(
             params["active_only"] = "true"
         data = await _proxy_sessions(proxy[0], proxy[1], "", params)
         if data is not None:
-            # Also fetch voice sessions from local platform DB and merge them
-            if channel is None or channel == "voice":
+            # Merge platform-local sessions (voice + browser) into proxy response
+            # These channels run on the platform, not the VPS agent, so their
+            # sessions are stored in the platform DB and must be merged manually.
+            local_channels = {"voice", "web"}
+            if channel is None or channel in local_channels:
                 try:
-                    voice_conditions = [
+                    merge_channels = [channel] if channel else list(local_channels)
+                    local_conditions = [
                         Conversation.user_id == current_user.id,
-                        Conversation.channel == "voice",
+                        Conversation.channel.in_(merge_channels),
                     ]
                     if active_only:
-                        voice_conditions.append(Conversation.is_active == True)
-                    voice_result = await db.execute(
+                        local_conditions.append(Conversation.is_active == True)
+                    local_result = await db.execute(
                         select(Conversation)
-                        .where(and_(*voice_conditions))
+                        .where(and_(*local_conditions))
                         .order_by(Conversation.updated_at.desc())
                         .limit(50)
                     )
-                    voice_sessions = voice_result.scalars().all()
-                    if voice_sessions:
-                        voice_list = [_session_to_response(s).model_dump(mode="json") for s in voice_sessions]
+                    local_sessions = local_result.scalars().all()
+                    if local_sessions:
+                        local_list = [_session_to_response(s).model_dump(mode="json") for s in local_sessions]
                         # Merge into proxy response
                         proxy_sessions = data.get("sessions", data) if isinstance(data, dict) else data
                         if isinstance(proxy_sessions, list):
-                            # Deduplicate by ID
                             existing_ids = {s.get("id") for s in proxy_sessions}
-                            for vs in voice_list:
-                                if vs["id"] not in existing_ids:
-                                    proxy_sessions.append(vs)
-                            # Re-sort by updated_at descending
+                            for ls in local_list:
+                                if ls["id"] not in existing_ids:
+                                    proxy_sessions.append(ls)
                             proxy_sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
                         elif isinstance(data, dict) and "sessions" in data:
                             existing_ids = {s.get("id") for s in data["sessions"]}
-                            for vs in voice_list:
-                                if vs["id"] not in existing_ids:
-                                    data["sessions"].append(vs)
+                            for ls in local_list:
+                                if ls["id"] not in existing_ids:
+                                    data["sessions"].append(ls)
                             data["sessions"].sort(key=lambda s: s.get("updated_at", ""), reverse=True)
                             data["total_count"] = len(data["sessions"])
                 except Exception as e:
-                    logger.warning("Failed to merge voice sessions: %s", e)
+                    logger.warning("Failed to merge local sessions: %s", e)
             return JSONResponse(content=data)
 
     # Build query
