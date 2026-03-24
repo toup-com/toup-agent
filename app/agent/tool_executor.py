@@ -2381,144 +2381,95 @@ class ToolExecutor:
         return f"Now playing \"{video_title}\"\nhttps://www.youtube.com/watch?v={video_id}"
 
     async def _play_netflix(self, query: str) -> str:
-        """Search for content on Netflix via TMDB and send a watch card."""
+        """Search Netflix and auto-open it for the user."""
         import httpx
         import re as _re
+        import json as _json
+        from urllib.parse import quote
 
         user_id = self._current_user_id
         if not user_id:
             return "ERROR: No user context"
 
-        # TMDB API (free, no key needed for read access token)
-        TMDB_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI0YjQ2MzgyMjJiYjFiZmIwYzEyOTc0MjNiMDk2ZmM2MCIsIm5iZiI6MTc0Mjg0NDM2OC41NSwic3ViIjoiNjdlMTg5NTBkMzFmMTcxNzU2OWJiMDY5Iiwic2NvcGVzIjpbImFwaV9yZWFkIl0sInZlcnNpb24iOjF9.Ue83dSNiFJiSAoKgMvCVhOH3f0U8vFLXbFNqPGGfEB4"
-        TMDB_BASE = "https://api.themoviedb.org/3"
-        headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
-
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                # Parse season/episode from query
-                season_match = _re.search(r'season\s*(\d+)', query, _re.IGNORECASE)
-                episode_match = _re.search(r'episode?\s*(\d+)', query, _re.IGNORECASE)
-                # Also match S01E01 format
-                se_match = _re.search(r'S(\d+)\s*E(\d+)', query, _re.IGNORECASE)
-                if se_match:
-                    season_num = int(se_match.group(1))
-                    episode_num = int(se_match.group(2))
-                else:
-                    season_num = int(season_match.group(1)) if season_match else None
-                    episode_num = int(episode_match.group(1)) if episode_match else None
+            # Parse season/episode from query
+            season_match = _re.search(r'season\s*(\d+)', query, _re.IGNORECASE)
+            episode_match = _re.search(r'episode?\s*(\d+)', query, _re.IGNORECASE)
+            se_match = _re.search(r'S(\d+)\s*E(\d+)', query, _re.IGNORECASE)
+            if se_match:
+                season_num = int(se_match.group(1))
+                episode_num = int(se_match.group(2))
+            else:
+                season_num = int(season_match.group(1)) if season_match else None
+                episode_num = int(episode_match.group(1)) if episode_match else None
 
-                # Clean query for search (remove season/episode text)
-                clean_query = _re.sub(r'(?:season|episode|from netflix|netflix|S\d+E?\d*)\s*\d*', '', query, flags=_re.IGNORECASE).strip()
-                clean_query = _re.sub(r'\s+', ' ', clean_query).strip()
+            # Clean query
+            clean_query = _re.sub(
+                r'(?:season|episode?|from netflix|netflix|on netflix|S\d+E?\d*)\s*\d*',
+                '', query, flags=_re.IGNORECASE
+            ).strip()
+            clean_query = _re.sub(r'\s+', ' ', clean_query).strip()
 
-                # Search TV shows first (most common for Netflix)
-                tv_resp = await client.get(
-                    f"{TMDB_BASE}/search/tv",
-                    params={"query": clean_query, "page": 1},
-                    headers=headers,
+            # Search Netflix via Google (fastest way to get Netflix title ID)
+            netflix_id = None
+            title = clean_query
+            poster_url = ""
+
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                # Google search for Netflix title
+                google_query = f"{clean_query} site:netflix.com"
+                resp = await client.get(
+                    "https://www.google.com/search",
+                    params={"q": google_query, "num": 5},
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36",
+                    },
                 )
-                tv_results = tv_resp.json().get("results", []) if tv_resp.status_code == 200 else []
+                # Extract Netflix URL from Google results
+                netflix_urls = _re.findall(r'https://www\.netflix\.com/(?:title|watch)/(\d+)', resp.text)
+                if netflix_urls:
+                    netflix_id = netflix_urls[0]
+                    logger.info("[play_netflix] Found Netflix ID via Google: %s", netflix_id)
 
-                # Also search movies
-                movie_resp = await client.get(
-                    f"{TMDB_BASE}/search/movie",
-                    params={"query": clean_query, "page": 1},
-                    headers=headers,
+                # Try to get title from Google snippet
+                title_match = _re.search(
+                    r'(?:Watch |)([^<]+?)(?:\s*\||\s*-)\s*Netflix', resp.text
                 )
-                movie_results = movie_resp.json().get("results", []) if movie_resp.status_code == 200 else []
+                if title_match:
+                    title = title_match.group(1).strip()
 
-                if not tv_results and not movie_results:
-                    return f"Could not find '{clean_query}' on any streaming service. Try a different title."
+            # Build the Netflix URL
+            if netflix_id:
+                netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
+            else:
+                netflix_url = f"https://www.netflix.com/search?q={quote(clean_query)}"
 
-                # Check Netflix availability for top results
-                best_match = None
-                media_type = None
+            # Episode info
+            episode_info = ""
+            if season_num and episode_num:
+                episode_info = f" — Season {season_num}, Episode {episode_num}"
+            elif season_num:
+                episode_info = f" — Season {season_num}"
 
-                # Check TV shows first
-                for item in tv_results[:3]:
-                    tmdb_id = item["id"]
-                    wp_resp = await client.get(
-                        f"{TMDB_BASE}/tv/{tmdb_id}/watch/providers",
-                        headers=headers,
-                    )
-                    if wp_resp.status_code == 200:
-                        providers = wp_resp.json().get("results", {})
-                        # Check US, CA, and other common regions
-                        for region in ["US", "CA", "GB", "DE", "FR", "AU"]:
-                            flatrate = providers.get(region, {}).get("flatrate", [])
-                            if any(p.get("provider_id") == 8 for p in flatrate):
-                                best_match = item
-                                media_type = "tv"
-                                break
-                    if best_match:
-                        break
+            # Broadcast netflix_card to auto-open in browser
+            from app.api.ws_chat import broadcast_to_user
+            await broadcast_to_user(user_id, {
+                "type": "netflix_card",
+                "title": f"{title}{episode_info}",
+                "poster": poster_url,
+                "overview": "",
+                "year": "",
+                "rating": 0,
+                "url": netflix_url,
+                "media_type": "tv" if season_num else "movie",
+            })
+            logger.info("[play_netflix] Card sent: %s → %s", title, netflix_url)
 
-                # Check movies if no TV match
-                if not best_match:
-                    for item in movie_results[:3]:
-                        tmdb_id = item["id"]
-                        wp_resp = await client.get(
-                            f"{TMDB_BASE}/movie/{tmdb_id}/watch/providers",
-                            headers=headers,
-                        )
-                        if wp_resp.status_code == 200:
-                            providers = wp_resp.json().get("results", {})
-                            for region in ["US", "CA", "GB", "DE", "FR", "AU"]:
-                                flatrate = providers.get(region, {}).get("flatrate", [])
-                                if any(p.get("provider_id") == 8 for p in flatrate):
-                                    best_match = item
-                                    media_type = "movie"
-                                    break
-                        if best_match:
-                            break
-
-                if not best_match:
-                    # Not on Netflix — suggest YouTube fallback
-                    title = tv_results[0].get("name", "") if tv_results else movie_results[0].get("title", "")
-                    return (
-                        f"'{title or clean_query}' is not currently available on Netflix. "
-                        f"Want me to play it on YouTube instead?"
-                    )
-
-                # Build Netflix watch URL and card
-                title = best_match.get("name") or best_match.get("title", "Unknown")
-                poster = best_match.get("poster_path", "")
-                poster_url = f"https://image.tmdb.org/t/p/w342{poster}" if poster else ""
-                overview = (best_match.get("overview") or "")[:150]
-                year = (best_match.get("first_air_date") or best_match.get("release_date") or "")[:4]
-                rating = best_match.get("vote_average", 0)
-
-                # Netflix search URL (fastest, always works)
-                netflix_search = f"https://www.netflix.com/search?q={title.replace(' ', '%20')}"
-
-                # Build season/episode info
-                episode_info = ""
-                if media_type == "tv":
-                    if season_num and episode_num:
-                        episode_info = f" — Season {season_num}, Episode {episode_num}"
-                    elif season_num:
-                        episode_info = f" — Season {season_num}"
-
-                # Broadcast netflix_card event to frontend
-                from app.api.ws_chat import broadcast_to_user
-                await broadcast_to_user(user_id, {
-                    "type": "netflix_card",
-                    "title": f"{title}{episode_info}",
-                    "poster": poster_url,
-                    "overview": overview,
-                    "year": year,
-                    "rating": round(rating, 1),
-                    "url": netflix_search,
-                    "media_type": media_type,
-                })
-                logger.info("[play_media] Netflix card sent: %s → %s", title, netflix_search)
-
-                return (
-                    f"Found \"{title}\"{episode_info} on Netflix ({year}, {rating:.1f}/10).\n"
-                    f"Opening Netflix: {netflix_search}"
-                )
+            return (
+                f"Opening \"{title}\"{episode_info} on Netflix.\n"
+                f"{netflix_url}"
+            )
 
         except Exception as e:
-            logger.warning("[play_media] Netflix search error: %s", e)
+            logger.warning("[play_netflix] Error: %s", e)
             return f"ERROR: Netflix search failed: {e}"
