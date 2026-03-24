@@ -238,27 +238,74 @@ class NetflixStream:
         current_url = await self._cdp_evaluate(ws_url, "window.location.href")
         logger.info("[NF] Current URL: %s", current_url)
 
-        # If on login page, do login (Netflix 2-step: email → Continue → password → Sign In)
+        # If on login page, do login using xdotool (real OS-level input, works with React)
         if current_url and "/login" in str(current_url):
-            logger.info("[NF] Login required, automating with CDP keyboard input...")
+            logger.info("[NF] Login required, using xdotool for real keyboard input...")
 
-            # Step 1: Type email using real keyboard events
-            email_sel = 'input[name="userLoginId"], input[type="email"], input[data-uia="login-field"], input[autocomplete="email"]'
-            await self._cdp_type_text(ws_url, email_sel, email)
+            env_xdo = {**os.environ, "DISPLAY": self.display}
+
+            # Click on email input field (center of page, roughly where the input is)
+            await asyncio.create_subprocess_exec(
+                "xdotool", "mousemove", "640", "380", "click", "1",
+                env=env_xdo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
             await asyncio.sleep(1)
 
-            # Click Continue/Submit
-            await self._cdp_click(ws_url, 'button[data-uia="login-submit-button"], button[type="submit"]')
+            # Clear any existing text and type email
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "key", "ctrl+a",
+                env=env_xdo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            await asyncio.sleep(0.2)
+
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "type", "--clearmodifiers", "--delay", "50", email,
+                env=env_xdo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            await asyncio.sleep(1)
+
+            # Click Continue button (below email field)
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "mousemove", "640", "450", "click", "1",
+                env=env_xdo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
             await asyncio.sleep(4)
 
-            # Step 2: Password page (refresh WS since page may have changed)
-            ws_url = await self._get_page_ws()
-            pw_sel = 'input[name="password"], input[type="password"], input[data-uia="password-field"]'
-            await self._cdp_type_text(ws_url, pw_sel, password)
+            # Take screenshot to check state
+            logger.info("[NF] After email submit, waiting for password page...")
+
+            # Click on password field
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "mousemove", "640", "380", "click", "1",
+                env=env_xdo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            await asyncio.sleep(0.5)
+
+            # Type password
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "key", "ctrl+a",
+                env=env_xdo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            await asyncio.sleep(0.2)
+
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "type", "--clearmodifiers", "--delay", "50", password,
+                env=env_xdo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
             await asyncio.sleep(1)
 
-            # Click Sign In
-            await self._cdp_click(ws_url, 'button[data-uia="login-submit-button"], button[type="submit"]')
+            # Click Sign In / Submit button
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "mousemove", "640", "450", "click", "1",
+                env=env_xdo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
             await asyncio.sleep(6)
 
             ws_url = await self._get_page_ws()
