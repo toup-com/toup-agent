@@ -175,6 +175,39 @@ class NetflixStream:
         await self._cdp_send(ws_url, "Page.navigate", {"url": url})
         await asyncio.sleep(3)
 
+    async def _cdp_type_text(self, ws_url: str, selectors: str, text: str):
+        """Focus an input and type text using CDP Input.insertText (works with React)."""
+        sel_list = [s.strip() for s in selectors.split(",")]
+        # Focus the first matching element
+        for sel in sel_list:
+            result = await self._cdp_evaluate(ws_url, f"""
+                (function() {{
+                    var el = document.querySelector('{sel}');
+                    if (el) {{ el.focus(); el.value = ''; return true; }}
+                    return false;
+                }})();
+            """)
+            if result:
+                break
+        await asyncio.sleep(0.3)
+        # Use insertText — works with React controlled inputs
+        await self._cdp_send(ws_url, "Input.insertText", {"text": text})
+        await asyncio.sleep(0.3)
+
+    async def _cdp_click(self, ws_url: str, selectors: str):
+        """Click first matching element from comma-separated selectors."""
+        # Split selectors and try each one
+        sel_list = [s.strip() for s in selectors.split(",")]
+        for sel in sel_list:
+            await self._cdp_evaluate(ws_url, f"""
+                (function() {{
+                    var el = document.querySelector('{sel}');
+                    if (el) {{ el.click(); return true; }}
+                    return false;
+                }})();
+            """)
+        await asyncio.sleep(0.5)
+
     async def _get_page_ws(self) -> str:
         """Get the WebSocket URL for the first browser page (with retries)."""
         for attempt in range(10):
@@ -207,63 +240,25 @@ class NetflixStream:
 
         # If on login page, do login (Netflix 2-step: email → Continue → password → Sign In)
         if current_url and "/login" in str(current_url):
-            logger.info("[NF] Login required, automating...")
+            logger.info("[NF] Login required, automating with CDP keyboard input...")
 
-            # Step 1: Fill email and click Continue
-            await self._cdp_evaluate(ws_url, f"""
-                (function() {{
-                    // Try new login flow (email input)
-                    var emailInput = document.querySelector('input[name="userLoginId"]')
-                        || document.querySelector('input[type="email"]')
-                        || document.querySelector('input[autocomplete="email"]')
-                        || document.querySelector('input[data-uia="login-field"]');
-                    if (emailInput) {{
-                        emailInput.focus();
-                        emailInput.value = '{email}';
-                        emailInput.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        emailInput.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                }})();
-            """)
+            # Step 1: Type email using real keyboard events
+            email_sel = 'input[name="userLoginId"], input[type="email"], input[data-uia="login-field"], input[autocomplete="email"]'
+            await self._cdp_type_text(ws_url, email_sel, email)
             await asyncio.sleep(1)
 
-            # Click Continue/Next button
-            await self._cdp_evaluate(ws_url, """
-                (function() {
-                    var btn = document.querySelector('button[data-uia="login-submit-button"]')
-                        || document.querySelector('button[type="submit"]')
-                        || document.querySelector('.login-button');
-                    if (btn) btn.click();
-                })();
-            """)
-            await asyncio.sleep(3)
+            # Click Continue/Submit
+            await self._cdp_click(ws_url, 'button[data-uia="login-submit-button"], button[type="submit"]')
+            await asyncio.sleep(4)
 
-            # Step 2: Fill password (may be on same page or new page)
+            # Step 2: Password page (refresh WS since page may have changed)
             ws_url = await self._get_page_ws()
-            await self._cdp_evaluate(ws_url, f"""
-                (function() {{
-                    var pwInput = document.querySelector('input[name="password"]')
-                        || document.querySelector('input[type="password"]')
-                        || document.querySelector('input[data-uia="password-field"]');
-                    if (pwInput) {{
-                        pwInput.focus();
-                        pwInput.value = '{password}';
-                        pwInput.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        pwInput.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                }})();
-            """)
+            pw_sel = 'input[name="password"], input[type="password"], input[data-uia="password-field"]'
+            await self._cdp_type_text(ws_url, pw_sel, password)
             await asyncio.sleep(1)
 
             # Click Sign In
-            await self._cdp_evaluate(ws_url, """
-                (function() {
-                    var btn = document.querySelector('button[data-uia="login-submit-button"]')
-                        || document.querySelector('button[type="submit"]')
-                        || document.querySelector('.login-button');
-                    if (btn) btn.click();
-                })();
-            """)
+            await self._cdp_click(ws_url, 'button[data-uia="login-submit-button"], button[type="submit"]')
             await asyncio.sleep(6)
 
             ws_url = await self._get_page_ws()
