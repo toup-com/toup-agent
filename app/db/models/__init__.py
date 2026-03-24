@@ -45,6 +45,9 @@ from .soul_config import SoulConfig
 # Platform (VPS, invites, billing)
 from .platform import VPSPlan, VPSInstance, Invite, LLMBundleAllocation, LLMUsageRecord
 
+# Streaming credentials
+from .streaming import StreamingCredential
+
 __all__ = [
     # Base
     "Base", "Vector",
@@ -62,4 +65,5 @@ __all__ = [
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
     "SoulConfig",
     "VPSPlan", "VPSInstance", "Invite", "LLMBundleAllocation", "LLMUsageRecord",
+    "StreamingCredential",
 ]

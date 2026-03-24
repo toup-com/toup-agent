@@ -825,6 +825,19 @@ class AgentRunner:
             "When the user asks you to do something on their system, USE your tools — don't say you can't."
         )
 
+        # ── 5b. Media Playback (web channel) ─────────────────────
+        if channel in ("web", "app"):
+            section_parts["media"] = (
+                "# Media Playback\n"
+                "You have a `play_media` tool that plays music and videos directly in the user's browser.\n"
+                "When the user asks to play a song, video, or music:\n"
+                "1. Call `play_media(query=\"SONG NAME ARTIST\")` immediately.\n"
+                "2. Do NOT just provide links — actually play it with the tool.\n"
+                "3. For Netflix content, use `play_media(query=\"MOVIE NAME\", channel=\"netflix\")`.\n"
+                "4. Default channel is YouTube (free, no login needed).\n"
+                "5. After calling play_media, tell the user what's playing."
+            )
+
         # ── 6. Runtime context ─────────────────────────────────────
         now = datetime.utcnow()
         _channel_label = channel or "telegram"
@@ -940,6 +953,7 @@ class AgentRunner:
             "work_brain",     # Work brain (disabled by default)
             "skills",         # WHAT the agent can do
             "environment",    # WHAT the agent has access to
+            "media",          # Media playback instructions (web/app)
             "runtime",        # WHEN/WHERE
             "formatting",     # HOW to respond
             "onboarding",     # Temporary onboarding instructions

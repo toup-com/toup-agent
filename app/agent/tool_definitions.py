@@ -555,7 +555,35 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
-        # 18. Browser — headless browser automation
+        # 18. play_media — play music/video for the user
+        # ------------------------------------------------------------------
+        {
+            "name": "play_media",
+            "description": (
+                "Play a song or video for the user. Searches YouTube and streams it "
+                "directly in the user's browser — no navigation needed. "
+                "Pass the song/artist name or movie title as the query. "
+                "For Netflix content, pass channel='netflix' and the agent will use "
+                "the user's connected Netflix account via the browser agent."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Song name, artist, or video title to search for (e.g. 'Adele Hello', 'Dark Knight trailer').",
+                    },
+                    "channel": {
+                        "type": "string",
+                        "enum": ["youtube", "netflix"],
+                        "description": "Streaming channel to use. Default: youtube.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        # ------------------------------------------------------------------
+        # 19. Browser — headless browser automation
         # ------------------------------------------------------------------
         {
             "name": "browser",

@@ -2291,3 +2291,134 @@ class ToolExecutor:
             return f"Talk mode ended" if ended else "No active talk mode session"
         else:
             return f"ERROR: Unknown talk_mode action '{action}'"
+
+    # ------------------------------------------------------------------
+    # play_media — search YouTube and broadcast media_play to frontend
+    # ------------------------------------------------------------------
+    async def _tool_play_media(self, inp: Dict[str, Any]) -> str:
+        import re as _re
+        import json as _json
+
+        query = (inp.get("query") or "").strip()
+        channel = (inp.get("channel") or "youtube").strip().lower()
+
+        if not query:
+            return "ERROR: Provide a song/video name. Example: play_media(query='Adele Hello')"
+
+        if channel == "netflix":
+            return await self._play_netflix(query)
+
+        # ── YouTube search (same 3-tier strategy as browser agent) ──
+        video_id = None
+        video_title = "YouTube Video"
+
+        # 1. Direct YouTube URL
+        yt_match = _re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})', query)
+        if yt_match:
+            video_id = yt_match.group(1)
+
+        # 2. httpx scrape of YouTube search results
+        if not video_id:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=10, follow_redirects=True) as hc:
+                    resp = await hc.get(
+                        "https://www.youtube.com/results",
+                        params={"search_query": query},
+                        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36"},
+                    )
+                id_matches = _re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
+                if id_matches:
+                    video_id = id_matches[0]
+                    title_m = _re.search(r'"title":\{"runs":\[\{"text":"([^"]+)"\}', resp.text)
+                    if title_m:
+                        video_title = title_m.group(1)
+            except Exception as e:
+                logger.warning("[play_media] httpx YouTube search failed: %s", e)
+
+        # 3. yt-dlp fallback
+        if not video_id:
+            try:
+                import shutil
+                ytdlp = shutil.which("yt-dlp") or "/opt/toup-agent/venv/bin/yt-dlp"
+                proc = await asyncio.create_subprocess_exec(
+                    ytdlp, f"ytsearch1:{query}",
+                    "--dump-json", "--flat-playlist", "--no-download", "--no-warnings", "--quiet",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    stdout = b""
+                if proc.returncode == 0 and stdout:
+                    data = _json.loads(stdout.decode().strip().split("\n")[0])
+                    video_id = data.get("id", "")
+                    video_title = data.get("title", "YouTube Video")
+            except Exception as e:
+                logger.warning("[play_media] yt-dlp error: %s", e)
+
+        if not video_id:
+            return f"Could not find a video for '{query}'. Try a different search term."
+
+        # Broadcast media_play event to the user's chat WebSocket
+        user_id = self._current_user_id
+        if user_id:
+            try:
+                from app.api.ws_chat import broadcast_to_user
+                await broadcast_to_user(user_id, {
+                    "type": "media_play",
+                    "provider": "youtube",
+                    "video_id": video_id,
+                    "title": video_title,
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                })
+                logger.info("[play_media] Broadcast media_play: %s - %s", video_id, video_title)
+            except Exception as e:
+                logger.warning("[play_media] Broadcast failed: %s", e)
+                return f"Found '{video_title}' but could not send to player. URL: https://www.youtube.com/watch?v={video_id}"
+
+        return f"Now playing \"{video_title}\"\nhttps://www.youtube.com/watch?v={video_id}"
+
+    async def _play_netflix(self, query: str) -> str:
+        """Play content on Netflix via the browser agent."""
+        user_id = self._current_user_id
+        if not user_id:
+            return "ERROR: No user context"
+
+        # Fetch Netflix credentials from DB
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import StreamingCredential
+            from sqlalchemy import select, and_
+
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(StreamingCredential).where(
+                        and_(
+                            StreamingCredential.user_id == user_id,
+                            StreamingCredential.channel == "netflix",
+                        )
+                    )
+                )
+                cred = result.scalar_one_or_none()
+
+            if not cred:
+                return (
+                    "Netflix is not connected. Ask the user to go to the Movies page "
+                    "and connect their Netflix account first."
+                )
+
+            # Send task to the browser agent via WS tunnel
+            from app.api.ws_chat import broadcast_to_user
+            await broadcast_to_user(user_id, {
+                "type": "netflix_play",
+                "query": query,
+                "email": cred.email,
+                "password": cred.password,
+            })
+            return f"Searching Netflix for \"{query}\"... The browser agent will handle playback."
+
+        except Exception as e:
+            logger.warning("[play_media] Netflix error: %s", e)
+            return f"ERROR: Failed to play on Netflix: {e}"
