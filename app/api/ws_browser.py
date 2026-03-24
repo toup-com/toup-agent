@@ -1638,7 +1638,19 @@ async def _run_browser_agent(
     conversation: List[Dict[str, Any]],
     overlay: AgentOverlay,
     model_override: str = None,
+    session_id: str = None,
+    user_id_for_save: str = None,
 ):
+    _agent_response = ""
+    # Intercept agent_message sends to capture the response text
+    _original_send = websocket.send_json
+    async def _capturing_send(data, **kwargs):
+        nonlocal _agent_response
+        if isinstance(data, dict) and data.get("type") == "agent_message":
+            _agent_response = data.get("content", "")
+        return await _original_send(data, **kwargs)
+    websocket.send_json = _capturing_send  # type: ignore
+
     try:
         await _run_browser_agent_inner(
             websocket, page, tab_manager, browser_mod,
@@ -1646,10 +1658,29 @@ async def _run_browser_agent(
         )
     except Exception as e:
         logger.exception("[WS Browser] Agent loop crashed")
+        _agent_response = f"Browser agent error: {e}"
         try:
-            await websocket.send_json({"type": "error", "message": f"Agent error: {e}"})
+            await _original_send({"type": "error", "message": f"Agent error: {e}"})
         except Exception:
             pass
+    finally:
+        websocket.send_json = _original_send  # type: ignore
+        # Save agent response to DB
+        if session_id and _agent_response and user_id_for_save:
+            try:
+                from app.db.database import async_session_maker
+                from app.db.models import Message as MsgModel
+                import uuid as _uuid
+                async with async_session_maker() as _pdb:
+                    _pdb.add(MsgModel(
+                        id=str(_uuid.uuid4()),
+                        conversation_id=session_id,
+                        role="assistant",
+                        content=_agent_response,
+                    ))
+                    await _pdb.commit()
+            except Exception as _pe:
+                logger.warning("[WS Browser] Failed to persist agent response: %s", _pe)
 
 
 async def _run_browser_agent_inner(
@@ -2243,6 +2274,7 @@ async def ws_browser(
     active_page = None
     overlay: Optional[AgentOverlay] = None
     chat_task: Optional[asyncio.Task] = None
+    _browser_session_id: Optional[str] = None  # DB session for persistence
     conversation: List[Dict[str, Any]] = []
 
     try:
@@ -2352,6 +2384,36 @@ async def ws_browser(
                         active_page = tab_manager.get_tab(tab_id)
                         overlay = AgentOverlay(active_page, websocket)
 
+                    # Persist browser messages to the chat session DB
+                    try:
+                        from app.db.database import async_session_maker
+                        from app.db.models import Message as MsgModel, Conversation
+                        from datetime import datetime
+                        import uuid as _uuid
+                        async with async_session_maker() as _pdb:
+                            # Create or reuse a browser session for today
+                            if not _browser_session_id:
+                                _bsess = Conversation(
+                                    user_id=user_id,
+                                    title="Browser",
+                                    channel="web",
+                                    is_active=True,
+                                )
+                                _pdb.add(_bsess)
+                                await _pdb.commit()
+                                await _pdb.refresh(_bsess)
+                                _browser_session_id = _bsess.id
+                            # Save user message
+                            _pdb.add(MsgModel(
+                                id=str(_uuid.uuid4()),
+                                conversation_id=_browser_session_id,
+                                role="user",
+                                content=message,
+                            ))
+                            await _pdb.commit()
+                    except Exception as _pe:
+                        logger.warning("[WS Browser] Failed to persist user message: %s", _pe)
+
                     if chat_task and not chat_task.done():
                         await websocket.send_json({"type": "error", "message": "Agent is still working"})
                     else:
@@ -2361,6 +2423,8 @@ async def ws_browser(
                                 websocket, active_page, tab_manager, browser_mod,
                                 message, conversation, overlay,
                                 model_override=_chat_model,
+                                session_id=_browser_session_id,
+                                user_id_for_save=user_id,
                             )
                         )
 
