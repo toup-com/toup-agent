@@ -2381,10 +2381,9 @@ class ToolExecutor:
         return f"Now playing \"{video_title}\"\nhttps://www.youtube.com/watch?v={video_id}"
 
     async def _play_netflix(self, query: str) -> str:
-        """Search Netflix and auto-open it for the user."""
+        """Find exact Netflix title via DuckDuckGo and auto-play it."""
         import httpx
         import re as _re
-        import json as _json
         from urllib.parse import quote
 
         user_id = self._current_user_id
@@ -2393,9 +2392,9 @@ class ToolExecutor:
 
         try:
             # Parse season/episode from query
+            se_match = _re.search(r'S(\d+)\s*E(\d+)', query, _re.IGNORECASE)
             season_match = _re.search(r'season\s*(\d+)', query, _re.IGNORECASE)
             episode_match = _re.search(r'episode?\s*(\d+)', query, _re.IGNORECASE)
-            se_match = _re.search(r'S(\d+)\s*E(\d+)', query, _re.IGNORECASE)
             if se_match:
                 season_num = int(se_match.group(1))
                 episode_num = int(se_match.group(2))
@@ -2403,70 +2402,71 @@ class ToolExecutor:
                 season_num = int(season_match.group(1)) if season_match else None
                 episode_num = int(episode_match.group(1)) if episode_match else None
 
-            # Clean query
+            # Clean query — remove netflix/season/episode text
             clean_query = _re.sub(
-                r'(?:season|episode?|from netflix|netflix|on netflix|S\d+E?\d*)\s*\d*',
+                r'(?:season|episode?|from netflix|netflix|on netflix|play me|play|S\d+E?\d*)\s*\d*',
                 '', query, flags=_re.IGNORECASE
             ).strip()
             clean_query = _re.sub(r'\s+', ' ', clean_query).strip()
 
-            # Search Netflix via Google (fastest way to get Netflix title ID)
             netflix_id = None
             title = clean_query
-            poster_url = ""
 
-            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-                # Google search for Netflix title
-                google_query = f"{clean_query} site:netflix.com"
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+                # DuckDuckGo HTML search — reliable, no rate limiting
+                search_query = f"{clean_query} site:netflix.com"
                 resp = await client.get(
-                    "https://www.google.com/search",
-                    params={"q": google_query, "num": 5},
+                    "https://html.duckduckgo.com/html/",
+                    params={"q": search_query},
                     headers={
-                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36",
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
                     },
                 )
-                # Extract Netflix URL from Google results
-                netflix_urls = _re.findall(r'https://www\.netflix\.com/(?:title|watch)/(\d+)', resp.text)
-                if netflix_urls:
-                    netflix_id = netflix_urls[0]
-                    logger.info("[play_netflix] Found Netflix ID via Google: %s", netflix_id)
 
-                # Try to get title from Google snippet
+                # Extract Netflix IDs from results
+                ids = _re.findall(r'netflix\.com/(?:title|watch)/(\d+)', resp.text)
+                if ids:
+                    netflix_id = ids[0]
+                    logger.info("[play_netflix] DuckDuckGo found Netflix ID: %s", netflix_id)
+
+                # Extract title from search result links
                 title_match = _re.search(
-                    r'(?:Watch |)([^<]+?)(?:\s*\||\s*-)\s*Netflix', resp.text
+                    r'class="result__a"[^>]*>(?:Watch\s+)?([^<|]+?)(?:\s*\||\s*[-–])\s*Netflix',
+                    resp.text,
                 )
                 if title_match:
-                    title = title_match.group(1).strip()
+                    import html as _html
+                    title = _html.unescape(title_match.group(1).strip())
 
-            # Build the Netflix URL
-            if netflix_id:
-                netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
-            else:
-                netflix_url = f"https://www.netflix.com/search?q={quote(clean_query)}"
+            if not netflix_id:
+                return (
+                    f"Could not find \"{clean_query}\" on Netflix. "
+                    f"It may not be available. Want me to play it on YouTube instead?"
+                )
 
-            # Episode info
+            # /watch/ URL auto-plays, /title/ shows details page
+            netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
+
+            # Episode info for display
             episode_info = ""
             if season_num and episode_num:
                 episode_info = f" — Season {season_num}, Episode {episode_num}"
             elif season_num:
                 episode_info = f" — Season {season_num}"
 
-            # Broadcast netflix_card to auto-open in browser
+            # Broadcast netflix_card to auto-open in user's browser
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(user_id, {
                 "type": "netflix_card",
                 "title": f"{title}{episode_info}",
-                "poster": poster_url,
-                "overview": "",
-                "year": "",
-                "rating": 0,
+                "netflix_id": netflix_id,
                 "url": netflix_url,
                 "media_type": "tv" if season_num else "movie",
             })
-            logger.info("[play_netflix] Card sent: %s → %s", title, netflix_url)
+            logger.info("[play_netflix] Auto-playing: %s → %s", title, netflix_url)
 
             return (
-                f"Opening \"{title}\"{episode_info} on Netflix.\n"
+                f"Now playing \"{title}\"{episode_info} on Netflix.\n"
                 f"{netflix_url}"
             )
 
