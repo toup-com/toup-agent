@@ -1725,12 +1725,23 @@ async def _run_browser_agent_inner(
         else:
             client = AsyncAnthropic(api_key=_ant_key)
         model = _requested_model
+
         _llm_provider = "anthropic"
     else:
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=settings.openai_api_key)
         model = _requested_model if _is_openai_model else "gpt-5.4"
         _llm_provider = "openai"
+
+    # OAuth tool name mapping — Claude Code OAuth requires canonical tool names
+    _is_oauth = _use_claude and "sk-ant-oat" in _ant_key
+    _BROWSER_TO_CC = {
+        "navigate": "Bash", "click": "Read", "type_text": "Write",
+        "scroll": "Edit", "go_back": "Grep", "wait": "Glob",
+        "select_dropdown": "WebFetch", "select_date": "WebSearch",
+        "play_media": "TodoWrite", "done": "Task",
+    }
+    _CC_TO_BROWSER = {v: k for k, v in _BROWSER_TO_CC.items()}
 
     logger.warning("=" * 80)
     logger.warning("[BROWSER AGENT] NEW SESSION")
@@ -1832,11 +1843,23 @@ async def _run_browser_agent_inner(
             try:
                 if _llm_provider == "anthropic":
                     tc_mode = {"type": "any"} if _force_required else {"type": "auto"}
+                    # OAuth: rename tools + prepend Claude Code identity
+                    _tools_to_send = BROWSER_TOOLS_ANTHROPIC
+                    _system_to_send = system_prompt
+                    if _is_oauth:
+                        _tools_to_send = []
+                        for t in BROWSER_TOOLS_ANTHROPIC:
+                            _cc_name = _BROWSER_TO_CC.get(t["name"], t["name"])
+                            _tools_to_send.append({**t, "name": _cc_name})
+                        _system_to_send = [
+                            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
+                            {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}},
+                        ]
                     response = await client.messages.create(
                         model=model,
-                        system=system_prompt,
+                        system=_system_to_send,
                         messages=conversation,
-                        tools=BROWSER_TOOLS_ANTHROPIC,
+                        tools=_tools_to_send,
                         tool_choice=tc_mode,
                         max_tokens=2048,
                         temperature=0.2,
@@ -1925,6 +1948,9 @@ async def _run_browser_agent_inner(
 
             for tc in _tool_blocks:
                 fn_name = tc.name
+                # OAuth: unmap Claude Code names back to browser tool names
+                if _is_oauth and fn_name in _CC_TO_BROWSER:
+                    fn_name = _CC_TO_BROWSER[fn_name]
                 fn_args = tc.input if hasattr(tc, 'input') else {}
 
                 logger.warning("[STEP %d] EXECUTING: %s(%s)", step + 1, fn_name, json.dumps(fn_args)[:300])
