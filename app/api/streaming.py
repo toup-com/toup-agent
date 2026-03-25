@@ -163,32 +163,52 @@ async def netflix_search(
     netflix_id = None
     title = q
 
+    import logging
+    _log = logging.getLogger(__name__)
+
     async with _httpx.AsyncClient(timeout=12, follow_redirects=True, headers={"User-Agent": ua}) as client:
-        # Try 1: Google
+        # Try 1: DuckDuckGo (most reliable, no captcha)
         try:
-            resp = await client.get("https://www.google.com/search", params={"q": f"{q} site:netflix.com", "num": 5})
+            resp = await client.get("https://html.duckduckgo.com/html/", params={"q": f"{q} site:netflix.com"})
+            _log.info("[NF-SEARCH] DDG status=%d len=%d", resp.status_code, len(resp.text))
             ids = re.findall(r'netflix\.com/(?:title|watch)/(\d+)', resp.text)
             if ids:
                 netflix_id = ids[0]
-                tm = re.search(r'(?:Watch |)([^<]+?)(?:\s*[|–-])\s*Netflix', resp.text)
+                tm = re.search(r'class="result__a"[^>]*>(?:Watch\s+)?([^<|]+?)(?:\s*[|\-–])\s*Netflix', resp.text)
                 if tm:
                     import html as _html
                     title = _html.unescape(tm.group(1).strip())
-        except Exception:
-            pass
+                _log.info("[NF-SEARCH] DDG found: id=%s title=%s", netflix_id, title)
+        except Exception as e:
+            _log.warning("[NF-SEARCH] DDG failed: %s", e)
 
-        # Try 2: DuckDuckGo
+        # Try 2: Google
         if not netflix_id:
             try:
-                resp = await client.get("https://html.duckduckgo.com/html/", params={"q": f"{q} site:netflix.com"})
+                resp = await client.get("https://www.google.com/search", params={"q": f"{q} site:netflix.com", "num": 5})
+                _log.info("[NF-SEARCH] Google status=%d len=%d", resp.status_code, len(resp.text))
                 ids = re.findall(r'netflix\.com/(?:title|watch)/(\d+)', resp.text)
                 if ids:
                     netflix_id = ids[0]
-                    tm = re.search(r'class="result__a"[^>]*>(?:Watch\s+)?([^<|]+?)(?:\s*[|\-–])\s*Netflix', resp.text)
+                    tm = re.search(r'(?:Watch |)([^<]+?)(?:\s*[|–-])\s*Netflix', resp.text)
                     if tm:
                         import html as _html
                         title = _html.unescape(tm.group(1).strip())
-            except Exception:
-                pass
+                    _log.info("[NF-SEARCH] Google found: id=%s title=%s", netflix_id, title)
+            except Exception as e:
+                _log.warning("[NF-SEARCH] Google failed: %s", e)
 
+        # Try 3: Bing
+        if not netflix_id:
+            try:
+                resp = await client.get("https://www.bing.com/search", params={"q": f"{q} site:netflix.com"})
+                _log.info("[NF-SEARCH] Bing status=%d len=%d", resp.status_code, len(resp.text))
+                ids = re.findall(r'netflix\.com/(?:title|watch)/(\d+)', resp.text)
+                if ids:
+                    netflix_id = ids[0]
+                    _log.info("[NF-SEARCH] Bing found: id=%s", netflix_id)
+            except Exception as e:
+                _log.warning("[NF-SEARCH] Bing failed: %s", e)
+
+    _log.info("[NF-SEARCH] Final: q=%s id=%s title=%s", q, netflix_id, title)
     return {"netflix_id": netflix_id, "title": title}
