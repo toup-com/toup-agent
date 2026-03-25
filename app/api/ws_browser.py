@@ -2198,31 +2198,60 @@ async def _netflix_auto_login(page, user_id: str, websocket: WebSocket, overlay)
             logger.info("[NETFLIX] Already logged in or no sign-in detected")
             return
 
-        # Fetch Netflix credentials from platform
-        from app.config import settings
-        platform_url = getattr(settings, 'platform_api_url', 'https://toup.ai/api')
-        agent_key = getattr(settings, 'agent_api_key', '')
+        # Fetch Netflix credentials — try direct DB first, then HTTP fallback
+        email = ""
+        password = ""
 
-        logger.info("[NETFLIX] Fetching credentials for user %s from %s", user_id, platform_url)
+        # Method 1: Direct DB access (works when running on platform)
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import StreamingCredential
+            from sqlalchemy import select, and_
 
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"{platform_url}/streaming/credentials/internal/netflix",
-                params={"user_id": user_id},
-                headers={"X-Agent-Key": agent_key},
-            )
-            logger.info("[NETFLIX] Credentials response: status=%d", r.status_code)
-            if r.status_code != 200:
-                logger.warning("[NETFLIX] No credentials found (status %d): %s", r.status_code, r.text[:200])
-                await websocket.send_json({
-                    "type": "narration",
-                    "text": "Netflix login required — add credentials in Movies settings.",
-                })
-                return
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(StreamingCredential).where(
+                        and_(
+                            StreamingCredential.user_id == user_id,
+                            StreamingCredential.channel == "netflix",
+                        )
+                    )
+                )
+                cred = result.scalar_one_or_none()
+                if cred:
+                    email = cred.email or ""
+                    password = cred.password or ""
+                    logger.info("[NETFLIX] Got credentials from DB for user %s: email=%s", user_id, email)
+        except Exception as db_err:
+            logger.info("[NETFLIX] DB lookup failed (may be on agent): %s", db_err)
 
-            creds = r.json()
-            email = creds.get("email", "")
-            password = creds.get("password", "")
+        # Method 2: HTTP fallback (works when running on agent VPS)
+        if not email:
+            from app.config import settings
+            platform_url = getattr(settings, 'platform_api_url', 'https://toup.ai/api')
+            agent_key = getattr(settings, 'agent_api_key', '')
+
+            logger.info("[NETFLIX] Fetching credentials via HTTP for user %s", user_id)
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    f"{platform_url}/streaming/credentials/internal/netflix",
+                    params={"user_id": user_id},
+                    headers={"X-Agent-Key": agent_key},
+                )
+                logger.info("[NETFLIX] Credentials HTTP response: status=%d", r.status_code)
+                if r.status_code == 200:
+                    creds = r.json()
+                    email = creds.get("email", "")
+                    password = creds.get("password", "")
+
+        if not email or not password:
+            logger.warning("[NETFLIX] No credentials found for user %s", user_id)
+            await websocket.send_json({
+                "type": "narration",
+                "text": "Netflix login required — add credentials in Movies settings.",
+            })
+            return
 
         if not email or not password:
             logger.warning("[NETFLIX] Empty credentials for user %s", user_id)
