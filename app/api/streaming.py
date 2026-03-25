@@ -152,9 +152,13 @@ async def netflix_search(
     q: str = Query(...),
     x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
 ):
-    """Search for a Netflix title ID. Tries Google → DuckDuckGo → fallback."""
+    """Search for a Netflix title ID. Tries Brave → Google → DuckDuckGo."""
     import re
     import httpx as _httpx
+    import html as _html
+    import logging
+
+    _log = logging.getLogger("netflix_search")
 
     if not x_agent_key:
         raise HTTPException(status_code=401, detail="X-Agent-Key required")
@@ -162,33 +166,59 @@ async def netflix_search(
     ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36"
     netflix_id = None
     title = q
+    _nf_pattern = r'netflix\.com/(?:title|watch)/(\d+)'
 
     async with _httpx.AsyncClient(timeout=12, follow_redirects=True, headers={"User-Agent": ua}) as client:
-        # Try 1: Google
+        # Try 1: Brave Search (most reliable, no blocking)
         try:
-            resp = await client.get("https://www.google.com/search", params={"q": f"{q} site:netflix.com", "num": 5})
-            ids = re.findall(r'netflix\.com/(?:title|watch)/(\d+)', resp.text)
+            resp = await client.get(
+                "https://search.brave.com/search",
+                params={"q": f"{q} netflix"},
+            )
+            ids = re.findall(_nf_pattern, resp.text)
             if ids:
                 netflix_id = ids[0]
-                tm = re.search(r'(?:Watch |)([^<]+?)(?:\s*[|–-])\s*Netflix', resp.text)
+                # Brave uses title="Watch TITLE" in snippet divs
+                tm = re.search(r'title="Watch\s+([^"]+)"', resp.text)
                 if tm:
-                    import html as _html
                     title = _html.unescape(tm.group(1).strip())
-        except Exception:
-            pass
+                _log.info(f"[Brave] Found Netflix ID {netflix_id} for '{q}' → '{title}'")
+        except Exception as e:
+            _log.warning(f"[Brave] Failed for '{q}': {e}")
 
-        # Try 2: DuckDuckGo
+        # Try 2: Google
         if not netflix_id:
             try:
-                resp = await client.get("https://html.duckduckgo.com/html/", params={"q": f"{q} site:netflix.com"})
-                ids = re.findall(r'netflix\.com/(?:title|watch)/(\d+)', resp.text)
+                resp = await client.get(
+                    "https://www.google.com/search",
+                    params={"q": f"{q} site:netflix.com", "num": 5},
+                )
+                ids = re.findall(_nf_pattern, resp.text)
+                if ids:
+                    netflix_id = ids[0]
+                    tm = re.search(r'(?:Watch |)([^<]+?)(?:\s*[|–-])\s*Netflix', resp.text)
+                    if tm:
+                        title = _html.unescape(tm.group(1).strip())
+                    _log.info(f"[Google] Found Netflix ID {netflix_id} for '{q}'")
+            except Exception as e:
+                _log.warning(f"[Google] Failed for '{q}': {e}")
+
+        # Try 3: DuckDuckGo HTML
+        if not netflix_id:
+            try:
+                resp = await client.get(
+                    "https://html.duckduckgo.com/html/",
+                    params={"q": f"{q} site:netflix.com"},
+                )
+                ids = re.findall(_nf_pattern, resp.text)
                 if ids:
                     netflix_id = ids[0]
                     tm = re.search(r'class="result__a"[^>]*>(?:Watch\s+)?([^<|]+?)(?:\s*[|\-–])\s*Netflix', resp.text)
                     if tm:
-                        import html as _html
                         title = _html.unescape(tm.group(1).strip())
-            except Exception:
-                pass
+                    _log.info(f"[DDG] Found Netflix ID {netflix_id} for '{q}'")
+            except Exception as e:
+                _log.warning(f"[DDG] Failed for '{q}': {e}")
 
+    _log.info(f"[netflix-search] q='{q}' → id={netflix_id}, title='{title}'")
     return {"netflix_id": netflix_id, "title": title}
