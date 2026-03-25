@@ -144,9 +144,15 @@ class NetflixStream:
             executable_path=chrome,
             headless=False,
             args=[
-                "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                "--no-sandbox", "--disable-dev-shm-usage",
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-features=TranslateUI",
+                # Force software rendering to bypass DRM black screen
+                "--disable-gpu",
+                "--use-gl=angle",
+                "--use-angle=swiftshader",
+                "--disable-accelerated-video-decode",
+                "--disable-gpu-compositing",
                 f"--remote-debugging-port={self.cdp_port}",
             ],
             viewport={"width": 1280, "height": 720},
