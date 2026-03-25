@@ -76,17 +76,29 @@ class NetflixStream:
 
     async def stop(self):
         self.running = False
-        for name in ["ffmpeg_proc", "chrome_proc", "xvfb_proc"]:
-            proc = getattr(self, name, None)
-            if proc and proc.returncode is None:
-                try:
-                    proc.terminate()
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+        # Stop FFmpeg
+        if self.ffmpeg_proc and self.ffmpeg_proc.returncode is None:
+            try:
+                self.ffmpeg_proc.terminate()
+                await asyncio.wait_for(self.ffmpeg_proc.wait(), timeout=5)
+            except Exception:
+                try: self.ffmpeg_proc.kill()
+                except Exception: pass
+        # Close Playwright browser
+        if hasattr(self, '_browser') and self._browser:
+            try: await self._browser.close()
+            except Exception: pass
+        if hasattr(self, '_playwright') and self._playwright:
+            try: await self._playwright.stop()
+            except Exception: pass
+        # Stop Xvfb
+        if self.xvfb_proc and self.xvfb_proc.returncode is None:
+            try:
+                self.xvfb_proc.terminate()
+                await asyncio.wait_for(self.xvfb_proc.wait(), timeout=5)
+            except Exception:
+                try: self.xvfb_proc.kill()
+                except Exception: pass
         await asyncio.sleep(1)
         shutil.rmtree(self.hls_dir, ignore_errors=True)
 
@@ -115,35 +127,34 @@ class NetflixStream:
         )).wait()
 
     async def _start_chrome(self):
-        env = {**os.environ, "DISPLAY": self.display, "HOME": "/root"}
+        """Launch Chrome via Playwright (Patchright) for proper automation."""
+        try:
+            from patchright.async_api import async_playwright
+        except ImportError:
+            from playwright.async_api import async_playwright
+
+        self._playwright = await async_playwright().start()
+
         chrome = shutil.which("google-chrome-stable") or "/opt/google/chrome/google-chrome"
-        data_dir = "/tmp/nf-chrome-shared"  # shared across streams for cookie persistence
+        data_dir = "/tmp/nf-chrome-shared"
         os.makedirs(data_dir, exist_ok=True)
 
-        self.chrome_proc = await asyncio.create_subprocess_exec(
-            chrome,
-            "--no-sandbox", "--disable-gpu", "--window-size=1280,720",
-            "--disable-dev-shm-usage", "--disable-infobars", "--disable-extensions",
-            "--autoplay-policy=no-user-gesture-required",
-            "--disable-features=TranslateUI",
-            f"--remote-debugging-port={self.cdp_port}",
-            f"--user-data-dir={data_dir}",
-            "about:blank",
-            env=env,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        self._browser = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=data_dir,
+            executable_path=chrome,
+            headless=False,
+            args=[
+                "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-features=TranslateUI",
+                f"--remote-debugging-port={self.cdp_port}",
+            ],
+            viewport={"width": 1280, "height": 720},
+            no_viewport=False,
+            ignore_https_errors=True,
         )
-        # Wait for CDP to be ready
-        for attempt in range(30):
-            try:
-                async with httpx.AsyncClient() as c:
-                    r = await c.get(f"http://127.0.0.1:{self.cdp_port}/json/version", timeout=2)
-                    if r.status_code == 200:
-                        logger.info("[NF] CDP ready after %d attempts", attempt + 1)
-                        return
-            except Exception:
-                pass
-            await asyncio.sleep(1)
-        raise RuntimeError("Chrome CDP not ready after 30s")
+        self._page = self._browser.pages[0] if self._browser.pages else await self._browser.new_page()
+        logger.info("[NF] Playwright Chrome launched")
 
     # ── Netflix Automation via CDP ─────────────────────────────────
 
@@ -224,180 +235,78 @@ class NetflixStream:
         raise RuntimeError("No CDP page found after 10 retries")
 
     async def _netflix_login_and_play(self, query: str, email: str, password: str):
-        """Login to Netflix and navigate to content."""
-        ws_url = await self._get_page_ws()
+        """Login to Netflix and navigate to content using Playwright."""
+        page = self._page
 
         # Navigate to Netflix
-        await self._cdp_navigate(ws_url, "https://www.netflix.com/browse")
-        await asyncio.sleep(2)
+        await page.goto("https://www.netflix.com/browse", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(2000)
 
-        # Refresh ws_url after navigation (page might change)
-        ws_url = await self._get_page_ws()
-
-        # Check current URL — are we logged in?
-        current_url = await self._cdp_evaluate(ws_url, "window.location.href")
+        current_url = page.url
         logger.info("[NF] Current URL: %s", current_url)
 
-        # If on login page, do login using CDP + React internal setter
-        if current_url and "/login" in str(current_url):
-            logger.info("[NF] Login required...")
+        # Login if needed
+        if "/login" in current_url:
+            logger.info("[NF] Login required, filling credentials via Playwright...")
 
-            # Use React's internal property setter to set input values
-            # This triggers React's onChange handler properly
-            await self._cdp_evaluate(ws_url, f"""
-                (function() {{
-                    function setReactValue(el, value) {{
-                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value'
-                        ).set;
-                        nativeInputValueSetter.call(el, value);
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    }}
+            # Fill email — try multiple selectors
+            email_input = page.locator('input[name="userLoginId"], input[type="email"], input[data-uia="login-field"]').first
+            await email_input.fill(email)
+            await page.wait_for_timeout(500)
 
-                    // Find email input
-                    var emailInput = document.querySelector('input[name="userLoginId"]')
-                        || document.querySelector('input[type="email"]')
-                        || document.querySelector('input[data-uia="login-field"]')
-                        || document.querySelector('input[autocomplete="email"]')
-                        || document.querySelector('#id_userLoginId');
-                    if (!emailInput) {{
-                        // Try finding any visible input
-                        var inputs = document.querySelectorAll('input[type="text"], input[type="email"], input:not([type])');
-                        for (var i = 0; i < inputs.length; i++) {{
-                            if (inputs[i].offsetParent !== null) {{ emailInput = inputs[i]; break; }}
-                        }}
-                    }}
+            # Click Continue/Sign In
+            submit_btn = page.locator('button:has-text("Continue"), button:has-text("Sign In"), button[type="submit"]').first
+            await submit_btn.click()
+            await page.wait_for_timeout(4000)
 
-                    if (emailInput) {{
-                        emailInput.focus();
-                        setReactValue(emailInput, '{email}');
-                        console.log('EMAIL SET: ' + emailInput.value);
-                    }} else {{
-                        console.log('EMAIL INPUT NOT FOUND');
-                    }}
-                }})();
-            """)
-            await asyncio.sleep(1)
+            # Fill password (may be on new page or same page)
+            pw_input = page.locator('input[name="password"], input[type="password"]').first
+            try:
+                await pw_input.fill(password, timeout=5000)
+                await page.wait_for_timeout(500)
 
-            # Click submit button
-            await self._cdp_evaluate(ws_url, """
-                (function() {
-                    var btns = document.querySelectorAll('button');
-                    for (var i = 0; i < btns.length; i++) {
-                        var text = btns[i].textContent.toLowerCase().trim();
-                        if (text === 'continue' || text === 'sign in' || text === 'next') {
-                            btns[i].click();
-                            return;
-                        }
-                    }
-                    // Fallback: submit any form
-                    var form = document.querySelector('form');
-                    if (form) form.submit();
-                })();
-            """)
-            await asyncio.sleep(4)
+                # Click Sign In
+                sign_in = page.locator('button:has-text("Sign In"), button:has-text("Continue"), button[type="submit"]').first
+                await sign_in.click()
+                await page.wait_for_timeout(6000)
+            except Exception as e:
+                logger.info("[NF] Password step skipped (maybe single-page login): %s", e)
 
-            # Password page
-            ws_url = await self._get_page_ws()
-            await self._cdp_evaluate(ws_url, f"""
-                (function() {{
-                    function setReactValue(el, value) {{
-                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value'
-                        ).set;
-                        nativeInputValueSetter.call(el, value);
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    }}
+            logger.info("[NF] After login: %s", page.url)
 
-                    var pwInput = document.querySelector('input[name="password"]')
-                        || document.querySelector('input[type="password"]')
-                        || document.querySelector('input[data-uia="password-field"]');
-                    if (!pwInput) {{
-                        var inputs = document.querySelectorAll('input[type="password"]');
-                        if (inputs.length > 0) pwInput = inputs[0];
-                    }}
-                    if (pwInput) {{
-                        pwInput.focus();
-                        setReactValue(pwInput, '{password}');
-                    }}
-                }})();
-            """)
-            await asyncio.sleep(1)
+        # Profile picker
+        if "/profiles" in page.url or "browse" in page.url:
+            try:
+                profile = page.locator('.profile-link, .profile-icon, [data-profile-guid], .choose-profile .profile, li.profile a').first
+                await profile.click(timeout=5000)
+                await page.wait_for_timeout(3000)
+                logger.info("[NF] Profile selected")
+            except Exception:
+                logger.info("[NF] No profile picker or already past it")
 
-            # Click sign in
-            await self._cdp_evaluate(ws_url, """
-                (function() {
-                    var btns = document.querySelectorAll('button');
-                    for (var i = 0; i < btns.length; i++) {
-                        var text = btns[i].textContent.toLowerCase().trim();
-                        if (text === 'sign in' || text === 'continue' || text === 'log in') {
-                            btns[i].click();
-                            return;
-                        }
-                    }
-                    var form = document.querySelector('form');
-                    if (form) form.submit();
-                })();
-            """)
-            await asyncio.sleep(6)
-
-            ws_url = await self._get_page_ws()
-            current_url = await self._cdp_evaluate(ws_url, "window.location.href")
-            logger.info("[NF] After login URL: %s", current_url)
-
-        # If on profile picker, click first profile
-        current_url = str(current_url or "")
-        if "/profiles" in current_url or "/browse" in current_url or "Who" in (await self._cdp_evaluate(ws_url, "document.title") or ""):
-            logger.info("[NF] Profile picker detected, clicking first profile...")
-            await asyncio.sleep(2)
-            ws_url = await self._get_page_ws()
-            await self._cdp_evaluate(ws_url, """
-                (function() {
-                    // Try multiple selectors for profile picker
-                    var selectors = [
-                        '.profile-link',
-                        '.profile-icon',
-                        '[data-profile-guid]',
-                        '.choose-profile .profile',
-                        'li.profile a',
-                        '.list-profiles a',
-                        '.list-profiles-container a',
-                    ];
-                    for (var i = 0; i < selectors.length; i++) {
-                        var els = document.querySelectorAll(selectors[i]);
-                        if (els.length > 0) { els[0].click(); return; }
-                    }
-                })();
-            """)
-            await asyncio.sleep(4)
-
-        # Navigate to search for the content
-        ws_url = await self._get_page_ws()
+        # Search for content
         search_url = f"https://www.netflix.com/search?q={quote(query)}"
-        await self._cdp_navigate(ws_url, search_url)
-        await asyncio.sleep(3)
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(3000)
+        logger.info("[NF] Search page: %s", page.url)
 
-        # Click first result to start playing
-        ws_url = await self._get_page_ws()
-        await self._cdp_evaluate(ws_url, """
-            // Click first title card in search results
-            const cards = document.querySelectorAll('.title-card, .slider-item, [data-uia="title-card"]');
-            if (cards.length > 0) {
-                const link = cards[0].querySelector('a') || cards[0];
-                link.click();
-            }
-        """)
-        await asyncio.sleep(2)
+        # Click first result
+        try:
+            card = page.locator('.title-card a, .slider-item a, [data-uia="title-card"] a, .title-card, .boxart-container').first
+            await card.click(timeout=5000)
+            await page.wait_for_timeout(2000)
+        except Exception as e:
+            logger.warning("[NF] Could not click search result: %s", e)
 
-        # Try to click play button if visible
-        ws_url = await self._get_page_ws()
-        await self._cdp_evaluate(ws_url, """
-            const playBtn = document.querySelector('[data-uia="play-button"], .playLink, .maturity-rating-overlay button');
-            if (playBtn) playBtn.click();
-        """)
-        await asyncio.sleep(2)
+        # Click play button if visible
+        try:
+            play_btn = page.locator('[data-uia="play-button"], .playLink, a[href*="/watch/"]').first
+            await play_btn.click(timeout=3000)
+            await page.wait_for_timeout(2000)
+        except Exception:
+            pass
+
+        logger.info("[NF] Final URL: %s", page.url)
 
     # ── FFmpeg ─────────────────────────────────────────────────────
 
