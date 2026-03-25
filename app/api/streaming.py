@@ -145,3 +145,50 @@ async def get_credential_internal(
         raise HTTPException(status_code=404, detail=f"No {channel} credentials found")
 
     return {"channel": cred.channel, "email": cred.email, "password": cred.password}
+
+
+@router.get("/netflix-search")
+async def netflix_search(
+    q: str = Query(...),
+    x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
+):
+    """Search for a Netflix title ID. Tries Google → DuckDuckGo → fallback."""
+    import re
+    import httpx as _httpx
+
+    if not x_agent_key:
+        raise HTTPException(status_code=401, detail="X-Agent-Key required")
+
+    ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36"
+    netflix_id = None
+    title = q
+
+    async with _httpx.AsyncClient(timeout=12, follow_redirects=True, headers={"User-Agent": ua}) as client:
+        # Try 1: Google
+        try:
+            resp = await client.get("https://www.google.com/search", params={"q": f"{q} site:netflix.com", "num": 5})
+            ids = re.findall(r'netflix\.com/(?:title|watch)/(\d+)', resp.text)
+            if ids:
+                netflix_id = ids[0]
+                tm = re.search(r'(?:Watch |)([^<]+?)(?:\s*[|–-])\s*Netflix', resp.text)
+                if tm:
+                    import html as _html
+                    title = _html.unescape(tm.group(1).strip())
+        except Exception:
+            pass
+
+        # Try 2: DuckDuckGo
+        if not netflix_id:
+            try:
+                resp = await client.get("https://html.duckduckgo.com/html/", params={"q": f"{q} site:netflix.com"})
+                ids = re.findall(r'netflix\.com/(?:title|watch)/(\d+)', resp.text)
+                if ids:
+                    netflix_id = ids[0]
+                    tm = re.search(r'class="result__a"[^>]*>(?:Watch\s+)?([^<|]+?)(?:\s*[|\-–])\s*Netflix', resp.text)
+                    if tm:
+                        import html as _html
+                        title = _html.unescape(tm.group(1).strip())
+            except Exception:
+                pass
+
+    return {"netflix_id": netflix_id, "title": title}

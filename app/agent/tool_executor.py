@@ -2381,9 +2381,10 @@ class ToolExecutor:
         return f"Now playing \"{video_title}\"\nhttps://www.youtube.com/watch?v={video_id}"
 
     async def _play_netflix(self, query: str) -> str:
-        """Stream Netflix content via VPS Chrome + FFmpeg → HLS."""
+        """Find Netflix content and auto-open it in user's browser."""
         import re as _re
         import httpx
+        from urllib.parse import quote
 
         user_id = self._current_user_id
         if not user_id:
@@ -2406,74 +2407,52 @@ class ToolExecutor:
                 '', query, flags=_re.IGNORECASE
             ).strip()
             clean_query = _re.sub(r'\s+', ' ', clean_query).strip()
-            if season_num and episode_num:
-                search_query = f"{clean_query} season {season_num} episode {episode_num}"
-            elif season_num:
-                search_query = f"{clean_query} season {season_num}"
-            else:
-                search_query = clean_query
 
-            title = clean_query
             episode_info = ""
             if season_num and episode_num:
                 episode_info = f" — Season {season_num}, Episode {episode_num}"
             elif season_num:
                 episode_info = f" — Season {season_num}"
 
-            # Fetch Netflix credentials from platform
+            # Search Netflix via platform (Google → DuckDuckGo fallback)
             from app.config import settings as _settings
             platform_url = getattr(_settings, 'platform_api_url', 'https://toup.ai/api')
             agent_key = getattr(_settings, 'agent_api_key', '')
 
-            cred_email, cred_password = "", ""
-            if agent_key:
-                try:
-                    async with httpx.AsyncClient(timeout=10) as c:
-                        r = await c.get(
-                            f"{platform_url}/streaming/credentials/internal/netflix",
-                            params={"user_id": user_id},
-                            headers={"X-Agent-Key": agent_key},
-                        )
-                    if r.status_code == 200:
-                        d = r.json()
-                        cred_email = d.get("email", "")
-                        cred_password = d.get("password", "")
-                except Exception as e:
-                    logger.warning("[play_netflix] Cred fetch: %s", e)
+            netflix_id = None
+            title = clean_query
 
-            if not cred_email:
-                return "Netflix not connected. Ask the user to connect Netflix on the Movies page."
-
-            # Start HLS stream (Chrome → Netflix → FFmpeg → HLS)
-            stream_id = f"nf-{hash(search_query) % 100000}"
-            hls_url = ""
-            try:
-                from app.services.netflix_stream import start_netflix_stream
-                await start_netflix_stream(
-                    stream_id=stream_id,
-                    netflix_url=search_query,  # pass search query, not URL
-                    email=cred_email,
-                    password=cred_password,
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(
+                    f"{platform_url}/streaming/netflix-search",
+                    params={"q": clean_query},
+                    headers={"X-Agent-Key": agent_key},
                 )
-                hls_url = f"/api/netflix-stream/{stream_id}/stream.m3u8"
-                logger.info("[play_netflix] Stream ready: %s", hls_url)
-            except Exception as e:
-                logger.exception("[play_netflix] Stream failed: %s", e)
+                if r.status_code == 200:
+                    data = r.json()
+                    netflix_id = data.get("netflix_id")
+                    title = data.get("title") or clean_query
 
-            # Broadcast to frontend
+            # Build URL
+            if netflix_id:
+                netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
+            else:
+                netflix_url = f"https://www.netflix.com/search?q={quote(clean_query)}"
+
+            # Auto-open in user's browser + show card in chat
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(user_id, {
-                "type": "netflix_stream",
+                "type": "netflix_card",
                 "title": f"{title}{episode_info}",
-                "stream_id": stream_id,
-                "hls_url": hls_url,
-                "fallback_url": f"https://www.netflix.com/search?q={clean_query.replace(' ', '+')}",
+                "netflix_id": netflix_id or "",
+                "url": netflix_url,
+                "media_type": "tv" if season_num else "movie",
             })
 
-            if hls_url:
-                return f"Now streaming \"{title}\"{episode_info} from Netflix in the Toup player."
+            if netflix_id:
+                return f"Now playing \"{title}\"{episode_info} on Netflix.\n{netflix_url}"
             else:
-                return f"Netflix stream couldn't start. Opening Netflix in your browser instead."
+                return f"Opening Netflix search for \"{clean_query}\". The show should appear as the first result."
 
         except Exception as e:
             logger.warning("[play_netflix] Error: %s", e)
