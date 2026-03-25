@@ -2434,6 +2434,8 @@ class ToolExecutor:
                     title = data.get("title") or clean_query
 
             # If specific season/episode requested, look up the episode ID
+            logger.info("[play_netflix] Search result: id=%s title=%s season=%s ep=%s", netflix_id, title, season_num, episode_num)
+
             if netflix_id and season_num and episode_num:
                 try:
                     # Fetch Netflix credentials
@@ -2469,13 +2471,16 @@ class ToolExecutor:
                                 netflix_id = ep_id
                                 logger.info("[play_netflix] Episode ID: %s", netflix_id)
                 except Exception as e:
-                    logger.warning("[play_netflix] Episode lookup failed: %s", e)
+                    logger.exception("[play_netflix] Episode lookup failed: %s", e)
 
-            # Build URL
+            # Build URL — always use /watch/ if we have an ID, never /search/
             if netflix_id:
                 netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
+                logger.info("[play_netflix] Using watch URL: %s", netflix_url)
             else:
+                # Fallback: use /title/ search page (NOT /search?q= which doesn't autoplay)
                 netflix_url = f"https://www.netflix.com/search?q={quote(clean_query)}"
+                logger.warning("[play_netflix] No ID found, using search: %s", netflix_url)
 
             # Auto-open in user's browser + show card in chat
             from app.api.ws_chat import broadcast_to_user
