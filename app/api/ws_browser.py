@@ -2171,6 +2171,163 @@ async def _run_browser_agent_inner(
 # Screenshot / state helpers
 # ---------------------------------------------------------------------------
 
+async def _netflix_silent_login(page, user_id: str, content_url: str):
+    """Silently login to Netflix and navigate to content — no screenshots sent.
+
+    1. Navigate to Netflix login page
+    2. Check if already logged in (redirects to browse)
+    3. If not, fill credentials from DB and submit
+    4. Handle profile selection
+    5. Navigate to the target content URL
+    """
+    try:
+        # First, go to Netflix homepage to check login state
+        await page.goto("https://www.netflix.com/browse", wait_until="domcontentloaded", timeout=15_000)
+        await asyncio.sleep(2)
+
+        current_url = page.url
+        logger.info("[NETFLIX-SILENT] After /browse, landed on: %s", current_url)
+
+        # If we're on browse page, we're logged in
+        if "/browse" in current_url and "/login" not in current_url:
+            logger.info("[NETFLIX-SILENT] Already logged in!")
+            # Handle profile selector if shown
+            profile = await page.query_selector('.profile-icon, .profile-link, [data-profile-guid]')
+            if profile:
+                await profile.click()
+                await asyncio.sleep(2)
+            # Navigate to content
+            await page.goto(content_url, wait_until="domcontentloaded", timeout=20_000)
+            await asyncio.sleep(2)
+            return
+
+        # Not logged in — fetch credentials
+        email, password = await _get_netflix_credentials(user_id)
+        if not email or not password:
+            logger.warning("[NETFLIX-SILENT] No credentials — navigating to content URL as-is")
+            await page.goto(content_url, wait_until="domcontentloaded", timeout=20_000)
+            await asyncio.sleep(2)
+            return
+
+        logger.info("[NETFLIX-SILENT] Logging in as %s", email)
+
+        # Navigate to login page
+        await page.goto("https://www.netflix.com/login", wait_until="networkidle", timeout=20_000)
+        await asyncio.sleep(3)
+
+        # Fill email
+        for selector in ['[name="userLoginId"]', '[data-uia="login-field"]', 'input[type="email"]', 'input[autocomplete="email"]']:
+            el = await page.query_selector(selector)
+            if el:
+                await el.click()
+                await el.fill("")
+                await el.type(email, delay=30)
+                logger.info("[NETFLIX-SILENT] Email filled via %s", selector)
+                break
+
+        await asyncio.sleep(0.5)
+
+        # Netflix may have a "Continue" button before password (two-step login)
+        continue_btn = await page.query_selector('button:has-text("Continue"), button:has-text("Next")')
+        if continue_btn:
+            await continue_btn.click()
+            await asyncio.sleep(2)
+
+        # Fill password
+        for selector in ['[name="password"]', '[data-uia="password-field"]', 'input[type="password"]']:
+            el = await page.query_selector(selector)
+            if el:
+                await el.click()
+                await el.fill("")
+                await el.type(password, delay=30)
+                logger.info("[NETFLIX-SILENT] Password filled via %s", selector)
+                break
+
+        await asyncio.sleep(0.5)
+
+        # Click sign in
+        for selector in ['[data-uia="login-submit-button"]', 'button[type="submit"]', 'button:has-text("Sign In")']:
+            btn = await page.query_selector(selector)
+            if btn:
+                await btn.click()
+                logger.info("[NETFLIX-SILENT] Clicked sign-in via %s", selector)
+                break
+
+        # Wait for login to complete
+        try:
+            await page.wait_for_url("**/browse**", timeout=15_000)
+            logger.info("[NETFLIX-SILENT] Login successful")
+        except Exception:
+            await asyncio.sleep(5)
+            logger.info("[NETFLIX-SILENT] Post-login URL: %s", page.url)
+
+        # Handle profile selector
+        await asyncio.sleep(1)
+        profile = await page.query_selector('.profile-icon, .profile-link, [data-profile-guid], .choose-profile .profile')
+        if profile:
+            logger.info("[NETFLIX-SILENT] Clicking first profile")
+            await profile.click()
+            await asyncio.sleep(3)
+
+        # Navigate to the content
+        logger.info("[NETFLIX-SILENT] Navigating to content: %s", content_url)
+        await page.goto(content_url, wait_until="domcontentloaded", timeout=20_000)
+        await asyncio.sleep(2)
+        logger.info("[NETFLIX-SILENT] Done — page: %s", page.url)
+
+    except Exception as e:
+        logger.warning("[NETFLIX-SILENT] Failed: %s — falling back to content URL", e, exc_info=True)
+        try:
+            await page.goto(content_url, wait_until="domcontentloaded", timeout=15_000)
+        except Exception:
+            pass
+
+
+async def _get_netflix_credentials(user_id: str) -> tuple:
+    """Fetch Netflix email/password for a user. Returns (email, password) or ('', '')."""
+    # Method 1: Direct DB access (platform side)
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import StreamingCredential
+        from sqlalchemy import select, and_
+
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(StreamingCredential).where(
+                    and_(
+                        StreamingCredential.user_id == user_id,
+                        StreamingCredential.channel == "netflix",
+                    )
+                )
+            )
+            cred = result.scalar_one_or_none()
+            if cred and cred.email and cred.password:
+                logger.info("[NETFLIX] Got credentials from DB for %s", cred.email)
+                return (cred.email, cred.password)
+    except Exception as e:
+        logger.info("[NETFLIX] DB lookup failed: %s", e)
+
+    # Method 2: HTTP fallback (agent side)
+    try:
+        import httpx
+        from app.config import settings
+        platform_url = getattr(settings, 'platform_api_url', 'https://toup.ai/api')
+        agent_key = getattr(settings, 'agent_api_key', '')
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{platform_url}/streaming/credentials/internal/netflix",
+                params={"user_id": user_id},
+                headers={"X-Agent-Key": agent_key},
+            )
+            if r.status_code == 200:
+                creds = r.json()
+                return (creds.get("email", ""), creds.get("password", ""))
+    except Exception as e:
+        logger.info("[NETFLIX] HTTP credential fetch failed: %s", e)
+
+    return ("", "")
+
+
 async def _netflix_auto_login(page, user_id: str, websocket: WebSocket, overlay):
     """Auto-login to Netflix if the page shows a sign-in state.
 
@@ -2591,18 +2748,31 @@ async def ws_browser(
                         continue
                     url = data.get("url", "about:blank")
                     ctx = await get_stealth_context()
-                    tab_id = await tab_manager.open_tab(ctx, url,
-                                                        viewport={"width": 1280, "height": 720})
-                    active_page = tab_manager.get_tab(tab_id)
-                    overlay = AgentOverlay(active_page, websocket)
-                    await overlay.inject()
-                    await _send_state(websocket, active_page, tab_manager)
-                    await asyncio.sleep(0.5)
-                    await _send_screenshot(websocket, active_page, overlay)
 
-                    # Auto-login to Netflix if not signed in
+                    # For Netflix: silently login first, then show content
                     if "netflix.com" in url:
-                        await _netflix_auto_login(active_page, user_id, websocket, overlay)
+                        # Send a loading state while we handle auth
+                        await websocket.send_json({"type": "narration", "text": "Loading Netflix..."})
+                        tab_id = await tab_manager.open_tab(ctx, "about:blank",
+                                                            viewport={"width": 1280, "height": 720})
+                        active_page = tab_manager.get_tab(tab_id)
+                        overlay = AgentOverlay(active_page, websocket)
+                        # Do silent login (no screenshots sent during login)
+                        await _netflix_silent_login(active_page, user_id, url)
+                        # Now show the content page
+                        await overlay.inject()
+                        await _send_state(websocket, active_page, tab_manager)
+                        await asyncio.sleep(0.5)
+                        await _send_screenshot(websocket, active_page, overlay)
+                    else:
+                        tab_id = await tab_manager.open_tab(ctx, url,
+                                                            viewport={"width": 1280, "height": 720})
+                        active_page = tab_manager.get_tab(tab_id)
+                        overlay = AgentOverlay(active_page, websocket)
+                        await overlay.inject()
+                        await _send_state(websocket, active_page, tab_manager)
+                        await asyncio.sleep(0.5)
+                        await _send_screenshot(websocket, active_page, overlay)
 
                 elif action == "navigate":
                     if not browser_available:
