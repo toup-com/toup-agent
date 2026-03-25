@@ -2433,6 +2433,44 @@ class ToolExecutor:
                     netflix_id = data.get("netflix_id")
                     title = data.get("title") or clean_query
 
+            # If specific season/episode requested, look up the episode ID
+            if netflix_id and season_num and episode_num:
+                try:
+                    # Fetch Netflix credentials
+                    cred_email, cred_password = "", ""
+                    async with httpx.AsyncClient(timeout=10) as c:
+                        cr = await c.get(
+                            f"{platform_url}/streaming/credentials/internal/netflix",
+                            params={"user_id": user_id},
+                            headers={"X-Agent-Key": agent_key},
+                        )
+                    if cr.status_code == 200:
+                        cd = cr.json()
+                        cred_email, cred_password = cd.get("email", ""), cd.get("password", "")
+
+                    if cred_email:
+                        # Call VPS episode lookup (Playwright scrapes Netflix show page)
+                        async with httpx.AsyncClient(timeout=90) as c:
+                            ep_resp = await c.post(
+                                "http://localhost:8001/api/netflix-stream/episode-lookup",
+                                headers={"X-Agent-Key": agent_key},
+                                json={
+                                    "show_id": netflix_id,
+                                    "season": season_num,
+                                    "episode": episode_num,
+                                    "email": cred_email,
+                                    "password": cred_password,
+                                },
+                                timeout=90,
+                            )
+                        if ep_resp.status_code == 200:
+                            ep_id = ep_resp.json().get("episode_id")
+                            if ep_id and ep_id != netflix_id:
+                                netflix_id = ep_id
+                                logger.info("[play_netflix] Episode ID: %s", netflix_id)
+                except Exception as e:
+                    logger.warning("[play_netflix] Episode lookup failed: %s", e)
+
             # Build URL
             if netflix_id:
                 netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
