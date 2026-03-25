@@ -835,7 +835,20 @@ class AgentRunner:
                 "2. Do NOT just provide links — actually play it with the tool.\n"
                 "3. For Netflix content, use `play_media(query=\"MOVIE NAME\", channel=\"netflix\")`.\n"
                 "4. Default channel is YouTube (free, no login needed).\n"
-                "5. After calling play_media, tell the user what's playing."
+                "5. After calling play_media, tell the user what's playing.\n\n"
+                "## Netflix Suggestions\n"
+                "When you suggest or recommend Netflix titles (movies or shows), ALWAYS make each suggestion "
+                "a clickable button so the user can play it with one click. Use the [[Play TITLE on Netflix]] format.\n"
+                "Example:\n"
+                "Here are some great serial killer documentaries on Netflix:\n\n"
+                "- **Conversations with a Killer: The Ted Bundy Tapes** — chilling interviews\n"
+                "[[Play Conversations with a Killer on Netflix]]\n"
+                "- **Night Stalker** — about Richard Ramirez\n"
+                "[[Play Night Stalker on Netflix]]\n"
+                "- **Dahmer – Monster** — the Ryan Murphy series\n"
+                "[[Play Dahmer Monster on Netflix]]\n\n"
+                "When the user clicks one of these buttons, you will receive their choice as a message. "
+                "Immediately call `play_media(query=\"TITLE\", channel=\"netflix\")` to play it."
             )
 
         # ── 6. Runtime context ─────────────────────────────────────
@@ -853,21 +866,21 @@ class AgentRunner:
         section_parts["runtime"] = "\n".join(runtime_lines)
 
         # ── 7. Formatting rules (channel-aware) ───────────────────
-        if _channel_label == "app":
+        if _channel_label in ("app", "web"):
             section_parts["formatting"] = (
                 "# Formatting Rules\n"
-                "You are chatting with the user inside their app. Follow these rules:\n"
+                "You are chatting with the user inside their " + ("app" if _channel_label == "app" else "web browser") + ". Follow these rules:\n"
                 "- Use simple Markdown: **bold**, *italic*, `code`.\n"
                 "- Do NOT use LaTeX math formatting.\n"
                 "- Use plain Unicode symbols for math: × ÷ √ → ⇒ ≤ ≥ ≠ ≈ ∞ π.\n"
                 "- Keep responses concise and conversational.\n"
                 "- Do NOT expose internal implementation details (databases, bridges, connections, file paths, error traces).\n"
-                "- When the user greets you, greet them back warmly and offer to help with the app.\n"
+                "- When the user greets you, greet them back warmly and offer to help.\n"
                 "- You have editing capabilities: you can modify the app's files, database, and navigation using your tools.\n\n"
                 "# Action Buttons\n"
                 "You can offer clickable action buttons by including [[Label]] markers in your response.\n"
                 "These render as tappable chips in the chat UI. When the user taps one, it sends that label as a message.\n"
-                "CRITICAL PLACEMENT RULE: Place [[option]] buttons DIRECTLY on the line after each question.\n"
+                "CRITICAL PLACEMENT RULE: Place [[option]] buttons DIRECTLY on the line after each question or suggestion.\n"
                 "NEVER collect all buttons at the end of the message. Each question gets its own buttons immediately below it.\n\n"
                 "CORRECT:\n"
                 "1. **Question one?**\n"
