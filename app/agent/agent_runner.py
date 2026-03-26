@@ -36,6 +36,9 @@ from app.agent.context_manager import (
 from app.agent.tool_definitions import get_agent_tools, get_extended_tools
 from app.agent.tool_executor import ToolExecutor
 from app.agent.skills.loader import SkillLoader
+from app.agent.query_intent import (
+    classify_query_intent, filter_tools_by_intent, QueryIntent, INTENT_FULL,
+)
 from app.config import settings
 from app.services.openai_agent_service import OpenAIAgentService, StreamEvent
 from app.services.anthropic_service import AnthropicService
@@ -137,6 +140,15 @@ class AgentRunner:
         start = time.time()
         logger.info(f"[AGENT] === New agent run for user_id={user_id} ===")
 
+        # ── Classify query intent (lightweight, <1ms) ─────────────────
+        t_classify = time.perf_counter()
+        query_intent = classify_query_intent(user_message)
+        logger.info(
+            f"[PERF] query_intent: {(time.perf_counter() - t_classify) * 1000:.1f}ms → "
+            f"category={query_intent.category}, skip_memory={query_intent.skip_memory_retrieval}, "
+            f"tools={len(query_intent.tool_names) or 'all'}"
+        )
+
         # Set user context for memory tools and current chat
         self.tools.set_user_id(user_id)
         self.tools.set_chat_id(telegram_chat_id)
@@ -172,11 +184,15 @@ class AgentRunner:
         from app.db.database import async_session_maker
 
         # ── Phase 1: Load from DB (short-lived session) ──────────
+        t_phase1 = time.perf_counter()
         async with async_session_maker() as db:
+            t_db = time.perf_counter()
             session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel)
             session_id = session.id
+            logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
             # Load user's disabled tools from AgentConfig
+            t_db = time.perf_counter()
             from sqlalchemy import select as _select
             from app.db import AgentConfig
             _ac_result = await db.execute(
@@ -187,17 +203,21 @@ class AgentRunner:
                 import json as _json
                 _user_disabled = set(_json.loads(_ac.disabled_tools))
                 self.tools.user_disabled_tools = _user_disabled
-                # Also hide disabled tools from LLM so it doesn't try to call them
                 self._disabled_tool_names = _user_disabled
             else:
                 self.tools.user_disabled_tools = set()
                 self._disabled_tool_names = set()
+            logger.info(f"[PERF] load_agent_config: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
-            system_prompt = await self._build_system_prompt(db, user_id, user_message, channel=channel)
-            logger.info(f"[AGENT] System prompt length: {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
+            t_prompt = time.perf_counter()
+            system_prompt = await self._build_system_prompt(db, user_id, user_message, channel=channel, intent=query_intent)
+            logger.info(f"[PERF] build_system_prompt: {(time.perf_counter() - t_prompt) * 1000:.0f}ms — {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
 
+            t_db = time.perf_counter()
             history = await self._load_history(db, session_id)
+            logger.info(f"[PERF] load_history: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages")
             await db.commit()
+        logger.info(f"[PERF] phase1_total: {(time.perf_counter() - t_phase1) * 1000:.0f}ms")
         # DB session closed — no connection held during LLM calls
 
         # Prepare messages
@@ -243,6 +263,17 @@ class AgentRunner:
             active_model = model_override
 
         active_llm = self.anthropic if _is_claude_model(active_model) else self.llm
+
+        # ── Filter tools by query intent ──────────────────────────────
+        # First iteration uses intent-filtered tools. If the LLM requests
+        # tools and we loop back, escalate to full toolset so the agent
+        # isn't artificially constrained mid-conversation.
+        all_tools = self.tool_defs
+        filtered_tools = filter_tools_by_intent(all_tools, query_intent)
+        current_tools = filtered_tools
+        logger.info(
+            f"[PERF] tool_filter: {len(all_tools)} total → {len(current_tools)} for intent={query_intent.category}"
+        )
         logger.info(f"[AGENT] Using {active_model} via {'Anthropic' if _is_claude_model(active_model) else 'OpenAI'} with {len(messages)} messages")
 
         for iteration in range(self.max_iterations):
@@ -257,11 +288,13 @@ class AgentRunner:
                     text_buf = ""
                     pending_tool_calls = []
                     stop_reason = ""
+                    _t_llm_start = time.perf_counter()
+                    _t_first_token = None
 
                     async for event in active_llm.create_message_stream(
                         messages=messages,
                         system=system_prompt,
-                        tools=self.tool_defs,
+                        tools=current_tools or None,
                         model=active_model,
                         thinking_budget=thinking_budget if _is_claude_model(active_model) else 0,
                     ):
@@ -270,6 +303,9 @@ class AgentRunner:
                             raise asyncio.CancelledError("Generation cancelled by user")
 
                         if event.type == "text":
+                            if _t_first_token is None:
+                                _t_first_token = time.perf_counter()
+                                logger.info(f"[PERF] llm_ttft: {(_t_first_token - _t_llm_start) * 1000:.0f}ms (iteration {iteration + 1})")
                             text_buf += event.text
                             if on_text_chunk:
                                 await on_text_chunk(event.text)
@@ -294,6 +330,11 @@ class AgentRunner:
                             total_output += event.usage.get("output_tokens", 0)
                             model_used = active_model
 
+                    logger.info(
+                        f"[PERF] llm_total: {(time.perf_counter() - _t_llm_start) * 1000:.0f}ms "
+                        f"(iteration {iteration + 1}, in={event.usage.get('input_tokens', 0)}, "
+                        f"out={event.usage.get('output_tokens', 0)}, stop={stop_reason})"
+                    )
                     break  # Success
 
                 except asyncio.CancelledError:
@@ -315,7 +356,7 @@ class AgentRunner:
                                 async for event in fallback_llm.create_message_stream(
                                     messages=messages,
                                     system=system_prompt,
-                                    tools=self.tool_defs,
+                                    tools=current_tools or None,
                                     model=fallback,
                                     thinking_budget=thinking_budget if _is_claude_model(fallback) else 0,
                                 ):
@@ -394,12 +435,14 @@ class AgentRunner:
                 all_tool_calls.append(tc)
                 await _hb.emit(HookEvent.BEFORE_TOOL_CALL, {"tool": tc["name"], "input": tc["input"]})
 
+                _t_tool = time.perf_counter()
                 try:
                     result = await self.tools.execute(tc["name"], tc["input"])
                 except Exception as e:
                     logger.exception(f"[AGENT] Tool {tc['name']} crashed")
                     result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
 
+                logger.info(f"[PERF] tool_exec({tc['name']}): {(time.perf_counter() - _t_tool) * 1000:.0f}ms — {len(result)} chars")
                 logger.info(f"[AGENT] Tool result: {result[:200]}")
                 await _hb.emit(HookEvent.AFTER_TOOL_CALL, {"tool": tc["name"], "result_len": len(result)})
                 if on_tool_end:
@@ -413,6 +456,12 @@ class AgentRunner:
                 })
 
             messages.append({"role": "user", "content": tool_results})
+
+            # After first tool use, escalate to full toolset for subsequent iterations
+            # so the agent isn't constrained if it discovers it needs more tools
+            if current_tools is not all_tools and query_intent.category != "full":
+                current_tools = all_tools
+                logger.info(f"[AGENT] Escalated to full toolset ({len(all_tools)} tools) after tool use")
 
             # ── Mid-loop context compaction ──────────────────────
             # Check if context is getting large and compact if needed.
@@ -453,6 +502,7 @@ class AgentRunner:
                 final_text = text_buf or "I've reached the maximum number of tool iterations. Here's what I have so far."
 
         # ── Phase 3: Save to DB (short-lived session) ────────────
+        t_phase3 = time.perf_counter()
         # Save messages synchronously (fast, needed for conversation continuity)
         async with async_session_maker() as db:
             await self._save_messages(
@@ -468,6 +518,7 @@ class AgentRunner:
                 save_user_message=save_user_message,
             )
             await db.commit()
+        logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
 
         # ── Phase 3b: Background tasks (memory extraction, feedback) ──
         # These are slow (LLM calls) — run in background so response returns immediately
@@ -509,7 +560,11 @@ class AgentRunner:
 
         elapsed = int((time.time() - start) * 1000)
         logger.info(f"[AGENT] Response: {final_text[:100]}...")
-        logger.info(f"[AGENT] Tokens: in={total_input} out={total_output} | Tools: {len(all_tool_calls)} | Time: {elapsed}ms")
+        logger.info(
+            f"[PERF] agent_run_total: {elapsed}ms | intent={query_intent.category} "
+            f"| tools_sent={len(current_tools)} | in={total_input} out={total_output} "
+            f"| tool_calls={len(all_tool_calls)}"
+        )
 
         # Hook: agent run complete
         await _hb.emit(HookEvent.AGENT_END, {
@@ -606,8 +661,14 @@ class AgentRunner:
         user_id: str,
         user_message: str,
         channel: Optional[str] = None,
+        intent: Optional[QueryIntent] = None,
     ) -> str:
         """Build a rich system prompt from identities + memories + runtime context.
+
+        The `intent` parameter controls which sections are included:
+        - Greetings/questions: skip memory retrieval, skills, environment, media
+        - Code/full: include everything
+        This reduces system prompt token count and thus LLM TTFT.
 
         Section order (most → least behavioral influence):
           1. Core Identity (soul)
@@ -618,6 +679,8 @@ class AgentRunner:
           6. Formatting Rules (channel-specific)
           7. Onboarding (CONDITIONAL — only if not completed)
         """
+        if intent is None:
+            intent = INTENT_FULL
         from sqlalchemy import select, and_
         from app.db.models import Identity, IdentityType
 
@@ -704,109 +767,134 @@ class AgentRunner:
                 logger.warning(f"Work brain load failed: {e}")
 
         # ── 3. Retrieve relevant user memories (hybrid search) ──────
-        try:
-            from app.services.memory_service import MemoryService
-            from app.services.query_classifier import classify_query
-
-            mem_svc = MemoryService(db)
-            classification = classify_query(user_message)
-            logger.info(f'[AGENT] Query classified as: {classification["type"]} — searching user memories for: "{user_message[:80]}"')
-
-            search_strategies = classification.get("strategies") or ["vector", "keyword", "graph"]
-            search_categories = classification.get("categories")
-
-            memories = await mem_svc.hybrid_search(
-                user_id=user_id, query=user_message, limit=15,
-                min_similarity=0.1, strategies=search_strategies,
-                categories=search_categories,
-            )
-            if classification.get("entity_hint"):
-                try:
-                    entity_mems = await mem_svc.search_by_entity_graph(
-                        user_id=user_id, entity_name=classification["entity_hint"],
-                        depth=2, limit=5,
-                    )
-                    existing_ids = {m["id"] for m in memories}
-                    for em in entity_mems:
-                        if em["id"] not in existing_ids:
-                            memories.insert(0, em)
-                    if entity_mems:
-                        logger.info(f"[AGENT] Entity search for '{classification['entity_hint']}' added {len(entity_mems)} results")
-                except Exception as e:
-                    logger.warning(f"Entity graph search failed: {e}")
-
-            user_memories = [m for m in memories if m.get("brain_type") == "user"]
-            self._last_retrieved_memories = user_memories
-            logger.info(f"[AGENT] Found {len(user_memories)} relevant user memories (hybrid)")
-
+        t_memory = time.perf_counter()
+        if intent.skip_memory_retrieval:
+            logger.info(f"[PERF] memory_retrieval: SKIPPED (intent={intent.category})")
+            user_memories = []
+            self._last_retrieved_memories = []
             memory_sections = []
 
-            # A. User Portrait
+            # Still load portrait from cache (fast, no LLM call)
             try:
-                from app.services.user_portrait_service import UserPortraitService
-                portrait_svc = UserPortraitService(db)
-                portrait = await portrait_svc.get_or_build_portrait(user_id)
+                from app.services.user_portrait_service import get_cached_portrait
+                portrait = get_cached_portrait(user_id)
                 if portrait:
                     memory_sections.append(f"## Who this user is\n{portrait}")
-                    logger.info(f"[AGENT] Portrait loaded ({len(portrait)} chars)")
-            except Exception as e:
-                logger.warning(f"Portrait generation failed: {e}")
-
-            if user_memories:
-                # B. Core facts
-                core_facts = [
-                    m for m in user_memories
-                    if m.get("strength", 0) >= 0.7
-                    and m.get("memory_type") not in ("event", "conversation")
-                ]
-                if core_facts:
-                    memory_sections.append("## Core facts about this user")
-                    for m in core_facts[:5]:
-                        memory_sections.append(f"- {m.get('content', '')}")
-
-                # C. Relevant memories
-                core_ids = {m.get("id") for m in core_facts}
-                regular = [m for m in user_memories if m.get("id") not in core_ids]
-                if regular:
-                    memory_sections.append("\n## Relevant to this conversation")
-                    for i, m in enumerate(regular[:10], 1):
-                        cat = m.get("category", "")
-                        content = m.get("content", "")
-                        age = self._format_memory_age(m.get("created_at"))
-                        memory_sections.append(f"{i}. [{cat}] {content} ({age})")
-
-                for m in user_memories:
-                    score = m.get("similarity_score", 0)
-                    logger.info(f"[AGENT]   Memory: [{m.get('category','')}] ({score:.2f}) {m.get('content','')[:80]}")
-
-            # D. Related entities
-            try:
-                entity_data = await mem_svc.get_entities(user_id=user_id, limit=8)
-                if entity_data:
-                    entity_lines = ["\n## People and things the user has mentioned"]
-                    for e in entity_data[:8]:
-                        desc = e.get("entity_type", "")
-                        name = e.get("name", "")
-                        if name:
-                            entity_lines.append(f"- {name} ({desc})")
-                    if len(entity_lines) > 1:
-                        memory_sections.append("\n".join(entity_lines))
             except Exception:
                 pass
+        else:
+            memory_sections = []
+            try:
+                from app.services.memory_service import MemoryService
+                from app.services.query_classifier import classify_query
 
-            if memory_sections:
-                section_parts["user_brain"] = "# User Brain\n" + "\n".join(memory_sections)
-        except Exception as e:
-            logger.warning(f"Memory retrieval failed in agent prompt: {e}")
+                mem_svc = MemoryService(db)
+                classification = classify_query(user_message)
+                logger.info(f'[AGENT] Query classified as: {classification["type"]} — searching user memories for: "{user_message[:80]}"')
 
-        # ── 4. Skills ──────────────────────────────────────────────
-        if self.skill_loader:
+                search_strategies = classification.get("strategies") or ["vector", "keyword", "graph"]
+                search_categories = classification.get("categories")
+
+                memories = await mem_svc.hybrid_search(
+                    user_id=user_id, query=user_message, limit=15,
+                    min_similarity=0.1, strategies=search_strategies,
+                    categories=search_categories,
+                )
+                if classification.get("entity_hint"):
+                    try:
+                        entity_mems = await mem_svc.search_by_entity_graph(
+                            user_id=user_id, entity_name=classification["entity_hint"],
+                            depth=2, limit=5,
+                        )
+                        existing_ids = {m["id"] for m in memories}
+                        for em in entity_mems:
+                            if em["id"] not in existing_ids:
+                                memories.insert(0, em)
+                        if entity_mems:
+                            logger.info(f"[AGENT] Entity search for '{classification['entity_hint']}' added {len(entity_mems)} results")
+                    except Exception as e:
+                        logger.warning(f"Entity graph search failed: {e}")
+
+                user_memories = [m for m in memories if m.get("brain_type") == "user"]
+                self._last_retrieved_memories = user_memories
+                logger.info(f"[AGENT] Found {len(user_memories)} relevant user memories (hybrid)")
+
+                # A. User Portrait (non-blocking — returns cache or empty)
+                try:
+                    from app.services.user_portrait_service import UserPortraitService
+                    portrait_svc = UserPortraitService(db)
+                    portrait = await portrait_svc.get_or_build_portrait(user_id)
+                    if portrait:
+                        memory_sections.append(f"## Who this user is\n{portrait}")
+                        logger.info(f"[AGENT] Portrait loaded ({len(portrait)} chars)")
+                except Exception as e:
+                    logger.warning(f"Portrait generation failed: {e}")
+
+                if user_memories:
+                    # B. Core facts
+                    core_facts = [
+                        m for m in user_memories
+                        if m.get("strength", 0) >= 0.7
+                        and m.get("memory_type") not in ("event", "conversation")
+                    ]
+                    if core_facts:
+                        memory_sections.append("## Core facts about this user")
+                        for m in core_facts[:5]:
+                            memory_sections.append(f"- {m.get('content', '')}")
+
+                    # C. Relevant memories
+                    core_ids = {m.get("id") for m in core_facts}
+                    regular = [m for m in user_memories if m.get("id") not in core_ids]
+                    if regular:
+                        memory_sections.append("\n## Relevant to this conversation")
+                        for i, m in enumerate(regular[:10], 1):
+                            cat = m.get("category", "")
+                            content = m.get("content", "")
+                            age = self._format_memory_age(m.get("created_at"))
+                            memory_sections.append(f"{i}. [{cat}] {content} ({age})")
+
+                    for m in user_memories:
+                        score = m.get("similarity_score", 0)
+                        logger.info(f"[AGENT]   Memory: [{m.get('category','')}] ({score:.2f}) {m.get('content','')[:80]}")
+
+                # D. Related entities
+                try:
+                    entity_data = await mem_svc.get_entities(user_id=user_id, limit=8)
+                    if entity_data:
+                        entity_lines = ["\n## People and things the user has mentioned"]
+                        for e in entity_data[:8]:
+                            desc = e.get("entity_type", "")
+                            name = e.get("name", "")
+                            if name:
+                                entity_lines.append(f"- {name} ({desc})")
+                        if len(entity_lines) > 1:
+                            memory_sections.append("\n".join(entity_lines))
+                except Exception:
+                    pass
+
+                if memory_sections:
+                    section_parts["user_brain"] = "# User Brain\n" + "\n".join(memory_sections)
+            except Exception as e:
+                logger.warning(f"Memory retrieval failed in agent prompt: {e}")
+
+        # Close with perf log either way
+        if memory_sections and "user_brain" not in section_parts:
+            section_parts["user_brain"] = "# User Brain\n" + "\n".join(memory_sections)
+        logger.info(f"[PERF] memory_retrieval: {(time.perf_counter() - t_memory) * 1000:.0f}ms")
+
+        # ── 4. Skills (only if intent requires them) ─────────────
+        if self.skill_loader and intent.include_skill_prompts:
             skill_parts = self.skill_loader.get_all_system_prompt_sections()
             if skill_parts:
                 section_parts["skills"] = "\n\n".join(skill_parts)
+        elif self.skill_loader and not intent.include_skill_prompts:
+            logger.info(f"[PERF] skill_prompts: SKIPPED (intent={intent.category})")
 
-        # ── 5. Environment & Capabilities ──────────────────────────
-        section_parts["environment"] = (
+        # ── 5. Environment & Capabilities (only if intent uses tools) ──
+        if not intent.include_environment:
+            logger.info(f"[PERF] environment_section: SKIPPED (intent={intent.category})")
+        else:
+            section_parts["environment"] = (
             "# Your Environment & Capabilities\n"
             "You are running as an agent service ON the user's server/VPS. "
             "This means:\n"
@@ -825,8 +913,8 @@ class AgentRunner:
             "When the user asks you to do something on their system, USE your tools — don't say you can't."
         )
 
-        # ── 5b. Media Playback (web channel) ─────────────────────
-        if channel in ("web", "app"):
+        # ── 5b. Media Playback (web channel, only if intent includes media) ──
+        if channel in ("web", "app") and (intent.include_media_section or intent.category == "full"):
             section_parts["media"] = (
                 "# Media Playback (IMPORTANT — read carefully)\n"
                 "You have a `play_media` tool that plays music and videos directly in the user's browser.\n"

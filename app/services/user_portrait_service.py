@@ -5,13 +5,17 @@ Instead of dumping 15 scattered memory fragments into the system prompt,
 this service creates a coherent 3-5 sentence portrait of who the user is,
 what they're working on, and what matters to them.
 
-The portrait is regenerated:
-- Every hour (TTL-based cache)
-- When explicitly requested
+The portrait is:
+- Served from in-memory cache (instant) when available
+- Rebuilt in the BACKGROUND when cache expires (never blocks chat)
+- Built on first request with a lightweight fallback (no LLM call)
+  and then upgraded via background task
 """
 
+import asyncio
 import logging
 import time
+import traceback
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -32,9 +36,20 @@ PORTRAIT_CATEGORIES = {
     "projects": "Active projects",
 }
 
-# In-memory cache: {user_id: {"summary": str, "raw": dict, "ts": float}}
+# In-memory cache: {user_id: {"summary": str, "ts": float}}
 _portrait_cache: Dict[str, dict] = {}
 _CACHE_TTL_SECONDS = 3600  # 1 hour
+
+# Track in-flight background rebuilds to avoid duplicate work
+_rebuilding: Dict[str, bool] = {}
+
+
+def get_cached_portrait(user_id: str) -> str:
+    """Return cached portrait if available, or empty string. Never blocks."""
+    cached = _portrait_cache.get(user_id)
+    if cached:
+        return cached["summary"]
+    return ""
 
 
 class UserPortraitService:
@@ -80,21 +95,61 @@ class UserPortraitService:
         }
 
     async def get_or_build_portrait(self, user_id: str) -> str:
-        """Get cached portrait or build a new one. Cache for 1 hour."""
+        """Get cached portrait. If expired or missing, return stale/empty and rebuild in background.
+
+        NEVER blocks the calling coroutine on an LLM call. The worst case is returning
+        an empty string on the very first request, with the portrait appearing on the next message.
+        """
         cached = _portrait_cache.get(user_id)
+
         if cached and (time.time() - cached["ts"]) < _CACHE_TTL_SECONDS:
+            # Fresh cache — return immediately
             return cached["summary"]
 
-        portrait = await self.build_portrait(user_id)
-        summary = portrait["summary"]
+        if cached:
+            # Stale cache — return stale value, rebuild in background
+            self._schedule_background_rebuild(user_id)
+            return cached["summary"]
 
-        if summary:
-            _portrait_cache[user_id] = {
-                "summary": summary,
-                "ts": time.time(),
-            }
+        # No cache at all — schedule build, return empty for this request
+        self._schedule_background_rebuild(user_id)
+        return ""
 
-        return summary
+    def _schedule_background_rebuild(self, user_id: str):
+        """Schedule a background portrait rebuild if one isn't already running."""
+        if _rebuilding.get(user_id):
+            return  # Already in progress
+
+        _rebuilding[user_id] = True
+        asyncio.create_task(self._background_rebuild(user_id))
+
+    async def _background_rebuild(self, user_id: str):
+        """Rebuild portrait in background with its own DB session. Updates cache when done."""
+        try:
+            from app.db.database import async_session_maker
+
+            async with async_session_maker() as db:
+                svc = UserPortraitService(db)
+                portrait = await svc.build_portrait(user_id)
+                summary = portrait["summary"]
+                await db.commit()
+
+            if summary:
+                _portrait_cache[user_id] = {
+                    "summary": summary,
+                    "ts": time.time(),
+                }
+                logger.info(f"[PERF] portrait_rebuild: completed for user={user_id[:8]}… ({len(summary)} chars)")
+            else:
+                logger.info(f"[PERF] portrait_rebuild: no data for user={user_id[:8]}…")
+
+        except Exception as e:
+            logger.warning(
+                f"Background portrait rebuild failed for user={user_id[:8]}…: "
+                f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            )
+        finally:
+            _rebuilding.pop(user_id, None)
 
     def invalidate_cache(self, user_id: str):
         """Invalidate the cached portrait for a user."""
@@ -135,7 +190,7 @@ class UserPortraitService:
         except Exception as e:
             logger.warning(f"Portrait synthesis failed: {e}")
 
-        # Fallback: concatenate top facts
+        # Fallback: concatenate top facts (no LLM needed)
         lines = []
         for contents in parts.values():
             lines.extend(contents[:2])

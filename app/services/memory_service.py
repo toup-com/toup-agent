@@ -893,8 +893,8 @@ class MemoryService:
         """
         start_time = time.time()
         
-        # Generate query embedding
-        query_embedding = self.embedding_service.embed(request.query, api_key=self.api_key)
+        # Generate query embedding (async to avoid blocking event loop)
+        query_embedding = await self.embedding_service.embed_async(request.query, api_key=self.api_key)
 
         # Build base query with filters - only search active, non-deleted memories
         query = select(Memory).where(
@@ -1815,7 +1815,8 @@ class MemoryService:
                 temporal_before = temporal["created_before"]
         
         # Generate query embedding once (shared by vector strategy)
-        query_embedding = self.embedding_service.embed(query, api_key=self.api_key)
+        # Use async version to avoid blocking the event loop during chat
+        query_embedding = await self.embedding_service.embed_async(query, api_key=self.api_key)
 
         # Run enabled strategies in parallel
         tasks = {}

@@ -95,7 +95,10 @@ class EmbeddingService:
         return self.openai_client
 
     def embed(self, text: str, api_key: Optional[str] = None) -> List[float]:
-        """Generate embedding for a single text."""
+        """Generate embedding for a single text (sync — blocks event loop for OpenAI).
+
+        For async code paths (e.g., chat message handling), prefer embed_async() instead.
+        """
         if self.is_openai:
             client = self._get_openai_client(api_key)
             response = client.embeddings.create(model=self.model_name, input=text)
@@ -103,6 +106,18 @@ class EmbeddingService:
         else:
             embedding = self.local_model.encode(text, convert_to_numpy=True)
             return embedding.tolist()
+
+    async def embed_async(self, text: str, api_key: Optional[str] = None) -> List[float]:
+        """Generate embedding without blocking the event loop.
+
+        - Local models: runs in a thread executor (~5ms, avoids GIL contention)
+        - OpenAI: runs in a thread executor to avoid blocking on sync HTTP call
+
+        Use this in any async code path where latency matters (chat, search).
+        """
+        import asyncio
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.embed, text, api_key)
 
     def embed_batch(self, texts: List[str], api_key: Optional[str] = None) -> List[List[float]]:
         """Generate embeddings for multiple texts."""
