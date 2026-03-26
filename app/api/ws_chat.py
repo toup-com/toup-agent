@@ -132,6 +132,75 @@ async def debug_broadcast_test():
     sent = await broadcast_to_user(user_id, event)
     return {"user_id": user_id[:8], "queues": queues_count, "sent": sent, "event_type": "job_update"}
 
+# ── Fast-path media detection ────────────────────────────────────────
+# Detects play/music requests via regex and fires media_play BEFORE LLM.
+# YouTube search takes ~1-2s vs 10-20s for full LLM pipeline.
+
+import re as _re_mod
+
+_PLAY_PATTERNS = [
+    _re_mod.compile(r'^\s*play\s+(?:me\s+)?(?:a\s+)?(?:song\s+(?:of\s+|by\s+|called\s+)?|video\s+(?:of\s+|by\s+|called\s+)?|music\s+(?:of\s+|by\s+)?)?(.+?)(?:\s+(?:on|from|in)\s+(?:youtube|yt))?\s*$', _re_mod.I),
+    _re_mod.compile(r'^\s*(?:put on|play me|play)\s+["\u201c]?(.+?)["\u201d]?\s*$', _re_mod.I),
+]
+
+_NETFLIX_KEYWORDS = _re_mod.compile(r'\b(?:netflix|disney|hulu|prime video|hbo)\b', _re_mod.I)
+
+
+async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Queue) -> None:
+    """If text looks like a play request, search YouTube and broadcast immediately."""
+    # Skip if it mentions streaming services (Netflix etc.) — those go through the agent
+    if _NETFLIX_KEYWORDS.search(text):
+        return
+
+    query = None
+    for pat in _PLAY_PATTERNS:
+        m = pat.match(text)
+        if m:
+            query = m.group(1).strip()
+            break
+
+    if not query or len(query) < 2 or len(query) > 200:
+        return
+
+    logger.info("[FAST-MEDIA] Detected play request: %r → query=%r", text, query)
+
+    try:
+        import httpx
+        video_id = None
+        video_title = "YouTube Video"
+
+        # Quick YouTube search via httpx (~1s)
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as hc:
+            resp = await hc.get(
+                "https://www.youtube.com/results",
+                params={"search_query": query},
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36"},
+            )
+            id_matches = _re_mod.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
+            if id_matches:
+                video_id = id_matches[0]
+                title_m = _re_mod.search(r'"title":\{"runs":\[\{"text":"([^"]+)"\}', resp.text)
+                if title_m:
+                    video_title = title_m.group(1)
+
+        if not video_id:
+            logger.warning("[FAST-MEDIA] No video found for: %s", query)
+            return
+
+        # Broadcast media_play immediately — frontend opens YouTube embed
+        event = {
+            "type": "media_play",
+            "provider": "youtube",
+            "video_id": video_id,
+            "title": video_title,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+        }
+        broadcast_queue.put_nowait(event)
+        logger.info("[FAST-MEDIA] Broadcast media_play in fast-path: %s - %s", video_id, video_title)
+    except Exception as e:
+        logger.warning("[FAST-MEDIA] Fast-path failed (agent will handle): %s", e)
+
+
 # References set at startup
 _agent_runner = None
 _skill_loader = None
@@ -503,6 +572,10 @@ async def ws_chat(
                             _media_paths.append(_tf.name)
                         except Exception as _me:
                             logger.warning("[WS] Failed to process media attachment: %s", _me)
+
+                # ── Fast-path: detect play/music requests and fire media_play immediately ──
+                # This runs the YouTube search (~1-2s) BEFORE the LLM starts (~10-20s)
+                await _fast_media_check(text, user_id, broadcast_queue)
 
                 # Run agent — use a task so we can cancel on disconnect
                 agent_task = asyncio.create_task(_agent_runner.run(
