@@ -13,9 +13,16 @@ This is what runs on each user's provisioned EC2 instance.
 """
 
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
+
+# Configure logging so agent_runner [PERF] and [AGENT] logs show in journalctl
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
