@@ -68,12 +68,20 @@ class AnthropicService:
             # which causes 401 for OAuth tokens. We need ONLY Authorization: Bearer.
             import os
             os.environ.pop("ANTHROPIC_API_KEY", None)
+            # CRITICAL: Use a custom httpx client with the correct user-agent.
+            # The Anthropic SDK prepends "Anthropic/Python X.Y.Z" to user-agent,
+            # which breaks OAuth validation (Anthropic checks that the request
+            # looks like it comes from Claude Code, not a generic Python client).
+            import httpx
+            _http_client = httpx.AsyncClient(
+                headers={"user-agent": "claude-code/1.0.33"},
+            )
             self.client = anthropic.AsyncAnthropic(
                 auth_token=api_key,
+                http_client=_http_client,
                 default_headers={
-                    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
-                    "user-agent": "claude-cli/2.1.2 (external, cli)",
-                    "x-app": "cli",
+                    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+                    "x-app": "claude-code",
                 },
             )
         else:
