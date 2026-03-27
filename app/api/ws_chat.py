@@ -172,11 +172,12 @@ _PLAY_PATTERNS = [
 _NETFLIX_KEYWORDS = _re_mod.compile(r'\b(?:netflix|disney|hulu|prime video|hbo)\b', _re_mod.I)
 
 
-async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Queue) -> None:
-    """If text looks like a play request, search YouTube and broadcast immediately."""
+async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Queue) -> Optional[str]:
+    """If text looks like a play request, search YouTube and broadcast immediately.
+    Returns a modified message text with a hint if handled, or None if not a media request."""
     # Skip if it mentions streaming services (Netflix etc.) — those go through the agent
     if _NETFLIX_KEYWORDS.search(text):
-        return
+        return None
 
     query = None
     for pat in _PLAY_PATTERNS:
@@ -186,7 +187,7 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
             break
 
     if not query or len(query) < 2 or len(query) > 200:
-        return
+        return None
 
     logger.info("[FAST-MEDIA] Detected play request: %r → query=%r", text, query)
 
@@ -211,7 +212,7 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
 
         if not video_id:
             logger.warning("[FAST-MEDIA] No video found for: %s", query)
-            return
+            return None
 
         # Broadcast media_play immediately — frontend opens YouTube embed
         event = {
@@ -223,8 +224,16 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
         }
         broadcast_queue.put_nowait(event)
         logger.info("[FAST-MEDIA] Broadcast media_play in fast-path: %s - %s", video_id, video_title)
+
+        # Return modified text so agent knows media is already playing
+        return (
+            f"{text}\n\n[SYSTEM: The video \"{video_title}\" (https://www.youtube.com/watch?v={video_id}) "
+            f"is already playing in the user's browser. Do NOT call play_media. "
+            f"Just respond conversationally about what's now playing.]"
+        )
     except Exception as e:
         logger.warning("[FAST-MEDIA] Fast-path failed (agent will handle): %s", e)
+        return None
 
 
 # References set at startup
@@ -600,12 +609,13 @@ async def ws_chat(
                             logger.warning("[WS] Failed to process media attachment: %s", _me)
 
                 # ── Fast-path: detect play/music requests and fire media_play immediately ──
-                # This runs the YouTube search (~1-2s) BEFORE the LLM starts (~10-20s)
-                await _fast_media_check(text, user_id, broadcast_queue)
+                # Returns modified text with system hint if media was found, so agent skips play_media
+                _fast_text = await _fast_media_check(text, user_id, broadcast_queue)
+                _agent_text = _fast_text or text
 
                 # Run agent — use a task so we can cancel on disconnect
                 agent_task = asyncio.create_task(_agent_runner.run(
-                    user_message=text,
+                    user_message=_agent_text,
                     user_id=user_id,
                     session_id=session_id,
                     channel=channel,
