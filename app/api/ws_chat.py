@@ -34,6 +34,32 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _friendly_error(exc: Exception) -> str:
+    """Convert raw exceptions into user-friendly error messages."""
+    name = type(exc).__name__
+    msg = str(exc)
+
+    # Anthropic API errors — check status code if available
+    status = getattr(exc, "status_code", None)
+    if status == 529 or "overloaded" in msg.lower() or "Overloaded" in msg:
+        return "Claude is temporarily overloaded. Please try again in a few seconds."
+    if status == 429 or "rate_limit" in msg.lower():
+        return "Rate limit reached. Please wait a moment and try again."
+    if status == 401 or "authentication" in msg.lower():
+        return "Authentication error with the AI service. Please contact support."
+    if status == 400 or "bad_request" in name.lower():
+        return "There was an issue with the request. Please try rephrasing your message."
+    if "timeout" in name.lower() or "timeout" in msg.lower():
+        return "The request timed out. Please try again."
+    if "connection" in name.lower() or "connection" in msg.lower():
+        return "Connection error with the AI service. Please try again."
+
+    # Generic fallback — don't expose internals
+    logger.error(f"[WS] Unhandled error type for friendly message: {name}: {msg}")
+    return "Something went wrong. Please try again in a moment."
+
+
 # ── User WebSocket broadcast registry ────────────────────────────────
 # Maps user_id → list of asyncio.Queues (one per active WS connection).
 # Background tasks (e.g. app builder) push events here, and the WS
@@ -718,7 +744,9 @@ async def ws_chat(
                         pass
                     logger.exception(f"[WS] Agent error for {user_id}")
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
-                    await _safe_send({"type": "error", "message": f"Agent error: {type(e).__name__}: {e}"})
+                    # Show user-friendly error instead of raw exception
+                    user_msg = _friendly_error(e)
+                    await _safe_send({"type": "error", "message": user_msg})
         finally:
             # Clean up broadcast queue and task
             broadcast_task.cancel()
