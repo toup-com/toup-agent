@@ -126,6 +126,8 @@ _GREETING_EXACT: Set[str] = {
     "ciao", "grazie", "buongiorno", "buonasera", "arrivederci",
     # Persian
     "درود", "ممنون", "خداحافظ", "بله", "خیر",
+    "سلام چطوری", "سلام خوبی", "سلام علیکم", "چطوری", "خوبی",
+    "صبح بخیر", "شب بخیر", "عصر بخیر", "خسته نباشی",
     # Swahili
     "jambo", "habari", "asante",
 }
@@ -137,6 +139,8 @@ _GREETING_PREFIXES = (
     "what's good", "how you doing", "how have you been",
     "good to see you", "nice to see you", "long time no see",
     "pleased to meet", "nice to meet",
+    # Persian
+    "سلام چطوری", "سلام خوبی", "سلام علیکم",
 )
 
 # Emoji-only pattern (message is entirely emoji/whitespace/punctuation)
@@ -373,6 +377,12 @@ def classify_query_intent(message: str) -> QueryIntent:
 
     # 2. Exact greeting match (after lowering + stripping punctuation)
     if clean in _GREETING_EXACT:
+        return INTENT_GREETING
+
+    # 2b. First word is a known greeting and message is short (≤4 words)
+    #     Catches "سلام چطوری", "hi how are you", "hola que tal", etc.
+    first_word = clean.split()[0] if clean else ""
+    if first_word in _GREETING_EXACT and len(clean.split()) <= 4:
         return INTENT_GREETING
 
     # 3. Short greeting prefix match — but check for meaningful content first
