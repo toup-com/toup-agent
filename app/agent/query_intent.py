@@ -274,7 +274,7 @@ INTENT_QUESTION = QueryIntent(
     include_skill_prompts=False,
     include_environment=False,
     include_media_section=False,
-    skip_memory_retrieval=False,
+    skip_memory_retrieval=True,  # General questions don't need user memories
 )
 
 INTENT_MEMORY = QueryIntent(
@@ -294,7 +294,7 @@ INTENT_WEB = QueryIntent(
     include_skill_prompts=False,
     include_environment=False,
     include_media_section=False,
-    skip_memory_retrieval=False,
+    skip_memory_retrieval=True,  # Web searches don't need user memories
 )
 
 INTENT_MEDIA = QueryIntent(
@@ -314,7 +314,7 @@ INTENT_CODE = QueryIntent(
     include_skill_prompts=True,
     include_environment=True,
     include_media_section=False,
-    skip_memory_retrieval=False,
+    skip_memory_retrieval=True,  # Code tasks don't need user memories
 )
 
 INTENT_AGENT = QueryIntent(
