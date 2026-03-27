@@ -262,17 +262,17 @@ class AnthropicService:
                     stop_reason=response.stop_reason,
                 )
             
-            except anthropic.RateLimitError:
+            except (anthropic.RateLimitError, anthropic.OverloadedError) as e:
                 if attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    logger.warning(f"Anthropic rate-limited, retrying in {wait}s")
+                    wait = 2 ** (attempt + 1)  # 2s, 4s
+                    logger.warning(f"Anthropic {type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(wait)
                 else:
                     raise
             except anthropic.APIConnectionError:
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
-                    logger.warning(f"Anthropic connection error, retrying in {wait}s")
+                    logger.warning(f"Anthropic connection error, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(wait)
                 else:
                     raise
@@ -321,69 +321,86 @@ class AnthropicService:
             prepared_tools, reverse_map = self._prepare_tools(tools)
             kwargs["tools"] = prepared_tools
 
-        current_tool_name = ""
-        current_tool_id = ""
-        input_json_buf = ""
-        
-        async with self.client.messages.stream(**kwargs) as stream:
-            async for event in stream:
-                # --- text delta ---
-                if event.type == "content_block_start":
-                    block = event.content_block
-                    if block.type == "thinking":
-                        yield StreamEvent(type="thinking_start", text="")
-                    elif block.type == "tool_use":
-                        # Convert CC tool name back to original
-                        current_tool_name = reverse_map.get(block.name, block.name) if reverse_map else block.name
-                        current_tool_id = block.id
-                        input_json_buf = ""
-                        yield StreamEvent(
-                            type="tool_use_start",
-                            tool_name=current_tool_name,
-                            tool_id=current_tool_id,
-                        )
-                
-                elif event.type == "content_block_delta":
-                    delta = event.delta
-                    if delta.type == "text_delta":
-                        yield StreamEvent(type="text", text=delta.text)
-                    elif delta.type == "thinking_delta":
-                        # Extended thinking — emit as a "thinking" event
-                        yield StreamEvent(type="thinking", text=delta.thinking)
-                    elif delta.type == "input_json_delta":
-                        input_json_buf += delta.partial_json
-                
-                elif event.type == "content_block_stop":
-                    if current_tool_name:
-                        # Parse accumulated JSON input
-                        import json as _json
-                        try:
-                            tool_input = _json.loads(input_json_buf) if input_json_buf else {}
-                        except _json.JSONDecodeError:
-                            tool_input = {"raw": input_json_buf}
-                        yield StreamEvent(
-                            type="tool_use_end",
-                            tool_name=current_tool_name,
-                            tool_id=current_tool_id,
-                            tool_input=tool_input,
-                        )
-                        current_tool_name = ""
-                        current_tool_id = ""
-                        input_json_buf = ""
-                
-                elif event.type == "message_stop":
-                    pass  # Final usage comes from message_end or get_final_message
-            
-            # After stream ends, get final message for usage/stop_reason
-            final = await stream.get_final_message()
-            yield StreamEvent(
-                type="message_end",
-                stop_reason=final.stop_reason,
-                usage={
-                    "input_tokens": final.usage.input_tokens,
-                    "output_tokens": final.usage.output_tokens,
-                },
-            )
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                current_tool_name = ""
+                current_tool_id = ""
+                input_json_buf = ""
+
+                async with self.client.messages.stream(**kwargs) as stream:
+                    async for event in stream:
+                        # --- text delta ---
+                        if event.type == "content_block_start":
+                            block = event.content_block
+                            if block.type == "thinking":
+                                yield StreamEvent(type="thinking_start", text="")
+                            elif block.type == "tool_use":
+                                # Convert CC tool name back to original
+                                current_tool_name = reverse_map.get(block.name, block.name) if reverse_map else block.name
+                                current_tool_id = block.id
+                                input_json_buf = ""
+                                yield StreamEvent(
+                                    type="tool_use_start",
+                                    tool_name=current_tool_name,
+                                    tool_id=current_tool_id,
+                                )
+
+                        elif event.type == "content_block_delta":
+                            delta = event.delta
+                            if delta.type == "text_delta":
+                                yield StreamEvent(type="text", text=delta.text)
+                            elif delta.type == "thinking_delta":
+                                yield StreamEvent(type="thinking", text=delta.thinking)
+                            elif delta.type == "input_json_delta":
+                                input_json_buf += delta.partial_json
+
+                        elif event.type == "content_block_stop":
+                            if current_tool_name:
+                                import json as _json
+                                try:
+                                    tool_input = _json.loads(input_json_buf) if input_json_buf else {}
+                                except _json.JSONDecodeError:
+                                    tool_input = {"raw": input_json_buf}
+                                yield StreamEvent(
+                                    type="tool_use_end",
+                                    tool_name=current_tool_name,
+                                    tool_id=current_tool_id,
+                                    tool_input=tool_input,
+                                )
+                                current_tool_name = ""
+                                current_tool_id = ""
+                                input_json_buf = ""
+
+                        elif event.type == "message_stop":
+                            pass
+
+                    # After stream ends, get final message for usage/stop_reason
+                    final = await stream.get_final_message()
+                    yield StreamEvent(
+                        type="message_end",
+                        stop_reason=final.stop_reason,
+                        usage={
+                            "input_tokens": final.usage.input_tokens,
+                            "output_tokens": final.usage.output_tokens,
+                        },
+                    )
+                return  # Success — exit retry loop
+
+            except (anthropic.RateLimitError, anthropic.OverloadedError) as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)  # 2s, 4s
+                    logger.warning(f"Anthropic stream {type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+            except anthropic.APIConnectionError:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"Anthropic stream connection error, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
 
 
 # ---------------------------------------------------------------------------
