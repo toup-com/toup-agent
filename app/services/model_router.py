@@ -68,7 +68,7 @@ def _get_tiers() -> Dict[str, ModelTier]:
 HEAVY_PATTERNS = [
     # Coding
     r"\b(implement|refactor|debug|fix\s+the\s+bug|write\s+(?:a\s+)?(?:full|complete)\s+(?:program|app|script|function|class))\b",
-    r"\b(build\s+(?:a|an|the)\s+\w+|create\s+(?:a|an)\s+(?:project|app|api|server|system))\b",
+    r"\b(build\s+(?:me\s+)?(?:a|an|the)\s+\w+|create\s+(?:me\s+)?(?:a|an)\s+(?:project|app|api|server|system|website|tool|bot))\b",
     r"\b(multi[- ]?file|codebase|architecture|design\s+pattern|system\s+design)\b",
     # Analysis / reasoning
     r"\b(analyze|compare\s+and\s+contrast|evaluate|critique|pros?\s+and\s+cons?)\b",
@@ -185,10 +185,13 @@ def classify_request(
     if heavy_matches > 0:
         signals["heavy_pattern"] = min(heavy_matches * 20, 60)
 
-    # ── 4. Tool-related keywords → always heavy (tools need best model) ─
-    tool_hits = sum(1 for kw in TOOL_KEYWORDS if kw in text_lower)
-    if tool_hits > 0:
-        signals["tool_keywords"] = 75  # Force heavy tier — tools need best reasoning
+    # ── 4. Tool-related keywords → bump score (but not for questions about tools) ─
+    # Skip if message is clearly a question ("do you have", "can you", "what is")
+    is_question_about = bool(re.search(r"^(?:do you|can you|are you|what|how|is there|have you)", text_lower))
+    if not is_question_about:
+        tool_hits = sum(1 for kw in TOOL_KEYWORDS if kw in text_lower)
+        if tool_hits > 0:
+            signals["tool_keywords"] = min(tool_hits * 25, 75)
 
     # ── 5. Code indicators ────────────────────────────────────────
     code_hits = 0
