@@ -790,18 +790,23 @@ class AgentRunner:
                 from app.services.query_classifier import classify_query
 
                 mem_svc = MemoryService(db)
+                _t0 = time.perf_counter()
                 classification = classify_query(user_message)
-                logger.info(f'[AGENT] Query classified as: {classification["type"]} — searching user memories for: "{user_message[:80]}"')
+                logger.info(f'[PERF] query_classify: {(time.perf_counter()-_t0)*1000:.0f}ms — type={classification["type"]}')
 
                 search_strategies = classification.get("strategies") or ["vector", "keyword", "graph"]
                 search_categories = classification.get("categories")
 
+                _t0 = time.perf_counter()
                 memories = await mem_svc.hybrid_search(
                     user_id=user_id, query=user_message, limit=15,
                     min_similarity=0.1, strategies=search_strategies,
                     categories=search_categories,
                 )
+                logger.info(f"[PERF] hybrid_search: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(memories)} results")
+
                 if classification.get("entity_hint"):
+                    _t0 = time.perf_counter()
                     try:
                         entity_mems = await mem_svc.search_by_entity_graph(
                             user_id=user_id, entity_name=classification["entity_hint"],
@@ -811,8 +816,7 @@ class AgentRunner:
                         for em in entity_mems:
                             if em["id"] not in existing_ids:
                                 memories.insert(0, em)
-                        if entity_mems:
-                            logger.info(f"[AGENT] Entity search for '{classification['entity_hint']}' added {len(entity_mems)} results")
+                        logger.info(f"[PERF] entity_search: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(entity_mems)} results")
                     except Exception as e:
                         logger.warning(f"Entity graph search failed: {e}")
 
@@ -820,16 +824,17 @@ class AgentRunner:
                 self._last_retrieved_memories = user_memories
                 logger.info(f"[AGENT] Found {len(user_memories)} relevant user memories (hybrid)")
 
-                # A. User Portrait (non-blocking — returns cache or empty)
+                # A. User Portrait
+                _t0 = time.perf_counter()
                 try:
                     from app.services.user_portrait_service import UserPortraitService
                     portrait_svc = UserPortraitService(db)
                     portrait = await portrait_svc.get_or_build_portrait(user_id)
                     if portrait:
                         memory_sections.append(f"## Who this user is\n{portrait}")
-                        logger.info(f"[AGENT] Portrait loaded ({len(portrait)} chars)")
+                    logger.info(f"[PERF] portrait: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(portrait) if portrait else 0} chars")
                 except Exception as e:
-                    logger.warning(f"Portrait generation failed: {e}")
+                    logger.warning(f"Portrait generation failed ({(time.perf_counter()-_t0)*1000:.0f}ms): {e}")
 
                 if user_memories:
                     # B. Core facts
