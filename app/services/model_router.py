@@ -51,12 +51,12 @@ def _get_tiers() -> Dict[str, ModelTier]:
         or (settings.anthropic_api_key and not settings.openai_api_key)
     )
 
-    # Light/medium → Sonnet (fast, 2-4s), Heavy → Opus (best quality, 10-18s)
+    # Light → Sonnet (fast, 2-4s for greetings/trivial), Medium/Heavy → Opus (default)
     return {
         "light": ModelTier(name="light", model="claude-sonnet-4-6", label="Claude Sonnet 4.6",
                            cost_per_1k_input=0.003, cost_per_1k_output=0.015),
-        "medium": ModelTier(name="medium", model="claude-sonnet-4-6", label="Claude Sonnet 4.6",
-                            cost_per_1k_input=0.003, cost_per_1k_output=0.015),
+        "medium": ModelTier(name="medium", model="claude-opus-4-6", label="Claude Opus 4.6",
+                            cost_per_1k_input=0.015, cost_per_1k_output=0.075),
         "heavy": ModelTier(name="heavy", model="claude-opus-4-6", label="Claude Opus 4.6",
                            cost_per_1k_input=0.015, cost_per_1k_output=0.075),
     }
