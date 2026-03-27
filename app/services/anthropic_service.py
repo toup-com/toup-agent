@@ -262,10 +262,11 @@ class AnthropicService:
                     stop_reason=response.stop_reason,
                 )
             
-            except (anthropic.RateLimitError, anthropic.OverloadedError) as e:
-                if attempt < max_retries - 1:
+            except anthropic.APIStatusError as e:
+                # Retry on 429 (rate limit) and 529 (overloaded)
+                if e.status_code in (429, 529) and attempt < max_retries - 1:
                     wait = 2 ** (attempt + 1)  # 2s, 4s
-                    logger.warning(f"Anthropic {type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                    logger.warning(f"Anthropic {e.status_code} {type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(wait)
                 else:
                     raise
@@ -387,10 +388,10 @@ class AnthropicService:
                     )
                 return  # Success — exit retry loop
 
-            except (anthropic.RateLimitError, anthropic.OverloadedError) as e:
-                if attempt < max_retries - 1:
-                    wait = 2 ** (attempt + 1)  # 2s, 4s
-                    logger.warning(f"Anthropic stream {type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+            except anthropic.APIStatusError as e:
+                if e.status_code in (429, 529) and attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)
+                    logger.warning(f"Anthropic stream {e.status_code} {type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(wait)
                 else:
                     raise
