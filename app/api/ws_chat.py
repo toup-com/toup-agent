@@ -613,9 +613,10 @@ async def ws_chat(
                 _fast_text = await _fast_media_check(text, user_id, broadcast_queue)
                 _agent_text = _fast_text or text
 
-                # Run agent — use a task so we can cancel on disconnect
+                # Run agent — use the modified text for LLM but save the original user text
                 agent_task = asyncio.create_task(_agent_runner.run(
                     user_message=_agent_text,
+                    display_user_message=text if _fast_text else None,
                     user_id=user_id,
                     session_id=session_id,
                     channel=channel,

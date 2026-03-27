@@ -133,6 +133,7 @@ class AgentRunner:
         thinking_budget: int = 0,
         idempotency_key: Optional[str] = None,
         save_user_message: bool = True,
+        display_user_message: Optional[str] = None,
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
@@ -509,7 +510,7 @@ class AgentRunner:
                 db=db,
                 session_id=session_id,
                 user_id=user_id,
-                user_message=user_message,
+                user_message=display_user_message or user_message,
                 assistant_response=final_text,
                 tokens_input=total_input,
                 tokens_output=total_output,
