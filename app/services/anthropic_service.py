@@ -90,84 +90,6 @@ class AnthropicService:
         self.default_model = settings.anthropic_model
         self.default_max_tokens = settings.anthropic_max_tokens
     
-    # Claude Code canonical tool names (OAuth tokens require these)
-    CLAUDE_CODE_TOOLS = [
-        "Read", "Write", "Edit", "Bash", "Grep", "Glob",
-        "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "KillShell",
-        "NotebookEdit", "Skill", "Task", "TaskOutput", "TodoWrite",
-        "WebFetch", "WebSearch",
-    ]
-    _CC_TOOL_LOOKUP = {t.lower(): t for t in CLAUDE_CODE_TOOLS}
-    
-    # Map Toup tool names → Claude Code tool names
-    _TOOL_NAME_MAP = {
-        "exec": "Bash",
-        "read_file": "Read",
-        "write_file": "Write",
-        "edit_file": "Edit",
-        "memory_search": "Grep",
-        "memory_store": "TodoWrite",
-        "web_search": "WebSearch",
-        "web_fetch": "WebFetch",
-        "send_file": "Task",
-        "send_photo": "TaskOutput",
-        "analyze_image": "Skill",
-        "cron": "NotebookEdit",
-        "spawn": "Glob",
-        "process": "KillShell",
-        "tts": "EnterPlanMode",
-        "sessions_list": "ExitPlanMode",
-        "sessions_history": "AskUserQuestion",
-        "browser": "Read",  # duplicate — will rename below
-    }
-    # Reverse map for converting CC names back to Toup names
-    _TOOL_NAME_REVERSE = {}
-    
-    def _build_tool_maps(self, tools: list) -> tuple:
-        """Build forward (toup→cc) and reverse (cc→toup) tool name maps.
-        Ensures each CC name is unique by appending suffix if needed."""
-        forward = {}
-        reverse = {}
-        used_cc_names = set()
-        
-        cc_pool = list(self.CLAUDE_CODE_TOOLS)
-        
-        for t in tools:
-            name = t["name"]
-            # Try the explicit mapping first
-            cc_name = self._TOOL_NAME_MAP.get(name)
-            if cc_name and cc_name not in used_cc_names:
-                forward[name] = cc_name
-                reverse[cc_name] = name
-                used_cc_names.add(cc_name)
-            else:
-                # Assign next available CC name
-                for cn in cc_pool:
-                    if cn not in used_cc_names:
-                        forward[name] = cn
-                        reverse[cn] = name
-                        used_cc_names.add(cn)
-                        break
-                else:
-                    # Ran out of CC names — keep original (will likely fail)
-                    forward[name] = name
-                    reverse[name] = name
-        
-        return forward, reverse
-    
-    def _prepare_tools(self, tools: list) -> tuple:
-        """For OAuth tokens, rename tools to Claude Code canonical names.
-        Returns (prepared_tools, reverse_map)."""
-        if not self.is_oauth or not tools:
-            return tools, {}
-        
-        forward, reverse = self._build_tool_maps(tools)
-        prepared = [
-            {**t, "name": forward.get(t["name"], t["name"])}
-            for t in tools
-        ]
-        return prepared, reverse
-    
     def _prepare_system(self, system: str) -> any:
         """
         Prepare system prompt. For OAuth tokens, prepend Claude Code identity
@@ -234,29 +156,24 @@ class AnthropicService:
         prepared_system = self._prepare_system(system)
         if prepared_system:
             kwargs["system"] = prepared_system
-        reverse_map = {}
         if tools:
-            prepared_tools, reverse_map = self._prepare_tools(tools)
-            kwargs["tools"] = prepared_tools
-        
+            kwargs["tools"] = tools
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 response = await self.client.messages.create(**kwargs)
-                
+
                 text_parts: List[str] = []
                 tool_calls: List[Dict[str, Any]] = []
-                
+
                 for block in response.content:
                     if block.type == "text":
                         text_parts.append(block.text)
                     elif block.type == "tool_use":
-                        # Reverse-map CC tool names back to original names
-                        original_name = reverse_map.get(block.name, block.name) if reverse_map else block.name
                         tool_calls.append({
                             "id": block.id,
-                            "name": original_name,
-                            "cc_name": block.name,  # Keep CC name for conversation
+                            "name": block.name,
                             "input": block.input,
                         })
                 
@@ -324,11 +241,8 @@ class AnthropicService:
         prepared_system = self._prepare_system(system)
         if prepared_system:
             kwargs["system"] = prepared_system
-        # For OAuth: rename tools to Claude Code canonical names
-        reverse_map = {}
         if tools:
-            prepared_tools, reverse_map = self._prepare_tools(tools)
-            kwargs["tools"] = prepared_tools
+            kwargs["tools"] = tools
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -346,7 +260,7 @@ class AnthropicService:
                                 yield StreamEvent(type="thinking_start", text="")
                             elif block.type == "tool_use":
                                 # Convert CC tool name back to original
-                                current_tool_name = reverse_map.get(block.name, block.name) if reverse_map else block.name
+                                current_tool_name = block.name
                                 current_tool_id = block.id
                                 input_json_buf = ""
                                 yield StreamEvent(
