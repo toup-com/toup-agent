@@ -598,3 +598,79 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
             resp["job_status"] = job_meta.get("job_status", "completed")
 
     return ChatMessageResponse(**resp)
+
+
+# ── Batch messages by date ───────────────────────────────────────────
+@router.get("/by-date/{date_str}/messages")
+async def get_messages_by_date(
+    date_str: str,
+    limit: int = Query(200, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get all messages for all sessions on a specific date (YYYY-MM-DD).
+    Returns messages from the 10 most recent sessions, ordered chronologically.
+    Single API call replaces N per-session calls.
+    """
+    from datetime import date as date_type, timedelta
+
+    try:
+        target_date = date_type.fromisoformat(date_str)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    # Try proxying to remote agent first
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_sessions(proxy[0], proxy[1], f"by-date/{date_str}/messages", {"limit": limit})
+        if data is not None:
+            return JSONResponse(content=data)
+
+    # Local: find sessions for this date
+    from sqlalchemy import cast, Date as SQLDate
+    day_start = datetime(target_date.year, target_date.month, target_date.day)
+    day_end = day_start + timedelta(days=1)
+
+    sessions_result = await db.execute(
+        select(Conversation.id)
+        .where(
+            and_(
+                Conversation.user_id == current_user.id,
+                Conversation.started_at >= day_start,
+                Conversation.started_at < day_end,
+            )
+        )
+        .order_by(Conversation.updated_at.desc())
+        .limit(10)
+    )
+    session_ids = [r[0] for r in sessions_result.fetchall()]
+
+    if not session_ids:
+        return JSONResponse(content=[])
+
+    # Get all messages for these sessions in one query
+    messages_result = await db.execute(
+        select(Message)
+        .where(Message.conversation_id.in_(session_ids))
+        .order_by(Message.created_at.asc())
+        .limit(limit)
+    )
+    messages = messages_result.scalars().all()
+
+    # Enrich with build job data
+    build_jobs = {}
+    job_ids = [
+        m.metadata_json and __import__("json").loads(m.metadata_json).get("job_id")
+        for m in messages if m.role == "job"
+    ]
+    job_ids = [j for j in job_ids if j]
+    if job_ids:
+        from app.db.models import BuildJob
+        bj_result = await db.execute(select(BuildJob).where(BuildJob.id.in_(job_ids)))
+        for bj in bj_result.scalars().all():
+            build_jobs[bj.id] = bj
+
+    return JSONResponse(content=[
+        _message_to_response(m, build_jobs).model_dump(mode="json") for m in messages
+    ])
