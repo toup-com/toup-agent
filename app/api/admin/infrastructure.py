@@ -243,3 +243,82 @@ async def destroy_container(
         return {"error": "Not found"}
     await svc_destroy(db, container.user_id)
     return {"status": "deleted"}
+
+
+@router.get("/containers/{container_id}/files")
+async def list_files(
+    container_id: str,
+    path: str = "",
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Browse files in a managed container's workspace and skills."""
+    result = await db.execute(
+        select(ManagedContainer).where(ManagedContainer.id == container_id)
+    )
+    container = result.scalar_one_or_none()
+    if not container:
+        return {"error": "Not found"}
+
+    user_prefix = container.user_id[:8]
+    base = f"/data/agents/{user_prefix}"
+
+    # Sanitize path to prevent directory traversal
+    clean_path = path.strip("/").replace("..", "")
+    target = f"{base}/{clean_path}" if clean_path else base
+
+    # List files via SSH
+    raw = await _ssh_cmd(
+        f"find {target} -maxdepth 1 -printf '%y|%s|%T@|%f\\n' 2>/dev/null | head -200"
+    )
+    if not raw:
+        return {"path": clean_path, "files": [], "base": base}
+
+    files = []
+    for line in raw.strip().split("\n"):
+        parts = line.split("|", 3)
+        if len(parts) < 4 or parts[3] == ".":
+            continue
+        ftype = "dir" if parts[0] == "d" else "file"
+        size = int(parts[1]) if parts[1].isdigit() else 0
+        mtime = float(parts[2]) if parts[2].replace(".", "").isdigit() else 0
+        name = parts[3]
+        files.append({
+            "name": name,
+            "type": ftype,
+            "size": size,
+            "modified": datetime.fromtimestamp(mtime).isoformat() if mtime else None,
+        })
+
+    # Sort: dirs first, then by name
+    files.sort(key=lambda f: (0 if f["type"] == "dir" else 1, f["name"]))
+
+    return {"path": clean_path, "files": files, "base": base}
+
+
+@router.get("/containers/{container_id}/file-content")
+async def read_file(
+    container_id: str,
+    path: str,
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read a file's content from a managed container's data directory."""
+    result = await db.execute(
+        select(ManagedContainer).where(ManagedContainer.id == container_id)
+    )
+    container = result.scalar_one_or_none()
+    if not container:
+        return {"error": "Not found"}
+
+    user_prefix = container.user_id[:8]
+    clean_path = path.strip("/").replace("..", "")
+    target = f"/data/agents/{user_prefix}/{clean_path}"
+
+    # Only allow text files under 1MB
+    size_check = await _ssh_cmd(f"stat -c%s {target} 2>/dev/null")
+    if not size_check or not size_check.isdigit() or int(size_check) > 1_000_000:
+        return {"error": "File too large or not found", "path": clean_path}
+
+    content = await _ssh_cmd(f"cat {target} 2>/dev/null")
+    return {"path": clean_path, "content": content, "size": int(size_check)}
