@@ -98,10 +98,11 @@ async def overview(
     """Get full VPS infrastructure overview."""
 
     # Get host stats via SSH (parallel)
-    disk_task = _ssh_cmd("df -h / | tail -1 | awk '{print $2, $3, $4, $5}'")
-    mem_task = _ssh_cmd("free -m | grep Mem | awk '{print $2, $3, $4}'")
-    cpu_task = _ssh_cmd("nproc && cat /proc/loadavg | awk '{print $1, $2, $3}'")
-    docker_task = _ssh_cmd("docker ps --format '{{.Names}}|{{.Status}}|{{.Ports}}|{{.Image}}' 2>/dev/null")
+    # NOTE: avoid single quotes in commands — they break inside the SSH wrapper's single-quoted string
+    disk_task = _ssh_cmd("df -h / | tail -1 | tr -s ' ' | cut -d' ' -f2,3,4,5")
+    mem_task = _ssh_cmd("free -m | grep Mem | tr -s ' ' | cut -d' ' -f2,3,4")
+    cpu_task = _ssh_cmd("nproc && cut -d' ' -f1,2,3 /proc/loadavg")
+    docker_task = _ssh_cmd("docker ps --format {{.Names}}~{{.Status}}~{{.Ports}}~{{.Image}} 2>/dev/null")
     uptime_task = _ssh_cmd("uptime -p")
 
     disk, mem, cpu, docker_ps, uptime = await asyncio.gather(
@@ -139,7 +140,7 @@ async def overview(
     containers_running = []
     if docker_ps:
         for line in docker_ps.strip().split("\n"):
-            parts = line.split("|")
+            parts = line.split("~")
             if len(parts) >= 3:
                 containers_running.append({
                     "name": parts[0],
@@ -188,11 +189,11 @@ async def overview(
     container_stats = {}
     if containers_running:
         stats_raw = await _ssh_cmd(
-            "docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null"
+            "docker stats --no-stream --format {{.Name}}~{{.CPUPerc}}~{{.MemUsage}}~{{.MemPerc}} 2>/dev/null"
         )
         if stats_raw:
             for line in stats_raw.strip().split("\n"):
-                parts = line.split("|")
+                parts = line.split("~")
                 if len(parts) >= 4:
                     container_stats[parts[0]] = {
                         "cpu": parts[1],
