@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     curl \
     git \
+    openssh-client \
     # Chromium dependencies for Playwright/Patchright
     libnss3 \
     libnspr4 \

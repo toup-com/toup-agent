@@ -233,7 +233,8 @@ class Settings(BaseSettings):
     # ── Managed Docker Host (containerized multi-tenant) ──────────
     docker_host_url: str = ""               # Docker API URL, e.g. "ssh://root@76.13.116.149"
     docker_host_ip: str = ""                # Public IP of Docker host (for agent_url)
-    docker_host_ssh_password: str = ""      # SSH password for Docker host
+    docker_host_ssh_key: str = ""           # SSH private key (ed25519) for Docker host
+    docker_host_ssh_password: str = ""      # SSH password fallback
     docker_host_pg_url: str = ""            # Admin PostgreSQL URL on Docker host for creating per-user DBs
     docker_agent_image: str = "toup-agent:latest"  # Docker image for agent containers
     docker_port_range_start: int = 9000     # Start of port range for agent containers

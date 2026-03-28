@@ -24,15 +24,26 @@ async def _ssh_cmd(cmd: str) -> str:
     """Run a command on the Docker host and return stdout."""
     if not settings.docker_host_ip:
         return ""
-    ssh_prefix = (
-        f"sshpass -p '{settings.docker_host_ssh_password}' "
-        if settings.docker_host_ssh_password else ""
-    )
-    full_cmd = (
-        f"{ssh_prefix}ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
-        f"-o PreferredAuthentications=password "
-        f"root@{settings.docker_host_ip} '{cmd}'"
-    )
+    # Reuse the key file from docker_host_service
+    from app.services.docker_host_service import _get_ssh_key_file
+    key_file = _get_ssh_key_file()
+    if key_file:
+        full_cmd = (
+            f"ssh -i {key_file} -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
+            f"-o PasswordAuthentication=no "
+            f"root@{settings.docker_host_ip} '{cmd}'"
+        )
+    elif settings.docker_host_ssh_password:
+        full_cmd = (
+            f"sshpass -p '{settings.docker_host_ssh_password}' "
+            f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
+            f"root@{settings.docker_host_ip} '{cmd}'"
+        )
+    else:
+        full_cmd = (
+            f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
+            f"root@{settings.docker_host_ip} '{cmd}'"
+        )
     try:
         proc = await asyncio.create_subprocess_shell(
             full_cmd,

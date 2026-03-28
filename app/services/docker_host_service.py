@@ -32,18 +32,50 @@ PORT_START = settings.docker_port_range_start
 PORT_END = settings.docker_port_range_end
 
 
+_ssh_key_file: Optional[str] = None
+
+
+def _get_ssh_key_file() -> Optional[str]:
+    """Write the SSH key to a temp file (once) and return the path."""
+    global _ssh_key_file
+    if _ssh_key_file:
+        return _ssh_key_file
+    if not settings.docker_host_ssh_key:
+        return None
+    import tempfile, os
+    fd, path = tempfile.mkstemp(prefix="toup_ssh_", suffix=".key")
+    with os.fdopen(fd, 'w') as f:
+        f.write(settings.docker_host_ssh_key)
+        if not settings.docker_host_ssh_key.endswith('\n'):
+            f.write('\n')
+    os.chmod(path, 0o600)
+    _ssh_key_file = path
+    return path
+
+
 async def _run_ssh(cmd: str) -> tuple[int, str, str]:
-    """Run a command on the Docker host via SSH."""
-    ssh_cmd = (
-        f"sshpass -p '{settings.docker_host_ssh_password}' "
-        f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
-        f"root@{settings.docker_host_ip} "
-        f"'{cmd}'"
-    ) if hasattr(settings, 'docker_host_ssh_password') and settings.docker_host_ssh_password else (
-        f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
-        f"root@{settings.docker_host_ip} "
-        f"'{cmd}'"
-    )
+    """Run a command on the Docker host via SSH (key auth preferred, password fallback)."""
+    key_file = _get_ssh_key_file()
+    if key_file:
+        ssh_cmd = (
+            f"ssh -i {key_file} -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
+            f"-o PasswordAuthentication=no "
+            f"root@{settings.docker_host_ip} "
+            f"'{cmd}'"
+        )
+    elif settings.docker_host_ssh_password:
+        ssh_cmd = (
+            f"sshpass -p '{settings.docker_host_ssh_password}' "
+            f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
+            f"root@{settings.docker_host_ip} "
+            f"'{cmd}'"
+        )
+    else:
+        ssh_cmd = (
+            f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
+            f"root@{settings.docker_host_ip} "
+            f"'{cmd}'"
+        )
     proc = await asyncio.create_subprocess_shell(
         ssh_cmd,
         stdout=asyncio.subprocess.PIPE,
