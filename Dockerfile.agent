@@ -18,11 +18,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Agent code
 COPY . .
 
-# Non-root user + workspace
+# Non-root user + workspace (don't chown /app recursively — pip packages are huge)
 RUN useradd -m -u 1000 toup && \
     mkdir -p /app/workspace /app/skills && \
-    chown -R toup:toup /app /home/toup
-USER toup
+    chown -R toup:toup /app/workspace /app/skills /home/toup
 
 # Agent listens on 8001 internally (mapped to unique host port)
 EXPOSE 8001
