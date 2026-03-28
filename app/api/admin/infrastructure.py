@@ -50,11 +50,44 @@ async def _ssh_cmd(cmd: str) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode != 0:
+            logger.warning(f"[INFRA-SSH] cmd='{cmd[:60]}' rc={proc.returncode} stderr={stderr.decode()[:200]}")
         return stdout.decode().strip()
     except Exception as e:
-        logger.warning(f"SSH command failed: {e}")
+        logger.warning(f"[INFRA-SSH] exception: {e}")
         return ""
+
+
+@router.get("/debug-ssh")
+async def debug_ssh(_=Depends(require_admin)):
+    """Debug SSH connectivity to Docker host."""
+    from app.services.docker_host_service import _get_ssh_key_file
+    key_file = _get_ssh_key_file()
+
+    info = {
+        "docker_host_ip": settings.docker_host_ip or "(not set)",
+        "ssh_key_configured": bool(settings.docker_host_ssh_key),
+        "ssh_key_length": len(settings.docker_host_ssh_key) if settings.docker_host_ssh_key else 0,
+        "ssh_key_file": key_file,
+        "ssh_password_configured": bool(settings.docker_host_ssh_password),
+        "managed_hosting_enabled": settings.managed_hosting_enabled,
+    }
+
+    # Try SSH
+    import shutil
+    info["ssh_binary"] = shutil.which("ssh") or "NOT FOUND"
+
+    if key_file:
+        import os
+        info["key_file_exists"] = os.path.exists(key_file)
+        info["key_file_perms"] = oct(os.stat(key_file).st_mode)[-3:] if os.path.exists(key_file) else "N/A"
+
+    # Test connection
+    test_result = await _ssh_cmd("echo OK")
+    info["ssh_test"] = test_result or "FAILED"
+
+    return info
 
 
 @router.get("/overview")
