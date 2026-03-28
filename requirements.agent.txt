@@ -1,0 +1,61 @@
+# Agent container requirements — no platform/provisioning deps
+# FastAPI & Server
+fastapi==0.109.0
+websockets>=13.0
+uvicorn[standard]==0.27.0
+python-multipart>=0.0.9
+
+# Database
+sqlalchemy[asyncio]==2.0.25
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+pgvector==0.2.4
+alembic==1.13.1
+
+# Embeddings & NLP
+numpy==1.26.3
+openai>=1.0.0
+tiktoken>=0.5.0
+
+# Document Processing
+pypdf==4.0.1
+python-docx==1.1.0
+markdown==3.5.2
+chardet==5.2.0
+
+# Media
+pillow==10.2.0
+
+# Auth & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+pydantic[email]>=2.7.2,<3.0.0
+pydantic-settings>=2.5.2
+
+# Utils
+python-dateutil==2.8.2
+httpx>=0.28.1
+tenacity==8.2.3
+apscheduler==3.10.4
+
+# Channels
+python-telegram-bot>=20.0
+discord.py>=2.3.0
+slack-bolt>=1.18.0
+slack-sdk>=3.27.0
+
+# Anthropic
+anthropic>=0.30.0
+
+# Cohere (Re-ranker)
+cohere>=5.0.0
+
+# Browser automation
+patchright>=1.0.0
+
+# MCP Server
+fastmcp==2.9.2
+
+# Smart Fetch
+trafilatura>=2.0.0
+yt-dlp>=2025.1.0
