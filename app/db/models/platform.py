@@ -62,6 +62,30 @@ class VPSInstance(Base):
     )
 
 
+class ManagedContainer(Base):
+    """A Docker container running a user's agent on the managed host."""
+    __tablename__ = "managed_containers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, unique=True)
+    container_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)  # Docker container ID
+    container_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    host_port: Mapped[int] = mapped_column(Integer, nullable=False)  # Mapped port on Docker host
+    db_name: Mapped[str] = mapped_column(String(100), nullable=False)  # Per-user PostgreSQL database
+    status: Mapped[str] = mapped_column(String(20), default="provisioning")  # provisioning|running|stopped|error
+    image_tag: Mapped[str] = mapped_column(String(100), default="toup-agent:latest")
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    stopped_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_managed_containers_user_id", "user_id"),
+        Index("ix_managed_containers_status", "status"),
+        Index("ix_managed_containers_host_port", "host_port", unique=True),
+    )
+
+
 class Invite(Base):
     """Closed-beta invite tokens."""
     __tablename__ = "invites"

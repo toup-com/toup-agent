@@ -43,7 +43,7 @@ from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig
 from .soul_config import SoulConfig
 
 # Platform (VPS, invites, billing)
-from .platform import VPSPlan, VPSInstance, Invite, LLMBundleAllocation, LLMUsageRecord
+from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord
 
 # Streaming credentials
 from .streaming import StreamingCredential
@@ -64,6 +64,6 @@ __all__ = [
     "App", "BuildJob",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
     "SoulConfig",
-    "VPSPlan", "VPSInstance", "Invite", "LLMBundleAllocation", "LLMUsageRecord",
+    "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord",
     "StreamingCredential",
 ]
