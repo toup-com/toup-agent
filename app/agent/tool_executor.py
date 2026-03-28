@@ -2361,11 +2361,11 @@ class ToolExecutor:
         if not video_id:
             return f"Could not find a video for '{query}'. Try a different search term."
 
-        # Broadcast media_play event to the user's chat WebSocket
+        # Broadcast media_play event to the user's chat WebSocket (zero delay)
         user_id = self._current_user_id
         if user_id:
             try:
-                from app.api.ws_chat import broadcast_to_user
+                from app.api.ws_chat import broadcast_to_user, _check_age_and_swap
                 await broadcast_to_user(user_id, {
                     "type": "media_play",
                     "provider": "youtube",
@@ -2374,6 +2374,8 @@ class ToolExecutor:
                     "url": f"https://www.youtube.com/watch?v={video_id}",
                 })
                 logger.info("[play_media] Broadcast media_play: %s - %s", video_id, video_title)
+                # Fire-and-forget: check age restriction in background, swap if needed
+                asyncio.create_task(_check_age_and_swap(video_id, user_id))
             except Exception as e:
                 logger.warning("[play_media] Broadcast failed: %s", e)
                 return f"Found '{video_title}' but could not send to player. URL: https://www.youtube.com/watch?v={video_id}"

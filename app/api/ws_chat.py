@@ -161,6 +161,9 @@ async def debug_broadcast_test():
 # ── Fast-path media detection ────────────────────────────────────────
 # Detects play/music requests via regex and fires media_play BEFORE LLM.
 # YouTube search takes ~1-2s vs 10-20s for full LLM pipeline.
+#
+# Age-restricted videos cannot play in YouTube embeds (iframe blocks them).
+# We detect restriction via yt-dlp metadata and fall back to Piped embed.
 
 import re as _re_mod
 
@@ -170,6 +173,46 @@ _PLAY_PATTERNS = [
 ]
 
 _NETFLIX_KEYWORDS = _re_mod.compile(r'\b(?:netflix|disney|hulu|prime video|hbo)\b', _re_mod.I)
+
+
+# Piped is an open-source YouTube frontend that plays age-restricted content
+_PIPED_EMBED_BASE = "https://piped.video/embed"
+
+
+async def _check_age_and_swap(video_id: str, user_id: str) -> None:
+    """Background task: check if video is age-restricted via yt-dlp.
+    If yes, send a media_embed_swap event so frontend hot-swaps to Piped embed.
+    This runs AFTER the video is already playing — zero latency impact."""
+    import shutil
+    ytdlp = shutil.which("yt-dlp") or "/opt/toup-agent/venv/bin/yt-dlp"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ytdlp, f"https://www.youtube.com/watch?v={video_id}",
+            "--dump-json", "--no-download", "--no-warnings", "--quiet",
+            "--skip-download",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode != 0 or not stdout:
+            return
+        import json
+        data = json.loads(stdout.decode().strip())
+        age_limit = data.get("age_limit", 0)
+        if not age_limit or age_limit <= 0:
+            return  # Not restricted — YouTube embed works fine
+
+        # Age-restricted → tell frontend to swap embed to Piped
+        embed_url = f"{_PIPED_EMBED_BASE}/{video_id}?autoplay=1"
+        logger.info("[AGE-SWAP] Video %s is age-restricted (age_limit=%s), swapping to Piped", video_id, age_limit)
+        await broadcast_to_user(user_id, {
+            "type": "media_embed_swap",
+            "video_id": video_id,
+            "embed_url": embed_url,
+        })
+    except asyncio.TimeoutError:
+        logger.warning("[AGE-SWAP] Timeout checking %s — YouTube embed stays", video_id)
+    except Exception as e:
+        logger.warning("[AGE-SWAP] Error checking %s: %s — YouTube embed stays", video_id, e)
 
 
 async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Queue) -> Optional[str]:
@@ -214,7 +257,7 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
             logger.warning("[FAST-MEDIA] No video found for: %s", query)
             return None
 
-        # Broadcast media_play immediately — frontend opens YouTube embed
+        # Broadcast media_play immediately — frontend opens YouTube embed (zero delay)
         event = {
             "type": "media_play",
             "provider": "youtube",
@@ -224,6 +267,9 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
         }
         broadcast_queue.put_nowait(event)
         logger.info("[FAST-MEDIA] Broadcast media_play in fast-path: %s - %s", video_id, video_title)
+
+        # Fire-and-forget: check age restriction in background, swap embed if needed
+        asyncio.create_task(_check_age_and_swap(video_id, user_id))
 
         # Return modified text so agent knows media is already playing
         return (
