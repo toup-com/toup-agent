@@ -6,6 +6,12 @@ venv/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 *.db
 .env
 .env.local
+apps/
+workspace/
+skills/
+node_modules/
+.git/
