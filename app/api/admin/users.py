@@ -62,6 +62,10 @@ class UserAdminResponse(BaseModel):
     memory_count: int = 0
     session_count: int = 0
     password_plain: Optional[str] = None
+    hosting_mode: Optional[str] = None
+    deploy_status: Optional[str] = None
+    agent_url: Optional[str] = None
+    setup_completed: bool = False
 
     class Config:
         from_attributes = True
@@ -175,7 +179,7 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
 ):
     """List all users with stats. Only admins."""
-    from app.db.models import Memory, Conversation
+    from app.db.models import Memory, Conversation, AgentConfig
 
     mem_sub = (
         select(Memory.user_id, func.count(Memory.id).label("mem_count"))
@@ -194,9 +198,14 @@ async def list_users(
             User,
             func.coalesce(mem_sub.c.mem_count, 0).label("memory_count"),
             func.coalesce(sess_sub.c.sess_count, 0).label("session_count"),
+            AgentConfig.hosting_mode,
+            AgentConfig.deploy_status,
+            AgentConfig.agent_url,
+            AgentConfig.setup_completed,
         )
         .outerjoin(mem_sub, User.id == mem_sub.c.user_id)
         .outerjoin(sess_sub, User.id == sess_sub.c.user_id)
+        .outerjoin(AgentConfig, User.id == AgentConfig.user_id)
         .order_by(User.created_at.desc())
     )
 
@@ -204,7 +213,7 @@ async def list_users(
     rows = result.all()
 
     users = []
-    for user, mem_count, sess_count in rows:
+    for user, mem_count, sess_count, hosting_mode, deploy_status, agent_url, setup_completed in rows:
         users.append(UserAdminResponse(
             id=user.id,
             email=user.email,
@@ -215,6 +224,10 @@ async def list_users(
             memory_count=mem_count,
             session_count=sess_count,
             password_plain=getattr(user, "password_plain", None),
+            hosting_mode=hosting_mode,
+            deploy_status=deploy_status,
+            agent_url=agent_url,
+            setup_completed=setup_completed or False,
         ))
     return UserListResponse(users=users, total=len(users))
 
