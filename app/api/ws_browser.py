@@ -2754,8 +2754,9 @@ async def ws_browser(
                         # Send a loading state while we handle auth
                         await websocket.send_json({"type": "narration", "text": "Loading Netflix..."})
                         tab_id = await tab_manager.open_tab(ctx, "about:blank",
-                                                            viewport={"width": 1280, "height": 720})
-                        active_page = tab_manager.get_tab(tab_id)
+                                                            viewport={"width": 1280, "height": 720},
+                                                            user_id=user_id)
+                        active_page = tab_manager.get_tab(tab_id, user_id=user_id)
                         overlay = AgentOverlay(active_page, websocket)
                         # Do silent login (no screenshots sent during login)
                         await _netflix_silent_login(active_page, user_id, url)
@@ -2766,8 +2767,9 @@ async def ws_browser(
                         await _send_screenshot(websocket, active_page, overlay)
                     else:
                         tab_id = await tab_manager.open_tab(ctx, url,
-                                                            viewport={"width": 1280, "height": 720})
-                        active_page = tab_manager.get_tab(tab_id)
+                                                            viewport={"width": 1280, "height": 720},
+                                                            user_id=user_id)
+                        active_page = tab_manager.get_tab(tab_id, user_id=user_id)
                         overlay = AgentOverlay(active_page, websocket)
                         await overlay.inject()
                         await _send_state(websocket, active_page, tab_manager)
@@ -2784,8 +2786,9 @@ async def ws_browser(
                     if not active_page:
                         ctx = await get_stealth_context()
                         tab_id = await tab_manager.open_tab(ctx, url,
-                                                            viewport={"width": 1280, "height": 720})
-                        active_page = tab_manager.get_tab(tab_id)
+                                                            viewport={"width": 1280, "height": 720},
+                                                            user_id=user_id)
+                        active_page = tab_manager.get_tab(tab_id, user_id=user_id)
                         overlay = AgentOverlay(active_page, websocket)
                     else:
                         if not url.startswith(("http://", "https://", "about:")):
@@ -2842,8 +2845,9 @@ async def ws_browser(
                     if not active_page:
                         ctx = await get_stealth_context()
                         tab_id = await tab_manager.open_tab(ctx,
-                                                            viewport={"width": 1280, "height": 720})
-                        active_page = tab_manager.get_tab(tab_id)
+                                                            viewport={"width": 1280, "height": 720},
+                                                            user_id=user_id)
+                        active_page = tab_manager.get_tab(tab_id, user_id=user_id)
                         overlay = AgentOverlay(active_page, websocket)
 
                     # Persist browser messages to the chat session DB

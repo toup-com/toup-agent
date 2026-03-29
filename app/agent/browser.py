@@ -1079,14 +1079,19 @@ async def get_element_center_by_index(page, index: int) -> Optional[Tuple[float,
 # ──────────────────────────────────────────────────────────────
 
 class TabManager:
-    """Manages named browser tabs (pages) with persistence."""
+    """Manages named browser tabs (pages) with per-user isolation."""
 
     def __init__(self):
-        self._tabs: Dict[str, Any] = {}  # tab_id → page
+        self._tabs: Dict[str, Any] = {}  # "user_id:tab_id" → page
         self._counter: int = 0
 
+    def _key(self, user_id: str, tab_id: str) -> str:
+        """Create a user-scoped key for tab storage."""
+        return f"{user_id}:{tab_id}"
+
     async def open_tab(self, context_or_browser, url: str = "about:blank",
-                       viewport: Optional[Dict[str, int]] = None) -> str:
+                       viewport: Optional[Dict[str, int]] = None,
+                       user_id: str = "") -> str:
         """Open a new tab from the stealth context and return its ID."""
         page = await context_or_browser.new_page()
         if viewport:
@@ -1095,49 +1100,70 @@ class TabManager:
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception as e:
-                # Timeout is OK — page may have partially loaded, continue anyway
                 logger.warning("[BROWSER] open_tab goto timeout for %s: %s (continuing)", url, e)
         self._counter += 1
         tab_id = f"tab_{self._counter}"
-        self._tabs[tab_id] = page
-        logger.info("[BROWSER] Opened tab %s → %s", tab_id, url)
+        self._tabs[self._key(user_id, tab_id)] = page
+        logger.info("[BROWSER] Opened tab %s for user %s → %s", tab_id, user_id[:8], url)
         return tab_id
 
-    async def close_tab(self, tab_id: str) -> bool:
-        page = self._tabs.pop(tab_id, None)
+    async def close_tab(self, tab_id: str, user_id: str = "") -> bool:
+        key = self._key(user_id, tab_id)
+        page = self._tabs.pop(key, None)
         if page:
             try:
                 await page.close()
             except Exception:
                 pass
-            logger.info("[BROWSER] Closed tab %s", tab_id)
+            logger.info("[BROWSER] Closed tab %s for user %s", tab_id, user_id[:8])
             return True
         return False
 
-    async def close_all(self):
-        for tid in list(self._tabs.keys()):
-            await self.close_tab(tid)
+    async def close_all(self, user_id: str = ""):
+        """Close all tabs for a specific user (or all if no user_id)."""
+        keys_to_close = [
+            k for k in self._tabs
+            if not user_id or k.startswith(f"{user_id}:")
+        ]
+        for key in keys_to_close:
+            page = self._tabs.pop(key, None)
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
-    def get_tab(self, tab_id: str) -> Optional[Any]:
-        return self._tabs.get(tab_id)
+    def get_tab(self, tab_id: str, user_id: str = "") -> Optional[Any]:
+        """Get a tab only if it belongs to the specified user."""
+        return self._tabs.get(self._key(user_id, tab_id))
 
-    def list_tabs(self) -> List[Dict[str, str]]:
+    def list_tabs(self, user_id: str = "") -> List[Dict[str, str]]:
+        """List tabs for a specific user only."""
         result = []
-        for tid, page in self._tabs.items():
+        prefix = f"{user_id}:" if user_id else ""
+        for key, page in self._tabs.items():
+            if prefix and not key.startswith(prefix):
+                continue
+            tab_id = key.split(":", 1)[1] if ":" in key else key
             try:
-                result.append({"tab_id": tid, "url": page.url, "title": ""})
+                result.append({"tab_id": tab_id, "url": page.url, "title": ""})
             except Exception:
-                result.append({"tab_id": tid, "url": "unknown", "title": ""})
+                result.append({"tab_id": tab_id, "url": "unknown", "title": ""})
         return result
 
-    async def list_tabs_async(self) -> List[Dict[str, str]]:
+    async def list_tabs_async(self, user_id: str = "") -> List[Dict[str, str]]:
+        """List tabs with titles for a specific user only."""
         result = []
-        for tid, page in self._tabs.items():
+        prefix = f"{user_id}:" if user_id else ""
+        for key, page in self._tabs.items():
+            if prefix and not key.startswith(prefix):
+                continue
+            tab_id = key.split(":", 1)[1] if ":" in key else key
             try:
                 title = await page.title()
-                result.append({"tab_id": tid, "url": page.url, "title": title})
+                result.append({"tab_id": tab_id, "url": page.url, "title": title})
             except Exception:
-                result.append({"tab_id": tid, "url": "unknown", "title": ""})
+                result.append({"tab_id": tab_id, "url": "unknown", "title": ""})
         return result
 
     @property
