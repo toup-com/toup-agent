@@ -285,6 +285,32 @@ async def destroy_container(
     return {"status": "deleted"}
 
 
+@router.post("/provision/{user_id}")
+async def admin_provision(
+    user_id: str,
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: provision a managed container for any user."""
+    from app.services.docker_host_service import provision_container
+
+    # Get the user's agent config
+    result = await db.execute(
+        select(AgentConfig).where(AgentConfig.user_id == user_id)
+    )
+    agent_config = result.scalar_one_or_none()
+
+    try:
+        container = await provision_container(db, user_id, agent_config)
+        return {
+            "status": container.status,
+            "port": container.host_port,
+            "container_name": container.container_name,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @router.get("/containers/{container_id}/files")
 async def list_files(
     container_id: str,
