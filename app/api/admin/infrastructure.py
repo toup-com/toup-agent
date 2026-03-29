@@ -459,6 +459,22 @@ async def container_details(
         else:
             env_lines.append(line)
 
+    # Get user's apps
+    from app.db.models import App
+    apps_result = await db.execute(
+        select(App).where(App.user_id == container.user_id).order_by(App.created_at.desc())
+    )
+    apps = [{
+        "id": a.id,
+        "name": a.name,
+        "slug": a.slug,
+        "status": a.status,
+        "port": a.port,
+        "web_port": a.web_port,
+        "platforms": a.platforms,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+    } for a in apps_result.scalars().all()]
+
     return {
         "id": container.id,
         "user_id": container.user_id,
@@ -473,7 +489,7 @@ async def container_details(
         "disk_usage": disk or "",
         "env": "\n".join(env_lines),
         "health": health or "",
+        "apps": apps,
         "created_at": container.created_at.isoformat() if container.created_at else None,
         "started_at": container.started_at.isoformat() if container.started_at else None,
     }
-    return {"path": clean_path, "content": content, "size": int(size_check)}
