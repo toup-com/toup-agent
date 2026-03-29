@@ -388,3 +388,92 @@ async def read_file(
 
     content = await _ssh_cmd(f"cat {target} 2>/dev/null")
     return {"path": clean_path, "content": content, "size": int(size_check)}
+
+
+@router.post("/containers/{container_id}/terminal")
+async def terminal_exec(
+    container_id: str,
+    body: dict,
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Execute a command inside a managed container's terminal."""
+    cmd = body.get("command", "")
+    if not cmd:
+        return {"error": "No command provided"}
+
+    result = await db.execute(
+        select(ManagedContainer).where(ManagedContainer.id == container_id)
+    )
+    container = result.scalar_one_or_none()
+    if not container:
+        return {"error": "Container not found"}
+
+    # Run command inside the Docker container
+    # We pipe to the SSH host which then pipes to docker exec
+    output = await _ssh_cmd(
+        f"echo {repr(cmd)} | docker exec -i {container.container_name} bash 2>&1"
+    )
+    return {"output": output, "command": cmd}
+
+
+@router.get("/containers/{container_id}/details")
+async def container_details(
+    container_id: str,
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get detailed info about a container — logs, env, processes, disk usage."""
+    result = await db.execute(
+        select(ManagedContainer, User.name, User.email)
+        .outerjoin(User, ManagedContainer.user_id == User.id)
+        .where(ManagedContainer.id == container_id)
+    )
+    row = result.one_or_none()
+    if not row:
+        return {"error": "Not found"}
+
+    container, user_name, user_email = row
+    name = container.container_name
+
+    # Gather info in parallel
+    logs_task = _ssh_cmd(f"docker logs --tail 50 {name} 2>&1")
+    processes_task = _ssh_cmd(f"docker exec {name} ps aux 2>&1")
+    disk_task = _ssh_cmd(f"du -sh /data/agents/{container.user_id[:8]}/workspace /data/agents/{container.user_id[:8]}/skills 2>/dev/null")
+    env_task = _ssh_cmd(f"cat /data/agents/{container.user_id[:8]}/.env 2>/dev/null")
+    health_task = _ssh_cmd(f"curl -sf http://localhost:{container.host_port}/agent/health 2>/dev/null")
+
+    logs, processes, disk, env_raw, health = await asyncio.gather(
+        logs_task, processes_task, disk_task, env_task, health_task
+    )
+
+    # Mask API keys in env
+    env_lines = []
+    for line in (env_raw or "").split("\n"):
+        if "=" in line:
+            key, val = line.split("=", 1)
+            if any(s in key.upper() for s in ["KEY", "TOKEN", "PASSWORD", "SECRET"]):
+                env_lines.append(f"{key}={val[:8]}...{val[-4:]}" if len(val) > 16 else f"{key}=****")
+            else:
+                env_lines.append(line)
+        else:
+            env_lines.append(line)
+
+    return {
+        "id": container.id,
+        "user_id": container.user_id,
+        "user_name": user_name,
+        "user_email": user_email,
+        "container_name": name,
+        "port": container.host_port,
+        "db_name": container.db_name,
+        "status": container.status,
+        "logs": logs or "",
+        "processes": processes or "",
+        "disk_usage": disk or "",
+        "env": "\n".join(env_lines),
+        "health": health or "",
+        "created_at": container.created_at.isoformat() if container.created_at else None,
+        "started_at": container.started_at.isoformat() if container.started_at else None,
+    }
+    return {"path": clean_path, "content": content, "size": int(size_check)}
