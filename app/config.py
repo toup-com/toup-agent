@@ -240,6 +240,8 @@ class Settings(BaseSettings):
     docker_port_range_start: int = 9000     # Start of port range for agent containers
     docker_port_range_end: int = 9999       # End of port range
     managed_hosting_enabled: bool = False   # Gate: set True once Docker host is configured
+    admin_alert_telegram_token: str = ""   # Bot token for admin alerts (separate from user bots)
+    admin_alert_telegram_chat_id: str = "" # Your Telegram user/group ID for alerts
 
     # ── Browser Proxy & Captcha ──
     browser_proxy: str = ""  # e.g. "http://user:pass@proxy.example.com:8080"
