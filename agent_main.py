@@ -394,6 +394,57 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 print(f"⚠️ Could not start heartbeat: {e}")
 
+        # ── Periodic self-update check (every 6 hours) ────────
+        if cron_service and cron_service.scheduler:
+            try:
+                from apscheduler.triggers.interval import IntervalTrigger as _IT
+
+                async def _periodic_update():
+                    """Check for updates and restart if new code is available."""
+                    import subprocess as _sp, os as _os, sys as _sys
+                    agent_dir = _os.environ.get("AGENT_DIR") or _os.path.abspath(_os.path.dirname(__file__))
+                    git_dir = _os.path.join(agent_dir, ".git")
+                    if not _os.path.isdir(git_dir):
+                        return  # No git repo, skip
+
+                    # Fetch and check if behind
+                    _sp.run(["git", "fetch", "--depth", "1", "origin", "main"],
+                            cwd=agent_dir, capture_output=True, timeout=15)
+                    result = _sp.run(["git", "rev-parse", "HEAD"], cwd=agent_dir, capture_output=True, text=True, timeout=5)
+                    local = result.stdout.strip()
+                    result = _sp.run(["git", "rev-parse", "origin/main"], cwd=agent_dir, capture_output=True, text=True, timeout=5)
+                    remote = result.stdout.strip()
+
+                    if local == remote:
+                        return  # Already up to date
+
+                    print(f"📦 Update available: {local[:8]} → {remote[:8]}, updating...")
+
+                    # Pull + install deps
+                    _sp.run(["git", "checkout", "-f", "origin/main"], cwd=agent_dir, capture_output=True, timeout=15)
+                    _sp.run(["git", "branch", "-f", "main", "origin/main"], cwd=agent_dir, capture_output=True, timeout=5)
+                    _sp.run(["git", "checkout", "main"], cwd=agent_dir, capture_output=True, timeout=5)
+
+                    venv_pip = _os.path.join(agent_dir, "venv", "bin", "pip")
+                    if _os.path.exists(venv_pip):
+                        _sp.run([venv_pip, "install", "-q", "-r", _os.path.join(agent_dir, "requirements.txt")],
+                                cwd=agent_dir, capture_output=True, timeout=120)
+
+                    # Restart — re-exec the process
+                    print("🔄 Restarting agent with new code...")
+                    _os.execv(_sys.executable, [_sys.executable] + _sys.argv)
+
+                cron_service.scheduler.add_job(
+                    _periodic_update,
+                    trigger=_IT(hours=6),
+                    id="auto_update",
+                    name="Periodic Self-Update",
+                    replace_existing=True,
+                )
+                print("🔄 Auto-update check (every 6h)")
+            except Exception as e:
+                print(f"⚠️ Could not start auto-update: {e}")
+
     except Exception as e:
         print(f"⚠️ Agent initialization error: {e}")
         import traceback
@@ -672,11 +723,28 @@ except Exception as _mcp_err:
 
 
 @app.get("/")
+def _get_version() -> str:
+    """Get version from git commit hash, fallback to 6.0.0."""
+    try:
+        import subprocess
+        agent_dir = os.environ.get("AGENT_DIR") or os.path.abspath(os.path.dirname(__file__))
+        result = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=agent_dir,
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return f"6.0.0-{result.stdout.strip()}"
+    except Exception:
+        pass
+    return "6.0.0"
+
+_agent_version = _get_version()
+
+
+@app.get("/")
 async def root():
     return {
         "name": "Toup Agent",
         "status": "healthy",
-        "version": "6.0.0",
+        "version": _agent_version,
         "mode": "agent",
     }
 
@@ -687,7 +755,7 @@ async def agent_health():
     uptime = _time.time() - _app_start_time if _app_start_time else 0
     return {
         "status": "healthy",
-        "version": "6.0.0",
+        "version": _agent_version,
         "mode": "agent",
         "uptime_seconds": round(uptime, 1),
         "agent_model": settings.agent_model,
