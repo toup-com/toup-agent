@@ -124,6 +124,11 @@ async def create_user_database(user_id: str) -> str:
     if code != 0:
         logger.warning(f"pgvector extension: {out} {err}")
 
+    # Set timezone to UTC (prevents naive/aware datetime conflicts)
+    await _run_ssh(
+        f'sudo -u postgres psql -d {db_name} -c "ALTER DATABASE {db_name} SET timezone TO \'UTC\';"'
+    )
+
     return db_name
 
 
