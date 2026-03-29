@@ -141,7 +141,7 @@ def _build_env(
         f"DATABASE_URL=postgresql+asyncpg://postgres:postgres@host.docker.internal:5432/{db_name}",
         f"AGENT_WORKSPACE_DIR=/app/workspace",
         f"SKILLS_DIR=/app/skills",
-        f"PLATFORM_API_URL={settings.platform_api_url}",
+        f"PLATFORM_API_URL={settings.platform_api_url if settings.platform_api_url.endswith('/api') else settings.platform_api_url + '/api'}",
         f"TOUP_TOKEN={agent_config.connect_token or '' if agent_config else ''}",
     ]
 
@@ -259,6 +259,12 @@ async def provision_container(
         container.started_at = datetime.utcnow()
 
         # Update AgentConfig with the container's URL
+        if not agent_config:
+            # Fetch it if not passed
+            result = await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == user_id)
+            )
+            agent_config = result.scalar_one_or_none()
         if agent_config:
             agent_config.agent_url = f"http://{settings.docker_host_ip}:{port}"
             agent_config.agent_api_key = agent_api_key
