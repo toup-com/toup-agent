@@ -92,6 +92,9 @@ async def overview(
 ):
     """Get full VPS infrastructure overview."""
 
+    # Get image version
+    image_info = await _ssh_cmd("docker inspect toup-agent:latest --format '{{.Created}}' 2>/dev/null | cut -c1-19")
+
     # Get host stats via SSH (parallel)
     # NOTE: avoid single quotes in commands — they break inside the SSH wrapper's single-quoted string
     disk_task = _ssh_cmd("df -h / | tail -1 | awk '{print $2, $3, $4, $5}'")
@@ -210,6 +213,7 @@ async def overview(
             "port_range": f"{settings.docker_port_range_start}-{settings.docker_port_range_end}",
             "max_capacity": settings.docker_port_range_end - settings.docker_port_range_start + 1,
         },
+        "image_built": image_info or "unknown",
     }
 
 
@@ -283,6 +287,72 @@ async def destroy_container(
         return {"error": "Not found"}
     await svc_destroy(db, container.user_id)
     return {"status": "deleted"}
+
+
+@router.post("/deploy-update")
+async def deploy_update(
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rebuild agent image and rolling-update all managed containers."""
+    steps = []
+
+    # 1. Pull latest code
+    out = await _ssh_cmd("cd /opt/toup-agent && git pull --ff-only 2>&1")
+    steps.append({"step": "git_pull", "output": out})
+
+    # 2. Build new image
+    out = await _ssh_cmd("cd /opt/toup-agent && docker build -f Dockerfile.agent -t toup-agent:latest . 2>&1 | tail -5")
+    steps.append({"step": "build_image", "output": out})
+
+    # 3. Rolling update each container
+    containers_raw = await _ssh_cmd("docker ps -a --filter 'name=toup-agent-' --format '{{.Names}}'")
+    updated = []
+    if containers_raw:
+        for name in containers_raw.strip().split("\n"):
+            if not name.startswith("toup-agent-"):
+                continue
+            user_prefix = name.replace("toup-agent-", "")
+            # Get current port
+            port_raw = await _ssh_cmd(f"docker port {name} 8001 2>/dev/null | head -1 | cut -d: -f2")
+            port = port_raw.strip() if port_raw else ""
+            if not port:
+                steps.append({"step": f"skip_{name}", "output": "no port mapping"})
+                continue
+
+            # Stop + remove + recreate
+            await _ssh_cmd(f"docker stop {name} 2>/dev/null; docker rm {name} 2>/dev/null")
+            out = await _ssh_cmd(
+                f"docker run -d --name {name} --restart unless-stopped "
+                f"--env-file /data/agents/{user_prefix}/.env "
+                f"-p {port}:8001 "
+                f"-v /data/agents/{user_prefix}/workspace:/app/workspace "
+                f"-v /data/agents/{user_prefix}/skills:/app/skills "
+                f"--add-host host.docker.internal:host-gateway "
+                f"--memory=512m --cpus=0.5 "
+                f"toup-agent:latest 2>&1"
+            )
+            updated.append(name)
+            steps.append({"step": f"update_{name}", "output": out.strip()[:50]})
+
+    # 4. Health check
+    await asyncio.sleep(8)
+    health_results = {}
+    for name in updated:
+        port_raw = await _ssh_cmd(f"docker port {name} 8001 2>/dev/null | head -1 | cut -d: -f2")
+        if port_raw:
+            h = await _ssh_cmd(f"curl -sf http://localhost:{port_raw.strip()}/agent/health 2>/dev/null | head -c 100")
+            health_results[name] = h or "starting..."
+
+    # Cleanup
+    await _ssh_cmd("docker image prune -f 2>/dev/null")
+
+    return {
+        "success": True,
+        "updated": updated,
+        "steps": steps,
+        "health": health_results,
+    }
 
 
 @router.post("/provision/{user_id}")
