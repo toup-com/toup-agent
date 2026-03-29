@@ -318,7 +318,7 @@ async def list_files(
     _=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Browse files in a managed container's workspace and skills."""
+    """Browse files INSIDE a managed container (not just host volumes)."""
     result = await db.execute(
         select(ManagedContainer).where(ManagedContainer.id == container_id)
     )
@@ -326,19 +326,17 @@ async def list_files(
     if not container:
         return {"error": "Not found"}
 
-    user_prefix = container.user_id[:8]
-    base = f"/data/agents/{user_prefix}"
-
-    # Sanitize path to prevent directory traversal
+    # Sanitize path
     clean_path = path.strip("/").replace("..", "")
-    target = f"{base}/{clean_path}" if clean_path else base
+    target = f"/app/{clean_path}" if clean_path else "/app"
 
-    # List files via SSH
+    # List files INSIDE the container via docker exec
     raw = await _ssh_cmd(
+        f"docker exec {container.container_name} "
         f"find {target} -maxdepth 1 -printf '%y|%s|%T@|%f\\n' 2>/dev/null | head -200"
     )
     if not raw:
-        return {"path": clean_path, "files": [], "base": base}
+        return {"path": clean_path, "files": [], "base": "/app"}
 
     files = []
     for line in raw.strip().split("\n"):
@@ -359,7 +357,7 @@ async def list_files(
     # Sort: dirs first, then by name
     files.sort(key=lambda f: (0 if f["type"] == "dir" else 1, f["name"]))
 
-    return {"path": clean_path, "files": files, "base": base}
+    return {"path": clean_path, "files": files, "base": "/app"}
 
 
 @router.get("/containers/{container_id}/file-content")
@@ -369,7 +367,7 @@ async def read_file(
     _=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Read a file's content from a managed container's data directory."""
+    """Read a file's content from inside the container."""
     result = await db.execute(
         select(ManagedContainer).where(ManagedContainer.id == container_id)
     )
@@ -377,16 +375,19 @@ async def read_file(
     if not container:
         return {"error": "Not found"}
 
-    user_prefix = container.user_id[:8]
     clean_path = path.strip("/").replace("..", "")
-    target = f"/data/agents/{user_prefix}/{clean_path}"
+    target = f"/app/{clean_path}"
 
-    # Only allow text files under 1MB
-    size_check = await _ssh_cmd(f"stat -c%s {target} 2>/dev/null")
+    # Check file size inside container
+    size_check = await _ssh_cmd(
+        f"docker exec {container.container_name} stat -c%s {target} 2>/dev/null"
+    )
     if not size_check or not size_check.isdigit() or int(size_check) > 1_000_000:
         return {"error": "File too large or not found", "path": clean_path}
 
-    content = await _ssh_cmd(f"cat {target} 2>/dev/null")
+    content = await _ssh_cmd(
+        f"docker exec {container.container_name} cat {target} 2>/dev/null"
+    )
     return {"path": clean_path, "content": content, "size": int(size_check)}
 
 
