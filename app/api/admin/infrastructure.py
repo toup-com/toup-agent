@@ -21,36 +21,31 @@ router = APIRouter(prefix="/admin/infrastructure", tags=["admin-infrastructure"]
 
 
 async def _ssh_cmd(cmd: str) -> str:
-    """Run a command on the Docker host and return stdout."""
+    """Run a command on the Docker host and return stdout. Uses stdin to avoid quoting issues."""
     if not settings.docker_host_ip:
         return ""
-    # Reuse the key file from docker_host_service
     from app.services.docker_host_service import _get_ssh_key_file
     key_file = _get_ssh_key_file()
+    ssh_args = ["ssh"]
     if key_file:
-        full_cmd = (
-            f"ssh -i {key_file} -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
-            f"-o PasswordAuthentication=no "
-            f"root@{settings.docker_host_ip} '{cmd}'"
-        )
-    elif settings.docker_host_ssh_password:
-        full_cmd = (
-            f"sshpass -p '{settings.docker_host_ssh_password}' "
-            f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
-            f"root@{settings.docker_host_ip} '{cmd}'"
-        )
-    else:
-        full_cmd = (
-            f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
-            f"root@{settings.docker_host_ip} '{cmd}'"
-        )
+        ssh_args += ["-i", key_file, "-o", "PasswordAuthentication=no"]
+    ssh_args += [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=5",
+        f"root@{settings.docker_host_ip}",
+        "bash", "-s",
+    ]
     try:
-        proc = await asyncio.create_subprocess_shell(
-            full_cmd,
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_args,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=cmd.encode()),
+            timeout=15,
+        )
         if proc.returncode != 0:
             logger.warning(f"[INFRA-SSH] cmd='{cmd[:60]}' rc={proc.returncode} stderr={stderr.decode()[:200]}")
         return stdout.decode().strip()
@@ -99,10 +94,10 @@ async def overview(
 
     # Get host stats via SSH (parallel)
     # NOTE: avoid single quotes in commands — they break inside the SSH wrapper's single-quoted string
-    disk_task = _ssh_cmd("df -h / | tail -1 | tr -s ' ' | cut -d' ' -f2,3,4,5")
-    mem_task = _ssh_cmd("free -m | grep Mem | tr -s ' ' | cut -d' ' -f2,3,4")
-    cpu_task = _ssh_cmd("nproc && cut -d' ' -f1,2,3 /proc/loadavg")
-    docker_task = _ssh_cmd("docker ps --format {{.Names}}~{{.Status}}~{{.Ports}}~{{.Image}} 2>/dev/null")
+    disk_task = _ssh_cmd("df -h / | tail -1 | awk '{print $2, $3, $4, $5}'")
+    mem_task = _ssh_cmd("free -m | grep Mem | awk '{print $2, $3, $4}'")
+    cpu_task = _ssh_cmd("nproc && awk '{print $1, $2, $3}' /proc/loadavg")
+    docker_task = _ssh_cmd("docker ps --format '{{.Names}}~{{.Status}}~{{.Ports}}~{{.Image}}' 2>/dev/null")
     uptime_task = _ssh_cmd("uptime -p")
 
     disk, mem, cpu, docker_ps, uptime = await asyncio.gather(
@@ -189,7 +184,7 @@ async def overview(
     container_stats = {}
     if containers_running:
         stats_raw = await _ssh_cmd(
-            "docker stats --no-stream --format {{.Name}}~{{.CPUPerc}}~{{.MemUsage}}~{{.MemPerc}} 2>/dev/null"
+            "docker stats --no-stream --format '{{.Name}}~{{.CPUPerc}}~{{.MemUsage}}~{{.MemPerc}}' 2>/dev/null"
         )
         if stats_raw:
             for line in stats_raw.strip().split("\n"):

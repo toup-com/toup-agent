@@ -54,34 +54,35 @@ def _get_ssh_key_file() -> Optional[str]:
 
 
 async def _run_ssh(cmd: str) -> tuple[int, str, str]:
-    """Run a command on the Docker host via SSH (key auth preferred, password fallback)."""
+    """Run a command on the Docker host via SSH. Passes command via stdin to avoid quoting issues."""
     key_file = _get_ssh_key_file()
     if key_file:
-        ssh_cmd = (
-            f"ssh -i {key_file} -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
-            f"-o PasswordAuthentication=no "
-            f"root@{settings.docker_host_ip} "
-            f"'{cmd}'"
-        )
-    elif settings.docker_host_ssh_password:
-        ssh_cmd = (
-            f"sshpass -p '{settings.docker_host_ssh_password}' "
-            f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
-            f"root@{settings.docker_host_ip} "
-            f"'{cmd}'"
-        )
+        ssh_args = [
+            "ssh", "-i", key_file,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=10",
+            "-o", "PasswordAuthentication=no",
+            f"root@{settings.docker_host_ip}",
+            "bash", "-s",
+        ]
     else:
-        ssh_cmd = (
-            f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
-            f"root@{settings.docker_host_ip} "
-            f"'{cmd}'"
-        )
-    proc = await asyncio.create_subprocess_shell(
-        ssh_cmd,
+        ssh_args = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=10",
+            f"root@{settings.docker_host_ip}",
+            "bash", "-s",
+        ]
+    proc = await asyncio.create_subprocess_exec(
+        *ssh_args,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    stdout, stderr = await asyncio.wait_for(
+        proc.communicate(input=cmd.encode()),
+        timeout=120,
+    )
     return proc.returncode or 0, stdout.decode(), stderr.decode()
 
 
