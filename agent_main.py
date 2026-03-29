@@ -580,7 +580,7 @@ async def lifespan(app: FastAPI):
                     if not public_ip:
                         print("⚠️ Could not detect public IP for registration", flush=True)
                         return
-                    agent_url = f"http://{public_ip}:8001"
+                    agent_url = f"http://{public_ip}:{settings.agent_port}"
                     # Ensure /api prefix is included
                     base = settings.platform_api_url.rstrip("/")
                     if not base.endswith("/api"):

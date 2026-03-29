@@ -137,6 +137,7 @@ def _build_env(
     db_name: str,
     agent_api_key: str,
     agent_config: Optional[AgentConfig],
+    host_port: int = 8001,
 ) -> str:
     """Build the .env content for an agent container."""
     lines = [
@@ -148,6 +149,7 @@ def _build_env(
         f"SKILLS_DIR=/app/skills",
         f"PLATFORM_API_URL={settings.platform_api_url if settings.platform_api_url.endswith('/api') else settings.platform_api_url + '/api'}",
         f"TOUP_TOKEN={agent_config.connect_token or '' if agent_config else ''}",
+        f"AGENT_PORT={host_port}",
     ]
 
     # Forward LLM keys from agent config
@@ -221,7 +223,7 @@ async def provision_container(
 
     try:
         # Build env file content
-        env_content = _build_env(user_id, db_name, agent_api_key, agent_config)
+        env_content = _build_env(user_id, db_name, agent_api_key, agent_config, host_port=port)
 
         # Write env file on Docker host
         escaped_env = env_content.replace("'", "'\\''")

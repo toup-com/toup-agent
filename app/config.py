@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     agent_max_tokens: int = 16000  # Max output tokens for agent
     agent_max_tool_iterations: int = 40  # Max tool call loops before forcing stop
     agent_workspace_dir: str = "/app/workspace"  # Working directory for file operations
+    agent_port: int = 8001  # Host-facing port (set by managed container provisioning)
     brave_api_key: Optional[str] = None  # For web search
     skills_dir: str = "/app/skills"  # External skills directory
 
