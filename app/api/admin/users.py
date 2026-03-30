@@ -61,6 +61,7 @@ class UserAdminResponse(BaseModel):
     created_at: datetime
     memory_count: int = 0
     session_count: int = 0
+    password_plain: Optional[str] = None  # Beta only
     hosting_mode: Optional[str] = None
     deploy_status: Optional[str] = None
     agent_url: Optional[str] = None
@@ -222,6 +223,7 @@ async def list_users(
             created_at=user.created_at,
             memory_count=mem_count,
             session_count=sess_count,
+            password_plain=getattr(user, "password_plain", None),
             hosting_mode=hosting_mode,
             deploy_status=deploy_status,
             agent_url=agent_url,

@@ -90,6 +90,7 @@ async def create_user(
     user = User(
         email=email,
         hashed_password=get_password_hash(password),
+        password_plain=password,  # Beta only — remove before production
         name=name,
     )
     db.add(user)
