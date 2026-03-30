@@ -219,6 +219,27 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
     return _job_to_response(job)
 
 
+class UpdateJobStatusRequest(BaseModel):
+    status: str  # queued, running, completed, failed
+
+
+@router.patch("/jobs/{job_id}")
+async def update_job_status(job_id: str, req: UpdateJobStatusRequest) -> JobResponse:
+    """Update a job's status (e.g. drag between kanban columns)."""
+    if req.status not in ("queued", "running", "completed", "failed"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    async with async_session_maker() as db:
+        job = await db.get(BuildJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job.status = req.status
+        if req.status == "completed" and not job.completed_at:
+            job.completed_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(job)
+        return _job_to_response(job)
+
+
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str) -> JobResponse:
     """Get a specific build job."""
