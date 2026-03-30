@@ -816,6 +816,8 @@ class ChatMessageResponse(BaseModel):
     model_used: Optional[str] = None
     memories_retrieved: Optional[List[str]] = None
     processing_time_ms: Optional[int] = None
+    # Media metadata (YouTube/Netflix cards)
+    media: Optional[dict] = None
     # Job card fields (role == 'job')
     job_id: Optional[str] = None
     job_name: Optional[str] = None
