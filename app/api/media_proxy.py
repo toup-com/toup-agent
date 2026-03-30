@@ -19,33 +19,58 @@ async def get_stream(video_id: str):
     import asyncio
 
     def _extract(vid: str) -> dict:
+        # Method 1: yt-dlp (most reliable)
         try:
             import yt_dlp
-        except ImportError:
-            return {"error": "yt-dlp not installed"}
-
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            # Get best combined audio+video stream (for casting)
-            "format": "best[ext=mp4]/best",
-        }
-        try:
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "format": "best[ext=mp4]/best",
+                "socket_timeout": 10,
+            }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-                if not info:
-                    return {"error": "No info found"}
-                return {
-                    "url": info.get("url", ""),
-                    "title": info.get("title", ""),
-                    "thumbnail": info.get("thumbnail", ""),
-                    "duration": info.get("duration", 0),
-                    "ext": info.get("ext", "mp4"),
-                }
+                if info and info.get("url"):
+                    return {
+                        "url": info["url"],
+                        "title": info.get("title", ""),
+                        "thumbnail": info.get("thumbnail", ""),
+                        "duration": info.get("duration", 0),
+                        "ext": info.get("ext", "mp4"),
+                    }
         except Exception as e:
-            logger.warning("[media_proxy] yt-dlp error: %s", e)
-            return {"error": str(e)}
+            logger.warning("[media_proxy] yt-dlp failed: %s", e)
+
+        # Method 2: Piped API fallback (multiple instances)
+        import urllib.request
+        import json as _json
+        piped_apis = [
+            "https://pipedapi.kavin.rocks",
+            "https://pipedapi.adminforge.de",
+            "https://watchapi.whatever.social",
+            "https://api.piped.yt",
+        ]
+        for api in piped_apis:
+            try:
+                req = urllib.request.Request(
+                    f"{api}/streams/{vid}",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = _json.loads(resp.read())
+                    hls = data.get("hls")
+                    if hls:
+                        return {
+                            "url": hls,
+                            "title": data.get("title", ""),
+                            "thumbnail": data.get("thumbnailUrl", ""),
+                            "type": "hls",
+                        }
+            except Exception as e:
+                logger.warning("[media_proxy] Piped %s failed: %s", api, e)
+
+        return {"error": "All extraction methods failed"}
 
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _extract, video_id)
