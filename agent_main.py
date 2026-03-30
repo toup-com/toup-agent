@@ -43,6 +43,7 @@ from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.dashboard import router as dashboard_router
 from app.api.soul import router as soul_router
+from app.api.llm_setup import router as llm_setup_router
 from app.api.apps import router as apps_router, set_app_manager, set_app_gateway, set_app_builder_skill
 
 _app_start_time = None
@@ -785,6 +786,7 @@ try:
 except ImportError as e:
     print(f"⚠️ Netflix stream not mounted: {e}")
 app.include_router(soul_router, prefix=settings.api_prefix)
+app.include_router(llm_setup_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
 try:
