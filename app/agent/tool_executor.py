@@ -2459,3 +2459,141 @@ class ToolExecutor:
         except Exception as e:
             logger.warning("[play_netflix] Error: %s", e)
             return f"ERROR: {e}"
+
+    # ------------------------------------------------------------------
+    # Job management — create/update dashboard jobs
+    # ------------------------------------------------------------------
+
+    async def _tool_create_job(self, inp: Dict[str, Any]) -> str:
+        """Create a new job visible in the dashboard and sidebar."""
+        import json as _json, uuid as _uuid
+        from datetime import datetime as _dt
+        from app.db.database import async_session_maker
+        from app.db.models import BuildJob
+
+        title = inp.get("title", "").strip()
+        if not title:
+            return "ERROR: title is required"
+
+        description = inp.get("description", title)
+        step_labels = inp.get("steps") or []
+        user_id = self._current_user_id
+        if not user_id:
+            return "ERROR: No user context"
+
+        job_id = str(_uuid.uuid4())
+        steps = []
+        for i, label in enumerate(step_labels):
+            steps.append({
+                "id": str(_uuid.uuid4()),
+                "type": f"step_{i}",
+                "label": label,
+                "status": "pending",
+            })
+
+        async with async_session_maker() as db:
+            job = BuildJob(
+                id=job_id,
+                user_id=user_id,
+                title=title,
+                prompt=description,
+                status="running",
+                steps_json=_json.dumps(steps),
+                model=settings.agent_model,
+                layer=0,  # 0 = agent task (vs 1 = app build)
+                created_at=_dt.utcnow(),
+            )
+            db.add(job)
+            await db.commit()
+
+        # Broadcast to frontend
+        try:
+            from app.api.ws_chat import broadcast_to_user
+            await broadcast_to_user(user_id, {
+                "type": "job_update",
+                "job_id": job_id,
+                "name": title,
+                "status": "running",
+                "step": step_labels[0] if step_labels else "Working...",
+                "total_steps": len(steps),
+                "completed_steps": 0,
+            })
+        except Exception:
+            pass
+
+        return _json.dumps({"job_id": job_id, "title": title, "steps": len(steps)})
+
+    async def _tool_update_job(self, inp: Dict[str, Any]) -> str:
+        """Update an existing job's status and steps."""
+        import json as _json
+        from datetime import datetime as _dt
+        from app.db.database import async_session_maker
+        from app.db.models import BuildJob
+
+        job_id = inp.get("job_id", "").strip()
+        if not job_id:
+            return "ERROR: job_id is required"
+
+        new_status = inp.get("status")
+        current_step = inp.get("current_step")
+        error_message = inp.get("error_message")
+        user_id = self._current_user_id
+
+        async with async_session_maker() as db:
+            job = await db.get(BuildJob, job_id)
+            if not job:
+                return f"ERROR: Job {job_id} not found"
+
+            steps = []
+            try:
+                steps = _json.loads(job.steps_json) if job.steps_json else []
+            except (ValueError, TypeError):
+                pass
+
+            # Mark steps as done up to current_step
+            completed_count = 0
+            if current_step is not None and steps:
+                for i, s in enumerate(steps):
+                    if i <= current_step:
+                        s["status"] = "done"
+                        completed_count += 1
+                    elif i == current_step + 1:
+                        s["status"] = "running"
+                job.steps_json = _json.dumps(steps)
+            else:
+                completed_count = sum(1 for s in steps if s.get("status") == "done")
+
+            if new_status:
+                job.status = new_status
+            if error_message:
+                job.error_message = error_message
+            if new_status == "completed":
+                job.completed_at = _dt.utcnow()
+                # Mark all steps done
+                for s in steps:
+                    s["status"] = "done"
+                job.steps_json = _json.dumps(steps)
+                completed_count = len(steps)
+
+            await db.commit()
+
+        # Broadcast
+        try:
+            from app.api.ws_chat import broadcast_to_user
+            current_label = ""
+            if steps:
+                running = [s for s in steps if s.get("status") == "running"]
+                current_label = running[0]["label"] if running else (steps[-1]["label"] if steps else "")
+            await broadcast_to_user(user_id, {
+                "type": "job_update",
+                "job_id": job_id,
+                "name": job.title,
+                "status": job.status,
+                "step": current_label,
+                "total_steps": len(steps),
+                "completed_steps": completed_count,
+            })
+        except Exception:
+            pass
+
+        return _json.dumps({"ok": True, "status": job.status, "completed_steps": completed_count})

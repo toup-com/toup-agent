@@ -1201,4 +1201,66 @@ def get_extended_tools():
                 "required": ["action"],
             },
         },
+        # ------------------------------------------------------------------
+        # Job management — create/update jobs visible in the dashboard
+        # ------------------------------------------------------------------
+        {
+            "name": "create_job",
+            "description": (
+                "Create a new job (task) that appears in the user's dashboard and sidebar. "
+                "Use this whenever the user asks you to do something that will take multiple steps "
+                "or that they'd want to track progress on. The job will appear in the Jobs tab "
+                "in real-time. Set status to 'running' when you start working on it."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title for the job (e.g. 'Research AI papers', 'Fix login bug').",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Detailed description of what needs to be done.",
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of step labels (e.g. ['Research', 'Draft outline', 'Write report']). Optional.",
+                    },
+                },
+                "required": ["title"],
+            },
+        },
+        {
+            "name": "update_job",
+            "description": (
+                "Update the status of an existing job. Use this to mark steps as done, "
+                "update the overall job status, or add an error message. "
+                "Call this as you complete each step so the user sees live progress."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job ID returned by create_job.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["running", "completed", "failed"],
+                        "description": "New overall job status.",
+                    },
+                    "current_step": {
+                        "type": "integer",
+                        "description": "Index (0-based) of the step to mark as done. All steps before this index will also be marked done.",
+                    },
+                    "error_message": {
+                        "type": "string",
+                        "description": "Error message if status is 'failed'.",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
     ]

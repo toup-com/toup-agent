@@ -964,6 +964,11 @@ class AgentRunner:
         ]
         if hasattr(self, "_current_lane") and self._current_lane != "main":
             runtime_lines.append(f"- Execution lane: {self._current_lane}")
+        runtime_lines.append(
+            "- When the user asks you to do a multi-step task, use the create_job tool "
+            "to create a trackable job. Update it with update_job as you complete each step. "
+            "This shows live progress in their dashboard."
+        )
         section_parts["runtime"] = "\n".join(runtime_lines)
 
         # ── 7. Formatting rules (channel-aware) ───────────────────
