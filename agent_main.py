@@ -785,8 +785,6 @@ try:
 except ImportError as e:
     print(f"⚠️ Netflix stream not mounted: {e}")
 app.include_router(soul_router, prefix=settings.api_prefix)
-from app.api.media_proxy import router as media_proxy_router
-app.include_router(media_proxy_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
 try:
