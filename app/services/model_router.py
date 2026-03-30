@@ -10,9 +10,8 @@ Tiers:
   - heavy (>70):  Tool use, coding, analysis     → best available
 
 Key combinations:
-  Both keys:     GPT-4o-mini (light) + Claude Opus (medium/heavy)
-  Anthropic only: Claude Sonnet (light) + Claude Opus (medium/heavy)
-  OpenAI only:   GPT-4o-mini (light) + GPT-5.4 (medium/heavy)
+  Anthropic (±OpenAI): Claude Sonnet (light) + Claude Opus (medium/heavy)
+  OpenAI only:         GPT-5.4 for all tiers
 
 The router uses fast heuristics (no LLM call) to classify in <1ms.
 """
@@ -48,26 +47,16 @@ class ModelTier:
 def _get_tiers() -> Dict[str, ModelTier]:
     """Build tiers dynamically based on available API keys.
 
-    Both keys: GPT-4o-mini (light, cheap), Claude Opus (medium/heavy, best quality)
+    Both keys: Claude Sonnet (light), Claude Opus (medium/heavy)
     Only Anthropic: Claude Sonnet (light), Claude Opus (medium/heavy)
-    Only OpenAI: GPT-4o-mini (light), GPT-5.4 (medium/heavy)
+    Only OpenAI: GPT-5.4 for all tiers
     """
     from app.services.key_provider import keys
     has_anthropic = keys.has_anthropic
     has_openai = keys.has_openai
 
-    if has_anthropic and has_openai:
-        # Best of both: cheap GPT for trivial, Claude Opus for real work
-        return {
-            "light": ModelTier(name="light", model="gpt-4o-mini", label="GPT-4o Mini",
-                               cost_per_1k_input=0.00015, cost_per_1k_output=0.0006),
-            "medium": ModelTier(name="medium", model="claude-opus-4-6", label="Claude Opus 4.6",
-                                cost_per_1k_input=0.015, cost_per_1k_output=0.075),
-            "heavy": ModelTier(name="heavy", model="claude-opus-4-6", label="Claude Opus 4.6",
-                               cost_per_1k_input=0.015, cost_per_1k_output=0.075),
-        }
-    elif has_anthropic:
-        # Anthropic only: Sonnet for light, Opus for rest
+    if has_anthropic:
+        # Anthropic available (with or without OpenAI): Sonnet for light, Opus for rest
         return {
             "light": ModelTier(name="light", model="claude-sonnet-4-6", label="Claude Sonnet 4.6",
                                cost_per_1k_input=0.003, cost_per_1k_output=0.015),
@@ -77,10 +66,10 @@ def _get_tiers() -> Dict[str, ModelTier]:
                                cost_per_1k_input=0.015, cost_per_1k_output=0.075),
         }
     elif has_openai:
-        # OpenAI only: mini for light, 5.4 for rest
+        # OpenAI only: GPT-5.4 for everything
         return {
-            "light": ModelTier(name="light", model="gpt-4o-mini", label="GPT-4o Mini",
-                               cost_per_1k_input=0.00015, cost_per_1k_output=0.0006),
+            "light": ModelTier(name="light", model="gpt-5.4", label="GPT-5.4",
+                               cost_per_1k_input=0.003, cost_per_1k_output=0.012),
             "medium": ModelTier(name="medium", model="gpt-5.4", label="GPT-5.4",
                                 cost_per_1k_input=0.003, cost_per_1k_output=0.012),
             "heavy": ModelTier(name="heavy", model="gpt-5.4", label="GPT-5.4",
