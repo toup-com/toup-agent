@@ -406,12 +406,12 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ App Manager/Builder error: {e}")
 
         # ── Store module refs for hot-restart ────────────────
-        global _telegram_bot, _agent_runner, _tool_executor, _subagent_manager, _skill_loader, _cron_service
-        _agent_runner = agent_runner
-        _tool_executor = tool_executor
-        _subagent_manager = subagent_manager
-        _skill_loader = skill_loader
-        _cron_service = cron_service
+        import agent_main as _self
+        _self._agent_runner = agent_runner
+        _self._tool_executor = tool_executor
+        _self._subagent_manager = subagent_manager
+        _self._skill_loader = skill_loader
+        _self._cron_service = cron_service
 
         # ── Start Telegram bot (if configured) ────────────────
         if settings.telegram_bot_token:
@@ -427,7 +427,7 @@ async def lifespan(app: FastAPI):
             telegram_bot.cron_service = cron_service
 
             await telegram_bot.start()
-            _telegram_bot = telegram_bot
+            _self._telegram_bot = telegram_bot
             print("🤖 Telegram bot started")
 
             # Admin dashboard refs
