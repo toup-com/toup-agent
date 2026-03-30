@@ -961,14 +961,13 @@ class AgentRunner:
             f"- Channel: {_channel_label}",
             f"- Workspace directory: {settings.agent_workspace_dir}",
             f"- Max tool iterations: {self.max_iterations}",
+            f"- You have FULL terminal/shell access via the `exec` tool. You can run any command, install packages, write scripts, manage files, use git, curl, python, node, etc.",
+            f"- You can read and write files using `read_file` and `write_file` tools.",
+            f"- You can search the web using the `web_search` tool.",
+            f"- When the user asks you to do a multi-step task, use the `create_job` tool to create a trackable job. Update it with `update_job` as you complete each step.",
         ]
         if hasattr(self, "_current_lane") and self._current_lane != "main":
             runtime_lines.append(f"- Execution lane: {self._current_lane}")
-        runtime_lines.append(
-            "- When the user asks you to do a multi-step task, use the create_job tool "
-            "to create a trackable job. Update it with update_job as you complete each step. "
-            "This shows live progress in their dashboard."
-        )
         section_parts["runtime"] = "\n".join(runtime_lines)
 
         # ── 7. Formatting rules (channel-aware) ───────────────────
