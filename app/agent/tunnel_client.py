@@ -293,6 +293,20 @@ class AgentTunnelClient:
         except Exception as e:
             logger.warning("[TUNNEL-CLIENT] KeyProvider refresh failed: %s", e)
 
+        # Hot-restart Telegram bot if token changed
+        try:
+            import app.config
+            new_tg_token = (app.config.settings.telegram_bot_token or "").strip()
+            import agent_main
+            old_bot = agent_main._telegram_bot
+            old_token = old_bot.token if old_bot else ""
+            if new_tg_token != old_token:
+                logger.info("[TUNNEL-CLIENT] Telegram token changed — restarting bot")
+                import asyncio
+                asyncio.create_task(agent_main.restart_telegram_bot())
+        except Exception as e:
+            logger.warning("[TUNNEL-CLIENT] Telegram bot restart check failed: %s", e)
+
     async def _handle_http_forward(self, ws, msg: dict):
         """Forward an HTTP request to the local agent server and return the result."""
         call_id = msg.get("id", "")

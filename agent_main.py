@@ -52,6 +52,70 @@ _skill_loader = None
 _PUBLIC_PATHS = frozenset({"/", "/agent/health", "/agent/system", "/docs", "/openapi.json", "/redoc"})
 
 
+# ── Module-level refs for hot-restart of channel bots ──────────────
+_telegram_bot = None
+_agent_runner = None
+_tool_executor = None
+_subagent_manager = None
+_skill_loader = None
+_cron_service = None
+
+
+async def restart_telegram_bot():
+    """Hot-restart the Telegram bot with a new token from settings.
+
+    Called by tunnel_client after config sync when the token changes.
+    Stops the old bot (if running) and starts a new one.
+    """
+    global _telegram_bot
+    from app.config import settings
+    from app.agent.telegram_bot import ToupTelegramBot
+
+    new_token = (settings.telegram_bot_token or "").strip()
+
+    # Stop existing bot
+    if _telegram_bot:
+        try:
+            await _telegram_bot.stop()
+            print("🛑 Telegram bot stopped (token changed)")
+        except Exception as e:
+            logging.warning(f"[RESTART] Bot stop error: {e}")
+        _telegram_bot = None
+
+    if not new_token:
+        print("ℹ️  No Telegram token — bot not started")
+        return
+
+    if not _agent_runner:
+        logging.warning("[RESTART] Cannot start Telegram bot — agent_runner not initialized")
+        return
+
+    try:
+        _telegram_bot = ToupTelegramBot(
+            token=new_token,
+            agent_runner=_agent_runner,
+        )
+        if _tool_executor:
+            _tool_executor.telegram_bot = _telegram_bot
+        if _subagent_manager:
+            _subagent_manager.set_bot(_telegram_bot)
+            _telegram_bot.subagent_manager = _subagent_manager
+        if _skill_loader:
+            _telegram_bot.skill_loader = _skill_loader
+        if _cron_service:
+            _cron_service.set_bot(_telegram_bot)
+            _telegram_bot.cron_service = _cron_service
+
+        await _telegram_bot.start()
+        print("🤖 Telegram bot restarted with new token")
+
+        from app.api.admin import set_bot_refs
+        set_bot_refs(_telegram_bot, _cron_service, _telegram_bot._start_time)
+    except Exception as e:
+        logging.exception(f"[RESTART] Failed to start Telegram bot: {e}")
+        _telegram_bot = None
+
+
 class AgentAPIKeyMiddleware:
     """Raw ASGI middleware that validates the X-Agent-Key header.
 
@@ -341,6 +405,14 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ App Manager/Builder error: {e}")
 
+        # ── Store module refs for hot-restart ────────────────
+        global _telegram_bot, _agent_runner, _tool_executor, _subagent_manager, _skill_loader, _cron_service
+        _agent_runner = agent_runner
+        _tool_executor = tool_executor
+        _subagent_manager = subagent_manager
+        _skill_loader = skill_loader
+        _cron_service = cron_service
+
         # ── Start Telegram bot (if configured) ────────────────
         if settings.telegram_bot_token:
             telegram_bot = ToupTelegramBot(
@@ -355,6 +427,7 @@ async def lifespan(app: FastAPI):
             telegram_bot.cron_service = cron_service
 
             await telegram_bot.start()
+            _telegram_bot = telegram_bot
             print("🤖 Telegram bot started")
 
             # Admin dashboard refs
