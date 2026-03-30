@@ -61,7 +61,6 @@ class UserAdminResponse(BaseModel):
     created_at: datetime
     memory_count: int = 0
     session_count: int = 0
-    password_plain: Optional[str] = None
     hosting_mode: Optional[str] = None
     deploy_status: Optional[str] = None
     agent_url: Optional[str] = None
@@ -223,7 +222,6 @@ async def list_users(
             created_at=user.created_at,
             memory_count=mem_count,
             session_count=sess_count,
-            password_plain=getattr(user, "password_plain", None),
             hosting_mode=hosting_mode,
             deploy_status=deploy_status,
             agent_url=agent_url,
@@ -274,6 +272,26 @@ async def update_user(
         created_at=user.created_at,
         password_plain=getattr(user, "password_plain", None),
     )
+
+
+@router.post("/users/{user_id}/reset-password")
+async def admin_reset_password(
+    user_id: str,
+    body: dict,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin resets a user's password. Invalidates their existing tokens."""
+    new_password = body.get("new_password", "")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    from app.services.auth_service import change_user_password
+    await change_user_password(db, user, new_password)
+    return {"success": True, "message": f"Password reset for {user.email}"}
 
 
 @router.delete("/users/{user_id}")

@@ -111,7 +111,7 @@ class MemoryEventType(str, Enum):
 
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=6)
+    password: str = Field(min_length=8)
     name: Optional[str] = None
 
 
@@ -140,6 +140,19 @@ class Token(BaseModel):
 class TokenPayload(BaseModel):
     sub: str
     exp: datetime
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+class UpdateProfileRequest(BaseModel):
+    name: Optional[str] = Field(None, max_length=255)
+
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=8)
 
 
 # ============ Memory Schemas ============

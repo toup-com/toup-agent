@@ -1,25 +1,32 @@
 """Authentication endpoints"""
 
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from typing import Optional
+from jose import jwt, JWTError
 
 from app.db import get_db
-from app.schemas import UserCreate, UserLogin, UserResponse, Token
+from app.schemas import (
+    UserCreate, UserLogin, UserResponse, Token,
+    ChangePasswordRequest, UpdateProfileRequest,
+)
 from app.services import (
     authenticate_user, create_user, get_user_by_email,
-    get_user_by_id, create_access_token, decode_access_token
+    get_user_by_id, create_access_token, decode_access_token,
+    verify_password, change_user_password,
 )
+from app.services.rate_limiter import login_rate_limiter
 from app.config import settings
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
-security = HTTPBearer(auto_error=False)  # Don't auto-reject — we also check SSO cookie
+security = HTTPBearer(auto_error=False)
 
 # SSO cookie config
 SSO_COOKIE_NAME = "hex_sso_token"
-SSO_COOKIE_DOMAIN = ".toup.ai"  # Shared across all *.toup.ai subdomains
+SSO_COOKIE_DOMAIN = ".toup.ai"
 SSO_COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 1 week
 
 
@@ -29,28 +36,28 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db)
 ):
     """Dependency to get the current authenticated user.
-    Checks Bearer token first, then falls back to SSO cookie."""
+    Checks Bearer token first, then falls back to SSO cookie.
+    Validates token was issued after last password change."""
     token = None
     user_id = None
-    
+
     # 1. Try Bearer token
     if credentials and credentials.credentials:
         token = credentials.credentials
         user_id = decode_access_token(token)
-    
+
     # 2. Fall back to SSO cookie
     if not user_id:
-        cookie_token = request.cookies.get(SSO_COOKIE_NAME)
-        if cookie_token:
-            user_id = decode_access_token(cookie_token)
+        token = request.cookies.get(SSO_COOKIE_NAME)
+        if token:
+            user_id = decode_access_token(token)
 
-    # 3. Fall back to agent mode — if X-Agent-Key was validated by middleware,
-    #    resolve user from settings.user_id (VPS agent serving platform proxy requests)
+    # 3. Fall back to agent mode
     if not user_id:
-        from app.config import settings
         agent_key = request.headers.get("x-agent-key", "")
         if settings.agent_api_key and agent_key == settings.agent_api_key and settings.user_id:
             user_id = settings.user_id
+            token = None  # Skip token revocation check for agent mode
 
     if not user_id:
         raise HTTPException(
@@ -58,11 +65,10 @@ async def get_current_user(
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     user = await get_user_by_id(db, user_id)
     if not user:
-        # In agent mode, auto-create a stub user for the platform owner
-        from app.config import settings
+        # In agent mode, auto-create a stub user
         if settings.agent_api_key and settings.user_id and user_id == settings.user_id:
             from app.db.models import User
             user = User(id=user_id, email=f"{user_id[:8]}@agent.local", hashed_password="", name="Agent Owner")
@@ -70,91 +76,127 @@ async def get_current_user(
             await db.commit()
             await db.refresh(user)
         else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User not found",
-            )
-    
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
     if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is disabled",
-        )
-    
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled")
+
+    # Token revocation: reject tokens issued before last password change
+    if token and getattr(user, 'password_changed_at', None):
+        try:
+            payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+            token_iat = datetime.utcfromtimestamp(payload.get("iat", 0))
+            if token_iat < user.password_changed_at:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Token invalidated by password change. Please log in again.",
+                )
+        except JWTError:
+            pass  # Token already validated by decode_access_token
+
     return user
 
+
+# ── Register ─────────────────────────────────────────────────────
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(
-    user_data: UserCreate,
-    db: AsyncSession = Depends(get_db)
-):
+async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     """Register a new user"""
-    # Check if email already exists
     existing = await get_user_by_email(db, user_data.email)
     if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
-    user = await create_user(
-        db,
-        email=user_data.email,
-        password=user_data.password,
-        name=user_data.name
-    )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+    user = await create_user(db, email=user_data.email, password=user_data.password, name=user_data.name)
     return user
 
 
+# ── Login (with rate limiting) ───────────────────────────────────
+
 @router.post("/login", response_model=Token)
-async def login(
-    credentials: UserLogin,
-    response: Response,
-    db: AsyncSession = Depends(get_db)
-):
-    """Login and get access token. Also sets SSO cookie for cross-domain auth.
-    Accepts email (nariman@toup.ai) or bare username (nariman)."""
+async def login(credentials: UserLogin, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    """Login and get access token. Rate-limited: 5 attempts per 5 minutes."""
     login_id = credentials.email.strip()
-    
-    # Try exact match first
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Rate limit check
+    retry_after = login_rate_limiter.check(client_ip, login_id)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many login attempts. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     user = await authenticate_user(db, login_id, credentials.password)
-    
-    # If no match and input doesn't contain @, try appending @toup.ai
     if not user and '@' not in login_id:
         user = await authenticate_user(db, f"{login_id}@toup.ai", credentials.password)
-    
+
     if not user:
+        login_rate_limiter.record(client_ip, login_id)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
+    login_rate_limiter.clear(client_ip, login_id)
     token = create_access_token(user.id)
-    
-    # Set SSO cookie for cross-domain auth (shared across *.toup.ai)
+
     response.set_cookie(
-        key=SSO_COOKIE_NAME,
-        value=token,
-        domain=SSO_COOKIE_DOMAIN,
-        max_age=SSO_COOKIE_MAX_AGE,
-        httponly=True,
-        secure=True,
-        samesite="none",  # Required for cross-domain cookies
-        path="/",
+        key=SSO_COOKIE_NAME, value=token, domain=SSO_COOKIE_DOMAIN,
+        max_age=SSO_COOKIE_MAX_AGE, httponly=True, secure=True,
+        samesite="none", path="/",
     )
-    
     return Token(access_token=token)
 
 
+# ── Profile ──────────────────────────────────────────────────────
+
 @router.get("/me", response_model=UserResponse)
-async def get_me(
-    current_user = Depends(get_current_user)
-):
+async def get_me(current_user=Depends(get_current_user)):
     """Get current user info"""
     return current_user
 
+
+@router.patch("/profile")
+async def update_profile(
+    body: UpdateProfileRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update user profile (name)."""
+    if body.name is not None:
+        current_user.name = body.name
+        current_user.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(current_user)
+    return {"id": current_user.id, "email": current_user.email, "name": current_user.name}
+
+
+# ── Change Password ──────────────────────────────────────────────
+
+@router.post("/change-password")
+async def change_password(
+    body: ChangePasswordRequest,
+    response: Response,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Change own password. Requires current password. Returns new token."""
+    if not verify_password(body.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    await change_user_password(db, current_user, body.new_password)
+    new_token = create_access_token(current_user.id)
+
+    response.set_cookie(
+        key=SSO_COOKIE_NAME, value=new_token, domain=SSO_COOKIE_DOMAIN,
+        max_age=SSO_COOKIE_MAX_AGE, httponly=True, secure=True,
+        samesite="none", path="/",
+    )
+    return {"access_token": new_token, "message": "Password changed successfully"}
+
+
+# ── Token Validation ─────────────────────────────────────────────
 
 class ValidateRequest(BaseModel):
     token: Optional[str] = None
@@ -167,120 +209,81 @@ class ValidateResponse(BaseModel):
 
 
 @router.post("/validate", response_model=ValidateResponse)
-async def validate_token(
-    request: Request,
-    body: Optional[ValidateRequest] = None,
-    db: AsyncSession = Depends(get_db)
-):
-    """Validate a JWT token and return user info. Used by Dashboard for SSO.
-    Accepts token in body, Authorization header, or SSO cookie."""
+async def validate_token(request: Request, body: Optional[ValidateRequest] = None, db: AsyncSession = Depends(get_db)):
+    """Validate a JWT token and return user info."""
     token = None
-    
-    # 1. Check request body
     if body and body.token:
         token = body.token
-    
-    # 2. Check Authorization header
     if not token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
-    
-    # 3. Check SSO cookie
     if not token:
         token = request.cookies.get(SSO_COOKIE_NAME)
-    
     if not token:
         return ValidateResponse(valid=False)
-    
+
     user_id = decode_access_token(token)
     if not user_id:
         return ValidateResponse(valid=False)
-    
+
     user = await get_user_by_id(db, user_id)
     if not user or not user.is_active:
         return ValidateResponse(valid=False)
-    
-    return ValidateResponse(
-        valid=True,
-        user_id=str(user.id),
-        email=user.email,
-        name=user.name,
-    )
 
+    # Token revocation check
+    if getattr(user, 'password_changed_at', None):
+        try:
+            payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+            token_iat = datetime.utcfromtimestamp(payload.get("iat", 0))
+            if token_iat < user.password_changed_at:
+                return ValidateResponse(valid=False)
+        except JWTError:
+            return ValidateResponse(valid=False)
+
+    return ValidateResponse(valid=True, user_id=str(user.id), email=user.email, name=user.name)
+
+
+# ── SSO Exchange ─────────────────────────────────────────────────
 
 class SSOExchangeRequest(BaseModel):
     token: str
 
-
 @router.post("/sso", response_model=Token)
-async def sso_exchange(
-    body: SSOExchangeRequest,
-    response: Response,
-    db: AsyncSession = Depends(get_db),
-):
-    """Exchange an SSO token (Brain JWT from the Dashboard) for a fresh JWT.
-    The Dashboard passes the hex_sso_token cookie value as a query-param;
-    this endpoint validates it and returns a Bearer token the SPA can store
-    in localStorage."""
+async def sso_exchange(body: SSOExchangeRequest, response: Response, db: AsyncSession = Depends(get_db)):
+    """Exchange an SSO token for a fresh JWT."""
     user_id = decode_access_token(body.token)
     if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired SSO token",
-        )
-
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired SSO token")
     user = await get_user_by_id(db, user_id)
     if not user or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found or inactive",
-        )
-
-    # Issue a fresh JWT
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
     new_token = create_access_token(user.id)
-
-    # Also set the SSO cookie so subsequent navigations work
     response.set_cookie(
-        key=SSO_COOKIE_NAME,
-        value=new_token,
-        domain=SSO_COOKIE_DOMAIN,
-        max_age=SSO_COOKIE_MAX_AGE,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
+        key=SSO_COOKIE_NAME, value=new_token, domain=SSO_COOKIE_DOMAIN,
+        max_age=SSO_COOKIE_MAX_AGE, httponly=True, secure=True, samesite="none", path="/",
     )
-
     return Token(access_token=new_token)
 
+
+# ── Logout ───────────────────────────────────────────────────────
 
 @router.post("/logout")
 async def logout_user(response: Response):
     """Logout — clear SSO cookie"""
-    response.delete_cookie(
-        key=SSO_COOKIE_NAME,
-        domain=SSO_COOKIE_DOMAIN,
-        path="/",
-    )
+    response.delete_cookie(key=SSO_COOKIE_NAME, domain=SSO_COOKIE_DOMAIN, path="/")
     return {"success": True}
 
 
-# For demo mode: auto-create a demo user if none exists
+# ── Demo ─────────────────────────────────────────────────────────
+
 @router.post("/demo", response_model=Token)
 async def demo_login(db: AsyncSession = Depends(get_db)):
     """Create or login as demo user (for testing)"""
     demo_email = "demo@toup.local"
     demo_password = "demo123456"
-    
     user = await get_user_by_email(db, demo_email)
     if not user:
-        user = await create_user(
-            db,
-            email=demo_email,
-            password=demo_password,
-            name="Demo User"
-        )
-    
+        user = await create_user(db, email=demo_email, password=demo_password, name="Demo User")
     token = create_access_token(user.id)
     return Token(access_token=token)

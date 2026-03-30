@@ -17,8 +17,8 @@ class User(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255))
-    password_plain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Admin-visible plaintext (closed beta only)
     name: Mapped[Optional[str]] = mapped_column(String(255))
+    password_changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     role: Mapped[str] = mapped_column(String(20), default="beta_user", index=True)  # admin | beta_user
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

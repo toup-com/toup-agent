@@ -90,7 +90,6 @@ async def create_user(
     user = User(
         email=email,
         hashed_password=get_password_hash(password),
-        password_plain=password,
         name=name,
     )
     db.add(user)
@@ -170,6 +169,15 @@ Your name will be chosen by the user during onboarding — if you don't know you
     
     db.add(default_soul)
     db.add(default_instructions)
+
+
+async def change_user_password(db: AsyncSession, user: User, new_password: str) -> User:
+    """Change a user's password and invalidate all existing tokens."""
+    user.hashed_password = get_password_hash(new_password)
+    user.password_changed_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(user)
+    return user
 
 
 async def get_user_by_id(db: AsyncSession, user_id: str) -> Optional[User]:
