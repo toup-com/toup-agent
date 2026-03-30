@@ -3046,9 +3046,9 @@ const _webDb = {
     ) -> str:
         """Call the LLM (Anthropic). Using Opus 4.6 for all phases."""
         import time as _time
-        from app.config import settings
+        from app.services.key_provider import keys
 
-        anthropic_key = (settings.anthropic_api_key or "").strip()
+        anthropic_key = keys.anthropic or ""
         if anthropic_key:
             try:
                 import anthropic

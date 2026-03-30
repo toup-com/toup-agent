@@ -27,12 +27,14 @@ RELOADABLE_FIELDS: Set[str] = {
     "group_policy", "group_require_mention", "tool_timeout_default",
 }
 
-# Fields that must NOT be reloaded (security-sensitive)
+# Fields that must NOT be reloaded (security-sensitive, require process restart)
+# NOTE: LLM API keys (openai_api_key, anthropic_api_key) are NOT frozen —
+# they are managed by KeyProvider which rebuilds clients on key change.
 FROZEN_FIELDS: Set[str] = {
-    "database_url", "jwt_secret", "jwt_algorithm", "openai_api_key",
-    "anthropic_api_key", "telegram_bot_token", "discord_bot_token",
+    "database_url", "jwt_secret", "jwt_algorithm",
+    "telegram_bot_token", "discord_bot_token",
     "slack_bot_token", "slack_app_token", "whatsapp_access_token",
-    "whatsapp_app_secret", "brave_api_key", "cohere_api_key",
+    "whatsapp_app_secret",
 }
 
 

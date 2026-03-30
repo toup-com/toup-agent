@@ -285,6 +285,14 @@ class AgentTunnelClient:
         except Exception as e:
             logger.warning("[TUNNEL-CLIENT] Failed to reload settings: %s", e)
 
+        # Refresh KeyProvider so all LLM services pick up new keys
+        try:
+            from app.services.key_provider import keys
+            keys.refresh()
+            print(f"🔑 API keys refreshed (openai={'✓' if keys.has_openai else '✗'}, anthropic={'✓' if keys.has_anthropic else '✗'})")
+        except Exception as e:
+            logger.warning("[TUNNEL-CLIENT] KeyProvider refresh failed: %s", e)
+
     async def _handle_http_forward(self, ws, msg: dict):
         """Forward an HTTP request to the local agent server and return the result."""
         call_id = msg.get("id", "")

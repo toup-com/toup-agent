@@ -58,12 +58,24 @@ class OpenAIAgentService:
     """
 
     def __init__(self):
-        api_key = settings.openai_api_key
+        from app.services.key_provider import keys
+        self._keys = keys
+        self._key_version = -1  # Force initial build
+        self.client = None
+        self.default_model = settings.agent_model
+        self.default_max_tokens = settings.agent_max_tokens
+        self._ensure_client()
+
+    def _ensure_client(self):
+        """Rebuild the OpenAI client if the API key has changed."""
+        if self._key_version == self._keys.version and self.client is not None:
+            return
+        self._key_version = self._keys.version
+        api_key = self._keys.openai or ""
         if not api_key:
             logger.warning("OPENAI_API_KEY not set — OpenAIAgentService will fail on calls")
         self.client = AsyncOpenAI(api_key=api_key or "missing")
-        self.default_model = settings.agent_model
-        self.default_max_tokens = settings.agent_max_tokens
+        logger.info("[OPENAI] Client rebuilt (v%d)", self._key_version)
 
     # ------------------------------------------------------------------
     # Streaming completion  (main interface used by agent_runner)
@@ -82,6 +94,7 @@ class OpenAIAgentService:
         Stream a chat completion. Yields StreamEvent objects matching the
         same contract as AnthropicService so the agent loop is unchanged.
         """
+        self._ensure_client()
         model = model or self.default_model
         max_tokens = max_tokens or self.default_max_tokens
 

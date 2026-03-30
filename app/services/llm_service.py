@@ -42,7 +42,8 @@ def _should_use_anthropic(api_key: Optional[str] = None) -> bool:
     Otherwise prefer Anthropic when its key is available."""
     if api_key:
         return False  # Explicit per-user OpenAI key
-    return bool(settings.anthropic_api_key)
+    from app.services.key_provider import keys
+    return keys.has_anthropic
 
 
 class LLMService:
@@ -55,6 +56,7 @@ class LLMService:
     """
 
     def __init__(self, api_key: Optional[str] = None):
+        from app.services.key_provider import keys
         self._use_anthropic = _should_use_anthropic(api_key)
         self._anthropic_svc = None
         self._openai_client = None
@@ -66,7 +68,7 @@ class LLMService:
             self.default_model = settings.agent_model or "claude-sonnet-4-6"
         else:
             from openai import AsyncOpenAI
-            self._openai_client = AsyncOpenAI(api_key=api_key or settings.openai_api_key)
+            self._openai_client = AsyncOpenAI(api_key=api_key or keys.openai or "missing")
             self.default_model = settings.default_model
 
         self.default_temperature = settings.temperature

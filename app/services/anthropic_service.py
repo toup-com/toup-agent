@@ -55,23 +55,31 @@ class AnthropicService:
     """
     
     def __init__(self):
-        api_key = (settings.anthropic_api_key or "").strip()
+        from app.services.key_provider import keys
+        self._key_version = -1  # Force initial build
+        self._keys = keys
+        self.client = None
+        self.is_oauth = False
+        self.default_model = settings.anthropic_model
+        self.default_max_tokens = settings.anthropic_max_tokens
+        self._ensure_client()
+
+    def _ensure_client(self):
+        """Rebuild the Anthropic client if the API key has changed."""
+        if self._key_version == self._keys.version and self.client is not None:
+            return
+        self._key_version = self._keys.version
+        api_key = self._keys.anthropic or ""
+
         if not api_key:
             logger.warning("ANTHROPIC_API_KEY not set — AnthropicService will fail on calls")
-        
+
         # Detect OAuth tokens (sk-ant-oat*) vs regular API keys (sk-ant-api*)
         self.is_oauth = bool(api_key and "sk-ant-oat" in api_key)
         if self.is_oauth:
             logger.info("Using Anthropic OAuth token authentication (Claude Code mode)")
-            # IMPORTANT: Remove ANTHROPIC_API_KEY from env before creating client.
-            # The SDK auto-reads this env var and sends it as X-Api-Key header,
-            # which causes 401 for OAuth tokens. We need ONLY Authorization: Bearer.
             import os
             os.environ.pop("ANTHROPIC_API_KEY", None)
-            # CRITICAL: Use a custom httpx client with the correct user-agent.
-            # The Anthropic SDK prepends "Anthropic/Python X.Y.Z" to user-agent,
-            # which breaks OAuth validation (Anthropic checks that the request
-            # looks like it comes from Claude Code, not a generic Python client).
             import httpx
             _http_client = httpx.AsyncClient(
                 headers={"user-agent": "claude-code/1.0.33"},
@@ -86,9 +94,7 @@ class AnthropicService:
             )
         else:
             self.client = anthropic.AsyncAnthropic(api_key=api_key or "missing")
-        
-        self.default_model = settings.anthropic_model
-        self.default_max_tokens = settings.anthropic_max_tokens
+        logger.info("[ANTHROPIC] Client rebuilt (oauth=%s, v%d)", self.is_oauth, self._key_version)
     
     def _prepare_system(self, system: str) -> any:
         """
@@ -136,6 +142,7 @@ class AnthropicService:
             AnthropicResponse with text content and any tool calls.
         """
         model = model or self.default_model
+        self._ensure_client()
         max_tokens = max_tokens or self.default_max_tokens
 
         kwargs: Dict[str, Any] = dict(
@@ -220,9 +227,10 @@ class AnthropicService:
         Stream a message. Yields StreamEvent objects for text chunks,
         tool use blocks, and the final message_end event.
         """
+        self._ensure_client()
         model = model or self.default_model
         max_tokens = max_tokens or self.default_max_tokens
-        
+
         kwargs: Dict[str, Any] = dict(
             model=model,
             max_tokens=max_tokens,

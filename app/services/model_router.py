@@ -52,8 +52,9 @@ def _get_tiers() -> Dict[str, ModelTier]:
     Only Anthropic: Claude Sonnet (light), Claude Opus (medium/heavy)
     Only OpenAI: GPT-4o-mini (light), GPT-5.4 (medium/heavy)
     """
-    has_anthropic = bool(settings.anthropic_api_key)
-    has_openai = bool(settings.openai_api_key)
+    from app.services.key_provider import keys
+    has_anthropic = keys.has_anthropic
+    has_openai = keys.has_openai
 
     if has_anthropic and has_openai:
         # Best of both: cheap GPT for trivial, Claude Opus for real work
@@ -298,14 +299,15 @@ def classify_request(
     tier = _get_tiers()[tier_name]
 
     # Safety fallbacks — _get_tiers() is already key-aware, but double-check
-    if _is_claude_model(tier.model) and not settings.anthropic_api_key:
-        fallback = settings.agent_model if settings.openai_api_key else tier.model
+    from app.services.key_provider import keys as _keys
+    if _is_claude_model(tier.model) and not _keys.has_anthropic:
+        fallback = settings.agent_model if _keys.has_openai else tier.model
         if fallback != tier.model:
             logger.info(f"[ROUTER] No Anthropic key — {tier.model} → {fallback}")
             tier = ModelTier(name=tier_name, model=fallback, label=f"{fallback} (fallback)")
 
-    if not _is_claude_model(tier.model) and not settings.openai_api_key:
-        fallback = "claude-opus-4-6" if settings.anthropic_api_key else tier.model
+    if not _is_claude_model(tier.model) and not _keys.has_openai:
+        fallback = "claude-opus-4-6" if _keys.has_anthropic else tier.model
         if fallback != tier.model:
             logger.info(f"[ROUTER] No OpenAI key — {tier.model} → {fallback}")
             tier = ModelTier(name=tier_name, model=fallback, label=f"{fallback} (fallback)")
