@@ -160,6 +160,8 @@ async def init_db():
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS layer2_changes_json TEXT",
         # VPS soul sync tracking
         "ALTER TABLE soul_configs ADD COLUMN IF NOT EXISTS vps_soul_synced_at TIMESTAMP",
+        # Password change tracking (token revocation)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
     ]
 
     # Vector dimension migration: if embedding_dimension changed (e.g. 1536 → 384),
