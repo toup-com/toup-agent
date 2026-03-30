@@ -857,30 +857,112 @@ echo "  Toup Agent Setup"
 echo "  ════════════════════════"
 echo ""
 
-# ── Check prerequisites ──────────────────────────────────
+# ── Check & auto-install prerequisites ───────────────────
 echo "[1/7] Checking prerequisites..."
 
-if ! command -v python3 &>/dev/null; then
-  echo "  Python 3 is required but not installed."
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    echo "  Install with: brew install python3"
-  else
-    echo "  Install with: sudo apt install python3 python3-venv"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  # ── macOS: ensure Xcode Command Line Tools ──
+  if ! xcode-select -p &>/dev/null; then
+    echo "  Installing Xcode Command Line Tools (this may take a few minutes)..."
+    xcode-select --install 2>/dev/null || true
+    # Wait for the installer to finish
+    echo "  Waiting for installation to complete..."
+    until xcode-select -p &>/dev/null; do
+      sleep 5
+    done
+    echo "  Xcode Command Line Tools installed"
   fi
-  exit 1
-fi
-PYVER=$(python3 --version 2>&1)
-echo "  $PYVER"
 
-if ! command -v git &>/dev/null; then
-  echo "  Git is required but not installed."
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    echo "  Install with: brew install git"
-  else
-    echo "  Install with: sudo apt install git"
+  # ── macOS: ensure Homebrew ──
+  if ! command -v brew &>/dev/null; then
+    echo "  Installing Homebrew (this may take a few minutes)..."
+    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    # Add brew to PATH for Apple Silicon and Intel
+    if [ -f /opt/homebrew/bin/brew ]; then
+      eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [ -f /usr/local/bin/brew ]; then
+      eval "$(/usr/local/bin/brew shellenv)"
+    fi
+    echo "  Homebrew installed"
   fi
+
+  # ── macOS: ensure Python 3.10+ ──
+  _need_python=false
+  if ! command -v python3 &>/dev/null; then
+    _need_python=true
+  else
+    _pyver_minor=$(python3 -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
+    if [ "$_pyver_minor" -lt 10 ]; then
+      echo "  Python 3.$_pyver_minor is too old (need 3.10+), upgrading..."
+      _need_python=true
+    fi
+  fi
+  if [ "$_need_python" = true ]; then
+    echo "  Installing Python 3.12..."
+    brew install python@3.12 </dev/null
+    # Ensure brew python is on PATH
+    export PATH="$(brew --prefix python@3.12)/libexec/bin:$(brew --prefix)/bin:$PATH"
+    echo "  Python 3.12 installed"
+  fi
+
+  # ── macOS: ensure Git ──
+  if ! command -v git &>/dev/null; then
+    echo "  Installing Git..."
+    brew install git </dev/null
+    echo "  Git installed"
+  fi
+
+else
+  # ── Linux: auto-install missing prerequisites ──
+  if ! command -v python3 &>/dev/null || ! command -v git &>/dev/null; then
+    echo "  Installing prerequisites..."
+    sudo apt-get update -qq
+  fi
+  if ! command -v python3 &>/dev/null; then
+    echo "  Installing Python 3..."
+    sudo apt-get install -y python3 python3-venv python3-pip
+  fi
+  _pyver_minor=$(python3 -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
+  if [ "$_pyver_minor" -lt 10 ]; then
+    echo "  Python 3.$_pyver_minor is too old (need 3.10+)."
+    echo "  Installing Python 3.12..."
+    sudo apt-get install -y software-properties-common
+    sudo add-apt-repository -y ppa:deadsnakes/ppa
+    sudo apt-get update -qq
+    sudo apt-get install -y python3.12 python3.12-venv
+    # Use python3.12 explicitly
+    alias python3=python3.12
+  fi
+  if ! command -v git &>/dev/null; then
+    echo "  Installing Git..."
+    sudo apt-get install -y git
+  fi
+fi
+
+# Pick the best python3 binary (prefer 3.12, then 3.11, then whatever is on PATH)
+PYTHON3=""
+for _candidate in python3.12 python3.11 python3; do
+  if command -v "$_candidate" &>/dev/null; then
+    _ver=$("$_candidate" -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
+    if [ "$_ver" -ge 10 ]; then
+      PYTHON3=$(command -v "$_candidate")
+      break
+    fi
+  fi
+done
+
+# Final check — if somehow still missing, bail with clear message
+if [ -z "$PYTHON3" ]; then
+  echo "  ERROR: Python 3.10+ could not be found. Please install Python 3.10+ manually and re-run."
   exit 1
 fi
+if ! command -v git &>/dev/null; then
+  echo "  ERROR: Git could not be installed. Please install Git manually and re-run."
+  exit 1
+fi
+
+PYVER=$($PYTHON3 --version 2>&1)
+echo "  $PYVER ($(which $PYTHON3))"
 echo "  $(git --version)"
 
 # ── Clone or update ──────────────────────────────────────
@@ -913,8 +995,17 @@ echo ""
 echo "[3/7] Setting up Python environment..."
 
 if [ ! -d "$AGENT_DIR/venv" ]; then
-  python3 -m venv "$AGENT_DIR/venv"
+  "$PYTHON3" -m venv "$AGENT_DIR/venv"
   echo "  Virtualenv created"
+else
+  # Recreate venv if existing Python is too old
+  _existing_ver=$("$AGENT_DIR/venv/bin/python" -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
+  if [ "$_existing_ver" -lt 10 ]; then
+    echo "  Existing venv uses Python 3.$_existing_ver, recreating with $PYVER..."
+    rm -rf "$AGENT_DIR/venv"
+    "$PYTHON3" -m venv "$AGENT_DIR/venv"
+    echo "  Virtualenv recreated"
+  fi
 fi
 
 echo "  Installing dependencies (this may take a minute)..."
