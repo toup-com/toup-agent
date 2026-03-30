@@ -437,19 +437,28 @@ class ToupTelegramBot:
         # Ensure user mapping exists (creates session on first message)
         toup_user_id = await self._get_toup_user_id(update.effective_user.id, telegram_user=update.effective_user)
 
-        # Read agent name from config (fallback to "Toup")
+        # Read agent name from SoulConfig (fallback to AgentConfig, then "Toup")
         bot_name = "Toup"
         try:
             from app.db.database import async_session_maker
-            from app.db.models import AgentConfig
+            from app.db.models import SoulConfig, AgentConfig
             from sqlalchemy import select
             async with async_session_maker() as db:
+                # Try SoulConfig first (set via Soul page)
                 result = await db.execute(
-                    select(AgentConfig.agent_name).where(AgentConfig.user_id == toup_user_id)
+                    select(SoulConfig.name).where(SoulConfig.user_id == toup_user_id)
                 )
-                row = result.scalar_one_or_none()
-                if row:
-                    bot_name = row
+                soul_name = result.scalar_one_or_none()
+                if soul_name:
+                    bot_name = soul_name
+                else:
+                    # Fallback to AgentConfig.agent_name
+                    result = await db.execute(
+                        select(AgentConfig.agent_name).where(AgentConfig.user_id == toup_user_id)
+                    )
+                    agent_name = result.scalar_one_or_none()
+                    if agent_name:
+                        bot_name = agent_name
         except Exception:
             pass
 
