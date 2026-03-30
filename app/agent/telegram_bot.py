@@ -437,28 +437,35 @@ class ToupTelegramBot:
         # Ensure user mapping exists (creates session on first message)
         toup_user_id = await self._get_toup_user_id(update.effective_user.id, telegram_user=update.effective_user)
 
-        # Read agent name from SoulConfig (fallback to AgentConfig, then "Toup")
+        # Read agent name: AgentConfig.agent_name (synced from Soul page)
+        # → fallback to Identity soul name → fallback to "Toup"
         bot_name = "Toup"
         try:
             from app.db.database import async_session_maker
-            from app.db.models import SoulConfig, AgentConfig
-            from sqlalchemy import select
+            from app.db.models import AgentConfig, Identity
+            from sqlalchemy import select, and_
             async with async_session_maker() as db:
-                # Try SoulConfig first (set via Soul page)
+                # Try AgentConfig.agent_name first (set by soul sync)
                 result = await db.execute(
-                    select(SoulConfig.name).where(SoulConfig.user_id == toup_user_id)
+                    select(AgentConfig.agent_name).where(AgentConfig.user_id == toup_user_id)
                 )
-                soul_name = result.scalar_one_or_none()
-                if soul_name:
-                    bot_name = soul_name
+                name = result.scalar_one_or_none()
+                if name:
+                    bot_name = name
                 else:
-                    # Fallback to AgentConfig.agent_name
+                    # Fallback: parse from Identity soul record name ("{Name} Soul")
                     result = await db.execute(
-                        select(AgentConfig.agent_name).where(AgentConfig.user_id == toup_user_id)
+                        select(Identity.name).where(and_(
+                            Identity.user_id == toup_user_id,
+                            Identity.identity_type == "soul",
+                            Identity.is_active == True,
+                        ))
                     )
-                    agent_name = result.scalar_one_or_none()
-                    if agent_name:
-                        bot_name = agent_name
+                    identity_name = result.scalar_one_or_none()
+                    if identity_name and identity_name.endswith(" Soul"):
+                        bot_name = identity_name[:-5]  # Remove " Soul" suffix
+                    elif identity_name:
+                        bot_name = identity_name
         except Exception:
             pass
 
