@@ -558,6 +558,14 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         except json.JSONDecodeError:
             memories_retrieved = None
 
+    # Parse message metadata (media cards, etc.)
+    msg_metadata = None
+    if getattr(message, 'metadata_json', None):
+        try:
+            msg_metadata = json.loads(message.metadata_json)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     resp = dict(
         id=message.id,
         role=message.role,
@@ -568,6 +576,7 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         model_used=message.model_used,
         memories_retrieved=memories_retrieved,
         processing_time_ms=message.processing_time_ms,
+        media=msg_metadata.get("media") if msg_metadata else None,
     )
 
     # Enrich job card messages with current BuildJob status

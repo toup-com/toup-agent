@@ -64,6 +64,9 @@ class Message(Base):
     # Processing metadata
     processing_time_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # Rich content metadata (JSON): media cards, tool results, etc.
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # Embedding stored as JSON array (for SQLite compatibility)
     embedding_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

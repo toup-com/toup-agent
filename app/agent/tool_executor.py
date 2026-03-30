@@ -2380,6 +2380,9 @@ class ToolExecutor:
                 logger.warning("[play_media] Broadcast failed: %s", e)
                 return f"Found '{video_title}' but could not send to player. URL: https://www.youtube.com/watch?v={video_id}"
 
+        # Store media metadata for message persistence
+        self._last_media = {"type": "youtube", "video_id": video_id, "title": video_title}
+
         return f"Now playing \"{video_title}\"\nhttps://www.youtube.com/watch?v={video_id}"
 
     async def _play_netflix(self, query: str) -> str:
@@ -2452,6 +2455,7 @@ class ToolExecutor:
             })
 
             if netflix_id:
+                self._last_media = {"type": "netflix", "title": f"{title}{episode_info}", "netflix_id": netflix_id, "url": netflix_url}
                 return f"Now playing \"{title}\"{episode_info} on Netflix.\n{netflix_url}"
             else:
                 return f"Opening Netflix search for \"{clean_query}\". The show should appear as the first result."

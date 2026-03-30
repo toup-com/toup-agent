@@ -1152,6 +1152,11 @@ class AgentRunner:
             db.add(user_msg)
             msg_count += 1
 
+        # Capture media metadata from tool calls (play_media, play_netflix)
+        media_meta = getattr(self.tools, '_last_media', None)
+        if media_meta:
+            self.tools._last_media = None  # Clear after capture
+
         asst_msg = Message(
             conversation_id=session_id,
             role="assistant",
@@ -1160,6 +1165,7 @@ class AgentRunner:
             tokens_completion=tokens_output,
             model_used=model,
             processing_time_ms=processing_time_ms,
+            metadata_json=json.dumps({"media": media_meta}) if media_meta else None,
         )
         db.add(asst_msg)
         msg_count += 1

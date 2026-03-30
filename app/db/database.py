@@ -162,6 +162,8 @@ async def init_db():
         "ALTER TABLE soul_configs ADD COLUMN IF NOT EXISTS vps_soul_synced_at TIMESTAMP",
         # Password change tracking (token revocation)
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
+        # Rich content metadata on messages (media cards, etc.)
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS metadata_json TEXT",
     ]
 
     # Vector dimension migration: if embedding_dimension changed (e.g. 1536 → 384),
