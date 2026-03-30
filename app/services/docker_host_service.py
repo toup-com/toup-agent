@@ -281,6 +281,12 @@ async def provision_container(
         await db.commit()
         await db.refresh(container)
         logger.info(f"Provisioned container {container_name} on port {port} for user {user_id[:8]}")
+
+        # Auto-sync soul config to the new container (background)
+        asyncio.create_task(_sync_soul_after_start(
+            user_id, f"http://{settings.docker_host_ip}:{port}", agent_api_key,
+        ))
+
         return container
 
     except Exception as e:
@@ -389,6 +395,66 @@ async def get_container_status(db: AsyncSession, user_id: str) -> Optional[dict]
     }
 
 
+async def _sync_soul_after_start(
+    user_id: str, agent_url: str, agent_api_key: str, db_session_maker=None,
+):
+    """Wait for container health, then push soul config.
+
+    Runs as a background task after provision or recreate.
+    """
+    import httpx
+    from app.db.database import async_session_maker
+    from app.db.models import SoulConfig
+    from sqlalchemy import select
+
+    # Wait up to 30s for the container to be healthy
+    for _ in range(10):
+        await asyncio.sleep(3)
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{agent_url}/agent/health")
+                if resp.status_code == 200:
+                    break
+        except Exception:
+            continue
+    else:
+        logger.warning(f"[DOCKER] Container not healthy after 30s for {user_id[:8]} — skipping soul sync")
+        return
+
+    # Load soul config from platform DB
+    try:
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(SoulConfig).where(SoulConfig.user_id == user_id)
+            )
+            soul = result.scalar_one_or_none()
+            if not soul:
+                return  # No soul configured yet
+
+        # Push to agent
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.put(
+                f"{agent_url}/api/soul/sync",
+                json={
+                    "user_id": user_id,
+                    "name": soul.name,
+                    "compiled_text": soul.compiled_text,
+                    "deactivate_agent_soul_memories": False,
+                    "agent_config_updates": {
+                        "agent_name": soul.name,
+                        "agent_color": soul.color,
+                    },
+                },
+                headers={"X-Agent-Key": agent_api_key},
+            )
+            if resp.status_code == 200:
+                logger.info(f"[DOCKER] Auto-synced soul to container for {user_id[:8]}")
+            else:
+                logger.warning(f"[DOCKER] Soul sync failed for {user_id[:8]}: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"[DOCKER] Soul sync error for {user_id[:8]}: {e}")
+
+
 async def update_container_env(
     db: AsyncSession,
     user_id: str,
@@ -428,4 +494,11 @@ async def update_container_env(
     container.status = "running"
     container.started_at = datetime.utcnow()
     await db.commit()
+
+    # Auto-sync soul config to the new/recreated container (background)
+    asyncio.create_task(_sync_soul_after_start(
+        user_id, agent_config.agent_url or f"http://{settings.docker_host_ip}:{port}",
+        agent_api_key, db_session_maker=None,
+    ))
+
     return container
