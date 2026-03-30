@@ -605,13 +605,14 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
 async def get_messages_by_date(
     date_str: str,
     limit: int = Query(200, ge=1, le=500),
+    tz_offset: int = Query(0),  # Client timezone offset in minutes (e.g. -210 for UTC+3:30)
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Get all messages for all sessions on a specific date (YYYY-MM-DD).
     Returns messages from the 10 most recent sessions, ordered chronologically.
-    Single API call replaces N per-session calls.
+    tz_offset adjusts the date boundary to match the client's local day.
     """
     from datetime import date as date_type, timedelta
 
@@ -620,16 +621,18 @@ async def get_messages_by_date(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    # Try proxying to remote agent first
+    # Try proxying to remote agent first (pass tz_offset through)
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
-        data = await _proxy_sessions(proxy[0], proxy[1], f"by-date/{date_str}/messages", {"limit": limit})
+        data = await _proxy_sessions(proxy[0], proxy[1], f"by-date/{date_str}/messages", {"limit": limit, "tz_offset": tz_offset})
         if data is not None:
             return JSONResponse(content=data)
 
-    # Local: find sessions for this date
-    from sqlalchemy import cast, Date as SQLDate
-    day_start = datetime(target_date.year, target_date.month, target_date.day)
+    # Local: find sessions for this date, adjusted for client timezone.
+    # tz_offset is in minutes from UTC (e.g. -210 means UTC+3:30).
+    # day_start in UTC = midnight local + offset
+    tz_delta = timedelta(minutes=tz_offset)
+    day_start = datetime(target_date.year, target_date.month, target_date.day) + tz_delta
     day_end = day_start + timedelta(days=1)
 
     sessions_result = await db.execute(
