@@ -403,7 +403,7 @@ async def update_container_env(
         return None
 
     agent_api_key = agent_config.agent_api_key or secrets.token_urlsafe(32)
-    env_content = _build_env(user_id, container.db_name, agent_api_key, agent_config)
+    env_content = _build_env(user_id, container.db_name, agent_api_key, agent_config, host_port=container.host_port)
 
     escaped_env = env_content.replace("'", "'\\''")
     await _run_ssh(f"echo '{escaped_env}' > /data/agents/{user_id[:8]}/.env")
