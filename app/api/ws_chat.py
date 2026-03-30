@@ -215,9 +215,9 @@ async def _check_age_and_swap(video_id: str, user_id: str) -> None:
         logger.warning("[AGE-SWAP] Error checking %s: %s — YouTube embed stays", video_id, e)
 
 
-async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Queue) -> Optional[str]:
+async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Queue) -> Optional[tuple]:
     """If text looks like a play request, search YouTube and broadcast immediately.
-    Returns a modified message text with a hint if handled, or None if not a media request."""
+    Returns (modified_text, media_meta_dict) if handled, or None if not a media request."""
     # Skip if it mentions streaming services (Netflix etc.) — those go through the agent
     if _NETFLIX_KEYWORDS.search(text):
         return None
@@ -272,11 +272,13 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
         asyncio.create_task(_check_age_and_swap(video_id, user_id))
 
         # Return modified text so agent knows media is already playing
-        return (
+        modified_text = (
             f"{text}\n\n[SYSTEM: The video \"{video_title}\" (https://www.youtube.com/watch?v={video_id}) "
             f"is already playing in the user's browser. Do NOT call play_media. "
             f"Just respond conversationally about what's now playing.]"
         )
+        media_meta = {"type": "youtube", "video_id": video_id, "title": video_title}
+        return (modified_text, media_meta)
     except Exception as e:
         logger.warning("[FAST-MEDIA] Fast-path failed (agent will handle): %s", e)
         return None
@@ -655,9 +657,13 @@ async def ws_chat(
                             logger.warning("[WS] Failed to process media attachment: %s", _me)
 
                 # ── Fast-path: detect play/music requests and fire media_play immediately ──
-                # Returns modified text with system hint if media was found, so agent skips play_media
-                _fast_text = await _fast_media_check(text, user_id, broadcast_queue)
+                # Returns (modified_text, media_meta) if media was found, so agent skips play_media
+                _fast_result = await _fast_media_check(text, user_id, broadcast_queue)
+                _fast_text = _fast_result[0] if _fast_result else None
                 _agent_text = _fast_text or text
+                # Pre-set _last_media so the inline card persists on the saved message
+                if _fast_result and hasattr(_agent_runner, 'tools'):
+                    _agent_runner.tools._last_media = _fast_result[1]
 
                 # Run agent — use the modified text for LLM but save the original user text
                 agent_task = asyncio.create_task(_agent_runner.run(
