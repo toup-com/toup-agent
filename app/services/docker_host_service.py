@@ -407,7 +407,23 @@ async def update_container_env(
 
     escaped_env = env_content.replace("'", "'\\''")
     await _run_ssh(f"echo '{escaped_env}' > /data/agents/{user_id[:8]}/.env")
-    await _run_ssh(f"docker restart {container.container_name}")
+
+    # Must recreate (not restart) so new --env-file is read.
+    # docker restart keeps the original env from docker run.
+    port = container.host_port
+    name = container.container_name
+    prefix = user_id[:8]
+    await _run_ssh(f"docker rm -f {name} 2>/dev/null || true")
+    await _run_ssh(
+        f"docker run -d --name {name} --restart unless-stopped "
+        f"--env-file /data/agents/{prefix}/.env "
+        f"-p {port}:8001 "
+        f"-v /data/agents/{prefix}/workspace:/app/workspace "
+        f"-v /data/agents/{prefix}/skills:/app/skills "
+        f"--add-host host.docker.internal:host-gateway "
+        f"--memory=512m --cpus=0.5 "
+        f"{settings.docker_agent_image}"
+    )
 
     container.status = "running"
     container.started_at = datetime.utcnow()
