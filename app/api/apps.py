@@ -191,6 +191,34 @@ async def list_jobs() -> List[JobResponse]:
         return [_job_to_response(job) for job in jobs]
 
 
+class CreateJobRequest(BaseModel):
+    title: str
+    description: str = ""
+
+
+@router.post("/jobs/")
+async def create_job(req: CreateJobRequest) -> JobResponse:
+    """Create a new agent task job from the dashboard."""
+    import uuid
+    user_id = _get_user_id()
+    job = BuildJob(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        title=req.title,
+        prompt=req.description or req.title,
+        status="queued",
+        steps_json="[]",
+        model="",
+        layer=0,
+        created_at=datetime.utcnow(),
+    )
+    async with async_session_maker() as db:
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+    return _job_to_response(job)
+
+
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str) -> JobResponse:
     """Get a specific build job."""
