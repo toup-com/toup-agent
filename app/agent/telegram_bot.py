@@ -807,7 +807,7 @@ class ToupTelegramBot:
                 mode_info = f"<code>{settings.agent_model}</code>"
             await update.message.reply_text(
                 f"🤖 Current model: {mode_info}\n\n"
-                f"Switch: <code>/model auto</code> or <code>/model gpt-5.2</code>",
+                f"Switch: <code>/model auto</code> or <code>/model gpt-5.4</code>",
                 parse_mode="HTML",
             )
             return
@@ -815,7 +815,7 @@ class ToupTelegramBot:
         new_model = args[0].strip()
         allowed_models = [
             "auto",
-            "gpt-5.2", "gpt-5", "gpt-4.1", "gpt-4o", "gpt-4o-mini",
+            "gpt-5.4", "gpt-5.2", "gpt-5", "gpt-4.1", "gpt-4o", "gpt-4o-mini",
             "claude-opus-4-6", "claude-sonnet-4-5", "claude-sonnet-4-5-20250514", "claude-sonnet-4-20250514",
         ]
         if new_model not in allowed_models:

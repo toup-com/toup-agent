@@ -32,8 +32,10 @@ class BuildLogger:
     # Model context windows for token budget tracking
     _MODEL_CONTEXT = {
         "claude-opus-4-6": 200_000,
+        "claude-sonnet-4-6": 200_000,
         "claude-sonnet-4-5-20250514": 200_000,
         "claude-sonnet-4-20250514": 200_000,
+        "gpt-5.4": 1_000_000,
         "gpt-5.2": 400_000,
         "gpt-5": 128_000,
         "gpt-4o": 128_000,

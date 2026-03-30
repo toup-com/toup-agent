@@ -113,7 +113,7 @@ class AgentConfig(Base):
     xai_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     deepseek_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     agent_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    agent_model: Mapped[str] = mapped_column(String(50), default="gpt-5.2")
+    agent_model: Mapped[str] = mapped_column(String(50), default="claude-opus-4-6")
 
     # LLM Bundle subscription
     bundle_stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

@@ -263,12 +263,13 @@ class Settings(BaseSettings):
 
     # Pricing per 1K tokens (USD)
     pricing_per_1k: dict[str, dict[str, float]] = {
-        "gpt-5.2": {"input": 0.003, "output": 0.012},
+        "gpt-5.4": {"input": 0.003, "output": 0.012},
         "gpt-5": {"input": 0.003, "output": 0.012},
         "gpt-4.1": {"input": 0.002, "output": 0.008},
         "gpt-4o": {"input": 0.0025, "output": 0.01},
         "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
         "claude-opus-4-6": {"input": 0.015, "output": 0.075},
+        "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
         "claude-sonnet-4-5-20250514": {"input": 0.003, "output": 0.015},
         "claude-sonnet-4-20250514": {"input": 0.003, "output": 0.015},
     }

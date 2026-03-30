@@ -1,16 +1,18 @@
 """
-Model Auto-Router — Heuristic-based model selection for cost optimization.
+Model Auto-Router — Key-aware, heuristic-based model selection.
 
 Classifies each user request by complexity/intent and routes to the
-cheapest model that can handle it well.
+best model based on which API keys the user has configured.
 
-Tiers (cost-optimized):
-  - light:   Simple greetings, short Q&A, chit-chat, single-fact lookups  → gpt-4o-mini (cheapest)
-  - medium:  Summarization, moderate reasoning, translations              → configured agent_model (GPT)
-  - heavy:   Any tool use, coding, analysis, planning, long-form, math   → Claude Opus 4.6
+Tiers:
+  - light (<20):  Simple greetings, short Q&A   → cheapest available
+  - medium (20-70): Moderate reasoning           → best available
+  - heavy (>70):  Tool use, coding, analysis     → best available
 
-Voice/real-time stays on OpenAI always (handled by ws_realtime.py).
-Only truly complex text tasks escalate to Claude Opus for best quality.
+Key combinations:
+  Both keys:     GPT-4o-mini (light) + Claude Opus (medium/heavy)
+  Anthropic only: Claude Sonnet (light) + Claude Opus (medium/heavy)
+  OpenAI only:   GPT-4o-mini (light) + GPT-5.4 (medium/heavy)
 
 The router uses fast heuristics (no LLM call) to classify in <1ms.
 """
@@ -42,24 +44,57 @@ class ModelTier:
     cost_per_1k_output: float = 0.0
 
 
-# Default tier configs — cost-optimized: GPT for light/medium, Claude only for heavy
+# Default tier configs — key-aware: uses whatever API keys the user has
 def _get_tiers() -> Dict[str, ModelTier]:
-    """Build tiers dynamically based on LLM_MODE and available keys."""
-    # When LLM_MODE=anthropic (or only Anthropic key available), use Claude for all tiers
-    anthropic_only = (
-        settings.llm_mode == "anthropic"
-        or (settings.anthropic_api_key and not settings.openai_api_key)
-    )
+    """Build tiers dynamically based on available API keys.
 
-    # Light → Sonnet (fast, 2-4s for greetings/trivial), Medium/Heavy → Opus (default)
-    return {
-        "light": ModelTier(name="light", model="claude-sonnet-4-6", label="Claude Sonnet 4.6",
-                           cost_per_1k_input=0.003, cost_per_1k_output=0.015),
-        "medium": ModelTier(name="medium", model="claude-opus-4-6", label="Claude Opus 4.6",
-                            cost_per_1k_input=0.015, cost_per_1k_output=0.075),
-        "heavy": ModelTier(name="heavy", model="claude-opus-4-6", label="Claude Opus 4.6",
-                           cost_per_1k_input=0.015, cost_per_1k_output=0.075),
-    }
+    Both keys: GPT-4o-mini (light, cheap), Claude Opus (medium/heavy, best quality)
+    Only Anthropic: Claude Sonnet (light), Claude Opus (medium/heavy)
+    Only OpenAI: GPT-4o-mini (light), GPT-5.4 (medium/heavy)
+    """
+    has_anthropic = bool(settings.anthropic_api_key)
+    has_openai = bool(settings.openai_api_key)
+
+    if has_anthropic and has_openai:
+        # Best of both: cheap GPT for trivial, Claude Opus for real work
+        return {
+            "light": ModelTier(name="light", model="gpt-4o-mini", label="GPT-4o Mini",
+                               cost_per_1k_input=0.00015, cost_per_1k_output=0.0006),
+            "medium": ModelTier(name="medium", model="claude-opus-4-6", label="Claude Opus 4.6",
+                                cost_per_1k_input=0.015, cost_per_1k_output=0.075),
+            "heavy": ModelTier(name="heavy", model="claude-opus-4-6", label="Claude Opus 4.6",
+                               cost_per_1k_input=0.015, cost_per_1k_output=0.075),
+        }
+    elif has_anthropic:
+        # Anthropic only: Sonnet for light, Opus for rest
+        return {
+            "light": ModelTier(name="light", model="claude-sonnet-4-6", label="Claude Sonnet 4.6",
+                               cost_per_1k_input=0.003, cost_per_1k_output=0.015),
+            "medium": ModelTier(name="medium", model="claude-opus-4-6", label="Claude Opus 4.6",
+                                cost_per_1k_input=0.015, cost_per_1k_output=0.075),
+            "heavy": ModelTier(name="heavy", model="claude-opus-4-6", label="Claude Opus 4.6",
+                               cost_per_1k_input=0.015, cost_per_1k_output=0.075),
+        }
+    elif has_openai:
+        # OpenAI only: mini for light, 5.4 for rest
+        return {
+            "light": ModelTier(name="light", model="gpt-4o-mini", label="GPT-4o Mini",
+                               cost_per_1k_input=0.00015, cost_per_1k_output=0.0006),
+            "medium": ModelTier(name="medium", model="gpt-5.4", label="GPT-5.4",
+                                cost_per_1k_input=0.003, cost_per_1k_output=0.012),
+            "heavy": ModelTier(name="heavy", model="gpt-5.4", label="GPT-5.4",
+                               cost_per_1k_input=0.003, cost_per_1k_output=0.012),
+        }
+    else:
+        # No keys — default to Claude (will fail at API call, but sane defaults)
+        return {
+            "light": ModelTier(name="light", model="claude-sonnet-4-6", label="Claude Sonnet 4.6",
+                               cost_per_1k_input=0.003, cost_per_1k_output=0.015),
+            "medium": ModelTier(name="medium", model="claude-opus-4-6", label="Claude Opus 4.6",
+                                cost_per_1k_input=0.015, cost_per_1k_output=0.075),
+            "heavy": ModelTier(name="heavy", model="claude-opus-4-6", label="Claude Opus 4.6",
+                               cost_per_1k_input=0.015, cost_per_1k_output=0.075),
+        }
 
 
 # ── Complexity Signals ───────────────────────────────────────────────
@@ -247,10 +282,9 @@ def classify_request(
     score = sum(signals.values())
 
     # ── Map to tier ───────────────────────────────────────────────
-    # Cost-optimized thresholds:
-    #   light (<20):  simple stuff → gpt-4o-mini (very cheap)
-    #   medium (20-70): moderate tasks → configured GPT model
-    #   heavy (>70):  truly complex → Claude Opus 4.6 (expensive, worth it)
+    #   light (<20):  trivial → cheapest model available
+    #   medium (20-70): moderate → primary model
+    #   heavy (>70):  complex → best model available
     if score < 20:
         tier_name = "light"
         confidence = min(0.95, 0.7 + (20 - score) / 100)
@@ -263,27 +297,18 @@ def classify_request(
 
     tier = _get_tiers()[tier_name]
 
-    # If the selected tier uses a Claude model but no Anthropic key is set,
-    # fall back to the configured agent_model (OpenAI)
+    # Safety fallbacks — _get_tiers() is already key-aware, but double-check
     if _is_claude_model(tier.model) and not settings.anthropic_api_key:
-        fallback_model = settings.agent_model
-        logger.info(f"[ROUTER] No Anthropic API key — overriding {tier.model} → {fallback_model}")
-        tier = ModelTier(
-            name=tier_name,
-            model=fallback_model,
-            label=f"{fallback_model} (fallback)",
-        )
+        fallback = settings.agent_model if settings.openai_api_key else tier.model
+        if fallback != tier.model:
+            logger.info(f"[ROUTER] No Anthropic key — {tier.model} → {fallback}")
+            tier = ModelTier(name=tier_name, model=fallback, label=f"{fallback} (fallback)")
 
-    # Reverse: if an OpenAI model is selected but no OpenAI key is set,
-    # fall back to Claude (prefer Sonnet for medium, Haiku for light)
-    if not _is_claude_model(tier.model) and not settings.openai_api_key and settings.anthropic_api_key:
-        claude_fallback = "claude-opus-4-6"
-        logger.info(f"[ROUTER] No OpenAI API key — overriding {tier.model} → {claude_fallback}")
-        tier = ModelTier(
-            name=tier_name,
-            model=claude_fallback,
-            label=f"{claude_fallback} (fallback)",
-        )
+    if not _is_claude_model(tier.model) and not settings.openai_api_key:
+        fallback = "claude-opus-4-6" if settings.anthropic_api_key else tier.model
+        if fallback != tier.model:
+            logger.info(f"[ROUTER] No OpenAI key — {tier.model} → {fallback}")
+            tier = ModelTier(name=tier_name, model=fallback, label=f"{fallback} (fallback)")
 
     # Build reason
     top_signals = sorted(signals.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
