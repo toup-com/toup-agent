@@ -72,8 +72,13 @@ async def get_stream(video_id: str):
 
         return {"error": "All extraction methods failed"}
 
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, _extract, video_id)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _extract, video_id),
+            timeout=25,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"error": "Stream extraction timed out"})
 
     if "error" in result:
         return JSONResponse(status_code=502, content=result)
