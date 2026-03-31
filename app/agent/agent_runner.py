@@ -970,8 +970,28 @@ class AgentRunner:
             runtime_lines.append(f"- Execution lane: {self._current_lane}")
         section_parts["runtime"] = "\n".join(runtime_lines)
 
+        # ── 6b. Vibe Coding mode ─────────────────────────────────
+        if _channel_label == "vibecoding":
+            section_parts["vibecoding"] = (
+                "# VIBE CODING MODE (CRITICAL)\n"
+                "The user is in the Vibe Coding workspace. You MUST write code using tools.\n\n"
+                "RULES:\n"
+                "1. FORBIDDEN: Do NOT use app_builder__build_app or any app_builder__* tools.\n"
+                "2. FORBIDDEN: Do NOT present numbered direction cards with [[option]] buttons.\n"
+                "3. Ask at most 1-2 brief clarifying questions (plain text), then START CODING.\n"
+                "4. When the user confirms ('yes', 'do it', 'ok', 'build it', 'go ahead'), you MUST call write_file and exec tools in your VERY NEXT response.\n"
+                "5. Do NOT just describe or list what you will build. Actually call the tools.\n"
+                "6. Use write_file to create each project file with complete, real code.\n"
+                "7. Use exec to run shell commands: mkdir -p, pip install, npm install, etc.\n"
+                "8. The user can see your tool calls live in a code viewer panel. If you only output text without calling tools, nothing appears.\n"
+                "9. After writing all files, use exec to install dependencies and start/test the project.\n"
+                "10. Write files to the workspace directory.\n\n"
+                "WORKFLOW: understand → (optional: 1-2 questions) → write_file × N → exec install → exec run/test\n"
+                "Never skip the write_file calls. The user is watching the code panel waiting to see files appear."
+            )
+
         # ── 7. Formatting rules (channel-aware) ───────────────────
-        if _channel_label in ("app", "web"):
+        if _channel_label in ("app", "web", "vibecoding"):
             section_parts["formatting"] = (
                 "# Formatting Rules\n"
                 "You are chatting with the user inside their " + ("app" if _channel_label == "app" else "web browser") + ". Follow these rules:\n"
