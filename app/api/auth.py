@@ -132,9 +132,20 @@ async def login(credentials: UserLogin, request: Request, response: Response, db
 
     if not user:
         login_rate_limiter.record(client_ip, login_id)
+        # Check if user exists at all to give a more helpful message
+        from app.services import get_user_by_email
+        exists = await get_user_by_email(db, login_id)
+        if not exists and '@' not in login_id:
+            exists = await get_user_by_email(db, f"{login_id}@toup.ai")
+        if not exists:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No account found with this email. Please sign up first.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
+            detail="Incorrect password",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
