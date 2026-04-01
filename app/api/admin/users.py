@@ -232,66 +232,31 @@ async def list_users(
     return UserListResponse(users=users, total=len(users))
 
 
-@router.get("/users/{user_id}/usage")
-async def get_user_usage(
-    user_id: str,
-    admin: User = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get token usage summary for a specific user. Admin only."""
+async def _build_usage_for_conv_ids(
+    conv_ids: list[str], db: AsyncSession,
+) -> list[dict]:
+    """Shared helper: build usage summary for a set of conversation IDs."""
     from datetime import timedelta
-    from app.db import Message, Conversation, AgentConfig
+    from app.db import Message
     from app.api.llm_setup import (
-        UsageSummaryOut, ProviderUsageOut, ModelUsageOut,
-        model_to_provider, PROVIDER_PREFIXES,
+        UsageSummaryOut, ProviderUsageOut, ModelUsageOut, model_to_provider,
     )
     from app.config import settings
-    import httpx, logging
 
-    logger = logging.getLogger(__name__)
-
-    # Verify user exists
-    target = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    if not target:
-        raise HTTPException(404, "User not found")
-
-    # Try proxying to user's remote agent first
-    try:
-        result = await db.execute(
-            select(AgentConfig.agent_url, AgentConfig.agent_api_key)
-            .where(AgentConfig.user_id == user_id, AgentConfig.deploy_status == "active")
-        )
-        row = result.first()
-        if row and row.agent_url and row.agent_api_key:
-            url = f"{row.agent_url}/api/llm-setup/usage/summary"
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url, headers={"X-Agent-Key": row.agent_api_key})
-                if resp.status_code == 200:
-                    return resp.json()
-            logger.warning("Agent usage proxy failed for user %s, falling back to local DB", user_id)
-    except Exception as e:
-        logger.warning("Agent usage proxy error for user %s: %s", user_id, e)
-
-    from datetime import datetime as dt
-    now = dt.utcnow()
+    now = datetime.utcnow()
     periods = {
         "today": now.replace(hour=0, minute=0, second=0, microsecond=0),
         "7d": now - timedelta(days=7),
         "30d": now - timedelta(days=30),
-        "all": dt(2000, 1, 1),
+        "all": datetime(2000, 1, 1),
     }
-
-    conv_result = await db.execute(
-        select(Conversation.id).where(Conversation.user_id == user_id)
-    )
-    conv_ids = [r[0] for r in conv_result.all()]
 
     if not conv_ids:
         return [
             UsageSummaryOut(
                 period=p, total_input_tokens=0, total_output_tokens=0,
                 total_tokens=0, total_cost_usd=0.0, total_requests=0, providers=[],
-            )
+            ).model_dump()
             for p in periods
         ]
 
@@ -316,50 +281,229 @@ async def get_user_usage(
         )
         rows = (await db.execute(stmt)).all()
 
-        provider_map: dict[str, ProviderUsageOut] = {}
+        provider_map: dict[str, dict] = {}
         for model_used, inp, out, cnt in rows:
             provider = model_to_provider(model_used or "")
             p_cost = pricing.get(model_used, {"input": 0.003, "output": 0.012})
             cost = (inp * p_cost["input"] / 1000) + (out * p_cost["output"] / 1000)
 
-            model_entry = ModelUsageOut(
-                model=model_used or "unknown",
-                provider=provider,
-                input_tokens=int(inp),
-                output_tokens=int(out),
-                total_tokens=int(inp + out),
-                cost_usd=round(cost, 4),
-                request_count=int(cnt),
-            )
+            model_entry = {
+                "model": model_used or "unknown", "provider": provider,
+                "input_tokens": int(inp), "output_tokens": int(out),
+                "total_tokens": int(inp + out), "cost_usd": round(cost, 4),
+                "request_count": int(cnt),
+            }
 
             if provider not in provider_map:
-                provider_map[provider] = ProviderUsageOut(
-                    provider=provider, input_tokens=0, output_tokens=0,
-                    total_tokens=0, cost_usd=0.0, request_count=0, models=[],
-                )
+                provider_map[provider] = {
+                    "provider": provider, "input_tokens": 0, "output_tokens": 0,
+                    "total_tokens": 0, "cost_usd": 0.0, "request_count": 0, "models": [],
+                }
             prov = provider_map[provider]
-            prov.input_tokens += int(inp)
-            prov.output_tokens += int(out)
-            prov.total_tokens += int(inp + out)
-            prov.cost_usd = round(prov.cost_usd + cost, 4)
-            prov.request_count += int(cnt)
-            prov.models.append(model_entry)
+            prov["input_tokens"] += int(inp)
+            prov["output_tokens"] += int(out)
+            prov["total_tokens"] += int(inp + out)
+            prov["cost_usd"] = round(prov["cost_usd"] + cost, 4)
+            prov["request_count"] += int(cnt)
+            prov["models"].append(model_entry)
 
-        providers = sorted(provider_map.values(), key=lambda p: p.total_tokens, reverse=True)
-        total_inp = sum(p.input_tokens for p in providers)
-        total_out = sum(p.output_tokens for p in providers)
+        providers = sorted(provider_map.values(), key=lambda p: p["total_tokens"], reverse=True)
+        total_inp = sum(p["input_tokens"] for p in providers)
+        total_out = sum(p["output_tokens"] for p in providers)
 
-        results.append(UsageSummaryOut(
-            period=period_name,
-            total_input_tokens=total_inp,
-            total_output_tokens=total_out,
-            total_tokens=total_inp + total_out,
-            total_cost_usd=round(sum(p.cost_usd for p in providers), 4),
-            total_requests=sum(p.request_count for p in providers),
-            providers=providers,
-        ))
+        results.append({
+            "period": period_name,
+            "total_input_tokens": total_inp,
+            "total_output_tokens": total_out,
+            "total_tokens": total_inp + total_out,
+            "total_cost_usd": round(sum(p["cost_usd"] for p in providers), 4),
+            "total_requests": sum(p["request_count"] for p in providers),
+            "providers": providers,
+        })
 
     return results
+
+
+@router.get("/users/{user_id}/usage")
+async def get_user_usage(
+    user_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get token usage summary for a specific user. Admin only."""
+    import httpx, logging
+    from app.db import Conversation, AgentConfig
+
+    logger = logging.getLogger(__name__)
+
+    # Verify user exists
+    target = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not target:
+        raise HTTPException(404, "User not found")
+
+    # Try proxying to user's remote agent first
+    try:
+        result = await db.execute(
+            select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+            .where(AgentConfig.user_id == user_id, AgentConfig.deploy_status == "active")
+        )
+        row = result.first()
+        if row and row.agent_url and row.agent_api_key:
+            url = f"{row.agent_url}/api/llm-setup/usage/summary"
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(url, headers={"X-Agent-Key": row.agent_api_key})
+                if resp.status_code == 200:
+                    return resp.json()
+            logger.warning("Agent usage proxy failed for user %s, falling back to local DB", user_id)
+    except Exception as e:
+        logger.warning("Agent usage proxy error for user %s: %s", user_id, e)
+
+    # Fallback: query local DB
+    conv_result = await db.execute(
+        select(Conversation.id).where(Conversation.user_id == user_id)
+    )
+    conv_ids = [r[0] for r in conv_result.all()]
+    return await _build_usage_for_conv_ids(conv_ids, db)
+
+
+@router.get("/usage/overview")
+async def get_usage_overview(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get platform-wide usage overview: per-user totals + aggregate. Admin only."""
+    import httpx, logging
+    from app.db import Message, Conversation, AgentConfig
+    from app.api.llm_setup import model_to_provider
+    from app.config import settings
+    from datetime import timedelta
+
+    logger = logging.getLogger(__name__)
+    now = datetime.utcnow()
+    periods = {
+        "today": now.replace(hour=0, minute=0, second=0, microsecond=0),
+        "7d": now - timedelta(days=7),
+        "30d": now - timedelta(days=30),
+        "all": datetime(2000, 1, 1),
+    }
+
+    # Get all users
+    users_result = await db.execute(select(User).order_by(User.created_at.desc()))
+    all_users = users_result.scalars().all()
+
+    # For each user, try agent proxy first, then local DB
+    user_usage_list = []
+    pricing = settings.pricing_per_1k
+
+    for u in all_users:
+        user_entry = {
+            "user_id": u.id,
+            "email": u.email,
+            "name": u.name or "",
+            "role": getattr(u, "role", "beta_user"),
+        }
+
+        # Try agent proxy
+        agent_data = None
+        try:
+            result = await db.execute(
+                select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+                .where(AgentConfig.user_id == u.id, AgentConfig.deploy_status == "active")
+            )
+            row = result.first()
+            if row and row.agent_url and row.agent_api_key:
+                url = f"{row.agent_url}/api/llm-setup/usage/summary"
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(url, headers={"X-Agent-Key": row.agent_api_key})
+                    if resp.status_code == 200:
+                        agent_data = resp.json()
+        except Exception:
+            pass
+
+        if agent_data:
+            # Extract 30d summary for the overview row
+            summary_30d = next((s for s in agent_data if s.get("period") == "30d"), None)
+            if summary_30d:
+                user_entry["total_tokens_30d"] = summary_30d.get("total_tokens", 0)
+                user_entry["total_cost_30d"] = summary_30d.get("total_cost_usd", 0.0)
+                user_entry["total_requests_30d"] = summary_30d.get("total_requests", 0)
+            else:
+                user_entry["total_tokens_30d"] = 0
+                user_entry["total_cost_30d"] = 0.0
+                user_entry["total_requests_30d"] = 0
+            summary_all = next((s for s in agent_data if s.get("period") == "all"), None)
+            if summary_all:
+                user_entry["total_tokens_all"] = summary_all.get("total_tokens", 0)
+                user_entry["total_cost_all"] = summary_all.get("total_cost_usd", 0.0)
+                user_entry["total_requests_all"] = summary_all.get("total_requests", 0)
+            else:
+                user_entry["total_tokens_all"] = 0
+                user_entry["total_cost_all"] = 0.0
+                user_entry["total_requests_all"] = 0
+        else:
+            # Local DB fallback
+            conv_result = await db.execute(
+                select(Conversation.id).where(Conversation.user_id == u.id)
+            )
+            conv_ids = [r[0] for r in conv_result.all()]
+
+            for suffix, since in [("30d", periods["30d"]), ("all", periods["all"])]:
+                if not conv_ids:
+                    user_entry[f"total_tokens_{suffix}"] = 0
+                    user_entry[f"total_cost_{suffix}"] = 0.0
+                    user_entry[f"total_requests_{suffix}"] = 0
+                    continue
+
+                stmt = (
+                    select(
+                        Message.model_used,
+                        func.coalesce(func.sum(func.coalesce(Message.tokens_prompt, 0)), 0).label("inp"),
+                        func.coalesce(func.sum(func.coalesce(Message.tokens_completion, 0)), 0).label("out"),
+                        func.count().label("cnt"),
+                    )
+                    .where(
+                        Message.conversation_id.in_(conv_ids),
+                        Message.role == "assistant",
+                        Message.model_used.isnot(None),
+                        Message.created_at >= since,
+                    )
+                    .group_by(Message.model_used)
+                )
+                rows = (await db.execute(stmt)).all()
+                total_tokens = 0
+                total_cost = 0.0
+                total_reqs = 0
+                for model_used, inp, out, cnt in rows:
+                    total_tokens += int(inp + out)
+                    total_reqs += int(cnt)
+                    p_cost = pricing.get(model_used, {"input": 0.003, "output": 0.012})
+                    total_cost += (inp * p_cost["input"] / 1000) + (out * p_cost["output"] / 1000)
+
+                user_entry[f"total_tokens_{suffix}"] = total_tokens
+                user_entry[f"total_cost_{suffix}"] = round(total_cost, 4)
+                user_entry[f"total_requests_{suffix}"] = total_reqs
+
+        user_usage_list.append(user_entry)
+
+    # Aggregate totals
+    agg_tokens_30d = sum(u.get("total_tokens_30d", 0) for u in user_usage_list)
+    agg_cost_30d = round(sum(u.get("total_cost_30d", 0) for u in user_usage_list), 4)
+    agg_reqs_30d = sum(u.get("total_requests_30d", 0) for u in user_usage_list)
+    agg_tokens_all = sum(u.get("total_tokens_all", 0) for u in user_usage_list)
+    agg_cost_all = round(sum(u.get("total_cost_all", 0) for u in user_usage_list), 4)
+    agg_reqs_all = sum(u.get("total_requests_all", 0) for u in user_usage_list)
+
+    return {
+        "aggregate": {
+            "total_tokens_30d": agg_tokens_30d,
+            "total_cost_30d": agg_cost_30d,
+            "total_requests_30d": agg_reqs_30d,
+            "total_tokens_all": agg_tokens_all,
+            "total_cost_all": agg_cost_all,
+            "total_requests_all": agg_reqs_all,
+        },
+        "users": sorted(user_usage_list, key=lambda u: u.get("total_tokens_30d", 0), reverse=True),
+    }
 
 
 @router.patch("/users/{user_id}", response_model=UserAdminResponse)
