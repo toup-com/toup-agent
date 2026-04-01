@@ -2361,7 +2361,54 @@ class ToolExecutor:
         if not video_id:
             return f"Could not find a video for '{query}'. Try a different search term."
 
-        # Broadcast media_play event to the user's chat WebSocket (zero delay)
+        yt_url = f"https://www.youtube.com/watch?v={video_id}"
+
+        # ── Telegram: download audio and send inline player ──
+        if self.telegram_bot and self._chat_id:
+            try:
+                import shutil, tempfile
+                ytdlp = shutil.which("yt-dlp") or "/opt/toup-agent/venv/bin/yt-dlp"
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    out_path = os.path.join(tmpdir, "%(title)s.%(ext)s")
+                    proc = await asyncio.create_subprocess_exec(
+                        ytdlp, yt_url,
+                        "-x", "--audio-format", "mp3",
+                        "--audio-quality", "5",
+                        "-o", out_path,
+                        "--no-playlist", "--no-warnings", "--quiet",
+                        "--max-filesize", "50m",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    )
+                    try:
+                        await asyncio.wait_for(proc.communicate(), timeout=120)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        logger.warning("[play_media] yt-dlp audio download timed out")
+
+                    # Find the downloaded mp3
+                    mp3_files = [f for f in os.listdir(tmpdir) if f.endswith(".mp3")]
+                    if mp3_files:
+                        audio_file_path = os.path.join(tmpdir, mp3_files[0])
+                        bot = self.telegram_bot.app.bot
+                        with open(audio_file_path, "rb") as af:
+                            await bot.send_audio(
+                                chat_id=self._chat_id,
+                                audio=af,
+                                title=video_title,
+                                performer=query,
+                                caption=f"🎵 {video_title}",
+                            )
+                        self._last_media = {"type": "youtube", "video_id": video_id, "title": video_title}
+                        return f"Playing \"{video_title}\" — sent as audio to Telegram."
+                    else:
+                        logger.warning("[play_media] No mp3 found after yt-dlp download")
+            except Exception as e:
+                logger.warning("[play_media] Telegram audio download failed: %s", e)
+            # Fallback: send link if audio download fails
+            self._last_media = {"type": "youtube", "video_id": video_id, "title": video_title}
+            return f"Playing \"{video_title}\" on YouTube now:\n{yt_url}\n\n(Audio download failed — tap the link to listen)"
+
+        # ── Web: broadcast media_play event to browser player ──
         user_id = self._current_user_id
         if user_id:
             try:
@@ -2371,19 +2418,18 @@ class ToolExecutor:
                     "provider": "youtube",
                     "video_id": video_id,
                     "title": video_title,
-                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "url": yt_url,
                 })
                 logger.info("[play_media] Broadcast media_play: %s - %s", video_id, video_title)
-                # Fire-and-forget: check age restriction in background, swap if needed
                 asyncio.create_task(_check_age_and_swap(video_id, user_id))
             except Exception as e:
                 logger.warning("[play_media] Broadcast failed: %s", e)
-                return f"Found '{video_title}' but could not send to player. URL: https://www.youtube.com/watch?v={video_id}"
+                return f"Found '{video_title}' but could not send to player. URL: {yt_url}"
 
         # Store media metadata for message persistence
         self._last_media = {"type": "youtube", "video_id": video_id, "title": video_title}
 
-        return f"Now playing \"{video_title}\"\nhttps://www.youtube.com/watch?v={video_id}"
+        return f"Now playing \"{video_title}\"\n{yt_url}"
 
     async def _play_netflix(self, query: str) -> str:
         """Find Netflix content and auto-open it in user's browser."""
