@@ -312,7 +312,7 @@ class TelegramStreamHandler:
         # Start continuous typing indicator
         self._start_typing()
 
-    async def on_tool_end(self, tool_name: str, result_summary: str):
+    async def on_tool_end(self, tool_name: str, result_summary: str, tool_input: dict = None):
         """Called when a tool finishes executing."""
         self._stop_typing()
         self.tool_status = f"\n\n✅ <i>{tool_name} done</i>"

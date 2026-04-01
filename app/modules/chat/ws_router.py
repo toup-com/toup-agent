@@ -150,7 +150,7 @@ async def ws_chat(
                 except Exception:
                     pass
 
-            async def on_tool_end(tool_name: str, summary: str):
+            async def on_tool_end(tool_name: str, summary: str, tool_input: dict = None):
                 try:
                     await websocket.send_json({"type": "tool_end", "tool": tool_name, "summary": summary})
                 except Exception:

@@ -259,7 +259,7 @@ async def api_chat_stream(
                 data = json.dumps({"type": "tool_start", "tool": tool_name})
                 yield f"data: {data}\n\n"
 
-            async def on_tool_end(tool_name: str, summary: str):
+            async def on_tool_end(tool_name: str, summary: str, tool_input: dict = None):
                 data = json.dumps({"type": "tool_end", "tool": tool_name, "summary": summary})
                 yield f"data: {data}\n\n"
 
