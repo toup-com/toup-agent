@@ -10,7 +10,9 @@ import logging
 from datetime import datetime
 from typing import Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -176,3 +178,198 @@ async def workspace_tree(
 
     files.sort(key=lambda f: (0 if f["type"] == "dir" else 1, f["path"]))
     return {"path": clean_path, "tree": files, "base": "/workspace"}
+
+
+# ── Write / Edit ─────────────────────────────────────────────────
+
+class FileWriteRequest(BaseModel):
+    path: str
+    content: str
+
+
+@router.post("/file-write")
+async def write_workspace_file(
+    body: FileWriteRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Write (create or overwrite) a file in the user's workspace."""
+    container = await _get_user_container(current_user.id, db)
+    if not container:
+        raise HTTPException(404, "No active container found")
+
+    clean_path = body.path.strip("/").replace("..", "")
+    if not clean_path:
+        raise HTTPException(400, "Path is required")
+    target = f"/app/workspace/{clean_path}"
+
+    # Ensure parent directory exists, then write file via stdin
+    import base64
+    b64 = base64.b64encode(body.content.encode()).decode()
+    await _ssh_cmd(
+        f"docker exec {container.container_name} bash -c "
+        f"'mkdir -p \"$(dirname {target})\" && echo \"{b64}\" | base64 -d > {target}'"
+    )
+
+    # Verify write
+    check = await _ssh_cmd(
+        f"docker exec {container.container_name} stat -c%s {target} 2>/dev/null"
+    )
+    if not check or not check.strip().isdigit():
+        raise HTTPException(500, "Failed to write file")
+
+    return {"success": True, "path": clean_path, "size": int(check.strip())}
+
+
+# ── Delete ───────────────────────────────────────────────────────
+
+@router.delete("/file")
+async def delete_workspace_file(
+    path: str = Query(..., description="File or directory path relative to workspace"),
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a file or directory from the user's workspace."""
+    container = await _get_user_container(current_user.id, db)
+    if not container:
+        raise HTTPException(404, "No active container found")
+
+    clean_path = path.strip("/").replace("..", "")
+    if not clean_path:
+        raise HTTPException(400, "Cannot delete workspace root")
+    target = f"/app/workspace/{clean_path}"
+
+    # Check exists
+    exists = await _ssh_cmd(
+        f"docker exec {container.container_name} test -e {target} && echo yes || echo no"
+    )
+    if exists != "yes":
+        raise HTTPException(404, "File or directory not found")
+
+    await _ssh_cmd(
+        f"docker exec {container.container_name} rm -rf {target}"
+    )
+    return {"success": True, "path": clean_path}
+
+
+# ── Rename / Move ────────────────────────────────────────────────
+
+class FileRenameRequest(BaseModel):
+    old_path: str
+    new_path: str
+
+
+@router.post("/file-rename")
+async def rename_workspace_file(
+    body: FileRenameRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rename or move a file/directory in the user's workspace."""
+    container = await _get_user_container(current_user.id, db)
+    if not container:
+        raise HTTPException(404, "No active container found")
+
+    old_clean = body.old_path.strip("/").replace("..", "")
+    new_clean = body.new_path.strip("/").replace("..", "")
+    if not old_clean or not new_clean:
+        raise HTTPException(400, "Both old_path and new_path are required")
+
+    old_target = f"/app/workspace/{old_clean}"
+    new_target = f"/app/workspace/{new_clean}"
+
+    # Ensure parent of new path exists
+    await _ssh_cmd(
+        f"docker exec {container.container_name} bash -c "
+        f"'mkdir -p \"$(dirname {new_target})\" && mv {old_target} {new_target}'"
+    )
+
+    # Verify
+    check = await _ssh_cmd(
+        f"docker exec {container.container_name} test -e {new_target} && echo yes || echo no"
+    )
+    if check != "yes":
+        raise HTTPException(500, "Rename failed")
+
+    return {"success": True, "old_path": old_clean, "new_path": new_clean}
+
+
+# ── Create directory ─────────────────────────────────────────────
+
+class CreateDirRequest(BaseModel):
+    path: str
+
+
+@router.post("/create-dir")
+async def create_workspace_dir(
+    body: CreateDirRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a directory in the user's workspace."""
+    container = await _get_user_container(current_user.id, db)
+    if not container:
+        raise HTTPException(404, "No active container found")
+
+    clean_path = body.path.strip("/").replace("..", "")
+    if not clean_path:
+        raise HTTPException(400, "Path is required")
+    target = f"/app/workspace/{clean_path}"
+
+    await _ssh_cmd(
+        f"docker exec {container.container_name} mkdir -p {target}"
+    )
+
+    check = await _ssh_cmd(
+        f"docker exec {container.container_name} test -d {target} && echo yes || echo no"
+    )
+    if check != "yes":
+        raise HTTPException(500, "Failed to create directory")
+
+    return {"success": True, "path": clean_path}
+
+
+# ── Download ─────────────────────────────────────────────────────
+
+@router.get("/file-download")
+async def download_workspace_file(
+    path: str = Query(..., description="File path relative to workspace"),
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Download a file from the user's workspace."""
+    container = await _get_user_container(current_user.id, db)
+    if not container:
+        raise HTTPException(404, "No active container found")
+
+    clean_path = path.strip("/").replace("..", "")
+    if not clean_path:
+        raise HTTPException(400, "Path is required")
+    target = f"/app/workspace/{clean_path}"
+
+    # Check exists and get size
+    size_check = await _ssh_cmd(
+        f"docker exec {container.container_name} stat -c%s {target} 2>/dev/null"
+    )
+    if not size_check or not size_check.strip().isdigit():
+        raise HTTPException(404, "File not found")
+    if int(size_check.strip()) > 50_000_000:
+        raise HTTPException(413, "File too large for download (>50MB)")
+
+    # Get file content as base64 to handle binary files
+    import base64
+    b64_content = await _ssh_cmd(
+        f"docker exec {container.container_name} base64 {target} 2>/dev/null"
+    )
+    if not b64_content:
+        raise HTTPException(500, "Failed to read file")
+
+    content_bytes = base64.b64decode(b64_content)
+    filename = clean_path.split("/")[-1]
+
+    import io
+    return StreamingResponse(
+        io.BytesIO(content_bytes),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
