@@ -10,7 +10,7 @@ from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy import delete as sa_delete
@@ -309,7 +309,7 @@ async def delete_user(
         Document, DocumentChunk, Media, CronJob, TelegramUserMapping,
         AgentError, ApiKey, VPSInstance, ManagedContainer, AgentConfig,
         LLMBundleAllocation, LLMUsageRecord,
-        App, BuildJob, SoulConfig,
+        App, BuildJob, SoulConfig, StreamingCredential,
     )
 
     # Safety: cannot delete yourself
@@ -347,6 +347,8 @@ async def delete_user(
         (EntityRelationship.source_entity_id.in_(entity_ids_q)) |
         (EntityRelationship.target_entity_id.in_(entity_ids_q))
     ))
+    # Also delete any EntityRelationships by direct user_id FK (covers orphans)
+    await db.execute(sa_delete(EntityRelationship).where(EntityRelationship.user_id == user_id))
 
     # Memory children: memory_events, memory_relationships, entity_links (by memory_id)
     from app.db.models import memory_relationships as mem_rel_table
@@ -369,6 +371,24 @@ async def delete_user(
     # Apps
     await db.execute(sa_delete(App).where(App.user_id == user_id))
 
+    # Destroy the Docker container on the VPS before deleting DB records
+    try:
+        from app.services.docker_host_service import _run_ssh
+        mc_result = await db.execute(
+            select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+        )
+        mc = mc_result.scalar_one_or_none()
+        if mc:
+            await _run_ssh(f"docker rm -f {mc.container_name} 2>/dev/null || true")
+    except Exception:
+        pass  # container may not exist or VPS unreachable — proceed anyway
+
+    # Streaming credentials
+    await db.execute(sa_delete(StreamingCredential).where(StreamingCredential.user_id == user_id))
+
+    # Workflows table (exists in DB but no SQLAlchemy model)
+    await db.execute(text("DELETE FROM workflows WHERE user_id = :uid"), {"uid": user_id})
+
     # Now delete all direct user_id tables (order: children before parents)
     for model in [
         Identity, MemoryEvent, Memory,
@@ -382,11 +402,13 @@ async def delete_user(
     # AgentError has nullable user_id
     await db.execute(sa_delete(AgentError).where(AgentError.user_id == user_id))
 
-    # Update invites that reference this user
+    # Update invites that reference this user (both used_by and created_by FKs)
     inv_result = await db.execute(select(Invite).where(Invite.used_by == user_id))
     for inv in inv_result.scalars().all():
         inv.used_by = None
         inv.used_at = None
+    # Delete invites created by this user (created_by FK)
+    await db.execute(sa_delete(Invite).where(Invite.created_by == user_id))
 
     # Finally delete the user
     await db.delete(user)
