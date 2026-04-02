@@ -328,6 +328,7 @@ async def deploy_update(
                 f"-p {port}:8001 "
                 f"-v /data/agents/{user_prefix}/workspace:/app/workspace "
                 f"-v /data/agents/{user_prefix}/skills:/app/skills "
+                f"-v /root/.cache/ms-playwright:/root/.cache/ms-playwright:ro "
                 f"--add-host host.docker.internal:host-gateway "
                 f"--memory=512m --cpus=0.5 "
                 f"toup-agent:latest 2>&1"

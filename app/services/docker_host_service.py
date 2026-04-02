@@ -252,6 +252,7 @@ async def provision_container(
             f"-p {port}:8001 "
             f"-v /data/agents/{user_id[:8]}/workspace:/app/workspace "
             f"-v /data/agents/{user_id[:8]}/skills:/app/skills "
+            f"-v /root/.cache/ms-playwright:/root/.cache/ms-playwright:ro "
             f"--add-host host.docker.internal:host-gateway "
             f"--memory=512m --cpus=0.5 "
             f"{settings.docker_agent_image}"
@@ -350,6 +351,67 @@ async def restart_container(db: AsyncSession, user_id: str) -> Optional[ManagedC
     container.error_message = None
     await db.commit()
     return container
+
+
+async def upgrade_container(db: AsyncSession, user_id: str) -> Optional[ManagedContainer]:
+    """Upgrade a container to the latest image (recreate with same config)."""
+    result = await db.execute(
+        select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+    )
+    container = result.scalar_one_or_none()
+    if not container:
+        return None
+
+    name = container.container_name
+    port = container.host_port
+    prefix = user_id[:8]
+
+    # Stop and remove old container
+    await _run_ssh(f"docker rm -f {name} 2>/dev/null || true")
+
+    # Recreate with latest image (uses same env, volumes, ports)
+    code, out, err = await _run_ssh(
+        f"docker run -d --name {name} --restart unless-stopped "
+        f"--env-file /data/agents/{prefix}/.env "
+        f"-p {port}:8001 "
+        f"-v /data/agents/{prefix}/workspace:/app/workspace "
+        f"-v /data/agents/{prefix}/skills:/app/skills "
+        f"-v /root/.cache/ms-playwright:/root/.cache/ms-playwright:ro "
+        f"--add-host host.docker.internal:host-gateway "
+        f"--memory=512m --cpus=0.5 "
+        f"{settings.docker_agent_image}"
+    )
+    if code != 0:
+        container.status = "error"
+        container.error_message = f"Upgrade failed: {err}"
+        await db.commit()
+        return container
+
+    container.container_id = out.strip()[:12]
+    container.status = "running"
+    container.started_at = datetime.utcnow()
+    container.image_tag = settings.docker_agent_image
+    container.error_message = None
+    await db.commit()
+    return container
+
+
+async def upgrade_all_containers(db: AsyncSession) -> dict:
+    """Upgrade ALL running containers to the latest image. Called after image rebuild."""
+    result = await db.execute(
+        select(ManagedContainer).where(ManagedContainer.status == "running")
+    )
+    containers = result.scalars().all()
+    upgraded = 0
+    failed = 0
+    for c in containers:
+        try:
+            await upgrade_container(db, c.user_id)
+            upgraded += 1
+        except Exception as e:
+            logger.error("Failed to upgrade container %s: %s", c.container_name, e)
+            failed += 1
+    return {"upgraded": upgraded, "failed": failed, "total": len(containers)}
 
 
 async def destroy_container(db: AsyncSession, user_id: str) -> bool:
@@ -486,6 +548,7 @@ async def update_container_env(
         f"-p {port}:8001 "
         f"-v /data/agents/{prefix}/workspace:/app/workspace "
         f"-v /data/agents/{prefix}/skills:/app/skills "
+        f"-v /root/.cache/ms-playwright:/root/.cache/ms-playwright:ro "
         f"--add-host host.docker.internal:host-gateway "
         f"--memory=512m --cpus=0.5 "
         f"{settings.docker_agent_image}"
