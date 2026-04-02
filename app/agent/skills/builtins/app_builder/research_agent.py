@@ -144,14 +144,24 @@ async def run_research(
     too long (browser not available, slow network), falls back to LLM-only
     question generation so the pipeline never stalls.
     """
+    import time as _t
+    _t0 = _t.time()
+    print(f"[RESEARCH] Starting research for: {chosen_direction[:60]}", flush=True)
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             _run_research_inner(original_idea, chosen_direction, call_llm),
             timeout=RESEARCH_TIMEOUT,
         )
+        print(f"[RESEARCH] Completed in {_t.time()-_t0:.1f}s — {len(result)} chars", flush=True)
+        return result
     except asyncio.TimeoutError:
-        logger.warning("Research timed out after %ds — falling back to LLM-only questions", RESEARCH_TIMEOUT)
-        return await _generate_fallback_questions(original_idea, chosen_direction, call_llm)
+        print(f"[RESEARCH] TIMEOUT after {RESEARCH_TIMEOUT}s — falling back to LLM-only", flush=True)
+        result = await _generate_fallback_questions(original_idea, chosen_direction, call_llm)
+        print(f"[RESEARCH] Fallback completed in {_t.time()-_t0:.1f}s — {len(result)} chars", flush=True)
+        return result
+    except Exception as exc:
+        print(f"[RESEARCH] ERROR: {type(exc).__name__}: {exc}", flush=True)
+        raise
 
 
 async def _run_research_inner(
@@ -160,7 +170,11 @@ async def _run_research_inner(
     call_llm: Callable[..., Awaitable[str]],
 ) -> str:
     """Inner research function — runs web search + LLM question generation."""
+    import time as _t
+
     # Step 1: Run 3 targeted searches CONCURRENTLY (not sequentially)
+    print("[RESEARCH] Step 1: Starting concurrent web searches...", flush=True)
+    _t1 = _t.time()
     search_queries = [
         f"best {chosen_direction} apps 2025 features",
         f"{chosen_direction} app UX design patterns common features",
@@ -182,6 +196,7 @@ async def _run_research_inner(
 
     # Run all searches concurrently — 3x faster than sequential
     search_results = await asyncio.gather(*[_safe_search(q) for q in search_queries])
+    print(f"[RESEARCH] Step 1 done in {_t.time()-_t1:.1f}s — {len(search_results)} search results", flush=True)
 
     all_search_results = []
     top_urls = []
@@ -192,8 +207,10 @@ async def _run_research_inner(
                 top_urls.append(u)
 
     combined_search = "\n\n".join(all_search_results)
+    print(f"[RESEARCH] Found {len(top_urls)} URLs to read", flush=True)
 
     # Step 2: Read top 2 articles concurrently
+    _t2 = _t.time()
     article_contents = []
     if top_urls:
         async def _safe_read(url: str) -> str:
@@ -210,8 +227,11 @@ async def _run_research_inner(
         article_contents = [r for r in read_results if r]
 
     combined_articles = "\n\n---\n\n".join(article_contents) if article_contents else "(no articles could be read)"
+    print(f"[RESEARCH] Step 2 done in {_t.time()-_t2:.1f}s — {len(article_contents)} articles read", flush=True)
 
     # Step 3: Call LLM to analyze research and generate questions
+    print("[RESEARCH] Step 3: Calling LLM (claude-sonnet-4-6) to generate questions...", flush=True)
+    _t3 = _t.time()
     user_message = RESEARCH_USER_TEMPLATE.format(
         original_idea=original_idea,
         chosen_direction=chosen_direction,
@@ -226,6 +246,7 @@ async def _run_research_inner(
         purpose="research_agent_questions",
         max_tokens=4000,
     )
+    print(f"[RESEARCH] Step 3 done in {_t.time()-_t3:.1f}s — {len(questions)} chars from LLM", flush=True)
 
     return questions.strip()
 

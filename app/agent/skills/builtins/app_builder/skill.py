@@ -964,20 +964,24 @@ class AppBuilderSkill(Skill):
 
     async def _exec_research_category(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         """Run the Research Sub-Agent: web search + LLM to generate research-informed questions."""
+        import time as _t
         from .research_agent import run_research
 
         original_idea = args.get("original_idea", "")
         chosen_direction = args.get("chosen_direction", "")
+        print(f"[SKILL] _exec_research_category called: idea={original_idea[:50]}, direction={chosen_direction[:50]}", flush=True)
 
         if not original_idea or not chosen_direction:
             return "ERROR: original_idea and chosen_direction are required"
 
+        _t0 = _t.time()
         try:
             questions = await run_research(
                 original_idea=original_idea,
                 chosen_direction=chosen_direction,
                 call_llm=self._call_llm,
             )
+            print(f"[SKILL] Research completed in {_t.time()-_t0:.1f}s — returning {len(questions)} chars", flush=True)
             return (
                 "RESEARCH COMPLETE. Present these research-informed questions to the user exactly as formatted below. "
                 "Do NOT add extra questions or rephrase — just present them in a friendly way with a brief intro like "
@@ -985,6 +989,7 @@ class AppBuilderSkill(Skill):
                 f"{questions}"
             )
         except Exception as exc:
+            print(f"[SKILL] Research FAILED in {_t.time()-_t0:.1f}s: {type(exc).__name__}: {exc}", flush=True)
             logger.exception("Research agent failed")
             return (
                 f"Research agent encountered an error: {exc}\n"
