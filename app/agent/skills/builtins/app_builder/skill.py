@@ -3196,6 +3196,7 @@ const _webDb = {
         """Call OpenAI API (uses the agent's configured model)."""
         import time as _time
         from openai import AsyncOpenAI
+        from app.config import settings
 
         client = AsyncOpenAI(api_key=openai_key)
         model = settings.agent_model or "gpt-5.4"
@@ -3204,7 +3205,7 @@ const _webDb = {
         t0 = _time.time()
         response = await client.chat.completions.create(
             model=model,
-            max_completion_tokens=min(max_tokens, 16000),
+            max_completion_tokens=max_tokens,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
