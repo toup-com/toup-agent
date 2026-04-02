@@ -3162,6 +3162,11 @@ const _webDb = {
                 if blog:
                     await blog.warn(msg)
                 raise TokenLimitError(retry_after_seconds=retry_after, message=msg)
+            except anthropic.AuthenticationError as e:
+                # Auth error (expired OAuth token, invalid key) — fall through to OpenAI fallback
+                print(f"[SKILL] Anthropic auth failed: {e} — will try OpenAI fallback", flush=True)
+                if blog:
+                    await blog.warn(f"Anthropic auth failed, trying OpenAI fallback")
             except anthropic.APIStatusError as e:
                 if e.status_code == 529:  # API overloaded
                     raise TokenLimitError(retry_after_seconds=120, message="API overloaded, retry in 2min")
@@ -3174,7 +3179,44 @@ const _webDb = {
                     await blog.error(f"Anthropic call failed: {e}")
                 raise
 
-        raise RuntimeError("No LLM provider configured (need ANTHROPIC_API_KEY)")
+        # ── Fallback to OpenAI when Anthropic key is missing or expired ──
+        from app.services.key_provider import keys as _keys
+        openai_key = _keys.openai or ""
+        if openai_key:
+            try:
+                import time as _time
+                from openai import AsyncOpenAI
+                _client = AsyncOpenAI(api_key=openai_key)
+                _model = settings.agent_model or "gpt-5.4"
+                print(f"[SKILL] _call_llm falling back to OpenAI ({_model}) — Anthropic unavailable", flush=True)
+                t0 = _time.time()
+                response = await _client.chat.completions.create(
+                    model=_model,
+                    max_completion_tokens=min(max_tokens, 16000),
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                )
+                text = response.choices[0].message.content or ""
+                elapsed = _time.time() - t0
+                print(f"[SKILL] OpenAI fallback completed in {elapsed:.1f}s — {len(text)} chars", flush=True)
+                if blog:
+                    await blog.llm_call(
+                        model=_model,
+                        purpose=purpose or user_message[:50],
+                        input_tokens=response.usage.prompt_tokens if response.usage else 0,
+                        output_tokens=response.usage.completion_tokens if response.usage else 0,
+                        duration_s=elapsed,
+                    )
+                return text
+            except Exception as e:
+                print(f"[SKILL] OpenAI fallback also failed: {e}", flush=True)
+                if blog:
+                    await blog.error(f"OpenAI fallback failed: {e}")
+                raise
+
+        raise RuntimeError("No LLM provider configured (need ANTHROPIC_API_KEY or OPENAI_API_KEY)")
 
     async def _update_step(
         self,
