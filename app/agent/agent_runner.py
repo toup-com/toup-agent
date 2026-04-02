@@ -272,6 +272,15 @@ class AgentRunner:
         all_tools = self.tool_defs
         filtered_tools = filter_tools_by_intent(all_tools, query_intent)
         current_tools = filtered_tools
+
+        # In vibecoding mode, strip all app_builder tools — agent should code directly
+        if channel == "vibecoding":
+            current_tools = [
+                t for t in current_tools
+                if not (t.get("function", {}).get("name", "") or "").startswith("app_builder__")
+            ]
+            logger.info(f"[VIBE] Stripped app_builder tools for vibecoding channel, {len(current_tools)} tools remaining")
+
         logger.info(
             f"[PERF] tool_filter: {len(all_tools)} total → {len(current_tools)} for intent={query_intent.category}"
         )
@@ -462,7 +471,13 @@ class AgentRunner:
             # so the agent isn't constrained if it discovers it needs more tools
             if current_tools is not all_tools and query_intent.category != "full":
                 current_tools = all_tools
-                logger.info(f"[AGENT] Escalated to full toolset ({len(all_tools)} tools) after tool use")
+                # Re-apply vibecoding filter after escalation
+                if channel == "vibecoding":
+                    current_tools = [
+                        t for t in current_tools
+                        if not (t.get("function", {}).get("name", "") or "").startswith("app_builder__")
+                    ]
+                logger.info(f"[AGENT] Escalated to full toolset ({len(current_tools)} tools) after tool use")
 
             # ── Mid-loop context compaction ──────────────────────
             # Check if context is getting large and compact if needed.
