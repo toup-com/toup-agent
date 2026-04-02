@@ -1142,6 +1142,7 @@ class AgentRunner:
             "environment",    # WHAT the agent has access to
             "media",          # Media playback instructions (web/app)
             "runtime",        # WHEN/WHERE
+            "vibecoding",     # Vibe coding mode override (when active)
             "formatting",     # HOW to respond
             "onboarding",     # Temporary onboarding instructions
             "activation",     # Optional activation prompt
@@ -1166,7 +1167,7 @@ class AgentRunner:
         self,
         db: AsyncSession,
         session_id: str,
-        max_messages: int = 20,
+        max_messages: int = 50,
     ) -> List[Dict[str, Any]]:
         """Load recent messages in Anthropic format (user/assistant roles)."""
         from sqlalchemy import select
