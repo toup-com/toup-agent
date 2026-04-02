@@ -242,7 +242,7 @@ async def _run_research_inner(
     questions = await call_llm(
         system_prompt=RESEARCH_SYSTEM_PROMPT,
         user_message=user_message,
-        model="claude-sonnet-4-6",
+        model="",  # dynamic — _call_llm picks best available provider
         purpose="research_agent_questions",
         max_tokens=4000,
     )
@@ -268,7 +268,7 @@ async def _generate_fallback_questions(
     questions = await call_llm(
         system_prompt=RESEARCH_SYSTEM_PROMPT,
         user_message=fallback_prompt,
-        model="claude-sonnet-4-6",
+        model="",  # dynamic — _call_llm picks best available provider
         purpose="research_fallback_questions",
         max_tokens=4000,
     )

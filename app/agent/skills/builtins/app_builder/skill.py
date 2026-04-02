@@ -3050,173 +3050,176 @@ const _webDb = {
         return code
 
     async def _call_llm(
-        self, system_prompt: str, user_message: str, model: str = "claude-opus-4-6",
+        self, system_prompt: str, user_message: str, model: str = "",
         blog=None, purpose: str = "", max_tokens: int = 32000,
     ) -> str:
-        """Call the LLM (Anthropic). Using Opus 4.6 for all phases."""
+        """Call the best available LLM based on the user's configured API keys.
+
+        Routing logic:
+          1. If Anthropic key is available and valid → use Claude
+          2. If OpenAI key is available → use OpenAI (agent's configured model)
+          3. If Anthropic fails with auth error → fall through to OpenAI
+          4. No keys at all → raise RuntimeError
+        """
         import time as _time
         from app.services.key_provider import keys
 
         anthropic_key = keys.anthropic or ""
+        openai_key = keys.openai or ""
+
+        if not anthropic_key and not openai_key:
+            raise RuntimeError("No LLM provider configured (need ANTHROPIC_API_KEY or OPENAI_API_KEY)")
+
+        # ── Try Anthropic first (if key exists) ──────────────────────
         if anthropic_key:
             try:
-                import anthropic
-                import os
-                is_oauth = "sk-ant-oat" in anthropic_key
-                if is_oauth:
-                    os.environ.pop("ANTHROPIC_API_KEY", None)
-                    client = anthropic.AsyncAnthropic(
-                        auth_token=anthropic_key,
-                        default_headers={
-                            # Must pretend to be Claude Code for OAuth token validity.
-                            # Do NOT include interleaved-thinking — it puts code in
-                            # thinking blocks, leaving only stubs in text_stream.
-                            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-                            "user-agent": "claude-cli/2.1.2 (external, cli)",
-                            "x-app": "cli",
-                        },
-                    )
-                else:
-                    client = anthropic.AsyncAnthropic(api_key=anthropic_key)
-
-                # OAuth tokens require Claude Code identity prefix
-                if is_oauth:
-                    _sys = [
-                        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
-                        {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}},
-                    ]
-                else:
-                    _sys = system_prompt
-
-                t0 = _time.time()
-                # Use streaming — Anthropic requires it for large max_tokens
-                text = ""
-                input_tok = 0
-                output_tok = 0
-                stop_reason = "end_turn"
-                _last_progress = t0
-                _chunk_count = 0
-                async with client.messages.stream(
-                    model=model,
-                    max_tokens=max_tokens,
-                    system=_sys,
-                    messages=[{"role": "user", "content": user_message}],
-                ) as stream:
-                    async for chunk in stream.text_stream:
-                        text += chunk
-                        _chunk_count += 1
-                        # Log progress every 10 seconds so user knows it's working
-                        _now = _time.time()
-                        if blog and (_now - _last_progress) >= 10:
-                            _elapsed_s = int(_now - t0)
-                            _words = len(text.split())
-                            await blog.info(f"LLM generating... {_elapsed_s}s elapsed, ~{_words} words so far")
-                            _last_progress = _now
-                    response = await stream.get_final_message()
-                    input_tok = getattr(response.usage, 'input_tokens', 0)
-                    output_tok = getattr(response.usage, 'output_tokens', 0)
-                    stop_reason = getattr(response, 'stop_reason', 'end_turn')
-
-                    # Safety net: if text_stream yielded garbage/stub, extract
-                    # from ALL content blocks (thinking blocks may contain real code)
-                    if len(text.strip()) < 100:
-                        all_text_parts = []
-                        for block in response.content:
-                            if hasattr(block, 'text') and block.text:
-                                all_text_parts.append(block.text)
-                            elif hasattr(block, 'thinking') and block.thinking:
-                                all_text_parts.append(block.thinking)
-                        combined = "\n".join(all_text_parts)
-                        if len(combined.strip()) > len(text.strip()):
-                            if blog:
-                                await blog.warn(
-                                    f"text_stream was short ({len(text)} chars), "
-                                    f"recovered {len(combined)} chars from content blocks"
-                                )
-                            text = combined
-
-                elapsed = _time.time() - t0
-
-                if blog:
-                    await blog.llm_call(
-                        model=model,
-                        purpose=purpose or user_message[:50],
-                        input_tokens=input_tok,
-                        output_tokens=output_tok,
-                        duration_s=elapsed,
-                    )
-
-                # Warn if output was truncated due to max_tokens
-                if stop_reason == "max_tokens" and blog:
-                    await blog.warn(f"LLM output truncated (hit {max_tokens} token limit)")
-
-                return text
-            except anthropic.RateLimitError as e:
-                # Token limit / rate limit — extract retry-after and raise for pause/resume
-                retry_after = 300  # default 5 minutes
-                try:
-                    retry_after = int(getattr(e.response, 'headers', {}).get('retry-after', 300))
-                except (ValueError, TypeError, AttributeError):
-                    pass
-                msg = f"Rate limit reached. Resets in {retry_after}s"
-                if blog:
-                    await blog.warn(msg)
-                raise TokenLimitError(retry_after_seconds=retry_after, message=msg)
-            except anthropic.AuthenticationError as e:
-                # Auth error (expired OAuth token, invalid key) — fall through to OpenAI fallback
-                print(f"[SKILL] Anthropic auth failed: {e} — will try OpenAI fallback", flush=True)
-                if blog:
-                    await blog.warn(f"Anthropic auth failed, trying OpenAI fallback")
-            except anthropic.APIStatusError as e:
-                if e.status_code == 529:  # API overloaded
-                    raise TokenLimitError(retry_after_seconds=120, message="API overloaded, retry in 2min")
-                # All other Anthropic errors — fail the build, no fallback to weaker models
-                if blog:
-                    await blog.error(f"Anthropic call failed (status {e.status_code}): {e}")
-                raise
-            except Exception as e:
-                if blog:
-                    await blog.error(f"Anthropic call failed: {e}")
-                raise
-
-        # ── Fallback to OpenAI when Anthropic key is missing or expired ──
-        from app.services.key_provider import keys as _keys
-        openai_key = _keys.openai or ""
-        if openai_key:
-            try:
-                import time as _time
-                from openai import AsyncOpenAI
-                _client = AsyncOpenAI(api_key=openai_key)
-                _model = settings.agent_model or "gpt-5.4"
-                print(f"[SKILL] _call_llm falling back to OpenAI ({_model}) — Anthropic unavailable", flush=True)
-                t0 = _time.time()
-                response = await _client.chat.completions.create(
-                    model=_model,
-                    max_completion_tokens=min(max_tokens, 16000),
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message},
-                    ],
+                text = await self._call_anthropic(
+                    system_prompt, user_message,
+                    model=model or "claude-sonnet-4-6",
+                    anthropic_key=anthropic_key,
+                    max_tokens=max_tokens, blog=blog, purpose=purpose,
                 )
-                text = response.choices[0].message.content or ""
-                elapsed = _time.time() - t0
-                print(f"[SKILL] OpenAI fallback completed in {elapsed:.1f}s — {len(text)} chars", flush=True)
-                if blog:
-                    await blog.llm_call(
-                        model=_model,
-                        purpose=purpose or user_message[:50],
-                        input_tokens=response.usage.prompt_tokens if response.usage else 0,
-                        output_tokens=response.usage.completion_tokens if response.usage else 0,
-                        duration_s=elapsed,
-                    )
                 return text
-            except Exception as e:
-                print(f"[SKILL] OpenAI fallback also failed: {e}", flush=True)
-                if blog:
-                    await blog.error(f"OpenAI fallback failed: {e}")
-                raise
+            except Exception as _anth_err:
+                # Import here to check error types
+                try:
+                    import anthropic as _anth_mod
+                    if isinstance(_anth_err, _anth_mod.RateLimitError):
+                        retry_after = 300
+                        try:
+                            retry_after = int(getattr(_anth_err.response, 'headers', {}).get('retry-after', 300))
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                        raise TokenLimitError(retry_after_seconds=retry_after, message=f"Rate limit reached. Resets in {retry_after}s")
+                    if isinstance(_anth_err, _anth_mod.APIStatusError) and _anth_err.status_code == 529:
+                        raise TokenLimitError(retry_after_seconds=120, message="API overloaded, retry in 2min")
+                    if isinstance(_anth_err, (_anth_mod.AuthenticationError,)):
+                        # Auth failed (expired OAuth token) — fall through to OpenAI
+                        print(f"[LLM] Anthropic auth failed, falling through to OpenAI: {_anth_err}", flush=True)
+                    else:
+                        # Other Anthropic errors — if we have OpenAI, try that; otherwise re-raise
+                        if openai_key:
+                            print(f"[LLM] Anthropic failed ({type(_anth_err).__name__}), trying OpenAI", flush=True)
+                        else:
+                            raise
+                except ImportError:
+                    if not openai_key:
+                        raise _anth_err
 
-        raise RuntimeError("No LLM provider configured (need ANTHROPIC_API_KEY or OPENAI_API_KEY)")
+        # ── OpenAI path ──────────────────────────────────────────────
+        if openai_key:
+            return await self._call_openai(
+                system_prompt, user_message,
+                openai_key=openai_key,
+                max_tokens=max_tokens, blog=blog, purpose=purpose,
+            )
+
+        raise RuntimeError("All LLM providers failed")
+
+    async def _call_anthropic(
+        self, system_prompt: str, user_message: str, model: str,
+        anthropic_key: str, max_tokens: int, blog=None, purpose: str = "",
+    ) -> str:
+        """Call Anthropic Claude API with streaming."""
+        import time as _time
+        import anthropic
+        import os
+
+        is_oauth = "sk-ant-oat" in anthropic_key
+        if is_oauth:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            client = anthropic.AsyncAnthropic(
+                auth_token=anthropic_key,
+                default_headers={
+                    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+                    "user-agent": "claude-cli/2.1.2 (external, cli)",
+                    "x-app": "cli",
+                },
+            )
+        else:
+            client = anthropic.AsyncAnthropic(api_key=anthropic_key)
+
+        _sys = ([
+            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}},
+        ] if is_oauth else system_prompt)
+
+        t0 = _time.time()
+        text = ""
+        _last_progress = t0
+        print(f"[LLM] Calling Anthropic ({model})...", flush=True)
+
+        async with client.messages.stream(
+            model=model, max_tokens=max_tokens, system=_sys,
+            messages=[{"role": "user", "content": user_message}],
+        ) as stream:
+            async for chunk in stream.text_stream:
+                text += chunk
+                _now = _time.time()
+                if blog and (_now - _last_progress) >= 10:
+                    await blog.info(f"LLM generating... {int(_now - t0)}s elapsed, ~{len(text.split())} words")
+                    _last_progress = _now
+            response = await stream.get_final_message()
+            input_tok = getattr(response.usage, 'input_tokens', 0)
+            output_tok = getattr(response.usage, 'output_tokens', 0)
+            stop_reason = getattr(response, 'stop_reason', 'end_turn')
+
+            # Safety net: recover from thinking-block stubs
+            if len(text.strip()) < 100:
+                parts = []
+                for block in response.content:
+                    if hasattr(block, 'text') and block.text:
+                        parts.append(block.text)
+                    elif hasattr(block, 'thinking') and block.thinking:
+                        parts.append(block.thinking)
+                combined = "\n".join(parts)
+                if len(combined.strip()) > len(text.strip()):
+                    if blog:
+                        await blog.warn(f"text_stream short ({len(text)} chars), recovered {len(combined)} chars")
+                    text = combined
+
+        elapsed = _time.time() - t0
+        print(f"[LLM] Anthropic ({model}) done in {elapsed:.1f}s — {len(text)} chars", flush=True)
+
+        if blog:
+            await blog.llm_call(model=model, purpose=purpose or user_message[:50],
+                                input_tokens=input_tok, output_tokens=output_tok, duration_s=elapsed)
+        if stop_reason == "max_tokens" and blog:
+            await blog.warn(f"LLM output truncated (hit {max_tokens} token limit)")
+
+        return text
+
+    async def _call_openai(
+        self, system_prompt: str, user_message: str,
+        openai_key: str, max_tokens: int, blog=None, purpose: str = "",
+    ) -> str:
+        """Call OpenAI API (uses the agent's configured model)."""
+        import time as _time
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=openai_key)
+        model = settings.agent_model or "gpt-5.4"
+        print(f"[LLM] Calling OpenAI ({model})...", flush=True)
+
+        t0 = _time.time()
+        response = await client.chat.completions.create(
+            model=model,
+            max_completion_tokens=min(max_tokens, 16000),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+        )
+        text = response.choices[0].message.content or ""
+        elapsed = _time.time() - t0
+        input_tok = response.usage.prompt_tokens if response.usage else 0
+        output_tok = response.usage.completion_tokens if response.usage else 0
+        print(f"[LLM] OpenAI ({model}) done in {elapsed:.1f}s — {len(text)} chars", flush=True)
+
+        if blog:
+            await blog.llm_call(model=model, purpose=purpose or user_message[:50],
+                                input_tokens=input_tok, output_tokens=output_tok, duration_s=elapsed)
+        return text
 
     async def _update_step(
         self,

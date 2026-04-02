@@ -98,7 +98,7 @@ async def run_building_questions(
     questions = await call_llm(
         system_prompt=BUILDING_SYSTEM_PROMPT,
         user_message=user_message,
-        model="claude-sonnet-4-6",
+        model="",  # dynamic — _call_llm picks best available provider
         purpose="building_agent_questions",
         max_tokens=4000,
     )
