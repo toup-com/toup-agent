@@ -1083,7 +1083,10 @@ class AppBuilderSkill(Skill):
             "you may skip Layer 0 and go directly to Layer 1A\n\n"
 
             "### Layer 1A: Research Agent (5+ Research-Informed Questions)\n"
-            "After the user picks a direction, call `app_builder__research_category` with:\n"
+            "**IMMEDIATELY after the user picks a direction from Layer 0, you MUST call "
+            "`app_builder__research_category`.** Do NOT ask any additional questions, do NOT ask "
+            "about platform preference, do NOT ask about tech stack, do NOT ask anything else — "
+            "just call the tool right away with:\n"
             "- `original_idea`: the user's original prompt\n"
             "- `chosen_direction`: the direction they picked (title + description)\n\n"
             "This tool researches the app category via web search and returns 5-7 research-informed questions "
@@ -1093,7 +1096,8 @@ class AppBuilderSkill(Skill):
             "Wait for the user to answer ALL research questions before proceeding.\n\n"
 
             "### Layer 1B: Building Agent (5+ Technical Questions)\n"
-            "After the user answers the research questions, call `app_builder__gather_requirements` with:\n"
+            "**IMMEDIATELY after the user answers ALL research questions, call "
+            "`app_builder__gather_requirements`.** Do NOT ask additional questions — call the tool with:\n"
             "- `original_idea`: the user's original prompt\n"
             "- `chosen_direction`: the direction from Layer 0\n"
             "- `research_context`: the research questions that were asked\n"

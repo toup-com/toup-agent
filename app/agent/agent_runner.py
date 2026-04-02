@@ -108,9 +108,12 @@ class AgentRunner:
         defs = list(self._core_tool_defs)
         if self.skill_loader:
             defs = defs + self.skill_loader.get_all_tool_definitions()
-        # Apply per-session disabled filter
+        # Apply per-session disabled filter (tools can be Anthropic or OpenAI format)
         if self._disabled_tool_names:
-            defs = [t for t in defs if t.get("function", {}).get("name") not in self._disabled_tool_names]
+            defs = [
+                t for t in defs
+                if (t.get("name") or t.get("function", {}).get("name")) not in self._disabled_tool_names
+            ]
         return defs
 
     # ------------------------------------------------------------------
@@ -210,13 +213,19 @@ class AgentRunner:
                 self._disabled_tool_names = set()
             logger.info(f"[PERF] load_agent_config: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
-            t_prompt = time.perf_counter()
-            system_prompt = await self._build_system_prompt(db, user_id, user_message, channel=channel, intent=query_intent)
-            logger.info(f"[PERF] build_system_prompt: {(time.perf_counter() - t_prompt) * 1000:.0f}ms — {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
-
             t_db = time.perf_counter()
             history = await self._load_history(db, session_id)
             logger.info(f"[PERF] load_history: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages")
+
+            # If conversation has active app_builder context (direction cards,
+            # tool calls), override intent so tools and skill prompts stay available
+            if query_intent.category != "full" and self._has_builder_context(history):
+                query_intent = INTENT_FULL
+                logger.info("[AGENT] Overriding intent to FULL — app_builder context detected in history")
+
+            t_prompt = time.perf_counter()
+            system_prompt = await self._build_system_prompt(db, user_id, user_message, channel=channel, intent=query_intent)
+            logger.info(f"[PERF] build_system_prompt: {(time.perf_counter() - t_prompt) * 1000:.0f}ms — {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
             await db.commit()
         logger.info(f"[PERF] phase1_total: {(time.perf_counter() - t_phase1) * 1000:.0f}ms")
         # DB session closed — no connection held during LLM calls
@@ -277,7 +286,7 @@ class AgentRunner:
         if channel == "vibecoding":
             current_tools = [
                 t for t in current_tools
-                if not (t.get("function", {}).get("name", "") or "").startswith("app_builder__")
+                if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
             ]
             logger.info(f"[VIBE] Stripped app_builder tools for vibecoding channel, {len(current_tools)} tools remaining")
 
@@ -479,7 +488,7 @@ class AgentRunner:
                 if channel == "vibecoding":
                     current_tools = [
                         t for t in current_tools
-                        if not (t.get("function", {}).get("name", "") or "").startswith("app_builder__")
+                        if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
                     ]
                 logger.info(f"[AGENT] Escalated to full toolset ({len(current_tools)} tools) after tool use")
 
@@ -1406,6 +1415,32 @@ class AgentRunner:
     # ------------------------------------------------------------------
     # Media handling (OpenAI vision format)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _has_builder_context(messages: List[Dict[str, Any]]) -> bool:
+        """Check if conversation history contains app_builder interactions.
+
+        Detects both tool_use blocks (app_builder__*) and the [[button]] syntax
+        that the builder's direction cards / question cards use.
+        """
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                if "[[" in content and "]]" in content:
+                    return True
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use" and block.get("name", "").startswith("app_builder__"):
+                        return True
+                    if block.get("type") == "text":
+                        t = block.get("text", "")
+                        if "[[" in t and "]]" in t:
+                            return True
+        return False
+
     def _build_media_content(
         self,
         text: str,

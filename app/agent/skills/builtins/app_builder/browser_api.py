@@ -33,6 +33,8 @@ _pw = None
 _lock = asyncio.Lock()
 
 
+BROWSER_LAUNCH_TIMEOUT = 15  # seconds — fail fast if Chromium isn't available
+
 async def _ensure_browser():
     """Lazy-init a headless-only browser for research. Separate from user browser."""
     global _browser, _context, _pw
@@ -48,17 +50,21 @@ async def _ensure_browser():
                 from playwright.async_api import async_playwright
 
             _pw = await async_playwright().start()
-            _browser = await _pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--headless=new",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-extensions",
-                    "--disable-infobars",
-                ],
+            # Timeout the launch — if Chromium binary is missing, launch() can hang
+            _browser = await asyncio.wait_for(
+                _pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--headless=new",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-extensions",
+                        "--disable-infobars",
+                    ],
+                ),
+                timeout=BROWSER_LAUNCH_TIMEOUT,
             )
             _context = await _browser.new_context(
                 viewport={"width": 1280, "height": 720},
@@ -75,6 +81,9 @@ async def _ensure_browser():
             logger.info("[BROWSER_API] Headless research browser launched")
             return _context
 
+        except asyncio.TimeoutError:
+            logger.error("[BROWSER_API] Browser launch timed out after %ds — Chromium may not be installed", BROWSER_LAUNCH_TIMEOUT)
+            raise RuntimeError("Browser launch timed out — Chromium not available")
         except ImportError:
             raise RuntimeError(
                 "Browser not available. Install: pip install patchright && patchright install chromium"

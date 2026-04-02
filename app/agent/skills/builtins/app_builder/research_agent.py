@@ -9,10 +9,14 @@ Called internally by AppBuilderSkill after the user picks a direction (Layer 0).
 The user never sees this agent directly — its output is presented by the main agent.
 """
 
+import asyncio
 import logging
 from typing import Callable, Awaitable
 
 logger = logging.getLogger(__name__)
+
+# Overall timeout for the entire research operation (search + read + LLM)
+RESEARCH_TIMEOUT = 45  # seconds
 
 
 async def _browser_search(query: str, count: int = 5) -> str:
@@ -136,55 +140,74 @@ async def run_research(
     """
     Research the chosen app direction and return formatted questions.
 
-    Uses the platform's stealth browser to:
-    1. Search Google for competing apps and features
-    2. Read full articles from top results for deeper insights
-    3. Feed everything to the LLM to generate research-informed questions
-
-    Args:
-        original_idea: The user's raw input (e.g., "I want a fitness app")
-        chosen_direction: The direction the user picked from Layer 0
-        call_llm: Reference to AppBuilderSkill._call_llm for making LLM calls
-
-    Returns:
-        Formatted string with 5-7 research-informed questions and [[option]] buttons
+    Wraps the actual research in an overall timeout. If web research takes
+    too long (browser not available, slow network), falls back to LLM-only
+    question generation so the pipeline never stalls.
     """
-    # Step 1: Run 3 targeted searches
+    try:
+        return await asyncio.wait_for(
+            _run_research_inner(original_idea, chosen_direction, call_llm),
+            timeout=RESEARCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Research timed out after %ds — falling back to LLM-only questions", RESEARCH_TIMEOUT)
+        return await _generate_fallback_questions(original_idea, chosen_direction, call_llm)
+
+
+async def _run_research_inner(
+    original_idea: str,
+    chosen_direction: str,
+    call_llm: Callable[..., Awaitable[str]],
+) -> str:
+    """Inner research function — runs web search + LLM question generation."""
+    # Step 1: Run 3 targeted searches CONCURRENTLY (not sequentially)
     search_queries = [
         f"best {chosen_direction} apps 2025 features",
         f"{chosen_direction} app UX design patterns common features",
         f"{chosen_direction} mobile app what users want reviews",
     ]
 
-    all_search_results = []
-    top_urls = []
-
-    for query in search_queries:
+    async def _safe_search(query: str) -> tuple:
+        """Run a single search, return (result_text, urls)."""
         try:
             result = await _browser_search(query, count=5)
-            all_search_results.append(f"Query: {query}\n{result}")
-            # Extract URLs from results for deep reading
-            for line in result.split("\n"):
-                line = line.strip()
-                if line.startswith("http") and len(top_urls) < 3:
-                    top_urls.append(line)
+            urls = [
+                line.strip() for line in result.split("\n")
+                if line.strip().startswith("http")
+            ][:2]
+            return (f"Query: {query}\n{result}", urls)
         except Exception as exc:
             logger.warning("Search failed for '%s': %s", query, exc)
-            all_search_results.append(f"Query: {query}\n(search failed)")
+            return (f"Query: {query}\n(search failed)", [])
+
+    # Run all searches concurrently — 3x faster than sequential
+    search_results = await asyncio.gather(*[_safe_search(q) for q in search_queries])
+
+    all_search_results = []
+    top_urls = []
+    for text, urls in search_results:
+        all_search_results.append(text)
+        for u in urls:
+            if len(top_urls) < 3:
+                top_urls.append(u)
 
     combined_search = "\n\n".join(all_search_results)
 
-    # Step 2: Read top 2-3 articles for deeper content
+    # Step 2: Read top 2 articles concurrently
     article_contents = []
-    for url in top_urls[:2]:  # Read max 2 articles to keep it fast
-        try:
-            content = await _browser_read_page(url)
-            if content and not content.startswith("(failed") and len(content) > 100:
-                # Truncate each article to keep LLM context manageable
-                truncated = content[:5000] if len(content) > 5000 else content
-                article_contents.append(f"URL: {url}\n{truncated}")
-        except Exception as exc:
-            logger.warning("Failed to read article %s: %s", url, exc)
+    if top_urls:
+        async def _safe_read(url: str) -> str:
+            try:
+                content = await _browser_read_page(url)
+                if content and not content.startswith("(failed") and len(content) > 100:
+                    truncated = content[:5000] if len(content) > 5000 else content
+                    return f"URL: {url}\n{truncated}"
+            except Exception as exc:
+                logger.warning("Failed to read article %s: %s", url, exc)
+            return ""
+
+        read_results = await asyncio.gather(*[_safe_read(u) for u in top_urls[:2]])
+        article_contents = [r for r in read_results if r]
 
     combined_articles = "\n\n---\n\n".join(article_contents) if article_contents else "(no articles could be read)"
 
@@ -204,4 +227,28 @@ async def run_research(
         max_tokens=4000,
     )
 
+    return questions.strip()
+
+
+async def _generate_fallback_questions(
+    original_idea: str,
+    chosen_direction: str,
+    call_llm: Callable[..., Awaitable[str]],
+) -> str:
+    """Generate research-style questions without web search (used when research times out)."""
+    fallback_prompt = (
+        f'User\'s original idea: "{original_idea}"\n'
+        f'Direction they chose: "{chosen_direction}"\n\n'
+        "Web research was unavailable. Generate 5-7 insightful questions about this app category "
+        "based on your knowledge of similar apps and common patterns in this space. "
+        "Reference well-known apps where relevant. "
+        "Each question MUST have [[option]] buttons on the next line."
+    )
+    questions = await call_llm(
+        system_prompt=RESEARCH_SYSTEM_PROMPT,
+        user_message=fallback_prompt,
+        model="claude-sonnet-4-6",
+        purpose="research_fallback_questions",
+        max_tokens=4000,
+    )
     return questions.strip()
