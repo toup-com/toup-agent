@@ -301,12 +301,16 @@ class AgentRunner:
                     _t_llm_start = time.perf_counter()
                     _t_first_token = None
 
+                    # In vibecoding mode, force tool use on first iteration
+                    _tool_choice = "required" if (channel == "vibecoding" and iteration == 0 and current_tools) else None
+
                     async for event in active_llm.create_message_stream(
                         messages=messages,
                         system=system_prompt,
                         tools=current_tools or None,
                         model=active_model,
                         thinking_budget=thinking_budget if _is_claude_model(active_model) else 0,
+                        tool_choice=_tool_choice,
                     ):
                         if cancel_check and cancel_check():
                             logger.info("[AGENT] Cancelled during streaming")

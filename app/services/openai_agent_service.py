@@ -89,6 +89,7 @@ class OpenAIAgentService:
         max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         thinking_budget: int = 0,
+        tool_choice: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a chat completion. Yields StreamEvent objects matching the
@@ -113,6 +114,8 @@ class OpenAIAgentService:
         # Convert Anthropic-format tools to OpenAI format
         if tools:
             kwargs["tools"] = _anthropic_tools_to_openai(tools)
+            if tool_choice:
+                kwargs["tool_choice"] = tool_choice
 
         max_retries = 3
         for attempt in range(max_retries):

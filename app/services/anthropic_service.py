@@ -222,6 +222,7 @@ class AnthropicService:
         max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         thinking_budget: int = 0,
+        tool_choice: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a message. Yields StreamEvent objects for text chunks,
@@ -251,6 +252,8 @@ class AnthropicService:
             kwargs["system"] = prepared_system
         if tools:
             kwargs["tools"] = tools
+            if tool_choice == "required":
+                kwargs["tool_choice"] = {"type": "any"}
 
         max_retries = 3
         for attempt in range(max_retries):
