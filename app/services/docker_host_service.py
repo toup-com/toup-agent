@@ -146,6 +146,7 @@ def _build_env(
         f"AGENT_API_KEY={agent_api_key}",
         f"DATABASE_URL=postgresql+asyncpg://postgres:postgres@host.docker.internal:5432/{db_name}",
         f"AGENT_WORKSPACE_DIR=/app/workspace",
+        f"TOUP_APPS_DIR=/app/workspace/apps",
         f"SKILLS_DIR=/app/skills",
         f"PLATFORM_API_URL={settings.platform_api_url if settings.platform_api_url.endswith('/api') else settings.platform_api_url + '/api'}",
         f"TOUP_TOKEN={agent_config.connect_token or '' if agent_config else ''}",
