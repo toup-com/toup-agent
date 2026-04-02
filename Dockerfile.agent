@@ -30,6 +30,12 @@ RUN apt-get update && apt-get install -y \
     libwayland-client0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Node.js 20 — needed for Expo project scaffolding and preview servers
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/* && \
+    npm install -g expo-cli@latest
+
 # Python deps
 COPY requirements.agent.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
