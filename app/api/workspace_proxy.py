@@ -59,6 +59,11 @@ def _host_workspace(user_id: str) -> str:
     return f"/data/agents/{user_id[:8]}/workspace"
 
 
+def _container_workspace() -> str:
+    """Return the workspace path inside the container."""
+    return "/app/workspace"
+
+
 async def _require_container(user_id: str, db: AsyncSession) -> ManagedContainer:
     """Get the user's managed container or raise 404."""
     result = await db.execute(
@@ -122,22 +127,36 @@ async def read_workspace_file(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Read a file from the user's workspace."""
-    await _require_container(current_user.id, db)
-    base = _host_workspace(current_user.id)
+    """Read a file from the user's workspace (tries container then host)."""
+    container = await _require_container(current_user.id, db)
+    host_base = _host_workspace(current_user.id)
 
     clean_path = path.strip("/").replace("..", "")
     if not clean_path:
         raise HTTPException(400, "Path is required")
-    target = f"{base}/{clean_path}"
 
-    size_check = await _ssh_cmd(f"stat -c%s {target} 2>/dev/null")
+    # Try container first (live files), fall back to host
+    container_target = f"{_container_workspace()}/{clean_path}"
+    size_check = await _ssh_cmd(
+        f"docker exec {container.container_name} stat -c%s {container_target} 2>/dev/null"
+    )
+    if size_check and size_check.strip().isdigit():
+        if int(size_check.strip()) > 1_000_000:
+            raise HTTPException(413, "File too large (>1MB)")
+        content = await _ssh_cmd(
+            f"docker exec {container.container_name} cat {container_target} 2>/dev/null"
+        )
+        return {"path": clean_path, "content": content, "size": int(size_check.strip())}
+
+    # Fall back to host path
+    host_target = f"{host_base}/{clean_path}"
+    size_check = await _ssh_cmd(f"stat -c%s {host_target} 2>/dev/null")
     if not size_check or not size_check.strip().isdigit():
         raise HTTPException(404, "File not found")
     if int(size_check.strip()) > 1_000_000:
         raise HTTPException(413, "File too large (>1MB)")
 
-    content = await _ssh_cmd(f"cat {target} 2>/dev/null")
+    content = await _ssh_cmd(f"cat {host_target} 2>/dev/null")
     return {"path": clean_path, "content": content, "size": int(size_check.strip())}
 
 
@@ -150,27 +169,43 @@ async def workspace_tree(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get a recursive file tree of the workspace."""
-    await _require_container(current_user.id, db)
-    base = _host_workspace(current_user.id)
+    """Get a recursive file tree of the workspace (checks both container and host)."""
+    container = await _require_container(current_user.id, db)
+    host_base = _host_workspace(current_user.id)
+    container_base = _container_workspace()
 
     clean_path = path.strip("/").replace("..", "")
-    target = f"{base}/{clean_path}" if clean_path else base
 
+    # Try container first (live files from write_file), then host (legacy/mounted files)
+    container_target = f"{container_base}/{clean_path}" if clean_path else container_base
     raw = await _ssh_cmd(
-        f"find {target} -maxdepth {depth} -printf '%y|%s|%P\\n' 2>/dev/null | head -1000"
+        f"docker exec {container.container_name} "
+        f"find {container_target} -maxdepth {depth} -printf '%y|%s|%P\\n' 2>/dev/null | head -1000"
     )
-    if not raw:
+
+    # Also check host path for files that may not be in container
+    host_target = f"{host_base}/{clean_path}" if clean_path else host_base
+    host_raw = await _ssh_cmd(
+        f"find {host_target} -maxdepth {depth} -printf '%y|%s|%P\\n' 2>/dev/null | head -1000"
+    )
+
+    # Merge: container files take priority, host files fill gaps
+    combined = (raw or "") + "\n" + (host_raw or "")
+    if not combined.strip():
         return {"path": clean_path, "tree": [], "base": "/workspace"}
 
+    seen = set()
     files = []
-    for line in raw.strip().split("\n"):
+    for line in combined.strip().split("\n"):
         parts = line.split("|", 2)
         if len(parts) < 3 or not parts[2]:
             continue
         ftype = "dir" if parts[0] == "d" else "file"
         size = int(parts[1]) if parts[1].isdigit() else 0
         rel_path = parts[2]
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
         name = rel_path.split("/")[-1]
         files.append({
             "name": name,
