@@ -699,8 +699,8 @@ class AppBuilderSkill(Skill):
         app_id = str(uuid.uuid4())
         job_id = str(uuid.uuid4())
         base_slug = _slugify(name)
-        apps_dir = self._app_manager.APPS_DIR if hasattr(self._app_manager, 'APPS_DIR') else "/opt/toup-agent/apps"
-        app_dir = os.path.join(apps_dir, app_id)
+        from app.agent.app_manager import APPS_DIR as _apps_dir
+        app_dir = os.path.join(_apps_dir, app_id)
 
         # Store the conversational context as plan JSON
         plan_context = {
@@ -2510,6 +2510,7 @@ class AppBuilderSkill(Skill):
         1. metro.config.js — stubs out expo-sqlite WASM on web (prevents crash)
         2. Patches database files to use conditional import (web-safe)
         """
+        from app.agent.app_manager import APPS_DIR as _apps_dir
         infra_files = {}
 
         # Metro config — stub out wa-sqlite on web to prevent SharedArrayBuffer crash
@@ -2537,12 +2538,12 @@ module.exports = config;
         # react-native-web sets font-family to "-apple-system,...,sans-serif" which lacks emoji.
         # We inject a global <style> into index.html (or the Expo web template) to fix this.
         index_html = os.path.join(
-            self._app_manager.APPS_DIR if hasattr(self._app_manager, 'APPS_DIR') else "/opt/toup-agent/apps",
+            _apps_dir,
             app_id, "web", "index.html"
         )
         # Also try the root index.html (Expo web template)
         root_index = os.path.join(
-            self._app_manager.APPS_DIR if hasattr(self._app_manager, 'APPS_DIR') else "/opt/toup-agent/apps",
+            _apps_dir,
             app_id, "index.html"
         )
         emoji_css = (
