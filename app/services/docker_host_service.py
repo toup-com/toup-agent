@@ -255,7 +255,7 @@ async def provision_container(
             f"-v /data/agents/{user_id[:8]}/skills:/app/skills "
             f"-v /root/.cache/ms-playwright:/root/.cache/ms-playwright:ro "
             f"--add-host host.docker.internal:host-gateway "
-            f"--memory=512m --cpus=0.5 "
+            f"--memory=1536m --cpus=1 "
             f"{settings.docker_agent_image}"
         )
         code, out, err = await _run_ssh(docker_run)
@@ -379,7 +379,7 @@ async def upgrade_container(db: AsyncSession, user_id: str) -> Optional[ManagedC
         f"-v /data/agents/{prefix}/skills:/app/skills "
         f"-v /root/.cache/ms-playwright:/root/.cache/ms-playwright:ro "
         f"--add-host host.docker.internal:host-gateway "
-        f"--memory=512m --cpus=0.5 "
+        f"--memory=1536m --cpus=1 "
         f"{settings.docker_agent_image}"
     )
     if code != 0:
@@ -551,7 +551,7 @@ async def update_container_env(
         f"-v /data/agents/{prefix}/skills:/app/skills "
         f"-v /root/.cache/ms-playwright:/root/.cache/ms-playwright:ro "
         f"--add-host host.docker.internal:host-gateway "
-        f"--memory=512m --cpus=0.5 "
+        f"--memory=1536m --cpus=1 "
         f"{settings.docker_agent_image}"
     )
 
