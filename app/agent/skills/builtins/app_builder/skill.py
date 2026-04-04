@@ -3057,70 +3057,73 @@ const _webDb = {
 
         Routing logic:
           1. If Anthropic key is available and valid → use Claude
-          2. If OpenAI key is available → use OpenAI (agent's configured model)
-          3. If Anthropic fails with auth error → fall through to OpenAI
-          4. No keys at all → raise RuntimeError
+          2. If Anthropic fails (auth, rate limit, overload) → fall through to OpenAI
+          3. If OpenAI key is available → use OpenAI
+          4. If both fail or neither key exists → raise with clear message
         """
-        import time as _time
         from app.services.key_provider import keys
 
         anthropic_key = keys.anthropic or ""
         openai_key = keys.openai or ""
+        errors: list[str] = []
 
         if not anthropic_key and not openai_key:
-            raise RuntimeError("No LLM provider configured (need ANTHROPIC_API_KEY or OPENAI_API_KEY)")
+            raise RuntimeError(
+                "No LLM API key configured. Add ANTHROPIC_API_KEY or OPENAI_API_KEY in Settings."
+            )
 
         # ── Try Anthropic first (if key exists) ──────────────────────
         if anthropic_key:
             try:
-                text = await self._call_anthropic(
+                return await self._call_anthropic(
                     system_prompt, user_message,
                     model=model or "claude-sonnet-4-6",
                     anthropic_key=anthropic_key,
                     max_tokens=max_tokens, blog=blog, purpose=purpose,
                 )
-                return text
+            except TokenLimitError:
+                # Rate-limit / overload — only pause if no OpenAI fallback
+                if not openai_key:
+                    raise
+                print("[LLM] Anthropic rate-limited, trying OpenAI fallback", flush=True)
+                if blog:
+                    await blog.warn("Anthropic rate-limited — switching to OpenAI")
+                errors.append("Anthropic: rate limited")
             except Exception as _anth_err:
-                # Import here to check error types
-                try:
-                    import anthropic as _anth_mod
-                    if isinstance(_anth_err, _anth_mod.RateLimitError):
-                        retry_after = 300
-                        try:
-                            retry_after = int(getattr(_anth_err.response, 'headers', {}).get('retry-after', 300))
-                        except (ValueError, TypeError, AttributeError):
-                            pass
-                        raise TokenLimitError(retry_after_seconds=retry_after, message=f"Rate limit reached. Resets in {retry_after}s")
-                    if isinstance(_anth_err, _anth_mod.APIStatusError) and _anth_err.status_code == 529:
-                        raise TokenLimitError(retry_after_seconds=120, message="API overloaded, retry in 2min")
-                    if isinstance(_anth_err, (_anth_mod.AuthenticationError,)):
-                        # Auth failed (expired OAuth token) — fall through to OpenAI
-                        print(f"[LLM] Anthropic auth failed, falling through to OpenAI: {_anth_err}", flush=True)
-                    else:
-                        # Other Anthropic errors — if we have OpenAI, try that; otherwise re-raise
-                        if openai_key:
-                            print(f"[LLM] Anthropic failed ({type(_anth_err).__name__}), trying OpenAI", flush=True)
-                        else:
-                            raise
-                except ImportError:
-                    if not openai_key:
-                        raise _anth_err
+                _reason = f"{type(_anth_err).__name__}: {_anth_err}"
+                errors.append(f"Anthropic: {_reason}")
+                if openai_key:
+                    print(f"[LLM] Anthropic failed ({_reason}), trying OpenAI", flush=True)
+                    if blog:
+                        await blog.warn(f"Anthropic unavailable — switching to OpenAI")
+                else:
+                    raise
 
-        # ── OpenAI path ──────────────────────────────────────────────
+        # ── Try OpenAI (primary or fallback) ─────────────────────────
         if openai_key:
-            return await self._call_openai(
-                system_prompt, user_message,
-                openai_key=openai_key,
-                max_tokens=max_tokens, blog=blog, purpose=purpose,
-            )
+            try:
+                return await self._call_openai(
+                    system_prompt, user_message,
+                    openai_key=openai_key,
+                    max_tokens=max_tokens, blog=blog, purpose=purpose,
+                )
+            except Exception as _oai_err:
+                errors.append(f"OpenAI: {type(_oai_err).__name__}: {_oai_err}")
 
-        raise RuntimeError("All LLM providers failed")
+        raise RuntimeError(
+            f"All LLM providers failed — please check your API keys in Settings.\n"
+            + "\n".join(f"  • {e}" for e in errors)
+        )
 
     async def _call_anthropic(
         self, system_prompt: str, user_message: str, model: str,
         anthropic_key: str, max_tokens: int, blog=None, purpose: str = "",
     ) -> str:
-        """Call Anthropic Claude API with streaming."""
+        """Call Anthropic Claude API with streaming.
+
+        Raises TokenLimitError on rate limit / overload (caller decides whether to pause or fallback).
+        Re-raises auth errors and other failures for the caller to handle.
+        """
         import time as _time
         import anthropic
         import os
@@ -3149,34 +3152,46 @@ const _webDb = {
         _last_progress = t0
         print(f"[LLM] Calling Anthropic ({model})...", flush=True)
 
-        async with client.messages.stream(
-            model=model, max_tokens=max_tokens, system=_sys,
-            messages=[{"role": "user", "content": user_message}],
-        ) as stream:
-            async for chunk in stream.text_stream:
-                text += chunk
-                _now = _time.time()
-                if blog and (_now - _last_progress) >= 10:
-                    await blog.info(f"LLM generating... {int(_now - t0)}s elapsed, ~{len(text.split())} words")
-                    _last_progress = _now
-            response = await stream.get_final_message()
-            input_tok = getattr(response.usage, 'input_tokens', 0)
-            output_tok = getattr(response.usage, 'output_tokens', 0)
-            stop_reason = getattr(response, 'stop_reason', 'end_turn')
+        try:
+            async with client.messages.stream(
+                model=model, max_tokens=max_tokens, system=_sys,
+                messages=[{"role": "user", "content": user_message}],
+            ) as stream:
+                async for chunk in stream.text_stream:
+                    text += chunk
+                    _now = _time.time()
+                    if blog and (_now - _last_progress) >= 10:
+                        await blog.info(f"LLM generating... {int(_now - t0)}s elapsed, ~{len(text.split())} words")
+                        _last_progress = _now
+                response = await stream.get_final_message()
+                input_tok = getattr(response.usage, 'input_tokens', 0)
+                output_tok = getattr(response.usage, 'output_tokens', 0)
+                stop_reason = getattr(response, 'stop_reason', 'end_turn')
 
-            # Safety net: recover from thinking-block stubs
-            if len(text.strip()) < 100:
-                parts = []
-                for block in response.content:
-                    if hasattr(block, 'text') and block.text:
-                        parts.append(block.text)
-                    elif hasattr(block, 'thinking') and block.thinking:
-                        parts.append(block.thinking)
-                combined = "\n".join(parts)
-                if len(combined.strip()) > len(text.strip()):
-                    if blog:
-                        await blog.warn(f"text_stream short ({len(text)} chars), recovered {len(combined)} chars")
-                    text = combined
+                # Safety net: recover from thinking-block stubs
+                if len(text.strip()) < 100:
+                    parts = []
+                    for block in response.content:
+                        if hasattr(block, 'text') and block.text:
+                            parts.append(block.text)
+                        elif hasattr(block, 'thinking') and block.thinking:
+                            parts.append(block.thinking)
+                    combined = "\n".join(parts)
+                    if len(combined.strip()) > len(text.strip()):
+                        if blog:
+                            await blog.warn(f"text_stream short ({len(text)} chars), recovered {len(combined)} chars")
+                        text = combined
+        except anthropic.RateLimitError as e:
+            retry_after = 300
+            try:
+                retry_after = int(getattr(e.response, 'headers', {}).get('retry-after', 300))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            raise TokenLimitError(retry_after_seconds=retry_after, message=f"Anthropic rate limit. Resets in {retry_after}s")
+        except anthropic.APIStatusError as e:
+            if e.status_code == 529:
+                raise TokenLimitError(retry_after_seconds=120, message="Anthropic API overloaded, retry in 2min")
+            raise
 
         elapsed = _time.time() - t0
         print(f"[LLM] Anthropic ({model}) done in {elapsed:.1f}s — {len(text)} chars", flush=True)
@@ -3189,32 +3204,71 @@ const _webDb = {
 
         return text
 
+    @staticmethod
+    def _resolve_openai_model() -> str:
+        """Pick the right OpenAI model name. Never pass a Claude model to OpenAI."""
+        from app.config import settings
+        model = settings.agent_model or ""
+        # If the configured model is a Claude model (or blank), use a sensible OpenAI default
+        if not model or "claude" in model.lower() or "haiku" in model.lower() or "sonnet" in model.lower() or "opus" in model.lower():
+            return "gpt-4.1"
+        return model
+
     async def _call_openai(
         self, system_prompt: str, user_message: str,
         openai_key: str, max_tokens: int, blog=None, purpose: str = "",
     ) -> str:
-        """Call OpenAI API (uses the agent's configured model)."""
+        """Call OpenAI API with streaming and proper error handling."""
         import time as _time
-        from openai import AsyncOpenAI
-        from app.config import settings
+        from openai import AsyncOpenAI, AuthenticationError, RateLimitError, APIStatusError
 
         client = AsyncOpenAI(api_key=openai_key)
-        model = settings.agent_model or "gpt-5.4"
+        model = self._resolve_openai_model()
         print(f"[LLM] Calling OpenAI ({model})...", flush=True)
 
         t0 = _time.time()
-        response = await client.chat.completions.create(
-            model=model,
-            max_completion_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-        )
-        text = response.choices[0].message.content or ""
+        _last_progress = t0
+        text = ""
+
+        try:
+            stream = await client.chat.completions.create(
+                model=model,
+                max_completion_tokens=max_tokens,
+                stream=True,
+                stream_options={"include_usage": True},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+            )
+            input_tok = 0
+            output_tok = 0
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    text += chunk.choices[0].delta.content
+                    _now = _time.time()
+                    if blog and (_now - _last_progress) >= 10:
+                        await blog.info(f"LLM generating... {int(_now - t0)}s elapsed, ~{len(text.split())} words")
+                        _last_progress = _now
+                if chunk.usage:
+                    input_tok = chunk.usage.prompt_tokens or 0
+                    output_tok = chunk.usage.completion_tokens or 0
+        except AuthenticationError as e:
+            raise RuntimeError(f"OpenAI authentication failed — check your API key: {e}") from e
+        except RateLimitError as e:
+            raise TokenLimitError(
+                retry_after_seconds=60,
+                message=f"OpenAI rate limit reached: {e}",
+            )
+        except APIStatusError as e:
+            if e.status_code == 529 or e.status_code >= 500:
+                raise TokenLimitError(
+                    retry_after_seconds=60,
+                    message=f"OpenAI API error ({e.status_code}): {e}",
+                )
+            raise
+
         elapsed = _time.time() - t0
-        input_tok = response.usage.prompt_tokens if response.usage else 0
-        output_tok = response.usage.completion_tokens if response.usage else 0
         print(f"[LLM] OpenAI ({model}) done in {elapsed:.1f}s — {len(text)} chars", flush=True)
 
         if blog:
