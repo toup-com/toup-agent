@@ -13,9 +13,11 @@ This is what runs on each user's provisioned EC2 instance.
 """
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from fastapi import FastAPI, Request, Response
 
 # Configure logging so agent_runner [PERF] and [AGENT] logs show in journalctl
@@ -345,11 +347,59 @@ async def lifespan(app: FastAPI):
         set_realtime_refs(tool_executor, agent_runner)
         set_ws_browser_refs(agent_runner, skill_loader)
 
+        # ── Clean up orphaned build jobs from previous crash/restart ──
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import BuildJob, App as AppModel
+            from sqlalchemy import select as _sel
+
+            async with async_session_maker() as _jdb:
+                # Find all jobs stuck in running/queued state (orphaned by restart)
+                result = await _jdb.execute(
+                    _sel(BuildJob).where(BuildJob.status.in_(["running", "queued"]))
+                )
+                orphaned_jobs = result.scalars().all()
+
+                for job in orphaned_jobs:
+                    job.status = "failed"
+                    job.error_message = "Interrupted by restart"
+                    job.completed_at = datetime.utcnow()
+
+                    # Mark any in-progress steps as failed with correct duration
+                    try:
+                        steps = json.loads(job.steps_json) if job.steps_json else []
+                        for s in steps:
+                            if s.get("status") == "running":
+                                s["status"] = "failed"
+                                started = s.get("started_at")
+                                if started:
+                                    try:
+                                        start_dt = datetime.fromisoformat(started)
+                                        s["duration_ms"] = int(
+                                            (datetime.utcnow() - start_dt).total_seconds() * 1000
+                                        )
+                                    except Exception:
+                                        pass
+                        job.steps_json = json.dumps(steps)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                    # Also fix the parent app status
+                    if job.app_id:
+                        app = await _jdb.get(AppModel, job.app_id)
+                        if app and app.status == "building":
+                            app.status = "error"
+
+                if orphaned_jobs:
+                    await _jdb.commit()
+                    print(f"🧹 Cleaned up {len(orphaned_jobs)} orphaned build job(s)")
+        except Exception as e:
+            print(f"⚠️ Orphan job cleanup skipped: {e}")
+
         # ── App Manager + App Builder Skill ────────────────────
         try:
             from app.agent.app_manager import AppManager
             app_manager = AppManager()
-            from app.db.database import async_session_maker
             restored = await app_manager.restore_on_startup(async_session_maker)
             set_app_manager(app_manager)
             if restored:
