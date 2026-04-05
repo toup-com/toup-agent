@@ -3256,17 +3256,31 @@ const _webDb = {
                     input_tok = chunk.usage.prompt_tokens or 0
                     output_tok = chunk.usage.completion_tokens or 0
         except AuthenticationError as e:
-            raise RuntimeError(f"OpenAI authentication failed — check your API key: {e}") from e
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in ("quota", "billing", "credit", "balance", "exceeded")):
+                raise RuntimeError(
+                    "OpenAI API credit limit reached — add more credits at "
+                    "platform.openai.com/account/billing or switch API key in Settings"
+                ) from e
+            raise RuntimeError(
+                "OpenAI API key is invalid or expired — check your API key in Settings"
+            ) from e
         except RateLimitError as e:
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in ("quota", "billing", "credit", "insufficient")):
+                raise RuntimeError(
+                    "OpenAI API credit limit reached — add more credits at "
+                    "platform.openai.com/account/billing or switch API key in Settings"
+                ) from e
             raise TokenLimitError(
                 retry_after_seconds=60,
-                message=f"OpenAI rate limit reached: {e}",
+                message=f"OpenAI rate limit reached — too many requests. Retrying in 60s.",
             )
         except APIStatusError as e:
             if e.status_code == 529 or e.status_code >= 500:
                 raise TokenLimitError(
                     retry_after_seconds=60,
-                    message=f"OpenAI API error ({e.status_code}): {e}",
+                    message=f"OpenAI API error ({e.status_code}) — retrying in 60s.",
                 )
             raise
 

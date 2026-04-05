@@ -36,26 +36,55 @@ logger = logging.getLogger(__name__)
 
 
 def _friendly_error(exc: Exception) -> str:
-    """Convert raw exceptions into user-friendly error messages."""
+    """Convert raw exceptions into user-friendly, actionable error messages."""
     name = type(exc).__name__
     msg = str(exc)
+    msg_lower = msg.lower()
 
-    # Anthropic API errors — check status code if available
+    # ── Quota / billing exhausted (must check before generic 429) ──
+    if any(kw in msg_lower for kw in ("insufficient_quota", "quota", "billing", "credit", "balance", "exceeded your current")):
+        return (
+            "Your API credit limit has been reached. To continue:\n"
+            "• Add more credits at platform.openai.com/account/billing\n"
+            "• Or add a different API key in Settings"
+        )
+
+    # ── Rate limit (temporary, not billing) ──
     status = getattr(exc, "status_code", None)
-    if status == 529 or "overloaded" in msg.lower() or "Overloaded" in msg:
-        return "Claude is temporarily overloaded. Please try again in a few seconds."
-    if status == 429 or "rate_limit" in msg.lower():
-        return "Rate limit reached. Please wait a moment and try again."
-    if status == 401 or "authentication" in msg.lower():
-        return "Authentication error with the AI service. Please contact support."
+    if status == 429 or "rate_limit" in msg_lower:
+        return "Rate limit reached — too many requests. Please wait a moment and try again."
+
+    # ── Anthropic overloaded ──
+    if status == 529 or "overloaded" in msg_lower:
+        return "The AI service is temporarily overloaded. Please try again in a few seconds."
+
+    # ── Auth errors — distinguish invalid key from expired token ──
+    if status == 401 or "authentication" in msg_lower or "unauthorized" in msg_lower:
+        if "expired" in msg_lower or "oauth" in msg_lower:
+            return "Your API token has expired. Please reconnect or update your API key in Settings."
+        return "Your API key is invalid. Please check your API key in Settings."
+
+    # ── Permission errors ──
+    if status == 403 or "permission" in msg_lower or "forbidden" in msg_lower:
+        return "Your API key doesn't have access to this model. Please check your plan or switch models in Settings."
+
+    # ── Bad request ──
     if status == 400 or "bad_request" in name.lower():
         return "There was an issue with the request. Please try rephrasing your message."
-    if "timeout" in name.lower() or "timeout" in msg.lower():
-        return "The request timed out. Please try again."
-    if "connection" in name.lower() or "connection" in msg.lower():
-        return "Connection error with the AI service. Please try again."
 
-    # Generic fallback — don't expose internals
+    # ── Server errors ──
+    if status and status >= 500:
+        return "The AI service is temporarily unavailable. Please try again in a moment."
+
+    # ── Timeout ──
+    if "timeout" in name.lower() or "timeout" in msg_lower:
+        return "The request timed out. Please try again."
+
+    # ── Connection ──
+    if "connection" in name.lower() or "connection" in msg_lower:
+        return "Couldn't reach the AI service. Please check your connection and try again."
+
+    # ── Generic fallback — don't expose internals ──
     logger.error(f"[WS] Unhandled error type for friendly message: {name}: {msg}")
     return "Something went wrong. Please try again in a moment."
 
