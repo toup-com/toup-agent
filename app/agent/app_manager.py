@@ -71,9 +71,9 @@ class AppManager:
 
     # ── Core Lifecycle ──────────────────────────────────
 
-    async def scaffold_app(self, app_id: str, app_name: str) -> str:
+    async def scaffold_app(self, app_id: str, app_name: str, slug: str = "") -> str:
         """Create a new Expo app directory. Returns the app directory path."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = os.path.join(APPS_DIR, slug or app_id)
         if os.path.exists(app_dir):
             logger.warning(f"App dir already exists: {app_dir}, removing")
             shutil.rmtree(app_dir)

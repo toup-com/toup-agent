@@ -700,7 +700,7 @@ class AppBuilderSkill(Skill):
         job_id = str(uuid.uuid4())
         base_slug = _slugify(name)
         from app.agent.app_manager import APPS_DIR as _apps_dir
-        app_dir = os.path.join(_apps_dir, app_id)
+        # app_dir will be set after slug deduplication below
 
         # Store the conversational context as plan JSON
         plan_context = {
@@ -723,6 +723,7 @@ class AppBuilderSkill(Skill):
                     break
                 slug = f"{base_slug}-{attempt}"
 
+            app_dir = os.path.join(_apps_dir, slug)
             app = App(
                 id=app_id,
                 user_id=user_id,
@@ -1302,7 +1303,7 @@ class AppBuilderSkill(Skill):
                 blog.set_step("scaffolding")
                 await self._update_step(job_id, user_id, "scaffolding", "running")
                 await blog.info(f"Creating Expo project '{app_name}'...")
-                await self._app_manager.scaffold_app(app_id, app_name)
+                await self._app_manager.scaffold_app(app_id, app_name, slug=slug)
                 await blog.success("Expo project created")
                 await self._update_step(job_id, user_id, "scaffolding", "done")
             else:
@@ -1644,7 +1645,7 @@ class AppBuilderSkill(Skill):
             try:
                 await blog.info(f"Creating Expo project '{app_name}'...")
                 t0 = time.time()
-                await self._app_manager.scaffold_app(app_id, app_name)
+                await self._app_manager.scaffold_app(app_id, app_name, slug=slug)
                 elapsed = time.time() - t0
                 await blog.success(f"Expo project created", f"{elapsed:.1f}s")
                 await self._update_step(job_id, user_id, "scaffolding", "done")

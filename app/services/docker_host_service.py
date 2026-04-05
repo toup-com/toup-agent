@@ -235,9 +235,11 @@ async def provision_container(
         if code != 0:
             raise RuntimeError(f"Failed to write env: {err}")
 
-        # Create workspace and skills directories
+        # Create workspace structure and skills directory
         await _run_ssh(
-            f"mkdir -p /data/agents/{user_id[:8]}/workspace "
+            f"mkdir -p /data/agents/{user_id[:8]}/workspace/apps "
+            f"/data/agents/{user_id[:8]}/workspace/dashboard "
+            f"/data/agents/{user_id[:8]}/workspace/vibecoding "
             f"/data/agents/{user_id[:8]}/skills"
         )
 
