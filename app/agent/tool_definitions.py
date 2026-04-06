@@ -560,23 +560,24 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "play_media",
             "description": (
-                "Play a song or video for the user. Searches YouTube and streams it "
-                "directly in the user's browser — no navigation needed. "
-                "Pass the song/artist name or movie title as the query. "
-                "For Netflix content, pass channel='netflix' and the agent will use "
-                "the user's connected Netflix account via the browser agent."
+                "Play a song, video, movie, or TV show for the user. "
+                "For music/YouTube videos, searches YouTube and streams directly. "
+                "For movies/TV shows, automatically finds the best connected streaming "
+                "provider (Netflix, Prime Video, Disney+, Crave, etc.) using the content "
+                "catalog — no need to specify which provider. "
+                "You can optionally force a specific provider with the channel parameter."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Song name, artist, or video title to search for (e.g. 'Adele Hello', 'Dark Knight trailer').",
+                        "description": "Song name, artist, movie title, or TV show (e.g. 'Adele Hello', 'Oppenheimer', 'Stranger Things S4E1').",
                     },
                     "channel": {
                         "type": "string",
-                        "enum": ["youtube", "netflix"],
-                        "description": "Streaming channel to use. Default: youtube.",
+                        "enum": ["youtube", "netflix", "prime", "disney", "crave", "auto"],
+                        "description": "Streaming channel. Default: 'auto' (automatically picks best provider for movies/shows, YouTube for music).",
                     },
                 },
                 "required": ["query"],

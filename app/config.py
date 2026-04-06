@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     agent_workspace_dir: str = "/app/workspace"  # Working directory for file operations
     agent_port: int = 8001  # Host-facing port (set by managed container provisioning)
     brave_api_key: Optional[str] = None  # For web search
+    tmdb_api_key: Optional[str] = None  # For content routing (TMDB Watch Providers)
     skills_dir: str = "/app/skills"  # External skills directory
 
     # Workspace Bootstrap
@@ -280,7 +281,7 @@ class Settings(BaseSettings):
         "mistral_api_key", "groq_api_key", "xai_api_key", "deepseek_api_key",
         "telegram_bot_token", "discord_bot_token", "slack_bot_token",
         "slack_app_token", "brave_api_key", "elevenlabs_api_key",
-        "cohere_api_key", "agent_api_key", "toup_token",
+        "cohere_api_key", "agent_api_key", "toup_token", "tmdb_api_key",
     }
 
     @model_validator(mode="after")

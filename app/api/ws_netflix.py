@@ -25,6 +25,8 @@ class StartStreamRequest(BaseModel):
     email: str
     password: str
     profile: str = ""
+    user_id: str = ""
+    provider: str = "netflix"
 
 
 class StartStreamResponse(BaseModel):
@@ -56,7 +58,8 @@ async def start_stream(
             netflix_url=body.netflix_url,
             email=body.email,
             password=body.password,
-            profile=body.profile,
+            user_id=body.user_id or settings.user_id,
+            provider=body.provider,
         )
     except Exception as e:
         logger.exception("[NF-STREAM] Failed to start")

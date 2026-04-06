@@ -2300,13 +2300,22 @@ class ToolExecutor:
         import json as _json
 
         query = (inp.get("query") or "").strip()
-        channel = (inp.get("channel") or "youtube").strip().lower()
+        channel = (inp.get("channel") or "auto").strip().lower()
 
         if not query:
             return "ERROR: Provide a song/video name. Example: play_media(query='Adele Hello')"
 
-        if channel == "netflix":
-            return await self._play_netflix(query)
+        # Auto-routing: for movies/TV, find the best provider
+        if channel == "auto":
+            routed = await self._auto_route_content(query)
+            if routed is not None:
+                return routed
+            # Fallback to YouTube if content router didn't handle it (music, videos, etc.)
+            channel = "youtube"
+
+        # Explicit streaming provider
+        if channel in ("netflix", "prime", "disney", "crave", "hbo_max", "hulu", "apple_tv", "paramount"):
+            return await self._play_streaming(query, channel)
 
         # ── YouTube search (same 3-tier strategy as browser agent) ──
         video_id = None
@@ -2431,8 +2440,82 @@ class ToolExecutor:
 
         return f"Now playing \"{video_title}\"\n{yt_url}"
 
-    async def _play_netflix(self, query: str) -> str:
-        """Find Netflix content and auto-open it in user's browser."""
+    async def _auto_route_content(self, query: str) -> Optional[str]:
+        """Use TMDB content router to find the best provider. Returns None to fall through to YouTube."""
+        import re as _re
+
+        user_id = self._current_user_id
+        if not user_id:
+            return None
+
+        # Clean query of streaming keywords
+        clean_query = _re.sub(
+            r'(?:season|episode?|from \w+|on \w+|play me|play|watch|S\d+E?\d*)\s*\d*',
+            '', query, flags=_re.IGNORECASE
+        ).strip()
+        clean_query = _re.sub(r'\s+', ' ', clean_query).strip()
+        if not clean_query:
+            return None
+
+        try:
+            from app.config import settings as _settings
+            tmdb_key = getattr(_settings, 'tmdb_api_key', '') or ''
+            if not tmdb_key:
+                # No TMDB key — can't route, fall through
+                return None
+
+            from app.services.content_router import ContentRouter
+
+            router = ContentRouter(tmdb_api_key=tmdb_key, region="CA")
+
+            # Get user's connected channels
+            connected = await self._get_connected_channels(user_id)
+            if not connected:
+                return None  # No streaming accounts connected, fall through to YouTube
+
+            match = await router.resolve(clean_query, connected)
+            if not match:
+                return None  # Not found on TMDB, probably music → YouTube
+
+            if match.provider:
+                # Found on a connected provider — play it
+                return await self._play_streaming(query, match.provider)
+
+            if match.all_providers:
+                # Available but not on any connected provider
+                msg = await router.get_available_text(match, connected)
+                return msg
+
+            return None  # No streaming info found, fall through to YouTube
+
+        except Exception as e:
+            logger.warning("[auto_route] Error: %s", e)
+            return None  # Fall through to YouTube on any error
+
+    async def _get_connected_channels(self, user_id: str) -> list:
+        """Fetch user's connected streaming channels from the platform."""
+        import httpx
+        from app.config import settings as _settings
+
+        platform_url = getattr(_settings, 'platform_api_url', 'https://toup.ai/api')
+        agent_key = getattr(_settings, 'agent_api_key', '')
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(
+                    f"{platform_url}/streaming/credentials/internal",
+                    params={"user_id": user_id},
+                    headers={"X-Agent-Key": agent_key},
+                )
+                if r.status_code == 200:
+                    creds = r.json()
+                    return [cr.get("channel") for cr in creds if cr.get("has_password")]
+        except Exception as e:
+            logger.warning("[get_connected_channels] Failed: %s", e)
+        return []
+
+    async def _play_streaming(self, query: str, channel: str) -> str:
+        """Play content on a specific streaming provider (Netflix, Prime, Disney+, etc.)."""
         import re as _re
         import httpx
         from urllib.parse import quote
@@ -2440,6 +2523,12 @@ class ToolExecutor:
         user_id = self._current_user_id
         if not user_id:
             return "ERROR: No user context"
+
+        PROVIDER_DISPLAY = {
+            "netflix": "Netflix", "prime": "Prime Video", "disney": "Disney+",
+            "crave": "Crave", "hbo_max": "Max", "hulu": "Hulu",
+            "apple_tv": "Apple TV+", "paramount": "Paramount+", "peacock": "Peacock",
+        }
 
         try:
             # Parse season/episode
@@ -2454,7 +2543,7 @@ class ToolExecutor:
 
             # Clean query
             clean_query = _re.sub(
-                r'(?:season|episode?|from netflix|netflix|on netflix|play me|play|S\d+E?\d*)\s*\d*',
+                r'(?:season|episode?|from \w+|on \w+|play me|play|watch|S\d+E?\d*)\s*\d*',
                 '', query, flags=_re.IGNORECASE
             ).strip()
             clean_query = _re.sub(r'\s+', ' ', clean_query).strip()
@@ -2465,49 +2554,64 @@ class ToolExecutor:
             elif season_num:
                 episode_info = f" — Season {season_num}"
 
-            # Search Netflix via platform (Google → DuckDuckGo fallback)
-            from app.config import settings as _settings
-            platform_url = getattr(_settings, 'platform_api_url', 'https://toup.ai/api')
-            agent_key = getattr(_settings, 'agent_api_key', '')
-
-            netflix_id = None
+            display_name = PROVIDER_DISPLAY.get(channel, channel.title())
             title = clean_query
 
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.get(
-                    f"{platform_url}/streaming/netflix-search",
-                    params={"q": clean_query},
-                    headers={"X-Agent-Key": agent_key},
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    netflix_id = data.get("netflix_id")
-                    title = data.get("title") or clean_query
+            # For Netflix, try to get a specific title ID via search
+            content_url = None
+            content_id = None
+            if channel == "netflix":
+                from app.config import settings as _settings
+                platform_url = getattr(_settings, 'platform_api_url', 'https://toup.ai/api')
+                agent_key = getattr(_settings, 'agent_api_key', '')
 
-            # Build URL
-            if netflix_id:
-                netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
-            else:
-                netflix_url = f"https://www.netflix.com/search?q={quote(clean_query)}"
+                async with httpx.AsyncClient(timeout=15) as c:
+                    r = await c.get(
+                        f"{platform_url}/streaming/netflix-search",
+                        params={"q": clean_query},
+                        headers={"X-Agent-Key": agent_key},
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        content_id = data.get("netflix_id")
+                        title = data.get("title") or clean_query
 
-            # Auto-open in user's browser + show card in chat
+                if content_id:
+                    content_url = f"https://www.netflix.com/watch/{content_id}"
+                else:
+                    content_url = f"https://www.netflix.com/search?q={quote(clean_query)}"
+
+            # Broadcast to user's browser
             from app.api.ws_chat import broadcast_to_user
-            await broadcast_to_user(user_id, {
-                "type": "netflix_card",
+            event = {
+                "type": "streaming_card",
+                "provider": channel,
+                "provider_name": display_name,
                 "title": f"{title}{episode_info}",
-                "netflix_id": netflix_id or "",
-                "url": netflix_url,
+                "content_id": content_id or "",
+                "url": content_url or "",
                 "media_type": "tv" if season_num else "movie",
-            })
+                "query": clean_query,
+            }
+            # Backward compat: also send netflix_card for Netflix
+            if channel == "netflix":
+                event["type"] = "netflix_card"
+                event["netflix_id"] = content_id or ""
 
-            if netflix_id:
-                self._last_media = {"type": "netflix", "title": f"{title}{episode_info}", "netflix_id": netflix_id, "url": netflix_url}
-                return f"Now playing \"{title}\"{episode_info} on Netflix.\n{netflix_url}"
+            await broadcast_to_user(user_id, event)
+
+            self._last_media = {
+                "type": channel, "title": f"{title}{episode_info}",
+                "provider": channel, "url": content_url or "",
+            }
+
+            if content_url and content_id:
+                return f'Now playing "{title}"{episode_info} on {display_name}.\n{content_url}'
             else:
-                return f"Opening Netflix search for \"{clean_query}\". The show should appear as the first result."
+                return f'Opening {display_name} for "{clean_query}"{episode_info}. The content should appear as the first result.'
 
         except Exception as e:
-            logger.warning("[play_netflix] Error: %s", e)
+            logger.warning("[play_streaming:%s] Error: %s", channel, e)
             return f"ERROR: {e}"
 
     # ------------------------------------------------------------------

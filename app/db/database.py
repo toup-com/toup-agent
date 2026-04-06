@@ -164,6 +164,9 @@ async def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
         # Rich content metadata on messages (media cards, etc.)
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS metadata_json TEXT",
+        # Streaming session persistence
+        "ALTER TABLE streaming_credentials ADD COLUMN IF NOT EXISTS session_status VARCHAR(20) DEFAULT 'cold'",
+        "ALTER TABLE streaming_credentials ADD COLUMN IF NOT EXISTS session_checked_at TIMESTAMP",
     ]
 
     # Vector dimension migration: if embedding_dimension changed (e.g. 1536 → 384),
