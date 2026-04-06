@@ -283,3 +283,64 @@ async def netflix_search(
 
     _log.info(f"[netflix-search] q='{q}' → id={netflix_id}, title='{title}'")
     return {"netflix_id": netflix_id, "title": title}
+
+
+@router.get("/content-resolve")
+async def content_resolve(
+    q: str = Query(..., description="Movie or show title"),
+    user_id: str = Query(...),
+    region: str = Query("CA"),
+    x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve a content query to the best available streaming provider.
+    Uses TMDB Watch Providers (system-level API key) + user's connected channels.
+    Called by agents — no per-user TMDB key needed."""
+    if not x_agent_key:
+        raise HTTPException(status_code=401, detail="X-Agent-Key required")
+
+    from app.db.models import AgentConfig, StreamingCredential
+    from app.config import settings
+
+    # Verify agent key
+    cfg = await db.execute(
+        select(AgentConfig).where(
+            and_(AgentConfig.user_id == user_id, AgentConfig.agent_api_key == x_agent_key)
+        )
+    )
+    if not cfg.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Invalid agent key")
+
+    # Get TMDB key from platform config
+    tmdb_key = settings.tmdb_api_key or ""
+    if not tmdb_key:
+        raise HTTPException(status_code=503, detail="TMDB API key not configured on platform")
+
+    # Get user's connected channels
+    result = await db.execute(
+        select(StreamingCredential).where(StreamingCredential.user_id == user_id)
+    )
+    creds = result.scalars().all()
+    connected = [c.channel for c in creds if c.password]
+
+    # Route content
+    from app.services.content_router import ContentRouter
+
+    router_svc = ContentRouter(tmdb_api_key=tmdb_key, region=region)
+    match = await router_svc.resolve(q, connected)
+
+    if not match:
+        return {"found": False, "title": q, "provider": None, "all_providers": [], "connected": connected}
+
+    return {
+        "found": True,
+        "title": match.title,
+        "tmdb_id": match.tmdb_id,
+        "media_type": match.media_type,
+        "year": match.year,
+        "provider": match.provider,
+        "provider_name": match.provider_name,
+        "all_providers": match.all_providers,
+        "connected": connected,
+        "poster_path": f"https://image.tmdb.org/t/p/w500{match.poster_path}" if match.poster_path else None,
+    }

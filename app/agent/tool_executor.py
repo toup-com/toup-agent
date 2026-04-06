@@ -2441,8 +2441,10 @@ class ToolExecutor:
         return f"Now playing \"{video_title}\"\n{yt_url}"
 
     async def _auto_route_content(self, query: str) -> Optional[str]:
-        """Use TMDB content router to find the best provider. Returns None to fall through to YouTube."""
+        """Call platform's content-resolve endpoint to find the best provider.
+        Returns None to fall through to YouTube (music, videos, etc.)."""
         import re as _re
+        import httpx
 
         user_id = self._current_user_id
         if not user_id:
@@ -2459,34 +2461,47 @@ class ToolExecutor:
 
         try:
             from app.config import settings as _settings
-            tmdb_key = getattr(_settings, 'tmdb_api_key', '') or ''
-            if not tmdb_key:
-                # No TMDB key — can't route, fall through
-                return None
+            platform_url = getattr(_settings, 'platform_api_url', 'https://toup.ai/api')
+            agent_key = getattr(_settings, 'agent_api_key', '')
 
-            from app.services.content_router import ContentRouter
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(
+                    f"{platform_url}/streaming/content-resolve",
+                    params={"q": clean_query, "user_id": user_id, "region": "CA"},
+                    headers={"X-Agent-Key": agent_key},
+                )
+                if r.status_code != 200:
+                    return None  # Platform doesn't have TMDB configured, fall through
 
-            router = ContentRouter(tmdb_api_key=tmdb_key, region="CA")
+                data = r.json()
 
-            # Get user's connected channels
-            connected = await self._get_connected_channels(user_id)
+            if not data.get("found"):
+                return None  # Not a movie/show on TMDB, probably music → YouTube
+
+            connected = data.get("connected", [])
             if not connected:
-                return None  # No streaming accounts connected, fall through to YouTube
+                return None  # No streaming accounts, fall through to YouTube
 
-            match = await router.resolve(clean_query, connected)
-            if not match:
-                return None  # Not found on TMDB, probably music → YouTube
-
-            if match.provider:
+            if data.get("provider"):
                 # Found on a connected provider — play it
-                return await self._play_streaming(query, match.provider)
+                return await self._play_streaming(query, data["provider"])
 
-            if match.all_providers:
+            if data.get("all_providers"):
                 # Available but not on any connected provider
-                msg = await router.get_available_text(match, connected)
-                return msg
+                title = data.get("title", clean_query)
+                provider_names = {
+                    "netflix": "Netflix", "prime": "Prime Video", "disney": "Disney+",
+                    "crave": "Crave", "hbo_max": "Max", "hulu": "Hulu",
+                    "apple_tv": "Apple TV+", "paramount": "Paramount+", "peacock": "Peacock",
+                }
+                available = [provider_names.get(p, p.title()) for p in data["all_providers"]]
+                return (
+                    f'"{title}" is available on: {", ".join(available)}. '
+                    f"You don't have any of these connected. "
+                    f"Connect one in Movies settings to watch."
+                )
 
-            return None  # No streaming info found, fall through to YouTube
+            return None  # No streaming info, fall through to YouTube
 
         except Exception as e:
             logger.warning("[auto_route] Error: %s", e)
