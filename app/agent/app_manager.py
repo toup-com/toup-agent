@@ -48,6 +48,33 @@ class AppManager:
         self._public_ip: Optional[str] = None
         os.makedirs(APPS_DIR, exist_ok=True)
 
+    async def _resolve_app_dir(self, app_id: str, app_dir: Optional[str] = None) -> str:
+        """Resolve the canonical app directory for a given app.
+
+        If app_dir is provided and exists, use it directly.
+        Otherwise, look up app.app_dir from the database.
+        Never recompute from APPS_DIR + app_id — that was the root cause of
+        the slug-vs-UUID directory mismatch bug.
+        """
+        if app_dir and os.path.exists(app_dir):
+            return app_dir
+        # DB lookup
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import App
+            async with async_session_maker() as db:
+                app = await db.get(App, app_id)
+                if app and app.app_dir and os.path.exists(app.app_dir):
+                    return app.app_dir
+        except Exception:
+            pass
+        # Last resort: try both slug-based and UUID-based paths
+        uuid_dir = os.path.join(APPS_DIR, app_id)
+        if os.path.exists(uuid_dir):
+            return uuid_dir
+        logger.error(f"[APP] Cannot resolve app_dir for {app_id} (tried {app_dir}, DB lookup, {uuid_dir})")
+        return uuid_dir  # return it anyway so callers get a clear error
+
     # ── Public IP ───────────────────────────────────────
 
     async def _get_public_ip(self) -> str:
@@ -108,9 +135,10 @@ class AppManager:
         logger.info(f"[APP] Scaffolded {app_name} at {app_dir}")
         return app_dir
 
-    async def write_app_files(self, app_id: str, files: Dict[str, str]) -> None:
+    async def write_app_files(self, app_id: str, files: Dict[str, str], app_dir: Optional[str] = None) -> None:
         """Write files dict to app directory on disk."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
+        assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
         for file_path, content in files.items():
             # Normalize path
             rel_path = file_path.lstrip("/")
@@ -120,9 +148,10 @@ class AppManager:
                 f.write(content)
         logger.info(f"[APP] Wrote {len(files)} files to {app_dir}")
 
-    async def install_deps(self, app_id: str, deps: Optional[List[str]] = None) -> str:
+    async def install_deps(self, app_id: str, deps: Optional[List[str]] = None, app_dir: Optional[str] = None) -> str:
         """Run npm install in app dir. Returns output."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
+        assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
 
         # Base install
         cmd = ["npm", "install"]
@@ -149,9 +178,10 @@ class AppManager:
         logger.info(f"[APP] Installed deps for {app_id}")
         return output[:2000]
 
-    async def start_metro(self, app_id: str) -> int:
+    async def start_metro(self, app_id: str, app_dir: Optional[str] = None) -> int:
         """Start Metro bundler for mobile preview. Returns allocated port."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
+        assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
         port = self._allocate_port(METRO_PORT_RANGE, self._used_metro_ports)
 
         managed = self._running.get(app_id)
@@ -186,9 +216,10 @@ class AppManager:
         logger.info(f"[APP] Metro started for {app_id} on port {port}")
         return port
 
-    async def start_web(self, app_id: str) -> int:
+    async def start_web(self, app_id: str, app_dir: Optional[str] = None) -> int:
         """Start Expo web server. Returns allocated port."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
+        assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
         port = self._allocate_port(WEB_PORT_RANGE, self._used_web_ports)
 
         managed = self._running.get(app_id)
@@ -266,11 +297,11 @@ class AppManager:
         logger.info(f"[APP] Stopped {app_id}")
         return stopped
 
-    async def restart_app(self, app_id: str) -> Dict[str, Any]:
+    async def restart_app(self, app_id: str, app_dir: Optional[str] = None) -> Dict[str, Any]:
         """Restart both Metro and web servers."""
         await self.stop_app(app_id)
-        metro_port = await self.start_metro(app_id)
-        web_port = await self.start_web(app_id)
+        metro_port = await self.start_metro(app_id, app_dir=app_dir)
+        web_port = await self.start_web(app_id, app_dir=app_dir)
         return {"metro_port": metro_port, "web_port": web_port}
 
     async def get_logs(self, app_id: str, lines: int = 50) -> List[str]:
@@ -312,9 +343,10 @@ class AppManager:
 
     # ── Database & Storage ──────────────────────────────
 
-    async def setup_database(self, app_id: str, db_type: str = "sqlite") -> str:
+    async def setup_database(self, app_id: str, db_type: str = "sqlite", app_dir: Optional[str] = None) -> str:
         """Set up database for the app. Returns db path/url."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
+        assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
 
         if db_type == "sqlite":
             # Create data directory and db file
@@ -382,18 +414,19 @@ export default supabase;
 
         return ""
 
-    async def setup_storage(self, app_id: str) -> str:
+    async def setup_storage(self, app_id: str, app_dir: Optional[str] = None) -> str:
         """Create storage directory for the app."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
         storage_dir = os.path.join(app_dir, "storage")
         os.makedirs(storage_dir, exist_ok=True)
         return storage_dir
 
     # ── GitHub ──────────────────────────────────────────
 
-    async def create_github_repo(self, app_id: str, app_name: str) -> Dict[str, str]:
+    async def create_github_repo(self, app_id: str, app_name: str, app_dir: Optional[str] = None) -> Dict[str, str]:
         """Create a private GitHub repo and init git in app dir."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
+        assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
         safe_name = re.sub(r"[^a-zA-Z0-9-]", "-", app_name.lower()).strip("-")[:40] or "app"
 
         # Init git
@@ -427,9 +460,9 @@ export default supabase;
             logger.warning(f"[APP] GitHub repo creation failed (gh CLI may not be configured): {e}")
             return {"repo_name": "", "repo_url": "", "error": str(e)}
 
-    async def push_to_github(self, app_id: str) -> str:
+    async def push_to_github(self, app_id: str, app_dir: Optional[str] = None) -> str:
         """Commit and push changes to GitHub."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
         await self._run_cmd(["git", "add", "."], cwd=app_dir)
         await self._run_cmd(
             ["git", "commit", "-m", f"Update app ({time.strftime('%Y-%m-%d %H:%M')})"],
@@ -442,9 +475,9 @@ export default supabase;
 
     # ── Publishing ──────────────────────────────────────
 
-    async def publish_web(self, app_id: str, domain: Optional[str] = None) -> str:
+    async def publish_web(self, app_id: str, domain: Optional[str] = None, app_dir: Optional[str] = None) -> str:
         """Export web build and serve. Returns URL."""
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
 
         # Export static web build
         await self._run_cmd(
@@ -510,8 +543,8 @@ export default supabase;
 
                     if app_row.status == "running":
                         try:
-                            metro_port = await self.start_metro(app_row.id)
-                            web_port = await self.start_web(app_row.id)
+                            metro_port = await self.start_metro(app_row.id, app_dir=app_dir)
+                            web_port = await self.start_web(app_row.id, app_dir=app_dir)
                             app_row.port = metro_port
                             app_row.web_port = web_port
                             managed = self._running.get(app_row.id)
@@ -592,10 +625,10 @@ export default supabase;
             logger.warning(f"[APP] Command failed: {' '.join(cmd)} → {err[:500]}")
         return output
 
-    async def delete_app(self, app_id: str) -> bool:
+    async def delete_app(self, app_id: str, app_dir: Optional[str] = None) -> bool:
         """Stop app and delete its directory."""
         await self.stop_app(app_id)
-        app_dir = os.path.join(APPS_DIR, app_id)
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
         if os.path.exists(app_dir):
             shutil.rmtree(app_dir)
             logger.info(f"[APP] Deleted {app_dir}")

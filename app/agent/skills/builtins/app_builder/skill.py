@@ -1274,6 +1274,7 @@ class AppBuilderSkill(Skill):
         blog = BuildLogger(job_id, user_id, ws_broadcast=self._ws_broadcast)
         blog.set_step("resume")
         await blog.info(f"Resuming build for '{name}' from step: {current_step}")
+        await blog.info(f"app_dir={app_dir} slug={slug}")
         await blog.info(f"Completed steps: {', '.join(completed_steps) if completed_steps else 'none'}")
 
         try:
@@ -1332,8 +1333,8 @@ class AppBuilderSkill(Skill):
                 else:
                     generated_files = existing_generated
 
-                await self._app_manager.write_app_files(app_id, generated_files)
-                await self._write_infra_files(app_id, generated_files, blog)
+                await self._app_manager.write_app_files(app_id, generated_files, app_dir=app_dir)
+                await self._write_infra_files(app_id, generated_files, blog, app_dir=app_dir)
 
                 async with async_session_maker() as db:
                     app = await db.get(App, app_id)
@@ -1355,8 +1356,8 @@ class AppBuilderSkill(Skill):
                 if needs_db and db_type != "none":
                     await self._update_step(job_id, user_id, "database", "running")
                     try:
-                        db_url = await self._app_manager.setup_database(app_id, db_type)
-                        storage_dir = await self._app_manager.setup_storage(app_id)
+                        db_url = await self._app_manager.setup_database(app_id, db_type, app_dir=app_dir)
+                        storage_dir = await self._app_manager.setup_storage(app_id, app_dir=app_dir)
                         async with async_session_maker() as db:
                             app = await db.get(App, app_id)
                             if app:
@@ -1381,7 +1382,7 @@ class AppBuilderSkill(Skill):
                 web_deps = ["react-dom", "react-native-web"]
                 all_deps = list(set((deps or []) + web_deps))
                 await blog.info(f"Installing {len(all_deps)} packages...")
-                await self._app_manager.install_deps(app_id, all_deps)
+                await self._app_manager.install_deps(app_id, all_deps, app_dir=app_dir)
                 await blog.success("Dependencies installed")
                 await self._update_step(job_id, user_id, "installing", "done")
             else:
@@ -1392,7 +1393,7 @@ class AppBuilderSkill(Skill):
                 blog.set_step("github")
                 await self._update_step(job_id, user_id, "github", "running")
                 try:
-                    repo_info = await self._app_manager.create_github_repo(app_id, app_name)
+                    repo_info = await self._app_manager.create_github_repo(app_id, app_name, app_dir=app_dir)
                     github_url = repo_info.get("repo_url", "")
                     async with async_session_maker() as db:
                         app = await db.get(App, app_id)
@@ -1417,9 +1418,9 @@ class AppBuilderSkill(Skill):
             await self._verify_deps_installed(app_dir, generated_files, deps, blog)
 
             # Start servers
-            metro_port = await self._app_manager.start_metro(app_id)
+            metro_port = await self._app_manager.start_metro(app_id, app_dir=app_dir)
             await blog.success(f"Metro running on port {metro_port}")
-            web_port = await self._app_manager.start_web(app_id)
+            web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
             await blog.success(f"Web server running on port {web_port}")
 
             # Bundle validation (simplified — same as _build_app step 7c)
@@ -1450,7 +1451,7 @@ class AppBuilderSkill(Skill):
                         fixed = True
                 if not fixed and not web_alive:
                     try:
-                        web_port = await self._app_manager.start_web(app_id)
+                        web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                         await asyncio.sleep(5)
                     except Exception:
                         pass
@@ -1460,7 +1461,7 @@ class AppBuilderSkill(Skill):
                     await asyncio.sleep(4)
                 else:
                     try:
-                        web_port = await self._app_manager.start_web(app_id)
+                        web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                     except Exception:
                         pass
 
@@ -1571,6 +1572,7 @@ class AppBuilderSkill(Skill):
         blog.set_model(settings.agent_model or "claude-opus-4-6")
         blog.set_step("init")
         await blog.info(f"Starting build for '{name}'", f"app={app_id}")
+        await blog.info(f"app_dir={app_dir} slug={slug}")
         await blog.info(f"User prompt: {description[:200]}{'...' if len(description) > 200 else ''}")
 
         # Build extra context from the conversational plan
@@ -1676,10 +1678,10 @@ class AppBuilderSkill(Skill):
                     job_id=job_id, user_id=user_id, blog=blog,
                     design_notes=design_notes,
                 )
-                await self._app_manager.write_app_files(app_id, generated_files)
+                await self._app_manager.write_app_files(app_id, generated_files, app_dir=app_dir)
 
                 # Write essential infrastructure files (metro config, web-safe DB)
-                await self._write_infra_files(app_id, generated_files, blog)
+                await self._write_infra_files(app_id, generated_files, blog, app_dir=app_dir)
 
                 total_bytes = sum(len(c.encode()) for c in generated_files.values())
                 await blog.success(f"Generated {len(generated_files)} files", f"{total_bytes:,} bytes total")
@@ -1706,7 +1708,7 @@ class AppBuilderSkill(Skill):
                 pending = getattr(e, 'pending_files', files_to_generate)
                 if partial:
                     # Write partial files to disk so they survive pause
-                    await self._app_manager.write_app_files(app_id, partial)
+                    await self._app_manager.write_app_files(app_id, partial, app_dir=app_dir)
                     async with async_session_maker() as db:
                         app = await db.get(App, app_id)
                         if app:
@@ -1734,8 +1736,8 @@ class AppBuilderSkill(Skill):
                 await self._update_step(job_id, user_id, "database", "running")
                 try:
                     await blog.info(f"Setting up {db_type} database...")
-                    db_url = await self._app_manager.setup_database(app_id, db_type)
-                    storage_dir = await self._app_manager.setup_storage(app_id)
+                    db_url = await self._app_manager.setup_database(app_id, db_type, app_dir=app_dir)
+                    storage_dir = await self._app_manager.setup_storage(app_id, app_dir=app_dir)
                     async with async_session_maker() as db:
                         app = await db.get(App, app_id)
                         if app:
@@ -1766,7 +1768,7 @@ class AppBuilderSkill(Skill):
                 for dep in sorted(all_deps):
                     await blog.debug(f"  {dep}")
                 t0 = time.time()
-                install_output = await self._app_manager.install_deps(app_id, all_deps)
+                install_output = await self._app_manager.install_deps(app_id, all_deps, app_dir=app_dir)
                 elapsed = time.time() - t0
                 await blog.command_run(f"npm install {' '.join(all_deps[:5])}{'...' if len(all_deps) > 5 else ''}",
                                        exit_code=0, duration_s=elapsed, output=install_output[:300] if install_output else "")
@@ -1786,7 +1788,7 @@ class AppBuilderSkill(Skill):
             await self._update_step(job_id, user_id, "github", "running")
             try:
                 await blog.info("Creating GitHub repository...")
-                repo_info = await self._app_manager.create_github_repo(app_id, app_name)
+                repo_info = await self._app_manager.create_github_repo(app_id, app_name, app_dir=app_dir)
                 github_url = repo_info.get("repo_url", "")
                 github_repo = repo_info.get("repo_name", "")
                 async with async_session_maker() as db:
@@ -1809,6 +1811,7 @@ class AppBuilderSkill(Skill):
             # ── Step 7: Starting servers + full auto-repair ─────────
             blog.set_step("starting")
             await self._update_step(job_id, user_id, "starting", "running")
+            logger.info(f"[BUILD] step=starting app_id={app_id} app_dir={app_dir}")
             qr_url = ""
             web_url = ""
             try:
@@ -1818,11 +1821,11 @@ class AppBuilderSkill(Skill):
 
                 # ── 7b: Start servers
                 await blog.info("Starting Metro bundler (mobile)...")
-                metro_port = await self._app_manager.start_metro(app_id)
+                metro_port = await self._app_manager.start_metro(app_id, app_dir=app_dir)
                 await blog.success(f"Metro running on port {metro_port}")
 
                 await blog.info("Starting Expo Web server...")
-                web_port = await self._app_manager.start_web(app_id)
+                web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                 await blog.success(f"Web server running on port {web_port}")
 
                 # ── 7c: Bundle validation + comprehensive auto-repair (up to 4 rounds) ──
@@ -1880,7 +1883,7 @@ class AppBuilderSkill(Skill):
                         if not fixed_something and not web_alive:
                             await blog.info("No actionable errors — restarting web server...")
                             try:
-                                web_port = await self._app_manager.start_web(app_id)
+                                web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                                 await blog.info(f"Web server restarted on port {web_port}")
                                 await asyncio.sleep(5)
                                 fixed_something = True
@@ -1897,7 +1900,7 @@ class AppBuilderSkill(Skill):
                         else:
                             await blog.info("Restarting web server after repairs...")
                             try:
-                                web_port = await self._app_manager.start_web(app_id)
+                                web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                                 await blog.info(f"Web server restarted on port {web_port}")
                             except Exception as restart_err:
                                 await blog.warn(f"Web server restart failed: {restart_err}")
@@ -1918,7 +1921,7 @@ class AppBuilderSkill(Skill):
                                 await blog.success("Static export succeeded — app code is valid")
                                 # Restart web server one final time — code compiles, server was the issue
                                 try:
-                                    web_port = await self._app_manager.start_web(app_id)
+                                    web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                                     await self._wait_for_server(web_port, timeout=20)
                                     bundle_ok = True
                                     await blog.success(f"Web server running on port {web_port} after static export verification")
@@ -2054,6 +2057,7 @@ class AppBuilderSkill(Skill):
         blog = BuildLogger(job_id, user_id, ws_broadcast=self._ws_broadcast)
         blog.set_step("init")
         await blog.info(f"Modifying '{app_name}'", f"app={app_id}")
+        await blog.info(f"app_dir={app_dir} slug={slug}")
         await blog.info(f"Changes: {changes[:200]}{'...' if len(changes) > 200 else ''}")
 
         try:
@@ -2140,7 +2144,7 @@ class AppBuilderSkill(Skill):
             )
 
             # Write files to disk
-            await self._app_manager.write_app_files(app_id, generated)
+            await self._app_manager.write_app_files(app_id, generated, app_dir=app_dir)
             await blog.success(f"Updated {len(generated)} files")
             await self._update_step(job_id, user_id, "writing", "done",
                                     detail=f"Updated {len(generated)} files")
@@ -2152,7 +2156,7 @@ class AppBuilderSkill(Skill):
             if new_deps:
                 await blog.info(f"Installing {len(new_deps)} new dependencies: {', '.join(new_deps)}")
                 try:
-                    await self._app_manager.install_deps(app_id, new_deps)
+                    await self._app_manager.install_deps(app_id, new_deps, app_dir=app_dir)
                     await blog.success(f"Installed {len(new_deps)} new deps")
                 except Exception as e:
                     await blog.warn(f"Dep install failed (non-fatal): {e}")
@@ -2166,8 +2170,8 @@ class AppBuilderSkill(Skill):
             await self._update_step(job_id, user_id, "starting", "running")
             try:
                 await self._app_manager.stop_app(app_id)
-                metro_port = await self._app_manager.start_metro(app_id)
-                web_port = await self._app_manager.start_web(app_id)
+                metro_port = await self._app_manager.start_metro(app_id, app_dir=app_dir)
+                web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                 await blog.success(f"Servers restarted — Metro:{metro_port} Web:{web_port}")
 
                 async with async_session_maker() as db:
@@ -2230,7 +2234,7 @@ class AppBuilderSkill(Skill):
                         # No errors found — restart server
                         if not fixed_something and not web_alive:
                             try:
-                                web_port = await self._app_manager.start_web(app_id)
+                                web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                                 await asyncio.sleep(5)
                                 fixed_something = True
                             except Exception:
@@ -2243,7 +2247,7 @@ class AppBuilderSkill(Skill):
                             await asyncio.sleep(4)
                         else:
                             try:
-                                web_port = await self._app_manager.start_web(app_id)
+                                web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                             except Exception:
                                 pass
 
@@ -2525,7 +2529,7 @@ class AppBuilderSkill(Skill):
             raise err
         return generated
 
-    async def _write_infra_files(self, app_id: str, generated_files: dict, blog=None):
+    async def _write_infra_files(self, app_id: str, generated_files: dict, blog=None, app_dir: str = ""):
         """Write essential infrastructure files that every app needs.
 
         1. metro.config.js — stubs out expo-sqlite WASM on web (prevents crash)
@@ -2759,7 +2763,7 @@ const styles = StyleSheet.create({
         self._fix_common_llm_mistakes(generated_files, infra_files, blog)
 
         if infra_files:
-            await self._app_manager.write_app_files(app_id, infra_files)
+            await self._app_manager.write_app_files(app_id, infra_files, app_dir=app_dir or None)
             if blog:
                 await blog.info(f"Wrote {len(infra_files)} infrastructure files (metro config, web-safe DB)")
 
@@ -3811,8 +3815,8 @@ const _webDb = {
 
         if repaired:
             # Apply infra fixes to repaired files
-            await self._write_infra_files(app_id, repaired, blog)
-            await self._app_manager.write_app_files(app_id, repaired)
+            await self._write_infra_files(app_id, repaired, blog, app_dir=app_dir)
+            await self._app_manager.write_app_files(app_id, repaired, app_dir=app_dir if app_dir else None)
             if blog:
                 await blog.success(f"Repaired {len(repaired)} files")
             return True
@@ -3869,10 +3873,11 @@ const _webDb = {
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                "npm", "install", "--save", *list(missing),
+                "npx", "expo", "install", *list(missing),
                 cwd=app_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env={**os.environ, "EXPO_NO_TELEMETRY": "1"},
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
             output = stdout.decode("utf-8", errors="replace") if stdout else ""
@@ -3882,15 +3887,15 @@ const _webDb = {
                 return True
             else:
                 if blog:
-                    await blog.warn(f"npm install failed (code {proc.returncode}): {output[:200]}")
+                    await blog.warn(f"npx expo install failed (code {proc.returncode}): {output[:200]}")
                 return False
         except asyncio.TimeoutError:
             if blog:
-                await blog.warn("npm install timed out (120s)")
+                await blog.warn("npx expo install timed out (120s)")
             return False
         except Exception as e:
             if blog:
-                await blog.warn(f"npm install failed: {e}")
+                await blog.warn(f"npx expo install failed: {e}")
             return False
 
     async def _verify_deps_installed(self, app_dir: str, generated_files: dict, deps: list, blog=None) -> bool:
@@ -3908,10 +3913,11 @@ const _webDb = {
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                "npm", "install", "--save", *new_deps,
+                "npx", "expo", "install", *new_deps,
                 cwd=app_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env={**os.environ, "EXPO_NO_TELEMETRY": "1"},
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
             if proc.returncode == 0:
