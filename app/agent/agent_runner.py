@@ -1608,18 +1608,25 @@ class AgentRunner:
                     logger.warning(f"Failed to read image {path}: {e}")
 
             elif ext in _DOC_EXTENSIONS:
+                fname = os.path.basename(path)
                 try:
                     with open(path, "rb") as f:
                         raw = f.read()
-                    extracted = self._extract_document_text(raw, os.path.basename(path), ext)
+                    extracted = self._extract_document_text(raw, fname, ext)
                     if extracted:
-                        fname = os.path.basename(path)
                         doc_texts.append(f"[Attached document: {fname}]\n{extracted}")
                         logger.info(f"[AGENT] Document extracted: {path} ({len(raw)} bytes, {len(extracted)} chars text)")
+                    else:
+                        doc_texts.append(f"[Attached document: {fname} — could not extract text (unsupported or empty)]")
+                        logger.warning(f"[AGENT] Document extraction returned empty for {path}")
                 except Exception as e:
+                    doc_texts.append(f"[Attached document: {fname} — extraction failed: {e}]")
                     logger.warning(f"Failed to extract document {path}: {e}")
             else:
-                logger.warning(f"[AGENT] Skipping unsupported media: {path} (mime={mime})")
+                # Unknown extension — still tell the agent a file was attached
+                fname = os.path.basename(path)
+                doc_texts.append(f"[Attached file: {fname} — unsupported format, contents not available]")
+                logger.warning(f"[AGENT] Unsupported media: {path} (mime={mime}, ext={ext})")
 
         # Combine user text with any extracted document content
         combined_text = text or ""

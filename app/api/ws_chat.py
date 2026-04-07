@@ -667,7 +667,7 @@ async def ws_chat(
                 _media_paths = []
                 _media_items = msg.get("media", [])
                 if _media_items and isinstance(_media_items, list):
-                    import tempfile, base64 as _b64
+                    import tempfile, base64 as _b64, os as _os
                     for _mi in _media_items[:5]:  # Max 5 attachments
                         try:
                             _mtype = _mi.get("type", "image/png")
@@ -678,7 +678,6 @@ async def ws_chat(
                             # Prefer extension from filename, fall back to MIME mapping
                             _ext = ""
                             if _mname:
-                                import os as _os
                                 _ext = _os.path.splitext(_mname.lower())[1]
                             if not _ext:
                                 _ext = {
@@ -689,10 +688,15 @@ async def ws_chat(
                                     "application/zip": ".zip",
                                     "application/x-zip-compressed": ".zip",
                                 }.get(_mtype, ".bin")
-                            _tf = tempfile.NamedTemporaryFile(delete=False, suffix=_ext)
-                            _tf.write(_b64.b64decode(_mdata))
-                            _tf.close()
-                            _media_paths.append(_tf.name)
+                            # Write to temp dir with original filename so agent runner sees the real name
+                            _tmpdir = tempfile.mkdtemp(prefix="toup_media_")
+                            _fname = _mname or f"attachment{_ext}"
+                            # Sanitize filename (keep only the basename, no path traversal)
+                            _fname = _os.path.basename(_fname)
+                            _fpath = _os.path.join(_tmpdir, _fname)
+                            with open(_fpath, "wb") as _wf:
+                                _wf.write(_b64.b64decode(_mdata))
+                            _media_paths.append(_fpath)
                         except Exception as _me:
                             logger.warning("[WS] Failed to process media attachment: %s", _me)
 
