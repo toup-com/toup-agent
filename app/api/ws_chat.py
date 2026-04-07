@@ -605,8 +605,35 @@ async def ws_chat(
                 # Terminal activity: show user message
                 _tprint(f"\n{_CYAN_BOLD} user {_RESET} {text}")
 
+                # ── Pre-save user message so it survives stream failures ──
+                try:
+                    from app.db.database import async_session_maker
+                    from app.db.models import Message as DbMessage, Conversation
+                    async with async_session_maker() as _presave_db:
+                        _presave_db.add(DbMessage(
+                            conversation_id=session_id,
+                            role="user",
+                            content=text,
+                        ))
+                        # Update conversation timestamp
+                        _conv = (await _presave_db.execute(
+                            __import__('sqlalchemy').select(Conversation).where(Conversation.id == session_id)
+                        )).scalar_one_or_none()
+                        if _conv:
+                            _conv.message_count = (_conv.message_count or 0) + 1
+                            _conv.updated_at = __import__('datetime').datetime.utcnow()
+                        await _presave_db.commit()
+                    _user_msg_presaved = True
+                except Exception as _pse:
+                    logger.warning(f"[WS] Failed to pre-save user message: {_pse}")
+                    _user_msg_presaved = False
+
+                # Accumulate streamed text for partial-save on error
+                _streamed_chunks: list = []
+
                 # Stream callbacks
                 async def on_text_chunk(chunk: str):
+                    _streamed_chunks.append(chunk)
                     try:
                         await websocket.send_json({"type": "text_chunk", "text": chunk})
                     except Exception:
@@ -720,7 +747,7 @@ async def ws_chat(
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
                     model_override=model,
-                    save_user_message=not is_onboarding_msg,
+                    save_user_message=not is_onboarding_msg and not _user_msg_presaved,
                     media_paths=_media_paths if _media_paths else None,
                 ))
 
@@ -842,6 +869,18 @@ async def ws_chat(
                         await stop_task
                     except (asyncio.CancelledError, Exception):
                         pass
+                    # Save partial response on user-stop so it's not lost
+                    _partial = "".join(_streamed_chunks).strip()
+                    if _partial:
+                        try:
+                            async with async_session_maker() as _err_db:
+                                _err_db.add(DbMessage(
+                                    conversation_id=session_id, role="assistant",
+                                    content=_partial + "\n\n*[Generation stopped by user]*",
+                                ))
+                                await _err_db.commit()
+                        except Exception:
+                            pass
                     await _safe_send({"type": "stopped", "message": "Generation stopped"})
                 except Exception as e:
                     stop_task.cancel()
@@ -851,6 +890,18 @@ async def ws_chat(
                         pass
                     logger.exception(f"[WS] Agent error for {user_id}")
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
+                    # Save partial response so it's not lost on refresh
+                    _partial = "".join(_streamed_chunks).strip()
+                    if _partial:
+                        try:
+                            async with async_session_maker() as _err_db:
+                                _err_db.add(DbMessage(
+                                    conversation_id=session_id, role="assistant",
+                                    content=_partial + "\n\n*[Response interrupted due to an error]*",
+                                ))
+                                await _err_db.commit()
+                        except Exception as _save_err:
+                            logger.warning(f"[WS] Failed to save partial response: {_save_err}")
                     # Show user-friendly error instead of raw exception
                     user_msg = _friendly_error(e)
                     await _safe_send({"type": "error", "message": user_msg})
