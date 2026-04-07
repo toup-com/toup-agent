@@ -2,7 +2,7 @@
 Apps & Build Jobs API — REST endpoints for managing user-built apps.
 
 Endpoints:
-  GET    /apps/                    - List all apps
+  GET    /apps/                    - List all apps (with lazy reconciliation)
   GET    /apps/{app_id}            - Get app details
   POST   /apps/{app_id}/start      - Start app (Metro + Web)
   POST   /apps/{app_id}/stop       - Stop app
@@ -17,6 +17,7 @@ Endpoints:
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +65,7 @@ class AppResponse(BaseModel):
     description: Optional[str] = None
     slug: str
     status: str
+    source: str = "app_builder"  # app_builder, vibecoding, filesystem_discovered
     port: Optional[int] = None
     web_port: Optional[int] = None
     qr_url: Optional[str] = None
@@ -118,6 +120,7 @@ async def _app_to_response(app: App) -> AppResponse:
         description=app.description,
         slug=app.slug,
         status=app.status,
+        source=getattr(app, 'source', None) or "app_builder",
         port=app.port,
         web_port=app.web_port,
         qr_url=qr_url,
@@ -165,13 +168,60 @@ def _job_to_response(job: BuildJob) -> JobResponse:
     )
 
 
+# ── Local reconciliation (agent VPS — direct filesystem access) ────
+
+async def _reconcile_local(user_id: str, db: AsyncSession):
+    """Run lazy reconciliation using the local filesystem (no SSH needed).
+
+    The agent runs on the same VPS as the app files, so we can use os.listdir.
+    """
+    from app.services.reconciliation_service import reconcile_apps, _last_reconcile, _LAZY_COOLDOWN_SECONDS
+    import time
+
+    # Quick cooldown check before importing/calling anything heavy
+    last = _last_reconcile.get(user_id, 0)
+    if time.time() - last < _LAZY_COOLDOWN_SECONDS:
+        return
+
+    from app.config import settings
+    from app.agent.app_manager import APPS_DIR
+
+    workspace = getattr(settings, 'agent_workspace_dir', None) or './workspace'
+
+    async def local_find(cmd: str) -> str:
+        """Simulate SSH find by listing local dirs."""
+        import asyncio
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        return stdout.decode().strip()
+
+    try:
+        await reconcile_apps(
+            user_id=user_id,
+            db=db,
+            ssh_cmd_fn=local_find,
+            trigger="lazy",
+            apps_dir=APPS_DIR,
+            workspace_dir=os.path.abspath(workspace),
+        )
+    except Exception as e:
+        logger.warning("[RECONCILE] Lazy reconciliation failed: %s", e)
+
+
 # ── App Endpoints ───────────────────────────────────────────────────
 
 @router.get("/")
 async def list_apps() -> List[AppResponse]:
-    """List all apps for the current user."""
+    """List all apps for the current user, with lazy reconciliation."""
     user_id = _get_user_id()
     async with async_session_maker() as db:
+        # Lazy reconciliation: scan filesystem for orphaned dirs / missing DB rows
+        await _reconcile_local(user_id, db)
+
         result = await db.execute(
             select(App).where(App.user_id == user_id).order_by(App.created_at.desc())
         )

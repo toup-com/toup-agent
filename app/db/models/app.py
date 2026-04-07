@@ -1,4 +1,4 @@
-"""App Builder models — user-built apps and build jobs."""
+"""App Builder models — user-built apps, build jobs, and reconciliation logs."""
 
 from datetime import datetime
 from typing import Optional
@@ -19,7 +19,8 @@ class App(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     slug: Mapped[str] = mapped_column(String(60), nullable=False, unique=True)
-    status: Mapped[str] = mapped_column(String(20), default="building")  # building, ready, running, stopped, error
+    status: Mapped[str] = mapped_column(String(20), default="building")  # building, ready, running, stopped, error, untracked, orphaned
+    source: Mapped[str] = mapped_column(String(30), default="app_builder")  # app_builder, vibecoding, filesystem_discovered
     port: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # Metro/mobile port 3001-3050
     web_port: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # Expo web port 4001-4050
     app_dir: Mapped[str] = mapped_column(Text, nullable=False)  # /opt/toup-agent/apps/{id}
@@ -62,3 +63,20 @@ class BuildJob(Base):
     layer2_changes_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array of Layer 2 changes
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class ReconciliationLog(Base):
+    """Audit log for workspace reconciliation passes."""
+    __tablename__ = "reconciliation_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    trigger: Mapped[str] = mapped_column(String(20), nullable=False)  # lazy, sweep, manual
+    dirs_scanned: Mapped[str] = mapped_column(Text, default="[]")  # JSON: directories scanned
+    dirs_on_disk: Mapped[str] = mapped_column(Text, default="[]")  # JSON: all dirs found on disk
+    dirs_in_db: Mapped[str] = mapped_column(Text, default="[]")  # JSON: all app_dirs in DB
+    created_apps: Mapped[str] = mapped_column(Text, default="[]")  # JSON: new App records created
+    orphaned_apps: Mapped[str] = mapped_column(Text, default="[]")  # JSON: apps marked orphaned (dir disappeared)
+    excluded_dirs: Mapped[str] = mapped_column(Text, default="[]")  # JSON: dirs skipped by ignore patterns
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

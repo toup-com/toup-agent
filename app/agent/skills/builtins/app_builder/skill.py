@@ -1505,6 +1505,16 @@ class AppBuilderSkill(Skill):
                     job.checkpoint_json = None  # Clear checkpoint
                     await db.commit()
 
+            # Broadcast job completion so Jobs panel updates without polling
+            if self._ws_broadcast:
+                await self._ws_broadcast(user_id, {
+                    "type": "job_update",
+                    "job_id": job_id,
+                    "app_id": app_id,
+                    "name": name,
+                    "status": "completed",
+                })
+
             # Register app in gateway
             if hasattr(self, '_app_gateway') and self._app_gateway:
                 try:
@@ -1978,6 +1988,16 @@ class AppBuilderSkill(Skill):
                     job.completed_at = datetime.utcnow()
                     job.model = "claude-opus-4-6"
                     await db.commit()
+
+            # Broadcast job completion so Jobs panel updates without polling
+            if self._ws_broadcast:
+                await self._ws_broadcast(user_id, {
+                    "type": "job_update",
+                    "job_id": job_id,
+                    "app_id": app_id,
+                    "name": name,
+                    "status": "completed",
+                })
 
             # Register app into the gateway (single skill, not per-app tools)
             if hasattr(self, '_app_gateway') and self._app_gateway:
@@ -3394,7 +3414,25 @@ const _webDb = {
             app = await db.get(App, app_id)
             if app:
                 app.status = "error"
+                # Create stub directory so Explorer can show the failed app
+                if app.app_dir:
+                    import os
+                    os.makedirs(app.app_dir, exist_ok=True)
                 await db.commit()
+
+        # Broadcast failure so frontend updates without a refresh
+        if self._ws_broadcast:
+            try:
+                from app.config import settings
+                await self._ws_broadcast(settings.user_id, {
+                    "type": "job_update",
+                    "job_id": job_id,
+                    "app_id": app_id,
+                    "status": "failed",
+                    "error_message": error_msg,
+                })
+            except Exception:
+                pass
 
     async def _pause_job(
         self, job_id: str, app_id: str, user_id: str,

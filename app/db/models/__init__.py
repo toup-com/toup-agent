@@ -34,7 +34,7 @@ from .entity import Entity, EntityLink, EntityRelationship
 from .document import Document, DocumentChunk, Media
 
 # Apps & Build Jobs
-from .app import App, BuildJob
+from .app import App, BuildJob, ReconciliationLog
 
 # Agent runtime
 from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig
@@ -61,7 +61,7 @@ __all__ = [
     "Memory", "memory_relationships", "BrainStats", "MemoryEvent", "RetrievalEvent",
     "Entity", "EntityLink", "EntityRelationship",
     "Document", "DocumentChunk", "Media",
-    "App", "BuildJob",
+    "App", "BuildJob", "ReconciliationLog",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
     "SoulConfig",
     "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord",

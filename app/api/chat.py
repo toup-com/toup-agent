@@ -670,3 +670,37 @@ async def get_chat_history(
         )
         for msg in messages
     ]
+
+
+# ── Builder mode persistence ──────────────────────────────────────
+
+@router.get("/conversations/{conversation_id}/builder-mode")
+async def get_builder_mode(conversation_id: str, db: AsyncSession = Depends(get_db)):
+    """Get the builder mode for a conversation. NULL means 'auto' (default)."""
+    conv = await db.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"builder_mode": getattr(conv, 'builder_mode', None) or "auto"}
+
+
+from pydantic import BaseModel as _PydanticBase
+
+class _BuilderModeRequest(_PydanticBase):
+    builder_mode: str  # "auto" or "vibe"
+
+
+@router.patch("/conversations/{conversation_id}/builder-mode")
+async def set_builder_mode(
+    conversation_id: str,
+    req: _BuilderModeRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Persist the builder mode toggle for a conversation."""
+    if req.builder_mode not in ("auto", "vibe"):
+        raise HTTPException(status_code=400, detail="builder_mode must be 'auto' or 'vibe'")
+    conv = await db.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    conv.builder_mode = req.builder_mode
+    await db.commit()
+    return {"ok": True, "builder_mode": req.builder_mode}

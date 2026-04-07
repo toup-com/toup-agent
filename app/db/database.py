@@ -164,6 +164,14 @@ async def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
         # Rich content metadata on messages (media cards, etc.)
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS metadata_json TEXT",
+        # Reconciliation: app source tracking (app_builder, vibecoding, filesystem_discovered)
+        "ALTER TABLE apps ADD COLUMN IF NOT EXISTS source VARCHAR(30) DEFAULT 'app_builder'",
+        # Backfill: existing apps under vibecoding/ path get source='vibecoding'
+        "UPDATE apps SET source = 'vibecoding' WHERE source = 'app_builder' AND app_dir LIKE '%/vibecoding/%'",
+        # Builder mode per-chat (NULL = auto/app_builder, 'vibe' = vibecoding)
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS builder_mode VARCHAR(10)",
+        # Reconciliation log cleanup: drop entries older than 30 days
+        "DELETE FROM reconciliation_logs WHERE created_at < NOW() - INTERVAL '30 days'",
     ]
 
     # Vector dimension migration: if embedding_dimension changed (e.g. 1536 → 384),

@@ -117,6 +117,100 @@ class AgentRunner:
         return defs
 
     # ------------------------------------------------------------------
+    # Vibecoding DB registration
+    # ------------------------------------------------------------------
+    async def _register_vibecoding_session(
+        self, user_id: str, prompt: str, session_id: Optional[str] = None,
+    ) -> tuple:
+        """Create App + BuildJob records for a vibecoding session.
+
+        Returns (job_id, app_id) tuple. Idempotent per session — won't create
+        duplicates if called multiple times for the same session.
+        """
+        import uuid as _uuid
+        import re as _re
+        import os as _os
+        from app.db.database import async_session_maker
+        from app.db.models import App, BuildJob
+        from app.agent.app_manager import APPS_DIR
+
+        workspace = getattr(settings, 'agent_workspace_dir', None) or './workspace'
+        vibecoding_dir = _os.path.join(_os.path.abspath(workspace), 'vibecoding')
+
+        async with async_session_maker() as db:
+            # Check for existing vibecoding app in this session to avoid duplicates
+            if session_id:
+                from sqlalchemy import select, and_
+                existing = await db.execute(
+                    select(BuildJob).where(
+                        and_(
+                            BuildJob.user_id == user_id,
+                            BuildJob.app_id.isnot(None),
+                        )
+                    ).order_by(BuildJob.created_at.desc()).limit(5)
+                )
+                recent_jobs = existing.scalars().all()
+                for j in recent_jobs:
+                    if j.status in ("queued", "running") and getattr(j, 'layer', 0) == 0:
+                        # Reuse the existing vibecoding job
+                        return j.id, j.app_id
+
+            # Generate slug from prompt
+            words = _re.sub(r'[^a-zA-Z0-9\s]', '', prompt).split()[:4]
+            slug_base = '-'.join(w.lower() for w in words) or 'vibecoding-project'
+            slug = slug_base[:50]
+
+            # Deduplicate slug
+            from sqlalchemy import select as sa_select
+            result = await db.execute(sa_select(App.slug).where(App.slug.like(f"{slug}%")))
+            existing_slugs = {row[0] for row in result.fetchall()}
+            if slug in existing_slugs:
+                counter = 1
+                while f"{slug}-{counter}" in existing_slugs:
+                    counter += 1
+                slug = f"{slug}-{counter}"
+
+            app_id = str(_uuid.uuid4())
+            job_id = str(_uuid.uuid4())
+            app_dir = _os.path.join(vibecoding_dir, slug)
+
+            # Create the directory
+            _os.makedirs(app_dir, exist_ok=True)
+
+            name = slug.replace('-', ' ').title()
+
+            app = App(
+                id=app_id,
+                user_id=user_id,
+                name=name,
+                description=prompt[:500] if prompt else "",
+                slug=slug,
+                status="building",
+                source="vibecoding",
+                app_dir=app_dir,
+                platforms="web",
+            )
+            db.add(app)
+
+            job = BuildJob(
+                id=job_id,
+                user_id=user_id,
+                app_id=app_id,
+                title=f"Vibecoding: {name}",
+                prompt=prompt[:2000] if prompt else "",
+                status="running",
+                steps_json="[]",
+                model="",
+                layer=0,
+                created_at=datetime.utcnow(),
+            )
+            db.add(job)
+            await db.commit()
+
+            logger.info(f"[VIBE] Registered vibecoding session: app={app_id[:8]} job={job_id[:8]} slug={slug}")
+            return job_id, app_id
+
+    # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
     async def run(
@@ -283,12 +377,24 @@ class AgentRunner:
         current_tools = filtered_tools
 
         # In vibecoding mode, strip all app_builder tools — agent should code directly
+        _vibe_job_id: Optional[str] = None
+        _vibe_app_id: Optional[str] = None
         if channel == "vibecoding":
             current_tools = [
                 t for t in current_tools
                 if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
             ]
             logger.info(f"[VIBE] Stripped app_builder tools for vibecoding channel, {len(current_tools)} tools remaining")
+
+            # Register vibecoding session in DB (App + BuildJob) for visibility
+            try:
+                _vibe_job_id, _vibe_app_id = await self._register_vibecoding_session(
+                    user_id=user_id,
+                    prompt=user_message,
+                    session_id=session_id,
+                )
+            except Exception as e:
+                logger.warning(f"[VIBE] Failed to register vibecoding session: {e}")
 
         logger.info(
             f"[PERF] tool_filter: {len(all_tools)} total → {len(current_tools)} for intent={query_intent.category}"
@@ -602,6 +708,30 @@ class AgentRunner:
             "tokens": total_input + total_output,
             "elapsed_ms": elapsed,
         })
+
+        # Finalize vibecoding session: mark job completed/failed
+        if _vibe_job_id and _vibe_app_id:
+            try:
+                async with async_session_maker() as vdb:
+                    from app.db.models import App as _App, BuildJob as _BJ
+                    vj = await vdb.get(_BJ, _vibe_job_id)
+                    va = await vdb.get(_App, _vibe_app_id)
+                    if vj and vj.status == "running":
+                        wrote_files = any(
+                            tc.get("name", "") in ("write_file", "edit_file", "exec")
+                            for tc in all_tool_calls
+                        )
+                        vj.status = "completed" if wrote_files else "failed"
+                        vj.completed_at = datetime.utcnow()
+                        vj.total_tokens = total_input + total_output
+                        vj.model = model_used
+                        if not wrote_files:
+                            vj.error_message = "No files were written"
+                    if va:
+                        va.status = "ready" if (vj and vj.status == "completed") else "error"
+                    await vdb.commit()
+            except Exception as e:
+                logger.warning(f"[VIBE] Failed to finalize vibecoding session: {e}")
 
         return AgentResponse(
             text=final_text,

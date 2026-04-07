@@ -724,6 +724,47 @@ async def lifespan(app: FastAPI):
                 print(f"⚠️ Platform registration failed: {e}", flush=True)
         asyncio.create_task(_self_register())
 
+    # ── Background reconciliation sweep (every 5 min) ──────────
+    _reconcile_task = None
+
+    async def _reconcile_sweep():
+        """Periodically reconcile filesystem ↔ DB for active user.
+
+        Only runs when the user has an active WebSocket connection (app is open).
+        Skips idle/logged-out users to avoid wasting cycles.
+        """
+        import os
+        from app.services.reconciliation_service import reconcile_apps
+        from app.agent.app_manager import APPS_DIR
+        from app.api.ws_chat import _user_ws_queues
+
+        workspace = getattr(settings, 'agent_workspace_dir', None) or './workspace'
+        user_id = settings.user_id
+
+        async def _local_cmd(cmd: str) -> str:
+            proc = await asyncio.create_subprocess_shell(
+                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            return stdout.decode().strip()
+
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            # Skip if no active WebSocket connections (user is idle/logged out)
+            if not _user_ws_queues.get(user_id):
+                continue
+            try:
+                async with async_session_maker() as db:
+                    await reconcile_apps(
+                        user_id=user_id, db=db, ssh_cmd_fn=_local_cmd,
+                        trigger="sweep", apps_dir=APPS_DIR,
+                        workspace_dir=os.path.abspath(workspace), force=True,
+                    )
+            except Exception as e:
+                logging.getLogger(__name__).warning("[SWEEP] Reconciliation failed: %s", e)
+
+    _reconcile_task = asyncio.create_task(_reconcile_sweep())
+
     print("🤖 Toup Agent ready.")
     print(f"   Server:  http://0.0.0.0:8001")
     print(f"   Health:  http://localhost:8001/agent/health")
@@ -732,6 +773,9 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── Shutdown (reverse order) ──────────────────────────────
+    if _reconcile_task:
+        _reconcile_task.cancel()
+
     await _hook_bus.emit(HookEvent.SHUTDOWN, {"app": "toup-agent"})
     print("🤖 Toup Agent shutting down...")
 

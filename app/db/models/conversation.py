@@ -33,6 +33,9 @@ class Conversation(Base):
     message_count: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
 
+    # Builder mode (per-chat toggle: NULL/'auto' = App Builder, 'vibe' = vibecoding)
+    builder_mode: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+
     # Metadata
     metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON stored as text
 
