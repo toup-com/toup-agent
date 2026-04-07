@@ -85,36 +85,6 @@ async def upsert_credential(
         db.add(cred)
 
     await db.commit()
-
-    # Fire-and-forget session warm-up on the agent VPS (if this is the platform)
-    # The agent will login in the background to prime cookies
-    from app.config import settings as _s
-    if _s.run_mode == "agent":
-        import asyncio
-        from app.services.netflix_stream import warm_session
-
-        async def _warmup():
-            try:
-                status = await warm_session(user.id, body.channel, body.email, body.password)
-                # Update session status in DB
-                from app.db import async_session_maker
-                async with async_session_maker() as s:
-                    result = await s.execute(
-                        select(StreamingCredential).where(
-                            and_(StreamingCredential.user_id == user.id, StreamingCredential.channel == body.channel)
-                        )
-                    )
-                    c = result.scalar_one_or_none()
-                    if c:
-                        c.session_status = status
-                        c.session_checked_at = datetime.utcnow()
-                        await s.commit()
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning("Session warm-up failed for %s/%s: %s", user.id, body.channel, e)
-
-        asyncio.create_task(_warmup())
-
     return {"status": "connected", "channel": body.channel}
 
 
@@ -175,37 +145,6 @@ async def get_credential_internal(
         raise HTTPException(status_code=404, detail=f"No {channel} credentials found")
 
     return {"channel": cred.channel, "email": cred.email, "password": cred.password}
-
-
-@router.get("/credentials/internal")
-async def list_credentials_internal(
-    user_id: str = Query(...),
-    x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
-    db: AsyncSession = Depends(get_db),
-):
-    """Internal endpoint for the agent to list all connected channels.
-    Returns channel names with has_password flag (no actual passwords)."""
-    if not x_agent_key:
-        raise HTTPException(status_code=401, detail="X-Agent-Key required")
-
-    from app.db.models import AgentConfig, StreamingCredential
-
-    cfg = await db.execute(
-        select(AgentConfig).where(
-            and_(AgentConfig.user_id == user_id, AgentConfig.agent_api_key == x_agent_key)
-        )
-    )
-    if not cfg.scalar_one_or_none():
-        raise HTTPException(status_code=403, detail="Invalid agent key")
-
-    result = await db.execute(
-        select(StreamingCredential).where(StreamingCredential.user_id == user_id)
-    )
-    creds = result.scalars().all()
-    return [
-        {"channel": c.channel, "has_password": bool(c.password), "session_status": c.session_status or "cold"}
-        for c in creds
-    ]
 
 
 @router.get("/netflix-search")
@@ -283,64 +222,3 @@ async def netflix_search(
 
     _log.info(f"[netflix-search] q='{q}' → id={netflix_id}, title='{title}'")
     return {"netflix_id": netflix_id, "title": title}
-
-
-@router.get("/content-resolve")
-async def content_resolve(
-    q: str = Query(..., description="Movie or show title"),
-    user_id: str = Query(...),
-    region: str = Query("CA"),
-    x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
-    db: AsyncSession = Depends(get_db),
-):
-    """Resolve a content query to the best available streaming provider.
-    Uses TMDB Watch Providers (system-level API key) + user's connected channels.
-    Called by agents — no per-user TMDB key needed."""
-    if not x_agent_key:
-        raise HTTPException(status_code=401, detail="X-Agent-Key required")
-
-    from app.db.models import AgentConfig, StreamingCredential
-    from app.config import settings
-
-    # Verify agent key
-    cfg = await db.execute(
-        select(AgentConfig).where(
-            and_(AgentConfig.user_id == user_id, AgentConfig.agent_api_key == x_agent_key)
-        )
-    )
-    if not cfg.scalar_one_or_none():
-        raise HTTPException(status_code=403, detail="Invalid agent key")
-
-    # Get TMDB key from platform config
-    tmdb_key = settings.tmdb_api_key or ""
-    if not tmdb_key:
-        raise HTTPException(status_code=503, detail="TMDB API key not configured on platform")
-
-    # Get user's connected channels
-    result = await db.execute(
-        select(StreamingCredential).where(StreamingCredential.user_id == user_id)
-    )
-    creds = result.scalars().all()
-    connected = [c.channel for c in creds if c.password]
-
-    # Route content
-    from app.services.content_router import ContentRouter
-
-    router_svc = ContentRouter(tmdb_api_key=tmdb_key, region=region)
-    match = await router_svc.resolve(q, connected)
-
-    if not match:
-        return {"found": False, "title": q, "provider": None, "all_providers": [], "connected": connected}
-
-    return {
-        "found": True,
-        "title": match.title,
-        "tmdb_id": match.tmdb_id,
-        "media_type": match.media_type,
-        "year": match.year,
-        "provider": match.provider,
-        "provider_name": match.provider_name,
-        "all_providers": match.all_providers,
-        "connected": connected,
-        "poster_path": f"https://image.tmdb.org/t/p/w500{match.poster_path}" if match.poster_path else None,
-    }

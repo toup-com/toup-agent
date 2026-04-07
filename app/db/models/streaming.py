@@ -12,8 +12,5 @@ class StreamingCredential(Base):
     channel = Column(String(50), nullable=False)  # netflix, prime, disney, etc.
     email = Column(String(255), nullable=False)
     password = Column(Text, nullable=False)
-    # Session persistence: cold=never logged in, warm=cookies exist, expired=needs re-auth, blocked=captcha/2fa
-    session_status = Column(String(20), default="cold")
-    session_checked_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

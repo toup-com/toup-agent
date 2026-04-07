@@ -1,8 +1,8 @@
 """
-Streaming Engine — Chrome (Widevine) + FFmpeg → HLS.
+Netflix Streaming — Chrome (Widevine) + FFmpeg → HLS.
 
-Supports Netflix, Prime Video, Disney+, Crave, and other providers.
-Uses per-user persistent browser sessions to avoid re-login on every stream.
+Handles login, profile selection, and content playback automatically
+via Chrome DevTools Protocol (CDP).
 """
 
 import asyncio
@@ -11,9 +11,8 @@ import logging
 import os
 import shutil
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional
 from urllib.parse import quote
 
 import httpx
@@ -25,119 +24,44 @@ HLS_PLAYLIST_SIZE = 5
 FFMPEG_FRAMERATE = 24
 FFMPEG_VIDEO_BITRATE = "2500k"
 
-# Per-user session directories: /tmp/toup-sessions/{user_id}/{provider}/
-SESSION_BASE = Path("/tmp/toup-sessions")
 
-
-# ── Provider configs ──────────────────────────────────────────────────
-
-PROVIDER_CONFIG = {
-    "netflix": {
-        "browse_url": "https://www.netflix.com/browse",
-        "login_url": "https://www.netflix.com/login",
-        "search_url": "https://www.netflix.com/search?q={query}",
-        "login_check": lambda url: "/login" in url,
-        "email_selectors": 'input[name="userLoginId"], input[type="email"], input[data-uia="login-field"]',
-        "password_selectors": 'input[name="password"], input[type="password"]',
-        "submit_selectors": 'button:has-text("Continue"), button:has-text("Sign In"), button[type="submit"]',
-        "profile_selectors": '.profile-link, .profile-icon, [data-profile-guid], .choose-profile .profile, li.profile a',
-        "profile_check": lambda url: "/profiles" in url,
-        "result_selectors": '.title-card a, .slider-item a, [data-uia="title-card"] a, .title-card, .boxart-container',
-        "play_selectors": '[data-uia="play-button"], .playLink, a[href*="/watch/"]',
-    },
-    "prime": {
-        "browse_url": "https://www.primevideo.com",
-        "login_url": "https://www.primevideo.com/auth-redirect/ref=atv_nb_lcl_en_CA",
-        "search_url": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={query}",
-        "login_check": lambda url: "ap/signin" in url or "/auth-redirect" in url,
-        "email_selectors": 'input[name="email"], input[type="email"], #ap_email',
-        "password_selectors": 'input[name="password"], input[type="password"], #ap_password',
-        "submit_selectors": '#signInSubmit, input[type="submit"], button:has-text("Sign in"), button:has-text("Sign-In")',
-        "profile_selectors": '[data-testid="profile-avatar"], .profile-selector a',
-        "profile_check": lambda url: "/profiles" in url,
-        "result_selectors": '[data-testid="search-result-item"] a, .av-hover-wrapper a, article a',
-        "play_selectors": '[data-testid="play-button"], .playButton, button:has-text("Play"), a:has-text("Watch")',
-    },
-    "disney": {
-        "browse_url": "https://www.disneyplus.com",
-        "login_url": "https://www.disneyplus.com/login",
-        "search_url": "https://www.disneyplus.com/search?q={query}",
-        "login_check": lambda url: "/login" in url,
-        "email_selectors": 'input[type="email"], input[name="email"]',
-        "password_selectors": 'input[type="password"], input[name="password"]',
-        "submit_selectors": 'button:has-text("Continue"), button:has-text("Sign In"), button[type="submit"]',
-        "profile_selectors": '[data-testid="profile-avatar"], .profile-avatar-link',
-        "profile_check": lambda url: "/select-profile" in url,
-        "result_selectors": '[data-testid="search-result"] a, .search-result a',
-        "play_selectors": 'button:has-text("Play"), [data-testid="play-button"]',
-    },
-    "crave": {
-        "browse_url": "https://www.crave.ca",
-        "login_url": "https://www.crave.ca/login",
-        "search_url": "https://www.crave.ca/search?q={query}",
-        "login_check": lambda url: "/login" in url or "/signin" in url,
-        "email_selectors": 'input[type="email"], input[name="email"], #email',
-        "password_selectors": 'input[type="password"], input[name="password"]',
-        "submit_selectors": 'button:has-text("Sign In"), button:has-text("Log In"), button[type="submit"]',
-        "profile_selectors": '.profile-selector a',
-        "profile_check": lambda url: "/profiles" in url,
-        "result_selectors": '.media-card a, .search-result a, article a',
-        "play_selectors": 'button:has-text("Play"), .play-button, a:has-text("Watch")',
-    },
-}
-
-
-def _get_session_dir(user_id: str, provider: str) -> Path:
-    """Get per-user per-provider Chrome data dir for session persistence."""
-    d = SESSION_BASE / user_id / provider
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-class StreamEngine:
-    """Generic streaming engine — works with any supported provider."""
-
-    def __init__(self, stream_id: str, provider: str = "netflix", user_id: str = ""):
+class NetflixStream:
+    def __init__(self, stream_id: str):
         self.stream_id = stream_id
-        self.provider = provider
-        self.user_id = user_id
-        self.config = PROVIDER_CONFIG.get(provider, PROVIDER_CONFIG["netflix"])
-        self.hls_dir = Path(tempfile.mkdtemp(prefix=f"stream-{stream_id}-"))
+        self.hls_dir = Path(tempfile.mkdtemp(prefix=f"nf-{stream_id}-"))
         self.display: Optional[str] = None
         self.cdp_port: Optional[int] = None
         self.xvfb_proc: Optional[asyncio.subprocess.Process] = None
+        self.chrome_proc: Optional[asyncio.subprocess.Process] = None
         self.ffmpeg_proc: Optional[asyncio.subprocess.Process] = None
         self.running = False
-        self._browser = None
-        self._playwright = None
-        self._page = None
 
     async def start(self, search_query: str, email: str, password: str) -> str:
-        """Start stream. Returns HLS playlist path."""
+        """Start Netflix stream. Returns HLS dir path."""
         try:
             self.running = True
 
             # 1. Xvfb
             self.display = await self._start_xvfb()
-            logger.info("[Stream:%s] Xvfb on %s", self.provider, self.display)
+            logger.info("[NF] Xvfb on %s", self.display)
 
-            # 2. PulseAudio
+            # 2. Setup PulseAudio
             await self._setup_pulse()
 
-            # 3. Chrome with per-user session
+            # 3. Launch Chrome with CDP
             self.cdp_port = 9300 + hash(self.stream_id) % 100
             await self._start_chrome()
-            logger.info("[Stream:%s] Chrome on CDP port %d", self.provider, self.cdp_port)
+            logger.info("[NF] Chrome on CDP port %d", self.cdp_port)
 
-            # 4. Session-aware login + navigate
-            await self._login_and_play(search_query, email, password)
-            logger.info("[Stream:%s] Playing", self.provider)
+            # 4. Automate Netflix login + navigate to content
+            await self._netflix_login_and_play(search_query, email, password)
+            logger.info("[NF] Netflix playing")
 
             # 5. FFmpeg capture → HLS
             await self._start_ffmpeg()
-            logger.info("[Stream:%s] FFmpeg capturing", self.provider)
+            logger.info("[NF] FFmpeg capturing")
 
-            # Wait for first segment
+            # Wait for first HLS segment
             playlist = self.hls_dir / "stream.m3u8"
             for _ in range(20):
                 if playlist.exists() and playlist.stat().st_size > 0:
@@ -145,13 +69,14 @@ class StreamEngine:
                 await asyncio.sleep(1)
             raise RuntimeError("HLS not ready in time")
 
-        except Exception:
-            logger.exception("[Stream:%s] Start failed", self.provider)
+        except Exception as e:
+            logger.exception("[NF] Start failed")
             await self.stop()
             raise
 
     async def stop(self):
         self.running = False
+        # Stop FFmpeg
         if self.ffmpeg_proc and self.ffmpeg_proc.returncode is None:
             try:
                 self.ffmpeg_proc.terminate()
@@ -159,12 +84,14 @@ class StreamEngine:
             except Exception:
                 try: self.ffmpeg_proc.kill()
                 except Exception: pass
-        if self._browser:
+        # Close Playwright browser
+        if hasattr(self, '_browser') and self._browser:
             try: await self._browser.close()
             except Exception: pass
-        if self._playwright:
+        if hasattr(self, '_playwright') and self._playwright:
             try: await self._playwright.stop()
             except Exception: pass
+        # Stop Xvfb
         if self.xvfb_proc and self.xvfb_proc.returncode is None:
             try:
                 self.xvfb_proc.terminate()
@@ -200,7 +127,7 @@ class StreamEngine:
         )).wait()
 
     async def _start_chrome(self):
-        """Launch Chrome with per-user persistent session dir."""
+        """Launch Chrome via Playwright (Patchright) for proper automation."""
         try:
             from patchright.async_api import async_playwright
         except ImportError:
@@ -209,9 +136,8 @@ class StreamEngine:
         self._playwright = await async_playwright().start()
 
         chrome = shutil.which("google-chrome-stable") or "/opt/google/chrome/google-chrome"
-
-        # Per-user session dir — cookies survive across streams
-        data_dir = str(_get_session_dir(self.user_id, self.provider))
+        data_dir = "/tmp/nf-chrome-shared"
+        os.makedirs(data_dir, exist_ok=True)
 
         self._browser = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=data_dir,
@@ -221,6 +147,7 @@ class StreamEngine:
                 "--no-sandbox", "--disable-dev-shm-usage",
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-features=TranslateUI",
+                # Force software rendering to bypass DRM black screen
                 "--disable-gpu",
                 "--use-gl=angle",
                 "--use-angle=swiftshader",
@@ -233,89 +160,159 @@ class StreamEngine:
             ignore_https_errors=True,
         )
         self._page = self._browser.pages[0] if self._browser.pages else await self._browser.new_page()
+        logger.info("[NF] Playwright Chrome launched")
 
-    # ── Session-aware login ────────────────────────────────────────
+    # ── Netflix Automation via CDP ─────────────────────────────────
 
-    async def _login_and_play(self, query: str, email: str, password: str):
-        """Navigate to content. Only login if session is expired."""
+    async def _cdp_send(self, ws_url: str, method: str, params: dict = None) -> dict:
+        """Send a CDP command via WebSocket."""
+        import websockets
+        try:
+            async with websockets.connect(ws_url, max_size=10_000_000, open_timeout=10) as ws:
+                msg = {"id": 1, "method": method, "params": params or {}}
+                await ws.send(json.dumps(msg))
+                async for raw in ws:
+                    resp = json.loads(raw)
+                    if resp.get("id") == 1:
+                        return resp.get("result", {})
+        except Exception as e:
+            logger.warning("[NF] CDP send failed (%s): %s", method, e)
+            return {}
+
+    async def _cdp_evaluate(self, ws_url: str, expression: str) -> any:
+        """Evaluate JS in the browser."""
+        result = await self._cdp_send(ws_url, "Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+        })
+        return result.get("result", {}).get("value")
+
+    async def _cdp_navigate(self, ws_url: str, url: str):
+        """Navigate to URL and wait for load."""
+        await self._cdp_send(ws_url, "Page.navigate", {"url": url})
+        await asyncio.sleep(3)
+
+    async def _cdp_type_text(self, ws_url: str, selectors: str, text: str):
+        """Focus an input and type text using CDP Input.insertText (works with React)."""
+        sel_list = [s.strip() for s in selectors.split(",")]
+        # Focus the first matching element
+        for sel in sel_list:
+            result = await self._cdp_evaluate(ws_url, f"""
+                (function() {{
+                    var el = document.querySelector('{sel}');
+                    if (el) {{ el.focus(); el.value = ''; return true; }}
+                    return false;
+                }})();
+            """)
+            if result:
+                break
+        await asyncio.sleep(0.3)
+        # Use insertText — works with React controlled inputs
+        await self._cdp_send(ws_url, "Input.insertText", {"text": text})
+        await asyncio.sleep(0.3)
+
+    async def _cdp_click(self, ws_url: str, selectors: str):
+        """Click first matching element from comma-separated selectors."""
+        # Split selectors and try each one
+        sel_list = [s.strip() for s in selectors.split(",")]
+        for sel in sel_list:
+            await self._cdp_evaluate(ws_url, f"""
+                (function() {{
+                    var el = document.querySelector('{sel}');
+                    if (el) {{ el.click(); return true; }}
+                    return false;
+                }})();
+            """)
+        await asyncio.sleep(0.5)
+
+    async def _get_page_ws(self) -> str:
+        """Get the WebSocket URL for the first browser page (with retries)."""
+        for attempt in range(10):
+            try:
+                async with httpx.AsyncClient() as c:
+                    r = await c.get(f"http://127.0.0.1:{self.cdp_port}/json", timeout=3)
+                    pages = r.json()
+                    for p in pages:
+                        if p.get("type") == "page":
+                            return p["webSocketDebuggerUrl"]
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        raise RuntimeError("No CDP page found after 10 retries")
+
+    async def _netflix_login_and_play(self, query: str, email: str, password: str):
+        """Login to Netflix and navigate to content using Playwright."""
         page = self._page
-        cfg = self.config
 
-        # Try navigating directly to content first (session may be warm)
-        search_url = cfg["search_url"].format(query=quote(query))
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        # Navigate to Netflix
+        await page.goto("https://www.netflix.com/browse", wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
 
         current_url = page.url
-        logger.info("[Stream:%s] Navigated to: %s", self.provider, current_url)
+        logger.info("[NF] Current URL: %s", current_url)
 
-        # Check if we got redirected to login
-        if cfg["login_check"](current_url):
-            logger.info("[Stream:%s] Session expired — logging in", self.provider)
-            await self._do_login(page, email, password, cfg)
+        # Login if needed
+        if "/login" in current_url:
+            logger.info("[NF] Login required, filling credentials via Playwright...")
 
-            # After login, navigate to content again
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(2000)
-            logger.info("[Stream:%s] After re-login: %s", self.provider, page.url)
-        else:
-            logger.info("[Stream:%s] Session warm — skipped login", self.provider)
+            # Fill email — try multiple selectors
+            email_input = page.locator('input[name="userLoginId"], input[type="email"], input[data-uia="login-field"]').first
+            await email_input.fill(email)
+            await page.wait_for_timeout(500)
 
-        # Handle profile picker if present
-        if cfg["profile_check"](page.url):
+            # Click Continue/Sign In
+            submit_btn = page.locator('button:has-text("Continue"), button:has-text("Sign In"), button[type="submit"]').first
+            await submit_btn.click()
+            await page.wait_for_timeout(4000)
+
+            # Fill password (may be on new page or same page)
+            pw_input = page.locator('input[name="password"], input[type="password"]').first
             try:
-                profile = page.locator(cfg["profile_selectors"]).first
+                await pw_input.fill(password, timeout=5000)
+                await page.wait_for_timeout(500)
+
+                # Click Sign In
+                sign_in = page.locator('button:has-text("Sign In"), button:has-text("Continue"), button[type="submit"]').first
+                await sign_in.click()
+                await page.wait_for_timeout(6000)
+            except Exception as e:
+                logger.info("[NF] Password step skipped (maybe single-page login): %s", e)
+
+            logger.info("[NF] After login: %s", page.url)
+
+        # Profile picker
+        if "/profiles" in page.url or "browse" in page.url:
+            try:
+                profile = page.locator('.profile-link, .profile-icon, [data-profile-guid], .choose-profile .profile, li.profile a').first
                 await profile.click(timeout=5000)
                 await page.wait_for_timeout(3000)
-                # Re-navigate to search after profile selection
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_timeout(2000)
+                logger.info("[NF] Profile selected")
             except Exception:
-                logger.info("[Stream:%s] No profile picker or already past it", self.provider)
+                logger.info("[NF] No profile picker or already past it")
 
-        # Click first search result
+        # Search for content
+        search_url = f"https://www.netflix.com/search?q={quote(query)}"
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(3000)
+        logger.info("[NF] Search page: %s", page.url)
+
+        # Click first result
         try:
-            card = page.locator(cfg["result_selectors"]).first
+            card = page.locator('.title-card a, .slider-item a, [data-uia="title-card"] a, .title-card, .boxart-container').first
             await card.click(timeout=5000)
             await page.wait_for_timeout(2000)
         except Exception as e:
-            logger.warning("[Stream:%s] Could not click result: %s", self.provider, e)
+            logger.warning("[NF] Could not click search result: %s", e)
 
-        # Click play button
+        # Click play button if visible
         try:
-            play_btn = page.locator(cfg["play_selectors"]).first
+            play_btn = page.locator('[data-uia="play-button"], .playLink, a[href*="/watch/"]').first
             await play_btn.click(timeout=3000)
             await page.wait_for_timeout(2000)
         except Exception:
             pass
 
-        logger.info("[Stream:%s] Final URL: %s", self.provider, page.url)
-
-    async def _do_login(self, page, email: str, password: str, cfg: dict):
-        """Perform the full login flow."""
-        # Fill email
-        email_input = page.locator(cfg["email_selectors"]).first
-        await email_input.fill(email)
-        await page.wait_for_timeout(500)
-
-        # Submit email (some providers have 2-step login)
-        submit_btn = page.locator(cfg["submit_selectors"]).first
-        await submit_btn.click()
-        await page.wait_for_timeout(4000)
-
-        # Fill password (may be on new page or same page)
-        pw_input = page.locator(cfg["password_selectors"]).first
-        try:
-            await pw_input.fill(password, timeout=5000)
-            await page.wait_for_timeout(500)
-
-            sign_in = page.locator(cfg["submit_selectors"]).first
-            await sign_in.click()
-            await page.wait_for_timeout(6000)
-        except Exception as e:
-            logger.info("[Stream:%s] Password step skipped: %s", self.provider, e)
-
-        logger.info("[Stream:%s] Login completed: %s", self.provider, page.url)
+        logger.info("[NF] Final URL: %s", page.url)
 
     # ── FFmpeg ─────────────────────────────────────────────────────
 
@@ -324,6 +321,7 @@ class StreamEngine:
         seg_pattern = str(self.hls_dir / "seg_%03d.ts")
         env = {**os.environ, "DISPLAY": self.display, "HOME": "/root"}
 
+        # Try with audio first
         args = [
             "ffmpeg", "-y",
             "-f", "x11grab", "-video_size", "1280x720",
@@ -346,9 +344,9 @@ class StreamEngine:
         )
         await asyncio.sleep(2)
 
-        # Retry video-only if audio fails
+        # If audio fails, retry video-only
         if self.ffmpeg_proc.returncode is not None:
-            logger.warning("[Stream:%s] FFmpeg audio failed, retrying video-only", self.provider)
+            logger.warning("[NF] FFmpeg with audio failed, retrying video-only")
             args_vo = [
                 "ffmpeg", "-y",
                 "-f", "x11grab", "-video_size", "1280x720",
@@ -368,147 +366,21 @@ class StreamEngine:
             )
 
 
-# ── Session warm-up (background login to prime cookies) ───────────────
+# ── Manager ────────────────────────────────────────────────────────
 
-async def warm_session(user_id: str, provider: str, email: str, password: str) -> str:
-    """Login in headless Chrome to establish session cookies. Returns status."""
-    cfg = PROVIDER_CONFIG.get(provider)
-    if not cfg:
-        return "unsupported"
-
-    try:
-        from patchright.async_api import async_playwright
-    except ImportError:
-        from playwright.async_api import async_playwright
-
-    chrome = shutil.which("google-chrome-stable") or "/opt/google/chrome/google-chrome"
-    data_dir = str(_get_session_dir(user_id, provider))
-
-    pw = await async_playwright().start()
-    try:
-        browser = await pw.chromium.launch_persistent_context(
-            user_data_dir=data_dir,
-            executable_path=chrome,
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        page = browser.pages[0] if browser.pages else await browser.new_page()
-
-        await page.goto(cfg["browse_url"], wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2000)
-
-        if cfg["login_check"](page.url):
-            # Do login
-            email_input = page.locator(cfg["email_selectors"]).first
-            await email_input.fill(email)
-            await page.wait_for_timeout(500)
-
-            submit_btn = page.locator(cfg["submit_selectors"]).first
-            await submit_btn.click()
-            await page.wait_for_timeout(4000)
-
-            pw_input = page.locator(cfg["password_selectors"]).first
-            try:
-                await pw_input.fill(password, timeout=5000)
-                await page.wait_for_timeout(500)
-                sign_in = page.locator(cfg["submit_selectors"]).first
-                await sign_in.click()
-                await page.wait_for_timeout(6000)
-            except Exception:
-                pass
-
-            # Check if login succeeded
-            final_url = page.url
-            if cfg["login_check"](final_url):
-                logger.warning("[warm_session:%s] Login may have failed: %s", provider, final_url)
-                await browser.close()
-                return "blocked"
-
-            # Handle profile picker
-            if cfg["profile_check"](final_url):
-                try:
-                    profile = page.locator(cfg["profile_selectors"]).first
-                    await profile.click(timeout=5000)
-                    await page.wait_for_timeout(2000)
-                except Exception:
-                    pass
-
-            logger.info("[warm_session:%s] Login successful for user %s", provider, user_id)
-            await browser.close()
-            return "warm"
-        else:
-            logger.info("[warm_session:%s] Already logged in for user %s", provider, user_id)
-            await browser.close()
-            return "warm"
-    except Exception as e:
-        logger.exception("[warm_session:%s] Failed: %s", provider, e)
-        return "cold"
-    finally:
-        await pw.stop()
+_active: dict[str, NetflixStream] = {}
 
 
-async def check_session(user_id: str, provider: str) -> str:
-    """Quick check if session cookies are still valid. Returns status."""
-    cfg = PROVIDER_CONFIG.get(provider)
-    if not cfg:
-        return "unsupported"
-
-    data_dir = _get_session_dir(user_id, provider)
-    if not (data_dir / "Default").exists():
-        return "cold"
-
-    try:
-        from patchright.async_api import async_playwright
-    except ImportError:
-        from playwright.async_api import async_playwright
-
-    chrome = shutil.which("google-chrome-stable") or "/opt/google/chrome/google-chrome"
-
-    pw = await async_playwright().start()
-    try:
-        browser = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(data_dir),
-            executable_path=chrome,
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        page = browser.pages[0] if browser.pages else await browser.new_page()
-        await page.goto(cfg["browse_url"], wait_until="domcontentloaded", timeout=15000)
-        await page.wait_for_timeout(2000)
-
-        status = "expired" if cfg["login_check"](page.url) else "warm"
-        await browser.close()
-        return status
-    except Exception:
-        return "cold"
-    finally:
-        await pw.stop()
-
-
-# ── Manager (backward-compatible) ─────────────────────────────────────
-
-_active: dict[str, StreamEngine] = {}
-
-
-async def start_netflix_stream(
-    stream_id: str,
-    netflix_url: str,
-    email: str,
-    password: str,
-    user_id: str = "",
-    provider: str = "netflix",
-    **kw,
-) -> str:
+async def start_netflix_stream(stream_id: str, netflix_url: str, email: str, password: str, **kw) -> str:
     if stream_id in _active:
         await stop_netflix_stream(stream_id)
-
+    # Extract search query from URL or use as-is
     query = netflix_url
     if "search?q=" in netflix_url:
         query = netflix_url.split("search?q=")[-1].replace("%20", " ").replace("+", " ")
     elif "/watch/" in netflix_url or "/title/" in netflix_url:
-        query = netflix_url
-
-    stream = StreamEngine(stream_id, provider=provider, user_id=user_id)
+        query = netflix_url  # pass URL directly
+    stream = NetflixStream(stream_id)
     _active[stream_id] = stream
     await stream.start(query, email, password)
     return str(stream.hls_dir)
