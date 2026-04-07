@@ -672,12 +672,23 @@ async def ws_chat(
                         try:
                             _mtype = _mi.get("type", "image/png")
                             _mdata = _mi.get("data", "")
+                            _mname = _mi.get("name", "")
                             if not _mdata:
                                 continue
-                            _ext = {
-                                "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
-                                "image/webp": ".webp", "application/pdf": ".pdf",
-                            }.get(_mtype, ".bin")
+                            # Prefer extension from filename, fall back to MIME mapping
+                            _ext = ""
+                            if _mname:
+                                import os as _os
+                                _ext = _os.path.splitext(_mname.lower())[1]
+                            if not _ext:
+                                _ext = {
+                                    "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+                                    "image/webp": ".webp", "application/pdf": ".pdf",
+                                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                                    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+                                    "application/zip": ".zip",
+                                    "application/x-zip-compressed": ".zip",
+                                }.get(_mtype, ".bin")
                             _tf = tempfile.NamedTemporaryFile(delete=False, suffix=_ext)
                             _tf.write(_b64.b64decode(_mdata))
                             _tf.close()

@@ -35,6 +35,12 @@ except ImportError:
     HAS_DOCX = False
 
 try:
+    from pptx import Presentation as PptxPresentation
+    HAS_PPTX = True
+except ImportError:
+    HAS_PPTX = False
+
+try:
     import markdown
     HAS_MARKDOWN = True
 except ImportError:
@@ -122,6 +128,8 @@ class DocumentService:
         '.zsh': 'code',
         '.ps1': 'code',
         '.docx': 'docx',
+        '.pptx': 'pptx',
+        '.zip': 'zip',
         '.json': 'json',
         '.yaml': 'yaml',
         '.yml': 'yaml',
@@ -230,6 +238,10 @@ class DocumentService:
             return await self._extract_pdf(content, chunk_size, chunk_overlap)
         elif file_type == 'docx':
             return await self._extract_docx(content, chunk_size, chunk_overlap)
+        elif file_type == 'pptx':
+            return await self._extract_pptx(content, chunk_size, chunk_overlap)
+        elif file_type == 'zip':
+            return await self._extract_zip(content, filename, chunk_size, chunk_overlap)
         elif file_type == 'markdown':
             return await self._extract_markdown(content, chunk_size, chunk_overlap)
         elif file_type == 'code':
@@ -292,7 +304,140 @@ class DocumentService:
             word_count=len(full_text.split()),
             metadata={"paragraph_count": len(paragraphs)}
         )
-    
+
+    async def _extract_pptx(
+        self,
+        content: bytes,
+        chunk_size: int,
+        chunk_overlap: int
+    ) -> DocumentExtraction:
+        """Extract text from PPTX (slide text + speaker notes)"""
+        if not HAS_PPTX:
+            raise ValueError("PPTX support not available. Install python-pptx.")
+
+        prs = PptxPresentation(io.BytesIO(content))
+        slides_text = []
+
+        for i, slide in enumerate(prs.slides, 1):
+            parts = [f"--- Slide {i} ---"]
+            # Extract text from all shapes
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    text = shape.text_frame.text.strip()
+                    if text:
+                        parts.append(text)
+                if shape.has_table:
+                    for row in shape.table.rows:
+                        row_text = " | ".join(cell.text.strip() for cell in row.cells)
+                        if row_text.strip(" |"):
+                            parts.append(row_text)
+            # Extract speaker notes
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+                if notes:
+                    parts.append(f"[Speaker Notes] {notes}")
+            slides_text.append("\n".join(parts))
+
+        full_text = "\n\n".join(slides_text)
+        chunks = self._chunk_text(full_text, chunk_size, chunk_overlap)
+
+        return DocumentExtraction(
+            text=full_text,
+            chunks=chunks,
+            word_count=len(full_text.split()),
+            metadata={"slide_count": len(prs.slides)}
+        )
+
+    async def _extract_zip(
+        self,
+        content: bytes,
+        filename: str,
+        chunk_size: int,
+        chunk_overlap: int
+    ) -> DocumentExtraction:
+        """Extract text from ZIP by recursively parsing supported files inside."""
+        import zipfile
+
+        MAX_FILES = 50
+        MAX_DEPTH = 3
+        MAX_TOTAL_SIZE = 100 * 1024 * 1024  # 100 MB uncompressed
+
+        all_parts: List[str] = []
+        files_processed = 0
+        total_size = 0
+
+        async def _process_zip(zf: zipfile.ZipFile, depth: int = 0):
+            nonlocal files_processed, total_size
+            if depth > MAX_DEPTH:
+                return
+
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                if files_processed >= MAX_FILES:
+                    all_parts.append(f"[Truncated: reached {MAX_FILES} file limit]")
+                    return
+                if total_size + info.file_size > MAX_TOTAL_SIZE:
+                    all_parts.append("[Truncated: reached 100 MB uncompressed size limit]")
+                    return
+
+                inner_name = info.filename
+                inner_ext = os.path.splitext(inner_name.lower())[1]
+                raw = zf.read(info)
+                total_size += len(raw)
+                files_processed += 1
+
+                # Nested zip
+                if inner_ext == '.zip' and depth < MAX_DEPTH:
+                    try:
+                        nested_zf = zipfile.ZipFile(io.BytesIO(raw))
+                        all_parts.append(f"\n=== Archive: {inner_name} ===")
+                        await _process_zip(nested_zf, depth + 1)
+                        nested_zf.close()
+                    except zipfile.BadZipFile:
+                        all_parts.append(f"\n[{inner_name}]: Invalid zip archive")
+                    continue
+
+                # Check if we have a parser for this type
+                file_type = self.DOCUMENT_EXTENSIONS.get(inner_ext)
+                if not file_type:
+                    all_parts.append(f"\n[{inner_name}]: Unsupported file type, skipped")
+                    continue
+
+                try:
+                    extraction = await self.extract_document(
+                        raw, inner_name, file_type, chunk_size, chunk_overlap
+                    )
+                    all_parts.append(f"\n=== {inner_name} ===\n{extraction.text}")
+                except Exception as e:
+                    try:
+                        text = raw.decode("utf-8", errors="replace")
+                        all_parts.append(f"\n=== {inner_name} ===\n{text}")
+                    except Exception:
+                        all_parts.append(f"\n[{inner_name}]: Failed to extract ({e})")
+
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(content))
+            await _process_zip(zf)
+            zf.close()
+        except zipfile.BadZipFile:
+            return DocumentExtraction(
+                text="[Error: Invalid or corrupted ZIP file]",
+                chunks=["[Error: Invalid or corrupted ZIP file]"],
+                word_count=0,
+                metadata={"error": "bad_zip"}
+            )
+
+        full_text = "\n".join(all_parts).strip() or "[Empty ZIP archive]"
+        chunks = self._chunk_text(full_text, chunk_size, chunk_overlap)
+
+        return DocumentExtraction(
+            text=full_text,
+            chunks=chunks,
+            word_count=len(full_text.split()),
+            metadata={"files_processed": files_processed, "total_uncompressed_bytes": total_size}
+        )
+
     async def _extract_markdown(
         self,
         content: bytes,

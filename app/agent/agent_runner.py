@@ -1577,14 +1577,20 @@ class AgentRunner:
         text: str,
         media_paths: List[str],
     ) -> List[Dict[str, Any]]:
-        """Build OpenAI content blocks with images (image_url) and text."""
+        """Build OpenAI content blocks with images (image_url) and document text."""
         import base64
         import mimetypes
 
         blocks: List[Dict[str, Any]] = []
+        doc_texts: List[str] = []
+
+        # Extensions that should be extracted as text via document parsers
+        _DOC_EXTENSIONS = {'.pdf', '.docx', '.pptx', '.zip', '.txt', '.md', '.json', '.yaml', '.yml', '.csv'}
 
         for path in media_paths:
             mime, _ = mimetypes.guess_type(path)
+            ext = os.path.splitext(path.lower())[1]
+
             if mime and mime.startswith("image/"):
                 try:
                     with open(path, "rb") as f:
@@ -1600,13 +1606,103 @@ class AgentRunner:
                     })
                 except Exception as e:
                     logger.warning(f"Failed to read image {path}: {e}")
-            else:
-                logger.warning(f"[AGENT] Skipping non-image media: {path} (mime={mime})")
 
-        if text:
-            blocks.append({"type": "text", "text": text})
-        
+            elif ext in _DOC_EXTENSIONS:
+                try:
+                    with open(path, "rb") as f:
+                        raw = f.read()
+                    extracted = self._extract_document_text(raw, os.path.basename(path), ext)
+                    if extracted:
+                        fname = os.path.basename(path)
+                        doc_texts.append(f"[Attached document: {fname}]\n{extracted}")
+                        logger.info(f"[AGENT] Document extracted: {path} ({len(raw)} bytes, {len(extracted)} chars text)")
+                except Exception as e:
+                    logger.warning(f"Failed to extract document {path}: {e}")
+            else:
+                logger.warning(f"[AGENT] Skipping unsupported media: {path} (mime={mime})")
+
+        # Combine user text with any extracted document content
+        combined_text = text or ""
+        if doc_texts:
+            combined_text = combined_text + "\n\n" + "\n\n".join(doc_texts) if combined_text else "\n\n".join(doc_texts)
+
+        if combined_text:
+            blocks.append({"type": "text", "text": combined_text})
+
         return blocks if blocks else [{"type": "text", "text": text or ""}]
+
+    def _extract_document_text(self, content: bytes, filename: str, ext: str) -> Optional[str]:
+        """Synchronously extract text from a document file for inline chat context."""
+        import io as _io
+
+        try:
+            if ext == '.pdf':
+                from pypdf import PdfReader
+                reader = PdfReader(_io.BytesIO(content))
+                return "\n\n".join(page.extract_text() or "" for page in reader.pages).strip()
+
+            elif ext == '.docx':
+                from docx import Document as DocxDocument
+                doc = DocxDocument(_io.BytesIO(content))
+                return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+            elif ext == '.pptx':
+                from pptx import Presentation as PptxPresentation
+                prs = PptxPresentation(_io.BytesIO(content))
+                parts = []
+                for i, slide in enumerate(prs.slides, 1):
+                    slide_parts = [f"--- Slide {i} ---"]
+                    for shape in slide.shapes:
+                        if shape.has_text_frame:
+                            t = shape.text_frame.text.strip()
+                            if t:
+                                slide_parts.append(t)
+                        if shape.has_table:
+                            for row in shape.table.rows:
+                                row_text = " | ".join(cell.text.strip() for cell in row.cells)
+                                if row_text.strip(" |"):
+                                    slide_parts.append(row_text)
+                    if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                        notes = slide.notes_slide.notes_text_frame.text.strip()
+                        if notes:
+                            slide_parts.append(f"[Speaker Notes] {notes}")
+                    parts.append("\n".join(slide_parts))
+                return "\n\n".join(parts)
+
+            elif ext == '.zip':
+                import zipfile
+                if not zipfile.is_zipfile(_io.BytesIO(content)):
+                    return "[Invalid ZIP file]"
+                zf = zipfile.ZipFile(_io.BytesIO(content))
+                parts = []
+                for i, info in enumerate(zf.infolist()):
+                    if info.is_dir() or i >= 50:
+                        continue
+                    inner_ext = os.path.splitext(info.filename.lower())[1]
+                    if inner_ext in {'.txt', '.md', '.json', '.csv', '.yaml', '.yml', '.py', '.js', '.ts'}:
+                        try:
+                            raw = zf.read(info)
+                            parts.append(f"=== {info.filename} ===\n{raw.decode('utf-8', errors='replace')}")
+                        except Exception:
+                            pass
+                    elif inner_ext in {'.pdf', '.docx', '.pptx'}:
+                        try:
+                            raw = zf.read(info)
+                            inner_text = self._extract_document_text(raw, info.filename, inner_ext)
+                            if inner_text:
+                                parts.append(f"=== {info.filename} ===\n{inner_text}")
+                        except Exception:
+                            pass
+                zf.close()
+                return "\n\n".join(parts) if parts else "[Empty or no supported files in ZIP]"
+
+            else:
+                # Plain text types (.txt, .md, .json, .csv, .yaml, .yml)
+                return content.decode("utf-8", errors="replace").strip()
+
+        except Exception as e:
+            logger.warning(f"[AGENT] Document extraction failed for {filename}: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Error logging

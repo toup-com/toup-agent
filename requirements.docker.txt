@@ -40,6 +40,7 @@ anthropic>=0.40.0
 # Document parsing
 PyPDF2>=3.0.0
 python-docx>=1.0.0
+python-pptx>=1.0.0
 
 # Web scraping
 beautifulsoup4==4.12.3
