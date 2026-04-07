@@ -236,9 +236,9 @@ async def provision_container(
             raise RuntimeError(f"Failed to write env: {err}")
 
         # Create workspace structure and skills directory
+        # Note: .dashboard/ is created on-demand by dashboard.py — no need for a placeholder
         await _run_ssh(
             f"mkdir -p /data/agents/{user_id[:8]}/workspace/apps "
-            f"/data/agents/{user_id[:8]}/workspace/dashboard "
             f"/data/agents/{user_id[:8]}/workspace/vibecoding "
             f"/data/agents/{user_id[:8]}/skills"
         )

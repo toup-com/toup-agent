@@ -216,44 +216,58 @@ async def workspace_tree(
 
     # Merge DB-only apps into the tree (apps that exist in DB but have no directory on disk).
     # This ensures failed builds that never created a folder still appear in the Explorer.
+    # The apps table lives on the AGENT's database — we proxy to the agent's /api/apps/ endpoint.
     if not clean_path or clean_path == "apps":
         try:
-            from app.db.models import App
-            apps_result = await db.execute(
-                select(App).where(App.user_id == current_user.id)
+            import httpx
+            agent_url = f"http://{settings.docker_host_ip}:{container.host_port}"
+            # Get the agent API key from AgentConfig
+            from app.db.models import AgentConfig
+            ac_result = await db.execute(
+                select(AgentConfig.agent_api_key).where(
+                    AgentConfig.user_id == current_user.id,
+                    AgentConfig.deploy_status == "active",
+                )
             )
-            db_apps = apps_result.scalars().all()
-            for app in db_apps:
-                # Compute the relative path this app dir would have under the workspace
-                # app.app_dir is absolute (e.g., /app/workspace/apps/basic-calculator)
-                # We need the path relative to the workspace root
-                for base in (container_base, host_base):
-                    if app.app_dir.startswith(base):
-                        rel = app.app_dir[len(base):].strip("/")
-                        break
-                else:
-                    # app_dir doesn't match either base — try stripping /app/workspace/
-                    rel = app.app_dir.replace("/app/workspace/", "").replace("/opt/toup-agent/", "apps/").strip("/")
+            ac_row = ac_result.first()
+            agent_key = ac_row.agent_api_key if ac_row else ""
 
-                if clean_path:
-                    # If browsing a subpath, only include apps under that path
-                    if not rel.startswith(clean_path + "/") and rel != clean_path:
-                        continue
-                    # Adjust rel to be relative to clean_path
-                    rel = rel[len(clean_path):].strip("/")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(
+                    f"{agent_url}/api/apps/",
+                    headers={"X-Agent-Key": agent_key},
+                )
+                if resp.status_code == 200:
+                    agent_apps = resp.json()
+                    for app in agent_apps:
+                        slug = app.get("slug", "")
+                        source = app.get("source", "app_builder")
+                        if not slug:
+                            continue
+                        # Derive workspace-relative path from source + slug
+                        if source == "vibecoding":
+                            rel = f"vibecoding/{slug}"
+                        else:
+                            rel = f"apps/{slug}"
 
-                if rel and rel not in seen:
-                    seen.add(rel)
-                    name = rel.split("/")[-1]
-                    files.append({
-                        "name": name,
-                        "path": rel if not clean_path else f"{clean_path}/{rel}",
-                        "type": "dir",
-                        "size": 0,
-                        "status": app.status,  # Extra field so frontend can show error/orphaned badge
-                    })
+                        if clean_path:
+                            if not rel.startswith(clean_path + "/") and rel != clean_path:
+                                continue
+                            rel = rel[len(clean_path):].strip("/")
+
+                        if rel and rel not in seen:
+                            seen.add(rel)
+                            name = rel.split("/")[-1]
+                            files.append({
+                                "name": name,
+                                "path": rel if not clean_path else f"{clean_path}/{rel}",
+                                "type": "dir",
+                                "size": 0,
+                                "status": app.get("status", ""),
+                                "source": app.get("source", ""),
+                            })
         except Exception as e:
-            logger.warning("[WORKSPACE] Failed to merge DB apps into tree: %s", e)
+            logger.warning("[WORKSPACE] Failed to merge agent apps into tree: %s", e)
 
     files.sort(key=lambda f: (0 if f["type"] == "dir" else 1, f["path"]))
     return {"path": clean_path, "tree": files, "base": "/workspace"}
