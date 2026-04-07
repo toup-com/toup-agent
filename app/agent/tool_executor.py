@@ -2484,27 +2484,23 @@ class ToolExecutor:
                     netflix_id = data.get("netflix_id")
                     title = data.get("title") or clean_query
 
-            # Build URL
-            if netflix_id:
-                netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
-            else:
-                netflix_url = f"https://www.netflix.com/search?q={quote(clean_query)}"
+            if not netflix_id:
+                return f"Could not find \"{clean_query}\" on Netflix. Try a more specific title."
+
+            netflix_url = f"https://www.netflix.com/watch/{netflix_id}"
 
             # Auto-open in user's browser + show card in chat
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(user_id, {
                 "type": "netflix_card",
                 "title": f"{title}{episode_info}",
-                "netflix_id": netflix_id or "",
+                "netflix_id": netflix_id,
                 "url": netflix_url,
                 "media_type": "tv" if season_num else "movie",
             })
 
-            if netflix_id:
-                self._last_media = {"type": "netflix", "title": f"{title}{episode_info}", "netflix_id": netflix_id, "url": netflix_url}
-                return f"Now playing \"{title}\"{episode_info} on Netflix.\n{netflix_url}"
-            else:
-                return f"Opening Netflix search for \"{clean_query}\". The show should appear as the first result."
+            self._last_media = {"type": "netflix", "title": f"{title}{episode_info}", "netflix_id": netflix_id, "url": netflix_url}
+            return f"Now playing \"{title}\"{episode_info} on Netflix.\n{netflix_url}"
 
         except Exception as e:
             logger.warning("[play_netflix] Error: %s", e)
