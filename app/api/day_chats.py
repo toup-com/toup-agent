@@ -60,17 +60,27 @@ async def list_day_chats(
     # per day chat). For 90 days that's 91 queries. Fix when telemetry shows it matters.
     items = []
     for dc in day_chats:
-        # Get distinct channels for this day chat
+        # Get distinct channels from MESSAGES (not Conversations) — because Telegram
+        # sessions are long-lived and their Conversation.day_chat_id may point to a
+        # different day. Message.day_chat_id is canonical for day membership.
         ch_result = await db.execute(
             select(distinct(Conversation.channel))
-            .where(Conversation.day_chat_id == dc.id)
+            .select_from(Message)
+            .join(Conversation, Message.conversation_id == Conversation.id)
+            .where(Message.day_chat_id == dc.id)
         )
         channels = sorted([r[0] for r in ch_result.all() if r[0]])
+
+        # Count from messages table (canonical), not from DayChat.message_count (cached, can drift)
+        msg_count_result = await db.execute(
+            select(func.count()).select_from(Message).where(Message.day_chat_id == dc.id)
+        )
+        msg_count = msg_count_result.scalar() or 0
 
         items.append({
             "id": dc.id,
             "local_date": dc.local_date.isoformat(),
-            "message_count": dc.message_count or 0,
+            "message_count": msg_count,
             "channels_active": channels,
             "last_message_at": dc.last_message_at.isoformat() if dc.last_message_at else None,
             "summary_status": dc.summary_status or "up_to_date",

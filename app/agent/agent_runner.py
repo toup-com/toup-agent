@@ -1434,12 +1434,18 @@ class AgentRunner:
 
         msg_count = 0
 
-        # Resolve day_chat_id from the session (for denormalization on messages)
+        # Resolve day_chat_id from the CURRENT TIME, not from the Conversation row.
+        # Telegram sessions are long-lived and span days — their Conversation.day_chat_id
+        # points to the creation day, not today. Messages must be bucketed by send time.
         result = await db.execute(
             select(Conversation).where(Conversation.id == session_id)
         )
         session = result.scalar_one_or_none()
-        _day_chat_id = getattr(session, 'day_chat_id', None) if session else None
+        try:
+            from app.db.message_helpers import resolve_day_chat_id_for_now
+            _day_chat_id = await resolve_day_chat_id_for_now(db, user_id)
+        except Exception:
+            _day_chat_id = getattr(session, 'day_chat_id', None) if session else None
 
         if save_user_message:
             user_msg = Message(

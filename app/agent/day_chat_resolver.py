@@ -2,7 +2,15 @@
 Day Chat Resolver — maps (user_id, timestamp, timezone) to a DayChat row.
 
 This is the single entry point for resolving which DayChat a message belongs to.
-All session creation flows go through here.
+All message save paths must call get_or_create_day_chat() to resolve the correct
+DayChat for the CURRENT TIME, not read day_chat_id from the Conversation row.
+
+CRITICAL SEMANTIC: Message.day_chat_id is CANONICAL for day membership.
+Conversation.day_chat_id is a LOOSE HINT that may be stale — Telegram sessions
+are long-lived and span multiple days, so their Conversation.day_chat_id points
+to the day the session was created, not the current day. Never determine which
+day a message belongs to by looking at its parent Conversation's day_chat_id.
+Always use Message.day_chat_id directly.
 
 Key semantics:
   - One DayChat per (user_id, local_date). Uses Postgres INSERT ... ON CONFLICT

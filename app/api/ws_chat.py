@@ -96,18 +96,10 @@ def _friendly_error(exc: Exception) -> str:
 _user_ws_queues: Dict[str, List[asyncio.Queue]] = {}
 
 
-async def _resolve_day_chat_id(db_session, conversation_id: str):
-    """Resolve day_chat_id from a conversation's parent DayChat. Returns None if not found."""
-    if not conversation_id:
-        return None
-    try:
-        from app.db.models import Conversation
-        row = (await db_session.execute(
-            select(Conversation.day_chat_id).where(Conversation.id == conversation_id)
-        )).scalar_one_or_none()
-        return row
-    except Exception:
-        return None
+async def _resolve_day_chat_id_for_now(db_session, user_id: str):
+    """Thin wrapper around the shared helper. See app.db.message_helpers."""
+    from app.db.message_helpers import resolve_day_chat_id_for_now
+    return await resolve_day_chat_id_for_now(db_session, user_id)
 
 
 async def broadcast_to_user(user_id: str, event: dict) -> int:
@@ -687,7 +679,7 @@ async def ws_chat(
                     from app.db.database import async_session_maker
                     from app.db.models import Message as DbMessage, Conversation
                     async with async_session_maker() as _presave_db:
-                        _presave_dc_id = await _resolve_day_chat_id(_presave_db, session_id)
+                        _presave_dc_id = await _resolve_day_chat_id_for_now(_presave_db, user_id)
                         _presave_db.add(DbMessage(
                             conversation_id=session_id,
                             day_chat_id=_presave_dc_id,
@@ -909,7 +901,7 @@ async def ws_chat(
                                         select(MsgModel).where(MsgModel.id == _jmid)
                                     )
                                     if not _existing.scalar_one_or_none():
-                                        _job_dc = await _resolve_day_chat_id(_jdb, response.session_id)
+                                        _job_dc = await _resolve_day_chat_id_for_now(_jdb, user_id)
                                         _jdb.add(MsgModel(
                                             id=_jmid,
                                             conversation_id=response.session_id,
@@ -958,7 +950,7 @@ async def ws_chat(
                     if _partial:
                         try:
                             async with async_session_maker() as _err_db:
-                                _err_dc = await _resolve_day_chat_id(_err_db, session_id)
+                                _err_dc = await _resolve_day_chat_id_for_now(_err_db, user_id)
                                 _err_db.add(DbMessage(
                                     conversation_id=session_id, day_chat_id=_err_dc, role="assistant",
                                     content=_partial + "\n\n*[Generation stopped by user]*",
@@ -980,7 +972,7 @@ async def ws_chat(
                     if _partial:
                         try:
                             async with async_session_maker() as _err_db:
-                                _err_dc = await _resolve_day_chat_id(_err_db, session_id)
+                                _err_dc = await _resolve_day_chat_id_for_now(_err_db, user_id)
                                 _err_db.add(DbMessage(
                                     conversation_id=session_id, day_chat_id=_err_dc, role="assistant",
                                     content=_partial + "\n\n*[Response interrupted due to an error]*",

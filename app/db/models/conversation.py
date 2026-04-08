@@ -23,7 +23,10 @@ class Conversation(Base):
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     title: Mapped[Optional[str]] = mapped_column(String(500))
 
-    # Parent DayChat — nullable during migration, non-nullable after backfill
+    # Parent DayChat — LOOSE HINT, may be stale for long-lived Telegram sessions.
+    # Telegram sessions span multiple days; this field points to the day the session
+    # was created, not necessarily today. For determining which day a message belongs to,
+    # ALWAYS use Message.day_chat_id (canonical) — never Conversation.day_chat_id.
     day_chat_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("day_chats.id"), nullable=True, index=True)
 
     # Channel tracking
