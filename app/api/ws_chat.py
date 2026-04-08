@@ -673,8 +673,17 @@ async def ws_chat(
                     from app.db.database import async_session_maker
                     from app.db.models import Message as DbMessage, Conversation
                     async with async_session_maker() as _presave_db:
+                        # Resolve day_chat_id from the conversation's parent DayChat
+                        _presave_dc_id = None
+                        if session_id:
+                            _presave_conv = (await _presave_db.execute(
+                                select(Conversation.day_chat_id).where(Conversation.id == session_id)
+                            )).scalar_one_or_none()
+                            if _presave_conv:
+                                _presave_dc_id = _presave_conv
                         _presave_db.add(DbMessage(
                             conversation_id=session_id,
+                            day_chat_id=_presave_dc_id,
                             role="user",
                             content=text,
                         ))
