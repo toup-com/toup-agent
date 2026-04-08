@@ -788,19 +788,19 @@ async def lifespan(app: FastAPI):
 
                 result = await _bmod.run_backfill(_bsm)
                 if result == "already_completed":
-                    logger.info("day_chat_backfill.skipped reason=already_completed")
+                    print("day_chat_backfill.skipped reason=already_completed")
                 elif result == "completed":
-                    logger.info("day_chat_backfill.done")
+                    print("day_chat_backfill.done")
                 elif result == "failed":
-                    logger.error("day_chat_backfill.skipped reason=previously_failed")
+                    print("⚠️ day_chat_backfill.skipped reason=previously_failed")
             except Exception as e:
                 # Backfill failure is never fatal — agent continues on old path
-                logger.error("day_chat_backfill.crash error=%s", e)
+                print(f"⚠️ day_chat_backfill.crash error={e}")
 
         _backfill_task = asyncio.create_task(_run_day_chat_backfill())
-        logger.info("day_chat_backfill.scheduled")
+        print("day_chat_backfill.scheduled")
     except Exception as e:
-        logger.warning("day_chat_backfill.skipped reason=import_error error=%s", e)
+        print(f"⚠️ day_chat_backfill.skipped reason=import_error error={e}")
 
     print("🤖 Toup Agent ready.")
     print(f"   Server:  http://0.0.0.0:8001")
