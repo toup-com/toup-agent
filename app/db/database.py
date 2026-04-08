@@ -163,22 +163,21 @@ async def init_db():
         _logger.warning("Could not verify table partitioning: %s", _e)
 
     # Add missing columns to existing tables (create_all only creates new tables).
-    # Split by run_mode: shared statements run everywhere, platform/agent-specific
-    # statements only run in their respective modes.
+    #
+    # IMPORTANT: All ALTER statements run in ALL modes. The table partitioning
+    # (AGENT_ONLY / PLATFORM_ONLY) only gates table CREATION, not column additions.
+    # Agent DBs are monolith-style — they contain all tables including platform ones
+    # (agent_configs, vps_plans, etc.) from before the partitioning was introduced.
+    # ALTER TABLE ... IF NOT EXISTS is safe on any table whether or not it "belongs"
+    # to this run_mode. Trying to ALTER a non-existent table just silently fails
+    # in the try/except below.
 
-    # ── Shared (both platform and agent) ──
-    _alter_shared = [
-        # Password change tracking (token revocation)
+    _alter_statements = [
+        # ── Users ──
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
-        # Day-as-Chat: user timezone
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone VARCHAR(50)",
-        # Stripe customer linkage on users (shared — users table exists in both DBs)
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255) UNIQUE",
-    ]
-
-    # ── Platform-only ALTER statements ──
-    _alter_platform = [
-        # LLM bundle columns on agent_configs (migration 016)
+        # ── Agent configs ──
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_mode VARCHAR(20) DEFAULT 'manual'",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS google_api_key TEXT",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS mistral_api_key TEXT",
@@ -189,33 +188,23 @@ async def init_db():
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_status VARCHAR(20) DEFAULT 'none'",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_started_at TIMESTAMP",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_current_period_end TIMESTAMP",
-        # Onboarding flag
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS agent_color VARCHAR(7)",
-        # Per-user tool access control
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS disabled_tools TEXT DEFAULT ''",
-        # Connect token for tunnel authentication
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS connect_token VARCHAR(100)",
-        # Agent display name (migration 017)
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS agent_name VARCHAR(100)",
-        # Database mode for agent deployment
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS db_mode VARCHAR(20) DEFAULT 'auto'",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS supabase_url TEXT",
-        # Multi-provider VPS support (Hostinger + Hetzner)
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS target_os VARCHAR(20)",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS setup_type VARCHAR(20)",
+        # ── VPS ──
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS hostinger_plan_id VARCHAR(50)",
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS hetzner_server_type VARCHAR(20)",
         "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
         "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS hostinger_vm_id VARCHAR(50)",
         "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS hetzner_vm_id VARCHAR(50)",
-        # Target OS for remote deploy (linux/macos/windows)
-        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS target_os VARCHAR(20)",
-        # Setup wizard type tracking (migration 019)
-        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS setup_type VARCHAR(20)",
-    ]
-
-    # ── Agent-only ALTER statements ──
-    _alter_agent = [
+        # ── Build jobs ──
         # Build logs for app builder jobs
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS build_logs_json TEXT DEFAULT '[]'",
         # Approved plan from conversational app builder
@@ -245,13 +234,6 @@ async def init_db():
         # Day-as-Chat: composite index for hot-path query
         "CREATE INDEX IF NOT EXISTS ix_messages_day_chat_created ON messages(day_chat_id, created_at)",
     ]
-
-    # Assemble final list based on run_mode
-    _alter_statements = list(_alter_shared)
-    if _run_mode in ("platform", "monolith"):
-        _alter_statements.extend(_alter_platform)
-    if _run_mode in ("agent", "monolith"):
-        _alter_statements.extend(_alter_agent)
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)
     if _run_mode in ("agent", "monolith"):
