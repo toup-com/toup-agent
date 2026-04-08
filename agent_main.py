@@ -36,6 +36,7 @@ from app.api import agent_router
 from app.api.stats import router as stats_router
 from app.api.memories import router as memories_router
 from app.api.sessions import router as sessions_router
+from app.api.day_chats import router as day_chats_router
 from app.api.chat import router as chat_router
 from app.api.ws_chat import router as ws_chat_router, set_ws_refs
 from app.api.api_v1 import router as api_v1_router
@@ -902,6 +903,7 @@ app.include_router(agent_router, prefix=settings.api_prefix)
 app.include_router(stats_router, prefix=settings.api_prefix)
 app.include_router(memories_router, prefix=settings.api_prefix)
 app.include_router(sessions_router, prefix=settings.api_prefix)
+app.include_router(day_chats_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
 app.include_router(ws_chat_router, prefix=settings.api_prefix)
 app.include_router(api_v1_router, prefix=settings.api_prefix)

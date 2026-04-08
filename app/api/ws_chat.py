@@ -473,6 +473,69 @@ async def ws_chat(
                 session_id = msg.get("session_id")
                 model = msg.get("model")
                 channel = msg.get("channel")  # e.g. "mobile", "web", "app"
+                client_tz = msg.get("tz")  # IANA timezone, e.g. "America/Toronto"
+
+                # ── Persist timezone to User if changed ──
+                # Self-healing: frontend sends tz on every message, we persist it once.
+                # If timezone changes from one real value to another, queue a re-bucket.
+                if client_tz and isinstance(client_tz, str) and len(client_tz) < 50:
+                    try:
+                        from app.db.database import async_session_maker as _tz_sm
+                        from app.db.models import User
+                        async with _tz_sm() as _tz_db:
+                            _user = (await _tz_db.execute(
+                                select(User).where(User.id == user_id)
+                            )).scalar_one_or_none()
+                            if _user:
+                                _old_tz = _user.timezone
+                                if _old_tz != client_tz:
+                                    _user.timezone = client_tz
+                                    await _tz_db.commit()
+                                    logger.info("[WS] Updated timezone for %s: %s → %s", user_id[:8], _old_tz, client_tz)
+
+                                    # Auto-rebucket if timezone changed from one real value to another
+                                    # (not just NULL → real, which is the initial backfill case)
+                                    if _old_tz and _old_tz != "UTC" and _old_tz != client_tz:
+                                        import os as _tz_os
+                                        async def _trigger_rebucket():
+                                            try:
+                                                import importlib.util as _ilu
+                                                _spec = _ilu.spec_from_file_location(
+                                                    "backfill_day_chats",
+                                                    _tz_os.path.join(_tz_os.path.dirname(_tz_os.path.dirname(__file__)), "services", "backfill_day_chats.py"),
+                                                )
+                                                _bmod = _ilu.module_from_spec(_spec)
+                                                _spec.loader.exec_module(_bmod)
+
+                                                # Reset migration status to not_started
+                                                from app.db.models.day_chat import MigrationStatus
+                                                async with _tz_sm() as _rb_db:
+                                                    ms = (await _rb_db.execute(
+                                                        select(MigrationStatus).where(
+                                                            MigrationStatus.migration_name == "day_chat_backfill"
+                                                        )
+                                                    )).scalar_one_or_none()
+                                                    if ms:
+                                                        ms.status = "not_started"
+                                                        ms.started_at = None
+                                                        ms.completed_at = None
+                                                        ms.progress_json = None
+                                                        ms.error_message = None
+                                                        await _rb_db.commit()
+
+                                                result = await _bmod.run_backfill(_tz_sm)
+                                                logger.info("day_chat_backfill.rebucket_completed tz_change=%s→%s result=%s", _old_tz, client_tz, result)
+                                            except Exception as _rbe:
+                                                logger.error("day_chat_backfill.rebucket_failed error=%s", _rbe)
+
+                                        # NOTE: If the WS connection closes mid-rebucket, this task may be
+                                        # garbage-collected and MigrationStatus left in 'in_progress'.
+                                        # This is acceptable — the next agent restart resumes it via
+                                        # the standard backfill startup path (in_progress → resume).
+                                        asyncio.create_task(_trigger_rebucket())
+                                        logger.info("day_chat_backfill.rebucket_queued tz_change=%s→%s", _old_tz, client_tz)
+                    except Exception as _tz_err:
+                        logger.debug("[WS] Timezone persistence skipped: %s", _tz_err)
 
                 # If message comes from inside a built app, prepend context
                 app_id_from_msg = msg.get("app_id")
@@ -858,6 +921,9 @@ async def ws_chat(
                         "tool_calls": len(response.tool_calls),
                         "processing_time_ms": response.processing_time_ms,
                     }
+                    # Day-as-Chat: include day_chat_id so frontend can group by day
+                    if getattr(response, 'day_chat_id', None):
+                        _done_payload["day_chat_id"] = response.day_chat_id
                     # Include any build jobs triggered during this run
                     if _pending_job_cards:
                         _done_payload["build_jobs"] = list(_pending_job_cards)

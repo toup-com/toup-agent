@@ -41,6 +41,10 @@ class MemoryCategory(str, Enum):
     INTERACTION = "interaction"     # How the user prefers to interact
     OTHER = "other"                 # Uncategorized
 
+    # Active work tracking (Day-as-Chat)
+    ACTIVE_TASK = "active_task"     # Ongoing work: "debugging X", "building Y", "waiting for Z"
+                                    # 7-day TTL, decayed if not reinforced, always injected
+
 
 # Backwards compatibility alias
 BrainRegion = MemoryCategory

@@ -76,7 +76,8 @@ class QueryIntent:
     include_skill_prompts: bool = False              # Whether to include skill system prompt sections
     include_environment: bool = False                # Whether to include environment section
     include_media_section: bool = False              # Whether to include media section
-    skip_memory_retrieval: bool = False              # Whether to skip hybrid memory search
+    # NOTE: skip_memory_retrieval was removed — memories are always retrieved now.
+    # 200ms cost is acceptable for context quality. See Day-as-Chat architecture.
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +265,6 @@ INTENT_GREETING = QueryIntent(
     include_skill_prompts=False,
     include_environment=False,
     include_media_section=False,
-    skip_memory_retrieval=True,
 )
 
 INTENT_QUESTION = QueryIntent(
@@ -274,7 +274,6 @@ INTENT_QUESTION = QueryIntent(
     include_skill_prompts=False,
     include_environment=False,
     include_media_section=False,
-    skip_memory_retrieval=True,  # General questions don't need user memories
 )
 
 INTENT_MEMORY = QueryIntent(
@@ -284,7 +283,6 @@ INTENT_MEMORY = QueryIntent(
     include_skill_prompts=False,
     include_environment=False,
     include_media_section=False,
-    skip_memory_retrieval=False,
 )
 
 INTENT_WEB = QueryIntent(
@@ -294,7 +292,6 @@ INTENT_WEB = QueryIntent(
     include_skill_prompts=False,
     include_environment=False,
     include_media_section=False,
-    skip_memory_retrieval=True,  # Web searches don't need user memories
 )
 
 INTENT_MEDIA = QueryIntent(
@@ -304,7 +301,6 @@ INTENT_MEDIA = QueryIntent(
     include_skill_prompts=False,
     include_environment=False,
     include_media_section=True,
-    skip_memory_retrieval=True,
 )
 
 INTENT_CODE = QueryIntent(
@@ -314,7 +310,6 @@ INTENT_CODE = QueryIntent(
     include_skill_prompts=True,
     include_environment=True,
     include_media_section=False,
-    skip_memory_retrieval=True,  # Code tasks don't need user memories
 )
 
 INTENT_AGENT = QueryIntent(
@@ -324,7 +319,6 @@ INTENT_AGENT = QueryIntent(
     include_skill_prompts=False,
     include_environment=True,
     include_media_section=False,
-    skip_memory_retrieval=True,
 )
 
 INTENT_FULL = QueryIntent(
@@ -334,7 +328,6 @@ INTENT_FULL = QueryIntent(
     include_skill_prompts=True,
     include_environment=True,
     include_media_section=True,
-    skip_memory_retrieval=False,
 )
 
 

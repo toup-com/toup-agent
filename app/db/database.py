@@ -210,6 +210,8 @@ async def init_db():
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS target_os VARCHAR(20)",
         # Stripe customer linkage on users (migration 018)
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255) UNIQUE",
+        # Setup wizard type tracking (migration 019)
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS setup_type VARCHAR(20)",
     ]
 
     # ── Agent-only ALTER statements ──

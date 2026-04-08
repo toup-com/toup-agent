@@ -141,7 +141,8 @@ class AgentConfig(Base):
 
     # Wizard state
     setup_completed: Mapped[bool] = mapped_column(Boolean, default=False)
-    setup_step: Mapped[int] = mapped_column(Integer, default=1)
+    setup_step: Mapped[int] = mapped_column(Integer, default=0)
+    setup_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # 'auto' | 'manual' | None
     onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False)
     agent_color: Mapped[Optional[str]] = mapped_column(String(7), nullable=True)
 
