@@ -172,6 +172,8 @@ async def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
         # Day-as-Chat: user timezone
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone VARCHAR(50)",
+        # Stripe customer linkage on users (shared — users table exists in both DBs)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255) UNIQUE",
     ]
 
     # ── Platform-only ALTER statements ──
@@ -208,8 +210,6 @@ async def init_db():
         "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS hetzner_vm_id VARCHAR(50)",
         # Target OS for remote deploy (linux/macos/windows)
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS target_os VARCHAR(20)",
-        # Stripe customer linkage on users (migration 018)
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255) UNIQUE",
         # Setup wizard type tracking (migration 019)
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS setup_type VARCHAR(20)",
     ]
