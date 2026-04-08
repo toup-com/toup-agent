@@ -78,6 +78,9 @@ async def get_or_create_day_chat(
 
     local_date, resolved_tz = resolve_local_date(utc_now, tz_name)
 
+    # Strip tzinfo for DB insertion — codebase convention is naive UTC datetimes
+    utc_now_naive = utc_now.replace(tzinfo=None) if utc_now.tzinfo else utc_now
+
     # Fast path: check if it already exists
     existing = (await db.execute(
         select(DayChat).where(
@@ -98,8 +101,8 @@ async def get_or_create_day_chat(
             user_id=user_id,
             local_date=local_date,
             timezone=resolved_tz,
-            started_at=utc_now,
-            last_message_at=utc_now,
+            started_at=utc_now_naive,
+            last_message_at=utc_now_naive,
             message_count=0,
             total_tokens=0,
             summary_status="up_to_date",
@@ -128,8 +131,8 @@ async def get_or_create_day_chat(
         user_id=user_id,
         local_date=local_date,
         timezone=resolved_tz,
-        started_at=utc_now,
-        last_message_at=utc_now,
+        started_at=utc_now_naive,
+        last_message_at=utc_now_naive,
         message_count=0,
         total_tokens=0,
         summary_status="up_to_date",
