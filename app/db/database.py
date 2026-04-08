@@ -142,23 +142,21 @@ async def init_db():
         if _run_mode == "platform":
             _leaked = _existing_set & AGENT_ONLY_TABLES
             if _leaked:
-                _logger.error(
-                    "FATAL: Agent-only tables found in platform DB: %s. "
-                    "This means table partitioning in base.py is broken. "
-                    "Fix AGENT_ONLY_TABLES or remove these tables manually.",
+                # Warn but don't crash — legacy monolith DBs have all tables.
+                # New tables won't be created (filtered above), but old ones remain.
+                _logger.warning(
+                    "Agent-only tables found in platform DB (legacy monolith): %s. "
+                    "These are harmless leftovers — new agent tables won't be created.",
                     _leaked,
                 )
-                raise RuntimeError(f"Agent-only tables leaked into platform DB: {_leaked}")
         elif _run_mode == "agent":
             _leaked = _existing_set & PLATFORM_ONLY_TABLES
             if _leaked:
-                _logger.error(
-                    "FATAL: Platform-only tables found in agent DB: %s. "
-                    "This means table partitioning in base.py is broken. "
-                    "Fix PLATFORM_ONLY_TABLES or remove these tables manually.",
+                _logger.warning(
+                    "Platform-only tables found in agent DB (legacy monolith): %s. "
+                    "These are harmless leftovers — new platform tables won't be created.",
                     _leaked,
                 )
-                raise RuntimeError(f"Platform-only tables leaked into agent DB: {_leaked}")
     except RuntimeError:
         raise
     except Exception as _e:
