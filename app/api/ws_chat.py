@@ -96,6 +96,20 @@ def _friendly_error(exc: Exception) -> str:
 _user_ws_queues: Dict[str, List[asyncio.Queue]] = {}
 
 
+async def _resolve_day_chat_id(db_session, conversation_id: str):
+    """Resolve day_chat_id from a conversation's parent DayChat. Returns None if not found."""
+    if not conversation_id:
+        return None
+    try:
+        from app.db.models import Conversation
+        row = (await db_session.execute(
+            select(Conversation.day_chat_id).where(Conversation.id == conversation_id)
+        )).scalar_one_or_none()
+        return row
+    except Exception:
+        return None
+
+
 async def broadcast_to_user(user_id: str, event: dict) -> int:
     """Push an event to all WebSocket connections for a user.
     Returns number of connections that received the event."""
@@ -673,14 +687,7 @@ async def ws_chat(
                     from app.db.database import async_session_maker
                     from app.db.models import Message as DbMessage, Conversation
                     async with async_session_maker() as _presave_db:
-                        # Resolve day_chat_id from the conversation's parent DayChat
-                        _presave_dc_id = None
-                        if session_id:
-                            _presave_conv = (await _presave_db.execute(
-                                select(Conversation.day_chat_id).where(Conversation.id == session_id)
-                            )).scalar_one_or_none()
-                            if _presave_conv:
-                                _presave_dc_id = _presave_conv
+                        _presave_dc_id = await _resolve_day_chat_id(_presave_db, session_id)
                         _presave_db.add(DbMessage(
                             conversation_id=session_id,
                             day_chat_id=_presave_dc_id,
@@ -902,9 +909,11 @@ async def ws_chat(
                                         select(MsgModel).where(MsgModel.id == _jmid)
                                     )
                                     if not _existing.scalar_one_or_none():
+                                        _job_dc = await _resolve_day_chat_id(_jdb, response.session_id)
                                         _jdb.add(MsgModel(
                                             id=_jmid,
                                             conversation_id=response.session_id,
+                                            day_chat_id=_job_dc,
                                             role="job",
                                             content=json.dumps({
                                                 "job_id": _jc["job_id"],
@@ -949,8 +958,9 @@ async def ws_chat(
                     if _partial:
                         try:
                             async with async_session_maker() as _err_db:
+                                _err_dc = await _resolve_day_chat_id(_err_db, session_id)
                                 _err_db.add(DbMessage(
-                                    conversation_id=session_id, role="assistant",
+                                    conversation_id=session_id, day_chat_id=_err_dc, role="assistant",
                                     content=_partial + "\n\n*[Generation stopped by user]*",
                                 ))
                                 await _err_db.commit()
@@ -970,8 +980,9 @@ async def ws_chat(
                     if _partial:
                         try:
                             async with async_session_maker() as _err_db:
+                                _err_dc = await _resolve_day_chat_id(_err_db, session_id)
                                 _err_db.add(DbMessage(
-                                    conversation_id=session_id, role="assistant",
+                                    conversation_id=session_id, day_chat_id=_err_dc, role="assistant",
                                     content=_partial + "\n\n*[Response interrupted due to an error]*",
                                 ))
                                 await _err_db.commit()
