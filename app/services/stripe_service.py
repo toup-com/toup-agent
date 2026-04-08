@@ -1,8 +1,10 @@
 """
-Stripe integration helpers for VPS checkout sessions.
+Stripe integration — checkout sessions, webhook verification,
+customer management, billing portal, and subscription helpers.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 import stripe
@@ -25,6 +27,94 @@ def _get_stripe_client() -> stripe.StripeClient:
     return stripe.StripeClient(settings.stripe_secret_key)
 
 
+# ── Customer management ──────────────────────────────────────────────
+
+
+def get_or_create_customer(user_id: str, email: str, name: Optional[str] = None) -> str:
+    """
+    Return an existing Stripe customer ID for the email, or create one.
+    Always tags metadata.user_id so we can reconcile later.
+    """
+    client = _get_stripe_client()
+
+    # Search by email first
+    existing = client.customers.list(params={"email": email, "limit": 1})
+    if existing.data:
+        cust = existing.data[0]
+        # Ensure our user_id is in metadata
+        if cust.metadata.get("user_id") != user_id:
+            client.customers.update(
+                cust.id,
+                params={"metadata": {"user_id": user_id}},
+            )
+        return cust.id
+
+    # Create new customer
+    cust = client.customers.create(
+        params={
+            "email": email,
+            "name": name or "",
+            "metadata": {"user_id": user_id},
+        }
+    )
+    return cust.id
+
+
+def create_billing_portal_session(customer_id: str, return_url: str) -> str:
+    """Create a Stripe Customer Portal session. Returns the portal URL."""
+    client = _get_stripe_client()
+    session = client.billing_portal.sessions.create(
+        params={
+            "customer": customer_id,
+            "return_url": return_url,
+        }
+    )
+    return session.url
+
+
+# ── Subscription helpers ─────────────────────────────────────────────
+
+
+def get_subscription(subscription_id: str) -> Optional[dict]:
+    """Retrieve a subscription from Stripe. Returns None on error."""
+    try:
+        client = _get_stripe_client()
+        sub = client.subscriptions.retrieve(subscription_id)
+        return {
+            "id": sub.id,
+            "status": sub.status,
+            "current_period_end": datetime.fromtimestamp(
+                sub.current_period_end, tz=timezone.utc
+            ),
+            "cancel_at_period_end": sub.cancel_at_period_end,
+            "customer": sub.customer,
+        }
+    except Exception as exc:
+        logger.warning("Failed to retrieve subscription %s: %s", subscription_id, exc)
+        return None
+
+
+def get_price(price_id: str) -> Optional[dict]:
+    """Retrieve a Stripe Price. Returns dict with unit_amount, currency, nickname."""
+    try:
+        client = _get_stripe_client()
+        price = client.prices.retrieve(price_id, params={"expand": ["product"]})
+        product = price.product
+        return {
+            "id": price.id,
+            "unit_amount": price.unit_amount,
+            "currency": price.currency,
+            "interval": price.recurring.interval if price.recurring else None,
+            "product_name": product.name if hasattr(product, "name") else "",
+        }
+    except Exception as exc:
+        logger.warning("Failed to retrieve price %s: %s", price_id, exc)
+        return None
+
+
+# ── Checkout sessions ────────────────────────────────────────────────
+
+
 def create_checkout_session(
     user_id: str,
     user_email: str,
@@ -32,15 +122,13 @@ def create_checkout_session(
     vps_instance_id: str,
     success_url: str,
     cancel_url: str,
+    stripe_customer_id: Optional[str] = None,
 ) -> dict:
     """
     Create a Stripe Checkout Session for a VPS subscription.
 
     Returns the session dict with at least:
         { "id": "cs_...", "url": "https://checkout.stripe.com/..." }
-
-    The vps_instance_id is stored in session metadata so the webhook
-    can look up the right VPSInstance record.
     """
     client = _get_stripe_client()
 
@@ -49,35 +137,36 @@ def create_checkout_session(
         raise ValueError(f"Unknown plan_id: {plan_id}")
 
     stripe_price_id: str = getattr(settings, price_id_attr, "")
-
     if not stripe_price_id:
         raise ValueError(
             f"Stripe price ID for plan '{plan_id}' is not configured "
             f"(set {price_id_attr.upper()} in environment)"
         )
 
-    session = client.checkout.sessions.create(
-        params={
-            "mode": "subscription",
-            "line_items": [{"price": stripe_price_id, "quantity": 1}],
-            "customer_email": user_email,
-            "success_url": success_url,
-            "cancel_url": cancel_url,
+    params: dict = {
+        "mode": "subscription",
+        "line_items": [{"price": stripe_price_id, "quantity": 1}],
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata": {
+            "user_id": user_id,
+            "vps_instance_id": vps_instance_id,
+            "plan_id": plan_id,
+        },
+        "subscription_data": {
             "metadata": {
                 "user_id": user_id,
                 "vps_instance_id": vps_instance_id,
-                "plan_id": plan_id,
-            },
-            "subscription_data": {
-                "metadata": {
-                    "user_id": user_id,
-                    "vps_instance_id": vps_instance_id,
-                }
-            },
-        }
-    )
+            }
+        },
+    }
+    if stripe_customer_id:
+        params["customer"] = stripe_customer_id
+    else:
+        params["customer_email"] = user_email
 
-    return {"id": session.id, "url": session.url}
+    session = client.checkout.sessions.create(params=params)
+    return {"id": session.id, "url": session.url, "customer": session.customer}
 
 
 def create_bundle_checkout_session(
@@ -85,6 +174,7 @@ def create_bundle_checkout_session(
     user_email: str,
     success_url: str,
     cancel_url: str,
+    stripe_customer_id: Optional[str] = None,
 ) -> dict:
     """
     Create a Stripe Checkout Session for the $40/mo LLM bundle subscription.
@@ -93,31 +183,31 @@ def create_bundle_checkout_session(
 
     price_id = settings.stripe_llm_bundle_price_id
     if not price_id:
-        raise ValueError(
-            "STRIPE_LLM_BUNDLE_PRICE_ID is not configured"
-        )
+        raise ValueError("STRIPE_LLM_BUNDLE_PRICE_ID is not configured")
 
-    session = client.checkout.sessions.create(
-        params={
-            "mode": "subscription",
-            "line_items": [{"price": price_id, "quantity": 1}],
-            "customer_email": user_email,
-            "success_url": success_url,
-            "cancel_url": cancel_url,
+    params: dict = {
+        "mode": "subscription",
+        "line_items": [{"price": price_id, "quantity": 1}],
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata": {
+            "user_id": user_id,
+            "type": "llm_bundle",
+        },
+        "subscription_data": {
             "metadata": {
                 "user_id": user_id,
                 "type": "llm_bundle",
-            },
-            "subscription_data": {
-                "metadata": {
-                    "user_id": user_id,
-                    "type": "llm_bundle",
-                }
-            },
-        }
-    )
+            }
+        },
+    }
+    if stripe_customer_id:
+        params["customer"] = stripe_customer_id
+    else:
+        params["customer_email"] = user_email
 
-    return {"id": session.id, "url": session.url}
+    session = client.checkout.sessions.create(params=params)
+    return {"id": session.id, "url": session.url, "customer": session.customer}
 
 
 def get_stripe_price_for_plan(plan_id: str) -> str:
@@ -141,36 +231,47 @@ def create_combined_checkout_session(
     metadata: dict,
     success_url: str,
     cancel_url: str,
+    stripe_customer_id: Optional[str] = None,
 ) -> dict:
     """
     Create a Stripe Checkout Session with multiple subscription line items.
     Used for combined VPS + LLM Bundle + Managed Supabase checkout.
     """
     client = _get_stripe_client()
-    session = client.checkout.sessions.create(
-        params={
-            "mode": "subscription",
-            "line_items": line_items,
-            "customer_email": user_email,
-            "success_url": success_url,
-            "cancel_url": cancel_url,
-            "metadata": metadata,
-            "subscription_data": {"metadata": metadata},
-        }
-    )
-    return {"id": session.id, "url": session.url}
+    params: dict = {
+        "mode": "subscription",
+        "line_items": line_items,
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata": metadata,
+        "subscription_data": {"metadata": metadata},
+    }
+    if stripe_customer_id:
+        params["customer"] = stripe_customer_id
+    else:
+        params["customer_email"] = user_email
+
+    session = client.checkout.sessions.create(params=params)
+    return {"id": session.id, "url": session.url, "customer": session.customer}
+
+
+# ── Webhook verification ─────────────────────────────────────────────
 
 
 def verify_webhook(payload: bytes, sig_header: str) -> Optional[dict]:
     """
     Verify a Stripe webhook signature and return the parsed event dict,
     or None if the signature is invalid.
+
+    Raises ValueError if STRIPE_WEBHOOK_SECRET is not configured —
+    unsigned payloads are never accepted.
     """
     webhook_secret = settings.stripe_webhook_secret
     if not webhook_secret:
-        logger.warning("STRIPE_WEBHOOK_SECRET not set — skipping signature verification")
-        import json
-        return json.loads(payload)
+        raise ValueError(
+            "STRIPE_WEBHOOK_SECRET is not configured — "
+            "cannot process webhooks without signature verification"
+        )
 
     try:
         event = stripe.Webhook.construct_event(

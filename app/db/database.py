@@ -69,10 +69,29 @@ async def get_db() -> AsyncSession:
 
 
 async def init_db():
-    """Initialize database tables and add any missing columns."""
-    from sqlalchemy import text
+    """Initialize database tables and add any missing columns.
+
+    Tables are partitioned by run_mode (see base.py):
+      - platform: creates PLATFORM_ONLY + SHARED tables
+      - agent: creates AGENT_ONLY + SHARED tables
+      - monolith: creates all tables
+    """
+    from sqlalchemy import text, inspect as sa_inspect
     import logging
     _logger = logging.getLogger(__name__)
+
+    from app.db.models.base import AGENT_ONLY_TABLES, PLATFORM_ONLY_TABLES, SHARED_TABLES
+
+    # Determine which tables belong in this database
+    _run_mode = settings.run_mode
+    if _run_mode == "platform":
+        _excluded = AGENT_ONLY_TABLES
+    elif _run_mode == "agent":
+        _excluded = PLATFORM_ONLY_TABLES
+    else:  # monolith
+        _excluded = set()
+
+    _allowed_tables = [t for t in Base.metadata.sorted_tables if t.name not in _excluded]
 
     # Ensure pgvector extension exists before create_all tries to use VECTOR columns
     _has_pgvector = False
@@ -85,7 +104,7 @@ async def init_db():
 
     async with engine.begin() as conn:
         try:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(Base.metadata.create_all, tables=_allowed_tables)
         except Exception as _e:
             if "vector" in str(_e).lower() and not _has_pgvector:
                 _logger.warning("create_all failed due to missing vector type — creating tables individually")
@@ -95,16 +114,15 @@ async def init_db():
     # If create_all failed due to missing vector, create tables one by one
     # in a FRESH connection (the old transaction is in an aborted state).
     if not _has_pgvector:
-        # Identify tables that have VECTOR columns so we can skip only those
         _vector_tables = set()
-        for table in Base.metadata.sorted_tables:
+        for table in _allowed_tables:
             for col in table.columns:
                 if "vector" in str(col.type).lower():
                     _vector_tables.add(table.name)
                     break
 
         async with engine.begin() as conn:
-            for table in Base.metadata.sorted_tables:
+            for table in _allowed_tables:
                 if table.name in _vector_tables:
                     _logger.info("Skipping table %s (needs pgvector)", table.name)
                     continue
@@ -113,8 +131,53 @@ async def init_db():
                 except Exception:
                     _logger.warning("Failed to create table %s", table.name)
 
-    # Add missing columns to existing tables (create_all only creates new tables)
-    _alter_statements = [
+    # ── Runtime safety assertion ──────────────────────────────────
+    # Verify that forbidden tables were NOT created in this DB.
+    # Catches the case where someone adds a model and forgets to
+    # update the partition sets in base.py.
+    try:
+        async with engine.connect() as conn:
+            _existing = await conn.run_sync(lambda sync_conn: sa_inspect(sync_conn).get_table_names())
+        _existing_set = set(_existing)
+        if _run_mode == "platform":
+            _leaked = _existing_set & AGENT_ONLY_TABLES
+            if _leaked:
+                _logger.error(
+                    "FATAL: Agent-only tables found in platform DB: %s. "
+                    "This means table partitioning in base.py is broken. "
+                    "Fix AGENT_ONLY_TABLES or remove these tables manually.",
+                    _leaked,
+                )
+                raise RuntimeError(f"Agent-only tables leaked into platform DB: {_leaked}")
+        elif _run_mode == "agent":
+            _leaked = _existing_set & PLATFORM_ONLY_TABLES
+            if _leaked:
+                _logger.error(
+                    "FATAL: Platform-only tables found in agent DB: %s. "
+                    "This means table partitioning in base.py is broken. "
+                    "Fix PLATFORM_ONLY_TABLES or remove these tables manually.",
+                    _leaked,
+                )
+                raise RuntimeError(f"Platform-only tables leaked into agent DB: {_leaked}")
+    except RuntimeError:
+        raise
+    except Exception as _e:
+        _logger.warning("Could not verify table partitioning: %s", _e)
+
+    # Add missing columns to existing tables (create_all only creates new tables).
+    # Split by run_mode: shared statements run everywhere, platform/agent-specific
+    # statements only run in their respective modes.
+
+    # ── Shared (both platform and agent) ──
+    _alter_shared = [
+        # Password change tracking (token revocation)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
+        # Day-as-Chat: user timezone
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone VARCHAR(50)",
+    ]
+
+    # ── Platform-only ALTER statements ──
+    _alter_platform = [
         # LLM bundle columns on agent_configs (migration 016)
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_mode VARCHAR(20) DEFAULT 'manual'",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS google_api_key TEXT",
@@ -147,6 +210,12 @@ async def init_db():
         "ALTER TABLE vps_instances ADD COLUMN IF NOT EXISTS hetzner_vm_id VARCHAR(50)",
         # Target OS for remote deploy (linux/macos/windows)
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS target_os VARCHAR(20)",
+        # Stripe customer linkage on users (migration 018)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255) UNIQUE",
+    ]
+
+    # ── Agent-only ALTER statements ──
+    _alter_agent = [
         # Build logs for app builder jobs
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS build_logs_json TEXT DEFAULT '[]'",
         # Approved plan from conversational app builder
@@ -160,64 +229,67 @@ async def init_db():
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS layer2_changes_json TEXT",
         # VPS soul sync tracking
         "ALTER TABLE soul_configs ADD COLUMN IF NOT EXISTS vps_soul_synced_at TIMESTAMP",
-        # Password change tracking (token revocation)
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
         # Rich content metadata on messages (media cards, etc.)
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS metadata_json TEXT",
-        # Reconciliation: app source tracking (app_builder, vibecoding, filesystem_discovered)
+        # Reconciliation: app source tracking
         "ALTER TABLE apps ADD COLUMN IF NOT EXISTS source VARCHAR(30) DEFAULT 'app_builder'",
-        # Backfill: existing apps under vibecoding/ path get source='vibecoding'
         "UPDATE apps SET source = 'vibecoding' WHERE source = 'app_builder' AND app_dir LIKE '%/vibecoding/%'",
-        # Builder mode per-chat (NULL = auto/app_builder, 'vibe' = vibecoding)
+        # Builder mode per-chat
         "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS builder_mode VARCHAR(10)",
-        # Reconciliation log cleanup: drop entries older than 30 days
+        # Reconciliation log cleanup
         "DELETE FROM reconciliation_logs WHERE created_at < NOW() - INTERVAL '30 days'",
+        # Day-as-Chat: FK from conversations to day_chats (nullable during migration)
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS day_chat_id VARCHAR(36) REFERENCES day_chats(id)",
+        # Day-as-Chat: denormalized FK from messages to day_chats for fast loading
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS day_chat_id VARCHAR(36) REFERENCES day_chats(id)",
+        # Day-as-Chat: composite index for hot-path query
+        "CREATE INDEX IF NOT EXISTS ix_messages_day_chat_created ON messages(day_chat_id, created_at)",
     ]
 
-    # Vector dimension migration: if embedding_dimension changed (e.g. 1536 → 384),
-    # drop and recreate the pgvector columns. Old embeddings are invalidated anyway
-    # since they came from a different model.
-    from app.config import settings as _cfg
-    _dim = _cfg.embedding_dimension
-    _vec_migration = [
-        # Memories
-        f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memories' AND column_name='embedding') THEN "
-        f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='memories'::regclass AND attname='embedding') != {_dim} THEN "
-        f"EXECUTE 'ALTER TABLE memories DROP COLUMN embedding'; "
-        f"EXECUTE 'ALTER TABLE memories ADD COLUMN embedding vector({_dim})'; "
-        f"END IF; END IF; END $$",
-        # Entities
-        f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='entities' AND column_name='embedding') THEN "
-        f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='entities'::regclass AND attname='embedding') != {_dim} THEN "
-        f"EXECUTE 'ALTER TABLE entities DROP COLUMN embedding'; "
-        f"EXECUTE 'ALTER TABLE entities ADD COLUMN embedding vector({_dim})'; "
-        f"END IF; END IF; END $$",
-        # Messages
-        f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='embedding') THEN "
-        f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='messages'::regclass AND attname='embedding') != {_dim} THEN "
-        f"EXECUTE 'ALTER TABLE messages DROP COLUMN embedding'; "
-        f"EXECUTE 'ALTER TABLE messages ADD COLUMN embedding vector({_dim})'; "
-        f"END IF; END IF; END $$",
-        # Document chunks
-        f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='document_chunks' AND column_name='embedding') THEN "
-        f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='document_chunks'::regclass AND attname='embedding') != {_dim} THEN "
-        f"EXECUTE 'ALTER TABLE document_chunks DROP COLUMN embedding'; "
-        f"EXECUTE 'ALTER TABLE document_chunks ADD COLUMN embedding vector({_dim})'; "
-        f"END IF; END IF; END $$",
-    ]
-    _alter_statements.extend(_vec_migration)
+    # Assemble final list based on run_mode
+    _alter_statements = list(_alter_shared)
+    if _run_mode in ("platform", "monolith"):
+        _alter_statements.extend(_alter_platform)
+    if _run_mode in ("agent", "monolith"):
+        _alter_statements.extend(_alter_agent)
 
-    # Ensure HNSW index exists on memories.embedding (may be lost after dimension migration)
-    _alter_statements.append(
-        f"CREATE INDEX IF NOT EXISTS ix_memories_embedding_hnsw "
-        f"ON memories USING hnsw (embedding vector_cosine_ops) "
-        f"WITH (m = 16, ef_construction = 64)"
-    )
+    # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)
+    if _run_mode in ("agent", "monolith"):
+        from app.config import settings as _cfg
+        _dim = _cfg.embedding_dimension
+        _vec_migration = [
+            f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memories' AND column_name='embedding') THEN "
+            f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='memories'::regclass AND attname='embedding') != {_dim} THEN "
+            f"EXECUTE 'ALTER TABLE memories DROP COLUMN embedding'; "
+            f"EXECUTE 'ALTER TABLE memories ADD COLUMN embedding vector({_dim})'; "
+            f"END IF; END IF; END $$",
+            f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='entities' AND column_name='embedding') THEN "
+            f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='entities'::regclass AND attname='embedding') != {_dim} THEN "
+            f"EXECUTE 'ALTER TABLE entities DROP COLUMN embedding'; "
+            f"EXECUTE 'ALTER TABLE entities ADD COLUMN embedding vector({_dim})'; "
+            f"END IF; END IF; END $$",
+            f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='embedding') THEN "
+            f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='messages'::regclass AND attname='embedding') != {_dim} THEN "
+            f"EXECUTE 'ALTER TABLE messages DROP COLUMN embedding'; "
+            f"EXECUTE 'ALTER TABLE messages ADD COLUMN embedding vector({_dim})'; "
+            f"END IF; END IF; END $$",
+            f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='document_chunks' AND column_name='embedding') THEN "
+            f"IF (SELECT atttypmod FROM pg_attribute WHERE attrelid='document_chunks'::regclass AND attname='embedding') != {_dim} THEN "
+            f"EXECUTE 'ALTER TABLE document_chunks DROP COLUMN embedding'; "
+            f"EXECUTE 'ALTER TABLE document_chunks ADD COLUMN embedding vector({_dim})'; "
+            f"END IF; END IF; END $$",
+        ]
+        _alter_statements.extend(_vec_migration)
+        _alter_statements.append(
+            f"CREATE INDEX IF NOT EXISTS ix_memories_embedding_hnsw "
+            f"ON memories USING hnsw (embedding vector_cosine_ops) "
+            f"WITH (m = 16, ef_construction = 64)"
+        )
 
-    # Seed user-facing VPS plans — Hetzner Cloud CPX (AMD, Shared Regular Performance)
-    # Location: ASH (Ashburn, Virginia, USA)
-    # NOTE: CPX11 (2GB RAM) too small for local embeddings + PostgreSQL + Python
-    _seed_statements = [
+    # Seed VPS plans (platform-only)
+    _seed_statements = []
+    if _run_mode in ("platform", "monolith"):
+        _seed_statements = [
         # Starter: CPX21 — 3 vCPU, 4GB RAM, 80GB SSD ($10.59 cost, $15 price)
         # For: 1-5 users, light usage, 1 embedding model (lazy-loaded)
         """INSERT INTO vps_plans (id, name, instance_type, vcpu, ram_gb, storage_gb, price_cents, stripe_price_id, provider, hetzner_server_type)

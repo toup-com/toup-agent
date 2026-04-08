@@ -153,14 +153,29 @@ async def bundle_checkout(
             db.add(alloc)
     await db.commit()
 
+    # Resolve or create Stripe customer
+    from app.db import User
+    from app.services.stripe_service import create_bundle_checkout_session, get_or_create_customer
+    user_result = await db.execute(select(User).where(User.id == current_user.id))
+    user_obj = user_result.scalar_one()
+    stripe_customer_id = user_obj.stripe_customer_id
+    if not stripe_customer_id:
+        stripe_customer_id = get_or_create_customer(
+            user_id=current_user.id,
+            email=current_user.email,
+            name=getattr(current_user, "name", None),
+        )
+        user_obj.stripe_customer_id = stripe_customer_id
+        await db.commit()
+
     # Create Stripe checkout
-    from app.services.stripe_service import create_bundle_checkout_session
     try:
         session = create_bundle_checkout_session(
             user_id=current_user.id,
             user_email=current_user.email,
             success_url=f"{settings.platform_api_url.rstrip('/api')}/agent?bundle_success=1",
             cancel_url=f"{settings.platform_api_url.rstrip('/api')}/agent?bundle_cancelled=1",
+            stripe_customer_id=stripe_customer_id,
         )
     except Exception as e:
         logger.exception("Stripe bundle checkout error: %s", e)
@@ -424,8 +439,15 @@ async def report_usage(
     if not config:
         raise HTTPException(401, "Invalid API key")
 
-    if config.llm_mode != "bundle" or config.bundle_status != "active":
+    # Allow active, cancelling (paid through period end), and past_due (Stripe retrying)
+    _allowed = {"active", "cancelling", "past_due"}
+    if config.llm_mode != "bundle" or config.bundle_status not in _allowed:
         raise HTTPException(400, "Bundle not active")
+
+    # If cancelling, check if period has actually ended
+    if config.bundle_status == "cancelling" and config.bundle_current_period_end:
+        if datetime.utcnow() > config.bundle_current_period_end:
+            raise HTTPException(400, "Bundle subscription has expired")
 
     # Calculate cost
     from app.config import settings as s

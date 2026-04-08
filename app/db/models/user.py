@@ -25,6 +25,12 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    # Stripe
+    stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True)
+
+    # Timezone (IANA format, e.g. "America/Toronto") — used for day boundaries
+    timezone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
     # Relationships
     memories: Mapped[List["Memory"]] = relationship("Memory", back_populates="user")
     conversations: Mapped[List["Conversation"]] = relationship("Conversation", back_populates="user")
