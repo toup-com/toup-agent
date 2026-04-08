@@ -308,8 +308,34 @@ class AgentRunner:
             logger.info(f"[PERF] load_agent_config: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
             t_db = time.perf_counter()
-            history = await self._load_history(db, session_id)
-            logger.info(f"[PERF] load_history: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages")
+            # ── Day-Chat context path (feature-flagged) ──
+            _day_chat_id = None
+            _day_context = None
+            _use_day_ctx = False
+            try:
+                from app.agent.day_chat_resolver import should_use_day_chat_context
+                _use_day_ctx = await should_use_day_chat_context()
+            except Exception:
+                pass
+
+            if _use_day_ctx and getattr(session, 'day_chat_id', None):
+                try:
+                    from app.agent.day_context_loader import load_day_context
+                    from app.agent.context_manager import get_context_window
+                    _day_chat_id = session.day_chat_id
+                    _ctx_window = get_context_window(settings.agent_model)
+                    _day_context = await load_day_context(db, _day_chat_id, model=settings.agent_model, model_context_tokens=_ctx_window)
+                    history = _day_context["messages"]
+                    logger.info(f"[PERF] load_day_context: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages (day-chat)")
+                except Exception as _dce:
+                    logger.warning("[AGENT] Day context load failed, falling back to session history: %s", _dce)
+                    _use_day_ctx = False
+                    _day_context = None
+                    history = await self._load_history(db, session_id)
+                    logger.info(f"[PERF] load_history: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages (fallback)")
+            else:
+                history = await self._load_history(db, session_id)
+                logger.info(f"[PERF] load_history: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages")
 
             # If conversation has active app_builder context (direction cards,
             # tool calls), override intent so tools and skill prompts stay available
@@ -319,6 +345,12 @@ class AgentRunner:
 
             t_prompt = time.perf_counter()
             system_prompt = await self._build_system_prompt(db, user_id, user_message, channel=channel, intent=query_intent)
+
+            # Inject <today_so_far> block when using day-chat context with a summary
+            if _use_day_ctx and _day_context and _day_context.get("summary"):
+                from app.agent.day_context_loader import build_today_so_far_block
+                system_prompt += build_today_so_far_block(_day_context["summary"])
+
             logger.info(f"[PERF] build_system_prompt: {(time.perf_counter() - t_prompt) * 1000:.0f}ms — {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
             await db.commit()
         logger.info(f"[PERF] phase1_total: {(time.perf_counter() - t_phase1) * 1000:.0f}ms")
@@ -331,6 +363,30 @@ class AgentRunner:
             messages.append({"role": "user", "content": content_blocks})
         else:
             messages.append({"role": "user", "content": user_message})
+
+        # ── ContextBudgetLog telemetry (day-chat path only) ──
+        if _use_day_ctx and _day_context and _day_chat_id:
+            try:
+                async with async_session_maker() as _cbl_db:
+                    from app.agent.context_budget import log_context_budget
+                    await log_context_budget(
+                        db=_cbl_db,
+                        day_chat_id=_day_chat_id,
+                        conversation_id=session_id,
+                        user_id=user_id,
+                        turn_id=None,  # Set after user message is saved
+                        system_tokens=estimate_tokens(system_prompt),
+                        summary_tokens=estimate_tokens(_day_context.get("summary") or ""),
+                        history_tokens=sum(estimate_tokens(m.get("content", "")) for m in messages),
+                        tool_tokens=0,  # Counted after tool loop
+                        memory_tokens=0,  # Already in system_tokens
+                        total_tokens=estimate_tokens(system_prompt) + sum(estimate_tokens(m.get("content", "")) for m in messages),
+                        model=settings.agent_model,
+                        summary_was_stale=_day_context.get("summary_was_stale", False),
+                    )
+                    await _cbl_db.commit()
+            except Exception as _cbl_err:
+                logger.warning("[context_budget] Log failed (non-fatal): %s", _cbl_err)
 
         # Context window management — initial check
         if needs_compaction(system_prompt, messages, settings.agent_model):
@@ -693,6 +749,14 @@ class AgentRunner:
 
         asyncio.create_task(_background_post_processing())
 
+        # ── Day-Chat summarizer (async, debounced, never blocks) ──
+        if _use_day_ctx and _day_chat_id:
+            try:
+                from app.services.day_summarizer import run_summarizer_if_needed
+                asyncio.create_task(run_summarizer_if_needed(async_session_maker, _day_chat_id))
+            except Exception as _sum_err:
+                logger.warning("[AGENT] Summarizer scheduling failed (non-fatal): %s", _sum_err)
+
         elapsed = int((time.time() - start) * 1000)
         logger.info(f"[AGENT] Response: {final_text[:100]}...")
         logger.info(
@@ -805,10 +869,24 @@ class AgentRunner:
 
         # Create new session
         _channel = "telegram" if telegram_chat_id else (channel or "agent")
+
+        # Resolve DayChat parent (if day-chat feature is active or backfill has run)
+        _day_chat_id = None
+        try:
+            from app.agent.day_chat_resolver import get_or_create_day_chat
+            from app.db.models import User
+            _user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+            _user_tz = getattr(_user, 'timezone', None) if _user else None
+            _dc = await get_or_create_day_chat(db, user_id, tz_name=_user_tz)
+            _day_chat_id = _dc.id
+        except Exception as _dce:
+            logger.debug("[AGENT] DayChat resolution skipped: %s", _dce)
+
         session = Conversation(
             user_id=user_id,
             channel=_channel,
             is_active=True,
+            day_chat_id=_day_chat_id,
             metadata_json=json.dumps({"telegram_chat_id": telegram_chat_id}) if telegram_chat_id else None,
         )
         db.add(session)
@@ -1343,9 +1421,17 @@ class AgentRunner:
 
         msg_count = 0
 
+        # Resolve day_chat_id from the session (for denormalization on messages)
+        result = await db.execute(
+            select(Conversation).where(Conversation.id == session_id)
+        )
+        session = result.scalar_one_or_none()
+        _day_chat_id = getattr(session, 'day_chat_id', None) if session else None
+
         if save_user_message:
             user_msg = Message(
                 conversation_id=session_id,
+                day_chat_id=_day_chat_id,
                 role="user",
                 content=user_message,
             )
@@ -1359,6 +1445,7 @@ class AgentRunner:
 
         asst_msg = Message(
             conversation_id=session_id,
+            day_chat_id=_day_chat_id,
             role="assistant",
             content=assistant_response,
             tokens_prompt=tokens_input,
@@ -1370,15 +1457,23 @@ class AgentRunner:
         db.add(asst_msg)
         msg_count += 1
 
-        # Update conversation counters (load by ID in this short-lived session)
-        result = await db.execute(
-            select(Conversation).where(Conversation.id == session_id)
-        )
-        session = result.scalar_one_or_none()
+        # Update conversation counters
         if session:
             session.message_count = (session.message_count or 0) + msg_count
             session.total_tokens = (session.total_tokens or 0) + tokens_input + tokens_output
             session.updated_at = datetime.utcnow()
+
+        # Update DayChat counters (if linked)
+        if _day_chat_id:
+            try:
+                from app.db.models.day_chat import DayChat
+                dc = (await db.execute(select(DayChat).where(DayChat.id == _day_chat_id))).scalar_one_or_none()
+                if dc:
+                    dc.message_count = (dc.message_count or 0) + msg_count
+                    dc.total_tokens = (dc.total_tokens or 0) + tokens_input + tokens_output
+                    dc.last_message_at = datetime.utcnow()
+            except Exception:
+                pass  # Non-fatal — DayChat stats are advisory
 
         await db.flush()
     

@@ -38,3 +38,73 @@ def Vector(dim: int = 0):
 
 
 Base = declarative_base()
+
+
+# ── Table Partitioning: Platform vs Agent DBs ─────────────────────────
+#
+# Toup has a hybrid database architecture:
+#   - Platform DB (Railway/Supabase): central, shared across all users
+#   - Agent DB (per-user Docker container): isolated per user
+#
+# When you add a new model, add its __tablename__ to exactly ONE of these
+# sets, or to SHARED_TABLES if it genuinely lives in both databases.
+# If you skip this step, test_table_partitioning.py will fail.
+#
+# init_db() uses these sets to decide which tables to create in each mode.
+# ──────────────────────────────────────────────────────────────────────
+
+AGENT_ONLY_TABLES: set[str] = {
+    # Day-as-Chat context architecture
+    "day_chats",
+    "context_budget_logs",
+    "migration_status",
+    # Conversation & messages (agent stores all chat data)
+    "conversations",
+    "messages",
+    # Memory system
+    "memories",
+    "memory_relationships",
+    "brain_stats",
+    "memory_events",
+    "retrieval_events",
+    # Entity & knowledge graph
+    "entities",
+    "entity_links",
+    "entity_relationships",
+    # Documents & media
+    "documents",
+    "document_chunks",
+    "media",
+    # Apps & build jobs
+    "apps",
+    "build_jobs",
+    "reconciliation_logs",
+    # Agent runtime
+    "cron_jobs",
+    "telegram_user_mappings",
+    "agent_errors",
+    "api_keys",
+    # Identity & soul
+    "identities",
+    "soul_configs",
+}
+
+PLATFORM_ONLY_TABLES: set[str] = {
+    # VPS & infrastructure
+    "vps_plans",
+    "vps_instances",
+    "managed_containers",
+    # Billing & invites
+    "invites",
+    "llm_bundle_allocations",
+    "llm_usage_records",
+    # Agent configuration (platform manages, agent reads via API)
+    "agent_configs",
+    # Streaming credentials (platform stores, agent fetches via API)
+    "streaming_credentials",
+}
+
+SHARED_TABLES: set[str] = {
+    # Users table exists in both: platform has all users, agent has its owner
+    "users",
+}

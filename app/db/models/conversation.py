@@ -11,12 +11,20 @@ from .base import Base, Vector
 
 
 class Conversation(Base):
-    """Conversation/Session record for tracking message history"""
+    """Conversation/Session record for tracking message history.
+
+    A session is a sub-stream inside a DayChat. It tracks one continuous UI
+    thread on one channel. The agent's context scope is the parent DayChat
+    (all sessions for the day), not individual sessions.
+    """
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     title: Mapped[Optional[str]] = mapped_column(String(500))
+
+    # Parent DayChat — nullable during migration, non-nullable after backfill
+    day_chat_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("day_chats.id"), nullable=True, index=True)
 
     # Channel tracking
     channel: Mapped[str] = mapped_column(String(50), default="api")  # api, telegram, discord, web
@@ -41,6 +49,7 @@ class Conversation(Base):
 
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="conversations")
+    day_chat: Mapped[Optional["DayChat"]] = relationship("DayChat", back_populates="conversations")
     messages: Mapped[List["Message"]] = relationship("Message", back_populates="conversation", order_by="Message.created_at")
 
 
@@ -50,6 +59,10 @@ class Message(Base):
 
     id: Mapped[str] = mapped_column(String(50), primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id: Mapped[str] = mapped_column(String(36), ForeignKey("conversations.id"), index=True)
+
+    # Denormalized from parent session for fast day-level loading
+    day_chat_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("day_chats.id"), nullable=True, index=True)
+
     role: Mapped[str] = mapped_column(String(20))  # "user", "assistant", "system", "job"
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -79,3 +92,7 @@ class Message(Base):
     # Relationships
     conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="messages")
     extracted_memories: Mapped[List["Memory"]] = relationship("Memory", back_populates="source_message")
+
+    __table_args__ = (
+        Index("ix_messages_day_chat_created", "day_chat_id", "created_at"),
+    )

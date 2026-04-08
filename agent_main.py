@@ -765,6 +765,42 @@ async def lifespan(app: FastAPI):
 
     _reconcile_task = asyncio.create_task(_reconcile_sweep())
 
+    # ── DayChat backfill (non-blocking background task) ─────
+    # Fires AFTER all services are initialized. The agent is fully
+    # responsive immediately — backfill runs in the background.
+    # Feature flag USE_DAY_CHAT_CONTEXT stays off until backfill is
+    # verified complete. Backfill failure is never fatal to the agent.
+    _backfill_task = None
+    try:
+        from app.db.database import async_session_maker as _bsm
+
+        async def _run_day_chat_backfill():
+            try:
+                # Import without triggering app.services.__init__
+                import importlib.util as _ilu
+                _spec = _ilu.spec_from_file_location(
+                    "backfill_day_chats",
+                    os.path.join(os.path.dirname(__file__), "app", "services", "backfill_day_chats.py"),
+                )
+                _bmod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_bmod)
+
+                result = await _bmod.run_backfill(_bsm)
+                if result == "already_completed":
+                    logger.info("day_chat_backfill.skipped reason=already_completed")
+                elif result == "completed":
+                    logger.info("day_chat_backfill.done")
+                elif result == "failed":
+                    logger.error("day_chat_backfill.skipped reason=previously_failed")
+            except Exception as e:
+                # Backfill failure is never fatal — agent continues on old path
+                logger.error("day_chat_backfill.crash error=%s", e)
+
+        _backfill_task = asyncio.create_task(_run_day_chat_backfill())
+        logger.info("day_chat_backfill.scheduled")
+    except Exception as e:
+        logger.warning("day_chat_backfill.skipped reason=import_error error=%s", e)
+
     print("🤖 Toup Agent ready.")
     print(f"   Server:  http://0.0.0.0:8001")
     print(f"   Health:  http://localhost:8001/agent/health")
@@ -773,6 +809,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── Shutdown (reverse order) ──────────────────────────────
+    if _backfill_task and not _backfill_task.done():
+        _backfill_task.cancel()
     if _reconcile_task:
         _reconcile_task.cancel()
 

@@ -24,6 +24,9 @@ from .identity import Identity
 # Conversation & Messages
 from .conversation import Conversation, Message
 
+# Day-as-Chat (day-level conversation container + telemetry + migrations)
+from .day_chat import DayChat, ContextBudgetLog, MigrationStatus
+
 # Memory system
 from .memory import Memory, memory_relationships, BrainStats, MemoryEvent, RetrievalEvent
 
@@ -66,4 +69,5 @@ __all__ = [
     "SoulConfig",
     "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord",
     "StreamingCredential",
+    "DayChat", "ContextBudgetLog", "MigrationStatus",
 ]

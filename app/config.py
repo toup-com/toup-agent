@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     brave_api_key: Optional[str] = None  # For web search
     skills_dir: str = "/app/skills"  # External skills directory
 
+    # Day-as-Chat context architecture (feature flag)
+    use_day_chat_context: bool = False  # When True, agent loads all sessions for the day as context
+
     # Workspace Bootstrap
     workspace_per_user: bool = True  # Create per-user workspace subdirectories
     workspace_create_readme: bool = True  # Create README.md in new workspaces
