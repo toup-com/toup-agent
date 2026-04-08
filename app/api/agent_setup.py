@@ -1,0 +1,813 @@
+"""
+Agent setup API — configuration wizard + deployment endpoints.
+
+GET  /api/agent-setup/config           — get current config
+PUT  /api/agent-setup/config           — update config (partial)
+POST /api/agent-setup/generate-key     — generate agent API key
+POST /api/agent-setup/test-ssh         — test SSH connectivity
+POST /api/agent-setup/deploy           — trigger agent deployment
+GET  /api/agent-setup/deploy-status    — check deployment status
+GET  /api/agent-setup/env              — download .env content
+POST /api/agent-setup/test-connection  — test deployed agent health
+POST /api/agent-setup/register         — agent self-registration on startup
+"""
+
+import json
+import logging
+import secrets
+import uuid
+from datetime import datetime
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.auth import get_current_user
+from app.config import settings
+from app.db import get_db, AgentConfig, VPSInstance
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/agent-setup", tags=["Agent Setup"])
+
+# ── Shared state for deploy log streaming ─────────────────────────────────
+# Maps user_id → list of (line, level) tuples + done flag
+_deploy_logs: dict[str, dict] = {}
+
+
+# ── Schemas ───────────────────────────────────────────────────────────────
+
+class AgentConfigOut(BaseModel):
+    hosting_mode: str = "self-hosted"
+    ssh_host: str | None = None
+    ssh_port: int = 22
+    ssh_user: str | None = None
+    target_os: str | None = None  # "linux" | "macos" | "windows"
+    # SSH creds never returned — only whether they're set
+    has_ssh_password: bool = False
+    has_ssh_key: bool = False
+    # Agent identity
+    agent_name: str | None = None
+    # LLM
+    llm_mode: str = "manual"
+    openai_api_key_set: bool = False
+    anthropic_api_key_set: bool = False
+    google_api_key_set: bool = False
+    mistral_api_key_set: bool = False
+    groq_api_key_set: bool = False
+    xai_api_key_set: bool = False
+    deepseek_api_key_set: bool = False
+    agent_model: str = "claude-opus-4-6"
+    # Bundle
+    bundle_status: str = "none"
+    bundle_current_period_end: str | None = None
+    # Channels
+    telegram_bot_token_set: bool = False
+    discord_bot_token_set: bool = False
+    slack_bot_token_set: bool = False
+    slack_app_token_set: bool = False
+    whatsapp_phone_number_id: str | None = None
+    whatsapp_access_token_set: bool = False
+    brave_api_key_set: bool = False
+    elevenlabs_api_key_set: bool = False
+    agent_api_key: str | None = None
+    agent_url: str | None = None
+    deploy_status: str = "none"
+    setup_completed: bool = False
+    setup_step: int = 0
+    setup_type: str | None = None  # 'auto' | 'manual' | None
+    onboarding_completed: bool = False
+    agent_color: str | None = None
+    # VPS info (if hosting_mode == "vps")
+    vps_ip: str | None = None
+    vps_status: str | None = None
+    vps_plan: str | None = None
+    # Tool access control
+    disabled_tools: list[str] = []
+    # Connect token (for terminal agent tunnel)
+    has_connect_token: bool = False
+    connect_token: str | None = None
+    # Database mode
+    db_mode: str = "auto"
+    supabase_url_set: bool = False
+    # Live sync status (set by PUT /config response)
+    tunnel_connected: bool = False
+    config_synced: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class AgentConfigUpdate(BaseModel):
+    hosting_mode: str | None = None
+    ssh_host: str | None = None
+    ssh_port: int | None = None
+    ssh_user: str | None = None
+    ssh_password: str | None = None
+    ssh_key: str | None = None
+    target_os: str | None = None
+    agent_name: str | None = None
+    llm_mode: str | None = None
+    openai_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    google_api_key: str | None = None
+    mistral_api_key: str | None = None
+    groq_api_key: str | None = None
+    xai_api_key: str | None = None
+    deepseek_api_key: str | None = None
+    agent_model: str | None = None
+    telegram_bot_token: str | None = None
+    discord_bot_token: str | None = None
+    slack_bot_token: str | None = None
+    slack_app_token: str | None = None
+    whatsapp_phone_number_id: str | None = None
+    whatsapp_access_token: str | None = None
+    brave_api_key: str | None = None
+    elevenlabs_api_key: str | None = None
+    setup_step: int | None = None
+    setup_type: str | None = None
+    setup_completed: bool | None = None
+    disabled_tools: list[str] | None = None
+    db_mode: str | None = None
+    supabase_url: str | None = None
+
+
+class SSHTestRequest(BaseModel):
+    ssh_host: str | None = None
+    ssh_port: int | None = None
+    ssh_user: str | None = None
+    ssh_password: str | None = None
+    ssh_key: str | None = None
+
+
+class AgentRegisterRequest(BaseModel):
+    agent_url: str
+    agent_api_key: str
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+async def _get_or_create_config(
+    user_id: str, db: AsyncSession,
+) -> AgentConfig:
+    """Get the user's AgentConfig, or create one."""
+    result = await db.execute(
+        select(AgentConfig).where(AgentConfig.user_id == user_id)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        config = AgentConfig(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+        )
+        db.add(config)
+        await db.commit()
+        await db.refresh(config)
+    return config
+
+
+def _config_to_out(config: AgentConfig, vps: VPSInstance | None = None) -> AgentConfigOut:
+    """Convert AgentConfig to safe output (no secrets)."""
+    from app.api.ws_agent_tunnel import is_agent_connected
+    out = AgentConfigOut(
+        hosting_mode=config.hosting_mode,
+        ssh_host=config.ssh_host,
+        ssh_port=config.ssh_port,
+        ssh_user=config.ssh_user,
+        target_os=getattr(config, 'target_os', None),
+        has_ssh_password=bool(config.ssh_password),
+        has_ssh_key=bool(config.ssh_key),
+        agent_name=getattr(config, 'agent_name', None),
+        llm_mode=config.llm_mode or "manual",
+        openai_api_key_set=bool(config.openai_api_key),
+        anthropic_api_key_set=bool(config.anthropic_api_key),
+        google_api_key_set=bool(config.google_api_key),
+        mistral_api_key_set=bool(config.mistral_api_key),
+        groq_api_key_set=bool(config.groq_api_key),
+        xai_api_key_set=bool(config.xai_api_key),
+        deepseek_api_key_set=bool(config.deepseek_api_key),
+        agent_model=config.agent_model,
+        bundle_status=config.bundle_status or "none",
+        bundle_current_period_end=(
+            config.bundle_current_period_end.isoformat()
+            if config.bundle_current_period_end else None
+        ),
+        telegram_bot_token_set=bool(config.telegram_bot_token),
+        discord_bot_token_set=bool(config.discord_bot_token),
+        slack_bot_token_set=bool(config.slack_bot_token),
+        slack_app_token_set=bool(config.slack_app_token),
+        whatsapp_phone_number_id=config.whatsapp_phone_number_id,
+        whatsapp_access_token_set=bool(config.whatsapp_access_token),
+        brave_api_key_set=bool(config.brave_api_key),
+        elevenlabs_api_key_set=bool(config.elevenlabs_api_key),
+        agent_api_key=config.agent_api_key,
+        agent_url=config.agent_url,
+        deploy_status=config.deploy_status,
+        setup_completed=config.setup_completed,
+        setup_step=config.setup_step,
+        setup_type=getattr(config, 'setup_type', None),
+        onboarding_completed=config.onboarding_completed,
+        agent_color=getattr(config, 'agent_color', None),
+        disabled_tools=json.loads(config.disabled_tools) if getattr(config, 'disabled_tools', None) else [],
+        has_connect_token=bool(getattr(config, 'connect_token', None)),
+        connect_token=getattr(config, 'connect_token', None),
+        db_mode=getattr(config, 'db_mode', None) or "auto",
+        supabase_url_set=bool(getattr(config, 'supabase_url', None)),
+        tunnel_connected=is_agent_connected(config.user_id),
+    )
+    if vps:
+        out.vps_ip = vps.public_ip
+        out.vps_status = vps.status
+        out.vps_plan = vps.plan_id
+    return out
+
+
+def _auto_model(config: AgentConfig) -> str:
+    """Pick the best default model based on which API keys the user has."""
+    if config.openai_api_key:
+        return "gpt-5.4"
+    if config.anthropic_api_key:
+        return "claude-sonnet-4-6"
+    if config.google_api_key:
+        return "gemini-2.5-flash"
+    if config.xai_api_key:
+        return "grok-3-mini"
+    if config.deepseek_api_key:
+        return "deepseek-chat"
+    if config.mistral_api_key:
+        return "mistral-large-latest"
+    if config.groq_api_key:
+        return "llama-3.3-70b-versatile"
+    return "claude-sonnet-4-6"  # Default
+
+
+def _build_env(config: AgentConfig, user_id: str) -> str:
+    """Build .env content from an AgentConfig."""
+    from app.services.ssh_deploy_service import generate_env_content
+    return generate_env_content(
+        user_id=user_id,
+        agent_api_key=config.agent_api_key or "",
+        openai_api_key=(config.openai_api_key or "").strip(),
+        anthropic_api_key=(config.anthropic_api_key or "").strip(),
+        google_api_key=(config.google_api_key or "").strip(),
+        mistral_api_key=(config.mistral_api_key or "").strip(),
+        groq_api_key=(config.groq_api_key or "").strip(),
+        xai_api_key=(config.xai_api_key or "").strip(),
+        deepseek_api_key=(config.deepseek_api_key or "").strip(),
+        agent_model=config.agent_model or _auto_model(config),
+        llm_mode=config.llm_mode or "manual",
+        telegram_bot_token=config.telegram_bot_token or "",
+        discord_bot_token=config.discord_bot_token or "",
+        slack_bot_token=config.slack_bot_token or "",
+        slack_app_token=config.slack_app_token or "",
+        whatsapp_phone_number_id=config.whatsapp_phone_number_id or "",
+        whatsapp_access_token=config.whatsapp_access_token or "",
+        brave_api_key=config.brave_api_key or "",
+        elevenlabs_api_key=config.elevenlabs_api_key or "",
+        toup_token=getattr(config, 'connect_token', '') or "",
+        db_mode=getattr(config, 'db_mode', 'auto') or "auto",
+        supabase_url=getattr(config, 'supabase_url', '') or "",
+    )
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────
+
+@router.get("/config", response_model=AgentConfigOut)
+async def get_config(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the user's agent configuration."""
+    config = await _get_or_create_config(current_user.id, db)
+
+    # Also fetch VPS info if available
+    vps_result = await db.execute(
+        select(VPSInstance)
+        .where(VPSInstance.user_id == current_user.id)
+        .where(VPSInstance.status.in_(["active", "provisioning", "pending"]))
+        .order_by(VPSInstance.created_at.desc())
+    )
+    vps = vps_result.scalars().first()
+
+    # If user has an active VPS, auto-set hosting_mode
+    if vps and vps.status == "active" and config.hosting_mode != "vps":
+        config.hosting_mode = "vps"
+        await db.commit()
+
+    return _config_to_out(config, vps)
+
+
+@router.put("/config", response_model=AgentConfigOut)
+async def update_config(
+    body: AgentConfigUpdate,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update agent configuration (partial update)."""
+    config = await _get_or_create_config(current_user.id, db)
+
+    update_data = body.model_dump(exclude_unset=True)
+    # Serialize list fields to JSON for DB storage
+    if "disabled_tools" in update_data:
+        update_data["disabled_tools"] = json.dumps(update_data["disabled_tools"])
+    # Strip whitespace from API key fields (users often paste with spaces)
+    _key_fields = {
+        "openai_api_key", "anthropic_api_key", "google_api_key",
+        "mistral_api_key", "groq_api_key", "xai_api_key", "deepseek_api_key",
+        "telegram_bot_token", "discord_bot_token", "slack_bot_token",
+        "slack_app_token", "brave_api_key", "elevenlabs_api_key",
+    }
+    for field, value in update_data.items():
+        if field in _key_fields and isinstance(value, str):
+            value = value.strip()
+            update_data[field] = value
+        if hasattr(config, field):
+            setattr(config, field, value)
+    config.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(config)
+
+    # Push updated .env to the agent via tunnel and restart it
+    config_synced = False
+    try:
+        from app.api.ws_agent_tunnel import send_config_update, is_agent_connected
+        if is_agent_connected(str(current_user.id)):
+            env_content = _build_env(config, str(current_user.id))
+            config_synced = await send_config_update(str(current_user.id), env_content)
+            if config_synced:
+                logger.info("[AGENT-SETUP] Pushed config to agent for %s", str(current_user.id)[:8])
+    except Exception as e:
+        logger.warning("[AGENT-SETUP] Config push failed: %s", e)
+
+    # If managed hosting, sync env and restart container
+    if config.hosting_mode == "managed" and not config_synced:
+        try:
+            from app.services.docker_host_service import update_container_env
+            result = await update_container_env(db, str(current_user.id), config)
+            if result:
+                config_synced = True
+                logger.info("[AGENT-SETUP] Synced managed container env for %s", str(current_user.id)[:8])
+        except Exception as e:
+            logger.warning("[AGENT-SETUP] Managed container sync failed: %s", e)
+
+    # Fetch VPS info
+    vps_result = await db.execute(
+        select(VPSInstance)
+        .where(VPSInstance.user_id == current_user.id)
+        .where(VPSInstance.status.in_(["active", "provisioning"]))
+        .order_by(VPSInstance.created_at.desc())
+    )
+    vps = vps_result.scalars().first()
+
+    out = _config_to_out(config, vps)
+    out.config_synced = config_synced
+    return out
+
+
+@router.post("/reset", response_model=AgentConfigOut)
+async def reset_setup(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reset the setup wizard to Step 0. Does not delete provisioned resources."""
+    config = await _get_or_create_config(current_user.id, db)
+    config.setup_step = 0
+    config.setup_type = None
+    config.setup_completed = False
+    config.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(config)
+    return _config_to_out(config)
+
+
+@router.post("/generate-key")
+async def generate_key(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate or regenerate an agent API key."""
+    config = await _get_or_create_config(current_user.id, db)
+    key = f"toup_ak_{secrets.token_urlsafe(32)}"
+    config.agent_api_key = key
+    config.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"agent_api_key": key}
+
+
+@router.post("/generate-connect-token")
+async def generate_connect_token(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate a connect token for the terminal agent tunnel.
+
+    The user passes this as TOUP_TOKEN when starting the agent.
+    The agent uses it to authenticate the WebSocket tunnel to the platform.
+    """
+    config = await _get_or_create_config(current_user.id, db)
+    token = f"toup_ct_{secrets.token_urlsafe(32)}"
+    config.connect_token = token
+    config.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"connect_token": token, "user_id": current_user.id}
+
+
+@router.post("/test-ssh")
+async def test_ssh(
+    body: SSHTestRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Test SSH connectivity to the target machine."""
+    config = await _get_or_create_config(current_user.id, db)
+
+    # Determine SSH credentials
+    ssh_host = body.ssh_host or config.ssh_host
+    ssh_port = body.ssh_port or config.ssh_port or 22
+    ssh_user = body.ssh_user or config.ssh_user or "root"
+    ssh_password = body.ssh_password or config.ssh_password
+    ssh_key = body.ssh_key or config.ssh_key
+
+    # For VPS users, auto-use VPS credentials
+    if config.hosting_mode == "vps" and not ssh_host:
+        vps_result = await db.execute(
+            select(VPSInstance)
+            .where(VPSInstance.user_id == current_user.id)
+            .where(VPSInstance.status == "active")
+            .order_by(VPSInstance.created_at.desc())
+        )
+        vps = vps_result.scalars().first()
+        if vps:
+            ssh_host = vps.public_ip
+            ssh_password = ssh_password or vps.ssh_password
+            ssh_user = "ubuntu"
+
+    if not ssh_host:
+        raise HTTPException(status_code=400, detail="No SSH host specified")
+
+    from app.services.ssh_deploy_service import test_ssh_connection
+    result = await test_ssh_connection(ssh_host, ssh_port, ssh_user, ssh_password, ssh_key)
+
+    # Enrich with os_type classification
+    if result.get("connected") and result.get("os"):
+        os_str = result["os"].lower()
+        if "darwin" in os_str or "macos" in os_str or "mac os" in os_str:
+            result["os_type"] = "macos"
+        elif "windows" in os_str:
+            result["os_type"] = "windows"
+        else:
+            result["os_type"] = "linux"
+
+    return result
+
+
+@router.post("/deploy")
+async def trigger_deploy(
+    background_tasks: BackgroundTasks,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Trigger agent deployment via SSH."""
+    config = await _get_or_create_config(current_user.id, db)
+
+    if config.deploy_status == "deploying":
+        # Check if there's actually a live deploy process in memory
+        log_state = _deploy_logs.get(current_user.id)
+        has_active_deploy = log_state and not log_state.get("done", False)
+
+        if has_active_deploy:
+            # Real deploy running — only allow override if stale (>15 min)
+            if config.updated_at and (datetime.utcnow() - config.updated_at).total_seconds() > 15 * 60:
+                config.deploy_status = "error"
+                config.deploy_log = (config.deploy_log or "") + "\n[System] Previous deployment timed out. Resetting."
+                await db.commit()
+            else:
+                raise HTTPException(status_code=409, detail="Deployment already in progress")
+        else:
+            # No in-memory deploy (server restarted or process finished) — auto-reset
+            config.deploy_status = "error"
+            config.deploy_log = (config.deploy_log or "") + "\n[System] Previous deployment was interrupted. Resetting."
+            await db.commit()
+
+    # Require at least one LLM source: own API key OR bundle mode
+    if config.llm_mode != "bundle" and not config.openai_api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key is required (or select LLM Bundle)")
+
+    # Generate API key if not set
+    if not config.agent_api_key:
+        config.agent_api_key = f"toup_ak_{secrets.token_urlsafe(32)}"
+
+    # Auto-generate connect token for platform tunnel
+    if not config.connect_token:
+        config.connect_token = f"toup_ct_{secrets.token_urlsafe(32)}"
+
+    # Determine SSH credentials
+    ssh_host = config.ssh_host
+    ssh_port = config.ssh_port or 22
+    ssh_user = config.ssh_user or "root"
+    ssh_password = config.ssh_password
+    ssh_key = config.ssh_key
+
+    # For VPS users, use VPS credentials
+    if config.hosting_mode == "vps":
+        vps_result = await db.execute(
+            select(VPSInstance)
+            .where(VPSInstance.user_id == current_user.id)
+            .where(VPSInstance.status == "active")
+            .order_by(VPSInstance.created_at.desc())
+        )
+        vps = vps_result.scalars().first()
+        if not vps:
+            raise HTTPException(status_code=400, detail="No active VPS found")
+        ssh_host = vps.public_ip
+        ssh_password = vps.ssh_password
+        ssh_user = "ubuntu"
+
+    if not ssh_host:
+        raise HTTPException(status_code=400, detail="No target machine configured")
+
+    # Generate .env content
+    from app.services.ssh_deploy_service import generate_env_content
+    env_content = _build_env(config, current_user.id)
+
+    config.deploy_status = "deploying"
+    config.deploy_log = ""
+    await db.commit()
+
+    # Initialize log stream
+    _deploy_logs[current_user.id] = {"lines": [], "done": False, "success": False}
+
+    # Run deployment in background
+    from app.db.database import async_session_maker
+    background_tasks.add_task(
+        _run_deploy,
+        user_id=current_user.id,
+        ssh_host=ssh_host,
+        ssh_port=ssh_port,
+        ssh_user=ssh_user,
+        ssh_password=ssh_password,
+        ssh_key=ssh_key,
+        env_content=env_content,
+        db_mode=getattr(config, 'db_mode', 'auto') or 'auto',
+        target_os=getattr(config, 'target_os', 'linux') or 'linux',
+        agent_url=f"http://{ssh_host}:8001",
+        db_factory=async_session_maker,
+    )
+
+    return {"status": "deploying", "message": "Deployment started"}
+
+
+async def _run_deploy(
+    user_id: str,
+    ssh_host: str,
+    ssh_port: int,
+    ssh_user: str,
+    ssh_password: str | None,
+    ssh_key: str | None,
+    env_content: str,
+    db_mode: str,
+    target_os: str,
+    agent_url: str,
+    db_factory,
+):
+    """Background task: run SSH deployment and update status."""
+    log_state = _deploy_logs.get(user_id, {"lines": [], "done": False, "success": False})
+
+    async def on_log(line: str, level: str):
+        log_state["lines"].append({"line": line, "level": level})
+
+    try:
+        from app.services.ssh_deploy_service import deploy_agent
+        success = await deploy_agent(
+            ssh_host, ssh_port, ssh_user, ssh_password, ssh_key,
+            env_content, on_log, db_mode=db_mode, target_os=target_os,
+        )
+    except Exception as e:
+        logger.exception("Deploy background task failed: %s", e)
+        success = False
+        await on_log(f"Fatal error: {e}", "error")
+
+    log_state["done"] = True
+    log_state["success"] = success
+
+    # Update database
+    async with db_factory() as db:
+        result = await db.execute(
+            select(AgentConfig).where(AgentConfig.user_id == user_id)
+        )
+        config = result.scalar_one_or_none()
+        if config:
+            config.deploy_status = "active" if success else "error"
+            config.agent_url = agent_url if success else None
+            config.deploy_log = "\n".join(
+                entry["line"] for entry in log_state["lines"][-100:]
+            )
+            config.updated_at = datetime.utcnow()
+            if success:
+                config.setup_completed = True
+            await db.commit()
+
+
+@router.get("/deploy-status")
+async def get_deploy_status(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Check current deployment status and recent logs."""
+    config = await _get_or_create_config(current_user.id, db)
+
+    log_state = _deploy_logs.get(current_user.id)
+    recent_lines = []
+    if log_state:
+        recent_lines = log_state["lines"][-50:]
+
+    return {
+        "deploy_status": config.deploy_status,
+        "done": log_state["done"] if log_state else True,
+        "success": log_state["success"] if log_state else config.deploy_status == "active",
+        "lines": recent_lines,
+        "agent_url": config.agent_url,
+    }
+
+
+@router.get("/env")
+async def get_env_content(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate .env file content for manual download."""
+    config = await _get_or_create_config(current_user.id, db)
+
+    if not config.agent_api_key:
+        config.agent_api_key = f"toup_ak_{secrets.token_urlsafe(32)}"
+        await db.commit()
+
+    content = _build_env(config, current_user.id)
+    return {"content": content}
+
+
+@router.get("/setup-script")
+async def get_setup_script(
+    platform: str = "bash",
+    format: str = "json",
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate a setup script for local machines. platform: 'bash' or 'windows'."""
+    config = await _get_or_create_config(current_user.id, db)
+
+    if not config.agent_api_key:
+        config.agent_api_key = f"toup_ak_{secrets.token_urlsafe(32)}"
+        await db.commit()
+
+    env_content = _build_env(config, current_user.id)
+
+    if platform == "windows":
+        from app.services.ssh_deploy_service import generate_setup_script_windows
+        script = generate_setup_script_windows(env_content)
+    else:
+        from app.services.ssh_deploy_service import generate_setup_script
+        script = generate_setup_script(env_content)
+
+    if format == "raw":
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(script, media_type="text/plain")
+
+    return {"script": script}
+
+
+@router.post("/test-connection")
+async def test_agent_connection(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Test if the deployed agent is reachable."""
+    config = await _get_or_create_config(current_user.id, db)
+
+    agent_url = config.agent_url
+    if not agent_url:
+        # Check VPS
+        vps_result = await db.execute(
+            select(VPSInstance)
+            .where(VPSInstance.user_id == current_user.id)
+            .where(VPSInstance.status == "active")
+        )
+        vps = vps_result.scalars().first()
+        if vps and vps.public_ip:
+            agent_url = f"http://{vps.public_ip}:8001"
+
+    if not agent_url:
+        return {"reachable": False, "error": "No agent URL configured"}
+
+    # First try direct HTTP (works for public-IP agents)
+    try:
+        import time
+        start = time.time()
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{agent_url}/agent/health")
+            latency = int((time.time() - start) * 1000)
+            if resp.status_code == 200:
+                return {"reachable": True, "latency_ms": latency, "error": None}
+    except Exception:
+        pass  # Fall through to tunnel check
+
+    # Fallback: check if agent is connected via WS tunnel (NAT'd/self-hosted agents)
+    from app.api.ws_agent_tunnel import is_agent_connected
+    if is_agent_connected(str(current_user.id)):
+        return {"reachable": True, "latency_ms": 0, "via": "tunnel", "error": None}
+
+    return {"reachable": False, "error": "Agent not reachable via HTTP or tunnel"}
+
+
+@router.post("/register")
+async def agent_register(
+    body: AgentRegisterRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Called by the agent on startup to register its URL.
+
+    Authenticates via agent_api_key (not JWT).
+    """
+    # Find the AgentConfig with this API key
+    result = await db.execute(
+        select(AgentConfig).where(AgentConfig.agent_api_key == body.agent_api_key)
+    )
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=401, detail="Invalid agent API key")
+
+    config.agent_url = body.agent_url
+    config.deploy_status = "active"
+    config.setup_completed = True
+    config.setup_step = 6
+    config.updated_at = datetime.utcnow()
+    await db.commit()
+
+    logger.info("Agent registered: user=%s url=%s", config.user_id, body.agent_url)
+    return {"registered": True}
+
+
+class ColorUpdateRequest(BaseModel):
+    color: str
+
+
+@router.put("/color")
+async def update_agent_color(
+    body: ColorUpdateRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update agent color (from onboarding or settings)."""
+    import re
+    if not re.match(r'^#[0-9A-Fa-f]{6}$', body.color):
+        raise HTTPException(status_code=400, detail="Invalid hex color")
+    config = await _get_or_create_config(current_user.id, db)
+    config.agent_color = body.color
+    config.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"color": config.agent_color}
+
+
+def get_deploy_logs(user_id: str) -> dict | None:
+    """Get deploy log state for WebSocket streaming."""
+    return _deploy_logs.get(user_id)
+
+
+@router.get("/install/{connect_token}")
+async def get_install_script(
+    connect_token: str,
+    platform: str = "bash",
+    db: AsyncSession = Depends(get_db),
+):
+    """Public endpoint: serve setup script for curl piping.
+
+    Authenticated via connect_token in the URL (no JWT required).
+    Usage: curl -sL https://toup.ai/api/agent-setup/install/<token> | bash
+    """
+    result = await db.execute(
+        select(AgentConfig).where(AgentConfig.connect_token == connect_token)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    # Auto-generate agent_api_key if missing
+    if not config.agent_api_key:
+        config.agent_api_key = f"toup_ak_{secrets.token_urlsafe(32)}"
+        await db.commit()
+
+    env_content = _build_env(config, config.user_id)
+
+    if platform == "windows":
+        from app.services.ssh_deploy_service import generate_setup_script_windows
+        script = generate_setup_script_windows(env_content)
+    else:
+        from app.services.ssh_deploy_service import generate_setup_script
+        script = generate_setup_script(env_content)
+
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(script, media_type="text/plain")
