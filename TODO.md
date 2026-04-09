@@ -18,11 +18,34 @@ chat view has (scroll-to-bottom, copy, regenerate). Likely either a prop
 that hides the toolbar or a separate BrowserChatPanel component that was
 never updated. Small frontend-only fix.
 
-## ContextBudgetLog telemetry not writing
-The context_budget_logs table exists but has 0 rows despite the day-chat
-context path being active. The write in agent_runner.py is wrapped in
-try/except and silently failing. Debug and fix — the telemetry data is
-needed to tune token budgets and monitor summary staleness.
+## Fixed 2026-04-08: Environment variable persistence
+
+The `USE_DAY_CHAT_CONTEXT` env var was being dropped whenever containers were
+recreated via multi-line SSH `docker run -e` commands. pydantic-settings defaulted
+to False, so the day-chat context path never fired in production despite the
+architectural plumbing being correct.
+
+Fix: env vars are now stored in `/data/agents/{user_id}/.env` on the VPS and
+loaded via `docker run --env-file`. This persists across recreations and doesn't
+rely on shell escaping of multi-line command arguments.
+
+Lesson: never trust env vars to survive container recreation through a multi-line
+SSH command. Always use --env-file for anything that must persist.
+
+## Fixed 2026-04-08: ContextBudgetLog datetime mismatch
+
+The telemetry INSERT used `datetime.now(timezone.utc)` (tz-aware) but the DB
+column stores naive UTC. asyncpg crashed with "can't subtract offset-naive and
+offset-aware". Fixed by using `datetime.utcnow()`. Same class of bug as Bug 4
+(naive/tz-aware mismatch). Total: 5 instances of this bug discovered during ship.
+
+## Automate container recreation
+
+Manually reconstructing `docker run` flags from `docker inspect` output is
+error-prone and lost the feature flag twice during the Day-as-Chat ship.
+Write a `deploy.sh` script that reads `/data/agents/{id}/.env`, stops, removes,
+and recreates the container with `--env-file`. Idempotent, safe to run repeatedly.
+Put it in `scripts/` in the toup-agent repo.
 
 ## Real Postgres integration tests
 Three production bugs shipped because SQLite tests don't exercise paths
