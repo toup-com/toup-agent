@@ -491,6 +491,24 @@ async def ws_chat(
 
         broadcast_task = asyncio.create_task(_broadcast_reader())
 
+        # Server-side keepalive: send periodic pings to prevent proxy idle timeouts.
+        # Railway and Cloudflare drop idle WebSocket connections after ~30s.
+        # Research subagent can take 15-30s with no data flowing — this keeps the WS alive.
+        WS_KEEPALIVE_INTERVAL = 15  # seconds
+
+        async def _keepalive():
+            try:
+                while True:
+                    await asyncio.sleep(WS_KEEPALIVE_INTERVAL)
+                    try:
+                        await websocket.send_json({"type": "ping"})
+                    except Exception:
+                        break
+            except asyncio.CancelledError:
+                pass
+
+        keepalive_task = asyncio.create_task(_keepalive())
+
         # Main message loop
         try:
             while True:
@@ -1089,6 +1107,7 @@ async def ws_chat(
         finally:
             # Clean up broadcast queue and task
             broadcast_task.cancel()
+            keepalive_task.cancel()
             _unregister_ws_queue(user_id, broadcast_queue)
 
     except WebSocketDisconnect:
