@@ -716,8 +716,10 @@ class AppBuilderSkill(Skill):
         }
 
         async with async_session_maker() as db:
-            # Deduplicate slug — append numeric suffix if collision
+            # Deduplicate slug — append numeric suffix if collision.
+            # Uses DB unique constraint as source of truth (handles concurrent races).
             from sqlalchemy import select as sa_select
+            from sqlalchemy.exc import IntegrityError as _IntegrityError
             slug = base_slug
             for attempt in range(1, 100):
                 existing = await db.execute(
@@ -728,29 +730,47 @@ class AppBuilderSkill(Skill):
                 slug = f"{base_slug}-{attempt}"
 
             app_dir = os.path.join(_apps_dir, slug)
-            app = App(
-                id=app_id,
-                user_id=user_id,
-                name=name,
-                description=description,
-                slug=slug,
-                status="building",
-                app_dir=app_dir,
-                platforms=",".join(platforms),
-            )
-            db.add(app)
 
-            job = BuildJob(
-                id=job_id,
-                user_id=user_id,
-                app_id=app_id,
-                title=f"Build: {name}",
-                prompt=description,
-                status="queued",
-                steps_json=json.dumps(self._initial_steps()),
-            )
-            db.add(job)
-            await db.commit()
+            # Retry loop: if concurrent build races for the same slug,
+            # the DB unique constraint catches it and we try the next suffix.
+            _slug_committed = False
+            for _slug_retry in range(5):
+                app = App(
+                    id=app_id,
+                    user_id=user_id,
+                    name=name,
+                    description=description,
+                    slug=slug,
+                    status="building",
+                    app_dir=app_dir,
+                    platforms=",".join(platforms),
+                )
+                db.add(app)
+                job = BuildJob(
+                    id=job_id,
+                    user_id=user_id,
+                    app_id=app_id,
+                    job_type="auto_builder",
+                    title=f"Build: {name}",
+                    prompt=description,
+                    status="queued",
+                    steps_json=json.dumps(self._initial_steps()),
+                )
+                db.add(job)
+                try:
+                    await db.commit()
+                    _slug_committed = True
+                    break
+                except _IntegrityError:
+                    await db.rollback()
+                    slug = f"{base_slug}-{_slug_retry + 2}"
+                    app_dir = os.path.join(_apps_dir, slug)
+                    app_id = str(uuid.uuid4())
+                    job_id = str(uuid.uuid4())
+                    logger.warning("[BUILD] Slug collision on '%s', retrying with '%s'", base_slug, slug)
+
+            if not _slug_committed:
+                return f"Failed to create app — slug collision after 5 retries for '{base_slug}'"
 
         # Broadcast initial job_update immediately (before background task starts)
         if self._ws_broadcast:
@@ -1789,52 +1809,76 @@ class AppBuilderSkill(Skill):
             except Exception as e:
                 error_text = str(e)
                 classification = self._app_manager._classify_install_error(error_text) if self._app_manager else "unknown"
-                await blog.error(f"npm install failed ({classification}): {error_text[:200]}")
+                await blog.error(f"[VALIDATOR] Install failed — classification={classification} job={job_id[:8]}")
+                await blog.info(f"[VALIDATOR] Error detail: {error_text[:300]}")
 
                 if classification == "bad_dep":
-                    # Try to auto-repair: ask LLM to fix package.json
-                    await blog.info("[REPAIR] Detected bad dependency — asking LLM to fix package.json...")
-                    try:
-                        pkg_path = os.path.join(app_dir, "package.json")
-                        with open(pkg_path, "r") as f:
-                            pkg_content = f.read()
-                        fix_prompt = (
-                            f"npm install failed with this error:\n{error_text[:500]}\n\n"
-                            f"Current package.json:\n{pkg_content}\n\n"
-                            "Fix the package.json to resolve the error. Remove bad packages, "
-                            "fix version numbers, or replace with working alternatives. "
-                            "Return ONLY the corrected JSON, nothing else."
+                    # Auto-repair: LLM fixes package.json (up to 2 attempts)
+                    _install_repaired = False
+                    _repair_error_context = error_text
+                    MAX_INSTALL_REPAIR_ATTEMPTS = 2
+
+                    for repair_attempt in range(1, MAX_INSTALL_REPAIR_ATTEMPTS + 1):
+                        await blog.info(
+                            f"[REPAIR] Detected bad dependency — asking LLM to fix package.json "
+                            f"(attempt {repair_attempt}/{MAX_INSTALL_REPAIR_ATTEMPTS}) job={job_id[:8]}"
                         )
-                        fixed_json = await self._call_llm(
-                            system_prompt="You fix npm package.json errors. Return only valid JSON.",
-                            user_message=fix_prompt,
-                            model="", purpose="repair_package_json",
-                            blog=blog,
-                        )
-                        # Extract JSON from LLM response
-                        import re as _re
-                        json_match = _re.search(r'\{[\s\S]*\}', fixed_json)
-                        if json_match:
+                        try:
+                            pkg_path = os.path.join(app_dir, "package.json")
+                            with open(pkg_path, "r") as f:
+                                pkg_content = f.read()
+                            fix_prompt = (
+                                f"npm install failed with this error:\n{_repair_error_context[:800]}\n\n"
+                                f"Current package.json:\n{pkg_content}\n\n"
+                                "Fix the package.json to resolve the error. Remove bad packages, "
+                                "fix version numbers, or replace with working alternatives. "
+                                "Return ONLY the corrected JSON, nothing else."
+                            )
+                            fixed_json = await self._call_llm(
+                                system_prompt="You fix npm package.json errors. Return only valid JSON.",
+                                user_message=fix_prompt,
+                                model="", purpose="repair_package_json",
+                                blog=blog,
+                            )
+                            import re as _re
+                            json_match = _re.search(r'\{[\s\S]*\}', fixed_json)
+                            if not json_match:
+                                raise RuntimeError("LLM did not return valid JSON")
                             json.loads(json_match.group())  # validate
                             with open(pkg_path, "w") as f:
                                 f.write(json_match.group())
-                            await blog.info("[REPAIR] package.json fixed, retrying install...")
+                            await blog.info(f"[REPAIR] package.json rewritten, retrying install...")
                             install_output = await self._app_manager.install_deps(app_id, all_deps, app_dir=app_dir)
-                            await blog.success("Dependencies installed after repair")
+                            await blog.success(f"[REPAIR] Dependencies installed after repair (attempt {repair_attempt})")
                             await self._update_step(job_id, user_id, "installing", "done")
-                        else:
-                            raise RuntimeError("LLM did not return valid JSON for package.json fix")
-                    except Exception as repair_err:
-                        await blog.error(f"[REPAIR] Auto-repair failed: {repair_err}")
+                            _install_repaired = True
+                            break
+                        except Exception as repair_err:
+                            _repair_error_context = str(repair_err)
+                            new_cls = self._app_manager._classify_install_error(_repair_error_context) if self._app_manager else "unknown"
+                            await blog.warn(
+                                f"[REPAIR] Attempt {repair_attempt} failed (new classification={new_cls}): "
+                                f"{_repair_error_context[:200]}"
+                            )
+                            if new_cls != "bad_dep":
+                                # Error changed type — don't keep trying LLM fixes
+                                await blog.error(f"[REPAIR] Error type changed to {new_cls}, stopping repair")
+                                break
+
+                    if not _install_repaired:
+                        await blog.error(f"[REPAIR] Install repair exhausted after {MAX_INSTALL_REPAIR_ATTEMPTS} attempts job={job_id[:8]}")
                         await blog.persist()
                         await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
                         return
-                elif classification in ("disk", "unknown"):
+
+                elif classification in ("disk",):
+                    await blog.error(f"[VALIDATOR] Non-recoverable install failure ({classification}) — failing job")
                     await blog.persist()
                     await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
                     return
                 else:
-                    # transient/stale — the retry already happened inside install_deps
+                    # transient/stale/unknown — retry already happened inside install_deps
+                    await blog.error(f"[VALIDATOR] Install failed after retry ({classification}) — failing job")
                     await blog.persist()
                     await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
                     return

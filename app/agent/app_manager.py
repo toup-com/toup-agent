@@ -329,7 +329,7 @@ class AppManager:
         managed.metro_port = port
         managed.metro_process = proc
         managed.started_at = time.time()
-        self._used_metro_ports.add(port)
+        # Port already claimed in _allocate_port
 
         # Start log reader
         asyncio.create_task(self._read_output(managed, proc, "metro"))
@@ -366,7 +366,7 @@ class AppManager:
 
         managed.web_port = port
         managed.web_process = proc
-        self._used_web_ports.add(port)
+        # Port already claimed in _allocate_port
 
         # Start log reader
         asyncio.create_task(self._read_output(managed, proc, "web"))
@@ -700,9 +700,10 @@ export default supabase;
     # ── Internal Helpers ────────────────────────────────
 
     def _allocate_port(self, port_range: Tuple[int, int], used: Set[int]) -> int:
-        """Find next free port in range."""
+        """Find next free port in range. Claims it atomically (adds to `used` before returning)."""
         for port in range(port_range[0], port_range[1] + 1):
             if port not in used:
+                used.add(port)  # Claim before returning — prevents TOCTOU race
                 return port
         raise RuntimeError(f"No free ports in range {port_range[0]}-{port_range[1]}")
 
