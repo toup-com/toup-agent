@@ -1765,7 +1765,7 @@ class ToolExecutor:
         """Show current session status: model, tokens, messages, uptime."""
         try:
             from app.db.database import async_session_maker
-            from app.db.models import Session, Message
+            from app.db.models import Conversation, Message
             from sqlalchemy import select, func
 
             user_id = self._current_user_id
@@ -1775,12 +1775,12 @@ class ToolExecutor:
                 # Find current session
                 from sqlalchemy import and_
                 result = await db.execute(
-                    select(Session).where(
+                    select(Conversation).where(
                         and_(
-                            Session.user_id == user_id,
-                            Session.is_active == True,
+                            Conversation.user_id == user_id,
+                            Conversation.is_active == True,
                         )
-                    ).order_by(Session.updated_at.desc()).limit(1)
+                    ).order_by(Conversation.updated_at.desc()).limit(1)
                 )
                 session = result.scalar_one_or_none()
                 if not session:
@@ -1788,16 +1788,16 @@ class ToolExecutor:
 
                 # Count messages
                 msg_count = await db.execute(
-                    select(func.count()).where(Message.session_id == session.id)
+                    select(func.count()).where(Message.conversation_id == session.id)
                 )
                 count = msg_count.scalar() or 0
 
                 # Token totals
                 token_result = await db.execute(
                     select(
-                        func.sum(Message.tokens_input),
-                        func.sum(Message.tokens_output),
-                    ).where(Message.session_id == session.id)
+                        func.sum(Message.tokens_prompt),
+                        func.sum(Message.tokens_completion),
+                    ).where(Message.conversation_id == session.id)
                 )
                 row = token_result.one()
                 total_in = row[0] or 0
