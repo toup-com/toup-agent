@@ -366,8 +366,9 @@ async def lifespan(app: FastAPI):
 
                 for job in orphaned_jobs:
                     job.status = "failed"
-                    job.error_message = "Interrupted by restart"
+                    job.error_message = "Agent restarted during execution"
                     job.completed_at = datetime.utcnow()
+                    logger.info("[SWEEP] Marking orphan job %s (%s) as failed — was %s", job.id[:8], job.title[:40], job.status)
 
                     # Mark any in-progress steps as failed with correct duration
                     try:
@@ -849,6 +850,28 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── Shutdown (reverse order) ──────────────────────────────
+    logger.info("[SHUTDOWN] Agent shutting down — marking in-flight jobs as failed")
+
+    # Checkpoint: mark any running jobs as failed before exit
+    try:
+        from app.db.models import BuildJob
+        from sqlalchemy import select as _shutdown_sel
+        async with async_session_maker() as _sdb:
+            _running = await _sdb.execute(
+                _shutdown_sel(BuildJob).where(BuildJob.status == "running")
+            )
+            _running_jobs = _running.scalars().all()
+            for _rj in _running_jobs:
+                _rj.status = "failed"
+                _rj.error_message = "Agent shutdown during execution"
+                _rj.completed_at = datetime.utcnow()
+                logger.info("[SHUTDOWN] Marked job %s as failed", _rj.id[:8])
+            if _running_jobs:
+                await _sdb.commit()
+                logger.info("[SHUTDOWN] Checkpointed %d in-flight jobs", len(_running_jobs))
+    except Exception as _se:
+        logger.warning("[SHUTDOWN] Failed to checkpoint jobs: %s", _se)
+
     if _backfill_task and not _backfill_task.done():
         _backfill_task.cancel()
     if _reconcile_task:

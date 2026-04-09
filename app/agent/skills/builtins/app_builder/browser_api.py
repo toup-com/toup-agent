@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Max text to return from a single page
 MAX_PAGE_TEXT = 15_000
 # Timeout for page loads
-NAV_TIMEOUT_MS = 20_000
+NAV_TIMEOUT_MS = 8_000  # Tightened from 20s — research has a 25s hard ceiling
 
 # ── Own headless browser instance (separate from user-facing browser) ────
 
