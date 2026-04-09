@@ -15,6 +15,7 @@ Endpoints:
   GET    /apps/jobs/{job_id}/logs  - Get structured build logs
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -90,6 +91,7 @@ class AppResponse(BaseModel):
 class JobResponse(BaseModel):
     id: str
     app_id: Optional[str] = None
+    job_type: str = "auto_builder"  # auto_builder, vibe_code, agent_task
     title: str
     prompt: str
     status: str
@@ -161,6 +163,7 @@ def _job_to_response(job: BuildJob) -> JobResponse:
     return JobResponse(
         id=job.id,
         app_id=job.app_id,
+        job_type=getattr(job, 'job_type', None) or "auto_builder",
         title=job.title,
         prompt=job.prompt,
         status=job.status,
@@ -258,13 +261,13 @@ class CreateJobRequest(BaseModel):
 @router.post("/jobs/")
 async def create_job(req: CreateJobRequest) -> JobResponse:
     """Create a new agent task job from the dashboard and execute it."""
-    import asyncio
     import uuid
     user_id = _get_user_id()
     job_id = str(uuid.uuid4())
     job = BuildJob(
         id=job_id,
         user_id=user_id,
+        job_type="agent_task",
         title=req.title,
         prompt=req.description or req.title,
         status="running",
@@ -281,13 +284,22 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
     # Execute the task via the agent runner in background
     if _agent_runner:
         async def _run_dashboard_task():
+            from app.agent.job_logger import JobLogger
+            blog = JobLogger(job_id, user_id, ws_broadcast=_ws_broadcast)
             try:
+                await blog.info(f"Starting task: {req.title}")
                 result = await _agent_runner.run(
                     user_message=req.description or req.title,
                     user_id=user_id,
                     session_id=f"dashboard-task-{job_id[:8]}",
                     channel="web",
+                    on_tool_start=lambda name, args: asyncio.ensure_future(
+                        blog.tool(f"Using {name}", meta={"tool": name})
+                    ),
                 )
+                blog._total_tokens = getattr(result, 'tokens_total', 0)
+                await blog.info(f"Task completed ({getattr(result, 'tokens_total', 0):,} tokens)")
+                await blog.persist()
                 # Mark completed
                 async with async_session_maker() as db:
                     j = await db.get(BuildJob, job_id)
@@ -307,6 +319,8 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
                     })
             except Exception as e:
                 logger.error(f"[DASHBOARD] Task {job_id[:8]} failed: {e}")
+                await blog.error(f"Task failed: {e}")
+                await blog.persist()
                 async with async_session_maker() as db:
                     j = await db.get(BuildJob, job_id)
                     if j:

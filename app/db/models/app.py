@@ -50,6 +50,7 @@ class BuildJob(Base):
     app_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    job_type: Mapped[str] = mapped_column(String(20), default="auto_builder")  # auto_builder, vibe_code, agent_task
     status: Mapped[str] = mapped_column(String(20), default="queued")  # queued, running, completed, failed
     steps_json: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of BuildStep dicts
     model: Mapped[str] = mapped_column(String(50), default="")

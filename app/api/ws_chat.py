@@ -22,6 +22,7 @@ Authentication:
 import asyncio
 import json
 import logging
+from datetime import datetime
 import sys
 from typing import Dict, List, Optional
 
@@ -248,6 +249,66 @@ async def _check_age_and_swap(video_id: str, user_id: str) -> None:
         logger.warning("[AGE-SWAP] Timeout checking %s — YouTube embed stays", video_id)
     except Exception as e:
         logger.warning("[AGE-SWAP] Error checking %s: %s — YouTube embed stays", video_id, e)
+
+
+# ── Task intent detection ──────────────────────────────────────────
+# Keyword/regex heuristic: detects imperative task requests in chat.
+# Matches phrases like "research X", "find me Y", "monitor Z", "set up A".
+import re as _re
+_TASK_INTENT_PATTERN = _re.compile(
+    r"^(research|find\s+(me\s+)?|look\s+up|monitor|track|set\s+up|remind\s+me|"
+    r"schedule|analyze|investigate|summarize|compile|gather|collect|prepare|"
+    r"write\s+(me\s+)?(a\s+)?|draft\s+(me\s+)?(a\s+)?|create\s+(a\s+)?report|"
+    r"compare|review|check\s+(if|whether)|scan|audit|benchmark|evaluate)",
+    _re.IGNORECASE,
+)
+
+
+async def _detect_and_create_task(
+    text: str, user_id: str, session_id: Optional[str],
+    broadcast_queue: asyncio.Queue,
+) -> Optional[str]:
+    """If text looks like a task request, create an agent_task BuildJob.
+
+    Returns job_id if a task was created, None otherwise.
+    """
+    if not _TASK_INTENT_PATTERN.search(text.strip()):
+        return None
+
+    import uuid
+    from app.db.database import async_session_maker
+    from app.db.models import BuildJob
+
+    job_id = str(uuid.uuid4())
+    title = text.strip()[:60]
+
+    job = BuildJob(
+        id=job_id,
+        user_id=user_id,
+        job_type="agent_task",
+        title=title,
+        prompt=text[:2000],
+        status="running",
+        steps_json="[]",
+        model="",
+        layer=0,
+    )
+    try:
+        async with async_session_maker() as db:
+            db.add(job)
+            await db.commit()
+
+        # Notify frontend: "Created task → view in Dashboard"
+        broadcast_queue.put_nowait({
+            "type": "task_created",
+            "job_id": job_id,
+            "title": title,
+        })
+        logger.info(f"[TASK] Detected task intent, created agent_task job {job_id[:8]}: {title}")
+        return job_id
+    except Exception as e:
+        logger.warning(f"[TASK] Failed to create task job: {e}")
+        return None
 
 
 async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Queue) -> Optional[tuple]:
@@ -807,6 +868,13 @@ async def ws_chat(
                 if _fast_result and hasattr(_agent_runner, 'tools'):
                     _agent_runner.tools._last_media = _fast_result[1]
 
+                # Task intent detection — detect imperative task requests in regular chat
+                _chat_task_job_id = None
+                if channel != "vibecoding" and not _fast_result:
+                    _chat_task_job_id = await _detect_and_create_task(
+                        text, user_id, session_id, broadcast_queue
+                    )
+
                 # Run agent — use the modified text for LLM but save the original user text
                 agent_task = asyncio.create_task(_agent_runner.run(
                     user_message=_agent_text,
@@ -857,6 +925,27 @@ async def ws_chat(
                         await stop_task  # Wait for stop task to actually finish
                     except (asyncio.CancelledError, Exception):
                         pass
+
+                    # Finalize chat task job if one was created
+                    if _chat_task_job_id:
+                        try:
+                            from app.db.database import async_session_maker as _sm
+                            from app.db.models import BuildJob as _BJ
+                            async with _sm() as _tdb:
+                                _tj = await _tdb.get(_BJ, _chat_task_job_id)
+                                if _tj and _tj.status == "running":
+                                    _tj.status = "completed"
+                                    _tj.completed_at = datetime.utcnow()
+                                    _tj.total_tokens = response.tokens_total or 0
+                                    _tj.model = response.model or ""
+                                    await _tdb.commit()
+                            await broadcast_queue.put({
+                                "type": "job_update",
+                                "job_id": _chat_task_job_id,
+                                "status": "completed",
+                            })
+                        except Exception as _te:
+                            logger.warning(f"[TASK] Failed to finalize task job: {_te}")
 
                     # Terminal activity: show agent response summary
                     resp_preview = response.text[:200].replace("\n", " ")
@@ -966,6 +1055,20 @@ async def ws_chat(
                     except (asyncio.CancelledError, Exception):
                         pass
                     logger.exception(f"[WS] Agent error for {user_id}")
+                    # Mark chat task job as failed if one was created
+                    if _chat_task_job_id:
+                        try:
+                            from app.db.database import async_session_maker as _sm2
+                            from app.db.models import BuildJob as _BJ2
+                            async with _sm2() as _fdb:
+                                _fj = await _fdb.get(_BJ2, _chat_task_job_id)
+                                if _fj and _fj.status == "running":
+                                    _fj.status = "failed"
+                                    _fj.error_message = str(e)[:500]
+                                    _fj.completed_at = datetime.utcnow()
+                                    await _fdb.commit()
+                        except Exception:
+                            pass
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
                     # Save partial response so it's not lost on refresh
                     _partial = "".join(_streamed_chunks).strip()

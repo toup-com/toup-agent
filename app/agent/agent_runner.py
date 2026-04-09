@@ -125,8 +125,8 @@ class AgentRunner:
     ) -> tuple:
         """Create App + BuildJob records for a vibecoding session.
 
-        Returns (job_id, app_id) tuple. Idempotent per session — won't create
-        duplicates if called multiple times for the same session.
+        Returns (job_id, app_id) tuple. Idempotent per session — follow-up
+        messages in the same session reuse the existing job (session continuity).
         """
         import uuid as _uuid
         import re as _re
@@ -139,21 +139,24 @@ class AgentRunner:
         vibecoding_dir = _os.path.join(_os.path.abspath(workspace), 'vibecoding')
 
         async with async_session_maker() as db:
-            # Check for existing vibecoding app in this session to avoid duplicates
+            # Session continuity: reuse existing vibe_code job for this session
             if session_id:
                 from sqlalchemy import select, and_
                 existing = await db.execute(
                     select(BuildJob).where(
                         and_(
                             BuildJob.user_id == user_id,
-                            BuildJob.app_id.isnot(None),
+                            BuildJob.status.in_(["running", "completed"]),
                         )
-                    ).order_by(BuildJob.created_at.desc()).limit(5)
+                    ).order_by(BuildJob.created_at.desc()).limit(10)
                 )
                 recent_jobs = existing.scalars().all()
                 for j in recent_jobs:
-                    if j.status in ("queued", "running") and getattr(j, 'layer', 0) == 0:
-                        # Reuse the existing vibecoding job
+                    if getattr(j, 'job_type', '') == 'vibe_code' and j.status in ("running", "completed"):
+                        # Reuse: reopen if completed, append to running
+                        if j.status == "completed":
+                            j.status = "running"
+                            await db.commit()
                         return j.id, j.app_id
 
             # Generate slug from prompt
@@ -197,6 +200,7 @@ class AgentRunner:
                 id=job_id,
                 user_id=user_id,
                 app_id=app_id,
+                job_type="vibe_code",
                 title=f"Vibecoding: {name}",
                 prompt=prompt[:2000] if prompt else "",
                 status="running",
@@ -445,12 +449,17 @@ class AgentRunner:
             logger.info(f"[VIBE] Stripped app_builder tools for vibecoding channel, {len(current_tools)} tools remaining")
 
             # Register vibecoding session in DB (App + BuildJob) for visibility
+            _vibe_logger = None
             try:
                 _vibe_job_id, _vibe_app_id = await self._register_vibecoding_session(
                     user_id=user_id,
                     prompt=user_message,
                     session_id=session_id,
                 )
+                if _vibe_job_id:
+                    from app.agent.job_logger import JobLogger
+                    _vibe_logger = JobLogger(_vibe_job_id, user_id)
+                    await _vibe_logger.info(f"Vibe coding: {user_message[:80]}")
             except Exception as e:
                 logger.warning(f"[VIBE] Failed to register vibecoding session: {e}")
 
@@ -789,9 +798,21 @@ class AgentRunner:
             "elapsed_ms": elapsed,
         })
 
-        # Finalize vibecoding session: mark job completed/failed
+        # Finalize vibecoding session: log events, mark job completed/failed
         if _vibe_job_id and _vibe_app_id:
             try:
+                # Log tool calls and file edits
+                if _vibe_logger:
+                    for tc in all_tool_calls:
+                        name = tc.get("name", "")
+                        if name in ("write_file", "edit_file"):
+                            path = tc.get("arguments", {}).get("path", "") if isinstance(tc.get("arguments"), dict) else ""
+                            await _vibe_logger.edit(f"Edited {path or 'file'}", meta={"path": path, "tool": name})
+                        elif name:
+                            await _vibe_logger.tool(f"Used {name}", meta={"tool": name})
+                    _vibe_logger._total_tokens = total_input + total_output
+                    await _vibe_logger.persist()
+
                 async with async_session_maker() as vdb:
                     from app.db.models import App as _App, BuildJob as _BJ
                     vj = await vdb.get(_BJ, _vibe_job_id)

@@ -227,6 +227,10 @@ async def init_db():
         "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS builder_mode VARCHAR(10)",
         # Reconciliation log cleanup
         "DELETE FROM reconciliation_logs WHERE created_at < NOW() - INTERVAL '30 days'",
+        # Job type classification (auto_builder, vibe_code, agent_task)
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS job_type VARCHAR(20) DEFAULT 'auto_builder'",
+        # Backfill: existing rows without job_type get auto_builder
+        "UPDATE build_jobs SET job_type = 'auto_builder' WHERE job_type IS NULL",
         # Day-as-Chat: FK from conversations to day_chats (nullable during migration)
         "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS day_chat_id VARCHAR(36) REFERENCES day_chats(id)",
         # Day-as-Chat: denormalized FK from messages to day_chats for fast loading
