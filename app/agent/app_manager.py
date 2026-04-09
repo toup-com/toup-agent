@@ -153,6 +153,14 @@ class AppManager:
         app_dir = await self._resolve_app_dir(app_id, app_dir)
         assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
 
+        # Clean stale node_modules from previous failed installs to prevent hangs
+        nm_path = os.path.join(app_dir, "node_modules")
+        lock_path = os.path.join(app_dir, "package-lock.json")
+        if os.path.isdir(nm_path) and not os.path.isfile(lock_path):
+            logger.warning("[APP] Cleaning stale node_modules (no lock file) in %s", app_dir)
+            import shutil
+            shutil.rmtree(nm_path, ignore_errors=True)
+
         # Base install
         cmd = ["npm", "install"]
         proc = await asyncio.create_subprocess_exec(
@@ -162,6 +170,10 @@ class AppManager:
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
         output = (stdout or b"").decode()
+        if proc.returncode != 0:
+            err_text = (stderr or b"").decode()[:1000]
+            logger.error("[APP] npm install failed (exit %d) in %s: %s", proc.returncode, app_dir, err_text)
+            raise RuntimeError(f"npm install failed: {err_text}")
 
         # Install extra deps using `npx expo install` for version compatibility
         if deps:
