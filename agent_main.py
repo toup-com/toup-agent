@@ -40,7 +40,7 @@ from app.api.memories import router as memories_router
 from app.api.sessions import router as sessions_router
 from app.api.day_chats import router as day_chats_router
 from app.api.chat import router as chat_router
-from app.api.ws_chat import router as ws_chat_router, set_ws_refs
+from app.api.ws_chat import router as ws_chat_router, set_ws_refs, broadcast_to_user
 from app.api.api_v1 import router as api_v1_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
@@ -429,7 +429,6 @@ async def lifespan(app: FastAPI):
         if app_manager:
             try:
                 from app.agent.skills.builtins.app_builder.skill import AppBuilderSkill
-                from app.api.ws_chat import broadcast_to_user
                 builder_skill = AppBuilderSkill(
                     app_manager=app_manager,
                     ws_broadcast=broadcast_to_user,
