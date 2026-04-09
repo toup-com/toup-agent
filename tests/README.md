@@ -50,3 +50,54 @@ against a real Postgres with all tables present.
 **Proposed approach:** Docker Compose with a Postgres service, seed script that
 creates the same tables a production agent DB has, then run `init_db()` and
 verify no crashes. Add to CI.
+
+---
+
+# Test retrospective — Day-as-Chat ship (2026-04-08)
+
+The Day-as-Chat refactor shipped with 57+ passing unit tests across 8 test
+files, all running against SQLite. Despite this, four production bugs made
+it to deploy:
+
+1. Runtime assertion in init_db() crashed monolith-style agent DBs that
+   contain both platform and agent tables. SQLite tests used clean partitioned
+   schemas and never triggered it. Fixed in 5d9aea9 (downgraded to warning).
+
+2. agent_main.py backfill code used logger.info() but no logger was defined
+   at module level. NameError crashed startup. SQLite tests don't import
+   agent_main.py. Fixed by using print().
+
+3. users.stripe_customer_id ALTER TABLE was in the platform-only block, but
+   the User ORM model references it and users is a shared table. Agent
+   queries crashed with UndefinedColumnError. SQLite tests don't use the
+   platform/agent partition system the same way. Fixed by moving ALTER to
+   the shared block.
+
+4. Telegram long-lived Conversation sessions span multiple days, but the
+   original implementation read day_chat_id from the Conversation row.
+   SQLite tests used short-lived sessions that didn't cross day boundaries.
+   Fixed via Option C refactor: Message.day_chat_id resolved at save time
+   from current local date, Conversation.day_chat_id demoted to a hint.
+
+## Testing gap to close
+
+SQLite unit tests are necessary but not sufficient. They don't catch:
+- Real Postgres-only syntax (AT TIME ZONE, INSERT ON CONFLICT nuances)
+- Schema ALTER idempotency on half-migrated DBs
+- Long-lived sessions that span day/month/year boundaries
+- Runtime assertions on production-shaped data
+- Module-level import errors that tests don't import
+
+## TODO: Integration test suite
+
+Build a test harness that:
+- Spins up a real Postgres container
+- Loads a snapshot of production-like data (anonymized)
+- Runs init_db() from a fresh state AND from a half-migrated state
+- Runs the full backfill idempotently
+- Exercises Telegram/cross-day scenarios specifically
+- Runs a synthetic cross-channel end-to-end turn
+- Runs in CI before any backend deploy
+
+Until this exists, manual verification on production (like the one that
+caught these four bugs) is the only safety net.
