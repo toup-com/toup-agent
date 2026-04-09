@@ -212,6 +212,7 @@ class Settings(BaseSettings):
     aws_key_pair_name: str = ""                    # EC2 key pair name
     aws_security_group_id: str = ""                # Security group allowing SSH + HTTP(S)
     stripe_secret_key: Optional[str] = None        # Set via STRIPE_SECRET_KEY
+    stripe_publishable_key: str = ""               # Set via STRIPE_PUBLISHABLE_KEY (public, safe for frontend)
     stripe_webhook_secret: Optional[str] = None    # Set via STRIPE_WEBHOOK_SECRET
     stripe_starter_price_id: str = ""              # Stripe Price ID for Starter plan
     stripe_standard_price_id: str = ""             # Stripe Price ID for Standard plan

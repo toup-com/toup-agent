@@ -60,6 +60,77 @@ def get_or_create_customer(user_id: str, email: str, name: Optional[str] = None)
     return cust.id
 
 
+def create_subscription_with_intent(
+    customer_id: str,
+    price_id: str,
+    user_id: str,
+) -> dict:
+    """
+    Create a Subscription with payment_behavior='default_incomplete'.
+    Returns the client_secret for the frontend PaymentElement to confirm,
+    plus the subscription ID.
+    """
+    client = _get_stripe_client()
+    sub = client.subscriptions.create(
+        params={
+            "customer": customer_id,
+            "items": [{"price": price_id}],
+            "payment_behavior": "default_incomplete",
+            "payment_settings": {
+                "save_default_payment_method": "on_subscription",
+            },
+            "metadata": {
+                "user_id": user_id,
+                "type": "llm_bundle",
+            },
+            "expand": ["latest_invoice.payment_intent"],
+        }
+    )
+    pi = sub.latest_invoice.payment_intent
+    return {
+        "subscription_id": sub.id,
+        "client_secret": pi.client_secret,
+        "status": sub.status,
+    }
+
+
+def get_active_subscription_for_customer(customer_id: str, price_id: str) -> Optional[dict]:
+    """Check if the customer already has an active subscription for this price."""
+    try:
+        client = _get_stripe_client()
+        subs = client.subscriptions.list(
+            params={
+                "customer": customer_id,
+                "price": price_id,
+                "status": "active",
+                "limit": 1,
+            }
+        )
+        if subs.data:
+            return {"subscription_id": subs.data[0].id, "status": "active"}
+        # Also check incomplete (payment pending)
+        subs_inc = client.subscriptions.list(
+            params={
+                "customer": customer_id,
+                "price": price_id,
+                "status": "incomplete",
+                "limit": 1,
+                "expand": ["data.latest_invoice.payment_intent"],
+            }
+        )
+        if subs_inc.data:
+            pi = subs_inc.data[0].latest_invoice.payment_intent
+            return {
+                "subscription_id": subs_inc.data[0].id,
+                "client_secret": pi.client_secret if pi else None,
+                "status": "incomplete",
+            }
+        return None
+    except Exception as exc:
+        logger.warning("Failed to check existing subscriptions: %s", exc)
+        return None
+
+
 def create_billing_portal_session(customer_id: str, return_url: str) -> str:
     """Create a Stripe Customer Portal session. Returns the portal URL."""
     client = _get_stripe_client()
