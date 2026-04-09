@@ -16,6 +16,7 @@ from app.db.models import (
     AgentConfig,
     LLMBundleAllocation,
     LLMUsageRecord,
+    LLMProxyEvent,
 )
 from app.db.database import get_db, init_db, drop_db, async_session_maker, engine
 
@@ -60,6 +61,7 @@ __all__ = [
     "AgentConfig",
     "LLMBundleAllocation",
     "LLMUsageRecord",
+    "LLMProxyEvent",
     # Database
     "get_db",
     "init_db",

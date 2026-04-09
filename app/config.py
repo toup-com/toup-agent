@@ -265,6 +265,17 @@ class Settings(BaseSettings):
     multi_agent_enabled: bool = False  # Enable persona-based routing
     multi_agent_default: str = "default"  # Default persona name
 
+    # ── Platform LLM Proxy (bundle mode) ───────────────────
+    platform_anthropic_api_key: Optional[str] = None  # Platform-owned Anthropic key
+    platform_openai_api_key: Optional[str] = None     # Platform-owned OpenAI key
+    platform_encryption_key: str = ""                  # Fernet key for encrypting secrets at rest
+
+    # Bundle budget configuration (all values in cents)
+    bundle_total_budget_cents: int = 4000              # $40/month total
+    bundle_anthropic_budget_cents: int = 3000           # $30/month Anthropic allocation
+    bundle_openai_budget_cents: int = 1000              # $10/month OpenAI allocation
+    bundle_anthropic_daily_cap_cents: int = 100          # $1/day Anthropic soft cap (triggers fallback)
+
     # Pricing per 1K tokens (USD)
     pricing_per_1k: dict[str, dict[str, float]] = {
         "gpt-5.4": {"input": 0.003, "output": 0.012},

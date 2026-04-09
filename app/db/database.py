@@ -197,6 +197,13 @@ async def init_db():
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS supabase_url TEXT",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS target_os VARCHAR(20)",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS setup_type VARCHAR(20)",
+        # LLM proxy auth + budget (migration 020)
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_token_hash VARCHAR(128)",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_anthropic_budget_cents INTEGER DEFAULT 3000",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_openai_budget_cents INTEGER DEFAULT 1000",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_anthropic_daily_cap_cents INTEGER DEFAULT 100",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_period_start TIMESTAMP",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_period_end TIMESTAMP",
         # ── VPS ──
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS hostinger_plan_id VARCHAR(50)",

@@ -121,6 +121,14 @@ class AgentConfig(Base):
     bundle_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     bundle_current_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # LLM Proxy auth + budget
+    llm_token_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    bundle_anthropic_budget_cents: Mapped[int] = mapped_column(Integer, default=3000)
+    bundle_openai_budget_cents: Mapped[int] = mapped_column(Integer, default=1000)
+    bundle_anthropic_daily_cap_cents: Mapped[int] = mapped_column(Integer, default=100)
+    bundle_period_start: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    bundle_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Step 3: Channels
     telegram_bot_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     discord_bot_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
