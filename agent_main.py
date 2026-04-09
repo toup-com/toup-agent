@@ -17,6 +17,8 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+
+logger = logging.getLogger(__name__)
 from datetime import datetime
 from fastapi import FastAPI, Request, Response
 
@@ -399,64 +401,87 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ Orphan job cleanup skipped: {e}")
 
         # ── App Manager + App Builder Skill ────────────────────
+        # Each step has its own try/except so partial init succeeds.
+        # If restore_on_startup fails, App Builder still registers.
+        app_manager = None
+        builder_skill = None
+        app_gateway = None
+
+        # Step 1: Create AppManager
         try:
             from app.agent.app_manager import AppManager
             app_manager = AppManager()
-            restored = await app_manager.restore_on_startup(async_session_maker)
             set_app_manager(app_manager)
-            if restored:
-                print(f"📱 App Manager: restored {restored} running app(s)")
-            else:
-                print("📱 App Manager ready")
+            print("📱 App Manager created")
+        except Exception as e:
+            logger.error(f"[INIT] AppManager construction failed: {e}", exc_info=True)
 
-            # Register AppBuilderSkill
-            from app.agent.skills.builtins.app_builder.skill import AppBuilderSkill
-            from app.api.ws_chat import broadcast_to_user
-            builder_skill = AppBuilderSkill(
-                app_manager=app_manager,
-                ws_broadcast=broadcast_to_user,
-            )
-            await skill_loader.register_dynamic(builder_skill)
-            set_app_builder_skill(builder_skill)  # Wire for resume API endpoint
-            print("🏗️ App Builder skill registered")
+        # Step 2: Restore previously-running apps (non-fatal)
+        if app_manager:
+            try:
+                restored = await app_manager.restore_on_startup(async_session_maker)
+                if restored:
+                    print(f"📱 App Manager: restored {restored} running app(s)")
+            except Exception as e:
+                logger.warning(f"[INIT] restore_on_startup failed (non-fatal, App Builder still available): {e}", exc_info=True)
 
-            # Register AppGatewaySkill (single skill, 12 tools for ALL apps)
+        # Step 3: Register AppBuilderSkill
+        if app_manager:
+            try:
+                from app.agent.skills.builtins.app_builder.skill import AppBuilderSkill
+                from app.api.ws_chat import broadcast_to_user
+                builder_skill = AppBuilderSkill(
+                    app_manager=app_manager,
+                    ws_broadcast=broadcast_to_user,
+                )
+                await skill_loader.register_dynamic(builder_skill)
+                set_app_builder_skill(builder_skill)
+                print("🏗️ App Builder skill registered")
+            except Exception as e:
+                logger.error(f"[INIT] AppBuilderSkill registration failed: {e}", exc_info=True)
+        else:
+            logger.error("[INIT] AppBuilderSkill NOT registered — AppManager is None")
+
+        # Step 4: Register AppGatewaySkill + load existing apps
+        try:
             from app.agent.skills.builtins.app_builder.app_gateway_skill import AppGatewaySkill
             app_gateway = AppGatewaySkill()
 
-            # Load existing apps into the gateway (not as separate agent tools)
-            try:
-                from app.agent.skills.builtins.app_builder.app_fs_skill import AppFsSkill
-                from app.db.models import App
-                from sqlalchemy import select as sa_select
-                async with async_session_maker() as _db:
-                    result = await _db.execute(
-                        sa_select(App).where(App.status.in_(["running", "ready", "stopped"]))
-                    )
-                    db_apps = result.scalars().all()
-                    for db_app in db_apps:
-                        try:
-                            fs_skill = AppFsSkill(
-                                app_id=db_app.id,
-                                app_name=db_app.name,
-                                app_slug=db_app.slug,
-                                app_dir=db_app.app_dir,
-                                app_manager=app_manager,
-                            )
-                            app_gateway.register_app(db_app.slug, fs_skill)
-                        except Exception as e:
-                            logger.debug(f"[AppGateway] Skipping app {db_app.id}: {e}")
-                if db_apps:
-                    print(f"📱 App Gateway: {len(db_apps)} app(s) loaded")
-            except Exception as e:
-                print(f"⚠️ App Gateway loading error: {e}")
+            # Load existing apps into the gateway (non-fatal per app)
+            if app_manager:
+                try:
+                    from app.agent.skills.builtins.app_builder.app_fs_skill import AppFsSkill
+                    from app.db.models import App
+                    from sqlalchemy import select as sa_select
+                    async with async_session_maker() as _db:
+                        result = await _db.execute(
+                            sa_select(App).where(App.status.in_(["running", "ready", "stopped"]))
+                        )
+                        db_apps = result.scalars().all()
+                        for db_app in db_apps:
+                            try:
+                                fs_skill = AppFsSkill(
+                                    app_id=db_app.id,
+                                    app_name=db_app.name,
+                                    app_slug=db_app.slug,
+                                    app_dir=db_app.app_dir,
+                                    app_manager=app_manager,
+                                )
+                                app_gateway.register_app(db_app.slug, fs_skill)
+                            except Exception as e:
+                                logger.debug(f"[AppGateway] Skipping app {db_app.id}: {e}")
+                    if db_apps:
+                        print(f"📱 App Gateway: {len(db_apps)} app(s) loaded")
+                except Exception as e:
+                    logger.warning(f"[INIT] App Gateway loading error (non-fatal): {e}", exc_info=True)
 
             await skill_loader.register_dynamic(app_gateway)
-            builder_skill._app_gateway = app_gateway  # so builder can register new apps
-            set_app_gateway(app_gateway)  # so delete endpoint can unregister apps
-            print(f"📱 App Gateway skill registered ({len(app_gateway.get_tools())} tools for all apps)")
+            if builder_skill:
+                builder_skill._app_gateway = app_gateway
+            set_app_gateway(app_gateway)
+            print(f"📱 App Gateway skill registered ({len(app_gateway.get_tools())} tools)")
         except Exception as e:
-            print(f"⚠️ App Manager/Builder error: {e}")
+            logger.error(f"[INIT] AppGatewaySkill registration failed: {e}", exc_info=True)
 
         # ── Store module refs for hot-restart ────────────────
         import agent_main as _self

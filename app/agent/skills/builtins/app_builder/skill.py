@@ -691,7 +691,11 @@ class AppBuilderSkill(Skill):
         user_id = ctx.user_id
 
         if not self._app_manager:
-            return "App builder is not available — app_manager not configured."
+            logger.error("[BUILD] App Builder tool called but _app_manager is None — check startup logs for '[INIT]' errors")
+            return (
+                "App Builder isn't available right now — the app manager failed to initialize on startup. "
+                "Check the agent logs for errors, or restart the agent from the Dashboard."
+            )
 
         from app.db.database import async_session_maker
         from app.db.models import App, BuildJob
@@ -849,7 +853,11 @@ class AppBuilderSkill(Skill):
             return "ERROR: job_id is required"
 
         if not self._app_manager:
-            return "App builder is not available — app_manager not configured."
+            logger.error("[BUILD] App Builder tool called but _app_manager is None — check startup logs for '[INIT]' errors")
+            return (
+                "App Builder isn't available right now — the app manager failed to initialize on startup. "
+                "Check the agent logs for errors, or restart the agent from the Dashboard."
+            )
 
         async with async_session_maker() as db:
             job = await db.get(BuildJob, job_id)
@@ -918,7 +926,11 @@ class AppBuilderSkill(Skill):
             return "ERROR: app_id and changes are required"
 
         if not self._app_manager:
-            return "App builder is not available — app_manager not configured."
+            logger.error("[BUILD] App Builder tool called but _app_manager is None — check startup logs for '[INIT]' errors")
+            return (
+                "App Builder isn't available right now — the app manager failed to initialize on startup. "
+                "Check the agent logs for errors, or restart the agent from the Dashboard."
+            )
 
         async with async_session_maker() as db:
             app = await db.get(App, app_id)
