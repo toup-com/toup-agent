@@ -803,6 +803,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ day_chat_backfill.skipped reason=import_error error={e}")
 
+    # One-time cleanup: remove legacy dashboard/ folder (replaced by .dashboard/)
+    try:
+        import os as _os
+        _ws = getattr(settings, 'agent_workspace_dir', None) or './workspace'
+        _legacy_dash = _os.path.join(_os.path.abspath(_ws), 'dashboard')
+        if _os.path.isdir(_legacy_dash):
+            if not _os.listdir(_legacy_dash):
+                _os.rmdir(_legacy_dash)
+                print("🧹 Removed empty legacy dashboard/ folder")
+            else:
+                print(f"⚠️ Legacy dashboard/ folder is not empty ({len(_os.listdir(_legacy_dash))} items), skipping removal")
+    except Exception as _e:
+        print(f"⚠️ dashboard/ cleanup skipped: {_e}")
+
     print("🤖 Toup Agent ready.")
     print(f"   Server:  http://0.0.0.0:8001")
     print(f"   Health:  http://localhost:8001/agent/health")

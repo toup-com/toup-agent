@@ -2139,18 +2139,27 @@ class ToolExecutor:
     # Helpers
     # ------------------------------------------------------------------
     def _resolve_path(self, path: str) -> str:
-        """Resolve a path relative to the user's workspace if not absolute."""
+        """Resolve a path relative to the session workspace (or user workspace) if not absolute."""
+        base = getattr(self, '_session_workspace', None) or self._get_user_workspace()
         if not path:
-            return self._get_user_workspace()
+            return base
         # Expand ~ to the user's home directory
         path = os.path.expanduser(path)
         if os.path.isabs(path):
             return path
-        return os.path.join(self._get_user_workspace(), path)
-    
+        return os.path.join(base, path)
+
     def set_user_id(self, user_id: str):
         """Set the current user ID for memory tools."""
         self._current_user_id = user_id
+
+    def set_session_workspace(self, path: Optional[str]):
+        """Set a per-session workspace override. Relative paths resolve against this.
+
+        Used by vibecoding to direct file writes into vibecoding/{slug}/.
+        Call with None to reset to the default workspace.
+        """
+        self._session_workspace = path
     
     @property
     def _current_user_id(self) -> str:

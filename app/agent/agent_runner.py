@@ -157,7 +157,10 @@ class AgentRunner:
                         if j.status == "completed":
                             j.status = "running"
                             await db.commit()
-                        return j.id, j.app_id
+                        # Look up app_dir for the existing app
+                        _existing_app = await db.get(App, j.app_id) if j.app_id else None
+                        _existing_dir = _existing_app.app_dir if _existing_app else ""
+                        return j.id, j.app_id, _existing_dir
 
             # Generate slug from prompt
             words = _re.sub(r'[^a-zA-Z0-9\s]', '', prompt).split()[:4]
@@ -212,8 +215,8 @@ class AgentRunner:
             db.add(job)
             await db.commit()
 
-            logger.info(f"[VIBE] Registered vibecoding session: app={app_id[:8]} job={job_id[:8]} slug={slug}")
-            return job_id, app_id
+            logger.info(f"[VIBE] Registered vibecoding session: app={app_id[:8]} job={job_id[:8]} slug={slug} dir={app_dir}")
+            return job_id, app_id, app_dir
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -450,8 +453,9 @@ class AgentRunner:
 
             # Register vibecoding session in DB (App + BuildJob) for visibility
             _vibe_logger = None
+            _vibe_app_dir = None
             try:
-                _vibe_job_id, _vibe_app_id = await self._register_vibecoding_session(
+                _vibe_job_id, _vibe_app_id, _vibe_app_dir = await self._register_vibecoding_session(
                     user_id=user_id,
                     prompt=user_message,
                     session_id=session_id,
@@ -460,6 +464,10 @@ class AgentRunner:
                     from app.agent.job_logger import JobLogger
                     _vibe_logger = JobLogger(_vibe_job_id, user_id)
                     await _vibe_logger.info(f"Vibe coding: {user_message[:80]}")
+                # Set session workspace so write_file targets vibecoding/{slug}/
+                if _vibe_app_dir and hasattr(self.tools, 'set_session_workspace'):
+                    self.tools.set_session_workspace(_vibe_app_dir)
+                    logger.info(f"[VIBE] Set session workspace to {_vibe_app_dir}")
             except Exception as e:
                 logger.warning(f"[VIBE] Failed to register vibecoding session: {e}")
 
@@ -833,6 +841,10 @@ class AgentRunner:
                     await vdb.commit()
             except Exception as e:
                 logger.warning(f"[VIBE] Failed to finalize vibecoding session: {e}")
+            finally:
+                # Reset session workspace so next non-vibe run uses the default
+                if hasattr(self.tools, 'set_session_workspace'):
+                    self.tools.set_session_workspace(None)
 
         return AgentResponse(
             text=final_text,
