@@ -1828,11 +1828,64 @@ class AppBuilderSkill(Skill):
                 web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                 await blog.success(f"Web server running on port {web_port}")
 
-                # ── 7c: Bundle validation + comprehensive auto-repair (up to 4 rounds) ──
+                # ── 7b+: Pre-flight dependency reconciliation ──
+                # Scan all generated files for imports and ensure they're in package.json
+                await blog.info("Reconciling dependencies...")
+                try:
+                    import re as _re
+                    all_imports = set()
+                    for fpath, code in generated_files.items():
+                        if isinstance(code, str):
+                            # Match: import ... from 'package' or require('package')
+                            for m in _re.finditer(r'''(?:from\s+['"]|require\s*\(\s*['"])(@?[a-zA-Z][a-zA-Z0-9._/-]*)''', code):
+                                pkg = m.group(1)
+                                # Skip relative imports and react/react-native (always available)
+                                if pkg.startswith('.') or pkg.startswith('/'):
+                                    continue
+                                # Get top-level package name (e.g. @react-navigation/native → @react-navigation/native)
+                                if pkg.startswith('@'):
+                                    parts = pkg.split('/')
+                                    pkg = '/'.join(parts[:2]) if len(parts) >= 2 else pkg
+                                else:
+                                    pkg = pkg.split('/')[0]
+                                # Skip built-in React/RN packages
+                                if pkg in ('react', 'react-native', 'react-dom', 'expo', 'expo-modules-core'):
+                                    continue
+                                all_imports.add(pkg)
+
+                    if all_imports:
+                        # Read current package.json to find what's already installed
+                        pkg_json_path = os.path.join(app_dir, "package.json")
+                        existing_deps = set()
+                        if os.path.exists(pkg_json_path):
+                            import json as _json
+                            with open(pkg_json_path) as f:
+                                pkg_data = _json.load(f)
+                            existing_deps = set(pkg_data.get("dependencies", {}).keys()) | set(pkg_data.get("devDependencies", {}).keys())
+
+                        missing = all_imports - existing_deps
+                        if missing:
+                            await blog.info(f"Auto-installing {len(missing)} missing deps: {', '.join(sorted(missing)[:10])}...")
+                            try:
+                                install_cmd = ["npx", "expo", "install"] + sorted(missing)
+                                proc = await asyncio.create_subprocess_exec(
+                                    *install_cmd, cwd=app_dir,
+                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                                )
+                                await asyncio.wait_for(proc.communicate(), timeout=120)
+                            except Exception as dep_err:
+                                await blog.warn(f"Dep reconciliation partial failure: {dep_err}")
+                        else:
+                            await blog.info("All imports accounted for in package.json")
+                except Exception as recon_err:
+                    await blog.warn(f"Dependency reconciliation skipped: {recon_err}")
+
+                # ── 7c: Bundle validation + comprehensive auto-repair (up to 8 rounds) ──
                 await blog.info("Validating web bundle compilation...")
                 bundle_ok = False
                 self._last_bundle_errors = []
-                MAX_REPAIR_ROUNDS = 4
+                MAX_REPAIR_ROUNDS = 8
+                repaired_files_history = set()  # Track which files we've already tried to repair
                 try:
                     for repair_round in range(MAX_REPAIR_ROUNDS):
                         # Check if web server is alive
@@ -1843,19 +1896,22 @@ class AppBuilderSkill(Skill):
                         if web_alive:
                             await self._wait_for_server(web_port, timeout=25)
                             bundle_ok, bundle_errors = await self._validate_bundle(web_port, blog)
+                            if bundle_errors:
+                                self._last_bundle_errors = [e.get("error", "") for e in bundle_errors]
                         else:
                             bundle_ok = False
                             await blog.warn("Web server crashed — extracting errors...")
                             bundle_errors = self._extract_errors_from_log_buffer(app_id)
+                            if bundle_errors:
+                                self._last_bundle_errors = [e.get("error", "") for e in bundle_errors]
                             if not bundle_errors:
                                 await blog.warn("No specific errors in process output")
-                                # Dump last 15 log lines for debugging
                                 if managed_app and managed_app.log_buffer:
                                     for line in list(managed_app.log_buffer)[-15:]:
                                         await blog.info(f"  {line}")
 
                         if bundle_ok:
-                            label = "Bundle compiles cleanly" if repair_round == 0 else f"Bundle repaired and compiles cleanly (round {repair_round})"
+                            label = "Bundle compiles cleanly" if repair_round == 0 else f"Bundle repaired (round {repair_round})"
                             await blog.success(label)
                             break
 
@@ -1864,25 +1920,32 @@ class AppBuilderSkill(Skill):
 
                         fixed_something = False
 
-                        # Fix 1: Missing dependencies (npm install)
+                        # Strategy 1: Missing dependencies (npm install)
                         if bundle_errors:
                             dep_fixed = await self._fix_missing_deps(app_id, app_dir, bundle_errors, blog)
                             if dep_fixed:
                                 fixed_something = True
 
-                        # Fix 2: Code errors — regenerate broken files via LLM
+                        # Strategy 2: Code errors — regenerate broken files via LLM
                         code_errors = [e for e in bundle_errors if e.get("file", "unknown") != "unknown"]
-                        if code_errors:
+                        # Filter out files we've already repaired 2+ times (diminishing returns)
+                        fresh_errors = [e for e in code_errors if repaired_files_history.count(e.get("file", "")) < 2]
+                        if not fresh_errors and code_errors:
+                            fresh_errors = code_errors  # If all are stale, retry anyway
+
+                        if fresh_errors:
                             repaired = await self._repair_bundle_errors(
-                                app_id, app_dir, code_errors, generated_files,
+                                app_id, app_dir, fresh_errors, generated_files,
                                 description, name, deps, db_type, blog
                             )
                             if repaired:
                                 fixed_something = True
+                                for e in fresh_errors:
+                                    repaired_files_history.add(e.get("file", ""))
 
-                        # Fix 3: No specific errors found — restart server (port/transient issue)
-                        if not fixed_something and not web_alive:
-                            await blog.info("No actionable errors — restarting web server...")
+                        # Strategy 3: Server not alive — restart
+                        if not web_alive:
+                            await blog.info("Restarting web server...")
                             try:
                                 web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                                 await blog.info(f"Web server restarted on port {web_port}")
@@ -1891,14 +1954,29 @@ class AppBuilderSkill(Skill):
                             except Exception as restart_err:
                                 await blog.warn(f"Web server restart failed: {restart_err}")
 
+                        # Strategy 4: If nothing else worked, try clearing Metro cache
+                        if not fixed_something and repair_round >= 2:
+                            await blog.info("Clearing Metro cache and restarting...")
+                            try:
+                                clear_proc = await asyncio.create_subprocess_exec(
+                                    "npx", "expo", "start", "--clear", "--web", "--port", str(web_port),
+                                    cwd=app_dir,
+                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                                )
+                                # Don't wait for it to finish — just start it and let the next round check
+                                await asyncio.sleep(8)
+                                fixed_something = True
+                            except Exception:
+                                pass
+
                         if not fixed_something:
-                            await blog.warn("Could not identify or fix any issues")
-                            break
+                            await blog.warn(f"No progress in round {repair_round + 1} — trying next round anyway")
+                            # Don't break — keep trying, the next round may catch different errors
 
                         # Restart server after code/dep fixes if it was alive (Metro needs to rebundle)
-                        if web_alive:
+                        if web_alive and fixed_something:
                             await asyncio.sleep(4)  # Wait for Metro hot-reload
-                        else:
+                        elif not web_alive and fixed_something:
                             await blog.info("Restarting web server after repairs...")
                             try:
                                 web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
@@ -3241,9 +3319,9 @@ const _webDb = {
         """Pick the right OpenAI model name. Never pass a Claude model to OpenAI."""
         from app.config import settings
         model = settings.agent_model or ""
-        # If the configured model is a Claude model (or blank), use a sensible OpenAI default
+        # If the configured model is a Claude model (or blank), use gpt-5.4 (best for code gen)
         if not model or "claude" in model.lower() or "haiku" in model.lower() or "sonnet" in model.lower() or "opus" in model.lower():
-            return "gpt-4.1"
+            return "gpt-5.4"
         return model
 
     async def _call_openai(
@@ -3514,14 +3592,48 @@ const _webDb = {
 
     @staticmethod
     def _strip_fences(code: str) -> str:
-        """Strip markdown code fences from generated code."""
+        """Strip markdown code fences and other wrapper artifacts from generated code.
+
+        Handles GPT-5.4 output formats that may include:
+        - Standard triple backticks (```tsx ... ```)
+        - Backticks with language identifier (```typescript ... ```)
+        - Leading/trailing explanation text before/after code blocks
+        - HTML code tags
+        """
+        import re as _re
         code = code.strip()
+
+        # If the response contains a fenced code block, extract ONLY the code inside
+        fence_match = _re.search(r'```(?:\w+)?\s*\n(.*?)```', code, _re.DOTALL)
+        if fence_match:
+            code = fence_match.group(1).strip()
+            return code
+
+        # Fallback: strip leading/trailing triple backticks (original logic)
         if code.startswith("```"):
             first_newline = code.index("\n") if "\n" in code else len(code)
             code = code[first_newline + 1:]
         if code.endswith("```"):
             code = code[:-3].rstrip()
-        return code
+
+        # Strip HTML code tags (GPT sometimes wraps in <code>)
+        if code.startswith("<code>"):
+            code = code[6:]
+        if code.endswith("</code>"):
+            code = code[:-7]
+
+        # Strip leading prose before actual code (e.g., "Here is the code:\n\nimport React...")
+        lines = code.split('\n')
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('import ') or stripped.startswith('export ') or stripped.startswith('const ') or \
+               stripped.startswith('function ') or stripped.startswith('//') or stripped.startswith('/*') or \
+               stripped.startswith('import{') or stripped.startswith('"use') or stripped == '{':
+                if i > 0:
+                    code = '\n'.join(lines[i:])
+                break
+
+        return code.strip()
 
     @staticmethod
     def _make_error_fallback(file_path: str) -> str:
@@ -3812,9 +3924,36 @@ const _webDb = {
                 except Exception:
                     pass
 
-        # Regenerate with error context
+        # Build rich error context for the repair LLM
+        error_context_parts = [description, "\n\n## BUNDLE ERRORS TO FIX"]
+        for e in bundle_errors[:5]:
+            error_context_parts.append(f"\n### Error in {e.get('file', 'unknown')}:")
+            error_context_parts.append(e.get("error", "")[:500])
+
+        # Include the current broken code so the LLM can see what went wrong
+        if existing:
+            error_context_parts.append("\n## CURRENT FILE CONTENTS (broken, for reference)")
+            for fp, code in existing.items():
+                error_context_parts.append(f"\n### {fp} (first 3000 chars):")
+                error_context_parts.append(code[:3000])
+
+        # Include package.json for dependency awareness
+        pkg_json_path = os.path.join(app_dir, "package.json")
+        if os.path.exists(pkg_json_path):
+            try:
+                with open(pkg_json_path) as f:
+                    error_context_parts.append(f"\n## package.json:\n{f.read()[:2000]}")
+            except Exception:
+                pass
+
+        error_context_parts.append(
+            "\n\nIMPORTANT: Generate COMPLETE working code that fixes the above errors. "
+            "Ensure all imports resolve to installed packages. Use emoji icons (not @expo/vector-icons). "
+            "Include NavigationContainer theme with fonts property."
+        )
+
         repaired = await self._generate_code(
-            description + "\n\nFIX THESE BUNDLE ERRORS: " + json.dumps([e["error"][:200] for e in bundle_errors[:3]]),
+            "\n".join(error_context_parts),
             app_name, list(files_to_repair), deps, db_type,
             blog=blog, existing_files=existing,
         )
