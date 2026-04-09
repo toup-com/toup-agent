@@ -48,25 +48,6 @@ def _write_json(name: str, data):
 
 # ── Schemas ──────────────────────────────────────────────────────────
 
-class TaskItem(BaseModel):
-    id: str = ""
-    title: str = ""
-    status: str = "todo"
-    priority: Optional[str] = "normal"
-    category: Optional[str] = None
-    effort: Optional[str] = None
-    dueDate: Optional[str] = None
-    assignedTo: Optional[str] = None
-    linkedJobId: Optional[str] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-    completed_at: Optional[str] = None
-
-
-class TasksSaveRequest(BaseModel):
-    tasks: List[TaskItem]
-
-
 class InboxCreate(BaseModel):
     id: Optional[str] = None
     title: str = ""
@@ -81,72 +62,30 @@ class DocSave(BaseModel):
     content: str
 
 
-class DelegateRequest(BaseModel):
-    taskId: str
-    title: str
-    prompt: str
 
 
 # ── Combined dashboard endpoint ──────────────────────────────────────
 
 @router.get("/dashboard")
 async def get_dashboard():
-    """Return combined dashboard data (tasks, status, stats, goals, alerts)."""
-    tasks = _read_json("tasks", [])
+    """Return combined dashboard data (status, goals, alerts).
+
+    Tasks/jobs are now served from the build_jobs DB table via /apps/jobs/.
+    Stats are computed client-side from jobs.
+    """
     goals = _read_json("goals", [])
     alerts = [a for a in _read_json("alerts", []) if not a.get("dismissed")]
 
-    # Compute stats from tasks
-    now = datetime.now(timezone.utc)
-    today_str = now.strftime("%Y-%m-%d")
-    done_today = sum(1 for t in tasks if t.get("status") == "done"
-                     and t.get("completed_at", "").startswith(today_str))
-    added_today = sum(1 for t in tasks if t.get("created_at", "").startswith(today_str))
-    total_done = sum(1 for t in tasks if t.get("status") == "done")
-    total_added = len(tasks)
-
-    by_category = {}
-    for t in tasks:
-        cat = t.get("category") or "uncategorized"
-        by_category[cat] = by_category.get(cat, 0) + 1
-
-    stats = {
-        "today": {"done": done_today, "added": added_today},
-        "week": {"done": total_done, "added": total_added},
-        "allTime": {"done": total_done, "added": total_added, "total": total_added},
-        "byCategory": by_category,
-    }
-
     return {
-        "tasks": tasks,
+        "tasks": [],  # Deprecated — use /apps/jobs/ instead
         "status": {"state": "running", "status": "active"},
-        "stats": stats,
+        "stats": {"today": {}, "week": {}, "allTime": {}, "byCategory": {}},
         "goals": goals,
         "alerts": alerts,
     }
 
 
-# ── Tasks ────────────────────────────────────────────────────────────
-
-@router.get("/tasks")
-async def list_tasks():
-    return _read_json("tasks", [])
-
-
-@router.post("/tasks")
-async def save_tasks(req: TasksSaveRequest):
-    now = datetime.now(timezone.utc).isoformat()
-    tasks = []
-    for t in req.tasks:
-        d = t.model_dump()
-        if not d.get("id"):
-            d["id"] = f"task-{uuid.uuid4().hex[:8]}"
-        if not d.get("created_at"):
-            d["created_at"] = now
-        d["updated_at"] = now
-        tasks.append(d)
-    _write_json("tasks", tasks)
-    return {"ok": True}
+# ── Tasks (REMOVED — canonical source is build_jobs DB table via /apps/jobs/) ──
 
 
 # ── Agent status ─────────────────────────────────────────────────────
@@ -168,23 +107,18 @@ async def list_agents():
     return agents
 
 
-# ── Activity log ─────────────────────────────────────────────────────
-
-@router.get("/activity")
-async def get_activity():
-    return _read_json("activity", [])
+# ── Activity log REMOVED — nothing wrote to .dashboard/activity.json ──
 
 
 # ── Stats ────────────────────────────────────────────────────────────
 
 @router.get("/stats")
 async def get_stats():
-    tasks = _read_json("tasks", [])
-    total_done = sum(1 for t in tasks if t.get("status") == "done")
+    """Stats are now computed client-side from build_jobs. Kept for backward compat."""
     return {
         "today": {"done": 0, "added": 0},
-        "week": {"done": total_done, "added": len(tasks)},
-        "allTime": {"done": total_done, "added": len(tasks), "total": len(tasks)},
+        "week": {"done": 0, "added": 0},
+        "allTime": {"done": 0, "added": 0, "total": 0},
         "byCategory": {},
     }
 
@@ -247,27 +181,7 @@ async def delete_inbox_item(item_id: str):
     return {"ok": True}
 
 
-# ── Jobs (delegated tasks) ──────────────────────────────────────────
-
-@router.get("/jobs")
-async def list_jobs():
-    return _read_json("jobs", [])
-
-
-@router.post("/delegate")
-async def delegate_task(req: DelegateRequest):
-    """Create a delegated job. For now, just stores the request."""
-    jobs = _read_json("jobs", [])
-    job_id = f"job-{uuid.uuid4().hex[:8]}"
-    jobs.append({
-        "jobId": job_id,
-        "title": req.title,
-        "prompt": req.prompt,
-        "status": "pending",
-        "createdAt": datetime.now(timezone.utc).isoformat(),
-    })
-    _write_json("jobs", jobs)
-    return {"jobId": job_id}
+# ── Jobs/delegate REMOVED — tasks execute via /apps/jobs/ + AgentRunner ──
 
 
 # ── Docs ─────────────────────────────────────────────────────────────

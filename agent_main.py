@@ -47,7 +47,7 @@ from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.dashboard import router as dashboard_router
 from app.api.soul import router as soul_router
 from app.api.llm_setup import router as llm_setup_router
-from app.api.apps import router as apps_router, set_app_manager, set_app_gateway, set_app_builder_skill
+from app.api.apps import router as apps_router, set_app_manager, set_app_gateway, set_app_builder_skill, set_agent_runner
 
 _app_start_time = None
 _skill_loader = None
@@ -346,6 +346,7 @@ async def lifespan(app: FastAPI):
         set_ws_refs(agent_runner, skill_loader)
         set_api_v1_refs(agent_runner, skill_loader)
         set_realtime_refs(tool_executor, agent_runner)
+        set_agent_runner(agent_runner, ws_broadcast=broadcast_to_user)
         set_ws_browser_refs(agent_runner, skill_loader)
 
         # ── Clean up orphaned build jobs from previous crash/restart ──

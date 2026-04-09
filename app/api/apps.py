@@ -37,6 +37,8 @@ router = APIRouter(prefix="/apps", tags=["Apps"])
 _app_manager = None
 _app_gateway = None
 _app_builder_skill = None
+_agent_runner = None
+_ws_broadcast = None
 
 
 def set_app_manager(app_manager):
@@ -55,6 +57,13 @@ def set_app_builder_skill(skill):
     """Wire the AppBuilderSkill instance for resume builds."""
     global _app_builder_skill
     _app_builder_skill = skill
+
+
+def set_agent_runner(runner, ws_broadcast=None):
+    """Wire the AgentRunner instance for executing dashboard tasks."""
+    global _agent_runner, _ws_broadcast
+    _agent_runner = runner
+    _ws_broadcast = ws_broadcast
 
 
 # ── Response schemas ────────────────────────────────────────────────
@@ -248,15 +257,17 @@ class CreateJobRequest(BaseModel):
 
 @router.post("/jobs/")
 async def create_job(req: CreateJobRequest) -> JobResponse:
-    """Create a new agent task job from the dashboard."""
+    """Create a new agent task job from the dashboard and execute it."""
+    import asyncio
     import uuid
     user_id = _get_user_id()
+    job_id = str(uuid.uuid4())
     job = BuildJob(
-        id=str(uuid.uuid4()),
+        id=job_id,
         user_id=user_id,
         title=req.title,
         prompt=req.description or req.title,
-        status="queued",
+        status="running",
         steps_json="[]",
         model="",
         layer=0,
@@ -266,6 +277,53 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
         db.add(job)
         await db.commit()
         await db.refresh(job)
+
+    # Execute the task via the agent runner in background
+    if _agent_runner:
+        async def _run_dashboard_task():
+            try:
+                result = await _agent_runner.run(
+                    user_message=req.description or req.title,
+                    user_id=user_id,
+                    session_id=f"dashboard-task-{job_id[:8]}",
+                    channel="web",
+                )
+                # Mark completed
+                async with async_session_maker() as db:
+                    j = await db.get(BuildJob, job_id)
+                    if j:
+                        j.status = "completed"
+                        j.completed_at = datetime.utcnow()
+                        j.total_tokens = getattr(result, 'tokens_total', 0)
+                        j.model = getattr(result, 'model', '')
+                        await db.commit()
+                # Broadcast completion
+                if _ws_broadcast:
+                    await _ws_broadcast(user_id, {
+                        "type": "job_update",
+                        "job_id": job_id,
+                        "status": "completed",
+                        "name": req.title,
+                    })
+            except Exception as e:
+                logger.error(f"[DASHBOARD] Task {job_id[:8]} failed: {e}")
+                async with async_session_maker() as db:
+                    j = await db.get(BuildJob, job_id)
+                    if j:
+                        j.status = "failed"
+                        j.error_message = str(e)[:500]
+                        j.completed_at = datetime.utcnow()
+                        await db.commit()
+                if _ws_broadcast:
+                    await _ws_broadcast(user_id, {
+                        "type": "job_update",
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error_message": str(e)[:200],
+                    })
+
+        asyncio.create_task(_run_dashboard_task())
+
     return _job_to_response(job)
 
 
