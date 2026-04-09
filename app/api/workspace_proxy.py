@@ -433,3 +433,88 @@ async def download_workspace_file(
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ── Preview (serve HTML/CSS/JS with correct MIME types) ──────────
+
+_MIME_TYPES = {
+    ".html": "text/html", ".htm": "text/html",
+    ".css": "text/css",
+    ".js": "application/javascript", ".mjs": "application/javascript",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".ico": "image/x-icon",
+    ".woff": "font/woff", ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+}
+
+
+@router.get("/preview/{path:path}")
+async def preview_workspace_file(
+    path: str,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve a workspace file with correct MIME type for browser preview.
+
+    Used for vibe-coded apps — HTML files are served inline so the browser
+    renders them instead of downloading.
+    """
+    container = await _require_container(current_user.id, db)
+    host_base = _host_workspace(current_user.id)
+    container_base = _container_workspace()
+
+    clean_path = path.strip("/").replace("..", "")
+    if not clean_path:
+        raise HTTPException(400, "Path is required")
+
+    # If path points to a directory, try index.html
+    container_target = f"{container_base}/{clean_path}"
+    is_dir = await _ssh_cmd(
+        f"docker exec {container.container_name} test -d {container_target} && echo yes || echo no"
+    )
+    if is_dir == "yes":
+        clean_path = f"{clean_path}/index.html"
+        container_target = f"{container_base}/{clean_path}"
+
+    # Try container first, then host
+    b64_content = await _ssh_cmd(
+        f"docker exec {container.container_name} base64 {container_target} 2>/dev/null"
+    )
+    if not b64_content:
+        host_target = f"{host_base}/{clean_path}"
+        b64_content = await _ssh_cmd(f"base64 {host_target} 2>/dev/null")
+
+    if not b64_content:
+        raise HTTPException(404, "File not found")
+
+    content_bytes = base64.b64decode(b64_content)
+
+    # Determine MIME type from extension
+    import os.path as _osp
+    ext = _osp.splitext(clean_path)[1].lower()
+    mime = _MIME_TYPES.get(ext, "application/octet-stream")
+
+    # For HTML files, rewrite relative URLs to go through the preview proxy
+    if mime == "text/html":
+        # Compute the base path for relative URL resolution
+        dir_path = "/".join(clean_path.split("/")[:-1])
+        base_href = f"/api/workspace/preview/{dir_path}/" if dir_path else "/api/workspace/preview/"
+        html = content_bytes.decode("utf-8", errors="replace")
+        # Inject <base> tag so relative assets resolve through the preview endpoint
+        if "<head" in html.lower():
+            html = html.replace("<head>", f'<head><base href="{base_href}">', 1)
+            html = html.replace("<HEAD>", f'<HEAD><base href="{base_href}">', 1)
+        else:
+            html = f'<base href="{base_href}">' + html
+        content_bytes = html.encode("utf-8")
+
+    return StreamingResponse(
+        io.BytesIO(content_bytes),
+        media_type=mime,
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
