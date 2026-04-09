@@ -25,6 +25,12 @@ METRO_PORT_RANGE = (3001, 3050)
 WEB_PORT_RANGE = (4001, 4050)
 MAX_LOG_LINES = 500
 
+# ── npm install constants ─────────────────────────────────────────
+NPM_CI_TIMEOUT = 180       # seconds — npm ci is faster, tighter budget
+NPM_INSTALL_TIMEOUT = 300  # seconds — npm install for first-time installs
+NPM_FLAGS = ["--no-audit", "--no-fund", "--loglevel=error"]
+NPM_RETRY_TRANSIENT_PATTERNS = ["ETIMEDOUT", "ECONNRESET", "EAI_AGAIN", "network", "FETCH_ERROR", "503"]
+
 
 @dataclass
 class ManagedApp:
@@ -149,46 +155,152 @@ class AppManager:
         logger.info(f"[APP] Wrote {len(files)} files to {app_dir}")
 
     async def install_deps(self, app_id: str, deps: Optional[List[str]] = None, app_dir: Optional[str] = None) -> str:
-        """Run npm install in app dir. Returns output."""
-        app_dir = await self._resolve_app_dir(app_id, app_dir)
-        assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
+        """Run npm install in app dir with clean state, retries, and error classification.
 
-        # Clean stale node_modules from previous failed installs to prevent hangs
+        Strategy:
+          1. Always clean node_modules + lock artifacts before install
+          2. Use npm ci if lock file exists, npm install otherwise
+          3. On transient network error, retry once with clean state
+          4. Capture both stdout/stderr for actionable error messages
+        """
+        app_dir = await self._resolve_app_dir(app_id, app_dir)
+        if not os.path.exists(app_dir):
+            raise RuntimeError(f"[INSTALL] app_dir does not exist: {app_dir}")
+
+        output = await self._npm_install_with_retry(app_id, app_dir)
+
+        # Install extra deps using `npx expo install` for version compatibility
+        if deps:
+            cmd2 = ["npx", "expo", "install"] + deps
+            env = {**os.environ, "EXPO_NO_TELEMETRY": "1"}
+            proc2 = await asyncio.create_subprocess_exec(
+                *cmd2, cwd=app_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            try:
+                stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=NPM_INSTALL_TIMEOUT)
+                output += "\n" + (stdout2 or b"").decode()
+            except asyncio.TimeoutError:
+                proc2.kill()
+                logger.warning("[INSTALL] expo install timed out for %s", app_id[:8])
+
+        logger.info("[INSTALL] Deps installed for %s", app_id[:8])
+        return output[:2000]
+
+    async def _npm_install_with_retry(self, app_id: str, app_dir: str) -> str:
+        """Run npm install with clean state and one retry on transient failure."""
+        last_error = ""
+        for attempt in range(2):
+            try:
+                return await self._npm_install_clean(app_id, app_dir, attempt)
+            except RuntimeError as e:
+                last_error = str(e)
+                classification = self._classify_install_error(last_error)
+                logger.warning(
+                    "[INSTALL] Attempt %d failed for %s — classified=%s: %s",
+                    attempt + 1, app_id[:8], classification, last_error[:200],
+                )
+                if classification == "transient" and attempt == 0:
+                    logger.info("[INSTALL] Retrying %s after transient failure...", app_id[:8])
+                    continue
+                raise
+        raise RuntimeError(last_error)
+
+    async def _npm_install_clean(self, app_id: str, app_dir: str, attempt: int = 0) -> str:
+        """Single npm install attempt with clean state."""
         nm_path = os.path.join(app_dir, "node_modules")
         lock_path = os.path.join(app_dir, "package-lock.json")
-        if os.path.isdir(nm_path) and not os.path.isfile(lock_path):
-            logger.warning("[APP] Cleaning stale node_modules (no lock file) in %s", app_dir)
-            import shutil
+        npm_cache = os.path.join("/tmp", f"npm-cache-{app_id[:8]}-{os.getpid()}")
+
+        # Always clean node_modules for a deterministic install
+        if os.path.isdir(nm_path):
+            logger.info("[INSTALL] Cleaning node_modules in %s (attempt %d)", app_dir, attempt + 1)
             shutil.rmtree(nm_path, ignore_errors=True)
 
-        # Base install
-        cmd = ["npm", "install"]
+        # Use npm ci if lock file exists (faster, deterministic), npm install otherwise
+        if os.path.isfile(lock_path):
+            cmd = ["npm", "ci", f"--cache={npm_cache}"] + NPM_FLAGS
+            timeout = NPM_CI_TIMEOUT
+            logger.info("[INSTALL] Using npm ci for %s (lock file exists)", app_id[:8])
+        else:
+            cmd = ["npm", "install", f"--cache={npm_cache}"] + NPM_FLAGS
+            timeout = NPM_INSTALL_TIMEOUT
+            logger.info("[INSTALL] Using npm install for %s (no lock file)", app_id[:8])
+
+        t0 = time.time()
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-        output = (stdout or b"").decode()
-        if proc.returncode != 0:
-            err_text = (stderr or b"").decode()[:1000]
-            logger.error("[APP] npm install failed (exit %d) in %s: %s", proc.returncode, app_dir, err_text)
-            raise RuntimeError(f"npm install failed: {err_text}")
 
-        # Install extra deps using `npx expo install` for version compatibility
-        if deps:
-            cmd2 = ["npx", "expo", "install"] + deps
-            proc2 = await asyncio.create_subprocess_exec(
-                *cmd2, cwd=app_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "EXPO_NO_TELEMETRY": "1"},
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            elapsed = time.time() - t0
+            raise RuntimeError(
+                f"npm install timed out after {elapsed:.0f}s in {app_dir}"
             )
-            stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=300)
-            output += "\n" + (stdout2 or b"").decode()
 
-        logger.info(f"[APP] Installed deps for {app_id}")
-        return output[:2000]
+        elapsed = time.time() - t0
+        stdout_text = (stdout or b"").decode()
+        stderr_text = (stderr or b"").decode()
+
+        if proc.returncode != 0:
+            # Combine last 50 lines of stderr + stdout for debugging
+            combined = (stderr_text + "\n" + stdout_text).strip()
+            tail = "\n".join(combined.split("\n")[-50:])
+            logger.error(
+                "[INSTALL] npm failed (exit %d) in %.1fs for %s:\n%s",
+                proc.returncode, elapsed, app_id[:8], tail[:1500],
+            )
+            raise RuntimeError(f"npm install failed (exit {proc.returncode}): {tail[:1000]}")
+
+        logger.info("[INSTALL] npm succeeded in %.1fs for %s", elapsed, app_id[:8])
+
+        # Clean up per-run cache
+        try:
+            shutil.rmtree(npm_cache, ignore_errors=True)
+        except Exception:
+            pass
+
+        return stdout_text[:2000]
+
+    @staticmethod
+    def _classify_install_error(error_text: str) -> str:
+        """Classify an npm install error for auto-repair routing.
+
+        Returns one of:
+          transient — network blip, registry timeout (retry in place)
+          bad_dep   — 404, version conflict, peer dep mismatch (regenerate package.json)
+          disk      — ENOSPC, ENOMEM (fail loudly, don't retry)
+          stale     — corrupted node_modules (clean and retry)
+          unknown   — unclassified (fail with raw error)
+        """
+        upper = error_text.upper()
+
+        # Transient network errors
+        for pattern in NPM_RETRY_TRANSIENT_PATTERNS:
+            if pattern.upper() in upper:
+                return "transient"
+
+        # Bad dependency
+        if any(s in upper for s in ["404", "NOT FOUND", "ERESOLVE", "PEER DEP", "NO MATCHING VERSION", "ETARGET"]):
+            return "bad_dep"
+
+        # Disk/memory
+        if any(s in upper for s in ["ENOSPC", "ENOMEM", "NO SPACE LEFT"]):
+            return "disk"
+
+        # Stale state
+        if any(s in upper for s in ["ENOENT", "EACCES", "EPERM", "LOCK"]):
+            return "stale"
+
+        return "unknown"
 
     async def start_metro(self, app_id: str, app_dir: Optional[str] = None) -> int:
         """Start Metro bundler for mobile preview. Returns allocated port."""

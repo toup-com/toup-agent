@@ -1787,10 +1787,57 @@ class AppBuilderSkill(Skill):
                 await blog.success(f"Dependencies installed", f"{elapsed:.1f}s")
                 await self._update_step(job_id, user_id, "installing", "done")
             except Exception as e:
-                await blog.error(f"npm install failed: {e}")
-                await blog.persist()
-                await self._fail_job(job_id, app_id, f"npm install failed: {e}")
-                return
+                error_text = str(e)
+                classification = self._app_manager._classify_install_error(error_text) if self._app_manager else "unknown"
+                await blog.error(f"npm install failed ({classification}): {error_text[:200]}")
+
+                if classification == "bad_dep":
+                    # Try to auto-repair: ask LLM to fix package.json
+                    await blog.info("[REPAIR] Detected bad dependency — asking LLM to fix package.json...")
+                    try:
+                        pkg_path = os.path.join(app_dir, "package.json")
+                        with open(pkg_path, "r") as f:
+                            pkg_content = f.read()
+                        fix_prompt = (
+                            f"npm install failed with this error:\n{error_text[:500]}\n\n"
+                            f"Current package.json:\n{pkg_content}\n\n"
+                            "Fix the package.json to resolve the error. Remove bad packages, "
+                            "fix version numbers, or replace with working alternatives. "
+                            "Return ONLY the corrected JSON, nothing else."
+                        )
+                        fixed_json = await self._call_llm(
+                            system_prompt="You fix npm package.json errors. Return only valid JSON.",
+                            user_message=fix_prompt,
+                            model="", purpose="repair_package_json",
+                            blog=blog,
+                        )
+                        # Extract JSON from LLM response
+                        import re as _re
+                        json_match = _re.search(r'\{[\s\S]*\}', fixed_json)
+                        if json_match:
+                            json.loads(json_match.group())  # validate
+                            with open(pkg_path, "w") as f:
+                                f.write(json_match.group())
+                            await blog.info("[REPAIR] package.json fixed, retrying install...")
+                            install_output = await self._app_manager.install_deps(app_id, all_deps, app_dir=app_dir)
+                            await blog.success("Dependencies installed after repair")
+                            await self._update_step(job_id, user_id, "installing", "done")
+                        else:
+                            raise RuntimeError("LLM did not return valid JSON for package.json fix")
+                    except Exception as repair_err:
+                        await blog.error(f"[REPAIR] Auto-repair failed: {repair_err}")
+                        await blog.persist()
+                        await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
+                        return
+                elif classification in ("disk", "unknown"):
+                    await blog.persist()
+                    await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
+                    return
+                else:
+                    # transient/stale — the retry already happened inside install_deps
+                    await blog.persist()
+                    await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
+                    return
 
             _checkpoint["completed_steps"] = ["planning", "scaffolding", "writing", "database", "installing"]
             _checkpoint["current_step"] = "github"
