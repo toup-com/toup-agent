@@ -48,7 +48,7 @@ async def log_context_budget(
             total_tokens=total_tokens,
             model=model,
             summary_was_stale=summary_was_stale,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.utcnow(),  # Naive UTC — matches codebase convention
         )
         db.add(log_entry)
         await db.flush()
