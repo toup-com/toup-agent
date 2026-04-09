@@ -319,11 +319,12 @@ class AgentRunner:
             except Exception:
                 pass
 
-            if _use_day_ctx and getattr(session, 'day_chat_id', None):
+            if _use_day_ctx:
                 try:
                     from app.agent.day_context_loader import load_day_context
                     from app.agent.context_manager import get_context_window
-                    _day_chat_id = session.day_chat_id
+                    from app.db.message_helpers import resolve_day_chat_id_for_now
+                    _day_chat_id = await resolve_day_chat_id_for_now(db, user_id)
                     _ctx_window = get_context_window(settings.agent_model)
                     _day_context = await load_day_context(db, _day_chat_id, model=settings.agent_model, model_context_tokens=_ctx_window)
                     history = _day_context["messages"]
