@@ -8,8 +8,9 @@ the flag being off. This lets the frontend deploy independently of the flag flip
 
 import logging
 from datetime import date as Date, datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import select, and_, func, distinct
@@ -22,6 +23,37 @@ from app.api.auth import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/day-chats", tags=["Day Chats"])
+
+
+# ── Agent proxy (platform mode proxies to user's VPS agent) ──────────
+
+async def _get_agent_proxy_info(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]]:
+    """Return (agent_url, agent_api_key) if the user has a remote agent."""
+    try:
+        from app.db.models import AgentConfig
+        result = await db.execute(
+            select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+            .where(AgentConfig.user_id == user_id, AgentConfig.deploy_status == "active")
+        )
+        row = result.first()
+        if row and row.agent_url and row.agent_api_key:
+            return (row.agent_url, row.agent_api_key)
+    except Exception:
+        pass
+    return None
+
+
+async def _proxy_day_chats(agent_url: str, agent_api_key: str, path: str = "", params: dict = None):
+    """Proxy a day-chats request to the VPS agent."""
+    url = f"{agent_url}/api/day-chats/{path}" if path else f"{agent_url}/api/day-chats"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers={"X-Agent-Key": agent_api_key}, params=params or {})
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.warning("Day-chats proxy %s failed: %s", url, e)
+    return None
 
 
 @router.get("")
@@ -39,6 +71,16 @@ async def list_day_chats(
     Works in read-only mode regardless of feature flag state. Returns empty list
     if no day_chats exist (backfill hasn't run yet).
     """
+    # Platform mode: proxy to user's VPS agent
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params = {"limit": limit}
+        if before:
+            params["before"] = before
+        data = await _proxy_day_chats(proxy[0], proxy[1], "", params)
+        if data is not None:
+            return JSONResponse(content=data)
+
     query = (
         select(DayChat)
         .where(DayChat.user_id == current_user.id)
@@ -112,6 +154,13 @@ async def get_day_chat_messages(
 
     Works in read-only mode regardless of feature flag state.
     """
+    # Platform mode: proxy to user's VPS agent
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_day_chats(proxy[0], proxy[1], f"{date_str}/messages", {"limit": limit})
+        if data is not None:
+            return JSONResponse(content=data)
+
     try:
         target_date = Date.fromisoformat(date_str)
     except ValueError:
