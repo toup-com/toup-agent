@@ -1831,6 +1831,7 @@ class AppBuilderSkill(Skill):
                 # ── 7c: Bundle validation + comprehensive auto-repair (up to 4 rounds) ──
                 await blog.info("Validating web bundle compilation...")
                 bundle_ok = False
+                self._last_bundle_errors = []
                 MAX_REPAIR_ROUNDS = 4
                 try:
                     for repair_round in range(MAX_REPAIR_ROUNDS):
@@ -1960,9 +1961,14 @@ class AppBuilderSkill(Skill):
                             app.web_pid = managed.web_process.pid if managed.web_process else None
                         await db.commit()
                 if not bundle_ok:
-                    await blog.error("Build completed with errors — check bundle logs")
+                    # Collect last known errors for the failure message
+                    last_errors = []
+                    if hasattr(self, '_last_bundle_errors'):
+                        last_errors = self._last_bundle_errors[:3]
+                    error_detail = "; ".join(last_errors) if last_errors else "Unknown bundle error"
+                    await blog.error(f"Build completed with errors: {error_detail}")
                     await blog.persist()
-                    await self._fail_job(job_id, app_id, "Bundle compilation failed after auto-repair")
+                    await self._fail_job(job_id, app_id, f"Bundle compilation failed: {error_detail[:200]}")
                     return
 
                 await self._update_step(job_id, user_id, "starting", "done",

@@ -54,7 +54,8 @@ RUN useradd -m -u 1000 toup && \
 EXPOSE 8001
 
 # Health check — hits the public /agent/health endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+# Generous retries (5) to avoid false unhealthy during long builds (npm install, code gen)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
     CMD curl -sf http://localhost:8001/agent/health || exit 1
 
 CMD ["uvicorn", "agent_main:app", "--host", "0.0.0.0", "--port", "8001"]
