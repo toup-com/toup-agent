@@ -68,11 +68,18 @@ Rules:
 - Include react-native-safe-area-context and react-native-screens
 - For responsive layout, use useWindowDimensions + isDesktop check (width > 768)
 - On desktop: maxWidth 800px centered, 2-3 column grids. On mobile: single column full width.
-- RESPONSIVE NAVIGATION: On mobile show bottom tab bar. On desktop show a left sidebar instead.
-  Use createBottomTabNavigator with a custom tabBar prop that renders AdaptiveTabBar.
-  Include /components/AdaptiveTabBar.tsx in the file list.
+- RESPONSIVE NAVIGATION — choose based on screen count:
+  - If the app has ONLY 1 screen (e.g. a calculator, timer, converter, single-purpose tool):
+    Do NOT include tab navigation or AdaptiveTabBar. Use a simple NativeStackNavigator with
+    one screen, or render the screen component directly in App.tsx. A calculator does not need
+    a sidebar or tab bar — it needs a keypad and a display, full stop.
+  - If the app has 2+ screens: Use createBottomTabNavigator with a custom tabBar prop that
+    renders AdaptiveTabBar. Include /components/AdaptiveTabBar.tsx in the file list.
+    On mobile: bottom tab bar. On desktop: left sidebar.
 - If the app needs charts, use react-native-chart-kit (NOT recharts — that's web-only)
 - Keep the file list focused — don't over-engineer
+- NEVER generate advertisements, ad banners, ad placeholders, "Ad banner (offline placeholder)",
+  or any monetization-related components. These are personal user apps, not published products.
 - Use EMOJI characters for ALL icons (🏠📊⚙️ etc.) — works on all platforms with zero imports.
   NEVER use @expo/vector-icons (breaks on Expo Web). NEVER use raw unicode symbols (▲☐⌂).
 - Tab bar icons MUST use emoji in <Text> components
@@ -103,8 +110,9 @@ CRITICAL — Agent Integration System:
 Every app is an "agentic app" — the user's AI agent must be able to work inside it.
 The platform proxy automatically injects the agent's Orb UI (floating chat widget with
 the user's real agent appearance, eyes, breathing animation, and live WebSocket connection).
-Do NOT generate any agent UI component — no AgentPlaceholder.tsx, no floating chat bubble.
-The proxy handles the agent UI for all apps automatically.
+Do NOT generate any agent UI component — no AgentPlaceholder.tsx, no floating chat bubble,
+no "Ask Agent" button, no "Agent Test Panel", no in-app agent chat. The proxy handles
+the agent UI for ALL apps automatically. Apps must NEVER duplicate the agent surface.
 
 You MUST include these files in EVERY plan:
   - /components/ErrorBoundary.tsx — Catches runtime errors, shows error screen instead of white page
@@ -159,10 +167,14 @@ Rules:
     The paddingBottom: 100 on mobile accounts for the bottom tab bar (60px) + agent button above it.
   - Cards and grid items: use percentage widths on desktop (width: isDesktop ? '48%' : '100%')
   - CRITICAL: Test all layouts mentally at 375px width. Nothing should overflow or be cut off.
-- RESPONSIVE NAVIGATION — bottom tabs on mobile, left sidebar on desktop:
-  - Use createBottomTabNavigator with `tabBar={{(props) => <AdaptiveTabBar {{...props}} appName={{"{app_name}"}} />}}`
-  - The AdaptiveTabBar component handles BOTH layouts (see below for /components/AdaptiveTabBar.tsx)
-  - NEVER hardcode bottom tabs without AdaptiveTabBar — it WILL look broken on desktop
+- RESPONSIVE NAVIGATION — choose based on screen count:
+  - If the app has ONLY 1 screen (e.g. calculator, timer, converter), do NOT use tab navigation.
+    Render the screen directly or use a simple NativeStackNavigator. No AdaptiveTabBar needed.
+  - If the app has 2+ screens: Use createBottomTabNavigator with `tabBar={{(props) => <AdaptiveTabBar {{...props}} appName={{"{app_name}"}} />}}`
+    The AdaptiveTabBar component handles BOTH layouts (see below for /components/AdaptiveTabBar.tsx)
+- NEVER generate advertisements, ad banners, ad placeholders, or monetization components.
+- NEVER generate "Ask Agent" buttons, agent chat panels, or agent test UIs.
+  The platform injects the agent Orb — apps must NOT duplicate it.
 - If this file uses database, import from '../lib/db' (expo-sqlite helper)
 - For navigation, use @react-navigation/native-stack
 - React Navigation v7 REQUIRES a `theme` prop with `fonts` on NavigationContainer. Without it, the app
@@ -229,11 +241,14 @@ Rendering differences WILL cause visual bugs if you ignore these rules:
 6. Use Platform.select() for platform-specific behavior (font families, padding, shadows).
    Test values must work on both web and native — avoid native-only APIs without web fallbacks.
 
-7. Import/Export consistency: If a module uses `export default X`, import it as `import X from '...'`.
-   If it uses `export {{ X }}`, import as `import {{ X }} from '...'`. NEVER use named import syntax
-   `import {{ X }}` for a module that only has `export default`. This causes X to be undefined at runtime.
-   For lib files (agentBridge, database, etc.), always provide BOTH `export default` AND named `export {{ }}`
-   so either import style works.
+7. Import/Export consistency — THIS IS THE #1 CAUSE OF RUNTIME CRASHES:
+   - Every named import MUST match an actual named export in the target module.
+     If you import `{{ calcPress }}` from '../lib/calcEngine', that module MUST export `calcPress` by EXACTLY
+     that name. A function named `pressKey` is NOT the same as `calcPress`.
+   - If a module uses `export default X`, import it as `import X from '...'`.
+   - For lib files, always provide BOTH `export default` AND named `export {{ }}` so either import style works.
+   - CRITICAL: Use IDENTICAL function/type names across files. If the lib exports `pressKey`, import `pressKey`.
+     Do NOT invent different names in the importing file — the bundler cannot resolve them.
 
 8. NEVER use async component functions. `export default async function Screen()` returns a Promise,
    not a React element — this causes an instant white page. Always use useEffect + useState for data fetching.
@@ -2800,6 +2815,7 @@ module.exports = config;
         # Fix import/export mismatches: if a lib file only has `export default X`,
         # add a named export too so `import { X }` also works
         self._fix_import_export_mismatches(generated_files, infra_files)
+        self._fix_named_import_mismatches(generated_files, infra_files)
 
         # Fix React Navigation v7 theme — must include `fonts` property
         import re as _re
@@ -3215,6 +3231,98 @@ const styles = StyleSheet.create({
                     f'export {{ {default_name} }};\nexport default {default_name};'
                 )
                 infra_files[fp] = code
+
+    @staticmethod
+    def _fix_named_import_mismatches(generated_files: dict, infra_files: dict):
+        """Detect and fix named imports that don't match any export in the target module.
+
+        Example: Screen imports `{ calcPress }` from '../lib/calcEngine', but the module
+        only exports `pressKey`. This compiles but crashes at runtime (`calcPress` is undefined).
+
+        Fix strategy: find the closest matching export name and rewrite the import.
+        """
+        import re as _re
+
+        # Build a map of file_path -> set of exported names
+        all_files = {**generated_files, **infra_files}
+        exports_by_file: dict[str, set[str]] = {}
+        for fp, code in all_files.items():
+            exports = set()
+            # Named exports: export { X, Y } or export { X as Y }
+            for m in _re.finditer(r'export\s*\{([^}]+)\}', code):
+                for name in m.group(1).split(','):
+                    name = name.strip().split(' as ')[-1].strip()
+                    if name:
+                        exports.add(name)
+            # export function/const/class/type/interface NAME
+            for m in _re.finditer(r'export\s+(?:default\s+)?(?:async\s+)?(?:function|const|let|var|class|type|interface|enum)\s+(\w+)', code):
+                exports.add(m.group(1))
+            # export default NAME;
+            for m in _re.finditer(r'export\s+default\s+(\w+)\s*;', code):
+                exports.add(m.group(1))
+            exports_by_file[fp] = exports
+
+        # For each file, check all named imports and verify they exist in the target
+        for fp, code in list(all_files.items()):
+            patched = infra_files.get(fp, code)
+            changed = False
+            for m in _re.finditer(r'import\s*\{([^}]+)\}\s*from\s*[\'"]([^\'"]+)[\'"]', patched):
+                import_names = [n.strip().split(' as ')[0].strip() for n in m.group(1).split(',') if n.strip()]
+                module_path = m.group(2)
+
+                # Resolve relative module path to a file path
+                target_fp = None
+                for candidate in exports_by_file:
+                    # Match ./lib/calcEngine -> /lib/calcEngine.ts
+                    clean_module = module_path.lstrip('.')
+                    clean_candidate = candidate.replace('.tsx', '').replace('.ts', '')
+                    if clean_candidate.endswith(clean_module):
+                        target_fp = candidate
+                        break
+
+                if not target_fp:
+                    continue  # External package import, skip
+
+                target_exports = exports_by_file.get(target_fp, set())
+                if not target_exports:
+                    continue
+
+                # Check each imported name
+                for imp_name in import_names:
+                    if imp_name.startswith('type '):
+                        continue  # Type imports are handled differently
+                    if imp_name in target_exports:
+                        continue  # Import is valid
+
+                    # Try to find a close match in exports (case-insensitive prefix/suffix)
+                    imp_lower = imp_name.lower()
+                    best_match = None
+                    for exp_name in target_exports:
+                        exp_lower = exp_name.lower()
+                        # Check common patterns: calcPress -> pressKey, CalcState -> CalcEngineState
+                        if imp_lower in exp_lower or exp_lower in imp_lower:
+                            best_match = exp_name
+                            break
+                        # Check suffix match (calcPress -> pressKey — both end with "press" variant)
+                        if imp_lower[-4:] == exp_lower[-4:] and len(imp_lower) > 4:
+                            best_match = exp_name
+                            break
+
+                    if best_match:
+                        logger.info(f"[IMPORT-FIX] {fp}: Rewriting import '{imp_name}' -> '{best_match}' (from {module_path})")
+                        patched = patched.replace(
+                            f'{{ {imp_name}' if f'{{ {imp_name}' in patched else f'{{{imp_name}',
+                            f'{{ {best_match}' if f'{{ {imp_name}' in patched else f'{{{best_match}',
+                            1
+                        )
+                        # Also fix all usages of the old name in this file
+                        patched = _re.sub(r'\b' + _re.escape(imp_name) + r'\b', best_match, patched)
+                        changed = True
+                    else:
+                        logger.warning(f"[IMPORT-FIX] {fp}: '{imp_name}' not found in {target_fp} exports: {target_exports}")
+
+            if changed:
+                infra_files[fp] = patched
 
     @staticmethod
     def _make_database_web_safe(code: str) -> str:

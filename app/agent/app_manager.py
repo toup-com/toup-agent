@@ -212,7 +212,10 @@ class AppManager:
         """Single npm install attempt with clean state."""
         nm_path = os.path.join(app_dir, "node_modules")
         lock_path = os.path.join(app_dir, "package-lock.json")
-        npm_cache = os.path.join("/tmp", f"npm-cache-{app_id[:8]}-{os.getpid()}")
+        # Use a shared npm cache across all apps so repeated deps (react-native,
+        # expo, etc.) are fetched once and reused. Previous per-app cache meant
+        # every build downloaded ~400MB of the same packages.
+        npm_cache = os.path.join("/tmp", "npm-cache-shared")
 
         # Always clean node_modules for a deterministic install
         if os.path.isdir(nm_path):
