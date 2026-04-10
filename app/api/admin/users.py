@@ -624,10 +624,13 @@ async def delete_user(
     # Also delete any EntityRelationships by direct user_id FK (covers orphans)
     await db.execute(sa_delete(EntityRelationship).where(EntityRelationship.user_id == user_id))
 
-    # Memory children: memory_events, memory_relationships, entity_links (by memory_id)
+    # Memory children: memory_events, memory_relationships, entity_links, media, doc_chunks (by memory_id)
     from app.db.models import memory_relationships as mem_rel_table
     mem_ids_q = select(Memory.id).where(Memory.user_id == user_id)
     await db.execute(sa_delete(MemoryEvent).where(MemoryEvent.memory_id.in_(mem_ids_q)))
+    await db.execute(sa_delete(EntityLink).where(EntityLink.memory_id.in_(mem_ids_q)))
+    await db.execute(sa_delete(DocumentChunk).where(DocumentChunk.memory_id.in_(mem_ids_q)))
+    await db.execute(sa_delete(Media).where(Media.memory_id.in_(mem_ids_q)))
     await db.execute(mem_rel_table.delete().where(
         mem_rel_table.c.source_id.in_(mem_ids_q) |
         mem_rel_table.c.target_id.in_(mem_ids_q)
@@ -669,8 +672,12 @@ async def delete_user(
     except Exception:
         pass
 
-    # Workflows table (exists in DB but no SQLAlchemy model)
-    await db.execute(text("DELETE FROM workflows WHERE user_id = :uid"), {"uid": user_id})
+    # Workflows table (exists in DB but no SQLAlchemy model — may not exist on platform)
+    try:
+        async with db.begin_nested():
+            await db.execute(text("DELETE FROM workflows WHERE user_id = :uid"), {"uid": user_id})
+    except Exception:
+        pass
 
     # ContextBudgetLog has FK to conversations.id AND day_chats.id — delete BEFORE both
     try:
@@ -680,11 +687,13 @@ async def delete_user(
         pass
 
     # Now delete all direct user_id tables (order: children before parents)
+    # Media has FK to memories.id — must come before Memory
+    # Conversation has FK to day_chats.id — DayChat deleted after this loop
     for model in [
-        Identity, MemoryEvent, Memory,
-        Conversation, Entity, BrainStats,
-        Document, Media, CronJob,
-        TelegramUserMapping, ApiKey, ManagedContainer, VPSInstance,
+        Identity, MemoryEvent, Media, Document,
+        Memory, Conversation, Entity, BrainStats,
+        CronJob, TelegramUserMapping, ApiKey,
+        ManagedContainer, VPSInstance,
         AgentConfig, SoulConfig, LLMBundleAllocation, LLMUsageRecord,
     ]:
         await db.execute(sa_delete(model).where(model.user_id == user_id))
