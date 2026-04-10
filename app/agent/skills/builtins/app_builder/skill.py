@@ -186,9 +186,14 @@ Rules:
 - PREFER THE SIMPLEST CORRECT IMPLEMENTATION. For a "simple calculator", use an accumulator pattern
   (current value + pending operator + apply on =), NOT a full expression parser/tokenizer/BODMAS engine.
   Build only what the user asked for — no extra complexity.
-- CRITICAL: When a lib module returns a structured result (e.g., {{ok: true, value: number}}), the
-  consuming screen MUST handle that exact shape. If the lib returns an object, do NOT check `typeof result !== 'number'`.
-  Always verify return types match across files.
+- CRITICAL — Cross-file API contracts (the #1 cause of silent white-page crashes):
+  - If a lib module's default export is an OBJECT with methods (e.g., `export default {{ formatNumber, calcPress }}`),
+    the consuming file MUST call it as `Module.methodName()`, NEVER as `Module()` — objects are not callable.
+  - If a lib function returns a structured result (e.g., `{{ok: true, value: number}}`), the consumer MUST
+    destructure it properly. Do NOT check `typeof result !== 'number'` when the function returns an object.
+  - BEFORE writing any import, mentally verify: does the target module export this exact name? Is the export
+    a function, object, or class? Does the consuming code use it in a way that matches its type?
+  - When in doubt, use the NAMED export with the EXACT function name, not the default export object.
 - If this file uses database, import from '../lib/db' (expo-sqlite helper)
 - For navigation, use @react-navigation/native-stack
 - React Navigation v7 REQUIRES a `theme` prop with `fonts` on NavigationContainer. Without it, the app
@@ -2830,6 +2835,7 @@ module.exports = config;
         # add a named export too so `import { X }` also works
         self._fix_import_export_mismatches(generated_files, infra_files)
         self._fix_named_import_mismatches(generated_files, infra_files)
+        self._fix_default_export_misuse(generated_files, infra_files)
 
         # Fix React Navigation v7 theme — must include `fonts` property
         import re as _re
@@ -3334,6 +3340,86 @@ const styles = StyleSheet.create({
                         changed = True
                     else:
                         logger.warning(f"[IMPORT-FIX] {fp}: '{imp_name}' not found in {target_fp} exports: {target_exports}")
+
+            if changed:
+                infra_files[fp] = patched
+
+    @staticmethod
+    def _fix_default_export_misuse(generated_files: dict, infra_files: dict):
+        """Detect when a default-exported object is called as a function.
+
+        Pattern: lib/format.ts has `export default { formatNumber, ... }` (object),
+        but screen does `const result = Format(calc)` — calling the object.
+        Fix: rewrite to use the appropriate method, e.g. `Format.formatNumber(calc)`.
+        """
+        import re as _re
+
+        all_files = {**generated_files, **infra_files}
+
+        # Find modules whose default export is an object literal: `export default { ... }`
+        object_default_exports: dict[str, list[str]] = {}  # file -> list of method names
+        for fp, code in all_files.items():
+            m = _re.search(r'export\s+default\s+\{([^}]+)\}', code)
+            if m:
+                methods = [n.strip().split(':')[0].strip() for n in m.group(1).split(',') if n.strip()]
+                object_default_exports[fp] = methods
+
+        if not object_default_exports:
+            return
+
+        # For each file, check if a default import from an object-exporting module is called as a function
+        for fp, code in list(all_files.items()):
+            patched = infra_files.get(fp, code)
+            changed = False
+
+            for m in _re.finditer(r'import\s+(\w+)\s+from\s*[\'"]([^\'"]+)[\'"]', patched):
+                import_name = m.group(1)
+                module_path = m.group(2)
+
+                # Resolve to a file path
+                target_fp = None
+                for candidate in object_default_exports:
+                    clean_module = module_path.lstrip('.')
+                    clean_candidate = candidate.replace('.tsx', '').replace('.ts', '')
+                    if clean_candidate.endswith(clean_module):
+                        target_fp = candidate
+                        break
+
+                if not target_fp:
+                    continue
+
+                methods = object_default_exports[target_fp]
+
+                # Check if the import is called as a function: `ImportName(` or `ImportName (`
+                call_pattern = _re.compile(r'\b' + _re.escape(import_name) + r'\s*\(')
+                # But exclude `ImportName.method(` which is correct usage
+                method_pattern = _re.compile(r'\b' + _re.escape(import_name) + r'\.\w+\s*\(')
+
+                for call_match in call_pattern.finditer(patched):
+                    pos = call_match.start()
+                    # Check it's not a method call
+                    if method_pattern.match(patched, pos):
+                        continue
+                    # Check it's not in an import statement
+                    line_start = patched.rfind('\n', 0, pos) + 1
+                    line = patched[line_start:patched.find('\n', pos)]
+                    if 'import' in line:
+                        continue
+
+                    # Found: object being called as function. Try to pick the right method.
+                    # Heuristic: use the first method or one that looks like a main entry
+                    best_method = methods[0] if methods else None
+                    for method_name in methods:
+                        if any(kw in method_name.lower() for kw in ['format', 'calc', 'eval', 'process', 'get', 'create']):
+                            best_method = method_name
+                            break
+
+                    if best_method:
+                        old_call = call_match.group(0)
+                        new_call = f"{import_name}.{best_method}("
+                        logger.info(f"[IMPORT-FIX] {fp}: Rewriting '{old_call.strip()}' -> '{new_call.strip()}' (default export is object, not function)")
+                        patched = patched[:pos] + patched[pos:].replace(old_call, new_call, 1)
+                        changed = True
 
             if changed:
                 infra_files[fp] = patched
