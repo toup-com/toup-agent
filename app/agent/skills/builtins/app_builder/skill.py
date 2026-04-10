@@ -78,6 +78,14 @@ Rules:
     On mobile: bottom tab bar. On desktop: left sidebar.
 - If the app needs charts, use react-native-chart-kit (NOT recharts — that's web-only)
 - Keep the file list focused — don't over-engineer
+- PREFER THE SIMPLEST CORRECT IMPLEMENTATION. Do not build complex engines when simple logic suffices.
+  Examples:
+  - "Simple calculator" → use an accumulator pattern (current value, pending operator, apply on =).
+    Do NOT build a full expression parser, BODMAS engine, tokenizer, or shunting-yard algorithm.
+  - "Timer" → use setInterval + state. Do NOT build a scheduler framework.
+  - "Todo list" → flat array in state. Do NOT build a relational data model with categories/tags/priorities.
+  Complexity should come from the user's requirements, not from the builder's assumptions.
+  When in doubt, build the minimal version that works correctly.
 - NEVER generate advertisements, ad banners, ad placeholders, "Ad banner (offline placeholder)",
   or any monetization-related components. These are personal user apps, not published products.
 - Use EMOJI characters for ALL icons (🏠📊⚙️ etc.) — works on all platforms with zero imports.
@@ -175,6 +183,12 @@ Rules:
 - NEVER generate advertisements, ad banners, ad placeholders, or monetization components.
 - NEVER generate "Ask Agent" buttons, agent chat panels, or agent test UIs.
   The platform injects the agent Orb — apps must NOT duplicate it.
+- PREFER THE SIMPLEST CORRECT IMPLEMENTATION. For a "simple calculator", use an accumulator pattern
+  (current value + pending operator + apply on =), NOT a full expression parser/tokenizer/BODMAS engine.
+  Build only what the user asked for — no extra complexity.
+- CRITICAL: When a lib module returns a structured result (e.g., {{ok: true, value: number}}), the
+  consuming screen MUST handle that exact shape. If the lib returns an object, do NOT check `typeof result !== 'number'`.
+  Always verify return types match across files.
 - If this file uses database, import from '../lib/db' (expo-sqlite helper)
 - For navigation, use @react-navigation/native-stack
 - React Navigation v7 REQUIRES a `theme` prop with `fonts` on NavigationContainer. Without it, the app
