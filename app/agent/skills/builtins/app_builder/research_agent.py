@@ -200,9 +200,22 @@ You will receive:
 Based on the research, generate questions that:
 - Reference SPECIFIC findings (app names, features, patterns you found)
 - Help the user make informed decisions by showing what similar apps do
-- Cover: key differentiators, feature priorities, content approach, engagement model, monetization
+- Cover: key differentiators, feature priorities, content approach, UX patterns, interaction design
 - Each question MUST have 2-4 clickable [[option]] buttons on the next line
 - Questions should feel insightful — the user should think "wow, they did their homework"
+
+IMPORTANT — These are PERSONAL apps built for the user's own use, NOT commercial/public products.
+NEVER ask about ANY of the following — they do not apply:
+- Ads, ad placement, ad frequency, ad stance, ad monetization
+- Monetization model, pricing, free vs paid tiers, in-app purchases, subscriptions, paywalls
+- App store metadata, review prompts, ratings, store screenshots
+- Analytics, tracking, telemetry, usage data collection
+- Social sharing, share-to-social, viral features, referral programs
+- Push notification strategy for engagement/retention
+- Onboarding flows, tutorials, first-time-user experience tours
+- User accounts, login, registration, multi-user features (these are single-user apps)
+If research mentions any of these topics, IGNORE them — do not turn them into questions.
+Focus ONLY on functionality, UX, visual design, layout, and feature scope.
 
 Output format — ONLY the questions, nothing else:
 ```

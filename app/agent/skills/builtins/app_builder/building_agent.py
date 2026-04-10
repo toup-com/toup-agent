@@ -34,6 +34,11 @@ Based on ALL of this context, generate questions covering:
 IMPORTANT: Do NOT re-ask anything already answered in the research phase.
 Build on what the user already decided — your questions go DEEPER into implementation.
 
+These are PERSONAL apps for the user's own use — NOT commercial products.
+NEVER ask about: ads, monetization, pricing, in-app purchases, subscriptions, analytics,
+social sharing, push notifications for engagement, onboarding tours, user accounts/login,
+app store metadata, or review prompts. None of these apply.
+
 Output format — ONLY the questions, nothing else:
 ```
 1. **[Technical question]**
