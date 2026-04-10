@@ -10,6 +10,8 @@ Endpoints:
   POST   /apps/{app_id}/push-github - Push to GitHub
   DELETE /apps/{app_id}            - Delete app
 
+  GET    /apps/{app_id}/preview/{path} - Reverse-proxy Expo web server (internal)
+
   GET    /apps/jobs/               - List all build jobs
   GET    /apps/jobs/{job_id}       - Get build job details
   GET    /apps/jobs/{job_id}/logs  - Get structured build logs
@@ -22,7 +24,9 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -599,6 +603,43 @@ async def delete_job(job_id: str) -> Dict[str, bool]:
         await db.delete(job)
         await db.commit()
     return {"ok": True}
+
+
+@router.get("/{app_id}/preview/{path:path}")
+@router.get("/{app_id}/preview")
+async def agent_preview_proxy(app_id: str, request: Request, path: str = ""):
+    """Reverse-proxy the Expo web dev server running inside this container.
+
+    The platform calls this endpoint instead of hitting the web_port directly,
+    because the web_port is only accessible inside the Docker container.
+    """
+    if not _app_manager:
+        raise HTTPException(503, "App manager not initialized")
+
+    managed = _app_manager._running.get(app_id)
+    if not managed or not managed.web_port:
+        raise HTTPException(503, "App web server not running")
+
+    target = f"http://127.0.0.1:{managed.web_port}/{path}"
+    params = dict(request.query_params)
+    if params:
+        from urllib.parse import urlencode
+        target += f"?{urlencode(params)}"
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.get(target)
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers={
+                    k: v for k, v in resp.headers.items()
+                    if k.lower() not in ("transfer-encoding", "connection", "content-encoding")
+                },
+            )
+    except Exception as e:
+        logger.error(f"[PREVIEW] Proxy to localhost:{managed.web_port} failed: {e}")
+        raise HTTPException(502, f"Preview server unreachable: {e}")
 
 
 @router.delete("/{app_id}")

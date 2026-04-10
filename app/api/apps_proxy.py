@@ -735,19 +735,6 @@ async def delete_job(job_id: str, current_user=Depends(get_current_user), db: As
 # Reverse-proxies the Expo web dev server through toup.ai so the
 # mobile app can load it over HTTPS without direct VPS port access.
 
-async def _get_app_web_port(app_id: str, agent_url: str, agent_api_key: str) -> int:
-    """Fetch the app's web_port from the VPS agent API."""
-    url = f"{agent_url}/api/apps/{app_id}"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url, headers={"X-Agent-Key": agent_api_key})
-        if resp.status_code != 200:
-            raise HTTPException(404, "App not found")
-        data = resp.json()
-        web_port = data.get("web_port")
-        if not web_port:
-            raise HTTPException(503, "App web server not running")
-        return web_port
-
 
 async def _get_user_from_token(token: str, db: AsyncSession):
     """Validate JWT from query param for preview auth."""
@@ -804,11 +791,9 @@ async def preview_proxy(
     agent_info = await _get_agent(user.id, db)
     agent_url, key, agent_color = _require(agent_info)
 
-    from urllib.parse import urlparse
-    vps_host = urlparse(agent_url).hostname
-
-    web_port = await _get_app_web_port(app_id, agent_url, key)
-    target = f"http://{vps_host}:{web_port}/{path}"
+    # Route through the agent's preview proxy endpoint (inside the container)
+    # instead of hitting the web_port directly (which is not exposed from Docker).
+    target = f"{agent_url}/api/apps/{app_id}/preview/{path}"
 
     # Forward query string (except our token param)
     params = {k: v for k, v in request.query_params.items() if k != "token"}
@@ -817,7 +802,7 @@ async def preview_proxy(
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.get(target)
+            resp = await client.get(target, headers={"X-Agent-Key": key})
             content_type = resp.headers.get("content-type", "text/html")
 
             body = resp.content
