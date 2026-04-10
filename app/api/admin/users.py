@@ -642,7 +642,9 @@ async def delete_user(
 
     # Build jobs depend on apps — delete first
     await db.execute(sa_delete(BuildJob).where(BuildJob.user_id == user_id))
-    # Apps
+    # Apps + reconciliation logs
+    from app.db.models import ReconciliationLog
+    await db.execute(sa_delete(ReconciliationLog).where(ReconciliationLog.user_id == user_id))
     await db.execute(sa_delete(App).where(App.user_id == user_id))
 
     # Destroy the Docker container on the VPS before deleting DB records
@@ -660,6 +662,13 @@ async def delete_user(
     # Streaming credentials
     await db.execute(sa_delete(StreamingCredential).where(StreamingCredential.user_id == user_id))
 
+    # LLM proxy events
+    try:
+        from app.db.models import LLMProxyEvent
+        await db.execute(sa_delete(LLMProxyEvent).where(LLMProxyEvent.user_id == user_id))
+    except Exception:
+        pass
+
     # Workflows table (exists in DB but no SQLAlchemy model)
     await db.execute(text("DELETE FROM workflows WHERE user_id = :uid"), {"uid": user_id})
 
@@ -675,6 +684,15 @@ async def delete_user(
 
     # AgentError has nullable user_id
     await db.execute(sa_delete(AgentError).where(AgentError.user_id == user_id))
+
+    # Day chats + context budget logs (AFTER conversations/messages are deleted — they have FK to day_chats)
+    try:
+        from app.db.models import DayChat, ContextBudgetLog
+        day_chat_ids_q = select(DayChat.id).where(DayChat.user_id == user_id)
+        await db.execute(sa_delete(ContextBudgetLog).where(ContextBudgetLog.day_chat_id.in_(day_chat_ids_q)))
+        await db.execute(sa_delete(DayChat).where(DayChat.user_id == user_id))
+    except Exception:
+        pass
 
     # Update invites that reference this user (both used_by and created_by FKs)
     inv_result = await db.execute(select(Invite).where(Invite.used_by == user_id))
