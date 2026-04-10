@@ -672,6 +672,13 @@ async def delete_user(
     # Workflows table (exists in DB but no SQLAlchemy model)
     await db.execute(text("DELETE FROM workflows WHERE user_id = :uid"), {"uid": user_id})
 
+    # ContextBudgetLog has FK to conversations.id AND day_chats.id — delete BEFORE both
+    try:
+        from app.db.models import DayChat, ContextBudgetLog
+        await db.execute(sa_delete(ContextBudgetLog).where(ContextBudgetLog.user_id == user_id))
+    except Exception:
+        pass
+
     # Now delete all direct user_id tables (order: children before parents)
     for model in [
         Identity, MemoryEvent, Memory,
@@ -685,11 +692,9 @@ async def delete_user(
     # AgentError has nullable user_id
     await db.execute(sa_delete(AgentError).where(AgentError.user_id == user_id))
 
-    # Day chats + context budget logs (AFTER conversations/messages are deleted — they have FK to day_chats)
+    # DayChat — delete AFTER conversations (Conversation.day_chat_id FK to day_chats)
     try:
-        from app.db.models import DayChat, ContextBudgetLog
-        day_chat_ids_q = select(DayChat.id).where(DayChat.user_id == user_id)
-        await db.execute(sa_delete(ContextBudgetLog).where(ContextBudgetLog.day_chat_id.in_(day_chat_ids_q)))
+        from app.db.models import DayChat
         await db.execute(sa_delete(DayChat).where(DayChat.user_id == user_id))
     except Exception:
         pass
