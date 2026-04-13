@@ -727,6 +727,18 @@ async def get_job(job_id: str, current_user=Depends(get_current_user), db: Async
 
 @router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
+
+    if is_agent_connected(current_user.id):
+        try:
+            result = await send_http_forward(
+                current_user.id, "DELETE", f"/api/apps/jobs/{job_id}",
+            )
+            if result is not None:
+                return JSONResponse(content=result)
+        except Exception:
+            pass
+
     agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, f"jobs/{job_id}", method="DELETE")
 
@@ -1147,5 +1159,19 @@ async def push_github(app_id: str, current_user=Depends(get_current_user), db: A
 
 @router.delete("/{app_id}")
 async def delete_app(app_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
+
+    # Try tunnel first (works for NAT'd / self-hosted agents)
+    if is_agent_connected(current_user.id):
+        try:
+            result = await send_http_forward(
+                current_user.id, "DELETE", f"/api/apps/{app_id}", timeout=30.0,
+            )
+            if result is not None:
+                return JSONResponse(content=result)
+        except Exception as e:
+            logger.debug("Tunnel DELETE forward failed, falling back to HTTP: %s", e)
+
+    # Fall back to direct HTTP
     agent_url, key, _ = _require(await _get_agent(current_user.id, db))
-    return await _proxy(agent_url, key, app_id, method="DELETE")
+    return await _proxy(agent_url, key, app_id, method="DELETE", timeout=30.0)
