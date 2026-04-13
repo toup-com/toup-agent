@@ -635,16 +635,22 @@ async def ws_chat(
                             if _app:
                                 _slug_safe = _app.slug.replace('-', '_')
                                 _is_layer2 = msg.get("layer2") or False
+                                _preview_url = f"https://toup.ai/workspace/apps/{_app.slug}"
                                 _base_ctx = (
                                     f"[CONTEXT: The user is chatting from inside their '{_app.name}' app. "
                                     f"You are their in-app assistant.\n"
                                     f"- Be conversational and helpful. Greet naturally when they say hi.\n"
                                     f"- NEVER mention internal details (SQLite, bridges, connections, file paths, agent infrastructure).\n"
-                                    f"- You have these app tools: app_{_slug_safe}__navigate (change screens), "
-                                    f"app_{_slug_safe}__read_file / app_{_slug_safe}__write_file (edit the app), "
-                                    f"app_{_slug_safe}__query_db (read/write app data).\n"
+                                    f"- NEVER give localhost URLs to the user. The app preview URL is: {_preview_url}\n"
+                                    f"- You have these app tools:\n"
+                                    f"  app_{_slug_safe}__navigate (change screens),\n"
+                                    f"  app_{_slug_safe}__read_file / app_{_slug_safe}__write_file (edit the app),\n"
+                                    f"  app_{_slug_safe}__edit_file (search/replace edits),\n"
+                                    f"  app_{_slug_safe}__query_db (read/write app data),\n"
+                                    f"  app_{_slug_safe}__restart (restart the app after code changes — ALWAYS call this after editing files).\n"
                                     f"- When the user asks to change something in the app (UI, content, settings), "
-                                    f"use write_file/query_db to make it happen.\n"
+                                    f"use write_file/edit_file to make the change, then call restart to apply it.\n"
+                                    f"- After fixing or restarting, give the user a clickable [[Open app]] chip.\n"
                                     f"- Suggest helpful actions as [[Button Label]] chips.\n"
                                 )
                                 if _is_layer2:

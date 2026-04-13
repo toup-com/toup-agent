@@ -341,7 +341,7 @@ class AppFsSkill(Skill):
                 self.app_id, file_path, action,
                 f"{'Created' if is_new else 'Updated'} {file_path} ({lines} lines, {len(content)} chars)"
             )
-            return f"Wrote '{file_path}' ({len(content)} chars). Metro will auto-hot-reload."
+            return f"Wrote '{file_path}' ({len(content)} chars). Call restart to apply changes if the app is not running."
         except Exception as e:
             return f"ERROR writing '{file_path}': {e}"
 
@@ -376,7 +376,7 @@ class AppFsSkill(Skill):
                 self.app_id, file_path, "edit",
                 f"Edited {file_path} (replaced {len(old_text)} chars with {len(new_text)} chars)"
             )
-            return f"Edited '{file_path}'. Metro will auto-hot-reload."
+            return f"Edited '{file_path}'. Call restart to apply changes if the app is not running."
         except Exception as e:
             return f"ERROR editing '{file_path}': {e}"
 
@@ -468,7 +468,11 @@ class AppFsSkill(Skill):
                     app.web_port = web_port
                     await db.commit()
 
-            return f"Restarted '{self.app_name}'. Metro: {metro_port}, Web: {web_port}"
+            web_url = await self._app_manager.get_web_url(self.app_id)
+            return (
+                f"Restarted '{self.app_name}' successfully. "
+                f"Preview: {web_url or f'localhost:{web_port}'}"
+            )
         except Exception as e:
             return f"ERROR restarting: {e}"
 
