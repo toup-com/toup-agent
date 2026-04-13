@@ -173,8 +173,8 @@ async def bundle_checkout(
         session = create_bundle_checkout_session(
             user_id=current_user.id,
             user_email=current_user.email,
-            success_url=f"{settings.platform_api_url.rstrip('/api')}/agent?bundle_success=1",
-            cancel_url=f"{settings.platform_api_url.rstrip('/api')}/agent?bundle_cancelled=1",
+            success_url=f"{settings.platform_api_url.rstrip('/api')}/setup?bundle_success=1",
+            cancel_url=f"{settings.platform_api_url.rstrip('/api')}/setup?bundle_cancelled=1",
             stripe_customer_id=stripe_customer_id,
         )
     except Exception as e:
