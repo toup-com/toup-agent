@@ -743,8 +743,9 @@ async def delete_user(
         inv.used_at = None
     await db.execute(sa_delete(Invite).where(Invite.created_by == user_id))
 
-    # ── 5. Delete the user ──
-    await db.delete(user)
+    # ── 5. Delete the user (raw SQL to avoid ORM loading relationships
+    #    that reference columns missing from legacy platform DB) ──
+    await db.execute(text("DELETE FROM users WHERE id = :uid").bindparams(uid=user_id))
     await db.commit()
 
     return {"success": True, "message": f"User {user.email} and all data deleted"}
