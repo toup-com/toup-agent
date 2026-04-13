@@ -4522,21 +4522,6 @@ const _webDb = {
     BUNDLE_ERROR_LINE_PREFIXES = (
         'error:', 'Error:',
     )
-    # Lines matching a keyword but also matching one of these patterns are
-    # Metro/React-Native runtime boilerplate baked into every compiled bundle.
-    # They are NOT actual compilation errors and must be skipped.
-    BUNDLE_FALSE_POSITIVE_PATTERNS = (
-        'moduleIdHint',       # Metro runtime: throw new Error("Cannot find module '" + moduleIdHint + "'")
-        'hasError',           # ErrorBoundary: { hasError: false, error: null }
-        'getDerivedStateFromError',  # ErrorBoundary lifecycle
-        'componentDidCatch',  # ErrorBoundary lifecycle
-        '__DEV__',            # Metro dev-mode guards: if (__DEV__) { throw new TypeError(...) }
-        'process.env.NODE_ENV',  # Bundler env guards with error constructors
-        'invariant(',         # invariant() calls are runtime guards, not compile errors
-        'new Error(',         # Generic error constructors in application code
-        'console.error(',     # Logging calls, not actual errors
-    )
-
     async def _validate_bundle(self, web_port: int, blog=None) -> tuple:
         """Check if the web bundle compiles without errors.
 
@@ -4555,7 +4540,18 @@ const _webDb = {
                             await blog.warn(f"Bundle request returned HTTP {resp.status}")
                         return False, await self._parse_bundle_error_response(resp, blog)
 
-                    # Read full response (up to 5MB) to catch errors anywhere in bundle
+                    # Read the response to check for compilation errors.
+                    # Metro puts error overlays in the FIRST ~100 lines of the bundle
+                    # when compilation fails.  The rest of a successful bundle is compiled
+                    # JS that naturally contains keywords like TypeError, SyntaxError,
+                    # CompileError as class names / variable names — scanning the full
+                    # 5MB bundle produces endless false positives.
+                    #
+                    # Strategy:
+                    #   - If response is very small (< 50KB), it's likely an error page
+                    #     or a trivially broken bundle — scan the whole thing.
+                    #   - If response is large (>= 50KB), a real compiled bundle — only
+                    #     scan the first 150 lines where Metro injects error overlays.
                     chunks = []
                     total = 0
                     async for chunk in resp.content.iter_chunked(65536):
@@ -4565,7 +4561,15 @@ const _webDb = {
                             break
                     text = b"".join(chunks).decode("utf-8", errors="replace")
 
-                    errors = self._extract_errors_from_text(text)
+                    if total < 50 * 1024:
+                        # Small response — likely error page, scan everything
+                        scan_text = text
+                    else:
+                        # Large bundle — only scan the preamble where errors appear
+                        lines = text.split("\n", 150)
+                        scan_text = "\n".join(lines[:150])
+
+                    errors = self._extract_errors_from_text(scan_text)
                     if errors and blog:
                         for e in errors[:5]:
                             await blog.error(f"Bundle error in {e['file']}: {e['error'][:200]}")
@@ -4632,9 +4636,6 @@ const _webDb = {
                 any(kw in line for kw in AppBuilderSkill.BUNDLE_ERROR_KEYWORDS)
                 or any(stripped.startswith(pfx) for pfx in AppBuilderSkill.BUNDLE_ERROR_LINE_PREFIXES)
             )
-            # Skip lines that match known Metro/RN runtime boilerplate
-            if is_error and any(fp in line for fp in AppBuilderSkill.BUNDLE_FALSE_POSITIVE_PATTERNS):
-                is_error = False
             if is_error:
                 # Try to extract file path
                 file_match = _re.search(r'(/[^\s:]+\.tsx?)', line)
