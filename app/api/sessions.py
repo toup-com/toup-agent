@@ -676,10 +676,16 @@ async def get_messages_by_date(
 
     # Enrich with build job data
     build_jobs = {}
-    job_ids = [
-        m.metadata_json and __import__("json").loads(m.metadata_json).get("job_id")
-        for m in messages if m.role == "job"
-    ]
+    job_ids = []
+    for m in messages:
+        if m.role == "job":
+            try:
+                _jdata = json.loads(m.content) if m.content else {}
+                _jid = _jdata.get("job_id")
+                if _jid:
+                    job_ids.append(_jid)
+            except (json.JSONDecodeError, TypeError):
+                pass
     job_ids = [j for j in job_ids if j]
     if job_ids:
         from app.db.models import BuildJob
