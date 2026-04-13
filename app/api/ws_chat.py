@@ -754,29 +754,31 @@ async def ws_chat(
                 _tprint(f"\n{_CYAN_BOLD} user {_RESET} {text}")
 
                 # ── Pre-save user message so it survives stream failures ──
-                try:
-                    from app.db.database import async_session_maker
-                    from app.db.models import Message as DbMessage, Conversation
-                    async with async_session_maker() as _presave_db:
-                        _presave_dc_id = await _resolve_day_chat_id_for_now(_presave_db, user_id)
-                        _presave_db.add(DbMessage(
-                            conversation_id=session_id,
-                            day_chat_id=_presave_dc_id,
-                            role="user",
-                            content=text,
-                        ))
-                        # Update conversation timestamp
-                        _conv = (await _presave_db.execute(
-                            __import__('sqlalchemy').select(Conversation).where(Conversation.id == session_id)
-                        )).scalar_one_or_none()
-                        if _conv:
-                            _conv.message_count = (_conv.message_count or 0) + 1
-                            _conv.updated_at = __import__('datetime').datetime.utcnow()
-                        await _presave_db.commit()
-                    _user_msg_presaved = True
-                except Exception as _pse:
-                    logger.warning(f"[WS] Failed to pre-save user message: {_pse}")
-                    _user_msg_presaved = False
+                # Skip if no session_id yet (first message — agent_runner creates session)
+                _user_msg_presaved = False
+                if session_id:
+                    try:
+                        from app.db.database import async_session_maker
+                        from app.db.models import Message as DbMessage, Conversation
+                        async with async_session_maker() as _presave_db:
+                            _presave_dc_id = await _resolve_day_chat_id_for_now(_presave_db, user_id)
+                            _presave_db.add(DbMessage(
+                                conversation_id=session_id,
+                                day_chat_id=_presave_dc_id,
+                                role="user",
+                                content=text,
+                            ))
+                            # Update conversation timestamp
+                            _conv = (await _presave_db.execute(
+                                __import__('sqlalchemy').select(Conversation).where(Conversation.id == session_id)
+                            )).scalar_one_or_none()
+                            if _conv:
+                                _conv.message_count = (_conv.message_count or 0) + 1
+                                _conv.updated_at = __import__('datetime').datetime.utcnow()
+                            await _presave_db.commit()
+                        _user_msg_presaved = True
+                    except Exception as _pse:
+                        logger.warning(f"[WS] Failed to pre-save user message: {_pse}")
 
                 # Accumulate streamed text for partial-save on error
                 _streamed_chunks: list = []
@@ -1090,7 +1092,7 @@ async def ws_chat(
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
                     # Save partial response so it's not lost on refresh
                     _partial = "".join(_streamed_chunks).strip()
-                    if _partial:
+                    if _partial and session_id:
                         try:
                             async with async_session_maker() as _err_db:
                                 _err_dc = await _resolve_day_chat_id_for_now(_err_db, user_id)
