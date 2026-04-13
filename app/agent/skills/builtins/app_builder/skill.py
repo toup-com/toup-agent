@@ -2079,7 +2079,7 @@ class AppBuilderSkill(Skill):
                 bundle_ok = False
                 self._last_bundle_errors = []
                 MAX_REPAIR_ROUNDS = 8
-                repaired_files_history = set()  # Track which files we've already tried to repair
+                repaired_files_history = []  # Track which files we've already tried to repair (list for .count())
                 try:
                     for repair_round in range(MAX_REPAIR_ROUNDS):
                         # Check if web server is alive
@@ -2135,7 +2135,7 @@ class AppBuilderSkill(Skill):
                             if repaired:
                                 fixed_something = True
                                 for e in fresh_errors:
-                                    repaired_files_history.add(e.get("file", ""))
+                                    repaired_files_history.append(e.get("file", ""))
 
                         # Strategy 3: Server not alive — restart
                         if not web_alive:
