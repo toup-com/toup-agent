@@ -725,6 +725,18 @@ async def get_job(job_id: str, current_user=Depends(get_current_user), db: Async
     return await _proxy(agent_url, key, f"jobs/{job_id}")
 
 
+@router.post("/jobs/{job_id}/fix")
+async def fix_job_proxy(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
+    return await _proxy(agent_url, key, f"jobs/{job_id}/fix", method="POST", timeout=60.0)
+
+
+@router.post("/jobs/{job_id}/resume")
+async def resume_job_proxy(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
+    return await _proxy(agent_url, key, f"jobs/{job_id}/resume", method="POST", timeout=60.0)
+
+
 @router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
