@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sqlalchemy import delete as sa_delete
+from sqlalchemy import delete as sa_delete, update as sa_update
 
 from app.db import get_db, User, Invite
 from app.api.auth import get_current_user
@@ -605,6 +605,11 @@ async def delete_user(
 
     # Delete all user data from every related table
     # Order matters: delete children before parents (foreign key deps)
+
+    # Nullify Memory → Message FK before deleting messages (Memory.source_message_id)
+    await db.execute(
+        sa_update(Memory).where(Memory.user_id == user_id).values(source_message_id=None)
+    )
 
     # Messages depend on conversations — delete first
     conv_ids_q = select(Conversation.id).where(Conversation.user_id == user_id)
