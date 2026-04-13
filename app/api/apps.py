@@ -784,15 +784,17 @@ async def agent_preview_proxy(app_id: str, request: Request, path: str = ""):
 @router.delete("/{app_id}")
 async def delete_app(app_id: str) -> Dict[str, bool]:
     """Delete an app (stop servers, remove files, unregister skills, remove DB records + related jobs)."""
-    # Get slug before deleting so we can unregister from gateway
+    # Get slug + app_dir before deleting so we can pass it to the manager
     app_slug = None
+    app_dir = None
     async with async_session_maker() as db:
         app = await db.get(App, app_id)
         if app:
             app_slug = app.slug
+            app_dir = app.app_dir
 
     if _app_manager:
-        await _app_manager.delete_app(app_id)
+        await _app_manager.delete_app(app_id, app_dir=app_dir)
 
     # Unregister from AppGatewaySkill (removes tools + domain actions)
     if _app_gateway and app_slug:
