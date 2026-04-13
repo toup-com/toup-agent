@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sqlalchemy import delete as sa_delete, update as sa_update
+from sqlalchemy import delete as sa_delete
 
 from app.db import get_db, User, Invite
 from app.api.auth import get_current_user
@@ -576,14 +576,17 @@ async def delete_user(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a user and all their data. Only admins."""
+    """Delete a user and all their data. Only admins.
+
+    The platform DB only has platform-only tables (managed_containers,
+    agent_configs, invites, etc.) and the shared users table. All
+    conversation/memory/entity data lives in per-user agent databases
+    on the VPS — those are cleaned up by destroying the container and
+    dropping the per-user PostgreSQL database.
+    """
     from app.db.models import (
-        Identity, Conversation, Message, Memory, Entity, EntityLink,
-        EntityRelationship, BrainStats, MemoryEvent, RetrievalEvent,
-        Document, DocumentChunk, Media, CronJob, TelegramUserMapping,
-        AgentError, ApiKey, VPSInstance, ManagedContainer, AgentConfig,
-        LLMBundleAllocation, LLMUsageRecord,
-        App, BuildJob, SoulConfig, StreamingCredential,
+        VPSInstance, ManagedContainer, AgentConfig,
+        LLMBundleAllocation, LLMUsageRecord, StreamingCredential,
     )
 
     # Safety: cannot delete yourself
@@ -603,59 +606,10 @@ async def delete_user(
         if admin_count.scalar() <= 1:
             raise HTTPException(400, "Cannot delete the last admin")
 
-    # Delete all user data from every related table
-    # Order matters: delete children before parents (foreign key deps)
-
-    # Nullify Memory → Message FK before deleting messages (Memory.source_message_id)
-    await db.execute(
-        sa_update(Memory).where(Memory.user_id == user_id).values(source_message_id=None)
-    )
-
-    # Messages depend on conversations — delete first
-    conv_ids_q = select(Conversation.id).where(Conversation.user_id == user_id)
-    await db.execute(sa_delete(Message).where(Message.conversation_id.in_(conv_ids_q)))
-
-    # Document chunks depend on documents
-    doc_ids_q = select(Document.id).where(Document.user_id == user_id)
-    await db.execute(sa_delete(DocumentChunk).where(DocumentChunk.document_id.in_(doc_ids_q)))
-
-    # Entity links and relationships depend on entities
-    entity_ids_q = select(Entity.id).where(Entity.user_id == user_id)
-    await db.execute(sa_delete(EntityLink).where(EntityLink.entity_id.in_(entity_ids_q)))
-    await db.execute(sa_delete(EntityRelationship).where(
-        (EntityRelationship.source_entity_id.in_(entity_ids_q)) |
-        (EntityRelationship.target_entity_id.in_(entity_ids_q))
-    ))
-    # Also delete any EntityRelationships by direct user_id FK (covers orphans)
-    await db.execute(sa_delete(EntityRelationship).where(EntityRelationship.user_id == user_id))
-
-    # Memory children: memory_events, memory_relationships, entity_links, media, doc_chunks (by memory_id)
-    from app.db.models import memory_relationships as mem_rel_table
-    mem_ids_q = select(Memory.id).where(Memory.user_id == user_id)
-    await db.execute(sa_delete(MemoryEvent).where(MemoryEvent.memory_id.in_(mem_ids_q)))
-    await db.execute(sa_delete(EntityLink).where(EntityLink.memory_id.in_(mem_ids_q)))
-    await db.execute(sa_delete(DocumentChunk).where(DocumentChunk.memory_id.in_(mem_ids_q)))
-    await db.execute(sa_delete(Media).where(Media.memory_id.in_(mem_ids_q)))
-    await db.execute(mem_rel_table.delete().where(
-        mem_rel_table.c.source_id.in_(mem_ids_q) |
-        mem_rel_table.c.target_id.in_(mem_ids_q)
-    ))
-
-    # Delete retrieval_events by conversation_id (FK to conversations)
-    await db.execute(sa_delete(RetrievalEvent).where(
-        RetrievalEvent.conversation_id.in_(conv_ids_q)
-    ))
-    # Also delete any retrieval_events by user_id (covers orphans)
-    await db.execute(sa_delete(RetrievalEvent).where(RetrievalEvent.user_id == user_id))
-
-    # Build jobs depend on apps — delete first
-    await db.execute(sa_delete(BuildJob).where(BuildJob.user_id == user_id))
-    # Apps + reconciliation logs
-    from app.db.models import ReconciliationLog
-    await db.execute(sa_delete(ReconciliationLog).where(ReconciliationLog.user_id == user_id))
-    await db.execute(sa_delete(App).where(App.user_id == user_id))
-
-    # Destroy the Docker container on the VPS before deleting DB records
+    # ── 1. Destroy Docker container + drop per-user agent DB on VPS ──
+    # Agent-only data (conversations, memories, entities, apps, etc.)
+    # lives in the per-user database — dropping it cleans everything.
+    prefix = user_id[:8]
     try:
         from app.services.docker_host_service import _run_ssh
         mc_result = await db.execute(
@@ -664,64 +618,36 @@ async def delete_user(
         mc = mc_result.scalar_one_or_none()
         if mc:
             await _run_ssh(f"docker rm -f {mc.container_name} 2>/dev/null || true")
+            await _run_ssh(
+                f"PGPASSWORD=postgres psql -U postgres -h localhost -c "
+                f"\"DROP DATABASE IF EXISTS {mc.db_name}\" 2>/dev/null || true"
+            )
     except Exception:
         pass  # container may not exist or VPS unreachable — proceed anyway
 
-    # Streaming credentials
-    await db.execute(sa_delete(StreamingCredential).where(StreamingCredential.user_id == user_id))
-
-    # LLM proxy events
+    # ── 2. Delete platform-only tables (order: children before parents) ──
+    # LLM proxy events (may not exist yet)
     try:
         from app.db.models import LLMProxyEvent
         await db.execute(sa_delete(LLMProxyEvent).where(LLMProxyEvent.user_id == user_id))
     except Exception:
         pass
 
-    # Workflows table (exists in DB but no SQLAlchemy model — may not exist on platform)
-    try:
-        async with db.begin_nested():
-            await db.execute(text("DELETE FROM workflows WHERE user_id = :uid"), {"uid": user_id})
-    except Exception:
-        pass
+    await db.execute(sa_delete(StreamingCredential).where(StreamingCredential.user_id == user_id))
+    await db.execute(sa_delete(LLMUsageRecord).where(LLMUsageRecord.user_id == user_id))
+    await db.execute(sa_delete(LLMBundleAllocation).where(LLMBundleAllocation.user_id == user_id))
+    await db.execute(sa_delete(ManagedContainer).where(ManagedContainer.user_id == user_id))
+    await db.execute(sa_delete(VPSInstance).where(VPSInstance.user_id == user_id))
+    await db.execute(sa_delete(AgentConfig).where(AgentConfig.user_id == user_id))
 
-    # ContextBudgetLog has FK to conversations.id AND day_chats.id — delete BEFORE both
-    try:
-        from app.db.models import DayChat, ContextBudgetLog
-        await db.execute(sa_delete(ContextBudgetLog).where(ContextBudgetLog.user_id == user_id))
-    except Exception:
-        pass
-
-    # Now delete all direct user_id tables (order: children before parents)
-    # Media has FK to memories.id — must come before Memory
-    # Conversation has FK to day_chats.id — DayChat deleted after this loop
-    for model in [
-        Identity, MemoryEvent, Media, Document,
-        Memory, Conversation, Entity, BrainStats,
-        CronJob, TelegramUserMapping, ApiKey,
-        ManagedContainer, VPSInstance,
-        AgentConfig, SoulConfig, LLMBundleAllocation, LLMUsageRecord,
-    ]:
-        await db.execute(sa_delete(model).where(model.user_id == user_id))
-
-    # AgentError has nullable user_id
-    await db.execute(sa_delete(AgentError).where(AgentError.user_id == user_id))
-
-    # DayChat — delete AFTER conversations (Conversation.day_chat_id FK to day_chats)
-    try:
-        from app.db.models import DayChat
-        await db.execute(sa_delete(DayChat).where(DayChat.user_id == user_id))
-    except Exception:
-        pass
-
-    # Update invites that reference this user (both used_by and created_by FKs)
+    # ── 3. Update/delete invites ──
     inv_result = await db.execute(select(Invite).where(Invite.used_by == user_id))
     for inv in inv_result.scalars().all():
         inv.used_by = None
         inv.used_at = None
-    # Delete invites created by this user (created_by FK)
     await db.execute(sa_delete(Invite).where(Invite.created_by == user_id))
 
-    # Finally delete the user
+    # ── 4. Delete the user ──
     await db.delete(user)
     await db.commit()
 
