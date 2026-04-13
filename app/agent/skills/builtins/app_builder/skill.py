@@ -2293,12 +2293,48 @@ class AppBuilderSkill(Skill):
                 except Exception as e:
                     await blog.warn(f"Bundle validation error: {e}")
 
+                # ── 7f: Runtime validation — catch errors that compile but crash on load ──
+                if bundle_ok and web_port:
+                    runtime_errors = await self._validate_runtime(web_port, blog)
+                    if runtime_errors:
+                        await blog.warn(f"Runtime errors detected: {runtime_errors[0][:200]}")
+                        # Feed runtime errors to LLM repair (up to 3 rounds)
+                        MAX_RUNTIME_REPAIRS = 3
+                        for rt_round in range(MAX_RUNTIME_REPAIRS):
+                            await blog.info(f"[RUNTIME-FIX] Repair round {rt_round + 1}/{MAX_RUNTIME_REPAIRS}...")
+                            # Extract file from error if possible
+                            import re as _rt_re
+                            _rt_errors = [{"file": "unknown", "error": e} for e in runtime_errors]
+                            for _rte in _rt_errors:
+                                _fm = _rt_re.search(r'(/[^\s:]+\.tsx?)', _rte["error"])
+                                if _fm:
+                                    _rte["file"] = _fm.group(1)
+
+                            repaired = await self._repair_bundle_errors(
+                                app_id, app_dir, _rt_errors, generated_files,
+                                description, name, deps, db_type, blog
+                            )
+                            if repaired:
+                                # Restart and re-check
+                                await asyncio.sleep(3)
+                                runtime_errors = await self._validate_runtime(web_port, blog)
+                                if not runtime_errors:
+                                    await blog.success(f"Runtime errors fixed (round {rt_round + 1})")
+                                    break
+                            else:
+                                await blog.warn(f"[RUNTIME-FIX] LLM could not fix runtime errors")
+                                break
+
+                        if runtime_errors:
+                            await blog.error(f"App has runtime errors after {MAX_RUNTIME_REPAIRS} repair attempts")
+                            bundle_ok = False  # Treat as failed build
+
                 qr_url = await self._app_manager.get_qr_url(app_id)
                 web_url = await self._app_manager.get_web_url(app_id)
                 await blog.info(f"QR URL: {qr_url}")
                 await blog.info(f"Web URL: {web_url}")
 
-                # Set status based on bundle validation result
+                # Set status based on bundle + runtime validation result
                 final_status = "running" if bundle_ok else "error"
                 async with async_session_maker() as db:
                     app = await db.get(App, app_id)
@@ -4700,6 +4736,94 @@ const _webDb = {
     BUNDLE_ERROR_LINE_PREFIXES = (
         'error:', 'Error:',
     )
+    async def _validate_runtime(self, web_port: int, blog=None) -> list:
+        """Load the app in a headless browser and check for runtime errors.
+
+        Returns a list of error strings (empty = app runs cleanly).
+        Uses Playwright to detect JavaScript errors, unhandled rejections,
+        and ErrorBoundary activations that compile fine but crash on load.
+        """
+        errors = []
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            if blog:
+                await blog.info("Runtime validation skipped (Playwright not available)")
+            return []
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+                page = await browser.new_page()
+
+                # Collect JS errors and console.error calls
+                page.on("pageerror", lambda err: errors.append(str(err)))
+                page.on("console", lambda msg: (
+                    errors.append(msg.text)
+                    if msg.type == "error" and not any(skip in msg.text for skip in [
+                        "favicon", "404", "manifest", "service-worker", "hot-update",
+                    ])
+                    else None
+                ))
+
+                url = f"http://localhost:{web_port}"
+                try:
+                    await page.goto(url, timeout=20000, wait_until="networkidle")
+                except Exception:
+                    # Page might not reach networkidle with WebSocket connections
+                    try:
+                        await page.goto(url, timeout=20000, wait_until="load")
+                    except Exception as nav_err:
+                        if blog:
+                            await blog.warn(f"Runtime check: page navigation failed: {nav_err}")
+                        await browser.close()
+                        return []
+
+                # Wait for React to render and any async effects to fire
+                await page.wait_for_timeout(4000)
+
+                # Check if ErrorBoundary activated
+                try:
+                    error_boundary = await page.query_selector("text=Something went wrong")
+                    if error_boundary:
+                        # Get the error message from the ErrorBoundary
+                        error_msg = await page.evaluate("""() => {
+                            const el = document.body.innerText;
+                            const match = el.match(/Something went wrong[\\s\\S]*?(?=Reload App|$)/);
+                            return match ? match[0].trim() : 'ErrorBoundary activated';
+                        }""")
+                        errors.append(f"ErrorBoundary: {error_msg[:500]}")
+                except Exception:
+                    pass
+
+                await browser.close()
+
+                # Filter out noise
+                errors = [e for e in errors if e and len(e) > 5 and "ErrorBoundary" not in e or "ErrorBoundary:" in e]
+                # Deduplicate
+                seen = set()
+                unique = []
+                for e in errors:
+                    key = e[:100]
+                    if key not in seen:
+                        seen.add(key)
+                        unique.append(e)
+                errors = unique[:5]  # Max 5 errors
+
+                if errors and blog:
+                    await blog.warn(f"Runtime validation found {len(errors)} error(s)")
+                    for e in errors:
+                        await blog.error(f"  Runtime: {e[:200]}")
+                elif not errors and blog:
+                    await blog.success("Runtime validation passed — app loads without errors")
+
+        except Exception as e:
+            if blog:
+                await blog.info(f"Runtime validation skipped: {e}")
+            return []  # Don't block build if Playwright fails
+
+        return errors
+
     async def _validate_bundle(self, web_port: int, blog=None) -> tuple:
         """Check if the web bundle compiles without errors.
 
