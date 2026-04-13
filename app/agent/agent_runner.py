@@ -298,19 +298,24 @@ class AgentRunner:
             logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
             # Load user's disabled tools from AgentConfig
+            # AgentConfig is platform-only — may not exist in agent DBs
             t_db = time.perf_counter()
-            from sqlalchemy import select as _select
-            from app.db import AgentConfig
-            _ac_result = await db.execute(
-                _select(AgentConfig).where(AgentConfig.user_id == user_id)
-            )
-            _ac = _ac_result.scalars().first()
-            if _ac and getattr(_ac, 'disabled_tools', None):
-                import json as _json
-                _user_disabled = set(_json.loads(_ac.disabled_tools))
-                self.tools.user_disabled_tools = _user_disabled
-                self._disabled_tool_names = _user_disabled
-            else:
+            try:
+                from sqlalchemy import select as _select
+                from app.db import AgentConfig
+                _ac_result = await db.execute(
+                    _select(AgentConfig).where(AgentConfig.user_id == user_id)
+                )
+                _ac = _ac_result.scalars().first()
+                if _ac and getattr(_ac, 'disabled_tools', None):
+                    import json as _json
+                    _user_disabled = set(_json.loads(_ac.disabled_tools))
+                    self.tools.user_disabled_tools = _user_disabled
+                    self._disabled_tool_names = _user_disabled
+                else:
+                    self.tools.user_disabled_tools = set()
+                    self._disabled_tool_names = set()
+            except Exception:
                 self.tools.user_disabled_tools = set()
                 self._disabled_tool_names = set()
             logger.info(f"[PERF] load_agent_config: {(time.perf_counter() - t_db) * 1000:.0f}ms")
