@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import time
 import uuid
@@ -749,10 +750,35 @@ export default supabase;
 
     async def delete_app(self, app_id: str, app_dir: Optional[str] = None) -> bool:
         """Stop app and delete its directory."""
-        await self.stop_app(app_id)
+        stopped = await self.stop_app(app_id)
+        if not stopped:
+            # App not in _running (e.g. after agent restart) — kill orphan
+            # processes by PID from DB record
+            await self._kill_orphan_processes(app_id)
         app_dir = await self._resolve_app_dir(app_id, app_dir)
         if os.path.exists(app_dir):
             shutil.rmtree(app_dir)
             logger.info(f"[APP] Deleted {app_dir}")
             return True
         return False
+
+    async def _kill_orphan_processes(self, app_id: str) -> None:
+        """Kill Metro/web processes by PID from DB when not tracked in _running."""
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models.app import App
+            async with async_session_maker() as db:
+                app = await db.get(App, app_id)
+                if not app:
+                    return
+                for pid in (app.metro_pid, app.web_pid):
+                    if pid:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            logger.info(f"[APP] Killed orphan process {pid} for {app_id}")
+                        except ProcessLookupError:
+                            pass
+                        except OSError as e:
+                            logger.debug(f"[APP] Could not kill PID {pid}: {e}")
+        except Exception as e:
+            logger.debug(f"[APP] Orphan cleanup failed for {app_id}: {e}")
