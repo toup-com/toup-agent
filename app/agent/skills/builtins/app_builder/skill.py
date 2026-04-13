@@ -4465,12 +4465,21 @@ const _webDb = {
         # Timeout — proceed anyway, bundle validation will catch errors
         logger.warning(f"[BUILD] Server on port {port} not ready after {timeout}s, proceeding")
 
-    # Error keywords to search for in Metro output / log buffer
+    # Error keywords to search for in Metro output / log buffer.
+    # These match ANYWHERE in a line — must be specific enough to avoid
+    # false positives on compiled JS (e.g. object properties like `error: null`).
     BUNDLE_ERROR_KEYWORDS = (
         'SyntaxError', 'TransformError', 'TypeError', 'ReferenceError',
         'Cannot find module', 'Module not found', 'Unexpected token',
-        'Unable to resolve', 'error:', 'Error:',
-        'ENOENT', 'EACCES', 'EADDRINUSE',
+        'Unable to resolve', 'ENOENT', 'EACCES', 'EADDRINUSE',
+        'Invariant Violation', 'Fatal error', 'CompileError', 'ParseError',
+    )
+    # These only match when they appear at the start of a line (after stripping
+    # whitespace).  Metro/Expo CLI prefixes error lines with "error:" or "Error:"
+    # but compiled JS contains `error:` mid-line as object property keys — those
+    # must NOT be treated as bundle errors.
+    BUNDLE_ERROR_LINE_PREFIXES = (
+        'error:', 'Error:',
     )
 
     async def _validate_bundle(self, web_port: int, blog=None) -> tuple:
@@ -4563,7 +4572,12 @@ const _webDb = {
         errors = []
         seen_files = set()
         for line in text.split("\n"):
-            if any(kw in line for kw in AppBuilderSkill.BUNDLE_ERROR_KEYWORDS):
+            stripped = line.lstrip()
+            is_error = (
+                any(kw in line for kw in AppBuilderSkill.BUNDLE_ERROR_KEYWORDS)
+                or any(stripped.startswith(pfx) for pfx in AppBuilderSkill.BUNDLE_ERROR_LINE_PREFIXES)
+            )
+            if is_error:
                 # Try to extract file path
                 file_match = _re.search(r'(/[^\s:]+\.tsx?)', line)
                 if not file_match:
@@ -4587,7 +4601,12 @@ const _webDb = {
         seen_files = set()
         import re as _re
         for line in list(managed_app.log_buffer)[-100:]:
-            if any(kw in line for kw in self.BUNDLE_ERROR_KEYWORDS):
+            stripped = line.lstrip()
+            is_error = (
+                any(kw in line for kw in self.BUNDLE_ERROR_KEYWORDS)
+                or any(stripped.startswith(pfx) for pfx in self.BUNDLE_ERROR_LINE_PREFIXES)
+            )
+            if is_error:
                 file_match = _re.search(r'(/[^\s:]+\.tsx?)', line)
                 if not file_match:
                     file_match = _re.search(r'(?:in |from |module )["\']?([a-zA-Z./][^\s"\']+\.tsx?)', line)
