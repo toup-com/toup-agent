@@ -4522,6 +4522,20 @@ const _webDb = {
     BUNDLE_ERROR_LINE_PREFIXES = (
         'error:', 'Error:',
     )
+    # Lines matching a keyword but also matching one of these patterns are
+    # Metro/React-Native runtime boilerplate baked into every compiled bundle.
+    # They are NOT actual compilation errors and must be skipped.
+    BUNDLE_FALSE_POSITIVE_PATTERNS = (
+        'moduleIdHint',       # Metro runtime: throw new Error("Cannot find module '" + moduleIdHint + "'")
+        'hasError',           # ErrorBoundary: { hasError: false, error: null }
+        'getDerivedStateFromError',  # ErrorBoundary lifecycle
+        'componentDidCatch',  # ErrorBoundary lifecycle
+        '__DEV__',            # Metro dev-mode guards: if (__DEV__) { throw new TypeError(...) }
+        'process.env.NODE_ENV',  # Bundler env guards with error constructors
+        'invariant(',         # invariant() calls are runtime guards, not compile errors
+        'new Error(',         # Generic error constructors in application code
+        'console.error(',     # Logging calls, not actual errors
+    )
 
     async def _validate_bundle(self, web_port: int, blog=None) -> tuple:
         """Check if the web bundle compiles without errors.
@@ -4618,6 +4632,9 @@ const _webDb = {
                 any(kw in line for kw in AppBuilderSkill.BUNDLE_ERROR_KEYWORDS)
                 or any(stripped.startswith(pfx) for pfx in AppBuilderSkill.BUNDLE_ERROR_LINE_PREFIXES)
             )
+            # Skip lines that match known Metro/RN runtime boilerplate
+            if is_error and any(fp in line for fp in AppBuilderSkill.BUNDLE_FALSE_POSITIVE_PATTERNS):
+                is_error = False
             if is_error:
                 # Try to extract file path
                 file_match = _re.search(r'(/[^\s:]+\.tsx?)', line)
@@ -4647,6 +4664,8 @@ const _webDb = {
                 any(kw in line for kw in self.BUNDLE_ERROR_KEYWORDS)
                 or any(stripped.startswith(pfx) for pfx in self.BUNDLE_ERROR_LINE_PREFIXES)
             )
+            if is_error and any(fp in line for fp in self.BUNDLE_FALSE_POSITIVE_PATTERNS):
+                is_error = False
             if is_error:
                 file_match = _re.search(r'(/[^\s:]+\.tsx?)', line)
                 if not file_match:

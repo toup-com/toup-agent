@@ -32,6 +32,18 @@ ERROR_BOUNDARY_LINES = [
     "interface State { hasError: boolean; error: Error | null; }",
 ]
 
+# Metro runtime boilerplate that appears in EVERY compiled bundle.
+METRO_RUNTIME_LINES = [
+    '  throw new Error("Cannot find module \'" + moduleIdHint + "\'");',
+    '  if (__DEV__) { throw new TypeError("Expected a component class..."); }',
+    '  invariant(googoo, "Module not found");',
+    '  console.error("Cannot find module", moduleName);',
+    '  var err = new Error("Module not found: " + name);',
+    '  process.env.NODE_ENV !== "production" ? invariant(false, "Unexpected token") : void 0;',
+    '  static getDerivedStateFromError(error) { return { hasError: true }; }',
+    '  componentDidCatch(error, errorInfo) { logError(error); }',
+]
+
 # Typical compiled JS patterns that should NOT trigger false positives.
 SAFE_JS_LINES = [
     "  var _error = require('./error');",
@@ -126,15 +138,41 @@ def test_has_error_false_regression():
     )
 
 
+def test_metro_runtime_not_flagged():
+    """Metro runtime boilerplate must produce zero errors."""
+    bundle = "\n".join(METRO_RUNTIME_LINES)
+    errors = AppBuilderSkill._extract_errors_from_text(bundle)
+    assert errors == [], (
+        f"Metro runtime false positive — got {len(errors)} error(s): "
+        f"{[e['error'] for e in errors]}"
+    )
+
+
+def test_module_id_hint_regression():
+    """Exact regression: Metro runtime template that caused build to fail."""
+    bundle = (
+        "function metroRequire(moduleId) {\n"
+        '  var moduleIdHint = moduleId;\n'
+        '  throw new Error("Cannot find module \'" + moduleIdHint + "\'");\n'
+        "}\n"
+    )
+    errors = AppBuilderSkill._extract_errors_from_text(bundle)
+    assert errors == [], (
+        f"moduleIdHint regression — got: {[e['error'] for e in errors]}"
+    )
+
+
 # ── Runner ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     tests = [
         test_error_boundary_not_flagged,
         test_safe_js_not_flagged,
+        test_metro_runtime_not_flagged,
         test_real_metro_errors_detected,
         test_mixed_bundle_only_catches_real_errors,
         test_has_error_false_regression,
+        test_module_id_hint_regression,
     ]
     passed = 0
     failed = 0
