@@ -238,10 +238,17 @@ async def init_db():
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS job_type VARCHAR(20) DEFAULT 'auto_builder'",
         # Backfill: existing rows without job_type get auto_builder
         "UPDATE build_jobs SET job_type = 'auto_builder' WHERE job_type IS NULL",
-        # Day-as-Chat: FK from conversations to day_chats (nullable during migration)
-        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS day_chat_id VARCHAR(36) REFERENCES day_chats(id)",
-        # Day-as-Chat: denormalized FK from messages to day_chats for fast loading
-        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS day_chat_id VARCHAR(36) REFERENCES day_chats(id)",
+        # Day-as-Chat: FK from conversations/messages to day_chats.
+        # On agent (day_chats exists): add with FK constraint.
+        # On platform (day_chats missing): add without FK so ORM queries don't crash.
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='day_chats') THEN "
+        "EXECUTE 'ALTER TABLE conversations ADD COLUMN IF NOT EXISTS day_chat_id VARCHAR(36) REFERENCES day_chats(id)'; "
+        "EXECUTE 'ALTER TABLE messages ADD COLUMN IF NOT EXISTS day_chat_id VARCHAR(36) REFERENCES day_chats(id)'; "
+        "ELSE "
+        "EXECUTE 'ALTER TABLE conversations ADD COLUMN IF NOT EXISTS day_chat_id VARCHAR(36)'; "
+        "EXECUTE 'ALTER TABLE messages ADD COLUMN IF NOT EXISTS day_chat_id VARCHAR(36)'; "
+        "END IF; END $$",
         # Day-as-Chat: composite index for hot-path query
         "CREATE INDEX IF NOT EXISTS ix_messages_day_chat_created ON messages(day_chat_id, created_at)",
     ]
