@@ -330,7 +330,7 @@ async def deploy_update(
                 f"-v /data/agents/{user_prefix}/skills:/app/skills "
                 f"-v /root/.cache/ms-playwright:/root/.cache/ms-playwright:ro "
                 f"--add-host host.docker.internal:host-gateway "
-                f"--memory=512m --cpus=0.5 "
+                f"--memory=2g --cpus=1 "
                 f"toup-agent:latest 2>&1"
             )
             updated.append(name)
