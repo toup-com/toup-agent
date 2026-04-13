@@ -345,8 +345,9 @@ async def deploy_update(
             h = await _ssh_cmd(f"curl -sf http://localhost:{port_raw.strip()}/agent/health 2>/dev/null | head -c 100")
             health_results[name] = h or "starting..."
 
-    # Cleanup
+    # Cleanup — prune dangling images AND build cache to prevent disk bloat
     await _ssh_cmd("docker image prune -f 2>/dev/null")
+    await _ssh_cmd("docker builder prune -a -f 2>/dev/null")
 
     return {
         "success": True,
