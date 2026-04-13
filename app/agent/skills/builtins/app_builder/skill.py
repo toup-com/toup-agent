@@ -2148,12 +2148,14 @@ class AppBuilderSkill(Skill):
                                 try:
                                     web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
                                     await self._wait_for_server(web_port, timeout=20)
-                                    bundle_ok = True
-                                    await blog.success(f"Web server running on port {web_port} after static export verification")
-                                except Exception:
-                                    # Even if server fails, mark as running — the code is valid
-                                    bundle_ok = True
-                                    await blog.info("Web server may be slow to start, but code compiles — marking as running")
+                                    # Verify the restarted server actually serves a valid bundle
+                                    bundle_ok, _ = await self._validate_bundle(web_port, blog)
+                                    if bundle_ok:
+                                        await blog.success(f"Web server running on port {web_port} after static export verification")
+                                    else:
+                                        await blog.warn(f"Web server on port {web_port} started but bundle still has errors — preview may not render")
+                                except Exception as _restart_err:
+                                    await blog.warn(f"Web server restart failed after static export: {_restart_err} — preview will not be available")
                             else:
                                 await blog.error(f"Static export also failed: {output[-300:]}")
                         except asyncio.TimeoutError:
@@ -2214,12 +2216,13 @@ class AppBuilderSkill(Skill):
             )
 
             await blog.persist()
+            _actual_model = getattr(self, '_last_llm_provider', None) or "claude-opus-4-6"
             async with async_session_maker() as db:
                 job = await db.get(BuildJob, job_id)
                 if job:
                     job.status = "completed"
                     job.completed_at = datetime.utcnow()
-                    job.model = "claude-opus-4-6"
+                    job.model = _actual_model
                     await db.commit()
 
             # Broadcast job completion so Jobs panel updates without polling
@@ -2496,12 +2499,13 @@ class AppBuilderSkill(Skill):
             await self._update_step(job_id, user_id, "ready", "done")
 
             await blog.persist()
+            _actual_model = getattr(self, '_last_llm_provider', None) or "claude-opus-4-6"
             async with async_session_maker() as db:
                 job = await db.get(BuildJob, job_id)
                 if job:
                     job.status = "completed"
                     job.completed_at = datetime.utcnow()
-                    job.model = "claude-opus-4-6"
+                    job.model = _actual_model
                     await db.commit()
 
             if self._ws_broadcast:
@@ -3505,12 +3509,14 @@ const _webDb = {
         # ── Try Anthropic first (if key exists) ──────────────────────
         if anthropic_key:
             try:
-                return await self._call_anthropic(
+                result = await self._call_anthropic(
                     system_prompt, user_message,
                     model=model or "claude-sonnet-4-6",
                     anthropic_key=anthropic_key,
                     max_tokens=max_tokens, blog=blog, purpose=purpose,
                 )
+                self._last_llm_provider = f"anthropic/{model or 'claude-sonnet-4-6'}"
+                return result
             except TokenLimitError:
                 # Rate-limit / overload — only pause if no OpenAI fallback
                 if not openai_key:
@@ -3532,11 +3538,13 @@ const _webDb = {
         # ── Try OpenAI (primary or fallback) ─────────────────────────
         if openai_key:
             try:
-                return await self._call_openai(
+                result = await self._call_openai(
                     system_prompt, user_message,
                     openai_key=openai_key,
                     max_tokens=max_tokens, blog=blog, purpose=purpose,
                 )
+                self._last_llm_provider = f"openai/{self._resolve_openai_model()}"
+                return result
             except Exception as _oai_err:
                 errors.append(f"OpenAI: {type(_oai_err).__name__}: {_oai_err}")
 
@@ -3673,6 +3681,7 @@ const _webDb = {
             )
             input_tok = 0
             output_tok = 0
+            finish_reason = None
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                     text += chunk.choices[0].delta.content
@@ -3680,6 +3689,8 @@ const _webDb = {
                     if blog and (_now - _last_progress) >= 10:
                         await blog.info(f"LLM generating... {int(_now - t0)}s elapsed, ~{len(text.split())} words")
                         _last_progress = _now
+                if chunk.choices and chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
                 if chunk.usage:
                     input_tok = chunk.usage.prompt_tokens or 0
                     output_tok = chunk.usage.completion_tokens or 0
@@ -3713,11 +3724,15 @@ const _webDb = {
             raise
 
         elapsed = _time.time() - t0
-        print(f"[LLM] OpenAI ({model}) done in {elapsed:.1f}s — {len(text)} chars", flush=True)
+        print(f"[LLM] OpenAI ({model}) done in {elapsed:.1f}s — {len(text)} chars, finish_reason={finish_reason}", flush=True)
 
         if blog:
             await blog.llm_call(model=model, purpose=purpose or user_message[:50],
                                 input_tokens=input_tok, output_tokens=output_tok, duration_s=elapsed)
+        if finish_reason == "length" and blog:
+            await blog.warn(f"OpenAI output truncated (hit {max_tokens} token limit) — code may be incomplete")
+        if finish_reason == "length":
+            logger.warning(f"[LLM] OpenAI output TRUNCATED (finish_reason=length, {len(text)} chars, purpose={purpose})")
         return text
 
     async def _update_step(
