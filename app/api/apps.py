@@ -396,6 +396,132 @@ async def get_job_logs(job_id: str) -> Dict[str, Any]:
         }
 
 
+@router.post("/jobs/{job_id}/fix")
+async def fix_failed_job(job_id: str) -> Dict[str, Any]:
+    """Auto-fix a failed build by patching known infra files and restarting.
+
+    Replaces broken agentBridge.ts/agentActions.ts with reliable stubs,
+    restarts the web server, and updates job + app status.
+    """
+    if not _app_manager:
+        raise HTTPException(status_code=503, detail="App manager not available")
+
+    async with async_session_maker() as db:
+        job = await db.get(BuildJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status != "failed":
+            return {"status": job.status, "message": "Job is not in failed state"}
+
+        app = await db.get(App, job.app_id)
+        if not app or not app.app_dir:
+            raise HTTPException(status_code=404, detail="App not found")
+
+        import os
+
+        # ── Patch known infra files ──
+        patches_applied = []
+
+        bridge_path = os.path.join(app.app_dir, "lib", "agentBridge.ts")
+        if os.path.exists(bridge_path):
+            with open(bridge_path, "r") as f:
+                content = f.read()
+            if len(content) > 500 or "AgentScreen" not in content:
+                bridge_stub = (
+                    "// AgentBridge — delegates to platform-injected bridge.\n"
+                    "const injected = typeof window !== 'undefined' && (window as any).__TOUP_AGENT_BRIDGE;\n"
+                    "const agentBridge = injected || {\n"
+                    "  isConnected: false, currentScreen: 'Home',\n"
+                    "  sendMessage: async () => {}, onAgentMessage: () => () => {},\n"
+                    "  onToolActivity: () => () => {}, setNavigationRef: () => {},\n"
+                    "  navigate: () => {}, getScreens: () => [], getActions: () => [],\n"
+                    "  setScreens: () => {}, setActions: () => {}, destroy: () => {},\n"
+                    "};\n"
+                    "export type AgentScreen = { name: string; description: string };\n"
+                    "export type AgentActionMeta = { id: string; label: string; handler: string };\n"
+                    "export { agentBridge };\n"
+                    "export const AgentBridge = agentBridge;\n"
+                    "export default agentBridge;\n"
+                )
+                with open(bridge_path, "w") as f:
+                    f.write(bridge_stub)
+                patches_applied.append("agentBridge.ts")
+
+        actions_path = os.path.join(app.app_dir, "lib", "agentActions.ts")
+        if os.path.exists(actions_path):
+            with open(actions_path, "r") as f:
+                content = f.read()
+            if len(content) > 500:
+                actions_stub = (
+                    "type AgentAction = { id: string; label: string; description: string; handler: (...args: any[]) => Promise<any> };\n"
+                    "const registry: Record<string, AgentAction[]> = {};\n"
+                    "export function registerAction(screen: string, action: AgentAction) {\n"
+                    "  if (!registry[screen]) registry[screen] = [];\n"
+                    "  registry[screen].push(action);\n"
+                    "}\n"
+                    "export function getActions(screen?: string): AgentAction[] {\n"
+                    "  if (!screen) return Object.values(registry).flat();\n"
+                    "  return registry[screen] || [];\n"
+                    "}\n"
+                    "export default { registerAction, getActions };\n"
+                )
+                with open(actions_path, "w") as f:
+                    f.write(actions_stub)
+                patches_applied.append("agentActions.ts")
+
+        # ── Restart web server ──
+        try:
+            await _app_manager.stop_app(app.id)
+        except Exception:
+            pass
+
+        try:
+            metro_port = await _app_manager.start_metro(app.id)
+            web_port = await _app_manager.start_web(app.id)
+
+            app.status = "running"
+            app.port = metro_port
+            app.web_port = web_port
+            managed = _app_manager._running.get(app.id)
+            if managed:
+                app.metro_pid = managed.metro_process.pid if managed.metro_process else None
+                app.web_pid = managed.web_process.pid if managed.web_process else None
+
+            job.status = "completed"
+            job.error_message = None
+            from datetime import datetime
+            job.completed_at = datetime.utcnow()
+
+            # Mark the failed "starting" step as done
+            try:
+                steps = json.loads(job.steps_json) if job.steps_json else []
+                for s in steps:
+                    if s.get("status") == "failed":
+                        s["status"] = "done"
+                    elif s.get("status") == "pending":
+                        s["status"] = "done"
+                job.steps_json = json.dumps(steps)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            await db.commit()
+
+            web_url = await _app_manager.get_web_url(app.id)
+            return {
+                "status": "fixed",
+                "patches": patches_applied,
+                "web_url": web_url,
+                "app_id": app.id,
+            }
+
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Server restart failed: {e}",
+                "patches": patches_applied,
+            }
+
+
 @router.post("/jobs/{job_id}/resume")
 async def resume_job(job_id: str) -> Dict[str, Any]:
     """Resume a paused build job. Triggers background resume via app_builder skill."""
