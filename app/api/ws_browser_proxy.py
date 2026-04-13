@@ -41,16 +41,19 @@ async def _authenticate_ws(token: str) -> Optional[str]:
 
 async def _get_agent_ws_info(user_id: str) -> Optional[tuple[str, str]]:
     """Return (agent_ws_url, agent_api_key) for the user's deployed agent."""
-    async with async_session_maker() as db:
-        result = await db.execute(
-            select(AgentConfig.agent_url, AgentConfig.agent_api_key)
-            .where(
-                AgentConfig.user_id == user_id,
-                AgentConfig.deploy_status == "active",
+    try:
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+                .where(
+                    AgentConfig.user_id == user_id,
+                    AgentConfig.deploy_status == "active",
+                )
             )
-        )
-        row = result.first()
-        if row and row.agent_url and row.agent_api_key:
+            row = result.first()
+    except Exception:
+        return None  # agent_configs table may not exist on agent DBs
+    if row and row.agent_url and row.agent_api_key:
             ws_url = row.agent_url.replace("https://", "wss://").replace("http://", "ws://")
             if not ws_url.endswith("/"):
                 ws_url += "/api/ws/browser"

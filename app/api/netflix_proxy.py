@@ -26,11 +26,14 @@ router = APIRouter(prefix="/netflix-stream", tags=["Netflix Stream Proxy"])
 
 async def _get_agent_info(user_id: str, db: AsyncSession):
     """Get agent URL and API key for a user."""
-    result = await db.execute(
-        select(AgentConfig.agent_url, AgentConfig.agent_api_key)
-        .where(AgentConfig.user_id == user_id)
-    )
-    row = result.first()
+    try:
+        result = await db.execute(
+            select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+            .where(AgentConfig.user_id == user_id)
+        )
+        row = result.first()
+    except Exception:
+        raise HTTPException(status_code=404, detail="No active agent")
     if not row or not row.agent_url or not row.agent_api_key:
         raise HTTPException(status_code=404, detail="No active agent")
     return row.agent_url, row.agent_api_key

@@ -401,14 +401,17 @@ async def _get_vps_info(user_id: str) -> Optional[tuple]:
     """Return (agent_url, agent_api_key) for the user's VPS agent."""
     from app.db.database import async_session_maker
     from app.db.models import AgentConfig
-    async with async_session_maker() as db:
-        result = await db.execute(
-            select(AgentConfig.agent_url, AgentConfig.agent_api_key)
-            .where(AgentConfig.user_id == user_id, AgentConfig.deploy_status == "active")
-        )
-        row = result.first()
-        if row and row.agent_url and row.agent_api_key:
-            return (row.agent_url, row.agent_api_key)
+    try:
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+                .where(AgentConfig.user_id == user_id, AgentConfig.deploy_status == "active")
+            )
+            row = result.first()
+            if row and row.agent_url and row.agent_api_key:
+                return (row.agent_url, row.agent_api_key)
+    except Exception:
+        pass  # agent_configs table may not exist on agent DBs
     return None
 
 
