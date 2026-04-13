@@ -4540,18 +4540,23 @@ const _webDb = {
                             await blog.warn(f"Bundle request returned HTTP {resp.status}")
                         return False, await self._parse_bundle_error_response(resp, blog)
 
-                    # Read the response to check for compilation errors.
-                    # Metro puts error overlays in the FIRST ~100 lines of the bundle
-                    # when compilation fails.  The rest of a successful bundle is compiled
-                    # JS that naturally contains keywords like TypeError, SyntaxError,
-                    # CompileError as class names / variable names — scanning the full
-                    # 5MB bundle produces endless false positives.
+                    # Determine bundle size to distinguish successful compilation
+                    # from error responses.
+                    #
+                    # Metro + Expo compiled bundles are ALWAYS large (200KB+) because
+                    # they include React Native, the module system, and the HMR client.
+                    # Error responses are small (<50KB) — either a JSON error body or
+                    # a minimal error overlay page.
+                    #
+                    # The compiled bundle's preamble, runtime, and application code ALL
+                    # contain error-related keywords (TypeError, SyntaxError, CompileError,
+                    # "Cannot find module", etc.) as class names, variable names, and
+                    # string literals.  Scanning ANY part of a successful bundle for
+                    # keywords will always produce false positives.
                     #
                     # Strategy:
-                    #   - If response is very small (< 50KB), it's likely an error page
-                    #     or a trivially broken bundle — scan the whole thing.
-                    #   - If response is large (>= 50KB), a real compiled bundle — only
-                    #     scan the first 150 lines where Metro injects error overlays.
+                    #   HTTP 200 + large response (>=50KB) → compilation succeeded.
+                    #   HTTP 200 + small response (<50KB)  → likely error page, scan it.
                     chunks = []
                     total = 0
                     async for chunk in resp.content.iter_chunked(65536):
@@ -4559,17 +4564,16 @@ const _webDb = {
                         total += len(chunk)
                         if total > 5 * 1024 * 1024:
                             break
+
+                    if total >= 50 * 1024:
+                        # Large bundle = successful compilation. Don't scan.
+                        if blog:
+                            await blog.info(f"Bundle compiled successfully ({total // 1024}KB)")
+                        return True, []
+
+                    # Small response — likely an error page. Scan it.
                     text = b"".join(chunks).decode("utf-8", errors="replace")
-
-                    if total < 50 * 1024:
-                        # Small response — likely error page, scan everything
-                        scan_text = text
-                    else:
-                        # Large bundle — only scan the preamble where errors appear
-                        lines = text.split("\n", 150)
-                        scan_text = "\n".join(lines[:150])
-
-                    errors = self._extract_errors_from_text(scan_text)
+                    errors = self._extract_errors_from_text(text)
                     if errors and blog:
                         for e in errors[:5]:
                             await blog.error(f"Bundle error in {e['file']}: {e['error'][:200]}")

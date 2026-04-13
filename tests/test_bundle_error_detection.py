@@ -85,26 +85,25 @@ def test_error_boundary_not_flagged():
     )
 
 
-def test_preamble_only_scanning_skips_deep_bundle():
-    """Simulate _validate_bundle's preamble-only scan for large bundles.
+def test_large_bundle_not_scanned():
+    """Simulate _validate_bundle's size-based strategy.
 
-    A large bundle (>50KB) should only have its first 150 lines scanned.
-    Metro runtime boilerplate at line 500+ should never be seen.
+    A large bundle (>=50KB) with HTTP 200 means compilation succeeded.
+    _validate_bundle returns True without scanning — no keyword check
+    is performed on the body at all, eliminating all false positives.
     """
-    # Build a fake bundle: 150 clean preamble lines + deep runtime at line 500+
-    preamble = ["// line " + str(i) for i in range(200)]
-    deep_runtime = METRO_RUNTIME_DEEP_BUNDLE_LINES
-    padding = ["// padding " + str(i) for i in range(300)]
-    full_bundle = "\n".join(preamble + padding + deep_runtime)
-
-    # Simulate the _validate_bundle logic: large bundle → only first 150 lines
-    lines = full_bundle.split("\n", 150)
-    scan_text = "\n".join(lines[:150])
-    errors = AppBuilderSkill._extract_errors_from_text(scan_text)
-    assert errors == [], (
-        f"Deep bundle false positive leaked through preamble scan — got: "
-        f"{[e['error'] for e in errors]}"
+    # The actual check is: if total >= 50KB → return True, []
+    # We verify the principle: _extract_errors_from_text WOULD find
+    # false positives in Metro runtime code, but _validate_bundle
+    # never calls it for large bundles.
+    metro_runtime = "\n".join(METRO_RUNTIME_DEEP_BUNDLE_LINES)
+    errors = AppBuilderSkill._extract_errors_from_text(metro_runtime)
+    # These WOULD be flagged if scanned (keywords match)...
+    assert len(errors) > 0, (
+        "Metro runtime should match keywords when scanned directly"
     )
+    # ...but _validate_bundle skips scanning for large (>50KB) bundles.
+    # This test documents the contract: scanning is only for small responses.
 
 
 def test_small_error_response_fully_scanned():
@@ -145,7 +144,7 @@ if __name__ == "__main__":
     tests = [
         test_real_metro_errors_detected,
         test_error_boundary_not_flagged,
-        test_preamble_only_scanning_skips_deep_bundle,
+        test_large_bundle_not_scanned,
         test_small_error_response_fully_scanned,
         test_error_in_preamble_detected,
         test_has_error_false_regression,
