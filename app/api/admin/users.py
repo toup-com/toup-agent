@@ -578,15 +578,19 @@ async def delete_user(
 ):
     """Delete a user and all their data. Only admins.
 
-    The platform DB only has platform-only tables (managed_containers,
-    agent_configs, invites, etc.) and the shared users table. All
-    conversation/memory/entity data lives in per-user agent databases
-    on the VPS — those are cleaned up by destroying the container and
-    dropping the per-user PostgreSQL database.
+    The platform DB is a legacy monolith — it has both platform-only tables
+    AND agent-only tables (conversations, memories, etc.) with FK constraints
+    to users. We must clean up BOTH to delete the user row. Newer agent-only
+    tables (day_chats, context_budget_logs) may not exist, so each cleanup
+    step uses a savepoint to avoid poisoning the transaction.
     """
     from app.db.models import (
-        VPSInstance, ManagedContainer, AgentConfig,
-        LLMBundleAllocation, LLMUsageRecord, StreamingCredential,
+        Identity, Conversation, Message, Memory, Entity, EntityLink,
+        EntityRelationship, BrainStats, MemoryEvent, RetrievalEvent,
+        Document, DocumentChunk, Media, CronJob, TelegramUserMapping,
+        AgentError, ApiKey, VPSInstance, ManagedContainer, AgentConfig,
+        LLMBundleAllocation, LLMUsageRecord,
+        App, BuildJob, SoulConfig, StreamingCredential,
     )
 
     # Safety: cannot delete yourself
@@ -606,9 +610,16 @@ async def delete_user(
         if admin_count.scalar() <= 1:
             raise HTTPException(400, "Cannot delete the last admin")
 
+    # ── Helper: run a delete inside a savepoint so missing tables/columns
+    #    don't abort the outer transaction ──
+    async def _safe_exec(stmt):
+        try:
+            async with db.begin_nested():
+                await db.execute(stmt)
+        except Exception:
+            pass  # table/column missing or other DB error — continue
+
     # ── 1. Destroy Docker container + drop per-user agent DB on VPS ──
-    # Agent-only data (conversations, memories, entities, apps, etc.)
-    # lives in the per-user database — dropping it cleans everything.
     prefix = user_id[:8]
     try:
         from app.services.docker_host_service import _run_ssh
@@ -623,13 +634,98 @@ async def delete_user(
                 f"\"DROP DATABASE IF EXISTS {mc.db_name}\" 2>/dev/null || true"
             )
     except Exception:
-        pass  # container may not exist or VPS unreachable — proceed anyway
+        pass
 
-    # ── 2. Delete platform-only tables (order: children before parents) ──
-    # LLM proxy events (may not exist yet)
+    # ── 2. Clean up agent-only tables (legacy monolith data) ──
+    # Each wrapped in savepoint — tables/columns may not exist.
+    # Order: children before parents (FK deps).
+
+    # Nullify Memory → Message FK before deleting messages
+    await _safe_exec(text(
+        "UPDATE memories SET source_message_id = NULL WHERE user_id = :uid"
+    ).bindparams(uid=user_id))
+
+    # Messages (FK to conversations)
+    await _safe_exec(text(
+        "DELETE FROM messages WHERE conversation_id IN "
+        "(SELECT id FROM conversations WHERE user_id = :uid)"
+    ).bindparams(uid=user_id))
+
+    # Document chunks (FK to documents and memories)
+    await _safe_exec(text(
+        "DELETE FROM document_chunks WHERE document_id IN "
+        "(SELECT id FROM documents WHERE user_id = :uid)"
+    ).bindparams(uid=user_id))
+    await _safe_exec(text(
+        "DELETE FROM document_chunks WHERE memory_id IN "
+        "(SELECT id FROM memories WHERE user_id = :uid)"
+    ).bindparams(uid=user_id))
+
+    # Entity links and relationships
+    await _safe_exec(text(
+        "DELETE FROM entity_links WHERE entity_id IN "
+        "(SELECT id FROM entities WHERE user_id = :uid)"
+    ).bindparams(uid=user_id))
+    await _safe_exec(text(
+        "DELETE FROM entity_links WHERE memory_id IN "
+        "(SELECT id FROM memories WHERE user_id = :uid)"
+    ).bindparams(uid=user_id))
+    await _safe_exec(text(
+        "DELETE FROM entity_relationships WHERE user_id = :uid"
+    ).bindparams(uid=user_id))
+
+    # Memory children
+    await _safe_exec(text(
+        "DELETE FROM memory_events WHERE memory_id IN "
+        "(SELECT id FROM memories WHERE user_id = :uid)"
+    ).bindparams(uid=user_id))
+    await _safe_exec(text(
+        "DELETE FROM memory_events WHERE user_id = :uid"
+    ).bindparams(uid=user_id))
+    await _safe_exec(text(
+        "DELETE FROM media WHERE memory_id IN "
+        "(SELECT id FROM memories WHERE user_id = :uid)"
+    ).bindparams(uid=user_id))
+    await _safe_exec(text(
+        "DELETE FROM media WHERE user_id = :uid"
+    ).bindparams(uid=user_id))
+    await _safe_exec(text(
+        "DELETE FROM memory_relationships WHERE source_id IN "
+        "(SELECT id FROM memories WHERE user_id = :uid) "
+        "OR target_id IN (SELECT id FROM memories WHERE user_id = :uid)"
+    ).bindparams(uid=user_id))
+
+    # Retrieval events
+    await _safe_exec(text(
+        "DELETE FROM retrieval_events WHERE user_id = :uid"
+    ).bindparams(uid=user_id))
+
+    # Build jobs, reconciliation logs, apps
+    await _safe_exec(text("DELETE FROM build_jobs WHERE user_id = :uid").bindparams(uid=user_id))
+    await _safe_exec(text("DELETE FROM reconciliation_logs WHERE user_id = :uid").bindparams(uid=user_id))
+    await _safe_exec(text("DELETE FROM apps WHERE user_id = :uid").bindparams(uid=user_id))
+
+    # Context budget logs + day chats (may not exist on platform DB)
+    await _safe_exec(text("DELETE FROM context_budget_logs WHERE user_id = :uid").bindparams(uid=user_id))
+
+    # Direct user_id tables
+    for table_name in [
+        "identities", "documents", "memories", "conversations",
+        "entities", "brain_stats", "cron_jobs", "telegram_user_mappings",
+        "api_keys", "agent_errors", "soul_configs",
+        "workflows",
+    ]:
+        await _safe_exec(text(
+            f"DELETE FROM {table_name} WHERE user_id = :uid"
+        ).bindparams(uid=user_id))
+
+    # Day chats (may not exist)
+    await _safe_exec(text("DELETE FROM day_chats WHERE user_id = :uid").bindparams(uid=user_id))
+
+    # ── 3. Delete platform-only tables ──
     try:
         from app.db.models import LLMProxyEvent
-        await db.execute(sa_delete(LLMProxyEvent).where(LLMProxyEvent.user_id == user_id))
+        await _safe_exec(sa_delete(LLMProxyEvent).where(LLMProxyEvent.user_id == user_id))
     except Exception:
         pass
 
@@ -640,14 +736,14 @@ async def delete_user(
     await db.execute(sa_delete(VPSInstance).where(VPSInstance.user_id == user_id))
     await db.execute(sa_delete(AgentConfig).where(AgentConfig.user_id == user_id))
 
-    # ── 3. Update/delete invites ──
+    # ── 4. Update/delete invites ──
     inv_result = await db.execute(select(Invite).where(Invite.used_by == user_id))
     for inv in inv_result.scalars().all():
         inv.used_by = None
         inv.used_at = None
     await db.execute(sa_delete(Invite).where(Invite.created_by == user_id))
 
-    # ── 4. Delete the user ──
+    # ── 5. Delete the user ──
     await db.delete(user)
     await db.commit()
 
