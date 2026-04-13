@@ -1855,9 +1855,10 @@ class AppBuilderSkill(Skill):
                 await blog.error(f"[VALIDATOR] Install failed — classification={classification} job={job_id[:8]}")
                 await blog.info(f"[VALIDATOR] Error detail: {error_text[:300]}")
 
+                _install_repaired = False
+
                 if classification == "bad_dep":
                     # Auto-repair: LLM fixes package.json (up to 2 attempts)
-                    _install_repaired = False
                     _repair_error_context = error_text
                     MAX_INSTALL_REPAIR_ATTEMPTS = 2
 
@@ -1904,24 +1905,64 @@ class AppBuilderSkill(Skill):
                                 f"{_repair_error_context[:200]}"
                             )
                             if new_cls != "bad_dep":
-                                # Error changed type — don't keep trying LLM fixes
                                 await blog.error(f"[REPAIR] Error type changed to {new_cls}, stopping repair")
                                 break
-
-                    if not _install_repaired:
-                        await blog.error(f"[REPAIR] Install repair exhausted after {MAX_INSTALL_REPAIR_ATTEMPTS} attempts job={job_id[:8]}")
-                        await blog.persist()
-                        await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
-                        return
 
                 elif classification in ("disk",):
                     await blog.error(f"[VALIDATOR] Non-recoverable install failure ({classification}) — failing job")
                     await blog.persist()
                     await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
                     return
-                else:
-                    # transient/stale/unknown — retry already happened inside install_deps
-                    await blog.error(f"[VALIDATOR] Install failed after retry ({classification}) — failing job")
+
+                elif classification in ("transient", "stale", "unknown"):
+                    # Orchestrator-level retry with escalating timeouts and cache clear
+                    INSTALL_RETRY_TIMEOUTS = [450, 600]
+                    for retry_idx, retry_timeout in enumerate(INSTALL_RETRY_TIMEOUTS, 1):
+                        await blog.info(
+                            f"[RETRY] Install retry {retry_idx}/{len(INSTALL_RETRY_TIMEOUTS)} "
+                            f"with {retry_timeout}s timeout (was {classification})..."
+                        )
+                        try:
+                            # Clear npm cache before retry to avoid corrupted state
+                            import shutil as _shutil
+                            npm_cache = os.path.join("/tmp", "npm-cache-shared")
+                            _shutil.rmtree(npm_cache, ignore_errors=True)
+                            # Clear node_modules lock artifacts
+                            lock_path = os.path.join(app_dir, "package-lock.json")
+                            if os.path.exists(lock_path):
+                                os.remove(lock_path)
+
+                            # Patch timeout for this attempt
+                            from app.agent import app_manager as _am
+                            orig_timeout = _am.NPM_INSTALL_TIMEOUT
+                            _am.NPM_INSTALL_TIMEOUT = retry_timeout
+                            _am.NPM_CI_TIMEOUT = retry_timeout
+                            try:
+                                install_output = await self._app_manager.install_deps(
+                                    app_id, all_deps, app_dir=app_dir
+                                )
+                            finally:
+                                _am.NPM_INSTALL_TIMEOUT = orig_timeout
+                                _am.NPM_CI_TIMEOUT = 180
+
+                            await blog.success(
+                                f"[RETRY] Dependencies installed on retry {retry_idx} ({retry_timeout}s budget)"
+                            )
+                            await self._update_step(job_id, user_id, "installing", "done")
+                            _install_repaired = True
+                            break
+                        except Exception as retry_err:
+                            retry_text = str(retry_err)
+                            retry_cls = self._app_manager._classify_install_error(retry_text) if self._app_manager else "unknown"
+                            await blog.warn(
+                                f"[RETRY] Attempt {retry_idx} failed ({retry_cls}): {retry_text[:200]}"
+                            )
+                            if retry_cls == "disk":
+                                await blog.error("[RETRY] Disk/memory error — stopping retries")
+                                break
+
+                if not _install_repaired:
+                    await blog.error(f"[VALIDATOR] Install failed after all recovery attempts ({classification}) job={job_id[:8]}")
                     await blog.persist()
                     await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
                     return

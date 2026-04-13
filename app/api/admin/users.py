@@ -4,9 +4,12 @@ Admin — User & Invite Management (closed beta access control)
 Moved from app/api/admin_users.py → app/api/admin/users.py
 """
 
+import logging
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional, List
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -619,7 +622,7 @@ async def delete_user(
         except Exception:
             pass  # table/column missing or other DB error — continue
 
-    # ── 1. Destroy Docker container + drop per-user agent DB on VPS ──
+    # ── 1. Destroy ALL VPS artifacts for this user ──
     prefix = user_id[:8]
     try:
         from app.services.docker_host_service import _run_ssh
@@ -628,13 +631,18 @@ async def delete_user(
         )
         mc = mc_result.scalar_one_or_none()
         if mc:
+            # Stop and remove Docker container
             await _run_ssh(f"docker rm -f {mc.container_name} 2>/dev/null || true")
+            # Drop per-user agent Postgres database
             await _run_ssh(
                 f"PGPASSWORD=postgres psql -U postgres -h localhost -c "
                 f"\"DROP DATABASE IF EXISTS {mc.db_name}\" 2>/dev/null || true"
             )
-    except Exception:
-        pass
+        # Remove data directory (.env with API keys, workspace, skills) —
+        # always attempt with prefix even if no ManagedContainer row existed
+        await _run_ssh(f"rm -rf /data/agents/{prefix}")
+    except Exception as e:
+        logger.warning("[DELETE-USER] VPS cleanup failed for %s: %s", prefix, e)
 
     # ── 2. Clean up agent-only tables (legacy monolith data) ──
     # Each wrapped in savepoint — tables/columns may not exist.

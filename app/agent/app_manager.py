@@ -29,7 +29,7 @@ MAX_LOG_LINES = 500
 NPM_CI_TIMEOUT = 180       # seconds — npm ci is faster, tighter budget
 NPM_INSTALL_TIMEOUT = 300  # seconds — npm install for first-time installs
 NPM_FLAGS = ["--no-audit", "--no-fund", "--loglevel=error"]
-NPM_RETRY_TRANSIENT_PATTERNS = ["ETIMEDOUT", "ECONNRESET", "EAI_AGAIN", "network", "FETCH_ERROR", "503"]
+NPM_RETRY_TRANSIENT_PATTERNS = ["ETIMEDOUT", "ECONNRESET", "EAI_AGAIN", "network", "FETCH_ERROR", "503", "timed out"]
 
 
 @dataclass
@@ -264,12 +264,6 @@ class AppManager:
             raise RuntimeError(f"npm install failed (exit {proc.returncode}): {tail[:1000]}")
 
         logger.info("[INSTALL] npm succeeded in %.1fs for %s", elapsed, app_id[:8])
-
-        # Clean up per-run cache
-        try:
-            shutil.rmtree(npm_cache, ignore_errors=True)
-        except Exception:
-            pass
 
         return stdout_text[:2000]
 
