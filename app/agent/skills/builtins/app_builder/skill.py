@@ -2211,6 +2211,83 @@ class AppBuilderSkill(Skill):
                         except Exception as e:
                             await blog.warn(f"Static export failed: {e}")
 
+                    # ── 7e: Auto-patch known infra files if they're the sole error source ──
+                    if not bundle_ok and self._last_bundle_errors:
+                        _infra_stubs = {
+                            "agentBridge": (
+                                "/lib/agentBridge.ts",
+                                "// AgentBridge — delegates to platform-injected bridge.\n"
+                                "const injected = typeof window !== 'undefined' && (window as any).__TOUP_AGENT_BRIDGE;\n"
+                                "const agentBridge = injected || {\n"
+                                "  isConnected: false, currentScreen: 'Home',\n"
+                                "  sendMessage: async () => {}, onAgentMessage: () => () => {},\n"
+                                "  onToolActivity: () => () => {}, setNavigationRef: () => {},\n"
+                                "  navigate: () => {}, getScreens: () => [], getActions: () => [],\n"
+                                "  setScreens: () => {}, setActions: () => {}, destroy: () => {},\n"
+                                "};\n"
+                                "export type AgentScreen = { name: string; description: string };\n"
+                                "export type AgentActionMeta = { id: string; label: string; handler: string };\n"
+                                "export { agentBridge };\n"
+                                "export const AgentBridge = agentBridge;\n"
+                                "export default agentBridge;\n"
+                            ),
+                            "agentActions": (
+                                "/lib/agentActions.ts",
+                                "// Agent action registry — screens register actions via registerAction().\n"
+                                "type AgentAction = { id: string; label: string; description: string; handler: (...args: any[]) => Promise<any> };\n"
+                                "const registry: Record<string, AgentAction[]> = {};\n"
+                                "export function registerAction(screen: string, action: AgentAction) {\n"
+                                "  if (!registry[screen]) registry[screen] = [];\n"
+                                "  registry[screen].push(action);\n"
+                                "}\n"
+                                "export function getActions(screen?: string): AgentAction[] {\n"
+                                "  if (!screen) return Object.values(registry).flat();\n"
+                                "  return registry[screen] || [];\n"
+                                "}\n"
+                                "export default { registerAction, getActions };\n"
+                            ),
+                            "ErrorBoundary": (
+                                "/components/ErrorBoundary.tsx",
+                                None,  # already handled by infra injection above
+                            ),
+                        }
+                        _patched_infra = False
+                        for _infra_name, (_infra_path, _infra_code) in _infra_stubs.items():
+                            if _infra_code is None:
+                                continue
+                            # Check if any bundle error points to this infra file
+                            _errors_in_file = [
+                                e for e in (bundle_errors if 'bundle_errors' in dir() else [])
+                                if _infra_name.lower() in e.get("file", "").lower()
+                                or _infra_name.lower() in e.get("error", "").lower()
+                            ]
+                            if not _errors_in_file:
+                                # Also check _last_bundle_errors text
+                                _errors_in_file = [
+                                    e for e in self._last_bundle_errors
+                                    if _infra_name.lower() in e.lower()
+                                ]
+                            if _errors_in_file:
+                                _abs = os.path.join(app_dir, _infra_path.lstrip("/"))
+                                with open(_abs, "w") as f:
+                                    f.write(_infra_code)
+                                _patched_infra = True
+                                await blog.warn(
+                                    f"[AUTO-PATCH] Replaced broken {_infra_path} with reliable stub"
+                                )
+                                logger.info(f"[AUTO-PATCH] {_infra_path} patched job={job_id[:8]}")
+
+                        if _patched_infra:
+                            await blog.info("Restarting web server after infra patches...")
+                            try:
+                                web_port = await self._app_manager.start_web(app_id, app_dir=app_dir)
+                                await self._wait_for_server(web_port, timeout=25)
+                                bundle_ok, _ = await self._validate_bundle(web_port, blog)
+                                if bundle_ok:
+                                    await blog.success("Bundle compiles after infra auto-patch")
+                            except Exception as _patch_err:
+                                await blog.warn(f"Server restart after auto-patch failed: {_patch_err}")
+
                     if not bundle_ok:
                         await blog.error("Bundle has compilation errors after all repair attempts")
                 except Exception as e:
