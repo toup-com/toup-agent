@@ -171,8 +171,9 @@ def _build_env(
             lines.append(f"TELEGRAM_BOT_TOKEN={agent_config.telegram_bot_token}")
         if agent_config.discord_bot_token:
             lines.append(f"DISCORD_BOT_TOKEN={agent_config.discord_bot_token}")
-        if agent_config.agent_model:
-            lines.append(f"AGENT_MODEL={agent_config.agent_model}")
+        # Resolve model: ensure it matches available keys
+        from app.api.agent_setup import _resolve_model
+        lines.append(f"AGENT_MODEL={_resolve_model(agent_config)}")
         if agent_config.agent_color:
             lines.append(f"AGENT_COLOR={agent_config.agent_color}")
 
