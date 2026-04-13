@@ -3841,11 +3841,18 @@ const _webDb = {
             print(f"[BUILD_STEP] step_dict is None for step_type={step_type} in job={job_id[:8]}", flush=True)
 
     async def _fail_job(self, job_id: str, app_id: str, error_msg: str):
-        """Mark a job as failed and clean up stuck step statuses."""
+        """Mark a job as failed, stop processes, and clean up stuck step statuses."""
         from app.db.database import async_session_maker
         from app.db.models import App, BuildJob
 
         logger.error(f"[BUILD] Job {job_id} failed: {error_msg}")
+
+        # Stop Metro/web processes — no reason to keep them running for a failed build
+        if self._app_manager:
+            try:
+                await self._app_manager.stop_app(app_id)
+            except Exception:
+                pass
 
         async with async_session_maker() as db:
             job = await db.get(BuildJob, job_id)
