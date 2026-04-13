@@ -303,10 +303,11 @@ class AgentRunner:
             try:
                 from sqlalchemy import select as _select
                 from app.db import AgentConfig
-                _ac_result = await db.execute(
-                    _select(AgentConfig).where(AgentConfig.user_id == user_id)
-                )
-                _ac = _ac_result.scalars().first()
+                async with db.begin_nested():
+                    _ac_result = await db.execute(
+                        _select(AgentConfig).where(AgentConfig.user_id == user_id)
+                    )
+                    _ac = _ac_result.scalars().first()
                 if _ac and getattr(_ac, 'disabled_tools', None):
                     import json as _json
                     _user_disabled = set(_json.loads(_ac.disabled_tools))
