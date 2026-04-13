@@ -1365,10 +1365,11 @@ class AgentRunner:
         # ── 8. Onboarding (CONDITIONAL) ────────────────────────────
         try:
             from app.db.models import AgentConfig
-            _cfg_result = await db.execute(
-                select(AgentConfig).where(AgentConfig.user_id == user_id)
-            )
-            _agent_cfg = _cfg_result.scalar_one_or_none()
+            async with db.begin_nested():
+                _cfg_result = await db.execute(
+                    select(AgentConfig).where(AgentConfig.user_id == user_id)
+                )
+                _agent_cfg = _cfg_result.scalar_one_or_none()
             if _agent_cfg and not _agent_cfg.onboarding_completed and not has_soul_identity:
                 section_parts["onboarding"] = (
                     "# Onboarding Mode (ACTIVE)\n"
@@ -1565,10 +1566,11 @@ class AgentRunner:
             try:
                 from app.db import AgentConfig
                 from sqlalchemy import select as _sel
-                result = await db.execute(
-                    _sel(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)
-                )
-                user_api_key = result.scalar_one_or_none()
+                async with db.begin_nested():
+                    result = await db.execute(
+                        _sel(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)
+                    )
+                    user_api_key = result.scalar_one_or_none()
             except Exception:
                 pass
 
