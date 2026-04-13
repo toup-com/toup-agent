@@ -114,26 +114,31 @@ You MUST include /components/ErrorBoundary.tsx in EVERY plan.
 This is a class-based React component that wraps the entire app and catches runtime errors,
 showing a helpful error message + reload button instead of a blank white screen.
 
-CRITICAL — Agent Integration System:
-Every app is an "agentic app" — the user's AI agent must be able to work inside it.
-The platform proxy automatically injects the agent's Orb UI (floating chat widget with
-the user's real agent appearance, eyes, breathing animation, and live WebSocket connection).
-Do NOT generate any agent UI component — no AgentPlaceholder.tsx, no floating chat bubble,
-no "Ask Agent" button, no "Agent Test Panel", no in-app agent chat. The proxy handles
-the agent UI for ALL apps automatically. Apps must NEVER duplicate the agent surface.
+CRITICAL — Agent Integration: REGISTER vs RENDER distinction.
+Every app is an "agentic app." The user's AI agent works inside it. There are two sides:
+
+  REGISTRATION (REQUIRED — your app is broken without these):
+  - /lib/agentBridge.ts — Bridge that exposes screens, actions, and navigation to the agent.
+    Wire AgentBridge.setNavigationRef(ref) and AgentBridge.currentScreen = screenName in App.tsx.
+  - /lib/agentActions.ts — Screen-specific action registry. Every screen calls
+    registerAction() in a useEffect to tell the agent what it can do on that screen.
+  - /lib/agentSkill.json — Domain action manifest (SQL queries, navigation, parameters).
+  These files are REQUIRED. Without them the agent cannot interact with your app.
+
+  RENDERING (FORBIDDEN — the platform handles all agent UI):
+  - Do NOT render <AgentPlaceholder />, "Agent ready" cards, chat panels, floating orbs,
+    "Ask Agent" buttons, "Agent Test Panel", or ANY visible agent UI component anywhere
+    in your JSX. The platform renders the agent's Orb and chat panel OUTSIDE your app
+    in a right-side split-view panel. Your app must not duplicate it.
+  - Do NOT include /components/AgentPlaceholder.tsx in your file plan.
+  - Do NOT add any JSX block with "Agent ready", "agent support", "floating agent orb",
+    or similar text. If you include such a block, it will be stripped automatically.
 
 You MUST include these files in EVERY plan:
   - /components/ErrorBoundary.tsx — Catches runtime errors, shows error screen instead of white page
-  - /lib/agentBridge.ts — Bridge module that:
-    - Exposes the current screen/route name to the agent
-    - Provides a navigate(screenName, params?) function for agent-driven navigation
-    - Lists available screens and their purposes
-    - Exposes app-specific actions the agent can trigger (e.g. createTodo, deleteItem)
-    - Uses postMessage/event-based communication pattern for agent ↔ app messaging
-  - /lib/agentActions.ts — Screen-specific action registry:
-    - Maps each screen to actions the agent can perform on it
-    - E.g. HomeScreen → [addItem, searchItems, filterBy], SettingsScreen → [toggleTheme, exportData]
-Do NOT include /components/AgentPlaceholder.tsx — the proxy injects the agent UI.
+  - /lib/agentBridge.ts — Bridge module (REGISTRATION, not UI)
+  - /lib/agentActions.ts — Action registry (REGISTRATION, not UI)
+Do NOT include /components/AgentPlaceholder.tsx — the platform renders all agent UI.
 """
 
 CODE_GEN_PROMPT = """Generate the complete TypeScript code for {file_path} in a React Native/Expo app.
@@ -452,6 +457,8 @@ Agent Integration System (CRITICAL — every app is "agentic"):
 
 - For ANY screen file:
   Register that screen's agent actions in a useEffect via agentActions.registerAction().
+  Do NOT render any "Agent ready" card, agent placeholder, or agent UI in the screen's JSX.
+  Registration is code (useEffect + imports). Rendering is JSX. Only registration belongs here.
 
 - If this is /lib/agentSkill.json:
   Generate a JSON manifest of domain-specific agent actions for this app.
@@ -3012,6 +3019,51 @@ const styles = StyleSheet.create({
 '''
             if blog:
                 await blog.info("Added ErrorBoundary component (prevents white screens)")
+
+        # Force AgentPlaceholder to null stub — LLMs sometimes generate visible agent UI
+        # despite prompt instructions. The platform shell renders all agent UI externally.
+        _agent_placeholder_stub = (
+            "import React from 'react';\n"
+            "// Platform renders agent UI externally — this component intentionally renders nothing.\n"
+            "export default function AgentPlaceholder() { return null; }\n"
+        )
+        _placeholder_path = "/components/AgentPlaceholder.tsx"
+        _existing = generated_files.get(_placeholder_path, infra_files.get(_placeholder_path, ""))
+        if _existing and _existing.strip() != _agent_placeholder_stub.strip():
+            infra_files[_placeholder_path] = _agent_placeholder_stub
+            if blog:
+                await blog.warn(f"[STRIP] Overwrote AgentPlaceholder.tsx with null stub (LLM generated visible agent UI) job={job_id[:8]}")
+                logger.info(f"[STRIP] AgentPlaceholder overwritten job={job_id[:8]} app={app_id[:8]}")
+        elif _placeholder_path not in generated_files and _placeholder_path not in infra_files:
+            # Not generated at all — add the stub so imports don't break
+            infra_files[_placeholder_path] = _agent_placeholder_stub
+
+        # Strip "Agent ready" cards from screen files — LLMs insert visible agent UI
+        # blocks despite instructions. Preserve registerAction() and AgentBridge plumbing.
+        import re as _strip_re
+        for fp in list(generated_files.keys()) + list(infra_files.keys()):
+            if '/screens/' not in fp and fp != '/App.tsx':
+                continue
+            code = infra_files.get(fp, generated_files.get(fp, ""))
+            if not code:
+                continue
+            # Match JSX blocks containing "Agent ready" or "floating agent orb" text
+            # These are visual-only — registerAction lives in useEffect, not in JSX
+            _original = code
+            # Remove View/div blocks containing agent card text
+            code = _strip_re.sub(
+                r'(?s)\{?/\*\s*[Aa]gent\s*(ready|card|placeholder|section).*?\*/\}?\s*'
+                r'<(?:View|div)[^>]*>.*?(?:Agent ready|floating agent orb|agent support).*?</(?:View|div)>\s*',
+                '', code
+            )
+            if code != _original:
+                if fp in infra_files:
+                    infra_files[fp] = code
+                else:
+                    generated_files[fp] = code
+                if blog:
+                    await blog.warn(f"[STRIP] Removed 'Agent ready' card from {fp} job={job_id[:8]}")
+                    logger.info(f"[STRIP] Agent card removed from {fp} job={job_id[:8]} app={app_id[:8]}")
 
         # Inject ErrorBoundary wrapper into App.tsx if not already present
         for fp in ["/App.tsx"]:
