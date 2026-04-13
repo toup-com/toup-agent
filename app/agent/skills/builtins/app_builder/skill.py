@@ -3038,6 +3038,48 @@ const styles = StyleSheet.create({
             # Not generated at all — add the stub so imports don't break
             infra_files[_placeholder_path] = _agent_placeholder_stub
 
+        # Force agentBridge.ts to the known-working delegation stub.
+        # LLMs generate massive, complex bridge implementations (400+ lines) with
+        # TypeScript type errors that waste 8 repair rounds. The platform injects
+        # window.__TOUP_AGENT_BRIDGE at runtime — the generated file just delegates.
+        _bridge_stub = (
+            "// AgentBridge — delegates to platform-injected bridge, falls back to no-op.\n"
+            "// The platform proxy sets window.__TOUP_AGENT_BRIDGE before this code runs.\n"
+            "const injected = typeof window !== 'undefined' && (window as any).__TOUP_AGENT_BRIDGE;\n"
+            "const agentBridge = injected || {\n"
+            "  isConnected: false,\n"
+            "  currentScreen: 'Home',\n"
+            "  sendMessage: async () => {},\n"
+            "  onAgentMessage: () => () => {},\n"
+            "  onToolActivity: () => () => {},\n"
+            "  setNavigationRef: () => {},\n"
+            "  navigate: () => {},\n"
+            "  getScreens: () => [],\n"
+            "  getActions: () => [],\n"
+            "  setScreens: () => {},\n"
+            "  setActions: () => {},\n"
+            "  destroy: () => {},\n"
+            "};\n"
+            "export type AgentScreen = { name: string; description: string };\n"
+            "export type AgentActionMeta = { id: string; label: string; handler: string };\n"
+            "export { agentBridge };\n"
+            "export const AgentBridge = agentBridge;\n"
+            "export default agentBridge;\n"
+        )
+        _bridge_path = "/lib/agentBridge.ts"
+        _existing_bridge = generated_files.get(_bridge_path, "")
+        if _existing_bridge and len(_existing_bridge) > 500:
+            # LLM generated a complex bridge — replace with the reliable stub
+            infra_files[_bridge_path] = _bridge_stub
+            if blog:
+                await blog.warn(
+                    f"[STRIP] Overwrote agentBridge.ts ({len(_existing_bridge)} chars → stub) — "
+                    f"LLM generated complex bridge that often has type errors job={job_id[:8]}"
+                )
+                logger.info(f"[STRIP] agentBridge overwritten job={job_id[:8]} app={app_id[:8]} orig_len={len(_existing_bridge)}")
+        elif _bridge_path not in generated_files and _bridge_path not in infra_files:
+            infra_files[_bridge_path] = _bridge_stub
+
         # Strip "Agent ready" cards from screen files — LLMs insert visible agent UI
         # blocks despite instructions. Preserve registerAction() and AgentBridge plumbing.
         import re as _strip_re
