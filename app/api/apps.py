@@ -413,6 +413,19 @@ async def fix_failed_job(job_id: str) -> Dict[str, Any]:
         if job.status != "failed":
             return {"status": job.status, "message": "Job is not in failed state"}
 
+        # Only fix builds that failed at "starting" (preview servers) step.
+        # Builds that failed at code gen or earlier need a full rebuild.
+        try:
+            steps = json.loads(job.steps_json) if job.steps_json else []
+            failed_step = next((s for s in steps if s.get("status") == "failed"), None)
+            if failed_step and failed_step.get("type") not in ("starting", "ready"):
+                return {
+                    "status": "cannot_fix",
+                    "message": f"Build failed at '{failed_step.get('label', 'unknown')}' — needs a full rebuild, not a quick fix.",
+                }
+        except (json.JSONDecodeError, TypeError):
+            pass
+
         app = await db.get(App, job.app_id)
         if not app or not app.app_dir:
             raise HTTPException(status_code=404, detail="App not found")

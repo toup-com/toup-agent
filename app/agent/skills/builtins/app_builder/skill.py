@@ -1416,7 +1416,7 @@ class AppBuilderSkill(Skill):
                     generated_files = existing_generated
 
                 await self._app_manager.write_app_files(app_id, generated_files, app_dir=app_dir)
-                await self._write_infra_files(app_id, generated_files, blog, app_dir=app_dir)
+                await self._write_infra_files(app_id, generated_files, blog, app_dir=app_dir, job_id=job_id)
 
                 async with async_session_maker() as db:
                     app = await db.get(App, app_id)
@@ -1763,7 +1763,7 @@ class AppBuilderSkill(Skill):
                 await self._app_manager.write_app_files(app_id, generated_files, app_dir=app_dir)
 
                 # Write essential infrastructure files (metro config, web-safe DB)
-                await self._write_infra_files(app_id, generated_files, blog, app_dir=app_dir)
+                await self._write_infra_files(app_id, generated_files, blog, app_dir=app_dir, job_id=job_id)
 
                 total_bytes = sum(len(c.encode()) for c in generated_files.values())
                 await blog.success(f"Generated {len(generated_files)} files", f"{total_bytes:,} bytes total")
@@ -2888,7 +2888,7 @@ class AppBuilderSkill(Skill):
             raise err
         return generated
 
-    async def _write_infra_files(self, app_id: str, generated_files: dict, blog=None, app_dir: str = ""):
+    async def _write_infra_files(self, app_id: str, generated_files: dict, blog=None, app_dir: str = "", job_id: str = ""):
         """Write essential infrastructure files that every app needs.
 
         1. metro.config.js — stubs out expo-sqlite WASM on web (prevents crash)
