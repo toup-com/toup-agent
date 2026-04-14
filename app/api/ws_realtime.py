@@ -683,6 +683,7 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
                 user_message=task,
                 user_id=user_id,
                 session_id=session_id,
+                channel="voice",
                 model_override=model_override,
             )
             logger.info(

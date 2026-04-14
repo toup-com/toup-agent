@@ -86,15 +86,26 @@ async def create_session(
     Sessions are containers for conversations with the agent.
     You can optionally provide a title and channel.
     """
+    # Resolve day_chat_id so voice/API-created sessions join the Day-as-Chat
+    _day_chat_id = None
+    try:
+        from app.agent.day_chat_resolver import get_or_create_day_chat
+        _user_tz = getattr(current_user, 'timezone', None)
+        _dc = await get_or_create_day_chat(db, current_user.id, tz_name=_user_tz)
+        _day_chat_id = _dc.id
+    except Exception:
+        pass
+
     # Create session (Conversation model)
     session = Conversation(
         user_id=current_user.id,
         title=request.title,
         channel=request.channel,
         metadata_json=json.dumps(request.metadata) if request.metadata else None,
-        is_active=True
+        is_active=True,
+        day_chat_id=_day_chat_id,
     )
-    
+
     db.add(session)
     await db.commit()
     await db.refresh(session)
@@ -478,6 +489,7 @@ async def create_session_message(
     role: str = "user",
     content: str = "",
     model_used: Optional[str] = None,
+    day_chat_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -511,12 +523,27 @@ async def create_session_message(
             detail="Content is required"
         )
 
+    # Resolve day_chat_id: use provided value, or fall back to session's, or resolve fresh
+    _day_chat_id = day_chat_id or session.day_chat_id
+    if not _day_chat_id:
+        try:
+            from app.agent.day_chat_resolver import get_or_create_day_chat
+            _user_tz = getattr(current_user, 'timezone', None)
+            _dc = await get_or_create_day_chat(db, current_user.id, tz_name=_user_tz)
+            _day_chat_id = _dc.id
+            # Also backfill the session's day_chat_id if it was missing
+            if not session.day_chat_id:
+                session.day_chat_id = _day_chat_id
+        except Exception:
+            pass
+
     msg = Message(
         id=str(_uuid.uuid4()),
         conversation_id=session_id,
         role=role,
         content=content.replace("\x00", ""),
         model_used=model_used,
+        day_chat_id=_day_chat_id,
     )
     db.add(msg)
 
