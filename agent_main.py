@@ -795,8 +795,9 @@ async def lifespan(app: FastAPI):
     # ── DayChat backfill (non-blocking background task) ─────
     # Fires AFTER all services are initialized. The agent is fully
     # responsive immediately — backfill runs in the background.
-    # Feature flag USE_DAY_CHAT_CONTEXT stays off until backfill is
-    # verified complete. Backfill failure is never fatal to the agent.
+    # use_day_chat_context defaults to True (config.py). The day-chat
+    # context path activates once backfill completes. Backfill failure
+    # is never fatal — agent falls back to session-based history.
     _backfill_task = None
     try:
         from app.db.database import async_session_maker as _bsm
