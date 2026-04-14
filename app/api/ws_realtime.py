@@ -263,37 +263,21 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
                 day_msgs.sort(key=lambda m: m.get("created_at", ""))
                 total = len(day_msgs)
 
-                # Smart windowing: keep ALL user messages (truncated) + last 20 full exchanges
-                # This ensures facts told early in the day ("my fav color is blue") survive
-                lines = [f"# Today's Conversation History ({total} messages across all channels)"]
-
-                # Phase 1: older messages — user messages only, heavily truncated (facts/requests)
-                older = day_msgs[:-40] if total > 40 else []
-                for m in older:
-                    role = m.get("role", "")
-                    content = (m.get("content", "") or "").strip()
-                    channel = m.get("channel", "")
-                    if role == "user" and content:
-                        ch = f" [{channel}]" if channel else ""
-                        # Keep user messages short — these are facts/requests
-                        truncated = content[:150] + "..." if len(content) > 150 else content
-                        lines.append(f"User{ch}: {truncated}")
-
-                # Phase 2: recent messages — full exchanges for continuity
-                recent = day_msgs[-40:] if total > 40 else day_msgs
-                for m in recent:
+                # Load ALL messages — no truncation, no windowing.
+                # The agent must remember everything from the entire day.
+                lines = [f"# Today's Full Conversation History ({total} messages across all channels)"]
+                for m in day_msgs:
                     role = m.get("role", "")
                     content = (m.get("content", "") or "").strip()
                     channel = m.get("channel", "")
                     if role in ("user", "assistant") and content:
                         speaker = "User" if role == "user" else "You"
                         ch = f" [{channel}]" if channel else ""
-                        truncated = content[:300] + "..." if len(content) > 300 else content
-                        lines.append(f"{speaker}{ch}: {truncated}")
+                        lines.append(f"{speaker}{ch}: {content}")
 
                 if len(lines) > 1:
                     sections.append("\n".join(lines))
-                    logger.info("[REALTIME] Loaded %d day-chat messages from VPS (Day-as-Chat, %d older + %d recent)", total, len(older), len(recent))
+                    logger.info("[REALTIME] Loaded %d day-chat messages from VPS (Day-as-Chat, full)", total)
             else:
                 logger.info("[REALTIME] No day-chat messages for today, falling back to sessions")
                 # Fallback to session-based loading if day-chat endpoint not available
