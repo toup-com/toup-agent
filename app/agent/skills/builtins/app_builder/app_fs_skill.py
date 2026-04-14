@@ -450,13 +450,19 @@ class AppFsSkill(Skill):
         return "\n".join(output) if output else "No logs available."
 
     async def _restart(self, args: Dict, ctx: SkillContext) -> str:
+        """Hot-restart: kill and respawn processes WITHOUT wiping node_modules.
+
+        Uses restart_processes() for fast 2-3s restarts after file edits.
+        Falls back to full install only if node_modules is somehow missing.
+        """
         if not self._app_manager:
             return "ERROR: app_manager not available"
 
         try:
-            await self._app_manager.stop_app(self.app_id)
-            metro_port = await self._app_manager.start_metro(self.app_id)
-            web_port = await self._app_manager.start_web(self.app_id)
+            result = await self._app_manager.restart_processes(self.app_id)
+            metro_port = result["metro_port"]
+            web_port = result["web_port"]
+            duration_ms = result.get("duration_ms", 0)
 
             from app.db.database import async_session_maker
             from app.db.models import App
@@ -470,7 +476,7 @@ class AppFsSkill(Skill):
 
             web_url = await self._app_manager.get_web_url(self.app_id)
             return (
-                f"Restarted '{self.app_name}' successfully. "
+                f"Restarted '{self.app_name}' successfully ({duration_ms}ms). "
                 f"Preview: {web_url or f'localhost:{web_port}'}"
             )
         except Exception as e:

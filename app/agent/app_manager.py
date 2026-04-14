@@ -440,11 +440,101 @@ class AppManager:
         return stopped
 
     async def restart_app(self, app_id: str, app_dir: Optional[str] = None) -> Dict[str, Any]:
-        """Restart both Metro and web servers."""
+        """Full restart: stop (with node_modules cleanup) + start from scratch.
+        Use restart_processes() for hot restarts after file edits."""
         await self.stop_app(app_id)
         metro_port = await self.start_metro(app_id, app_dir=app_dir)
         web_port = await self.start_web(app_id, app_dir=app_dir)
         return {"metro_port": metro_port, "web_port": web_port}
+
+    async def restart_processes(self, app_id: str) -> Dict[str, Any]:
+        """Hot-restart: kill and respawn Metro + Web processes WITHOUT wiping node_modules.
+
+        Used by app__restart tool after file edits. Typical restart time: 2-3 seconds.
+        Falls back to full install if node_modules is missing (e.g. after crash/manual cleanup).
+        """
+        import socket
+
+        t_start = time.time()
+        managed = self._running.get(app_id)
+        app_dir = await self._resolve_app_dir(app_id)
+
+        # ── Gracefully kill existing processes ──
+        if managed:
+            for proc_name, proc in [("metro", managed.metro_process), ("web", managed.web_process)]:
+                if proc and proc.returncode is None:
+                    try:
+                        proc.terminate()
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                        logger.debug(f"[APP] {proc_name} terminated gracefully for {app_id}")
+                    except (asyncio.TimeoutError, ProcessLookupError):
+                        try:
+                            proc.kill()
+                            logger.debug(f"[APP] {proc_name} killed (force) for {app_id}")
+                        except ProcessLookupError:
+                            pass
+        else:
+            managed = ManagedApp(app_id=app_id)
+            self._running[app_id] = managed
+
+        # ── Check node_modules — fall back to full install only if missing ──
+        nm_dir = os.path.join(app_dir, "node_modules")
+        if not os.path.exists(nm_dir):
+            logger.warning(f"[APP] node_modules missing during restart for {app_id}, reinstalling...")
+            await self._npm_install_with_retry(app_id, app_dir)
+
+        # ── Reuse existing ports if possible, otherwise allocate new ones ──
+        metro_port = managed.metro_port or self._allocate_port(METRO_PORT_RANGE, self._used_metro_ports)
+        web_port = managed.web_port or self._allocate_port(WEB_PORT_RANGE, self._used_web_ports)
+
+        # ── Spawn Metro ──
+        metro_proc = await asyncio.create_subprocess_exec(
+            "npx", "expo", "start", "--port", str(metro_port), "--lan",
+            cwd=app_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "EXPO_NO_TELEMETRY": "1", "CI": "1"},
+        )
+        managed.metro_port = metro_port
+        managed.metro_process = metro_proc
+        managed.started_at = time.time()
+        asyncio.create_task(self._read_output(managed, metro_proc, "metro"))
+
+        # ── Spawn Web ──
+        web_proc = await asyncio.create_subprocess_exec(
+            "npx", "expo", "start", "--web", "--port", str(web_port),
+            cwd=app_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
+        )
+        managed.web_port = web_port
+        managed.web_process = web_proc
+        asyncio.create_task(self._read_output(managed, web_proc, "web"))
+
+        # ── Wait for web server to be ready (up to 15s) ──
+        for attempt in range(15):
+            await asyncio.sleep(1)
+            if web_proc.returncode is not None:
+                logger.error(f"[APP] Web server exited early during restart for {app_id} (code {web_proc.returncode})")
+                break
+            try:
+                with socket.create_connection(("127.0.0.1", web_port), timeout=1):
+                    duration_ms = int((time.time() - t_start) * 1000)
+                    logger.info(
+                        "app_restart_complete app=%s duration_ms=%d wiped_node_modules=False",
+                        app_id[:8], duration_ms,
+                    )
+                    return {"metro_port": metro_port, "web_port": web_port, "duration_ms": duration_ms}
+            except (OSError, ConnectionRefusedError):
+                continue
+
+        duration_ms = int((time.time() - t_start) * 1000)
+        logger.warning(
+            "app_restart_slow app=%s duration_ms=%d wiped_node_modules=%s",
+            app_id[:8], duration_ms, not os.path.exists(nm_dir),
+        )
+        return {"metro_port": metro_port, "web_port": web_port, "duration_ms": duration_ms}
 
     async def get_logs(self, app_id: str, lines: int = 50) -> List[str]:
         """Get recent logs from app's Metro + web processes."""
