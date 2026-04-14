@@ -3,9 +3,13 @@ Managed Agent API — provision, start, stop, and monitor Docker containers
 for Quick Setup users on the shared Docker host.
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+
+logger = logging.getLogger(__name__)
 
 from app.db.database import get_db
 from app.db.models import AgentConfig
@@ -40,11 +44,51 @@ async def provision(
         container = await docker_host_service.provision_container(
             db, current_user.id, agent_config
         )
+
+        # ── Sync Soul identity to newly provisioned agent ──
+        # The user may have configured their Soul (name, pronouns, style)
+        # during onboarding BEFORE the agent was provisioned. The Soul save
+        # skips VPS sync when agent_url is not set. Now that the agent is
+        # running, sync the Soul identity so the agent uses the correct name.
+        agent_url = f"http://{settings.docker_host_ip}:{container.host_port}"
+        try:
+            from app.api.soul import _sync_soul_to_vps
+            from app.db.models.soul_config import SoulConfig
+
+            soul_cfg = (await db.execute(
+                select(SoulConfig).where(SoulConfig.user_id == current_user.id)
+            )).scalar_one_or_none()
+
+            if soul_cfg and soul_cfg.compiled_text:
+                import asyncio
+                async def _deferred_soul_sync():
+                    """Wait for agent to finish starting, then sync Soul."""
+                    await asyncio.sleep(10)  # Agent needs time to start
+                    try:
+                        await _sync_soul_to_vps(
+                            agent_url=agent_url,
+                            agent_api_key=agent_config.agent_api_key,
+                            user_id=current_user.id,
+                            name=soul_cfg.name,
+                            compiled_text=soul_cfg.compiled_text,
+                            deactivate_agent_soul_memories=True,
+                            agent_config_updates={
+                                "agent_name": soul_cfg.name,
+                                "agent_color": soul_cfg.color,
+                            },
+                        )
+                        logger.info(f"[PROVISION] Soul synced to agent for user {current_user.id}")
+                    except Exception as e:
+                        logger.error(f"[PROVISION] Soul sync failed for user {current_user.id}: {e}")
+                asyncio.create_task(_deferred_soul_sync())
+        except Exception as e:
+            logger.warning(f"[PROVISION] Could not queue soul sync: {e}")
+
         return {
             "status": container.status,
             "port": container.host_port,
             "container_name": container.container_name,
-            "agent_url": f"http://{settings.docker_host_ip}:{container.host_port}",
+            "agent_url": agent_url,
         }
     except RuntimeError as e:
         raise HTTPException(500, str(e))
