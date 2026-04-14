@@ -327,36 +327,41 @@ async def sync_soul(
         try:
             from sqlalchemy import update as sql_update
             from app.db.models.memory import Memory
-            result = await db.execute(
-                sql_update(Memory).where(
-                    and_(
-                        Memory.user_id == req.user_id,
-                        Memory.brain_type == "agent",
-                        Memory.category == "agent_soul",
-                        Memory.is_active == True,
-                    )
-                ).values(is_active=False, updated_at=datetime.utcnow())
-            )
-            memories_deactivated = result.rowcount
+            async with db.begin_nested():
+                result = await db.execute(
+                    sql_update(Memory).where(
+                        and_(
+                            Memory.user_id == req.user_id,
+                            Memory.brain_type == "agent",
+                            Memory.category == "agent_soul",
+                            Memory.is_active == True,
+                        )
+                    ).values(is_active=False, updated_at=datetime.utcnow())
+                )
+                memories_deactivated = result.rowcount
             if memories_deactivated:
                 logger.info(f"[SOUL] Deactivated {memories_deactivated} agent_soul memories on VPS for user {req.user_id}")
         except Exception as e:
             logger.warning(f"[SOUL] Failed to deactivate agent_soul memories on VPS: {e}")
 
     # 3. Update AgentConfig fields if provided
+    # Wrapped in savepoint because agent DBs may not have agent_configs table
+    # (it's a platform-only table). Without the savepoint, a failed query
+    # poisons the transaction and the identity+memory changes are lost.
     if req.agent_config_updates:
         try:
-            ac_result = await db.execute(
-                select(AgentConfig).where(AgentConfig.user_id == req.user_id)
-            )
-            ac = ac_result.scalar_one_or_none()
-            if ac:
-                for field, value in req.agent_config_updates.items():
-                    if hasattr(ac, field):
-                        setattr(ac, field, value)
-                logger.info(f"[SOUL] Updated AgentConfig on VPS: {list(req.agent_config_updates.keys())}")
+            async with db.begin_nested():
+                ac_result = await db.execute(
+                    select(AgentConfig).where(AgentConfig.user_id == req.user_id)
+                )
+                ac = ac_result.scalar_one_or_none()
+                if ac:
+                    for field, value in req.agent_config_updates.items():
+                        if hasattr(ac, field):
+                            setattr(ac, field, value)
+                    logger.info(f"[SOUL] Updated AgentConfig on VPS: {list(req.agent_config_updates.keys())}")
         except Exception as e:
-            logger.warning(f"[SOUL] Failed to update AgentConfig on VPS: {e}")
+            logger.warning(f"[SOUL] Failed to update AgentConfig on VPS (table may not exist): {e}")
 
     await db.commit()
     logger.info(f"[SOUL] Synced soul identity for user {req.user_id}: {req.name}")
