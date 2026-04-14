@@ -90,6 +90,8 @@ class AppResponse(BaseModel):
     platforms: List[str] = ["web", "ios"]
     created_at: str
     updated_at: str
+    # Checkpoint 4a: parsed agentSkill.json manifest (null if missing/invalid)
+    skill_json: Optional[Dict[str, Any]] = None
 
 
 class JobResponse(BaseModel):
@@ -120,7 +122,7 @@ def _get_user_id() -> str:
 
 
 async def _app_to_response(app: App) -> AppResponse:
-    """Convert App model to response, enriching with live status."""
+    """Convert App model to response, enriching with live status and manifest."""
     qr_url = None
     web_url = None
     if _app_manager and app.status == "running":
@@ -128,6 +130,18 @@ async def _app_to_response(app: App) -> AppResponse:
         web_url = await _app_manager.get_web_url(app.id)
 
     platforms = app.platforms.split(",") if app.platforms else ["web", "ios"]
+
+    # Load agentSkill.json manifest (Checkpoint 4a)
+    skill_json = None
+    try:
+        from app.services.app_manifest_loader import load_app_manifest
+        if _app_manager:
+            app_dir = await _app_manager._resolve_app_dir(app.id)
+            manifest = load_app_manifest(app_dir, app_id=app.id)
+            if manifest:
+                skill_json = manifest.model_dump()
+    except Exception as e:
+        logger.debug("Failed to load manifest for %s: %s", app.id[:8], e)
 
     return AppResponse(
         id=app.id,
@@ -146,6 +160,7 @@ async def _app_to_response(app: App) -> AppResponse:
         platforms=platforms,
         created_at=app.created_at.isoformat() if app.created_at else "",
         updated_at=app.updated_at.isoformat() if app.updated_at else "",
+        skill_json=skill_json,
     )
 
 
