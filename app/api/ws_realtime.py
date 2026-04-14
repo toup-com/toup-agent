@@ -224,44 +224,69 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         except Exception as e:
             logger.warning("[REALTIME] Failed to load VPS user memories: %s", e)
 
-        # 2c. Load today's chat history from VPS sessions
+        # 2c. Load today's chat history via Day-as-Chat (cross-channel context)
+        # Uses /api/day-chats/{date}/messages which loads ALL messages from today
+        # across web, app, telegram, and voice channels — not just recent sessions.
         try:
-            sessions_data = await _vps_api(
-                agent_url, agent_api_key, "GET", "/api/sessions",
-                params={"limit": 5, "active_only": "false"},
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            day_msgs = await _vps_api(
+                agent_url, agent_api_key, "GET",
+                f"/api/day-chats/{today_str}/messages",
+                params={"limit": 500},
             )
-            if sessions_data:
-                sess_list = sessions_data.get("sessions", []) if isinstance(sessions_data, dict) else []
-                today_messages = []
-                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                for sess in sess_list[:5]:
-                    sess_id = sess.get("id", "")
-                    sess_updated = sess.get("updated_at", "")
-                    if not sess_updated or today_str not in sess_updated:
-                        continue
-                    msgs_data = await _vps_api(
-                        agent_url, agent_api_key, "GET",
-                        f"/api/sessions/{sess_id}/messages",
-                        params={"limit": 20},
-                    )
-                    if msgs_data and isinstance(msgs_data, list):
-                        today_messages.extend(msgs_data)
-
-                if today_messages:
-                    # Sort by created_at, take last 20
-                    today_messages.sort(key=lambda m: m.get("created_at", ""))
-                    recent = today_messages[-20:]
-                    lines = ["# Today's Conversation History (most recent)"]
-                    for m in recent:
-                        role = m.get("role", "")
-                        content = m.get("content", "")
-                        if role in ("user", "assistant") and content:
-                            speaker = "User" if role == "user" else "You"
-                            truncated = content[:300] + "..." if len(content) > 300 else content
-                            lines.append(f"{speaker}: {truncated}")
-                    if len(lines) > 1:
-                        sections.append("\n".join(lines))
-                        logger.info("[REALTIME] Loaded %d today's messages from VPS", len(recent))
+            if day_msgs and isinstance(day_msgs, list):
+                # Sort by created_at, take last 30 for context
+                day_msgs.sort(key=lambda m: m.get("created_at", ""))
+                recent = day_msgs[-30:]
+                lines = ["# Today's Conversation History (all channels — web, app, voice, telegram)"]
+                for m in recent:
+                    role = m.get("role", "")
+                    content = m.get("content", "")
+                    channel = m.get("channel", "")
+                    if role in ("user", "assistant") and content:
+                        speaker = "User" if role == "user" else "You"
+                        channel_tag = f" [{channel}]" if channel else ""
+                        truncated = content[:300] + "..." if len(content) > 300 else content
+                        lines.append(f"{speaker}{channel_tag}: {truncated}")
+                if len(lines) > 1:
+                    sections.append("\n".join(lines))
+                    logger.info("[REALTIME] Loaded %d day-chat messages from VPS (Day-as-Chat)", len(recent))
+            else:
+                logger.info("[REALTIME] No day-chat messages for today, falling back to sessions")
+                # Fallback to session-based loading if day-chat endpoint not available
+                sessions_data = await _vps_api(
+                    agent_url, agent_api_key, "GET", "/api/sessions",
+                    params={"limit": 5, "active_only": "false"},
+                )
+                if sessions_data:
+                    sess_list = sessions_data.get("sessions", []) if isinstance(sessions_data, dict) else []
+                    today_messages = []
+                    for sess in sess_list[:5]:
+                        sess_id = sess.get("id", "")
+                        sess_updated = sess.get("updated_at", "")
+                        if not sess_updated or today_str not in sess_updated:
+                            continue
+                        msgs_data = await _vps_api(
+                            agent_url, agent_api_key, "GET",
+                            f"/api/sessions/{sess_id}/messages",
+                            params={"limit": 20},
+                        )
+                        if msgs_data and isinstance(msgs_data, list):
+                            today_messages.extend(msgs_data)
+                    if today_messages:
+                        today_messages.sort(key=lambda m: m.get("created_at", ""))
+                        recent = today_messages[-20:]
+                        lines = ["# Today's Conversation History (most recent)"]
+                        for m in recent:
+                            role = m.get("role", "")
+                            content = m.get("content", "")
+                            if role in ("user", "assistant") and content:
+                                speaker = "User" if role == "user" else "You"
+                                truncated = content[:300] + "..." if len(content) > 300 else content
+                                lines.append(f"{speaker}: {truncated}")
+                        if len(lines) > 1:
+                            sections.append("\n".join(lines))
+                            logger.info("[REALTIME] Loaded %d today's messages from VPS (session fallback)", len(recent))
         except Exception as e:
             logger.warning("[REALTIME] Failed to load VPS chat history: %s", e)
 
