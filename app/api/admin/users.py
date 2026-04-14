@@ -83,6 +83,7 @@ class UserUpdateRequest(BaseModel):
     role: Optional[str] = Field(None, pattern="^(admin|beta_user)$")
     is_active: Optional[bool] = None
     name: Optional[str] = None
+    timezone: Optional[str] = None
 
 
 class InviteSignupRequest(BaseModel):
@@ -538,6 +539,8 @@ async def update_user(
         user.is_active = body.is_active
     if body.name is not None:
         user.name = body.name
+    if body.timezone is not None:
+        user.timezone = body.timezone
 
     await db.commit()
     await db.refresh(user)
