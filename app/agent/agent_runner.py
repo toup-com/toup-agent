@@ -901,6 +901,28 @@ class AgentRunner:
             if session:
                 return session, False
 
+        # ── 2c Risk 4 compat shim: bridge sends literal "app-{id}" session_id ──
+        # The injected bridge script (apps_proxy.py) hardcodes session_id: "app-{app_id}"
+        # in every message. This bypasses the 2b metadata_json lookup that ChatPage uses,
+        # creating duplicate Conversations for the same app on the same day.
+        # Shim: if session_id looks like a bridge-generated value, normalize it to None
+        # so it falls through to the 2b one-per-app-per-day reuse path below.
+        # Session IDs in this system are always UUIDs (never start with "app-").
+        # See: docs/checkpoint-2c-http-endpoint-audit.md, Risk 4.
+        if (
+            session_id
+            and session_id.startswith("app-")
+            and channel == "app"
+            and app_id
+        ):
+            logger.info(
+                "bridge_session_shim_applied user=%s app=%s original_session_id=%s",
+                user_id[:8] if user_id else "?",
+                app_id[:8] if app_id else "?",
+                session_id,
+            )
+            session_id = None  # fall through to 2b resolution path
+
         if session_id:
             from sqlalchemy import select
             result = await db.execute(
