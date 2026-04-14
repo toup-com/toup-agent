@@ -475,6 +475,8 @@ async def ws_chat(
 
         async def _broadcast_reader():
             """Forward broadcast events to this WebSocket."""
+            _persisted_job_ids: set = set()
+
             try:
                 while True:
                     event = await broadcast_queue.get()
@@ -486,6 +488,35 @@ async def ws_chat(
                     except Exception as e:
                         print(f"[BROADCAST_READER] Send FAILED: type={etype} error={e}", flush=True)
                         break
+
+                    # Persist job cards to DB so they survive page reload
+                    if etype == "job_update" and event.get("job_id"):
+                        _jid = event["job_id"]
+                        if _jid not in _persisted_job_ids:
+                            _persisted_job_ids.add(_jid)
+                            try:
+                                from app.db.database import async_session_maker as _sm
+                                from app.db.models import Message as _Msg
+                                from sqlalchemy import select as _sel
+                                async with _sm() as _jdb:
+                                    _existing = await _jdb.execute(
+                                        _sel(_Msg).where(_Msg.id == f"job-{_jid}")
+                                    )
+                                    if not _existing.scalar_one_or_none():
+                                        _job_dc = await _resolve_day_chat_id_for_now(_jdb, user_id)
+                                        _jdb.add(_Msg(
+                                            id=f"job-{_jid}",
+                                            conversation_id=f"build-{_jid[:8]}",
+                                            day_chat_id=_job_dc,
+                                            role="job",
+                                            content=json.dumps({
+                                                "job_id": _jid,
+                                                "job_name": event.get("name", "App Build"),
+                                            }),
+                                        ))
+                                        await _jdb.commit()
+                            except Exception as _pe:
+                                print(f"[BROADCAST_READER] Job persist failed: {_pe}", flush=True)
             except asyncio.CancelledError:
                 print(f"[BROADCAST_READER] Cancelled for user={user_id[:8]}", flush=True)
 
