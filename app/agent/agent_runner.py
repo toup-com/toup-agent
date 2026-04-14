@@ -913,17 +913,22 @@ class AgentRunner:
             )
             session = result.scalar_one_or_none()
             if session:
-                # For non-telegram sessions, start a new session if the day changed
-                # OR if the channel switched (e.g. web → vibecoding)
-                if session.channel != "telegram" and session.started_at:
-                    from datetime import datetime, timezone
-                    now_utc = datetime.now(timezone.utc)
+                from datetime import datetime, timezone
+                now_utc = datetime.now(timezone.utc)
+                channel_switched = channel and session.channel and channel != session.channel
+
+                if session.channel == "telegram" and not channel_switched:
+                    # Telegram → Telegram: always reuse (long-lived sessions)
+                    return session, False
+
+                if channel_switched:
+                    # Channel switch (e.g. telegram → web, web → vibecoding):
+                    # create a new session so messages are tagged with the correct channel
+                    logger.info(f"[AGENT] Channel switched {session.channel} → {channel}, creating new session")
+                elif session.started_at:
                     started = session.started_at.replace(tzinfo=timezone.utc) if session.started_at.tzinfo is None else session.started_at
-                    channel_switched = channel and session.channel and channel != session.channel
                     if started.date() != now_utc.date():
                         logger.info(f"[AGENT] Session {session_id} is from {started.date()}, creating new session for today")
-                    elif channel_switched:
-                        logger.info(f"[AGENT] Channel switched {session.channel} → {channel}, creating new session")
                     else:
                         return session, False
                 else:
