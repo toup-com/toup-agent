@@ -240,6 +240,8 @@ class AgentRunner:
         save_user_message: bool = True,
         display_user_message: Optional[str] = None,
         client_tz: Optional[str] = None,
+        app_id: Optional[str] = None,
+        force_new_session: bool = False,
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
@@ -294,7 +296,7 @@ class AgentRunner:
         t_phase1 = time.perf_counter()
         async with async_session_maker() as db:
             t_db = time.perf_counter()
-            session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel)
+            session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session)
             session_id = session.id
             logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
@@ -877,10 +879,12 @@ class AgentRunner:
         session_id: Optional[str],
         telegram_chat_id: Optional[int],
         channel: Optional[str] = None,
+        app_id: Optional[str] = None,
+        force_new: bool = False,
     ):
         from sqlalchemy import select, and_
         from app.db.models import Conversation
-        
+
         # If Telegram, try to find an active session for this chat
         if telegram_chat_id and not session_id:
             result = await db.execute(
@@ -896,7 +900,7 @@ class AgentRunner:
             session = result.scalar_one_or_none()
             if session:
                 return session, False
-        
+
         if session_id:
             from sqlalchemy import select
             result = await db.execute(
@@ -925,9 +929,6 @@ class AgentRunner:
                 else:
                     return session, False
 
-        # Create new session
-        _channel = "telegram" if telegram_chat_id else (channel or "agent")
-
         # Resolve DayChat parent (if day-chat feature is active or backfill has run)
         # Prefer client_tz from the WS message over User.timezone from DB
         _day_chat_id = None
@@ -943,12 +944,52 @@ class AgentRunner:
         except Exception as _dce:
             logger.debug("[AGENT] DayChat resolution skipped: %s", _dce)
 
+        # ── App channel: one Conversation per app per day (reuse pattern) ──
+        # When channel="app" and session_id is null, look for an existing
+        # Conversation for this app in today's day chat. Reuse it so the user
+        # sees a single continuous thread per app per day.
+        # Uses SELECT ... FOR UPDATE on the DayChat row to prevent concurrent
+        # first-messages from creating duplicate Conversations.
+        if channel == "app" and app_id and not session_id and _day_chat_id and not force_new:
+            try:
+                from app.db.models.day_chat import DayChat
+                # Lock the DayChat row — serializes concurrent app-conversation creation
+                await db.execute(
+                    select(DayChat).where(DayChat.id == _day_chat_id).with_for_update()
+                )
+                # Look for existing app conversation in today's day chat
+                candidates = (await db.execute(
+                    select(Conversation).where(and_(
+                        Conversation.user_id == user_id,
+                        Conversation.day_chat_id == _day_chat_id,
+                        Conversation.channel == "app",
+                    ))
+                )).scalars().all()
+                for conv in candidates:
+                    try:
+                        meta = json.loads(conv.metadata_json or "{}")
+                        if meta.get("app_id") == app_id:
+                            logger.info("[AGENT] Reusing app conversation %s for app %s", conv.id[:8], app_id[:8])
+                            return conv, False
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+            except Exception as _app_err:
+                logger.debug("[AGENT] App conversation lookup failed: %s", _app_err)
+
+        # Create new session
+        _channel = "telegram" if telegram_chat_id else (channel or "agent")
+        _meta = None
+        if telegram_chat_id:
+            _meta = json.dumps({"telegram_chat_id": telegram_chat_id})
+        elif channel == "app" and app_id:
+            _meta = json.dumps({"app_id": app_id})
+
         session = Conversation(
             user_id=user_id,
             channel=_channel,
             is_active=True,
             day_chat_id=_day_chat_id,
-            metadata_json=json.dumps({"telegram_chat_id": telegram_chat_id}) if telegram_chat_id else None,
+            metadata_json=_meta,
         )
         db.add(session)
         await db.flush()

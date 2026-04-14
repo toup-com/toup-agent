@@ -313,3 +313,73 @@ async def get_day_chat_messages(
         }
         for msg, channel in rows
     ])
+
+
+@router.get("/app-conversation/{app_id}")
+async def resolve_app_conversation(
+    app_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve the existing Conversation for an app in today's day chat.
+
+    Returns the conversation_id and message count if found, 404 if no
+    conversation exists yet (user hasn't chatted with this app today).
+
+    Used by the frontend to restore app conversation state on re-open.
+    """
+    import json as _json
+
+    # Platform mode: proxy to user's VPS agent
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_day_chats(proxy[0], proxy[1], f"app-conversation/{app_id}")
+        if data is not None:
+            return JSONResponse(content=data)
+
+    # Find today's day chat
+    user_tz = getattr(current_user, 'timezone', None)
+    if user_tz:
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo(user_tz)
+            local_today = datetime.now(tz).date()
+        except (KeyError, Exception):
+            local_today = datetime.utcnow().date()
+    else:
+        local_today = datetime.utcnow().date()
+
+    dc = (await db.execute(
+        select(DayChat).where(
+            and_(DayChat.user_id == current_user.id, DayChat.local_date == local_today)
+        )
+    )).scalar_one_or_none()
+
+    if not dc:
+        raise HTTPException(status_code=404, detail="No day chat for today")
+
+    # Find app conversation in today's day chat
+    candidates = (await db.execute(
+        select(Conversation).where(and_(
+            Conversation.user_id == current_user.id,
+            Conversation.day_chat_id == dc.id,
+            Conversation.channel == "app",
+        ))
+    )).scalars().all()
+
+    for conv in candidates:
+        try:
+            meta = _json.loads(conv.metadata_json or "{}")
+            if meta.get("app_id") == app_id:
+                msg_count = (await db.execute(
+                    select(func.count()).select_from(Message)
+                    .where(Message.conversation_id == conv.id)
+                )).scalar() or 0
+                return JSONResponse(content={
+                    "conversation_id": conv.id,
+                    "message_count": msg_count,
+                })
+        except (ValueError, TypeError):
+            continue
+
+    raise HTTPException(status_code=404, detail="No app conversation found for today")

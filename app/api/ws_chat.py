@@ -590,6 +590,7 @@ async def ws_chat(
                 model = msg.get("model")
                 channel = msg.get("channel")  # e.g. "mobile", "web", "app"
                 client_tz = msg.get("tz")  # IANA timezone, e.g. "America/Toronto"
+                force_new_session = bool(msg.get("force_new"))  # Skip session reuse (New Thread in app workspace)
 
                 # ── Persist timezone to User if changed ──
                 # Self-healing: frontend sends tz on every message, we persist it once.
@@ -946,6 +947,8 @@ async def ws_chat(
                     save_user_message=not is_onboarding_msg and not _user_msg_presaved,
                     media_paths=_media_paths if _media_paths else None,
                     client_tz=client_tz,
+                    app_id=app_id_from_msg,
+                    force_new_session=force_new_session,
                 ))
 
                 # Wait for agent to finish, but also listen for stop via a receiver task
