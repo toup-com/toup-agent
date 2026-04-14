@@ -225,32 +225,75 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
             logger.warning("[REALTIME] Failed to load VPS user memories: %s", e)
 
         # 2c. Load today's chat history via Day-as-Chat (cross-channel context)
-        # Uses /api/day-chats/{date}/messages which loads ALL messages from today
-        # across web, app, telegram, and voice channels — not just recent sessions.
+        # Uses /api/day-chats endpoint which loads ALL messages from today
+        # across web, app, telegram, and voice channels.
+        # Strategy: load all messages, keep user messages short (facts/requests),
+        # keep recent assistant messages full for continuity.
         try:
-            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            day_msgs = await _vps_api(
-                agent_url, agent_api_key, "GET",
-                f"/api/day-chats/{today_str}/messages",
-                params={"limit": 500},
-            )
+            # Use the day-chats list endpoint to find today's actual date key
+            # (handles timezone correctly — the agent resolves local_date)
+            day_msgs = None
+            try:
+                dc_list = await _vps_api(
+                    agent_url, agent_api_key, "GET",
+                    "/api/day-chats",
+                    params={"limit": 1},
+                )
+                if dc_list and isinstance(dc_list, list) and dc_list:
+                    today_date = dc_list[0].get("local_date")
+                    if today_date:
+                        day_msgs = await _vps_api(
+                            agent_url, agent_api_key, "GET",
+                            f"/api/day-chats/{today_date}/messages",
+                            params={"limit": 500},
+                        )
+            except Exception:
+                pass
+
+            # Fallback: try UTC date directly
+            if not day_msgs:
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                day_msgs = await _vps_api(
+                    agent_url, agent_api_key, "GET",
+                    f"/api/day-chats/{today_str}/messages",
+                    params={"limit": 500},
+                )
+
             if day_msgs and isinstance(day_msgs, list):
-                # Sort by created_at, take last 30 for context
                 day_msgs.sort(key=lambda m: m.get("created_at", ""))
-                recent = day_msgs[-30:]
-                lines = ["# Today's Conversation History (all channels — web, app, voice, telegram)"]
+                total = len(day_msgs)
+
+                # Smart windowing: keep ALL user messages (truncated) + last 20 full exchanges
+                # This ensures facts told early in the day ("my fav color is blue") survive
+                lines = [f"# Today's Conversation History ({total} messages across all channels)"]
+
+                # Phase 1: older messages — user messages only, heavily truncated (facts/requests)
+                older = day_msgs[:-40] if total > 40 else []
+                for m in older:
+                    role = m.get("role", "")
+                    content = (m.get("content", "") or "").strip()
+                    channel = m.get("channel", "")
+                    if role == "user" and content:
+                        ch = f" [{channel}]" if channel else ""
+                        # Keep user messages short — these are facts/requests
+                        truncated = content[:150] + "..." if len(content) > 150 else content
+                        lines.append(f"User{ch}: {truncated}")
+
+                # Phase 2: recent messages — full exchanges for continuity
+                recent = day_msgs[-40:] if total > 40 else day_msgs
                 for m in recent:
                     role = m.get("role", "")
-                    content = m.get("content", "")
+                    content = (m.get("content", "") or "").strip()
                     channel = m.get("channel", "")
                     if role in ("user", "assistant") and content:
                         speaker = "User" if role == "user" else "You"
-                        channel_tag = f" [{channel}]" if channel else ""
+                        ch = f" [{channel}]" if channel else ""
                         truncated = content[:300] + "..." if len(content) > 300 else content
-                        lines.append(f"{speaker}{channel_tag}: {truncated}")
+                        lines.append(f"{speaker}{ch}: {truncated}")
+
                 if len(lines) > 1:
                     sections.append("\n".join(lines))
-                    logger.info("[REALTIME] Loaded %d day-chat messages from VPS (Day-as-Chat)", len(recent))
+                    logger.info("[REALTIME] Loaded %d day-chat messages from VPS (Day-as-Chat, %d older + %d recent)", total, len(older), len(recent))
             else:
                 logger.info("[REALTIME] No day-chat messages for today, falling back to sessions")
                 # Fallback to session-based loading if day-chat endpoint not available
