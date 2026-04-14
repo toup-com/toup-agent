@@ -300,10 +300,18 @@ class AppManager:
 
         return "unknown"
 
+    async def _ensure_node_modules(self, app_id: str, app_dir: str) -> None:
+        """Reinstall node_modules if missing (e.g. after stop cleaned them)."""
+        nm_dir = os.path.join(app_dir, "node_modules")
+        if not os.path.exists(nm_dir):
+            logger.info(f"[APP] node_modules missing for {app_id}, reinstalling...")
+            await self._npm_install_with_retry(app_id, app_dir)
+
     async def start_metro(self, app_id: str, app_dir: Optional[str] = None) -> int:
         """Start Metro bundler for mobile preview. Returns allocated port."""
         app_dir = await self._resolve_app_dir(app_id, app_dir)
         assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
+        await self._ensure_node_modules(app_id, app_dir)
         port = self._allocate_port(METRO_PORT_RANGE, self._used_metro_ports)
 
         managed = self._running.get(app_id)
@@ -342,6 +350,7 @@ class AppManager:
         """Start Expo web server. Returns allocated port."""
         app_dir = await self._resolve_app_dir(app_id, app_dir)
         assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
+        await self._ensure_node_modules(app_id, app_dir)
         port = self._allocate_port(WEB_PORT_RANGE, self._used_web_ports)
 
         managed = self._running.get(app_id)
@@ -415,6 +424,17 @@ class AppManager:
         managed.metro_port = None
         managed.web_port = None
         del self._running[app_id]
+
+        # Free disk: remove node_modules (~400MB per app).
+        # package-lock.json is kept so npm install is deterministic on next start.
+        try:
+            app_dir = await self._resolve_app_dir(app_id)
+            nm_dir = os.path.join(app_dir, "node_modules")
+            if os.path.exists(nm_dir):
+                shutil.rmtree(nm_dir)
+                logger.info(f"[APP] Cleaned node_modules for {app_id}")
+        except Exception as e:
+            logger.debug(f"[APP] node_modules cleanup skipped for {app_id}: {e}")
 
         logger.info(f"[APP] Stopped {app_id}")
         return stopped
