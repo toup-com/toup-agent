@@ -656,6 +656,7 @@ async def ws_chat(
 
                 # If message comes from inside a built app, prepend context
                 app_id_from_msg = msg.get("app_id")
+                _original_user_text = text  # Preserve before context injection
                 if channel == "app" and app_id_from_msg:
                     try:
                         from app.db.database import async_session_maker
@@ -804,7 +805,7 @@ async def ws_chat(
                                 conversation_id=session_id,
                                 day_chat_id=_presave_dc_id,
                                 role="user",
-                                content=text,
+                                content=_original_user_text,
                             ))
                             # Update conversation timestamp
                             _conv = (await _presave_db.execute(
@@ -934,9 +935,13 @@ async def ws_chat(
                     )
 
                 # Run agent — use the modified text for LLM but save the original user text
+                # display_user_message: the clean text to save to DB (no context injection).
+                # For app-channel messages, text has [CONTEXT:...] prepended — always
+                # save the original. For fast-path (music), save the modified fast text.
+                _display_text = _original_user_text if (_original_user_text != text) else (text if _fast_text else None)
                 agent_task = asyncio.create_task(_agent_runner.run(
                     user_message=_agent_text,
-                    display_user_message=text if _fast_text else None,
+                    display_user_message=_display_text,
                     user_id=user_id,
                     session_id=session_id,
                     channel=channel,
