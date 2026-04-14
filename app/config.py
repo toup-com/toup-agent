@@ -89,7 +89,7 @@ class Settings(BaseSettings):
     skills_dir: str = "/app/skills"  # External skills directory
 
     # Day-as-Chat context architecture (feature flag)
-    use_day_chat_context: bool = False  # When True, agent loads all sessions for the day as context
+    use_day_chat_context: bool = True  # Day-as-Chat: agent loads all sessions/channels for the day as context
 
     # Workspace Bootstrap
     workspace_per_user: bool = True  # Create per-user workspace subdirectories
