@@ -591,6 +591,9 @@ async def ws_chat(
                 channel = msg.get("channel")  # e.g. "mobile", "web", "app"
                 client_tz = msg.get("tz")  # IANA timezone, e.g. "America/Toronto"
                 force_new_session = bool(msg.get("force_new"))  # Skip session reuse (New Thread in app workspace)
+                # system_action: true when a structured action (e.g. customize_app) triggers
+                # an agent turn without a real user message. Skip presave + user message save.
+                _is_system_action = bool(msg.get("system_action"))
 
                 # ── Persist timezone to User if changed ──
                 # Self-healing: frontend sends tz on every message, we persist it once.
@@ -794,8 +797,9 @@ async def ws_chat(
 
                 # ── Pre-save user message so it survives stream failures ──
                 # Skip if no session_id yet (first message — agent_runner creates session)
+                # Skip for system actions (customize_app) — no user message to save
                 _user_msg_presaved = False
-                if session_id:
+                if session_id and not _is_system_action:
                     try:
                         from app.db.database import async_session_maker
                         from app.db.models import Message as DbMessage, Conversation
@@ -949,7 +953,7 @@ async def ws_chat(
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
                     model_override=model,
-                    save_user_message=not is_onboarding_msg and not _user_msg_presaved,
+                    save_user_message=not is_onboarding_msg and not _user_msg_presaved and not _is_system_action,
                     media_paths=_media_paths if _media_paths else None,
                     client_tz=client_tz,
                     app_id=app_id_from_msg,
