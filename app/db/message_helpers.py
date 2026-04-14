@@ -14,22 +14,36 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
-async def resolve_day_chat_id_for_now(db: AsyncSession, user_id: str) -> Optional[str]:
+async def resolve_day_chat_id_for_now(
+    db: AsyncSession,
+    user_id: str,
+    tz_override: Optional[str] = None,
+) -> Optional[str]:
     """Resolve the DayChat ID for the current moment using the user's timezone.
 
     This is the canonical way to get day_chat_id for a new Message.
     Returns None if resolution fails (graceful degradation — message
     still saves, just without day_chat_id).
+
+    Args:
+        db: Active async session.
+        user_id: The user's ID.
+        tz_override: If provided, use this timezone instead of reading from the
+            User row. This is critical for WebSocket callers that have the client's
+            timezone from the message payload — avoids a race where the User.timezone
+            hasn't been persisted yet or is still NULL.
     """
     if not user_id:
         return None
     try:
         from app.agent.day_chat_resolver import get_or_create_day_chat
-        from app.db.models import User
-        from sqlalchemy import select
 
-        user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-        tz_name = getattr(user, 'timezone', None) if user else None
+        tz_name = tz_override
+        if not tz_name:
+            from app.db.models import User
+            from sqlalchemy import select
+            user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+            tz_name = getattr(user, 'timezone', None) if user else None
         dc = await get_or_create_day_chat(db, user_id, tz_name=tz_name)
         return dc.id
     except Exception:

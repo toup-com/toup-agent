@@ -239,6 +239,7 @@ class AgentRunner:
         idempotency_key: Optional[str] = None,
         save_user_message: bool = True,
         display_user_message: Optional[str] = None,
+        client_tz: Optional[str] = None,
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
@@ -337,7 +338,7 @@ class AgentRunner:
                     from app.agent.day_context_loader import load_day_context
                     from app.agent.context_manager import get_context_window
                     from app.db.message_helpers import resolve_day_chat_id_for_now
-                    _day_chat_id = await resolve_day_chat_id_for_now(db, user_id)
+                    _day_chat_id = await resolve_day_chat_id_for_now(db, user_id, tz_override=client_tz)
                     _ctx_window = get_context_window(settings.agent_model)
                     _day_context = await load_day_context(db, _day_chat_id, model=settings.agent_model, model_context_tokens=_ctx_window)
                     history = _day_context["messages"]
@@ -732,6 +733,7 @@ class AgentRunner:
                 model=model_used,
                 processing_time_ms=int((time.time() - start) * 1000),
                 save_user_message=save_user_message,
+                client_tz=client_tz,
             )
             await db.commit()
         logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
@@ -927,13 +929,16 @@ class AgentRunner:
         _channel = "telegram" if telegram_chat_id else (channel or "agent")
 
         # Resolve DayChat parent (if day-chat feature is active or backfill has run)
+        # Prefer client_tz from the WS message over User.timezone from DB
         _day_chat_id = None
         try:
             from app.agent.day_chat_resolver import get_or_create_day_chat
-            from app.db.models import User
-            _user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-            _user_tz = getattr(_user, 'timezone', None) if _user else None
-            _dc = await get_or_create_day_chat(db, user_id, tz_name=_user_tz)
+            _tz_for_day = client_tz
+            if not _tz_for_day:
+                from app.db.models import User
+                _user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+                _tz_for_day = getattr(_user, 'timezone', None) if _user else None
+            _dc = await get_or_create_day_chat(db, user_id, tz_name=_tz_for_day)
             _day_chat_id = _dc.id
         except Exception as _dce:
             logger.debug("[AGENT] DayChat resolution skipped: %s", _dce)
@@ -1478,6 +1483,7 @@ class AgentRunner:
         model: str,
         processing_time_ms: int,
         save_user_message: bool = True,
+        client_tz: Optional[str] = None,
     ):
         from sqlalchemy import select
         from app.db.models import Message, Conversation
@@ -1497,7 +1503,7 @@ class AgentRunner:
         session = result.scalar_one_or_none()
         try:
             from app.db.message_helpers import resolve_day_chat_id_for_now
-            _day_chat_id = await resolve_day_chat_id_for_now(db, user_id)
+            _day_chat_id = await resolve_day_chat_id_for_now(db, user_id, tz_override=client_tz)
         except Exception:
             _day_chat_id = getattr(session, 'day_chat_id', None) if session else None
 

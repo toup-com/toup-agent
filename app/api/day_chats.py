@@ -13,7 +13,7 @@ from typing import Optional, List, Tuple
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, and_, func, distinct
+from sqlalchemy import select, and_, func, distinct, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -98,6 +98,68 @@ async def list_day_chats(
 
     result = await db.execute(query)
     day_chats = result.scalars().all()
+
+    # ── Self-healing: fix DayChats with future local_date ──
+    # This can happen when a user's timezone was NULL (defaulting to UTC) and
+    # messages were sent after midnight UTC but before midnight local. The DayChat
+    # got created with tomorrow's UTC date instead of today's local date.
+    # Fix: re-resolve the date using the user's current timezone and merge.
+    user_tz = getattr(current_user, 'timezone', None)
+    if user_tz:
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo(user_tz)
+            local_today = datetime.now(tz).date()
+            _healed = False
+            for dc in list(day_chats):  # copy list — we may delete entries
+                if dc.local_date > local_today:
+                    _healed = True
+                    logger.warning(
+                        "[day_chats] Future-dated DayChat detected: id=%s local_date=%s > today=%s (tz=%s). Rebucketing.",
+                        dc.id[:8], dc.local_date, local_today, user_tz,
+                    )
+                    # Check if a DayChat for today already exists
+                    existing_today = (await db.execute(
+                        select(DayChat).where(
+                            and_(DayChat.user_id == current_user.id, DayChat.local_date == local_today)
+                        )
+                    )).scalar_one_or_none()
+
+                    if existing_today:
+                        # Merge: move all messages from the future DayChat to today's
+                        await db.execute(
+                            update(Message)
+                            .where(Message.day_chat_id == dc.id)
+                            .values(day_chat_id=existing_today.id)
+                        )
+                        # Update conversations too
+                        await db.execute(
+                            update(Conversation)
+                            .where(Conversation.day_chat_id == dc.id)
+                            .values(day_chat_id=existing_today.id)
+                        )
+                        # Delete the orphaned future DayChat
+                        await db.delete(dc)
+                        await db.commit()
+                        logger.info("[day_chats] Merged future DayChat %s into %s (today)", dc.id[:8], existing_today.id[:8])
+                    else:
+                        # No DayChat for today — just fix the date
+                        dc.local_date = local_today
+                        dc.timezone = user_tz
+                        await db.commit()
+                        logger.info("[day_chats] Fixed future DayChat %s: %s → %s", dc.id[:8], dc.local_date, local_today)
+
+            if _healed:
+                # Re-query after healing to get correct data
+                result = await db.execute(
+                    select(DayChat)
+                    .where(DayChat.user_id == current_user.id)
+                    .order_by(DayChat.local_date.desc())
+                    .limit(limit)
+                )
+                day_chats = result.scalars().all()
+        except Exception as _heal_err:
+            logger.warning("[day_chats] Self-healing failed: %s", _heal_err)
 
     # TODO: collapse to single GROUP BY query — currently N+1 (one channel query
     # per day chat). For 90 days that's 91 queries. Fix when telemetry shows it matters.
