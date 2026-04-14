@@ -683,7 +683,7 @@ async def ws_chat(
                                     f"  app_{_slug_safe}__restart (restart the app after code changes — ALWAYS call this after editing files).\n"
                                     f"- When the user asks to change something in the app (UI, content, settings), "
                                     f"use write_file/edit_file to make the change, then call restart to apply it.\n"
-                                    f"- After fixing or restarting, give the user a clickable [[Open app]] chip.\n"
+                                    f"- After fixing or restarting, give the user a clickable [[open_app:{_app.slug}]] chip.\n"
                                     f"- Suggest helpful actions as [[Button Label]] chips.\n"
                                 )
                                 if _is_layer2:

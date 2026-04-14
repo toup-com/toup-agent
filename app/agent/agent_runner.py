@@ -1370,7 +1370,7 @@ class AgentRunner:
                 "DO NOT just describe what you would do — actually DO it by calling your write_file/edit_file tools to modify the source code. "
                 "After editing, call the restart tool to apply changes. Read the relevant file first, make the edit, restart, and confirm what you changed.\n"
                 "- NEVER give the user localhost URLs. App previews are at: https://toup.ai/workspace/apps/{app-slug}\n"
-                "- After fixing or restarting an app, offer a [[Open app]] chip so the user can see the result.\n\n"
+                "- After fixing or restarting an app, offer a [[open_app:{app-slug}]] chip so the user can see the result. Use the app's slug (e.g. [[open_app:Confidence-Booster]]).\n\n"
                 "# Action Buttons\n"
                 "You can offer clickable action buttons by including [[Label]] markers in your response.\n"
                 "These render as tappable chips in the chat UI. When the user taps one, it sends that label as a message.\n"
