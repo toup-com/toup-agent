@@ -751,7 +751,13 @@ async def agent_preview_proxy(app_id: str, request: Request, path: str = ""):
 
     The platform calls this endpoint instead of hitting the web_port directly,
     because the web_port is only accessible inside the Docker container.
+
+    Includes a server-side retry loop (up to 15s) to absorb the brief dead
+    window after app__restart kills and respawns the dev server processes.
+    The browser makes ONE request; the proxy absorbs the race transparently.
     """
+    import asyncio as _asyncio
+
     if not _app_manager:
         raise HTTPException(503, "App manager not initialized")
 
@@ -765,20 +771,71 @@ async def agent_preview_proxy(app_id: str, request: Request, path: str = ""):
         from urllib.parse import urlencode
         target += f"?{urlencode(params)}"
 
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.get(target)
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers={
-                    k: v for k, v in resp.headers.items()
-                    if k.lower() not in ("transfer-encoding", "connection", "content-encoding")
-                },
-            )
-    except Exception as e:
-        logger.error(f"[PREVIEW] Proxy to localhost:{managed.web_port} failed: {e}")
-        raise HTTPException(502, f"Preview server unreachable: {e}")
+    # ── Server-side retry loop — absorbs restart dead window ──
+    max_attempts = 15
+    attempt_delay = 1.0
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for attempt in range(max_attempts):
+            try:
+                resp = await client.get(target)
+
+                if resp.status_code == 200:
+                    # Dev server is ready — return response
+                    return Response(
+                        content=resp.content,
+                        status_code=resp.status_code,
+                        headers={
+                            k: v for k, v in resp.headers.items()
+                            if k.lower() not in ("transfer-encoding", "connection", "content-encoding")
+                        },
+                    )
+                elif resp.status_code in (500, 502, 503):
+                    # Server is starting up / recompiling — retry
+                    if attempt < max_attempts - 1:
+                        logger.info(
+                            "[PREVIEW] retry %d/%d app=%s status=%d path=%s",
+                            attempt + 1, max_attempts, app_id[:8], resp.status_code, path[:60],
+                        )
+                        await _asyncio.sleep(attempt_delay)
+                        continue
+                    else:
+                        # Exhausted retries — return error with no-cache headers
+                        return Response(
+                            content=b"<html><body><h3>App is taking longer than usual to start. Try refreshing in a few seconds.</h3></body></html>",
+                            status_code=503,
+                            media_type="text/html",
+                            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+                        )
+                else:
+                    # 4xx etc — don't retry, return as-is
+                    return Response(
+                        content=resp.content,
+                        status_code=resp.status_code,
+                        headers={
+                            k: v for k, v in resp.headers.items()
+                            if k.lower() not in ("transfer-encoding", "connection", "content-encoding")
+                        },
+                    )
+
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, OSError) as e:
+                if attempt < max_attempts - 1:
+                    logger.info(
+                        "[PREVIEW] retry %d/%d app=%s error=%s path=%s",
+                        attempt + 1, max_attempts, app_id[:8], type(e).__name__, path[:60],
+                    )
+                    await _asyncio.sleep(attempt_delay)
+                    continue
+                else:
+                    return Response(
+                        content=b"<html><body><h3>App is taking longer than usual to start. Try refreshing in a few seconds.</h3></body></html>",
+                        status_code=502,
+                        media_type="text/html",
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+                    )
+
+    # Should never reach here, but just in case
+    raise HTTPException(502, "Preview server unreachable")
 
 
 @router.delete("/{app_id}")
