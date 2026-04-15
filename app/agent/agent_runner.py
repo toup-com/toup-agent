@@ -480,6 +480,17 @@ class AgentRunner:
             except Exception as e:
                 logger.warning(f"[VIBE] Failed to register vibecoding session: {e}")
 
+        # In app-channel mode, strip app_builder tools AND core mutation tools —
+        # customization must use app__write_file / app__edit_file so edits get logged
+        # via _record_layer2_change. Core write_file/edit_file bypass the audit trail.
+        if channel == "app":
+            current_tools = [
+                t for t in current_tools
+                if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
+                and (t.get("name", "") or t.get("function", {}).get("name", "") or "") not in ("write_file", "edit_file")
+            ]
+            logger.info(f"[APP] Stripped app_builder + core mutation tools for app channel, {len(current_tools)} tools remaining")
+
         logger.info(
             f"[PERF] tool_filter: {len(all_tools)} total → {len(current_tools)} for intent={query_intent.category}"
         )

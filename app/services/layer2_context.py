@@ -92,9 +92,18 @@ def _build_behavior_rules(app_name: str, slug_safe: str, app_slug: str, preview_
         "NEVER mention internal details (SQLite, bridges, connections, file paths, agent infrastructure).",
         f"NEVER give localhost URLs to the user. The app preview URL is: {preview_url}",
         f"When the user asks to change something in the app (UI, content, settings), "
-        f"use write_file/edit_file to make the change, then call restart to apply it.",
+        f"use app_{slug_safe}__write_file / app_{slug_safe}__edit_file to make the change, "
+        f"then call app_{slug_safe}__restart to apply it.",
         f"After fixing or restarting, give the user a clickable [[open_app:{app_slug}]] chip.",
         "Suggest helpful actions as [[Button Label]] chips.",
+        f"TOOL RESTRICTION: You are customizing an existing app, not building a new one. "
+        f"Use app_{slug_safe}__write_file, app_{slug_safe}__edit_file, and app_{slug_safe}__read_file "
+        f"to make changes in place. The iframe will hot-reload to show changes immediately. "
+        f"Do NOT call app_builder__build_app — that tool is for creating new apps from scratch. "
+        f"If the user asks for a large change (new screen, new feature, significant refactoring), "
+        f"accomplish it with in-place file operations: create the new file with "
+        f"app_{slug_safe}__write_file, update navigation/routing with app_{slug_safe}__edit_file, "
+        f"and restart with app_{slug_safe}__restart. The app stays live throughout.",
     ]
 
 
@@ -134,15 +143,15 @@ def _build_layer2_instructions(slug_safe: str) -> str:
         f"app name, which test type (academic/general), basic preferences, weekly availability.\n"
         f"  Every question MUST have [[option]] buttons on the NEXT LINE — buttons must be inline with their question, "
         f"NOT collected at the end.\n\n"
-        f"  STEP 3 (AFTER user answers): IMMEDIATELY begin editing the app using write_file/query_db.\n"
+        f"  STEP 3 (AFTER user answers): IMMEDIATELY begin editing the app using app_{slug_safe}__write_file / app_{slug_safe}__edit_file.\n"
         f"  Do NOT just acknowledge the answers or offer action buttons — you MUST apply actual code changes.\n"
         f"  Do NOT use memory_store to save preferences. Do NOT say 'let me store your preferences'.\n"
-        f"  INSTEAD: Use write_file to rewrite app files with the user's choices applied.\n"
+        f"  INSTEAD: Use app_{slug_safe}__write_file to rewrite app files with the user's choices applied.\n"
         f"  Replace placeholder data with real content, upgrade features, add algorithms.\n"
-        f"  Be EFFICIENT — use write_file to write complete files, batch related changes together.\n"
+        f"  Be EFFICIENT — use app_{slug_safe}__write_file to write complete files, batch related changes together.\n"
         f"  Show brief progress after each edit.\n"
         f"  IMPORTANT: You have a limited number of tool calls. Be efficient — don't waste iterations "
-        f"on unnecessary reads. Combine related edits into single write_file calls when possible.\n\n"
+        f"on unnecessary reads. Combine related edits into single app_{slug_safe}__write_file calls when possible.\n\n"
         f"  STEP 4 (COMPLETION): Give a BRIEF human-friendly summary of what you customized.\n"
         f"  NEVER expose internal operations (memory storage, file reading, database queries) to the user.\n"
         f"  NEVER say 'let me store' or 'let me save to memory' — the user does not care about internals.\n"
