@@ -395,8 +395,9 @@ def _build_agent_widget_script(
         '<script>',
         'document.addEventListener("DOMContentLoaded",function(){',
         'var B=window.__TOUP_AGENT_BRIDGE;if(!B)return;',
-        # Hide widget if inside platform iframe — parent React panel handles chat
-        'try{if(window.self!==window.top&&document.referrer.indexOf(window.location.host)>=0)return}catch(e){}',
+        # Hide widget if inside an iframe — platform AppSplit panel handles chat on web.
+        # Mobile WebView loads the preview as top-level window, so the widget renders there.
+        'try{if(window.self!==window.top)return}catch(e){}',
         'window.__TOUP_AGENT_UI_INJECTED=true;',
         # Create root
         'var bk=document.createElement("div");bk.id="taw-bk";'
