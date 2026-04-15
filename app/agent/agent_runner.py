@@ -488,7 +488,7 @@ class AgentRunner:
             current_tools = [
                 t for t in current_tools
                 if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
-                and (t.get("name", "") or t.get("function", {}).get("name", "") or "") not in ("write_file", "edit_file", "exec")
+                and (t.get("name", "") or t.get("function", {}).get("name", "") or "") not in ("write_file", "edit_file", "exec", "pty_exec", "apply_patch")
             ]
             logger.info(f"[APP] Stripped app_builder + core mutation tools for app channel, {len(current_tools)} tools remaining")
 
