@@ -482,12 +482,13 @@ class AgentRunner:
 
         # In app-channel mode, strip app_builder tools AND core mutation tools —
         # customization must use app__write_file / app__edit_file so edits get logged
-        # via _record_layer2_change. Core write_file/edit_file bypass the audit trail.
+        # via _record_layer2_change. Core write_file/edit_file/exec bypass the audit trail.
+        # Agent proved it uses exec with Python scripts as a workaround when write_file is stripped.
         if channel == "app":
             current_tools = [
                 t for t in current_tools
                 if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
-                and (t.get("name", "") or t.get("function", {}).get("name", "") or "") not in ("write_file", "edit_file")
+                and (t.get("name", "") or t.get("function", {}).get("name", "") or "") not in ("write_file", "edit_file", "exec")
             ]
             logger.info(f"[APP] Stripped app_builder + core mutation tools for app channel, {len(current_tools)} tools remaining")
 
