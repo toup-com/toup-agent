@@ -784,7 +784,11 @@ export default supabase;
                                 app_row.metro_pid = managed.metro_process.pid
                             if managed and managed.web_process:
                                 app_row.web_pid = managed.web_process.pid
+                            # Verify web server is actually responding
+                            if web_port:
+                                await self._wait_for_ready(managed, timeout=90)
                             restored += 1
+                            logger.info(f"[APP] Restored {app_row.name} (metro={metro_port}, web={web_port})")
                         except Exception as e:
                             logger.error(f"[APP] Failed to restore {app_row.id}: {e}")
                             app_row.status = "error"
@@ -827,8 +831,8 @@ export default supabase;
         except Exception:
             pass
 
-    async def _wait_for_ready(self, managed: ManagedApp, timeout: int = 30) -> None:
-        """Wait for Metro to report ready."""
+    async def _wait_for_ready(self, managed: ManagedApp, timeout: int = 90) -> None:
+        """Wait for Metro/Expo to report ready (log-based + HTTP probe)."""
         start = time.time()
         ready_patterns = ["Metro waiting on port", "Logs for your project", "Starting Metro", "Web is waiting on"]
         while time.time() - start < timeout:
@@ -837,7 +841,20 @@ export default supabase;
                 for pattern in ready_patterns:
                     if pattern.lower() in line.lower():
                         return
-            await asyncio.sleep(1)
+            # Also try HTTP probe on web port — catches cases where logs are delayed
+            if managed.web_port:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                        f"http://127.0.0.1:{managed.web_port}/",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+                    if stdout.decode().strip() == "200":
+                        return
+                except Exception:
+                    pass
+            await asyncio.sleep(2)
         logger.warning(f"[APP] Metro ready timeout for {managed.app_id} after {timeout}s")
 
     async def _run_cmd(
