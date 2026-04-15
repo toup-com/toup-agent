@@ -24,12 +24,63 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from app.agent.skills.base import Skill, SkillContext, SkillMeta
 
 logger = logging.getLogger(__name__)
+
+
+# ── Post-edit syntax validation ─────────────────────────────────
+# Uses the app's own @babel/parser (always present in Expo apps)
+# to check TypeScript/JSX syntax after every write/edit.
+# If parsing fails, the edit is reverted and an error is returned
+# to the agent so it can retry with correct syntax.
+
+_VALIDATABLE_EXTENSIONS = {'.ts', '.tsx', '.js', '.jsx'}
+
+def _validate_syntax(file_path: str, app_dir: str) -> Optional[str]:
+    """Validate TypeScript/JSX syntax using the app's Babel parser.
+
+    Returns None if valid, or an error message string if syntax is broken.
+    Skips non-JS/TS files silently (returns None).
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in _VALIDATABLE_EXTENSIONS:
+        return None
+
+    babel_parser = os.path.join(app_dir, 'node_modules', '@babel', 'parser', 'lib', 'index.js')
+    if not os.path.exists(babel_parser):
+        return None  # No parser available — skip validation
+
+    abs_path = file_path if os.path.isabs(file_path) else os.path.join(app_dir, file_path.lstrip('/'))
+
+    # Use node to parse — fast (~50ms), catches all syntax errors
+    script = (
+        f'try{{'
+        f'const p=require("{babel_parser}");'
+        f'const c=require("fs").readFileSync("{abs_path}","utf8");'
+        f'p.parse(c,{{sourceType:"module",plugins:["typescript","jsx","decorators-legacy"]}});'
+        f'}}catch(e){{console.error(e.message.split("\\n")[0]);process.exit(1)}}'
+    )
+    try:
+        result = subprocess.run(
+            ['node', '-e', script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() or 'Unknown syntax error'
+            return error_msg
+    except subprocess.TimeoutExpired:
+        logger.warning("syntax_validation_timeout file=%s", file_path)
+        return None  # Don't block on timeout — let the edit through
+    except Exception as e:
+        logger.warning("syntax_validation_error file=%s error=%s", file_path, e)
+        return None  # Don't block on unexpected errors
+
+    return None
 
 
 async def _record_layer2_change(app_id: str, file_path: str, action: str, summary: str):
@@ -383,11 +434,36 @@ class AppFsSkill(Skill):
 
         abs_path = os.path.join(self.app_dir, file_path.lstrip("/"))
         is_new = not os.path.exists(abs_path)
+        original_content = None
+        if not is_new:
+            try:
+                with open(abs_path, 'r', encoding='utf-8') as f:
+                    original_content = f.read()
+            except Exception:
+                pass
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
 
         try:
             with open(abs_path, 'w', encoding='utf-8') as f:
                 f.write(content)
+
+            # Syntax validation — revert if the new file has syntax errors
+            syntax_error = _validate_syntax(abs_path, self.app_dir)
+            if syntax_error:
+                if original_content is not None:
+                    with open(abs_path, 'w', encoding='utf-8') as f:
+                        f.write(original_content)
+                elif is_new:
+                    os.remove(abs_path)
+                logger.warning("syntax_validation_reverted file=%s error=%s", file_path, syntax_error)
+                return (
+                    f"SYNTAX ERROR in '{file_path}' — your code has a syntax error and was NOT saved. "
+                    f"The file was reverted to its previous state.\n\n"
+                    f"Error: {syntax_error}\n\n"
+                    f"Fix the syntax error and try again. Common issues: missing commas between "
+                    f"object properties, unclosed brackets, duplicate variable declarations."
+                )
+
             # Track Layer 2 change
             action = "create" if is_new else "edit"
             lines = content.count('\n') + 1
@@ -424,6 +500,20 @@ class AppFsSkill(Skill):
             new_content = content.replace(old_text, new_text, 1)
             with open(abs_path, 'w', encoding='utf-8') as f:
                 f.write(new_content)
+
+            # Syntax validation — revert if the edit breaks syntax
+            syntax_error = _validate_syntax(abs_path, self.app_dir)
+            if syntax_error:
+                with open(abs_path, 'w', encoding='utf-8') as f:
+                    f.write(content)  # revert to original
+                logger.warning("syntax_validation_reverted file=%s error=%s", file_path, syntax_error)
+                return (
+                    f"SYNTAX ERROR in '{file_path}' — your edit produced invalid syntax and was NOT applied. "
+                    f"The file was reverted to its previous state.\n\n"
+                    f"Error: {syntax_error}\n\n"
+                    f"Your replacement text:\n```\n{new_text[:200]}\n```\n\n"
+                    f"Fix the syntax error in your replacement text and try again."
+                )
 
             # Track Layer 2 change
             await _record_layer2_change(
