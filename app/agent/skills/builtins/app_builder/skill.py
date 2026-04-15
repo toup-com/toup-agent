@@ -153,8 +153,18 @@ Database: {db_type}
 Rules:
 - Use TypeScript with proper types
 - Use React Native components (View, Text, ScrollView, Pressable, TextInput, FlatList, etc.)
-- Use StyleSheet.create() for styles — dark theme (background: #161B22, text: #F0F2F5)
-- Accent color: #58A6FF (blue)
+- Use StyleSheet.create() for styles
+- Choose a VIBRANT, UNIQUE color palette that matches the app's purpose and personality.
+  Do NOT default to dark gray. Pick colors that feel alive and match the app's domain:
+  - Fitness app → energetic orange/red (#FF6B35, #FF3B30)
+  - Finance app → trustworthy navy/emerald (#0A2463, #10B981)
+  - Study app → warm paper/cream (#FFF8E7, #8B6914)
+  - Social app → playful pink/purple (#EC4899, #8B5CF6)
+  - Health app → calming teal/mint (#14B8A6, #ECFDF5)
+  - Productivity app → clean blue/white (#3B82F6, #F0F4FF)
+  - Food app → appetizing warm tones (#F97316, #FEF3C7)
+  Pick 4-5 coordinated colors: background, card, accent, text, muted text.
+  Use the user's design_notes if they specified color preferences.
 - MOBILE-FIRST RESPONSIVE LAYOUT — these apps run on MOBILE phones (375px) AND desktop web (1200px+):
   - Use useWindowDimensions() at the top of every screen
   - Define: const isDesktop = width > 768;
@@ -202,16 +212,18 @@ Rules:
 - If this file uses database, import from '../lib/db' (expo-sqlite helper)
 - For navigation, use @react-navigation/native-stack
 - React Navigation v7 REQUIRES a `theme` prop with `fonts` on NavigationContainer. Without it, the app
-  CRASHES with "Cannot read properties of undefined (reading 'bold')". ALWAYS add this theme prop:
-  <NavigationContainer theme={{{{ dark: true, colors: {{
-    primary: "#58A6FF", background: "#161B22", card: "#1C2128",
-    text: "#F0F2F5", border: "#30363D", notification: "#58A6FF",
+  CRASHES with "Cannot read properties of undefined (reading 'bold')". ALWAYS add this theme prop
+  using your chosen color palette (example with warm tones — adapt to YOUR palette):
+  <NavigationContainer theme={{{{ dark: false, colors: {{
+    primary: "#YOUR_ACCENT", background: "#YOUR_BG", card: "#YOUR_CARD",
+    text: "#YOUR_TEXT", border: "#YOUR_BORDER", notification: "#YOUR_ACCENT",
   }}, fonts: {{
     regular: {{ fontFamily: "System", fontWeight: "400" }},
     medium: {{ fontFamily: "System", fontWeight: "500" }},
     bold: {{ fontFamily: "System", fontWeight: "700" }},
     heavy: {{ fontFamily: "System", fontWeight: "900" }},
   }} }}}}>
+  Set dark: true for dark themes, dark: false for light themes. Match the colors to your palette.
   NEVER use <NavigationContainer> without the theme prop — it WILL crash.
 - Make it fully functional — not a skeleton
 - Include proper error handling and loading states
@@ -302,16 +314,16 @@ Responsive Navigation (CRITICAL — every app MUST include this):
   - Call useWindowDimensions() to get width. const isDesktop = width > 768;
   - Extract tabs from state.routes + descriptors (label, emoji icon, isFocused).
   - On MOBILE (isDesktop === false): render a horizontal bottom tab bar:
-    - View with flexDirection: 'row', backgroundColor: '#1C2128', borderTopWidth: 1, borderTopColor: '#30363D'
+    - View with flexDirection: 'row', matching your app's card/surface color, borderTopWidth: 1
     - paddingBottom: insets.bottom (safe area), height: 60 + insets.bottom
     - paddingRight: 56 — reserve space on the right for the floating agent Orb
       so the last tab item is never hidden behind the agent button
-    - Each tab: Pressable with emoji icon + label, highlighted color when focused (#58A6FF vs #8B949E)
+    - Each tab: Pressable with emoji icon + label, highlighted with your accent color when focused
   - On DESKTOP (isDesktop === true): render a vertical left sidebar:
-    - View with width: 220, backgroundColor: '#1C2128', borderRightWidth: 1, borderRightColor: '#30363D'
-    - App name as header: Text with fontSize 16, fontWeight '700', color '#F0F2F5', padding 20
+    - View with width: 220, matching your app's card/surface color, border on right
+    - App name as header: Text with fontSize 16, fontWeight '700', padding 20
     - Each tab: Pressable row with emoji (fontSize 18) + label (fontSize 14), padding 14 16,
-      active tab has backgroundColor '#21262D' + borderRadius 8 + color '#58A6FF'
+      active tab has subtle background tint + accent color text
     - marginTop: 8 between header and nav items
   - On press: call navigation.navigate(route.name)
 
@@ -326,8 +338,8 @@ Responsive Navigation (CRITICAL — every app MUST include this):
         <Tab.Navigator
           tabBar={{(props) => <AdaptiveTabBar {{...props}} appName="{app_name}" />}}
           screenOptions={{{{
-            headerStyle: {{ backgroundColor: '#1C2128' }},
-            headerTintColor: '#F0F2F5',
+            headerStyle: {{ backgroundColor: 'YOUR_CARD_COLOR' }},
+            headerTintColor: 'YOUR_TEXT_COLOR',
             tabBarStyle: {{ display: 'none' }},  // AdaptiveTabBar handles rendering
           }}}}
         >
@@ -360,9 +372,9 @@ Error Boundary (CRITICAL — prevents white screens):
   - Class component extending React.Component<{{children: React.ReactNode}}, {{hasError: boolean, error: Error | null}}>
   - static getDerivedStateFromError(error): return {{ hasError: true, error }}
   - componentDidCatch(error, errorInfo): console.error('[ErrorBoundary]', error, errorInfo)
-  - When hasError is true, render a dark error screen (#161B22 background):
-    - Center-aligned: "⚠️" emoji (fontSize 48), "Something went wrong" title (white, 18px, bold),
-      error.message in gray (13px, max 3 lines), and a "Reload App" button (#58A6FF, rounded, Pressable)
+  - When hasError is true, render an error screen using the app's background color:
+    - Center-aligned: "⚠️" emoji (fontSize 48), "Something went wrong" title (18px, bold),
+      error.message in muted text (13px, max 3 lines), and a "Reload App" button (accent color, rounded, Pressable)
     - The reload button calls: this.setState({{ hasError: false, error: null }}) to retry rendering
   - When hasError is false: return this.props.children
   - Export as default
