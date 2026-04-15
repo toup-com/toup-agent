@@ -33,31 +33,64 @@ logger = logging.getLogger(__name__)
 
 
 async def _record_layer2_change(app_id: str, file_path: str, action: str, summary: str):
-    """Append a Layer 2 change to the most recent build job for this app."""
+    """Append a Layer 2 change to the most recent build job for this app.
+
+    Best-effort audit logging — failures are logged loudly but never re-raised.
+    The file edit has already succeeded by the time we're called; we're recording
+    it for the Customizations tab UI.
+    """
     try:
         from app.db.database import async_session_maker
         from app.db.models import BuildJob
         from sqlalchemy import select
 
         async with async_session_maker() as db:
-            # Find the most recent build job for this app
-            result = await db.execute(
-                select(BuildJob)
-                .where(BuildJob.app_id == app_id)
-                .order_by(BuildJob.created_at.desc())
-                .limit(1)
-            )
-            job = result.scalar_one_or_none()
-            if not job:
+            try:
+                result = await db.execute(
+                    select(BuildJob)
+                    .where(BuildJob.app_id == app_id)
+                    .order_by(BuildJob.created_at.desc())
+                    .limit(1)
+                )
+                job = result.scalar_one_or_none()
+            except Exception as query_err:
+                logger.error(
+                    "layer2_change_query_failed app_id=%s file=%s error=%s",
+                    app_id[:8] if app_id else "?",
+                    file_path,
+                    query_err,
+                    exc_info=True,
+                )
                 return
 
-            # Parse existing changes
+            if not job:
+                logger.warning(
+                    "layer2_change_no_build_job app_id=%s file=%s",
+                    app_id[:8] if app_id else "?",
+                    file_path,
+                )
+                return
+
+            # Parse existing changes — corrupt JSON is a real bug, not silent recovery
             changes = []
             if job.layer2_changes_json:
                 try:
                     changes = json.loads(job.layer2_changes_json)
-                except (json.JSONDecodeError, TypeError):
-                    changes = []
+                    if not isinstance(changes, list):
+                        raise ValueError(f"layer2_changes_json is not a list: {type(changes)}")
+                except (json.JSONDecodeError, TypeError, ValueError) as parse_err:
+                    logger.error(
+                        "layer2_change_corrupt_history app_id=%s job_id=%s file=%s error=%s raw_len=%d",
+                        app_id[:8] if app_id else "?",
+                        job.id[:8],
+                        file_path,
+                        parse_err,
+                        len(job.layer2_changes_json or ""),
+                        exc_info=True,
+                    )
+                    # Do NOT reset to empty — that destroys audit history.
+                    # Bail out and preserve the corrupt record so an operator can fix it.
+                    return
 
             changes.append({
                 "file": file_path,
@@ -65,10 +98,31 @@ async def _record_layer2_change(app_id: str, file_path: str, action: str, summar
                 "summary": summary,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            job.layer2_changes_json = json.dumps(changes)
-            await db.commit()
-    except Exception as e:
-        logger.warning(f"Failed to record Layer 2 change: {e}")
+
+            try:
+                job.layer2_changes_json = json.dumps(changes)
+                await db.commit()
+            except Exception as commit_err:
+                logger.error(
+                    "layer2_change_commit_failed app_id=%s job_id=%s file=%s error=%s",
+                    app_id[:8] if app_id else "?",
+                    job.id[:8],
+                    file_path,
+                    commit_err,
+                    exc_info=True,
+                )
+                return
+
+    except Exception as unexpected_err:
+        # Outermost catch-all — should never hit in practice
+        logger.error(
+            "layer2_change_unexpected_error app_id=%s file=%s error_type=%s error=%s",
+            app_id[:8] if app_id else "?",
+            file_path,
+            type(unexpected_err).__name__,
+            unexpected_err,
+            exc_info=True,
+        )
 
 
 class AppFsSkill(Skill):
