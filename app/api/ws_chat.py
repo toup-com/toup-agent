@@ -658,137 +658,18 @@ async def ws_chat(
                         logger.debug("[WS] Timezone persistence skipped: %s", _tz_err)
 
                 # If message comes from inside a built app, prepend context
+                # Uses the consolidated build_layer2_context (Checkpoint 5 Part 2, Risk 5)
                 app_id_from_msg = msg.get("app_id")
                 _original_user_text = text  # Preserve before context injection
                 if channel == "app" and app_id_from_msg:
                     try:
                         from app.db.database import async_session_maker
-                        from app.db.models import App, BuildJob
-                        from sqlalchemy import select
-                        import json as _json
+                        from app.services.layer2_context import build_layer2_context
+                        _is_layer2 = msg.get("layer2") or False
                         async with async_session_maker() as _db:
-                            _app = await _db.get(App, app_id_from_msg)
-                            if _app:
-                                _slug_safe = _app.slug.replace('-', '_')
-                                _is_layer2 = msg.get("layer2") or False
-                                _preview_url = f"https://toup.ai/workspace/apps/{_app.slug}"
-                                _base_ctx = (
-                                    f"[CONTEXT: The user is chatting from inside their '{_app.name}' app. "
-                                    f"You are their in-app assistant.\n"
-                                    f"- Be conversational and helpful. Greet naturally when they say hi.\n"
-                                    f"- NEVER mention internal details (SQLite, bridges, connections, file paths, agent infrastructure).\n"
-                                    f"- NEVER give localhost URLs to the user. The app preview URL is: {_preview_url}\n"
-                                    f"- You have these app tools:\n"
-                                    f"  app_{_slug_safe}__navigate (change screens),\n"
-                                    f"  app_{_slug_safe}__read_file / app_{_slug_safe}__write_file (edit the app),\n"
-                                    f"  app_{_slug_safe}__edit_file (search/replace edits),\n"
-                                    f"  app_{_slug_safe}__query_db (read/write app data),\n"
-                                    f"  app_{_slug_safe}__restart (restart the app after code changes — ALWAYS call this after editing files).\n"
-                                    f"- When the user asks to change something in the app (UI, content, settings), "
-                                    f"use write_file/edit_file to make the change, then call restart to apply it.\n"
-                                    f"- After fixing or restarting, give the user a clickable [[open_app:{_app.slug}]] chip.\n"
-                                    f"- Suggest helpful actions as [[Button Label]] chips.\n"
-                                )
-                                if _is_layer2:
-                                    # ── Load Layer 1 context so agent knows what was already asked/built ──
-                                    _layer1_context = ""
-                                    try:
-                                        _l1_result = await _db.execute(
-                                            select(BuildJob)
-                                            .where(BuildJob.app_id == app_id_from_msg, BuildJob.layer == 1)
-                                            .order_by(BuildJob.created_at.desc())
-                                            .limit(1)
-                                        )
-                                        _l1_job = _l1_result.scalar_one_or_none()
-                                        if _l1_job:
-                                            # Original user request
-                                            _layer1_context += f"  LAYER 1 BUILD REQUEST: \"{_l1_job.prompt}\"\n"
-                                            # Structured choices from checkpoint
-                                            if _l1_job.checkpoint_json:
-                                                try:
-                                                    _ckpt = _json.loads(_l1_job.checkpoint_json)
-                                                    _pc = _ckpt.get("plan_context") or {}
-                                                    if _pc:
-                                                        _parts = []
-                                                        if _pc.get("screens"):
-                                                            _parts.append(f"screens: {', '.join(_pc['screens'])}")
-                                                        if _pc.get("features"):
-                                                            _parts.append(f"features: {', '.join(_pc['features'])}")
-                                                        if _pc.get("db_type"):
-                                                            _parts.append(f"database: {_pc['db_type']}")
-                                                        if _pc.get("design_notes"):
-                                                            _parts.append(f"design: {_pc['design_notes']}")
-                                                        if _parts:
-                                                            _layer1_context += f"  LAYER 1 CHOICES: {'; '.join(_parts)}\n"
-                                                    _ec = _ckpt.get("extra_context")
-                                                    if _ec:
-                                                        _layer1_context += f"  LAYER 1 EXTRA CONTEXT: {_ec[:500]}\n"
-                                                except Exception:
-                                                    pass
-                                        # App plan (architecture decisions)
-                                        if _app.plan_json:
-                                            try:
-                                                _plan = _json.loads(_app.plan_json)
-                                                _plan_summary = _plan.get("summary", "")
-                                                if _plan_summary:
-                                                    _layer1_context += f"  LAYER 1 APP PLAN: {_plan_summary[:500]}\n"
-                                            except Exception:
-                                                pass
-                                        # App description
-                                        if _app.description:
-                                            _layer1_context += f"  APP DESCRIPTION: {_app.description[:300]}\n"
-                                    except Exception as _e:
-                                        logger.debug(f"[WS] Could not load Layer 1 context: {_e}")
-
-                                    # Layer 2 trigger — audit-first deep customization, building ON TOP of Layer 1
-                                    _base_ctx += (
-                                        f"\n- LAYER 2 CUSTOMIZATION MODE activated.\n"
-                                    )
-                                    if _layer1_context:
-                                        _base_ctx += (
-                                            f"\n  ── WHAT LAYER 1 ALREADY ESTABLISHED (DO NOT RE-ASK ANY OF THIS) ──\n"
-                                            f"{_layer1_context}"
-                                            f"  ── END LAYER 1 CONTEXT ──\n\n"
-                                            f"  The above was ALREADY asked and answered during Layer 1. The app was ALREADY built with these parameters.\n"
-                                            f"  You MUST NOT ask about any of the above topics again. They are settled.\n\n"
-                                        )
-                                    _base_ctx += (
-                                        f"  CRITICAL: Layer 2 is an EDIT LAYER on top of Layer 1. You are NOT rebuilding the app.\n"
-                                        f"  Layer 1 already created a functional app. Your job is to ENHANCE, FIX, and EXTEND it.\n"
-                                        f"  NEVER propose replacing or rebuilding what Layer 1 created. Only improve it.\n\n"
-                                        f"  STEP 1 (SILENT): Use app_{_slug_safe}__read_file to read the app's key files — "
-                                        f"App.tsx, main screen components, database/seed data, config/constants. "
-                                        f"Be EFFICIENT: read 3-5 key files, not every single file. "
-                                        f"Do NOT tell the user you are reading files. Do NOT expose paths or technical details.\n"
-                                        f"  As you read, identify ONLY things Layer 1 did poorly or left incomplete:\n"
-                                        f"  - Placeholder/demo data that should be real content\n"
-                                        f"  - Shallow features that need deeper implementation\n"
-                                        f"  - Generic defaults that should be personalized\n"
-                                        f"  - Missing functionality that would make the app truly useful\n"
-                                        f"  - Hardcoded content that should be dynamic\n\n"
-                                        f"  STEP 2: Ask 10+ questions that reference SPECIFIC things you found in the code.\n"
-                                        f"  Each question MUST cite something concrete from the code (a number, a file, a feature).\n"
-                                        f"  Example: 'I found 500 vocabulary words but they are all general English — should I focus them on academic passages for your field?'\n"
-                                        f"  Example: 'The study plan is a fixed 90-day schedule — want me to make it adaptive based on your quiz performance?'\n"
-                                        f"  Example: 'The reading section has 10 passages but they are placeholder text — should I generate real IELTS-style passages?'\n"
-                                        f"  FORBIDDEN TOPICS (Layer 1 already handled these): target score, test date, study hours, color theme, "
-                                        f"app name, which test type (academic/general), basic preferences, weekly availability.\n"
-                                        f"  Every question MUST have [[option]] buttons on the NEXT LINE — buttons must be inline with their question, "
-                                        f"NOT collected at the end.\n\n"
-                                        f"  STEP 3 (AFTER user answers): IMMEDIATELY begin editing the app using write_file/query_db.\n"
-                                        f"  Do NOT just acknowledge the answers or offer action buttons — you MUST apply actual code changes.\n"
-                                        f"  Do NOT use memory_store to save preferences. Do NOT say 'let me store your preferences'.\n"
-                                        f"  INSTEAD: Use write_file to rewrite app files with the user's choices applied.\n"
-                                        f"  Replace placeholder data with real content, upgrade features, add algorithms.\n"
-                                        f"  Be EFFICIENT — use write_file to write complete files, batch related changes together.\n"
-                                        f"  Show brief progress after each edit.\n"
-                                        f"  IMPORTANT: You have a limited number of tool calls. Be efficient — don't waste iterations "
-                                        f"on unnecessary reads. Combine related edits into single write_file calls when possible.\n\n"
-                                        f"  STEP 4 (COMPLETION): Give a BRIEF human-friendly summary of what you customized.\n"
-                                        f"  NEVER expose internal operations (memory storage, file reading, database queries) to the user.\n"
-                                        f"  NEVER say 'let me store' or 'let me save to memory' — the user does not care about internals.\n"
-                                    )
-                                text = f"{_base_ctx}]\n\n{text}"
+                            _l2_ctx = await build_layer2_context(app_id_from_msg, _db, is_layer2=_is_layer2)
+                            if _l2_ctx:
+                                text = f"{_l2_ctx.render(is_layer2=_is_layer2)}\n\n{text}"
                     except Exception as e:
                         logger.warning(f"[WS] Failed to load app context: {e}")
 
