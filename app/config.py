@@ -91,6 +91,9 @@ class Settings(BaseSettings):
     # Day-as-Chat context architecture (feature flag)
     use_day_chat_context: bool = True  # Day-as-Chat: agent loads all sessions/channels for the day as context
 
+    # Day recall (recall_day tool + end-of-day archival summaries)
+    enable_day_recall: bool = False  # When true, exposes recall_day tool + runs hourly archival job
+
     # Workspace Bootstrap
     workspace_per_user: bool = True  # Create per-user workspace subdirectories
     workspace_create_readme: bool = True  # Create README.md in new workspaces

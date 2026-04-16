@@ -158,9 +158,14 @@ class LLMProxyEvent(Base):
     was_fallback: Mapped[bool] = mapped_column(Boolean, default=False)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(10), default="ok")  # ok | error
+    # Operation classification for billing + budget exemption.
+    # NULL or "user.*" = counts toward user caps. "system.*" (e.g. "system.day_archival")
+    # = platform-side operations, tracked for cost dashboards but exempt from user caps.
+    operation_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
         Index("ix_llm_proxy_user_created", "user_id", "created_at"),
         Index("ix_llm_proxy_user_provider_created", "user_id", "provider", "created_at"),
+        Index("ix_llm_proxy_operation_type", "operation_type"),
     )

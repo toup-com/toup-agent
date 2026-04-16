@@ -29,29 +29,38 @@ logger = logging.getLogger(__name__)
 # Tool name sets by category
 # ---------------------------------------------------------------------------
 
+# Baseline recall tools — exposed in EVERY non-greeting intent. Users reference
+# past days across every category ("build an app based on yesterday's idea"
+# is code-intent, "what did we decide about Stripe yesterday" could route
+# anywhere). recall_day must be available on turn 1, not only after tool
+# escalation, so it lives here and is merged into each intent's tool set below.
+TOOLS_RECALL: FrozenSet[str] = frozenset({
+    "recall_day",
+})
+
 TOOLS_MEMORY: FrozenSet[str] = frozenset({
     "memory_search", "memory_store", "memory_delete",
-})
+}) | TOOLS_RECALL
 
 TOOLS_WEB: FrozenSet[str] = frozenset({
     "web_search", "web_fetch", "browser",
-})
+}) | TOOLS_RECALL
 
 TOOLS_MEDIA: FrozenSet[str] = frozenset({
     "send_file", "send_photo", "analyze_image", "tts", "play_media",
     "tts_prefs", "canvas",
-})
+}) | TOOLS_RECALL
 
 TOOLS_CODE: FrozenSet[str] = frozenset({
     "exec", "pty_exec", "read_file", "write_file", "edit_file",
     "grep", "find", "ls", "apply_patch",
-})
+}) | TOOLS_RECALL
 
 TOOLS_AGENT: FrozenSet[str] = frozenset({
     "spawn", "process", "sessions_list", "sessions_history",
     "sessions_send", "session_status", "agents_list", "lanes_status",
     "thread",
-})
+}) | TOOLS_RECALL
 
 TOOLS_ADMIN: FrozenSet[str] = frozenset({
     "cron", "config_reload", "doctor", "moderate", "poll",
@@ -164,12 +173,24 @@ _MEMORY_KEYWORDS = {
     "forget", "delete memory", "remove memory", "clear memory",
     "my memories", "what have i told you", "save this",
     "store this", "note this", "remember this",
+    # Temporal recall — references to past days the agent should fetch.
+    "yesterday", "last week", "last monday", "last tuesday", "last wednesday",
+    "last thursday", "last friday", "last saturday", "last sunday",
+    "what we discussed", "what we talked about", "what you taught me",
+    "based on yesterday", "from yesterday", "on monday", "on tuesday",
+    "on wednesday", "on thursday", "on friday", "on saturday", "on sunday",
 }
 
 _MEMORY_PATTERNS_RE = re.compile(
     r'\b(?:remember|recall|memorize|forget)\b.*\b(?:that|this|about|when)\b'
     r'|\bwhat (?:did i|do you (?:know|remember))\b'
-    r'|\b(?:save|store|note|delete|remove|clear)\s+(?:this|that|my|the)\s*(?:memory|memories|info)?\b',
+    r'|\b(?:save|store|note|delete|remove|clear)\s+(?:this|that|my|the)\s*(?:memory|memories|info)?\b'
+    # Temporal recall: "yesterday", weekday names, "N days/weeks ago" — these
+    # signal the user is referencing a past day the agent should load.
+    r'|\byesterday\b'
+    r'|\b(?:last|past|this past)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)\b'
+    r'|\b\d+\s+(?:days?|weeks?|months?)\s+ago\b'
+    r'|\b(?:what|which)\b.*\b(?:we|you)\b.*\b(?:discussed|talked|taught|learned|said|did|built|decided)\b.*\b(?:yesterday|last\s+\w+|\d+\s+days?\s+ago)\b',
     re.IGNORECASE,
 )
 

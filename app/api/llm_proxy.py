@@ -101,17 +101,26 @@ async def _get_spend(
     since: datetime,
     cache_scope: str,
 ) -> int:
-    """Get total spend in cents for a user+provider since a given time."""
+    """Get user-attributable spend in cents for a user+provider since a given time.
+
+    Excludes events tagged with operation_type starting with "system." — those are
+    platform-side operations (e.g. end-of-day archival) tracked for cost dashboards
+    but exempt from user budget caps.
+    """
     cache_key = _cache_key(user_id, provider, cache_scope)
     cached = _get_cached_spend(cache_key)
     if cached is not None:
         return cached
 
+    # Budget counts only user-attributable events. System ops (operation_type LIKE 'system.%')
+    # are logged for cost tracking but don't consume the user's cap.
     result = await db.execute(
         select(func.coalesce(func.sum(LLMProxyEvent.cost_cents), 0)).where(
             LLMProxyEvent.user_id == user_id,
             LLMProxyEvent.provider == provider,
             LLMProxyEvent.created_at >= since,
+            (LLMProxyEvent.operation_type.is_(None))
+            | (~LLMProxyEvent.operation_type.startswith("system.")),
         )
     )
     cents = int(result.scalar())
@@ -186,7 +195,21 @@ async def _log_event(
     latency_ms: int,
     was_fallback: bool = False,
     status: str = "ok",
+    operation_type: Optional[str] = None,
 ):
+    """Log an LLM usage event.
+
+    `operation_type` semantics (CRITICAL — do not change without updating _get_spend):
+      - None or "user.*" → user-attributable, counts toward the user's cap.
+      - "system.*" → platform-side, EXEMPT from user cap, still shown in cost
+        dashboards. Must only be set for genuine platform operations (archival
+        summaries, etc.), never for user-facing chat.
+
+    Defensive invariant: the HTTP /chat and /embeddings proxy endpoints NEVER
+    pass operation_type — they leave it None so user cap logic applies. System
+    operations route via app/services/internal_llm.py which enforces the
+    "system." prefix with a ValueError.
+    """
     event = LLMProxyEvent(
         id=str(uuid.uuid4()),
         user_id=user_id,
@@ -199,16 +222,20 @@ async def _log_event(
         was_fallback=was_fallback,
         latency_ms=latency_ms,
         status=status,
+        operation_type=operation_type,
     )
     db.add(event)
     await db.commit()
-    _invalidate_cache(user_id)
+    # Only invalidate the user-budget cache when a user-attributable event landed.
+    # System operations don't affect user caps so they can leave the cache intact.
+    if not (operation_type and operation_type.startswith("system.")):
+        _invalidate_cache(user_id)
 
     logger.info(
         "llm_proxy user=%s provider=%s model=%s tokens_in=%d tokens_out=%d "
-        "cost_cents=%d latency=%dms fallback=%s status=%s",
+        "cost_cents=%d latency=%dms fallback=%s status=%s op=%s",
         user_id[:8], provider, model, input_tokens, output_tokens,
-        cost_cents, latency_ms, was_fallback, status,
+        cost_cents, latency_ms, was_fallback, status, operation_type or "user",
     )
 
 

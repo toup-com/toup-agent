@@ -17,7 +17,7 @@ from typing import Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import async_session_maker, User
@@ -202,6 +202,230 @@ async def run_retrieval_feedback_analysis():
     logger.info(f"Retrieval feedback analysis complete for {len(user_ids)} users")
 
 
+# Process-level lock guarding the archival pass. Prevents a second invocation
+# from starting while the previous one is still running (e.g. if an hourly run
+# is slow). Multi-worker deployments would need a DB advisory lock; a single
+# AsyncIOScheduler in a single process is the only call site today.
+_ARCHIVAL_LOCK: Optional["asyncio.Lock"] = None
+
+
+def _archival_lock() -> "asyncio.Lock":
+    """Return a singleton asyncio.Lock for the archival pass.
+
+    Created lazily on first call because module-load time may precede the
+    event loop in some deployment contexts.
+    """
+    import asyncio as _asyncio
+    global _ARCHIVAL_LOCK
+    if _ARCHIVAL_LOCK is None:
+        _ARCHIVAL_LOCK = _asyncio.Lock()
+    return _ARCHIVAL_LOCK
+
+
+# How long a DayChat may sit in archival_summary_status='pending' before the
+# next run considers it stuck and re-attempts. Set large enough that slow Haiku
+# calls aren't clobbered, small enough that a crashed worker's zombie row
+# recovers within the next job cycle.
+_STUCK_PENDING_MAX_AGE_HOURS = 2
+
+
+async def run_end_of_day_archival():
+    """Generate archival summaries for days that have rolled over in each user's local timezone.
+
+    Runs hourly. Single-instance via a process-level asyncio lock; a second
+    invocation while the previous is still running returns immediately.
+
+    For each user:
+      1. Compute the user's local today (IANA timezone-aware; DST-safe).
+      2. Find their DayChat rows where local_date < local_today AND
+         archival_summary_status IN ('not_needed', 'pending').
+         - 'pending' rows older than _STUCK_PENDING_MAX_AGE_HOURS are treated
+           as stuck (crashed worker, API timeout) and re-attempted.
+         - 'failed' rows are NEVER auto-retried (requires admin reset to avoid
+           tight-loop cost on a systematically-bad day).
+      3. Skip if the DayChat has zero user/assistant messages.
+      4. Atomically claim the row (UPDATE ... WHERE current_status = ...) so
+         concurrent workers can't double-summarize the same day.
+      5. Call generate_archival_summary (system.day_archival-tagged).
+      6. Commit archival_summary + archival_summary_generated_at + status.
+
+    Idempotent: on re-run, already-up_to_date days are skipped. The per-call cost
+    is tagged operation_type="system.day_archival" by internal_llm so it lands in
+    cost dashboards but never touches user budget caps.
+
+    Feature-flagged on settings.enable_day_recall; the scheduler skips scheduling
+    this job entirely when the flag is off.
+    """
+    import zoneinfo
+    from datetime import datetime as dt, timezone as tz, timedelta as td
+    from sqlalchemy import and_, or_, update
+
+    from app.db import async_session_maker, User
+    from app.db.models.day_chat import DayChat
+    from app.db.models import Message
+    from app.services.day_summarizer import generate_archival_summary
+
+    lock = _archival_lock()
+    if lock.locked():
+        logger.info("[archival] Skipping run — previous invocation still in flight.")
+        return
+
+    async with lock:
+        started_at = dt.now(tz.utc)
+        logger.info("[archival] Starting end-of-day archival pass at %s", started_at.isoformat())
+
+        # Enumerate active users once.
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(User.id, User.timezone).where(User.is_active == True)  # noqa: E712
+                )
+                users = [(row[0], row[1]) for row in result.fetchall()]
+        except Exception as e:
+            logger.error("[archival] Failed to enumerate users: %s", e, exc_info=True)
+            return
+
+        stuck_cutoff = dt.now(tz.utc) - td(hours=_STUCK_PENDING_MAX_AGE_HOURS)
+
+        processed = 0
+        claimed = 0
+        succeeded = 0
+        failed = 0
+        skipped_empty = 0
+        skipped_raced = 0
+
+        for user_id, user_tz_name in users:
+            try:
+                # Compute local today for this user with explicit fallback log.
+                if user_tz_name:
+                    try:
+                        local_today = dt.now(zoneinfo.ZoneInfo(user_tz_name)).date()
+                    except Exception as tz_err:
+                        logger.warning(
+                            "[archival] user=%s invalid timezone %r (%s), falling back to UTC",
+                            user_id[:8], user_tz_name, tz_err,
+                        )
+                        local_today = dt.now(tz.utc).date()
+                else:
+                    local_today = dt.now(tz.utc).date()
+
+                async with async_session_maker() as udb:
+                    # Find candidates. 'pending' only counts as a candidate if stale
+                    # (older than _STUCK_PENDING_MAX_AGE_HOURS) — otherwise another
+                    # worker is actively processing it.
+                    rows = (await udb.execute(
+                        select(DayChat).where(
+                            and_(
+                                DayChat.user_id == user_id,
+                                DayChat.local_date < local_today,
+                                or_(
+                                    DayChat.archival_summary_status == "not_needed",
+                                    and_(
+                                        DayChat.archival_summary_status == "pending",
+                                        or_(
+                                            DayChat.archival_summary_generated_at.is_(None),
+                                            DayChat.archival_summary_generated_at < stuck_cutoff,
+                                        ),
+                                    ),
+                                ),
+                            )
+                        ).order_by(DayChat.local_date.asc())
+                    )).scalars().all()
+
+                    for dc in rows:
+                        processed += 1
+
+                        # Skip days with no user/assistant content.
+                        msg_count = (await udb.execute(
+                            select(func.count()).select_from(Message).where(
+                                and_(
+                                    Message.day_chat_id == dc.id,
+                                    Message.role.in_(["user", "assistant"]),
+                                )
+                            )
+                        )).scalar() or 0
+                        if msg_count == 0:
+                            skipped_empty += 1
+                            continue
+
+                        # Atomic claim: only one worker succeeds in flipping the
+                        # status from its current value to 'pending'. If the row
+                        # already changed (another worker got there first, or it
+                        # was healed), skip without double-processing.
+                        expected_status = dc.archival_summary_status
+                        claim_now = dt.now(tz.utc)
+                        claim = await udb.execute(
+                            update(DayChat)
+                            .where(
+                                and_(
+                                    DayChat.id == dc.id,
+                                    DayChat.archival_summary_status == expected_status,
+                                )
+                            )
+                            .values(
+                                archival_summary_status="pending",
+                                archival_summary_generated_at=claim_now,
+                            )
+                        )
+                        await udb.commit()
+                        if (claim.rowcount or 0) == 0:
+                            skipped_raced += 1
+                            logger.info(
+                                "[archival] user=%s date=%s lost claim race, skipping",
+                                user_id[:8], dc.local_date.isoformat(),
+                            )
+                            continue
+                        claimed += 1
+
+                        # Generate. Runs in a separate session so a rollback here
+                        # doesn't blow up the outer transaction.
+                        try:
+                            async with async_session_maker() as gen_db:
+                                summary = await generate_archival_summary(gen_db, dc.id)
+                        except Exception as gen_err:
+                            logger.warning(
+                                "[archival] generate failed user=%s date=%s: %s",
+                                user_id[:8], dc.local_date.isoformat(), gen_err,
+                            )
+                            summary = None
+
+                        # Commit the outcome.
+                        fresh = (await udb.execute(
+                            select(DayChat).where(DayChat.id == dc.id)
+                        )).scalar_one_or_none()
+                        if not fresh:
+                            continue
+                        if summary:
+                            fresh.archival_summary = summary
+                            fresh.archival_summary_generated_at = dt.now(tz.utc)
+                            fresh.archival_summary_status = "up_to_date"
+                            succeeded += 1
+                        else:
+                            fresh.archival_summary_status = "failed"
+                            fresh.archival_summary_generated_at = dt.now(tz.utc)
+                            failed += 1
+                        await udb.commit()
+            except Exception as e:
+                logger.error(
+                    "[archival] user=%s failed: %s",
+                    (user_id or "-")[:8], e, exc_info=True,
+                )
+                failed += 1
+
+        duration_s = (dt.now(tz.utc) - started_at).total_seconds()
+        logger.info(
+            "[archival] complete duration=%.1fs users=%d processed=%d claimed=%d "
+            "succeeded=%d failed=%d empty=%d raced=%d",
+            duration_s, len(users), processed, claimed,
+            succeeded, failed, skipped_empty, skipped_raced,
+        )
+
+    logger.info(
+        "End-of-day archival complete: processed=%d succeeded=%d failed=%d empty=%d users=%d",
+        processed, succeeded, failed, skipped_empty, len(users),
+    )
+
+
 def setup_scheduler(
     decay_interval_hours: int = 6,
     consolidation_interval_hours: int = 24,
@@ -257,23 +481,31 @@ def setup_scheduler(
         name="Retrieval Quality Analysis (Weekly)",
         replace_existing=True,
     )
-    
-    # Phase 5: Retrieval Feedback Analysis — runs weekly (Sundays at 4 AM)
-    scheduler.add_job(
-        run_retrieval_feedback_analysis,
-        trigger=CronTrigger(day_of_week="sun", hour=4, minute=0),
-        id="retrieval_feedback_analysis",
-        name="Retrieval Quality Analysis (Weekly)",
-        replace_existing=True,
-    )
-    
+
+    # Day-as-Chat archival — runs hourly, gated on feature flag. Not timezone-bound:
+    # each run iterates every user and compares THEIR local today to their DayChat
+    # local_date values. A day rolling over in Asia/Tokyo will be caught within the
+    # hour; same for America/Los_Angeles. Cheaper than per-timezone cron entries.
+    try:
+        from app.config import settings as _s
+        if getattr(_s, "enable_day_recall", False):
+            scheduler.add_job(
+                run_end_of_day_archival,
+                trigger=IntervalTrigger(hours=1),
+                id="day_archival",
+                name="End-of-Day Archival Summaries",
+                replace_existing=True,
+            )
+    except Exception as e:
+        logger.warning("Could not register day_archival job: %s", e)
+
     logger.info(
         f"Scheduler configured: decay every {decay_interval_hours}h, "
         f"consolidation daily at 3AM, "
         f"health check every {health_check_interval_minutes}min, "
         f"feedback analysis weekly (Sun 4AM)"
     )
-    
+
     return scheduler
 
 

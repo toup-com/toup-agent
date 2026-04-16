@@ -49,6 +49,7 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "browser": 50_000,
     "sessions_list": 10_000,
     "sessions_history": 30_000,
+    "recall_day": 50_000,
     "grep": 30_000,
     "find": 15_000,
     "ls": 15_000,
@@ -1395,6 +1396,239 @@ class ToolExecutor:
         except Exception as e:
             logger.exception("sessions_history failed")
             return f"ERROR: {e}"
+
+    # ------------------------------------------------------------------
+    # 17b. recall_day — recall a past day's conversation across channels
+    # ------------------------------------------------------------------
+    async def _tool_recall_day(self, inp: Dict[str, Any]) -> str:
+        """Recall a past day's conversation across all channels.
+
+        See tool_definitions for the full schema. Error cases return a string
+        starting with "ERROR:" so the agent can recover without crashing the
+        turn. The outer executor applies TOOL_OUTPUT_LIMITS["recall_day"] as a
+        final safety net, but this method does its own structured truncation
+        first so the agent gets a useful "narrow with query" hint instead of a
+        silent byte cut.
+        """
+        date_ref = (inp.get("date") or "").strip()
+        if not date_ref:
+            return "ERROR: 'date' is required (e.g. 'yesterday', 'last Monday', '2026-04-15')"
+
+        # Cap query length to prevent pathological O(N·M) substring scans.
+        raw_query = inp.get("query") or ""
+        if not isinstance(raw_query, str):
+            raw_query = str(raw_query)
+        raw_query = raw_query.strip()
+        if len(raw_query) > 200:
+            raw_query = raw_query[:200]
+        query = raw_query or None
+
+        if not settings.enable_day_recall:
+            return "ERROR: recall_day is not enabled on this agent"
+
+        user_id = self._current_user_id
+        if not user_id:
+            return "ERROR: No user context"
+
+        include_full = bool(inp.get("include_full_conversation", False))
+        try:
+            limit = int(inp.get("limit", 200))
+        except (TypeError, ValueError):
+            limit = 200
+        limit = max(1, min(limit, 500))
+
+        # Character budget kept well below TOOL_OUTPUT_LIMITS["recall_day"]=50000
+        # so the outer byte-truncation fallback is never needed in practice.
+        OUTPUT_CHAR_BUDGET = 45_000
+
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models.day_chat import DayChat
+            from app.db.models import Message, Conversation, User
+            from app.agent.date_resolver import resolve_date_reference
+            from sqlalchemy import select, and_
+
+            async with async_session_maker() as db:
+                # Get user timezone for date resolution
+                user_row = (await db.execute(
+                    select(User).where(User.id == user_id)
+                )).scalar_one_or_none()
+                user_tz = getattr(user_row, "timezone", None) if user_row else None
+
+                target_date = resolve_date_reference(date_ref, tz_name=user_tz)
+                if target_date is None:
+                    logger.info(
+                        "[recall_day] user=%s unresolved date=%r tz=%s",
+                        user_id[:8], date_ref, user_tz,
+                    )
+                    return (
+                        f"ERROR: Could not resolve date '{date_ref}'. "
+                        f"Try formats like 'yesterday', 'last Monday', '3 days ago', "
+                        f"'April 10', or 'YYYY-MM-DD'. Future dates are not supported."
+                    )
+
+                # Look up DayChat by (user_id, local_date)
+                dc = (await db.execute(
+                    select(DayChat).where(
+                        and_(DayChat.user_id == user_id, DayChat.local_date == target_date)
+                    )
+                )).scalar_one_or_none()
+
+                if not dc:
+                    logger.info(
+                        "[recall_day] user=%s no_day_chat date=%s (ref=%r)",
+                        user_id[:8], target_date.isoformat(), date_ref,
+                    )
+                    return (
+                        f"No conversation record exists for {target_date.isoformat()}. "
+                        f"Day-level tracking began when the user first chatted with the agent. "
+                        f"Tell the user you have no record of that specific day."
+                    )
+
+                # Header shared across return paths.
+                header_lines = [f"# Day: {target_date.isoformat()}"]
+                if dc.message_count is not None:
+                    header_lines.append(f"Messages: {dc.message_count}")
+                header = "\n".join(header_lines)
+
+                # Summary-only mode: prefer archival (permanent, fact-dense) over
+                # rolling (compresses active context). Label honestly so the agent
+                # can judge whether to fetch the full conversation.
+                summary_source: Optional[str] = None
+                summary_tag: str = ""
+                if dc.archival_summary:
+                    summary_source = dc.archival_summary
+                    summary_tag = "archival"
+                elif dc.rolling_summary:
+                    summary_source = dc.rolling_summary
+                    summary_tag = "rolling"
+
+                if not include_full and summary_source:
+                    if query and query.lower() not in summary_source.lower():
+                        logger.info(
+                            "[recall_day] user=%s date=%s mode=summary tag=%s query=%r result=not_in_summary",
+                            user_id[:8], target_date.isoformat(), summary_tag, query,
+                        )
+                        return (
+                            f"{header}\n\n"
+                            f"## Summary ({summary_tag} — '{query}' not in summary)\n\n"
+                            f"{summary_source}\n\n"
+                            f"[note: '{query}' was not found in the {summary_tag} summary. "
+                            f"Re-call recall_day with include_full_conversation=true and the same "
+                            f"`query` to search the raw messages.]"
+                        )
+                    logger.info(
+                        "[recall_day] user=%s date=%s mode=summary tag=%s query=%r chars=%d",
+                        user_id[:8], target_date.isoformat(), summary_tag,
+                        query, len(summary_source),
+                    )
+                    return f"{header}\n\n## Summary ({summary_tag})\n\n{summary_source}"
+
+                # No summary yet, or full-conversation mode explicitly requested.
+                rows = (await db.execute(
+                    select(Message, Conversation.channel)
+                    .join(Conversation, Message.conversation_id == Conversation.id)
+                    .where(
+                        and_(
+                            Message.day_chat_id == dc.id,
+                            Message.role.in_(["user", "assistant"]),
+                        )
+                    )
+                    .order_by(Message.created_at.asc())
+                )).all()
+
+                if not rows:
+                    return f"{header}\n\n[No user/assistant messages on this day.]"
+
+                formatted: List[str] = []
+                for msg, channel in rows:
+                    time_str = msg.created_at.strftime("%-I:%M%p").lower() if msg.created_at else ""
+                    role_label = "User" if msg.role == "user" else "Agent"
+                    tag = f"[{channel or 'web'} {time_str}]"
+                    formatted.append(f"{tag} {role_label}: {msg.content}")
+
+                # v1 query filter: case-insensitive substring match + ±2 context window.
+                # Substring match — NOT regex — so metacharacters are literal.
+                # TODO(v2): replace with embedding-based semantic filter once inline
+                # embeddings are cheap enough for per-tool-call use.
+                truncated = False
+                if query:
+                    q_lower = query.lower()
+                    hit_indices = [i for i, line in enumerate(formatted) if q_lower in line.lower()]
+                    if not hit_indices:
+                        logger.info(
+                            "[recall_day] user=%s date=%s mode=full query=%r result=no_hits",
+                            user_id[:8], target_date.isoformat(), query,
+                        )
+                        return (
+                            f"{header}\n\n"
+                            f"[No messages on {target_date.isoformat()} matched '{query}'. "
+                            f"Try a different query term, or call without `query` to see the full day.]"
+                            + (f"\n\n## Summary ({summary_tag})\n\n{summary_source}" if summary_source else "")
+                        )
+                    keep: set = set()
+                    for i in hit_indices:
+                        for j in range(max(0, i - 2), min(len(formatted), i + 3)):
+                            keep.add(j)
+                    filtered = [formatted[i] for i in sorted(keep)]
+                    if len(filtered) > limit:
+                        filtered = filtered[:limit]
+                        truncated = True
+                    body = "\n\n".join(filtered)
+                    # Enforce character budget so the agent gets a truncation hint
+                    # rather than a silent byte cut from the outer executor.
+                    if len(body) > OUTPUT_CHAR_BUDGET:
+                        body = self._truncate_with_marker(body, OUTPUT_CHAR_BUDGET, narrowable=True)
+                        truncated = True
+                    summary_line = f"[filtered to {len(filtered)} / {len(formatted)} messages matching '{query}'"
+                    if truncated:
+                        summary_line += "; output truncated — narrow further with a more specific `query`"
+                    summary_line += "]"
+                    logger.info(
+                        "[recall_day] user=%s date=%s mode=full query=%r hits=%d kept=%d truncated=%s",
+                        user_id[:8], target_date.isoformat(), query,
+                        len(hit_indices), len(filtered), truncated,
+                    )
+                    return f"{header}\n\n{summary_line}\n\n{body}"
+
+                # No query — apply limit. For recall we want BOTH ends of the day:
+                # the beginning sets context, the end shows outcomes. If over limit,
+                # keep the first N/2 and last N/2 with a gap marker.
+                total = len(formatted)
+                if total > limit:
+                    half = limit // 2
+                    head = formatted[:half]
+                    tail = formatted[-half:]
+                    gap_note = f"\n\n[... {total - limit} messages elided; pass `query` to narrow ...]\n\n"
+                    body = "\n\n".join(head) + gap_note + "\n\n".join(tail)
+                    truncated = True
+                else:
+                    body = "\n\n".join(formatted)
+                if len(body) > OUTPUT_CHAR_BUDGET:
+                    body = self._truncate_with_marker(body, OUTPUT_CHAR_BUDGET, narrowable=True)
+                    truncated = True
+                logger.info(
+                    "[recall_day] user=%s date=%s mode=full query=None total=%d kept=%d truncated=%s",
+                    user_id[:8], target_date.isoformat(),
+                    total, total if total <= limit else limit, truncated,
+                )
+                return f"{header}\n\n{body}"
+
+        except Exception as e:
+            logger.exception("recall_day failed (user=%s date=%r)", user_id[:8] if user_id else "-", date_ref)
+            return f"ERROR: {type(e).__name__}: {e}"
+
+    @staticmethod
+    def _truncate_with_marker(body: str, budget: int, *, narrowable: bool) -> str:
+        """Truncate `body` to `budget` chars and append a clear marker for the agent."""
+        if len(body) <= budget:
+            return body
+        marker = "\n\n[... output truncated"
+        if narrowable:
+            marker += " — call recall_day again with a more specific `query` parameter to narrow"
+        marker += " ...]"
+        keep = max(0, budget - len(marker))
+        return body[:keep] + marker
 
     # ------------------------------------------------------------------
     # 18. browser — headless browser automation

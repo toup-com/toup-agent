@@ -58,6 +58,14 @@ class DayChat(Base):
     # Summary lifecycle: up_to_date | pending | failed | stale
     summary_status: Mapped[str] = mapped_column(String(20), default="up_to_date")
 
+    # Archival summary — permanent, fact-dense index entry produced by the
+    # end-of-day job. Distinct from rolling_summary (which compresses active
+    # context). Returned by recall_day in summary-only mode.
+    archival_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    archival_summary_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # not_needed | pending | up_to_date | failed
+    archival_summary_status: Mapped[str] = mapped_column(String(20), default="not_needed")
+
     # Relationships
     user: Mapped["User"] = relationship("User")
     conversations: Mapped[List["Conversation"]] = relationship(

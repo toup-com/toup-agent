@@ -1314,7 +1314,14 @@ class AgentRunner:
             "- **Admin capabilities**: You ARE the agent running on this system. You can install packages, "
             "manage services, modify configurations, and perform system administration tasks.\n"
             "- **Memory management**: You can store, search, and manage memories in the brain database. "
-            "You can also delete or modify memories by using `exec` with psql commands.\n\n"
+            "You can also delete or modify memories by using `exec` with psql commands.\n"
+            "- **Day recall**: Use `recall_day` to load any past day's conversation across all channels "
+            "(web, telegram, voice, app). It accepts natural language dates — 'yesterday', 'last Monday', "
+            "'3 days ago', '2026-04-15'. Weekday names always resolve to the most recent past occurrence. "
+            "Returns a fact-dense archival summary by default; pass `include_full_conversation=true` "
+            "when you need specific content (e.g. to build a quiz from yesterday's lesson, or to quote "
+            "something the user said last Tuesday). Pass an optional `query` to filter within a day that "
+            "mixes unrelated topics. NEVER tell the user you can't remember a past day — use this tool.\n\n"
             "When the user asks you to do something on their system, USE your tools — don't say you can't."
         )
 
@@ -1367,6 +1374,16 @@ class AgentRunner:
         ]
         if hasattr(self, "_current_lane") and self._current_lane != "main":
             runtime_lines.append(f"- Execution lane: {self._current_lane}")
+        if settings.enable_day_recall:
+            runtime_lines.append(
+                "- Past-day recall: call `recall_day` whenever the user references a previous day. "
+                "Dates accepted: 'yesterday', 'last Monday', '3 days ago', '2026-04-15'. "
+                "Weekday names resolve to the most recent PAST occurrence. "
+                "Returns an archival summary by default; pass include_full_conversation=true for raw messages "
+                "(e.g. to build a quiz from a past lesson), or pass `query` to filter within the day. "
+                "Call it on the first turn if needed — no prior tool call required. "
+                "NEVER say you can't remember a past day."
+            )
         section_parts["runtime"] = "\n".join(runtime_lines)
 
         # ── 6b. Vibe Coding mode ─────────────────────────────────

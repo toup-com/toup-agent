@@ -555,6 +555,45 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
+        # 17b. recall_day — recall a past day's conversation across channels
+        # ------------------------------------------------------------------
+        {
+            "name": "recall_day",
+            "description": (
+                "Recall a past day's conversation across ALL channels (web, telegram, voice, app, vibecoding). "
+                "Returns the day's archival summary by default. Set include_full_conversation=true to get the "
+                "raw messages when the summary is not detailed enough for the task. "
+                "Pass an optional `query` to filter within the day when it mixes unrelated topics "
+                "(e.g. query='calculus course' when the user asks to build a quiz from yesterday's lesson "
+                "and the day also has unrelated chatter). "
+                "Accepts natural language dates: 'yesterday', 'last Monday', '3 days ago', 'April 10', "
+                "or ISO 'YYYY-MM-DD'. Weekday names always resolve to the most recent PAST occurrence. "
+                "Use this whenever the user references a previous day — never say you can't remember."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Date reference: 'yesterday', 'last Tuesday', '3 days ago', '2026-04-15', 'April 10', etc.",
+                    },
+                    "include_full_conversation": {
+                        "type": "boolean",
+                        "description": "If true, return raw messages annotated with channel + time. Use when you need specific content — e.g. to make a quiz from a lesson. Default: false (summary only).",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional topic filter. When the day mixes unrelated topics, pass this to narrow the returned messages (keyword match with ±2-message context window).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max messages to return when include_full_conversation=true. Default 200.",
+                    },
+                },
+                "required": ["date"],
+            },
+        },
+        # ------------------------------------------------------------------
         # 18. play_media — play music/video for the user
         # ------------------------------------------------------------------
         {

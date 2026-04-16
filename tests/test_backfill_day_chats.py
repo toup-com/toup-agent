@@ -75,6 +75,9 @@ async def _make_engine():
                     summary_up_to_message_id VARCHAR(50),
                     summary_updated_at TIMESTAMP,
                     summary_status VARCHAR(20) DEFAULT 'up_to_date',
+                    archival_summary TEXT,
+                    archival_summary_generated_at TIMESTAMP,
+                    archival_summary_status VARCHAR(20) DEFAULT 'not_needed',
                     UNIQUE(user_id, local_date)
                 )
             """)
