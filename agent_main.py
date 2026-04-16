@@ -54,6 +54,9 @@ from app.api.apps import router as apps_router, set_app_manager, set_app_gateway
 _app_start_time = None
 _skill_loader = None
 
+# ── Boot progress tracking (exposed via /agent/health) ────────────
+_boot_progress = {"percent": 0, "phase": "starting", "ready": False}
+
 # ── Paths that skip API key auth (health checks, root) ─────────────
 _PUBLIC_PATHS = frozenset({"/", "/agent/health", "/agent/system", "/docs", "/openapi.json", "/redoc"})
 
@@ -187,6 +190,7 @@ async def lifespan(app: FastAPI):
 
     # ── Startup ───────────────────────────────────────────────
     print("🤖 Toup Agent starting up...")
+    _boot_progress.update(percent=5, phase="database")
     await init_db()
     print("✅ Database initialized")
 
@@ -210,6 +214,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ Auto-update check skipped: {e}")
 
+    _boot_progress.update(percent=10, phase="auto_update")
     # ── Ensure owner user exists in DB ─────────────────────────
     # Must run BEFORE session migration (which references user_id as FK)
     if settings.user_id:
@@ -270,6 +275,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ Session migration skipped: {e}")
 
+    _boot_progress.update(percent=15, phase="user_setup")
     # Pre-load embedding service (needed for memory retrieval in system prompt)
     try:
         from app.services import get_embedding_service
@@ -283,6 +289,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ Could not pre-load embedding service: {e}")
 
+    _boot_progress.update(percent=25, phase="embeddings")
     # ── Agent stack initialization ────────────────────────────
     telegram_bot = None
     cron_service = None
@@ -324,6 +331,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
+        _boot_progress.update(percent=35, phase="skills")
         # Build the agent pipeline
         openai_agent_svc = OpenAIAgentService()
         subagent_manager = SubAgentManager()
@@ -401,6 +409,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ Orphan job cleanup skipped: {e}")
 
+        _boot_progress.update(percent=50, phase="agent_pipeline")
         # ── App Manager + App Builder Skill ────────────────────
         # Each step has its own try/except so partial init succeeds.
         # If restore_on_startup fails, App Builder still registers.
@@ -491,6 +500,7 @@ async def lifespan(app: FastAPI):
         _self._skill_loader = skill_loader
         _self._cron_service = cron_service
 
+        _boot_progress.update(percent=65, phase="apps")
         # ── Start Telegram bot (if configured) ────────────────
         if settings.telegram_bot_token:
             telegram_bot = ToupTelegramBot(
@@ -601,6 +611,7 @@ async def lifespan(app: FastAPI):
         import traceback
         traceback.print_exc()
 
+    _boot_progress.update(percent=80, phase="channels")
     # ── Hook Bus ──────────────────────────────────────────────
     from app.agent.hooks import get_hook_bus, HookEvent
     _hook_bus = get_hook_bus()
@@ -638,6 +649,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ MCP client error: {e}")
 
+    _boot_progress.update(percent=85, phase="hooks")
     # ── Discord Channel ───────────────────────────────────────
     discord_channel = None
     if settings.discord_bot_token:
@@ -843,6 +855,7 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         print(f"⚠️ dashboard/ cleanup skipped: {_e}")
 
+    _boot_progress.update(percent=100, phase="ready", ready=True)
     print("🤖 Toup Agent ready.")
     print(f"   Server:  http://0.0.0.0:8001")
     print(f"   Health:  http://localhost:8001/agent/health")
@@ -1031,6 +1044,7 @@ async def agent_health():
         "mode": "agent",
         "uptime_seconds": round(uptime, 1),
         "agent_model": settings.agent_model,
+        "boot_progress": _boot_progress,
         "channels": {
             "telegram": "enabled" if settings.telegram_bot_token else "disabled",
             "discord": "enabled" if settings.discord_bot_token else "disabled",
