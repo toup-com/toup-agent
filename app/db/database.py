@@ -251,6 +251,16 @@ async def init_db():
         "END IF; END $$",
         # Day-as-Chat: composite index for hot-path query
         "CREATE INDEX IF NOT EXISTS ix_messages_day_chat_created ON messages(day_chat_id, created_at)",
+        # Day Recall + LLM proxy operation tagging (migration 021).
+        # These run on every startup so existing agent DBs self-heal on container
+        # restart without needing manual psql. New DBs get the columns from
+        # Base.metadata.create_all() via the ORM model; these ALTERs are no-ops
+        # there. See docs/day-recall-system.md.
+        "ALTER TABLE llm_proxy_events ADD COLUMN IF NOT EXISTS operation_type VARCHAR(50)",
+        "CREATE INDEX IF NOT EXISTS ix_llm_proxy_operation_type ON llm_proxy_events (operation_type)",
+        "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS archival_summary TEXT",
+        "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS archival_summary_generated_at TIMESTAMP",
+        "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS archival_summary_status VARCHAR(20) NOT NULL DEFAULT 'not_needed'",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)
