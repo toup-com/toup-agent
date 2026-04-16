@@ -80,7 +80,7 @@ class Settings(BaseSettings):
 
     # Agent Runtime
     agent_model: str = "claude-opus-4-6"  # Primary agent model
-    agent_fallback_model: str = "claude-haiku-4-5-20251001"  # Fallback if primary model fails
+    agent_fallback_model: str = "gpt-5.4"  # Fallback if primary model fails (cross-provider)
     agent_max_tokens: int = 16000  # Max output tokens for agent
     agent_max_tool_iterations: int = 40  # Max tool call loops before forcing stop
     agent_workspace_dir: str = "/app/workspace"  # Working directory for file operations

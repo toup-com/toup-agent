@@ -716,17 +716,11 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
     """
     from app.services.model_router import classify_request
 
-    # Classify the task complexity
+    # Simple key-based routing — no classifier, just pick the best model
     decision = classify_request(task)
-    # Since the voice agent already decided this needs reasoning (called think),
-    # treat "light" as at least "medium" — use the configured agent_model
-    # All tiers use Opus 4.6 for now (routing disabled for testing)
-    model_override = decision.model  # always claude-opus-4-6
+    model_override = decision.model
 
-    logger.info(
-        "[REALTIME] think: tier=%s, model=%s, reason=%s",
-        decision.tier, model_override, decision.reason,
-    )
+    logger.info("[REALTIME] think: model=%s", model_override)
 
     # Option A: Use agent_runner (preferred — full tool access + memory)
     if _agent_runner:

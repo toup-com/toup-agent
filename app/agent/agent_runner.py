@@ -566,9 +566,13 @@ class AgentRunner:
                     raise
 
                 except Exception as e:
-                    # Detect authentication errors — no point retrying the same
-                    # broken credentials; immediately cross-provider fallback.
-                    _is_auth_error = "401" in str(e) or "authentication" in str(e).lower() or "AuthenticationError" in type(e).__name__
+                    # Detect errors that warrant immediate cross-provider fallback:
+                    # - 401 auth errors: broken credentials, skip retries entirely
+                    # - 429 rate limits: after exhausting retries, cross to other provider
+                    _err_str = str(e).lower()
+                    _is_auth_error = "401" in str(e) or "authentication" in _err_str or "AuthenticationError" in type(e).__name__
+                    _is_rate_limit = "429" in str(e) or "rate_limit" in _err_str or "RateLimitError" in type(e).__name__
+                    _should_cross_provider = _is_auth_error or _is_rate_limit
                     if _is_auth_error:
                         attempt = MAX_RETRIES  # skip remaining retries
 
@@ -576,15 +580,15 @@ class AgentRunner:
                         logger.warning(f"[AGENT] LLM call failed (attempt {attempt + 1}), retrying: {e}")
                         await asyncio.sleep(RETRY_DELAY * (attempt + 1))
                     else:
-                        # Pick fallback: on auth errors, cross to the OTHER provider
-                        # so a broken Anthropic key falls back to OpenAI and vice-versa.
+                        # Pick fallback: on auth/rate-limit errors, cross to the OTHER
+                        # provider so broken or throttled keys fall back gracefully.
                         from app.services.key_provider import keys as _keys
-                        if _is_auth_error and _is_claude_model(active_model) and _keys.has_openai:
+                        if _should_cross_provider and _is_claude_model(active_model) and _keys.has_openai:
                             fallback = "gpt-5.4"
-                            logger.warning(f"[AGENT] Auth error on {active_model}, crossing to OpenAI fallback {fallback}")
-                        elif _is_auth_error and not _is_claude_model(active_model) and _keys.has_anthropic:
-                            fallback = "claude-sonnet-4-6"
-                            logger.warning(f"[AGENT] Auth error on {active_model}, crossing to Anthropic fallback {fallback}")
+                            logger.warning(f"[AGENT] {type(e).__name__} on {active_model}, crossing to OpenAI fallback {fallback}")
+                        elif _should_cross_provider and not _is_claude_model(active_model) and _keys.has_anthropic:
+                            fallback = "claude-opus-4-6"
+                            logger.warning(f"[AGENT] {type(e).__name__} on {active_model}, crossing to Anthropic fallback {fallback}")
                         else:
                             fallback = settings.agent_fallback_model
                             logger.warning(f"[AGENT] Primary model {active_model} failed, trying fallback {fallback}")
