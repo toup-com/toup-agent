@@ -285,7 +285,10 @@ async def run_end_of_day_archival():
             logger.error("[archival] Failed to enumerate users: %s", e, exc_info=True)
             return
 
-        stuck_cutoff = dt.now(tz.utc) - td(hours=_STUCK_PENDING_MAX_AGE_HOURS)
+        # Naive UTC to match the `archival_summary_generated_at` column which
+        # is DateTime (no tz) per the day_chats model. asyncpg refuses to
+        # compare tz-aware vs tz-naive — a real production bug caught here.
+        stuck_cutoff = (dt.now(tz.utc) - td(hours=_STUCK_PENDING_MAX_AGE_HOURS)).replace(tzinfo=None)
 
         processed = 0
         claimed = 0
@@ -353,7 +356,8 @@ async def run_end_of_day_archival():
                         # already changed (another worker got there first, or it
                         # was healed), skip without double-processing.
                         expected_status = dc.archival_summary_status
-                        claim_now = dt.now(tz.utc)
+                        # Naive UTC — column has no tz. See comment on stuck_cutoff.
+                        claim_now = dt.now(tz.utc).replace(tzinfo=None)
                         claim = await udb.execute(
                             update(DayChat)
                             .where(
@@ -397,12 +401,12 @@ async def run_end_of_day_archival():
                             continue
                         if summary:
                             fresh.archival_summary = summary
-                            fresh.archival_summary_generated_at = dt.now(tz.utc)
+                            fresh.archival_summary_generated_at = dt.now(tz.utc).replace(tzinfo=None)
                             fresh.archival_summary_status = "up_to_date"
                             succeeded += 1
                         else:
                             fresh.archival_summary_status = "failed"
-                            fresh.archival_summary_generated_at = dt.now(tz.utc)
+                            fresh.archival_summary_generated_at = dt.now(tz.utc).replace(tzinfo=None)
                             failed += 1
                         await udb.commit()
             except Exception as e:

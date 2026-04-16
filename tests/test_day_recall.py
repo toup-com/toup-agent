@@ -769,6 +769,33 @@ async def test_archival_job_atomic_claim():
     print("✓ test_archival_job_atomic_claim")
 
 
+# ── Test 16b: archival job writes tz-naive timestamps (prod bug) ─────
+async def test_archival_writes_tz_naive_timestamps():
+    """`archival_summary_generated_at` is a tz-NAIVE column (DateTime, no tz).
+
+    Regression: the archival job originally compared column values against
+    `datetime.now(timezone.utc)` which asyncpg rejects as "can't subtract
+    offset-naive and offset-aware datetimes". The fix strips tzinfo before
+    comparison/write. This test asserts the runtime code uses naive UTC.
+    """
+    import inspect
+    from app.scripts import scheduled_tasks
+
+    src = inspect.getsource(scheduled_tasks.run_end_of_day_archival)
+    # Three timestamp sites must be tz-naive: stuck_cutoff, claim_now,
+    # and the two archival_summary_generated_at writes in the outcome commit.
+    assert "stuck_cutoff" in src
+    # The fix pattern: `.replace(tzinfo=None)` on every datetime that lands
+    # in the day_chats.archival_summary_generated_at column or is compared
+    # against it.
+    assert src.count(".replace(tzinfo=None)") >= 4, (
+        "Expected >=4 tzinfo=None strips in run_end_of_day_archival; "
+        "otherwise asyncpg will reject tz-mixed comparisons. "
+        f"Found {src.count('.replace(tzinfo=None)')}"
+    )
+    print("✓ test_archival_writes_tz_naive_timestamps")
+
+
 # ── Test 17: stuck-pending recovery (B1) ─────────────────────────────
 async def test_stuck_pending_recovery():
     """A DayChat stuck in 'pending' for >2h must be re-claimable on the next run."""
@@ -923,6 +950,7 @@ def main():
         await test_quiz_from_yesterday_integration()
         await test_query_adversarial_inputs()
         await test_archival_job_atomic_claim()
+        await test_archival_writes_tz_naive_timestamps()
         await test_stuck_pending_recovery()
         await test_timezone_day_rollover()
         await test_recall_output_truncation_marker()
