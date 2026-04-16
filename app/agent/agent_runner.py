@@ -566,14 +566,31 @@ class AgentRunner:
                     raise
 
                 except Exception as e:
+                    # Detect authentication errors — no point retrying the same
+                    # broken credentials; immediately cross-provider fallback.
+                    _is_auth_error = "401" in str(e) or "authentication" in str(e).lower() or "AuthenticationError" in type(e).__name__
+                    if _is_auth_error:
+                        attempt = MAX_RETRIES  # skip remaining retries
+
                     if attempt < MAX_RETRIES:
                         logger.warning(f"[AGENT] LLM call failed (attempt {attempt + 1}), retrying: {e}")
                         await asyncio.sleep(RETRY_DELAY * (attempt + 1))
                     else:
-                        fallback = settings.agent_fallback_model
+                        # Pick fallback: on auth errors, cross to the OTHER provider
+                        # so a broken Anthropic key falls back to OpenAI and vice-versa.
+                        from app.services.key_provider import keys as _keys
+                        if _is_auth_error and _is_claude_model(active_model) and _keys.has_openai:
+                            fallback = "gpt-5.4"
+                            logger.warning(f"[AGENT] Auth error on {active_model}, crossing to OpenAI fallback {fallback}")
+                        elif _is_auth_error and not _is_claude_model(active_model) and _keys.has_anthropic:
+                            fallback = "claude-sonnet-4-6"
+                            logger.warning(f"[AGENT] Auth error on {active_model}, crossing to Anthropic fallback {fallback}")
+                        else:
+                            fallback = settings.agent_fallback_model
+                            logger.warning(f"[AGENT] Primary model {active_model} failed, trying fallback {fallback}")
+
                         if active_model != fallback:
                             fallback_llm = self.anthropic if _is_claude_model(fallback) else self.llm
-                            logger.warning(f"[AGENT] Primary model {active_model} failed, trying fallback {fallback}")
                             try:
                                 text_buf = ""
                                 pending_tool_calls = []
