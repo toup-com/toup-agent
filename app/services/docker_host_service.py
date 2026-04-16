@@ -247,6 +247,10 @@ async def provision_container(
         # Remove existing container if any
         await _run_ssh(f"docker rm -f {container_name} 2>/dev/null || true")
 
+        # Clean up dangling images and stale build cache to prevent disk bloat
+        await _run_ssh("docker image prune -f 2>/dev/null || true")
+        await _run_ssh("docker builder prune -f --keep-storage=2GB 2>/dev/null || true")
+
         # Run the container
         docker_run = (
             f"docker run -d "
@@ -415,6 +419,11 @@ async def upgrade_all_containers(db: AsyncSession) -> dict:
         except Exception as e:
             logger.error("Failed to upgrade container %s: %s", c.container_name, e)
             failed += 1
+    # Clean up old images and build cache after upgrading all containers
+    await _run_ssh("docker image prune -f 2>/dev/null || true")
+    await _run_ssh("docker builder prune -f --keep-storage=2GB 2>/dev/null || true")
+    logger.info("Docker cleanup: pruned dangling images and stale build cache")
+
     return {"upgraded": upgraded, "failed": failed, "total": len(containers)}
 
 
