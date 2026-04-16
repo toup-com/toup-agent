@@ -20,6 +20,50 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _convert_messages_for_anthropic(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert OpenAI-format messages to Anthropic format.
+
+    The main difference is image handling:
+      OpenAI:    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+      Anthropic: {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
+    """
+    converted = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            converted.append(msg)
+            continue
+
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                # Convert OpenAI image_url → Anthropic image
+                url = (block.get("image_url") or {}).get("url", "")
+                if url.startswith("data:"):
+                    # Parse data URI: data:image/png;base64,iVBOR...
+                    header, _, b64data = url.partition(",")
+                    media_type = header.split(":", 1)[-1].split(";")[0] if ":" in header else "image/png"
+                    new_content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64data,
+                        },
+                    })
+                else:
+                    # External URL — use Anthropic's URL source
+                    new_content.append({
+                        "type": "image",
+                        "source": {"type": "url", "url": url},
+                    })
+            else:
+                new_content.append(block)
+
+        converted.append({**msg, "content": new_content})
+    return converted
+
+
 @dataclass
 class AnthropicResponse:
     """Non-streaming response from Anthropic."""
@@ -144,6 +188,7 @@ class AnthropicService:
         model = model or self.default_model
         self._ensure_client()
         max_tokens = max_tokens or self.default_max_tokens
+        messages = _convert_messages_for_anthropic(messages)
 
         kwargs: Dict[str, Any] = dict(
             model=model,
@@ -231,6 +276,7 @@ class AnthropicService:
         self._ensure_client()
         model = model or self.default_model
         max_tokens = max_tokens or self.default_max_tokens
+        messages = _convert_messages_for_anthropic(messages)
 
         kwargs: Dict[str, Any] = dict(
             model=model,
