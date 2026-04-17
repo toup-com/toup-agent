@@ -86,6 +86,11 @@ class Message(Base):
     # Rich content metadata (JSON): media cards, tool results, etc.
     metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Generated-file attachments (array of {id, filename, mime_type, size_bytes, storage_path, created_at}).
+    # Populated by agent generate_* tools; rendered in the web two-pane DocumentSplit.
+    # Stored as JSONB on Postgres; Text fallback on SQLite (dev).
+    attachments: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # Embedding stored as JSON array (for SQLite compatibility)
     embedding_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

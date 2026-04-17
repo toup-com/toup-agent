@@ -64,6 +64,13 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "poll": 1_000,
     "thread": 2_000,
     "tts_prefs": 1_000,
+    # Document generators — short confirmation strings, attachment goes via WS event
+    "generate_pdf": 1_000,
+    "generate_docx": 1_000,
+    "generate_xlsx": 1_000,
+    "generate_pptx": 1_000,
+    "generate_markdown": 1_000,
+    "generate_html_to_pdf": 1_000,
 }
 
 # Default if tool not in the table
@@ -177,6 +184,10 @@ class ToolExecutor:
         self._proc_counter: int = 0
         # Per-user disabled tools (loaded from AgentConfig)
         self.user_disabled_tools: Set[str] = set()
+        # Accumulated attachments from generate_* tools (one list per agent run).
+        # agent_runner drains this after each tool call to emit WS events, and
+        # at assistant-message persistence to set Message.attachments. Cleared there.
+        self.pending_attachments: List[Dict[str, Any]] = []
 
     def set_chat_id(self, chat_id: Optional[int]):
         """Set the current Telegram chat ID for send_file/send_photo tools."""
@@ -879,6 +890,103 @@ class ToolExecutor:
         except Exception as exc:
             logger.exception("send_photo failed")
             return f"ERROR: Failed to send photo: {exc}"
+
+    # ------------------------------------------------------------------
+    # 10b. generate_* — produce formatted documents
+    # ------------------------------------------------------------------
+    async def _register_attachment(self, att) -> str:
+        """Append an Attachment to pending_attachments and return a summary string."""
+        d = att.to_dict() if hasattr(att, "to_dict") else dict(att)
+        self.pending_attachments.append(d)
+        return (
+            f"Generated {d['filename']} ({d['size_bytes']} bytes, {d['mime_type']}). "
+            f"File will appear in the document pane; agent_runner will emit the "
+            f"attachment event after this tool call completes."
+        )
+
+    def _user_scope(self) -> str:
+        return getattr(self, "_user_id", "") or "shared"
+
+    async def _tool_generate_pdf(self, inp: Dict[str, Any]) -> str:
+        from app.agent.doc_generators import gen_pdf
+        try:
+            att = await gen_pdf(
+                content=inp.get("content", []),
+                filename=inp.get("filename", "document.pdf"),
+                user_scope=self._user_scope(),
+                title=inp.get("title"),
+                cover_page=bool(inp.get("cover_page", False)),
+            )
+        except Exception as exc:
+            logger.exception("generate_pdf failed")
+            return f"ERROR: {type(exc).__name__}: {exc}"
+        return await self._register_attachment(att)
+
+    async def _tool_generate_docx(self, inp: Dict[str, Any]) -> str:
+        from app.agent.doc_generators import gen_docx
+        try:
+            att = await gen_docx(
+                content=inp.get("content", []),
+                filename=inp.get("filename", "document.docx"),
+                user_scope=self._user_scope(),
+                title=inp.get("title"),
+            )
+        except Exception as exc:
+            logger.exception("generate_docx failed")
+            return f"ERROR: {type(exc).__name__}: {exc}"
+        return await self._register_attachment(att)
+
+    async def _tool_generate_xlsx(self, inp: Dict[str, Any]) -> str:
+        from app.agent.doc_generators import gen_xlsx
+        try:
+            att = await gen_xlsx(
+                sheets=inp.get("sheets", []),
+                filename=inp.get("filename", "document.xlsx"),
+                user_scope=self._user_scope(),
+            )
+        except Exception as exc:
+            logger.exception("generate_xlsx failed")
+            return f"ERROR: {type(exc).__name__}: {exc}"
+        return await self._register_attachment(att)
+
+    async def _tool_generate_pptx(self, inp: Dict[str, Any]) -> str:
+        from app.agent.doc_generators import gen_pptx
+        try:
+            att = await gen_pptx(
+                slides=inp.get("slides", []),
+                filename=inp.get("filename", "document.pptx"),
+                user_scope=self._user_scope(),
+            )
+        except Exception as exc:
+            logger.exception("generate_pptx failed")
+            return f"ERROR: {type(exc).__name__}: {exc}"
+        return await self._register_attachment(att)
+
+    async def _tool_generate_markdown(self, inp: Dict[str, Any]) -> str:
+        from app.agent.doc_generators import gen_markdown
+        try:
+            att = await gen_markdown(
+                content=inp.get("content", ""),
+                filename=inp.get("filename", "document.md"),
+                user_scope=self._user_scope(),
+            )
+        except Exception as exc:
+            logger.exception("generate_markdown failed")
+            return f"ERROR: {type(exc).__name__}: {exc}"
+        return await self._register_attachment(att)
+
+    async def _tool_generate_html_to_pdf(self, inp: Dict[str, Any]) -> str:
+        from app.agent.doc_generators import gen_html_to_pdf
+        try:
+            att = await gen_html_to_pdf(
+                html=inp.get("html", ""),
+                filename=inp.get("filename", "document.pdf"),
+                user_scope=self._user_scope(),
+            )
+        except Exception as exc:
+            logger.exception("generate_html_to_pdf failed")
+            return f"ERROR: {type(exc).__name__}: {exc}"
+        return await self._register_attachment(att)
 
     # ------------------------------------------------------------------
     # 11. analyze_image — GPT vision on URL or workspace file

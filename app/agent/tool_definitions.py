@@ -1303,3 +1303,134 @@ def get_extended_tools():
             },
         },
     ]
+
+
+def get_doc_generation_tools() -> List[Dict[str, Any]]:
+    """Document-generation tools (PDF/DOCX/XLSX/PPTX/MD/HTML→PDF).
+
+    Gated by settings.feature_doc_generation. Each tool writes a file to
+    the per-user storage backend and returns a summary string; the
+    actual attachment metadata is emitted to the client over the WS
+    `attachment` event after the tool completes.
+
+    The LLM should pick these over inline markdown when the user asks
+    for an export, report, invoice, spreadsheet, slide deck, etc.
+    """
+    _content_block = {
+        "type": "array",
+        "description": (
+            "Structured content blocks. Each block has a `type`: "
+            "'heading' (+level 1-4, +text), 'paragraph' (+text), "
+            "'table' (+headers, +rows), 'image' (+path, +caption?), "
+            "'bullet_list' (+items), 'numbered_list' (+items), 'page_break'."
+        ),
+        "items": {"type": "object"},
+    }
+    return [
+        {
+            "name": "generate_pdf",
+            "description": (
+                "Produce a PDF from structured content blocks and deliver it to the user. "
+                "Prefer this over inline markdown when the user asks for a report, export, "
+                "invoice, or any document they'd want to download or share."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "content": _content_block,
+                    "filename": {"type": "string", "description": "Output filename (e.g. 'report.pdf')."},
+                    "title": {"type": "string", "description": "Optional document title, used for the cover page and PDF metadata."},
+                    "cover_page": {"type": "boolean", "description": "If true, add a cover page with title + today's date."},
+                },
+                "required": ["content", "filename"],
+            },
+        },
+        {
+            "name": "generate_docx",
+            "description": (
+                "Produce a Word (.docx) document from structured content blocks. "
+                "Use when the user wants an editable document (vs. a read-only PDF)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "content": _content_block,
+                    "filename": {"type": "string"},
+                    "title": {"type": "string", "description": "Optional H0 title at the top."},
+                },
+                "required": ["content", "filename"],
+            },
+        },
+        {
+            "name": "generate_xlsx",
+            "description": (
+                "Produce an Excel (.xlsx) workbook with one or more sheets. "
+                "Use for tabular data — expense summaries, datasets, schedules."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sheets": {
+                        "type": "array",
+                        "description": "List of sheets, each {name, headers, rows}. `rows` is a list of lists.",
+                        "items": {"type": "object"},
+                    },
+                    "filename": {"type": "string"},
+                },
+                "required": ["sheets", "filename"],
+            },
+        },
+        {
+            "name": "generate_pptx",
+            "description": (
+                "Produce a PowerPoint (.pptx) deck. Use for presentations, briefings, slide summaries."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "slides": {
+                        "type": "array",
+                        "description": (
+                            "List of slides. Each slide has `type`: 'title' (+title, +subtitle), "
+                            "'content' (+title, +bullets[]), 'image' (+title, +path), 'section' (+title)."
+                        ),
+                        "items": {"type": "object"},
+                    },
+                    "filename": {"type": "string"},
+                },
+                "required": ["slides", "filename"],
+            },
+        },
+        {
+            "name": "generate_markdown",
+            "description": (
+                "Save a Markdown document. Use when the user wants plain-text output "
+                "they can import elsewhere (notes, docs sites, etc.)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Markdown source."},
+                    "filename": {"type": "string"},
+                },
+                "required": ["content", "filename"],
+            },
+        },
+        {
+            "name": "generate_html_to_pdf",
+            "description": (
+                "Render an HTML string to PDF via weasyprint. Use when you need CSS-styled PDF "
+                "output (custom fonts, complex layouts). Only available on agent-side runtimes "
+                "(requires Pango/Cairo); falls back to an error on platform-side. Prefer "
+                "generate_pdf with structured blocks when possible."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "html": {"type": "string", "description": "Full HTML document or fragment."},
+                    "filename": {"type": "string"},
+                },
+                "required": ["html", "filename"],
+            },
+        },
+    ]

@@ -10,6 +10,10 @@ Protocol:
     { "type": "text_chunk", "text": "..." }
     { "type": "tool_start", "tool": "..." }
     { "type": "tool_end", "tool": "...", "summary": "..." }
+    { "type": "attachment", "message_id": "...", "attachment_id": "...",
+      "filename": "...", "mime_type": "...", "size_bytes": 1234,
+      "download_url": "/api/files/{message_id}/{attachment_id}",
+      "preview_url": "/api/files/.../preview?format=html" }
     { "type": "done", "session_id": "...", "tokens": {...}, "model": "..." }
     { "type": "error", "message": "..." }
     { "type": "pong" }
@@ -715,6 +719,35 @@ async def ws_chat(
                     except Exception:
                         pass
 
+                async def on_attachment(message_id: str, att: dict):
+                    """Emit `attachment` event when a generate_* tool produces a file.
+
+                    The frontend uses this to open the DocumentSplit pane (or inline
+                    fallback on narrow viewports) and attach the file reference to
+                    the currently-streaming assistant message.
+                    """
+                    mime = att.get("mime_type", "")
+                    aid = att.get("id", "")
+                    preview_mimes = {
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    }
+                    payload = {
+                        "type": "attachment",
+                        "message_id": message_id,
+                        "attachment_id": aid,
+                        "filename": att.get("filename", ""),
+                        "mime_type": mime,
+                        "size_bytes": att.get("size_bytes", 0),
+                        "download_url": f"{settings.api_prefix}/files/{message_id}/{aid}",
+                    }
+                    if mime in preview_mimes or mime == "application/pdf" or mime.startswith("image/"):
+                        payload["preview_url"] = f"{settings.api_prefix}/files/{message_id}/{aid}/preview?format=html"
+                    try:
+                        await websocket.send_json(payload)
+                    except Exception:
+                        pass
+
                 async def on_tool_start(tool_name: str):
                     _tprint(f"{_DIM}  ⚙ {tool_name}{_RESET}")
                     try:
@@ -833,6 +866,7 @@ async def ws_chat(
                     on_text_chunk=on_text_chunk,
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
+                    on_attachment=on_attachment,
                     model_override=model,
                     save_user_message=not is_onboarding_msg and not _user_msg_presaved and not _is_system_action,
                     media_paths=_media_paths if _media_paths else None,

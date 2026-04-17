@@ -34,6 +34,17 @@ markdown==3.5.2
 python-magic==0.4.27
 chardet==5.2.0
 
+# Document Generation (Phase 1 of doc-delivery feature)
+# reportlab: PDF generation (pure Python — works on platform + agent)
+# openpyxl: XLSX generation + server-side HTML preview
+# mammoth: DOCX → HTML preview rendering
+# weasyprint: HTML → PDF with CSS (agent-side only — needs Pango/Cairo system libs,
+#   imported lazily inside the generator so platform image without libs doesn't break)
+reportlab==4.1.0
+openpyxl==3.1.2
+mammoth==1.7.1
+weasyprint==61.2
+
 # Media Processing
 pillow==10.2.0
 # moviepy==1.0.3  # Optional: for video processing

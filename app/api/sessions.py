@@ -597,6 +597,20 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         except (json.JSONDecodeError, TypeError):
             pass
 
+    # Parse generated-file attachments (strip storage_path — internal only).
+    attachments_list = None
+    if getattr(message, 'attachments', None):
+        try:
+            raw = json.loads(message.attachments)
+            if isinstance(raw, list):
+                attachments_list = [
+                    {k: v for k, v in att.items() if k != "storage_path"}
+                    for att in raw
+                    if isinstance(att, dict)
+                ]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     resp = dict(
         id=message.id,
         role=message.role,
@@ -608,6 +622,7 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         memories_retrieved=memories_retrieved,
         processing_time_ms=message.processing_time_ms,
         media=msg_metadata.get("media") if msg_metadata else None,
+        attachments=attachments_list,
     )
 
     # Enrich job card messages with current BuildJob status

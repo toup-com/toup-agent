@@ -91,6 +91,14 @@ class Settings(BaseSettings):
     # Day-as-Chat context architecture (feature flag)
     use_day_chat_context: bool = True  # Day-as-Chat: agent loads all sessions/channels for the day as context
 
+    # Document Generation + Web Attachments (Phase 1+2 of doc-delivery feature)
+    # When false: generate_* tools are not registered, attachment WS events are not emitted.
+    # Frontend has its own localStorage gate (TOUP_DOC_ATTACHMENTS) for the two-pane UI.
+    feature_doc_generation: bool = False
+    # Storage backend for generated files. "local" writes to {agent_workspace_dir}/generated/.
+    # "s3" is stubbed for a follow-up PR.
+    files_storage_backend: str = "local"
+
     # Day recall (recall_day tool + end-of-day archival summaries)
     enable_day_recall: bool = False  # When true, exposes recall_day tool + runs hourly archival job
 

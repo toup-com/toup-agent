@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Coroutine, Dict, List, Optional
@@ -33,7 +34,7 @@ from app.agent.context_manager import (
     estimate_tokens,
     estimate_messages_tokens,
 )
-from app.agent.tool_definitions import get_agent_tools, get_extended_tools
+from app.agent.tool_definitions import get_agent_tools, get_extended_tools, get_doc_generation_tools
 from app.agent.tool_executor import ToolExecutor
 from app.agent.skills.loader import SkillLoader
 from app.agent.query_intent import (
@@ -76,6 +77,8 @@ OnTextChunk = Callable[[str], Coroutine[Any, Any, None]]
 OnToolStart = Callable[[str], Coroutine[Any, Any, None]]
 OnToolEnd = Callable[[str, str], Coroutine[Any, Any, None]]
 OnToolProgress = Callable[[str, str], Coroutine[Any, Any, None]]
+# Emitted per generated attachment. (message_id, attachment_dict)
+OnAttachment = Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 class AgentRunner:
@@ -93,8 +96,12 @@ class AgentRunner:
         self.anthropic = AnthropicService()
         self.tools = tool_executor
         self.skill_loader = skill_loader
-        # Core tools (static) — skill tools are added dynamically via property
+        # Core tools (static) — skill tools are added dynamically via property.
+        # Document-generation tools (generate_pdf/docx/xlsx/pptx/md/html_to_pdf)
+        # are only registered when the feature flag is on.
         self._core_tool_defs = get_agent_tools() + get_extended_tools()
+        if getattr(settings, "feature_doc_generation", False):
+            self._core_tool_defs += get_doc_generation_tools()
         self.max_iterations = settings.agent_max_tool_iterations
         self._session_model_override: Optional[str] = None  # Per-session model
         self._current_lane: str = 'main'  # Active execution lane
@@ -232,6 +239,7 @@ class AgentRunner:
         on_tool_start: Optional[OnToolStart] = None,
         on_tool_end: Optional[OnToolEnd] = None,
         on_tool_progress: Optional[OnToolProgress] = None,
+        on_attachment: Optional[OnAttachment] = None,
         media_paths: Optional[List[str]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         model_override: Optional[str] = None,
@@ -248,6 +256,14 @@ class AgentRunner:
         """
         start = time.time()
         logger.info(f"[AGENT] === New agent run for user_id={user_id} ===")
+
+        # Pre-generate the assistant message ID so generate_* tools can emit
+        # attachment WS events with a stable message_id before the message
+        # is persisted. Used at line ~1649 when creating the assistant Message.
+        asst_message_id = str(uuid.uuid4())
+        # Reset pending attachments — belongs to this run only.
+        self.tools.pending_attachments = []
+        _attachments_emitted_count = 0
 
         # ── Classify query intent (lightweight, <1ms) ─────────────────
         t_classify = time.perf_counter()
@@ -694,6 +710,17 @@ class AgentRunner:
                 if on_tool_end:
                     summary = result[:200] + "..." if len(result) > 200 else result
                     await on_tool_end(tc["name"], summary, tc.get("input"))
+
+                # Drain newly-registered attachments (from generate_* tools) and
+                # emit them over the WS. We emit per-attachment so the frontend
+                # can open the DocumentSplit pane as soon as the first file is ready.
+                if on_attachment and len(self.tools.pending_attachments) > _attachments_emitted_count:
+                    for att in self.tools.pending_attachments[_attachments_emitted_count:]:
+                        try:
+                            await on_attachment(asst_message_id, att)
+                        except Exception:
+                            logger.exception("on_attachment callback raised")
+                    _attachments_emitted_count = len(self.tools.pending_attachments)
 
                 tool_results.append({
                     "type": "tool_result",
@@ -1325,6 +1352,54 @@ class AgentRunner:
             "When the user asks you to do something on their system, USE your tools — don't say you can't."
         )
 
+        # ── 5a. Document Generation (only if feature flag is on) ──
+        # Tokens aren't loaded when the flag is off — gated here, same pattern
+        # as the tool schemas being gated in AgentRunner.__init__.
+        if getattr(settings, "feature_doc_generation", False):
+            section_parts["doc_generation"] = (
+                "# Document Generation\n"
+                "You can produce formatted documents (PDF, Word, Excel, PowerPoint, Markdown) "
+                "and deliver them to the user. When the user asks for a report, export, summary "
+                "of tabular data, invoice, spreadsheet, slide deck, or anything they'd want to "
+                "download, share, or edit, prefer the `generate_*` tools over inline markdown.\n\n"
+                "Pick the right tool:\n"
+                "- `generate_pdf` — print-ready reports, summaries, invoices. Accepts structured "
+                "blocks (headings, paragraphs, tables, images, page_break).\n"
+                "- `generate_docx` — editable Word document. Use when the user will revise it.\n"
+                "- `generate_xlsx` — tabular data, especially multi-sheet workbooks. Use for "
+                "expense summaries, datasets, schedules.\n"
+                "- `generate_pptx` — slide decks. Use for briefings or presentations.\n"
+                "- `generate_markdown` — plain text the user will import elsewhere (Obsidian, "
+                "Notion, docs sites).\n\n"
+                "Use descriptive filenames (e.g., `march-expenses.xlsx`, not `file.xlsx`).\n\n"
+                "After the tool call, give a brief one-sentence confirmation. The file appears "
+                "in the document pane — don't repeat its contents back in markdown; the pane "
+                "is enough.\n\n"
+                "Do NOT generate a document when the user is asking a conversational question "
+                "(\"what's the difference between X and Y?\", \"explain Z\"). Plain markdown "
+                "answers belong in chat. Files are for artifacts the user will keep.\n\n"
+                "## Examples\n\n"
+                "User: \"Give me a summary of this month's expenses in an Excel file.\"\n"
+                "→ gather the data, then call:\n"
+                "  generate_xlsx(filename=\"march-expenses.xlsx\", sheets=[{\n"
+                "    \"name\": \"March 2026\",\n"
+                "    \"headers\": [\"Date\", \"Category\", \"Amount\"],\n"
+                "    \"rows\": [[\"2026-03-01\", \"Groceries\", 87.40], ...]\n"
+                "  }])\n"
+                "→ in chat: \"Done — March expenses are in the pane. Total: $1,243.70 across 23 entries.\"\n\n"
+                "User: \"Write me a one-page project brief on the app rebuild, PDF please.\"\n"
+                "→ generate_pdf(filename=\"app-rebuild-brief.pdf\", title=\"App Rebuild — Brief\",\n"
+                "    cover_page=True, content=[\n"
+                "      {\"type\": \"heading\", \"level\": 1, \"text\": \"Goal\"},\n"
+                "      {\"type\": \"paragraph\", \"text\": \"...\"},\n"
+                "      {\"type\": \"heading\", \"level\": 1, \"text\": \"Timeline\"},\n"
+                "      {\"type\": \"table\", \"headers\": [\"Phase\", \"End date\"], \"rows\": [...]},\n"
+                "    ])\n"
+                "→ in chat: \"Brief is ready in the pane.\"\n\n"
+                "User: \"Can you help me understand the difference between a linked list and an array?\"\n"
+                "→ do NOT generate a file. This is a conversational explanation. Answer in markdown."
+            )
+
         # ── 5b. Media Playback (web channel, only if intent includes media) ──
         if channel in ("web", "app") and (intent.include_media_section or intent.category == "full"):
             section_parts["media"] = (
@@ -1538,6 +1613,7 @@ class AgentRunner:
             "work_brain",     # Work brain (disabled by default)
             "skills",         # WHAT the agent can do
             "environment",    # WHAT the agent has access to
+            "doc_generation", # Document generation (PDF/DOCX/XLSX/PPTX/MD) — flag-gated
             "media",          # Media playback instructions (web/app)
             "runtime",        # WHEN/WHERE
             "vibecoding",     # Vibe coding mode override (when active)
@@ -1640,7 +1716,14 @@ class AgentRunner:
         if media_meta:
             self.tools._last_media = None  # Clear after capture
 
+        # Capture generated-file attachments (generate_* tools). IDs were already
+        # emitted to the client during tool execution under asst_message_id; now
+        # we persist the list against the same message ID so GET /api/files/... resolves.
+        _pending_atts = list(self.tools.pending_attachments)
+        self.tools.pending_attachments = []
+
         asst_msg = Message(
+            id=asst_message_id,
             conversation_id=session_id,
             day_chat_id=_day_chat_id,
             role="assistant",
@@ -1650,6 +1733,7 @@ class AgentRunner:
             model_used=model,
             processing_time_ms=processing_time_ms,
             metadata_json=json.dumps({"media": media_meta}) if media_meta else None,
+            attachments=json.dumps(_pending_atts) if _pending_atts else None,
         )
         db.add(asst_msg)
         msg_count += 1

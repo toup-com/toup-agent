@@ -37,6 +37,8 @@ from app.api.dashboard_proxy import router as dashboard_proxy_router
 # Combined checkout
 from app.api.checkout import router as checkout_router
 from app.api.llm_setup import router as llm_setup_router
+# Generated-file attachments (Phase 2 of doc-delivery)
+from app.api.files import router as files_router
 
 # Global start time for uptime tracking
 _app_start_time = None
@@ -380,6 +382,8 @@ app.include_router(dashboard_proxy_router, prefix=settings.api_prefix)
 app.include_router(checkout_router, prefix=settings.api_prefix)
 # LLM setup & usage
 app.include_router(llm_setup_router, prefix=settings.api_prefix)
+# Generated-file attachments
+app.include_router(files_router, prefix=settings.api_prefix)
 
 
 

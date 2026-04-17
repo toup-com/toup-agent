@@ -261,6 +261,9 @@ async def init_db():
         "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS archival_summary TEXT",
         "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS archival_summary_generated_at TIMESTAMP",
         "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS archival_summary_status VARCHAR(20) NOT NULL DEFAULT 'not_needed'",
+        # Doc-delivery feature (generated-file attachments on assistant messages).
+        # JSONB on Postgres, TEXT on SQLite — ORM uses Text for portability, ALTER promotes to JSONB on PG.
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachments JSONB",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)
