@@ -16,6 +16,7 @@ import json
 import logging
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, Response
 from sqlalchemy import select
@@ -31,6 +32,59 @@ from app.services.file_storage import get_storage_backend, stream_file
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/files", tags=["Files"])
+
+
+async def _get_agent_proxy_info(user_id: str, db: AsyncSession):
+    """Return (agent_url, agent_api_key) for the caller's remote agent, or None.
+
+    On the platform run_mode, attachments + file bytes live on the VPS agent.
+    Platform forwards GET /api/files/* to the agent via X-Agent-Key, mirroring
+    the stats / dashboard proxy patterns.
+    """
+    try:
+        from app.db.models import AgentConfig  # noqa — may not exist on agent DBs
+        result = await db.execute(
+            select(AgentConfig.agent_url, AgentConfig.agent_api_key).where(
+                AgentConfig.user_id == user_id,
+                AgentConfig.deploy_status == "active",
+            )
+        )
+        row = result.first()
+        if row and row.agent_url and row.agent_api_key:
+            return (row.agent_url, row.agent_api_key)
+    except Exception:
+        pass
+    return None
+
+
+async def _proxy_file(agent_url: str, agent_api_key: str, path: str, params: dict):
+    """Open a streaming GET to the agent's files endpoint and return an
+    (content_iter, headers, status) tuple. Caller wraps into StreamingResponse."""
+    url = f"{agent_url.rstrip('/')}/api/files/{path}"
+    client = httpx.AsyncClient(timeout=30.0)
+    req = client.build_request("GET", url, headers={"X-Agent-Key": agent_api_key}, params=params)
+    resp = await client.send(req, stream=True)
+    if resp.status_code >= 400:
+        body = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=resp.status_code, detail=body.decode(errors="replace")[:500])
+
+    async def _iter():
+        try:
+            async for chunk in resp.aiter_raw():
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    # Pass through content-type, content-length, content-disposition.
+    passthrough_headers = {}
+    for h in ("content-type", "content-length", "content-disposition", "cache-control"):
+        v = resp.headers.get(h)
+        if v:
+            passthrough_headers[h] = v
+    return _iter(), passthrough_headers, resp.status_code
 
 
 async def _get_user_for_file(
@@ -121,6 +175,19 @@ async def download_file(
 ):
     """Stream the raw attachment bytes with correct Content-Type + Content-Disposition."""
     current_user = await _get_user_for_file(request, token, db)
+
+    # Platform-side: data lives on the user's agent VPS. Proxy the request.
+    if settings.run_mode == "platform":
+        proxy = await _get_agent_proxy_info(current_user.id, db)
+        if not proxy:
+            raise HTTPException(status_code=404, detail="No active agent for user")
+        content_iter, headers, status = await _proxy_file(
+            proxy[0], proxy[1], f"{message_id}/{attachment_id}", {}
+        )
+        return StreamingResponse(content_iter, status_code=status,
+                                 media_type=headers.get("content-type", "application/octet-stream"),
+                                 headers=headers)
+
     att = await _load_attachment(message_id, attachment_id, current_user.id, db)
     key = att.get("storage_path")
     if not key:
@@ -162,6 +229,19 @@ async def preview_file(
     Other → 415 Unsupported Media Type (client should use /download)
     """
     current_user = await _get_user_for_file(request, token, db)
+
+    # Platform-side: proxy the preview request to the user's VPS agent.
+    if settings.run_mode == "platform":
+        proxy = await _get_agent_proxy_info(current_user.id, db)
+        if not proxy:
+            raise HTTPException(status_code=404, detail="No active agent for user")
+        content_iter, headers, status = await _proxy_file(
+            proxy[0], proxy[1], f"{message_id}/{attachment_id}/preview", {"format": format}
+        )
+        return StreamingResponse(content_iter, status_code=status,
+                                 media_type=headers.get("content-type", "text/html"),
+                                 headers=headers)
+
     att = await _load_attachment(message_id, attachment_id, current_user.id, db)
     key = att.get("storage_path")
     mime = att.get("mime_type", "")
