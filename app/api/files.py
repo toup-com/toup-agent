@@ -234,10 +234,15 @@ async def preview_file(
 ):
     """Server-side render for the DocumentViewer pane.
 
-    DOCX  → HTML via mammoth
-    XLSX  → HTML tables (one per sheet) via openpyxl
-    PPTX  → 204 (frontend falls back to download)
-    Other → 415 Unsupported Media Type (client should use /download)
+    DOCX / PPTX → PDF via LibreOffice headless (cached). Browser renders
+                  the PDF natively in an <iframe>, matching Slack /
+                  Dropbox / Google Drive faithfulness.
+    XLSX        → HTML tables (one per sheet) via openpyxl.
+    Other       → 415 (client should use /download).
+
+    First DOCX/PPTX preview for a given file takes ~3-8s (LibreOffice
+    cold start); subsequent requests are near-instant from the cache
+    entry at `{storage_path}.preview.pdf`.
     """
     current_user = await _get_user_for_file(request, token, db)
 
@@ -260,10 +265,34 @@ async def preview_file(
     if not key or not backend.exists(key):
         raise HTTPException(status_code=410, detail="File unavailable")
 
+    # ── DOCX / PPTX → PDF via LibreOffice ────────────────────────
+    # Production-grade faithful rendering. Cached per file.
+    if mime in (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ):
+        from app.services.doc_preview import render_to_pdf
+        try:
+            pdf_bytes = await render_to_pdf(key)
+        except RuntimeError as e:
+            # Binary missing — agent needs libreoffice-{core,writer,impress}.
+            raise HTTPException(status_code=501, detail=str(e))
+        if not pdf_bytes:
+            raise HTTPException(status_code=502, detail="LibreOffice conversion failed")
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Cache-Control": "private, max-age=3600",
+                "Content-Disposition": f'inline; filename="{att.get("filename","document")}.pdf"',
+            },
+        )
+
     if format != "html" and format != "png":
         raise HTTPException(status_code=400, detail="format must be 'html' or 'png'")
 
-    # ── DOCX → HTML ─────────────────────────────────────────────
+    # Legacy DOCX → mammoth HTML path is now dead (LibreOffice path above wins
+    # first), but kept here for the rare case a deploy lacks libreoffice.
     if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
         try:
             import mammoth  # type: ignore
@@ -319,11 +348,7 @@ async def preview_file(
             parts.append("</table></div>")
         return HTMLResponse(content="".join(parts))
 
-    # ── PPTX → first-slide PNG (best-effort; libreoffice or placeholder) ─────
-    if mime == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
-        # Full rendering is out of scope. Return 204 so frontend falls back
-        # to "download + see filename" UX. Follow-up PR can add libreoffice
-        # or python-pptx-to-image rendering.
-        return Response(status_code=204)
+    # (PPTX is now handled by the LibreOffice PDF path above; legacy 204
+    # fallback removed.)
 
     raise HTTPException(status_code=415, detail=f"No preview for {mime}")

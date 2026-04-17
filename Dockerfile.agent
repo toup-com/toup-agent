@@ -28,6 +28,12 @@ RUN apt-get update && apt-get install -y \
     libcairo2 \
     libasound2 \
     libwayland-client0 \
+    # LibreOffice — DOCX/PPTX → PDF preview (doc-delivery feature).
+    # Core + writer + impress only; calc is excluded because XLSX
+    # preview uses openpyxl → HTML (lighter and sheet-tab interactive).
+    libreoffice-core \
+    libreoffice-writer \
+    libreoffice-impress \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20 — needed for Expo project scaffolding and preview servers
