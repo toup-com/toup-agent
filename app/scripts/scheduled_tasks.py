@@ -430,6 +430,100 @@ async def run_end_of_day_archival():
     )
 
 
+async def run_account_purge():
+    """Hard-delete accounts that were anonymized for deletion more than 30 days ago.
+
+    Our account-deletion endpoint (POST /api/auth/delete-account) immediately
+    anonymizes PII and deactivates the account — email becomes
+    `deleted-<id>@deleted.toup.ai`, is_active is set to False, and
+    password_changed_at marks the moment of deletion. This job runs daily and
+    removes the underlying user row plus all owned data after 30 days, honoring
+    the retention promise made to users in the Privacy Policy.
+
+    Safe by construction: only accounts that match BOTH the deleted-email
+    pattern AND is_active=False AND password_changed_at older than 30 days
+    are considered, so an active user cannot be caught accidentally.
+    """
+    from datetime import datetime, timedelta
+    from sqlalchemy import inspect, delete as sa_delete
+    from app.db import Base
+
+    cutoff = datetime.utcnow() - timedelta(days=30)
+
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(User).where(
+                User.is_active == False,  # noqa: E712
+                User.email.like("deleted-%@deleted.toup.ai"),
+                User.password_changed_at.is_not(None),
+                User.password_changed_at < cutoff,
+            )
+        )
+        to_purge: list[User] = list(result.scalars().all())
+
+    if not to_purge:
+        logger.info("[account_purge] nothing to purge")
+        return
+
+    # Discover every table whose rows reference users.id so we stay correct as
+    # new models are added. Child tables without a direct user_id (e.g.
+    # Message → day_chat_id → DayChat) cascade from their parent below.
+    user_owned_tables: list[str] = []
+    for table_name, table in Base.metadata.tables.items():
+        if "user_id" in table.c:
+            user_owned_tables.append(table_name)
+
+    logger.info(
+        "[account_purge] purging %d account(s) across %d user-owned table(s)",
+        len(to_purge), len(user_owned_tables),
+    )
+
+    purged = 0
+    failed = 0
+    for user in to_purge:
+        try:
+            async with async_session_maker() as udb:
+                # Delete day_chat message rows via the FK from messages →
+                # day_chats, then delete all user_owned rows, then the user.
+                from app.db.models.day_chat import DayChat
+                from app.db.models import Message
+
+                day_chat_ids = [
+                    row[0] for row in (
+                        await udb.execute(
+                            select(DayChat.id).where(DayChat.user_id == user.id)
+                        )
+                    ).fetchall()
+                ]
+                if day_chat_ids:
+                    await udb.execute(
+                        sa_delete(Message).where(Message.day_chat_id.in_(day_chat_ids))
+                    )
+
+                for table_name in user_owned_tables:
+                    table = Base.metadata.tables[table_name]
+                    await udb.execute(
+                        sa_delete(table).where(table.c.user_id == user.id)
+                    )
+
+                # Finally the user row itself.
+                await udb.execute(
+                    sa_delete(User.__table__).where(User.__table__.c.id == user.id)
+                )
+                await udb.commit()
+                purged += 1
+                logger.info("[account_purge] removed account %s…", user.id[:8])
+        except Exception as e:
+            failed += 1
+            logger.error(
+                "[account_purge] failed to purge %s: %s", user.id[:8], e, exc_info=True,
+            )
+
+    logger.info(
+        "[account_purge] complete — purged=%d failed=%d", purged, failed,
+    )
+
+
 def setup_scheduler(
     decay_interval_hours: int = 6,
     consolidation_interval_hours: int = 24,
@@ -483,6 +577,16 @@ def setup_scheduler(
         trigger=CronTrigger(day_of_week="sun", hour=4, minute=0),
         id="retrieval_feedback_analysis",
         name="Retrieval Quality Analysis (Weekly)",
+        replace_existing=True,
+    )
+
+    # Account Purge — runs daily at 4:30 AM, hard-deletes accounts that were
+    # anonymized >30 days ago. Honors the Privacy Policy retention promise.
+    scheduler.add_job(
+        run_account_purge,
+        trigger=CronTrigger(hour=4, minute=30),
+        id="account_purge",
+        name="Account Purge (>30d after deletion)",
         replace_existing=True,
     )
 
