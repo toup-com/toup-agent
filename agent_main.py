@@ -50,6 +50,9 @@ from app.api.dashboard import router as dashboard_router
 from app.api.soul import router as soul_router
 from app.api.llm_setup import router as llm_setup_router
 from app.api.apps import router as apps_router, set_app_manager, set_app_gateway, set_app_builder_skill, set_agent_runner
+# Generated-file attachments (doc-delivery feature). Serves the actual files
+# from local disk on the agent; the platform's files_router proxies here.
+from app.api.files import router as files_router
 
 _app_start_time = None
 _skill_loader = None
@@ -997,6 +1000,8 @@ except ImportError as e:
     print(f"⚠️ Netflix stream not mounted: {e}")
 app.include_router(soul_router, prefix=settings.api_prefix)
 app.include_router(llm_setup_router, prefix=settings.api_prefix)
+# Generated-file attachments — data + files live here on the agent.
+app.include_router(files_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
 try:
