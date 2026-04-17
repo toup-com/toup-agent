@@ -94,7 +94,8 @@ class Settings(BaseSettings):
     # Document Generation + Web Attachments (Phase 1+2 of doc-delivery feature)
     # When false: generate_* tools are not registered, attachment WS events are not emitted.
     # Frontend has its own localStorage gate (TOUP_DOC_ATTACHMENTS) for the two-pane UI.
-    feature_doc_generation: bool = False
+    # Default ON as of the doc-delivery rollout — disable via FEATURE_DOC_GENERATION=false.
+    feature_doc_generation: bool = True
     # Storage backend for generated files. "local" writes to {agent_workspace_dir}/generated/.
     # "s3" is stubbed for a follow-up PR.
     files_storage_backend: str = "local"
