@@ -25,6 +25,28 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/day-chats", tags=["Day Chats"])
 
 
+def _serialize_attachments(msg: Message) -> Optional[List[dict]]:
+    """Return Message.attachments as a client-safe list (strip storage_path)
+    or None when there are no attachments. Handles both native-JSON driver
+    returns (list) and legacy TEXT-stored JSON strings."""
+    import json as _json
+    raw = getattr(msg, "attachments", None)
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = _json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, list):
+        return None
+    return [
+        {k: v for k, v in att.items() if k != "storage_path"}
+        for att in raw
+        if isinstance(att, dict)
+    ]
+
+
 # ── Agent proxy (platform mode proxies to user's VPS agent) ──────────
 
 async def _get_agent_proxy_info(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]]:
@@ -288,6 +310,7 @@ async def get_day_chat_messages(
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "channel": channel_map.get(m.conversation_id, "web"),
                 "conversation_id": m.conversation_id,
+                "attachments": _serialize_attachments(m),
             }
             for m in messages
         ])
@@ -310,6 +333,7 @@ async def get_day_chat_messages(
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
             "channel": channel or "web",
             "conversation_id": msg.conversation_id,
+            "attachments": _serialize_attachments(msg),
         }
         for msg, channel in rows
     ])
