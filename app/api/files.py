@@ -59,9 +59,18 @@ async def _get_agent_proxy_info(user_id: str, db: AsyncSession):
 
 async def _proxy_file(agent_url: str, agent_api_key: str, path: str, params: dict):
     """Open a streaming GET to the agent's files endpoint and return an
-    (content_iter, headers, status) tuple. Caller wraps into StreamingResponse."""
+    (content_iter, headers, status) tuple. Caller wraps into StreamingResponse.
+
+    Uses aiter_bytes (decoded) and does NOT forward content-length — any
+    intermediate gzip would make that value wrong, and a stale content-length
+    makes the browser wait on bytes that will never arrive (this showed up
+    as ~60s downloads for 37 KB files). FastAPI emits chunked transfer
+    encoding when content-length is absent, which matches the iterator.
+    """
     url = f"{agent_url.rstrip('/')}/api/files/{path}"
-    client = httpx.AsyncClient(timeout=30.0)
+    # Shorter timeout — files on the agent are local-disk reads, should be
+    # subsecond. Long timeout just hides transport issues.
+    client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0))
     req = client.build_request("GET", url, headers={"X-Agent-Key": agent_api_key}, params=params)
     resp = await client.send(req, stream=True)
     if resp.status_code >= 400:
@@ -72,15 +81,17 @@ async def _proxy_file(agent_url: str, agent_api_key: str, path: str, params: dic
 
     async def _iter():
         try:
-            async for chunk in resp.aiter_raw():
+            async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
                 yield chunk
         finally:
             await resp.aclose()
             await client.aclose()
 
-    # Pass through content-type, content-length, content-disposition.
+    # Only forward content-type and content-disposition. Let chunked transfer
+    # encoding handle framing so the browser doesn't wait on a size that may
+    # not match (e.g. after transparent gzip decoding in the httpx layer).
     passthrough_headers = {}
-    for h in ("content-type", "content-length", "content-disposition", "cache-control"):
+    for h in ("content-type", "content-disposition", "cache-control"):
         v = resp.headers.get(h)
         if v:
             passthrough_headers[h] = v
