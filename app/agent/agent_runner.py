@@ -796,6 +796,7 @@ class AgentRunner:
                 processing_time_ms=int((time.time() - start) * 1000),
                 save_user_message=save_user_message,
                 client_tz=client_tz,
+                asst_message_id=asst_message_id,
             )
             await db.commit()
         logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
@@ -1678,6 +1679,7 @@ class AgentRunner:
         processing_time_ms: int,
         save_user_message: bool = True,
         client_tz: Optional[str] = None,
+        asst_message_id: Optional[str] = None,
     ):
         from sqlalchemy import select
         from app.db.models import Message, Conversation
@@ -1722,8 +1724,9 @@ class AgentRunner:
         _pending_atts = list(self.tools.pending_attachments)
         self.tools.pending_attachments = []
 
-        asst_msg = Message(
-            id=asst_message_id,
+        # Build kwargs so we only set id when provided (new code path); older
+        # save paths that don't pass asst_message_id fall back to the UUID default.
+        _asst_kwargs = dict(
             conversation_id=session_id,
             day_chat_id=_day_chat_id,
             role="assistant",
@@ -1733,8 +1736,16 @@ class AgentRunner:
             model_used=model,
             processing_time_ms=processing_time_ms,
             metadata_json=json.dumps({"media": media_meta}) if media_meta else None,
-            attachments=json.dumps(_pending_atts) if _pending_atts else None,
         )
+        if asst_message_id:
+            _asst_kwargs["id"] = asst_message_id
+        if _pending_atts:
+            # Column is JSON (JSONB on Postgres, TEXT on SQLite). SQLAlchemy's JSON
+            # type serializes Python lists automatically — pass the list directly,
+            # NOT json.dumps(...). Also mirror into metadata_json for legacy clients
+            # and history-loader code that still reads JSON-in-TEXT.
+            _asst_kwargs["attachments"] = _pending_atts
+        asst_msg = Message(**_asst_kwargs)
         db.add(asst_msg)
         msg_count += 1
 

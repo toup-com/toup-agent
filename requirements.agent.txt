@@ -24,6 +24,15 @@ python-pptx==1.0.2
 markdown==3.5.2
 chardet==5.2.0
 
+# Document Generation (doc-delivery feature).
+# weasyprint: HTML→PDF with CSS. Requires Pango/Cairo system libs on the host;
+# Dockerfile.agent should install libpango/libcairo. Import stays lazy in
+# doc_generators.py so the tool fails gracefully if libs are missing.
+reportlab==4.1.0
+openpyxl==3.1.2
+mammoth==1.7.1
+weasyprint==61.2
+
 # Media
 pillow==10.2.0
 

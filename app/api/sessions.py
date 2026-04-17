@@ -597,19 +597,22 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # Parse generated-file attachments (strip storage_path — internal only).
+    # Generated-file attachments (JSON column — already a Python list).
+    # Strip storage_path — internal key, not for the client.
     attachments_list = None
-    if getattr(message, 'attachments', None):
+    raw_atts = getattr(message, 'attachments', None)
+    # Belt-and-braces: some drivers may return a JSON string even on a JSON column.
+    if isinstance(raw_atts, str):
         try:
-            raw = json.loads(message.attachments)
-            if isinstance(raw, list):
-                attachments_list = [
-                    {k: v for k, v in att.items() if k != "storage_path"}
-                    for att in raw
-                    if isinstance(att, dict)
-                ]
+            raw_atts = json.loads(raw_atts)
         except (json.JSONDecodeError, TypeError):
-            pass
+            raw_atts = None
+    if isinstance(raw_atts, list):
+        attachments_list = [
+            {k: v for k, v in att.items() if k != "storage_path"}
+            for att in raw_atts
+            if isinstance(att, dict)
+        ]
 
     resp = dict(
         id=message.id,

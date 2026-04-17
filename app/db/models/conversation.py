@@ -4,7 +4,8 @@ from datetime import datetime
 from typing import Optional, List
 import uuid
 
-from sqlalchemy import Column, String, Text, DateTime, Integer, Boolean, ForeignKey, Index
+from sqlalchemy import Column, String, Text, DateTime, Integer, Boolean, ForeignKey, Index, JSON
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
 from .base import Base, Vector
@@ -88,8 +89,11 @@ class Message(Base):
 
     # Generated-file attachments (array of {id, filename, mime_type, size_bytes, storage_path, created_at}).
     # Populated by agent generate_* tools; rendered in the web two-pane DocumentSplit.
-    # Stored as JSONB on Postgres; Text fallback on SQLite (dev).
-    attachments: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # JSONB on Postgres (binary, indexable), JSON/TEXT on SQLite dev.
+    # Pass Python lists/dicts directly — SQLAlchemy handles serialization.
+    attachments: Mapped[Optional[list]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
 
     # Embedding stored as JSON array (for SQLite compatibility)
     embedding_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

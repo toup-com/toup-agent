@@ -94,13 +94,19 @@ async def _load_attachment(
     if not conv or conv.user_id != user_id:
         raise HTTPException(status_code=404, detail="Attachment not found")
 
-    try:
-        attachments = json.loads(msg.attachments)
-    except (TypeError, ValueError):
+    # Column is JSON(B) — already a Python list when fetched via SQLAlchemy.
+    # Belt-and-braces: some drivers may still return a string (legacy rows).
+    attachments = msg.attachments
+    if isinstance(attachments, str):
+        try:
+            attachments = json.loads(attachments)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=404, detail="Attachment not found")
+    if not isinstance(attachments, list):
         raise HTTPException(status_code=404, detail="Attachment not found")
 
     for att in attachments:
-        if att.get("id") == attachment_id:
+        if isinstance(att, dict) and att.get("id") == attachment_id:
             return att
     raise HTTPException(status_code=404, detail="Attachment not found")
 
