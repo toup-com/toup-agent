@@ -309,27 +309,30 @@ async def _merge_build_usage(
 ) -> None:
     """Merge auto-builder LLM usage (BuildUsage table) into an in-progress provider_map.
 
-    provider_map is the same dict structure used by the chat-messages aggregation, so
-    auto-builder tokens roll up into the same per-provider totals. Model entries are
-    tagged `source="auto_builder"` so the UI can tell them apart from chat."""
+    Runs in a fresh, isolated session so a missing table (build_usage doesn't exist
+    on platform-only DBs) can't poison the caller's transaction. Model entries are
+    tagged `source=\"auto_builder\"` so the UI can tell them apart from chat."""
     try:
         from app.db.models import BuildUsage
+        from app.db.database import async_session_maker
     except Exception:
         return
-    stmt = (
-        select(
-            BuildUsage.provider,
-            BuildUsage.model,
-            func.coalesce(func.sum(BuildUsage.input_tokens), 0).label("inp"),
-            func.coalesce(func.sum(BuildUsage.output_tokens), 0).label("out"),
-            func.coalesce(func.sum(BuildUsage.cost_usd), 0.0).label("cost"),
-            func.count().label("cnt"),
-        )
-        .where(BuildUsage.user_id == user_id, BuildUsage.created_at >= since)
-        .group_by(BuildUsage.provider, BuildUsage.model)
-    )
+    rows = []
     try:
-        rows = (await db.execute(stmt)).all()
+        async with async_session_maker() as iso:
+            stmt = (
+                select(
+                    BuildUsage.provider,
+                    BuildUsage.model,
+                    func.coalesce(func.sum(BuildUsage.input_tokens), 0).label("inp"),
+                    func.coalesce(func.sum(BuildUsage.output_tokens), 0).label("out"),
+                    func.coalesce(func.sum(BuildUsage.cost_usd), 0.0).label("cost"),
+                    func.count().label("cnt"),
+                )
+                .where(BuildUsage.user_id == user_id, BuildUsage.created_at >= since)
+                .group_by(BuildUsage.provider, BuildUsage.model)
+            )
+            rows = (await iso.execute(stmt)).all()
     except Exception as _e:
         logger.warning("BuildUsage aggregation skipped: %s", _e)
         return

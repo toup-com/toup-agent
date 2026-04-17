@@ -445,7 +445,10 @@ async def get_usage_overview(
                 user_entry["total_requests_all"] = 0
         else:
             # Local DB fallback: chat messages + auto-builder BuildUsage rows.
+            # BuildUsage is queried in an isolated session so a missing table on
+            # platform-only DBs can't poison the outer transaction.
             from app.db.models import BuildUsage  # noqa: WPS433
+            from app.db.database import async_session_maker  # noqa: WPS433
 
             conv_result = await db.execute(
                 select(Conversation.id).where(Conversation.user_id == u.id)
@@ -481,20 +484,21 @@ async def get_usage_overview(
                         total_cost += (inp * p_cost["input"] / 1000) + (out * p_cost["output"] / 1000)
 
                 try:
-                    bu_stmt = (
-                        select(
-                            func.coalesce(func.sum(BuildUsage.input_tokens), 0).label("inp"),
-                            func.coalesce(func.sum(BuildUsage.output_tokens), 0).label("out"),
-                            func.coalesce(func.sum(BuildUsage.cost_usd), 0.0).label("cost"),
-                            func.count().label("cnt"),
+                    async with async_session_maker() as iso:
+                        bu_stmt = (
+                            select(
+                                func.coalesce(func.sum(BuildUsage.input_tokens), 0).label("inp"),
+                                func.coalesce(func.sum(BuildUsage.output_tokens), 0).label("out"),
+                                func.coalesce(func.sum(BuildUsage.cost_usd), 0.0).label("cost"),
+                                func.count().label("cnt"),
+                            )
+                            .where(BuildUsage.user_id == u.id, BuildUsage.created_at >= since)
                         )
-                        .where(BuildUsage.user_id == u.id, BuildUsage.created_at >= since)
-                    )
-                    bu_row = (await db.execute(bu_stmt)).first()
-                    if bu_row:
-                        total_tokens += int(bu_row.inp) + int(bu_row.out)
-                        total_cost += float(bu_row.cost or 0.0)
-                        total_reqs += int(bu_row.cnt)
+                        bu_row = (await iso.execute(bu_stmt)).first()
+                        if bu_row:
+                            total_tokens += int(bu_row.inp) + int(bu_row.out)
+                            total_cost += float(bu_row.cost or 0.0)
+                            total_reqs += int(bu_row.cnt)
                 except Exception as _e:
                     logger.warning("BuildUsage aggregation skipped for user %s: %s", u.id, _e)
 
@@ -640,47 +644,56 @@ async def diagnose_user_usage(
             "messages_with_tokens": int(with_tokens),
         }
 
-    # Auto-builder usage (lives on agent DB; local fallback only has data if this
-    # platform DB also happens to hold BuildUsage rows — e.g. monolith mode).
+    # Auto-builder usage (lives on agent DB; absent on platform-only DBs).
+    # Run in an isolated session so a missing table can't poison the outer tx.
+    from app.db.database import async_session_maker as _sm  # noqa: WPS433
     try:
-        job_count = (await db.execute(
-            select(func.count()).select_from(BuildJob).where(BuildJob.user_id == user_id)
-        )).scalar_one()
-        bu_stmt = (
-            select(
-                BuildUsage.provider,
-                func.coalesce(func.sum(BuildUsage.input_tokens), 0).label("inp"),
-                func.coalesce(func.sum(BuildUsage.output_tokens), 0).label("out"),
-                func.coalesce(func.sum(BuildUsage.cost_usd), 0.0).label("cost"),
-                func.count().label("cnt"),
+        async with _sm() as iso:
+            try:
+                job_count = (await iso.execute(
+                    select(func.count()).select_from(BuildJob).where(BuildJob.user_id == user_id)
+                )).scalar_one()
+            except Exception:
+                job_count = 0
+            bu_stmt = (
+                select(
+                    BuildUsage.provider,
+                    func.coalesce(func.sum(BuildUsage.input_tokens), 0).label("inp"),
+                    func.coalesce(func.sum(BuildUsage.output_tokens), 0).label("out"),
+                    func.coalesce(func.sum(BuildUsage.cost_usd), 0.0).label("cost"),
+                    func.count().label("cnt"),
+                )
+                .where(BuildUsage.user_id == user_id)
+                .group_by(BuildUsage.provider)
             )
-            .where(BuildUsage.user_id == user_id)
-            .group_by(BuildUsage.provider)
-        )
-        by_provider: list[dict] = []
-        total_tokens = 0
-        total_cost = 0.0
-        total_calls = 0
-        for provider, inp, out, cost, cnt in (await db.execute(bu_stmt)).all():
-            inp_i = int(inp); out_i = int(out); cnt_i = int(cnt); cost_f = float(cost or 0.0)
-            total_tokens += inp_i + out_i
-            total_cost += cost_f
-            total_calls += cnt_i
-            by_provider.append({
-                "provider": provider,
-                "input_tokens": inp_i,
-                "output_tokens": out_i,
-                "total_tokens": inp_i + out_i,
-                "cost_usd": round(cost_f, 4),
-                "llm_calls": cnt_i,
-            })
-        out["auto_builder"] = {
-            "build_jobs": int(job_count),
-            "total_tokens": total_tokens,
-            "total_cost_usd": round(total_cost, 4),
-            "total_llm_calls": total_calls,
-            "by_provider": sorted(by_provider, key=lambda p: p["total_tokens"], reverse=True),
-        }
+            by_provider: list[dict] = []
+            total_tokens = 0
+            total_cost = 0.0
+            total_calls = 0
+            try:
+                bu_rows = (await iso.execute(bu_stmt)).all()
+            except Exception:
+                bu_rows = []
+            for provider, inp, out, cost, cnt in bu_rows:
+                inp_i = int(inp); out_i = int(out); cnt_i = int(cnt); cost_f = float(cost or 0.0)
+                total_tokens += inp_i + out_i
+                total_cost += cost_f
+                total_calls += cnt_i
+                by_provider.append({
+                    "provider": provider,
+                    "input_tokens": inp_i,
+                    "output_tokens": out_i,
+                    "total_tokens": inp_i + out_i,
+                    "cost_usd": round(cost_f, 4),
+                    "llm_calls": cnt_i,
+                })
+            out["auto_builder"] = {
+                "build_jobs": int(job_count),
+                "total_tokens": total_tokens,
+                "total_cost_usd": round(total_cost, 4),
+                "total_llm_calls": total_calls,
+                "by_provider": sorted(by_provider, key=lambda p: p["total_tokens"], reverse=True),
+            }
     except Exception as e:
         out["auto_builder"] = {"error": f"{type(e).__name__}: {e}"}
 
