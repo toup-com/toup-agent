@@ -510,6 +510,144 @@ async def get_usage_overview(
     }
 
 
+@router.get("/usage/diagnose/{user_id}")
+async def diagnose_user_usage(
+    user_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Explain why a user's usage row is zero. Reports agent-config state, agent-proxy
+    reachability, and local-DB message counts so admins can see which branch fired."""
+    import httpx
+    from app.db import Message, Conversation, AgentConfig
+
+    target = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not target:
+        raise HTTPException(404, "User not found")
+
+    out: dict = {
+        "user": {"id": target.id, "email": target.email, "name": target.name or ""},
+        "agent_config": None,
+        "agent_proxy": None,
+        "local_db": None,
+        "verdict": None,
+    }
+
+    cfg_row = (await db.execute(
+        select(
+            AgentConfig.agent_url,
+            AgentConfig.agent_api_key,
+            AgentConfig.deploy_status,
+            AgentConfig.hosting_mode,
+            AgentConfig.setup_completed,
+        ).where(AgentConfig.user_id == user_id)
+    )).first()
+
+    if cfg_row is None:
+        out["agent_config"] = {"exists": False}
+    else:
+        out["agent_config"] = {
+            "exists": True,
+            "hosting_mode": cfg_row.hosting_mode,
+            "deploy_status": cfg_row.deploy_status,
+            "setup_completed": bool(cfg_row.setup_completed),
+            "has_agent_url": bool(cfg_row.agent_url),
+            "has_agent_key": bool(cfg_row.agent_api_key),
+            "agent_url": cfg_row.agent_url,
+        }
+
+    if (
+        cfg_row
+        and cfg_row.deploy_status == "active"
+        and cfg_row.agent_url
+        and cfg_row.agent_api_key
+    ):
+        proxy: dict = {"attempted": True}
+        try:
+            url = f"{cfg_row.agent_url}/api/llm-setup/usage/summary"
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, headers={"X-Agent-Key": cfg_row.agent_api_key})
+                proxy["status_code"] = resp.status_code
+                if resp.status_code == 200:
+                    data = resp.json()
+                    summary_30d = next((s for s in data if s.get("period") == "30d"), None) or {}
+                    summary_all = next((s for s in data if s.get("period") == "all"), None) or {}
+                    proxy["reported_tokens_30d"] = summary_30d.get("total_tokens", 0)
+                    proxy["reported_requests_30d"] = summary_30d.get("total_requests", 0)
+                    proxy["reported_tokens_all"] = summary_all.get("total_tokens", 0)
+                    proxy["reported_requests_all"] = summary_all.get("total_requests", 0)
+                else:
+                    proxy["body_preview"] = resp.text[:500]
+        except Exception as e:
+            proxy["error"] = f"{type(e).__name__}: {e}"
+        out["agent_proxy"] = proxy
+    else:
+        out["agent_proxy"] = {"attempted": False, "reason": "agent not active or missing url/key"}
+
+    conv_ids = [r[0] for r in (await db.execute(
+        select(Conversation.id).where(Conversation.user_id == user_id)
+    )).all()]
+
+    if not conv_ids:
+        out["local_db"] = {
+            "conversations": 0,
+            "assistant_messages": 0,
+            "messages_with_model": 0,
+            "messages_with_tokens": 0,
+        }
+    else:
+        assistant_count = (await db.execute(
+            select(func.count()).select_from(Message).where(
+                Message.conversation_id.in_(conv_ids),
+                Message.role == "assistant",
+            )
+        )).scalar_one()
+        with_model = (await db.execute(
+            select(func.count()).select_from(Message).where(
+                Message.conversation_id.in_(conv_ids),
+                Message.role == "assistant",
+                Message.model_used.isnot(None),
+            )
+        )).scalar_one()
+        with_tokens = (await db.execute(
+            select(func.count()).select_from(Message).where(
+                Message.conversation_id.in_(conv_ids),
+                Message.role == "assistant",
+                Message.tokens_prompt.isnot(None),
+            )
+        )).scalar_one()
+        out["local_db"] = {
+            "conversations": len(conv_ids),
+            "assistant_messages": int(assistant_count),
+            "messages_with_model": int(with_model),
+            "messages_with_tokens": int(with_tokens),
+        }
+
+    proxy_ok = (
+        out["agent_proxy"].get("attempted")
+        and out["agent_proxy"].get("status_code") == 200
+        and (out["agent_proxy"].get("reported_tokens_all", 0) > 0)
+    )
+    local_has_data = out["local_db"]["messages_with_model"] > 0
+
+    if proxy_ok:
+        out["verdict"] = "agent_proxy_has_data"
+    elif local_has_data:
+        out["verdict"] = "local_db_has_data"
+    elif not out["agent_config"]["exists"]:
+        out["verdict"] = "no_agent_config_and_no_local_messages"
+    elif cfg_row and cfg_row.deploy_status != "active":
+        out["verdict"] = f"agent_not_active (status={cfg_row.deploy_status}) and no local messages"
+    elif out["agent_proxy"].get("attempted") and out["agent_proxy"].get("status_code") != 200:
+        out["verdict"] = "agent_unreachable_and_no_local_messages"
+    elif out["agent_proxy"].get("attempted") and out["agent_proxy"].get("reported_tokens_all", 0) == 0:
+        out["verdict"] = "agent_reports_zero_and_no_local_messages"
+    else:
+        out["verdict"] = "no_usage_recorded"
+
+    return out
+
+
 @router.patch("/users/{user_id}", response_model=UserAdminResponse)
 async def update_user(
     user_id: str,
