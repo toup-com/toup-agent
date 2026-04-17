@@ -286,6 +286,47 @@ async def logout_user(response: Response):
     return {"success": True}
 
 
+# ── Delete Account ───────────────────────────────────────────────
+# Apple App Store Guideline 5.1.1(v): users must be able to initiate
+# account deletion from within the app. We anonymize PII and disable
+# the account immediately; a background job later purges the row.
+
+class DeleteAccountRequest(BaseModel):
+    password: str
+
+
+@router.post("/delete-account")
+async def delete_account(
+    body: DeleteAccountRequest,
+    response: Response,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete current user's account. Requires password confirmation.
+
+    Immediate effects: email/name/password/payment info are cleared,
+    account is deactivated, all outstanding tokens are invalidated.
+    """
+    if not verify_password(body.password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Password is incorrect")
+
+    now = datetime.utcnow()
+    current_user.email = f"deleted-{current_user.id}@deleted.toup.ai"
+    current_user.name = "Deleted User"
+    current_user.hashed_password = "deleted"
+    current_user.password_plain = None
+    current_user.stripe_customer_id = None
+    current_user.timezone = None
+    current_user.is_active = False
+    current_user.updated_at = now
+    current_user.password_changed_at = now
+
+    await db.commit()
+
+    response.delete_cookie(key=SSO_COOKIE_NAME, domain=SSO_COOKIE_DOMAIN, path="/")
+    return {"success": True, "message": "Account deletion initiated"}
+
+
 # ── Demo ─────────────────────────────────────────────────────────
 
 @router.post("/demo", response_model=Token)
