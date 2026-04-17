@@ -237,13 +237,18 @@ async def list_users(
 
 
 async def _build_usage_for_conv_ids(
-    conv_ids: list[str], db: AsyncSession,
+    conv_ids: list[str], db: AsyncSession, user_id: Optional[str] = None,
 ) -> list[dict]:
-    """Shared helper: build usage summary for a set of conversation IDs."""
+    """Shared helper: build usage summary for a set of conversation IDs.
+
+    When `user_id` is provided, per-user auto-builder usage (BuildUsage table) is
+    merged into the per-provider totals, tagged with `source=\"auto_builder\"` on
+    the model rows. Chat rows get `source=\"chat\"`."""
     from datetime import timedelta
     from app.db import Message
     from app.api.llm_setup import (
         UsageSummaryOut, ProviderUsageOut, ModelUsageOut, model_to_provider,
+        _merge_build_usage,
     )
     from app.config import settings
 
@@ -255,61 +260,55 @@ async def _build_usage_for_conv_ids(
         "all": datetime(2000, 1, 1),
     }
 
-    if not conv_ids:
-        return [
-            UsageSummaryOut(
-                period=p, total_input_tokens=0, total_output_tokens=0,
-                total_tokens=0, total_cost_usd=0.0, total_requests=0, providers=[],
-            ).model_dump()
-            for p in periods
-        ]
-
     results = []
     pricing = settings.pricing_per_1k
 
     for period_name, since in periods.items():
-        stmt = (
-            select(
-                Message.model_used,
-                func.coalesce(func.sum(func.coalesce(Message.tokens_prompt, 0)), 0).label("inp"),
-                func.coalesce(func.sum(func.coalesce(Message.tokens_completion, 0)), 0).label("out"),
-                func.count().label("cnt"),
-            )
-            .where(
-                Message.conversation_id.in_(conv_ids),
-                Message.role == "assistant",
-                Message.model_used.isnot(None),
-                Message.created_at >= since,
-            )
-            .group_by(Message.model_used)
-        )
-        rows = (await db.execute(stmt)).all()
-
         provider_map: dict[str, dict] = {}
-        for model_used, inp, out, cnt in rows:
-            provider = model_to_provider(model_used or "")
-            p_cost = pricing.get(model_used, {"input": 0.003, "output": 0.012})
-            cost = (inp * p_cost["input"] / 1000) + (out * p_cost["output"] / 1000)
 
-            model_entry = {
-                "model": model_used or "unknown", "provider": provider,
-                "input_tokens": int(inp), "output_tokens": int(out),
-                "total_tokens": int(inp + out), "cost_usd": round(cost, 4),
-                "request_count": int(cnt),
-            }
+        if conv_ids:
+            stmt = (
+                select(
+                    Message.model_used,
+                    func.coalesce(func.sum(func.coalesce(Message.tokens_prompt, 0)), 0).label("inp"),
+                    func.coalesce(func.sum(func.coalesce(Message.tokens_completion, 0)), 0).label("out"),
+                    func.count().label("cnt"),
+                )
+                .where(
+                    Message.conversation_id.in_(conv_ids),
+                    Message.role == "assistant",
+                    Message.model_used.isnot(None),
+                    Message.created_at >= since,
+                )
+                .group_by(Message.model_used)
+            )
+            rows = (await db.execute(stmt)).all()
 
-            if provider not in provider_map:
-                provider_map[provider] = {
-                    "provider": provider, "input_tokens": 0, "output_tokens": 0,
-                    "total_tokens": 0, "cost_usd": 0.0, "request_count": 0, "models": [],
-                }
-            prov = provider_map[provider]
-            prov["input_tokens"] += int(inp)
-            prov["output_tokens"] += int(out)
-            prov["total_tokens"] += int(inp + out)
-            prov["cost_usd"] = round(prov["cost_usd"] + cost, 4)
-            prov["request_count"] += int(cnt)
-            prov["models"].append(model_entry)
+            for model_used, inp, out, cnt in rows:
+                provider = model_to_provider(model_used or "")
+                p_cost = pricing.get(model_used, {"input": 0.003, "output": 0.012})
+                cost = (inp * p_cost["input"] / 1000) + (out * p_cost["output"] / 1000)
+
+                if provider not in provider_map:
+                    provider_map[provider] = {
+                        "provider": provider, "input_tokens": 0, "output_tokens": 0,
+                        "total_tokens": 0, "cost_usd": 0.0, "request_count": 0, "models": [],
+                    }
+                prov = provider_map[provider]
+                prov["input_tokens"] += int(inp)
+                prov["output_tokens"] += int(out)
+                prov["total_tokens"] += int(inp + out)
+                prov["cost_usd"] = round(prov["cost_usd"] + cost, 4)
+                prov["request_count"] += int(cnt)
+                prov["models"].append({
+                    "model": model_used or "unknown", "provider": provider,
+                    "input_tokens": int(inp), "output_tokens": int(out),
+                    "total_tokens": int(inp + out), "cost_usd": round(cost, 4),
+                    "request_count": int(cnt), "source": "chat",
+                })
+
+        if user_id:
+            await _merge_build_usage(user_id, since, provider_map, db)
 
         providers = sorted(provider_map.values(), key=lambda p: p["total_tokens"], reverse=True)
         total_inp = sum(p["input_tokens"] for p in providers)
@@ -367,7 +366,7 @@ async def get_user_usage(
         select(Conversation.id).where(Conversation.user_id == user_id)
     )
     conv_ids = [r[0] for r in conv_result.all()]
-    return await _build_usage_for_conv_ids(conv_ids, db)
+    return await _build_usage_for_conv_ids(conv_ids, db, user_id=user_id)
 
 
 @router.get("/usage/overview")
@@ -445,43 +444,59 @@ async def get_usage_overview(
                 user_entry["total_cost_all"] = 0.0
                 user_entry["total_requests_all"] = 0
         else:
-            # Local DB fallback
+            # Local DB fallback: chat messages + auto-builder BuildUsage rows.
+            from app.db.models import BuildUsage  # noqa: WPS433
+
             conv_result = await db.execute(
                 select(Conversation.id).where(Conversation.user_id == u.id)
             )
             conv_ids = [r[0] for r in conv_result.all()]
 
             for suffix, since in [("30d", periods["30d"]), ("all", periods["all"])]:
-                if not conv_ids:
-                    user_entry[f"total_tokens_{suffix}"] = 0
-                    user_entry[f"total_cost_{suffix}"] = 0.0
-                    user_entry[f"total_requests_{suffix}"] = 0
-                    continue
-
-                stmt = (
-                    select(
-                        Message.model_used,
-                        func.coalesce(func.sum(func.coalesce(Message.tokens_prompt, 0)), 0).label("inp"),
-                        func.coalesce(func.sum(func.coalesce(Message.tokens_completion, 0)), 0).label("out"),
-                        func.count().label("cnt"),
-                    )
-                    .where(
-                        Message.conversation_id.in_(conv_ids),
-                        Message.role == "assistant",
-                        Message.model_used.isnot(None),
-                        Message.created_at >= since,
-                    )
-                    .group_by(Message.model_used)
-                )
-                rows = (await db.execute(stmt)).all()
                 total_tokens = 0
                 total_cost = 0.0
                 total_reqs = 0
-                for model_used, inp, out, cnt in rows:
-                    total_tokens += int(inp + out)
-                    total_reqs += int(cnt)
-                    p_cost = pricing.get(model_used, {"input": 0.003, "output": 0.012})
-                    total_cost += (inp * p_cost["input"] / 1000) + (out * p_cost["output"] / 1000)
+
+                if conv_ids:
+                    stmt = (
+                        select(
+                            Message.model_used,
+                            func.coalesce(func.sum(func.coalesce(Message.tokens_prompt, 0)), 0).label("inp"),
+                            func.coalesce(func.sum(func.coalesce(Message.tokens_completion, 0)), 0).label("out"),
+                            func.count().label("cnt"),
+                        )
+                        .where(
+                            Message.conversation_id.in_(conv_ids),
+                            Message.role == "assistant",
+                            Message.model_used.isnot(None),
+                            Message.created_at >= since,
+                        )
+                        .group_by(Message.model_used)
+                    )
+                    rows = (await db.execute(stmt)).all()
+                    for model_used, inp, out, cnt in rows:
+                        total_tokens += int(inp + out)
+                        total_reqs += int(cnt)
+                        p_cost = pricing.get(model_used, {"input": 0.003, "output": 0.012})
+                        total_cost += (inp * p_cost["input"] / 1000) + (out * p_cost["output"] / 1000)
+
+                try:
+                    bu_stmt = (
+                        select(
+                            func.coalesce(func.sum(BuildUsage.input_tokens), 0).label("inp"),
+                            func.coalesce(func.sum(BuildUsage.output_tokens), 0).label("out"),
+                            func.coalesce(func.sum(BuildUsage.cost_usd), 0.0).label("cost"),
+                            func.count().label("cnt"),
+                        )
+                        .where(BuildUsage.user_id == u.id, BuildUsage.created_at >= since)
+                    )
+                    bu_row = (await db.execute(bu_stmt)).first()
+                    if bu_row:
+                        total_tokens += int(bu_row.inp) + int(bu_row.out)
+                        total_cost += float(bu_row.cost or 0.0)
+                        total_reqs += int(bu_row.cnt)
+                except Exception as _e:
+                    logger.warning("BuildUsage aggregation skipped for user %s: %s", u.id, _e)
 
                 user_entry[f"total_tokens_{suffix}"] = total_tokens
                 user_entry[f"total_cost_{suffix}"] = round(total_cost, 4)
@@ -520,6 +535,7 @@ async def diagnose_user_usage(
     reachability, and local-DB message counts so admins can see which branch fired."""
     import httpx
     from app.db import Message, Conversation, AgentConfig
+    from app.db.models import BuildUsage, BuildJob
 
     target = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not target:
@@ -530,6 +546,7 @@ async def diagnose_user_usage(
         "agent_config": None,
         "agent_proxy": None,
         "local_db": None,
+        "auto_builder": None,
         "verdict": None,
     }
 
@@ -622,6 +639,50 @@ async def diagnose_user_usage(
             "messages_with_model": int(with_model),
             "messages_with_tokens": int(with_tokens),
         }
+
+    # Auto-builder usage (lives on agent DB; local fallback only has data if this
+    # platform DB also happens to hold BuildUsage rows — e.g. monolith mode).
+    try:
+        job_count = (await db.execute(
+            select(func.count()).select_from(BuildJob).where(BuildJob.user_id == user_id)
+        )).scalar_one()
+        bu_stmt = (
+            select(
+                BuildUsage.provider,
+                func.coalesce(func.sum(BuildUsage.input_tokens), 0).label("inp"),
+                func.coalesce(func.sum(BuildUsage.output_tokens), 0).label("out"),
+                func.coalesce(func.sum(BuildUsage.cost_usd), 0.0).label("cost"),
+                func.count().label("cnt"),
+            )
+            .where(BuildUsage.user_id == user_id)
+            .group_by(BuildUsage.provider)
+        )
+        by_provider: list[dict] = []
+        total_tokens = 0
+        total_cost = 0.0
+        total_calls = 0
+        for provider, inp, out, cost, cnt in (await db.execute(bu_stmt)).all():
+            inp_i = int(inp); out_i = int(out); cnt_i = int(cnt); cost_f = float(cost or 0.0)
+            total_tokens += inp_i + out_i
+            total_cost += cost_f
+            total_calls += cnt_i
+            by_provider.append({
+                "provider": provider,
+                "input_tokens": inp_i,
+                "output_tokens": out_i,
+                "total_tokens": inp_i + out_i,
+                "cost_usd": round(cost_f, 4),
+                "llm_calls": cnt_i,
+            })
+        out["auto_builder"] = {
+            "build_jobs": int(job_count),
+            "total_tokens": total_tokens,
+            "total_cost_usd": round(total_cost, 4),
+            "total_llm_calls": total_calls,
+            "by_provider": sorted(by_provider, key=lambda p: p["total_tokens"], reverse=True),
+        }
+    except Exception as e:
+        out["auto_builder"] = {"error": f"{type(e).__name__}: {e}"}
 
     proxy_ok = (
         out["agent_proxy"].get("attempted")

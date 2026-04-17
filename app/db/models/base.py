@@ -78,6 +78,7 @@ AGENT_ONLY_TABLES: set[str] = {
     # Apps & build jobs
     "apps",
     "build_jobs",
+    "build_usage",
     "reconciliation_logs",
     # Agent runtime
     "cron_jobs",

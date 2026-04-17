@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 import uuid
 
-from sqlalchemy import String, Text, DateTime, Integer, ForeignKey
+from sqlalchemy import String, Text, DateTime, Integer, Float, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -64,6 +64,27 @@ class BuildJob(Base):
     layer2_changes_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array of Layer 2 changes
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class BuildUsage(Base):
+    """Per-LLM-call usage row emitted during an auto-builder build.
+
+    Lets admins aggregate tokens/cost per user per provider (anthropic, openai, etc.).
+    One row per LLM call. Written at job persist time in a single bulk insert to keep
+    the hot build loop allocation-free. BuildJob stays the aggregate owner via
+    `total_tokens`; this table is the breakdown."""
+    __tablename__ = "build_usage"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id: Mapped[str] = mapped_column(String(36), ForeignKey("build_jobs.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(30), nullable=False, index=True)  # anthropic, openai, other
+    model: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    phase: Mapped[str] = mapped_column(String(30), nullable=False, default="")  # planning, code_gen, repair, research, building, layer2
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class ReconciliationLog(Base):

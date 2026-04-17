@@ -74,6 +74,7 @@ class ModelUsageOut(BaseModel):
     total_tokens: int
     cost_usd: float
     request_count: int
+    source: Optional[str] = None  # "chat" | "auto_builder" — null for unaggregated entries
 
 
 class ProviderUsageOut(BaseModel):
@@ -303,6 +304,60 @@ def model_to_provider(model: str) -> str:
     return "other"
 
 
+async def _merge_build_usage(
+    user_id: str, since: datetime, provider_map: dict, db: AsyncSession,
+) -> None:
+    """Merge auto-builder LLM usage (BuildUsage table) into an in-progress provider_map.
+
+    provider_map is the same dict structure used by the chat-messages aggregation, so
+    auto-builder tokens roll up into the same per-provider totals. Model entries are
+    tagged `source="auto_builder"` so the UI can tell them apart from chat."""
+    try:
+        from app.db.models import BuildUsage
+    except Exception:
+        return
+    stmt = (
+        select(
+            BuildUsage.provider,
+            BuildUsage.model,
+            func.coalesce(func.sum(BuildUsage.input_tokens), 0).label("inp"),
+            func.coalesce(func.sum(BuildUsage.output_tokens), 0).label("out"),
+            func.coalesce(func.sum(BuildUsage.cost_usd), 0.0).label("cost"),
+            func.count().label("cnt"),
+        )
+        .where(BuildUsage.user_id == user_id, BuildUsage.created_at >= since)
+        .group_by(BuildUsage.provider, BuildUsage.model)
+    )
+    try:
+        rows = (await db.execute(stmt)).all()
+    except Exception as _e:
+        logger.warning("BuildUsage aggregation skipped: %s", _e)
+        return
+    for provider, model, inp, out, cost, cnt in rows:
+        inp_i = int(inp); out_i = int(out); cnt_i = int(cnt); cost_f = float(cost)
+        if provider not in provider_map:
+            provider_map[provider] = {
+                "provider": provider, "input_tokens": 0, "output_tokens": 0,
+                "total_tokens": 0, "cost_usd": 0.0, "request_count": 0, "models": [],
+            }
+        prov = provider_map[provider]
+        prov["input_tokens"] += inp_i
+        prov["output_tokens"] += out_i
+        prov["total_tokens"] += inp_i + out_i
+        prov["cost_usd"] = round(prov["cost_usd"] + cost_f, 4)
+        prov["request_count"] += cnt_i
+        prov["models"].append({
+            "model": model or "unknown",
+            "provider": provider,
+            "input_tokens": inp_i,
+            "output_tokens": out_i,
+            "total_tokens": inp_i + out_i,
+            "cost_usd": round(cost_f, 4),
+            "request_count": cnt_i,
+            "source": "auto_builder",
+        })
+
+
 @router.get("/usage/summary", response_model=list[UsageSummaryOut])
 async def get_usage_summary(
     current_user=Depends(get_current_user),
@@ -342,79 +397,72 @@ async def get_usage_summary(
     )
     conv_ids = [r[0] for r in conv_result.all()]
 
-    if not conv_ids:
-        return [
-            UsageSummaryOut(
-                period=p, total_input_tokens=0, total_output_tokens=0,
-                total_tokens=0, total_cost_usd=0.0, total_requests=0, providers=[],
-            )
-            for p in periods
-        ]
-
-    # Query messages grouped by model for each period
+    # Query messages grouped by model for each period, then merge BuildUsage (auto builder).
     results = []
     pricing = settings.pricing_per_1k
 
     for period_name, since in periods.items():
-        stmt = (
-            select(
-                Message.model_used,
-                func.coalesce(func.sum(func.coalesce(Message.tokens_prompt, 0)), 0).label("inp"),
-                func.coalesce(func.sum(func.coalesce(Message.tokens_completion, 0)), 0).label("out"),
-                func.count().label("cnt"),
-            )
-            .where(
-                Message.conversation_id.in_(conv_ids),
-                Message.role == "assistant",
-                Message.model_used.isnot(None),
-                Message.created_at >= since,
-            )
-            .group_by(Message.model_used)
-        )
-        rows = (await db.execute(stmt)).all()
+        provider_map: dict[str, dict] = {}
 
-        # Build per-model entries
-        provider_map: dict[str, ProviderUsageOut] = {}
-        for model_used, inp, out, cnt in rows:
-            provider = model_to_provider(model_used or "")
-            p_cost = pricing.get(model_used, {"input": 0.003, "output": 0.012})
-            cost = (inp * p_cost["input"] / 1000) + (out * p_cost["output"] / 1000)
-
-            model_entry = ModelUsageOut(
-                model=model_used or "unknown",
-                provider=provider,
-                input_tokens=int(inp),
-                output_tokens=int(out),
-                total_tokens=int(inp + out),
-                cost_usd=round(cost, 4),
-                request_count=int(cnt),
-            )
-
-            if provider not in provider_map:
-                provider_map[provider] = ProviderUsageOut(
-                    provider=provider, input_tokens=0, output_tokens=0,
-                    total_tokens=0, cost_usd=0.0, request_count=0, models=[],
+        if conv_ids:
+            stmt = (
+                select(
+                    Message.model_used,
+                    func.coalesce(func.sum(func.coalesce(Message.tokens_prompt, 0)), 0).label("inp"),
+                    func.coalesce(func.sum(func.coalesce(Message.tokens_completion, 0)), 0).label("out"),
+                    func.count().label("cnt"),
                 )
-            prov = provider_map[provider]
-            prov.input_tokens += int(inp)
-            prov.output_tokens += int(out)
-            prov.total_tokens += int(inp + out)
-            prov.cost_usd = round(prov.cost_usd + cost, 4)
-            prov.request_count += int(cnt)
-            prov.models.append(model_entry)
+                .where(
+                    Message.conversation_id.in_(conv_ids),
+                    Message.role == "assistant",
+                    Message.model_used.isnot(None),
+                    Message.created_at >= since,
+                )
+                .group_by(Message.model_used)
+            )
+            rows = (await db.execute(stmt)).all()
 
-        providers = sorted(provider_map.values(), key=lambda p: p.total_tokens, reverse=True)
-        total_inp = sum(p.input_tokens for p in providers)
-        total_out = sum(p.output_tokens for p in providers)
+            for model_used, inp, out, cnt in rows:
+                provider = model_to_provider(model_used or "")
+                p_cost = pricing.get(model_used, {"input": 0.003, "output": 0.012})
+                cost = (inp * p_cost["input"] / 1000) + (out * p_cost["output"] / 1000)
+
+                if provider not in provider_map:
+                    provider_map[provider] = {
+                        "provider": provider, "input_tokens": 0, "output_tokens": 0,
+                        "total_tokens": 0, "cost_usd": 0.0, "request_count": 0, "models": [],
+                    }
+                prov = provider_map[provider]
+                prov["input_tokens"] += int(inp)
+                prov["output_tokens"] += int(out)
+                prov["total_tokens"] += int(inp + out)
+                prov["cost_usd"] = round(prov["cost_usd"] + cost, 4)
+                prov["request_count"] += int(cnt)
+                prov["models"].append({
+                    "model": model_used or "unknown",
+                    "provider": provider,
+                    "input_tokens": int(inp),
+                    "output_tokens": int(out),
+                    "total_tokens": int(inp + out),
+                    "cost_usd": round(cost, 4),
+                    "request_count": int(cnt),
+                    "source": "chat",
+                })
+
+        await _merge_build_usage(current_user.id, since, provider_map, db)
+
+        providers_sorted = sorted(provider_map.values(), key=lambda p: p["total_tokens"], reverse=True)
+        total_inp = sum(p["input_tokens"] for p in providers_sorted)
+        total_out = sum(p["output_tokens"] for p in providers_sorted)
 
         results.append(UsageSummaryOut(
             period=period_name,
             total_input_tokens=total_inp,
             total_output_tokens=total_out,
             total_tokens=total_inp + total_out,
-            total_cost_usd=round(sum(p.cost_usd for p in providers), 4),
-            total_requests=sum(p.request_count for p in providers),
-            providers=providers,
+            total_cost_usd=round(sum(p["cost_usd"] for p in providers_sorted), 4),
+            total_requests=sum(p["request_count"] for p in providers_sorted),
+            providers=[ProviderUsageOut(**p) for p in providers_sorted],
         ))
 
     return results

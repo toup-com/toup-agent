@@ -64,6 +64,30 @@ class BuildLogger:
         self._session_output_tokens = 0
         self._compaction_count = 0
         self._model_context_window = self._DEFAULT_CONTEXT
+        # Per-call usage rows queued for insertion into build_usage table.
+        # Each persist() flushes only the new (unpersisted) rows.
+        self._usage_records: List[Dict[str, Any]] = []
+        self._usage_persisted_count = 0
+
+    @staticmethod
+    def _infer_provider(model: str) -> str:
+        """Map a model name to its provider bucket for per-provider admin aggregation."""
+        if not model:
+            return "other"
+        m = model.lower()
+        if m.startswith("claude") or "anthropic" in m:
+            return "anthropic"
+        if m.startswith("gpt") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4") or "openai" in m:
+            return "openai"
+        if m.startswith("gemini") or "google" in m:
+            return "google"
+        if m.startswith("mistral"):
+            return "mistral"
+        if "grok" in m or "xai" in m:
+            return "xai"
+        if "deepseek" in m:
+            return "deepseek"
+        return "other"
 
     @property
     def logs(self) -> List[Dict[str, Any]]:
@@ -124,6 +148,17 @@ class BuildLogger:
         self._total_cost_usd += cost_usd
         self._session_input_tokens += input_tokens
         self._session_output_tokens += output_tokens
+
+        if total > 0 or cost_usd > 0:
+            self._usage_records.append({
+                "provider": self._infer_provider(model),
+                "model": model or "",
+                "phase": self._current_step or "",
+                "input_tokens": int(input_tokens),
+                "output_tokens": int(output_tokens),
+                "cost_usd": float(cost_usd),
+                "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            })
 
         usage_pct = self.context_usage_pct
         detail = f"{model} · {total:,} tokens · {duration_s:.1f}s"
@@ -211,9 +246,10 @@ class BuildLogger:
                 pass  # Don't fail the build because WS broadcast failed
 
     async def persist(self):
-        """Save accumulated logs to the database."""
+        """Save accumulated logs + any new per-call usage rows to the database."""
         from app.db.database import async_session_maker
-        from app.db.models import BuildJob
+        from app.db.models import BuildJob, BuildUsage
+        import uuid as _uuid
 
         try:
             async with async_session_maker() as db:
@@ -222,7 +258,27 @@ class BuildLogger:
                     job.build_logs_json = json.dumps(self._logs)
                     if self._total_tokens > 0:
                         job.total_tokens = self._total_tokens
-                    await db.commit()
+
+                new_rows = self._usage_records[self._usage_persisted_count:]
+                if new_rows:
+                    db.add_all([
+                        BuildUsage(
+                            id=str(_uuid.uuid4()),
+                            job_id=self.job_id,
+                            user_id=self.user_id,
+                            provider=r["provider"],
+                            model=r["model"],
+                            phase=r["phase"],
+                            input_tokens=r["input_tokens"],
+                            output_tokens=r["output_tokens"],
+                            cost_usd=r["cost_usd"],
+                            created_at=r["created_at"],
+                        )
+                        for r in new_rows
+                    ])
+                    self._usage_persisted_count = len(self._usage_records)
+
+                await db.commit()
         except Exception as e:
             logger.warning(f"[BUILD] Failed to persist logs: {e}")
 
