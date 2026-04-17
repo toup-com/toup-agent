@@ -71,6 +71,7 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "generate_pptx": 1_000,
     "generate_markdown": 1_000,
     "generate_html_to_pdf": 1_000,
+    "convert_document": 1_000,
 }
 
 # Default if tool not in the table
@@ -973,6 +974,61 @@ class ToolExecutor:
         except Exception as exc:
             logger.exception("generate_markdown failed")
             return f"ERROR: {type(exc).__name__}: {exc}"
+        return await self._register_attachment(att)
+
+    async def _tool_convert_document(self, inp: Dict[str, Any]) -> str:
+        """Convert an existing generated DOCX/PPTX to PDF via LibreOffice.
+
+        This is what the user actually wants when they click "Make it a PDF"
+        or say "give me the PDF version" — faithful conversion of the layout
+        they already have, NOT a fresh reportlab PDF from scratch.
+
+        Looks up the source file by filename in this turn's pending_attachments
+        (the most recent generated file). If not found there, scans the user's
+        generated/ directory for the latest match.
+        """
+        from app.agent.doc_generators import Attachment, MIME_PDF, _persist, _safe_filename
+        from app.services.doc_preview import render_to_pdf
+        from app.services.file_storage import get_storage_backend
+        import glob, os
+
+        source_filename = inp.get("source_filename", "").strip()
+        if not source_filename:
+            return "ERROR: source_filename is required"
+        out_filename = _safe_filename(
+            inp.get("filename", "") or source_filename.rsplit(".", 1)[0] + ".pdf",
+            ".pdf",
+        )
+
+        # 1. Prefer pending_attachments (this-turn file).
+        source_key = None
+        for att in self.pending_attachments:
+            if att.get("filename") == source_filename:
+                source_key = att.get("storage_path")
+                break
+
+        # 2. Fall back to scanning the user's generated/ dir for the most recent match.
+        if not source_key:
+            backend = get_storage_backend()
+            ws = self._user_scope()
+            search_root = os.path.join(backend.root, "generated", ws)
+            if os.path.isdir(search_root):
+                matches = glob.glob(os.path.join(search_root, f"*_{source_filename}"))
+                if matches:
+                    latest = max(matches, key=os.path.getmtime)
+                    source_key = f"{ws}/{os.path.basename(latest)}"
+
+        if not source_key:
+            return f"ERROR: Couldn't find a generated file named '{source_filename}'"
+
+        try:
+            pdf_bytes = await render_to_pdf(source_key)
+        except RuntimeError as exc:
+            return f"ERROR: {exc}"
+        if not pdf_bytes:
+            return "ERROR: LibreOffice conversion failed. Try generate_pdf with structured content as a fallback."
+
+        att = await _persist(pdf_bytes, out_filename, MIME_PDF, self._user_scope())
         return await self._register_attachment(att)
 
     async def _tool_generate_html_to_pdf(self, inp: Dict[str, Any]) -> str:

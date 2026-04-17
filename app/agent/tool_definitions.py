@@ -1417,6 +1417,33 @@ def get_doc_generation_tools() -> List[Dict[str, Any]]:
             },
         },
         {
+            "name": "convert_document",
+            "description": (
+                "Convert an EXISTING generated DOCX or PPTX file to PDF via "
+                "LibreOffice — faithful WYSIWYG conversion, NOT a new document "
+                "from scratch. Use this when the user says \"make it a PDF\", "
+                "\"give me the PDF version\", \"convert to PDF\", or similar. "
+                "Produces a PDF that looks identical to what Word / PowerPoint "
+                "would print. Do NOT call generate_pdf for this — that builds "
+                "a new PDF from structured blocks, which loses the original "
+                "layout."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "source_filename": {
+                        "type": "string",
+                        "description": "Filename of the previously-generated file (e.g. 'hiring-application-form.docx').",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Output filename (optional; defaults to source basename + .pdf).",
+                    },
+                },
+                "required": ["source_filename"],
+            },
+        },
+        {
             "name": "generate_html_to_pdf",
             "description": (
                 "Render an HTML string to PDF via weasyprint. Use when you need CSS-styled PDF "
