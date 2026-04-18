@@ -399,7 +399,10 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
     channel = (msg.get("channel") or "").strip().lower()
     enabled = bool(msg.get("enabled"))
 
+    print(f"[radio] toggle entry user={user_id[:8]} channel={channel!r} enabled={enabled} msg={msg}", flush=True)
+
     if not RadioSessionManager.is_channel_allowed(channel):
+        print(f"[radio] toggle REJECT channel_not_supported channel={channel!r}", flush=True)
         await broadcast_to_user(user_id, {
             "type": "radio_state",
             "channel": channel,
@@ -423,6 +426,7 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
     seed_video_id = (msg.get("video_id") or "").strip()
     seed_title = (msg.get("title") or "").strip()
     seed_intent = (msg.get("seed_intent") or "").strip()
+    seed_source = "payload" if seed_video_id else None
 
     if not seed_video_id:
         existing = mgr.get(user_id, channel)
@@ -430,14 +434,23 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
             seed_video_id = existing.seed_track.video_id
             seed_title = seed_title or existing.seed_track.title
             seed_intent = seed_intent or existing.seed_intent
+            seed_source = "session"
 
     if not seed_video_id and _agent_runner and getattr(_agent_runner, "tools", None):
         last = getattr(_agent_runner.tools, "_last_media", None)
         if last and last.get("video_id"):
             seed_video_id = last["video_id"]
             seed_title = seed_title or last.get("title", "") or "Now Playing"
+            seed_source = "last_media"
 
     if not seed_video_id:
+        existing_sess = mgr.get(user_id, channel)
+        last_media = getattr(_agent_runner.tools, "_last_media", None) if _agent_runner else None
+        print(
+            f"[radio] toggle REJECT no_seed_track user={user_id[:8]} channel={channel!r} "
+            f"existing_sess={existing_sess!r} last_media={last_media!r}",
+            flush=True,
+        )
         await broadcast_to_user(user_id, {
             "type": "radio_state",
             "channel": channel,
@@ -451,6 +464,11 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         channel=channel,
         seed_intent=seed_intent or seed_title or "music",
         seed_track=SeedTrack(video_id=seed_video_id, title=seed_title or "Now Playing"),
+    )
+    print(
+        f"[radio] toggle OK user={user_id[:8]} channel={channel} "
+        f"seed_source={seed_source} video={seed_video_id} title={seed_title!r}",
+        flush=True,
     )
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
