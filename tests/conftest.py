@@ -75,28 +75,36 @@ async def client() -> AsyncIterator[AsyncClient]:
 
 
 @pytest_asyncio.fixture
-async def auth_headers(client: AsyncClient) -> dict[str, str]:
-    """Unique user per test via a random email — prevents cross-test collisions."""
-    email = f"test-{uuid.uuid4().hex[:12]}@toup.test"
-    password = "test-password-1234"
-    reg = await client.post(
-        "/api/auth/register",
-        json={"email": email, "password": password, "name": "Test User"},
-    )
-    assert reg.status_code in (200, 201), f"register failed: {reg.status_code} {reg.text}"
-    token = reg.json().get("access_token")
-    if not token:
-        login = await client.post("/api/auth/login", json={"email": email, "password": password})
-        assert login.status_code == 200, login.text
-        token = login.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
+async def _test_user() -> dict[str, str]:
+    """Create a User row directly and mint a JWT. Bypasses the register endpoint
+    so we don't depend on identity/soul seeding (those tables live in the agent
+    schema, which RUN_MODE=platform excludes)."""
+    from app.db import User, async_session_maker
+    from app.services.auth_service import create_access_token, get_password_hash
+
+    user_id = str(uuid.uuid4())
+    email = f"test-{uuid.uuid4().hex[:12]}@example.com"
+    async with async_session_maker() as db:
+        user = User(
+            id=user_id,
+            email=email,
+            hashed_password=get_password_hash("test-password-1234"),
+            name="Test User",
+        )
+        db.add(user)
+        await db.commit()
+    token = create_access_token(user_id)
+    return {"id": user_id, "email": email, "token": token}
 
 
 @pytest_asyncio.fixture
-async def test_user_id(client: AsyncClient, auth_headers: dict[str, str]) -> str:
-    me = await client.get("/api/auth/me", headers=auth_headers)
-    assert me.status_code == 200, me.text
-    return me.json()["id"]
+async def auth_headers(_test_user: dict[str, str]) -> dict[str, str]:
+    return {"Authorization": f"Bearer {_test_user['token']}"}
+
+
+@pytest_asyncio.fixture
+async def test_user_id(_test_user: dict[str, str]) -> str:
+    return _test_user["id"]
 
 
 # ── Stripe test-mode gate ─────────────────────────────────────────────

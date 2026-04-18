@@ -156,7 +156,7 @@ async def test_invoice_payment_succeeded_activates_bundle(
         {"id": f"in_test_{secrets_mod.token_hex(4)}", "subscription": sub_id, "object": "invoice"},
     )
 
-    with patch("app.api.vps.get_subscription", side_effect=_fake_get_subscription):
+    with patch("app.services.stripe_service.get_subscription", side_effect=_fake_get_subscription):
         resp = await client.post("/api/vps/webhook/stripe", content=payload, headers=headers)
 
     assert resp.status_code == 200, resp.text
@@ -186,7 +186,7 @@ async def test_duplicate_invoice_webhook_is_idempotent(
         event_id="evt_test_dup",  # same id both times — replay
     )
 
-    with patch("app.api.vps.get_subscription", side_effect=_fake_get_subscription):
+    with patch("app.services.stripe_service.get_subscription", side_effect=_fake_get_subscription):
         r1 = await client.post("/api/vps/webhook/stripe", content=payload, headers=headers)
         cfg_after_first = await _get_agent_config(test_user_id)
         first_token = cfg_after_first.llm_token_hash
@@ -228,7 +228,7 @@ async def test_subscription_updated_cancelling_transitions_state(
             "status": "active",
             "cancel_at_period_end": True,
             "current_period_end": int((datetime.now(timezone.utc) + timedelta(days=12)).timestamp()),
-            "metadata": {"type": "llm_bundle"},
+            "metadata": {"type": "llm_bundle", "user_id": test_user_id},
         },
     )
     resp = await client.post("/api/vps/webhook/stripe", content=payload, headers=headers)
@@ -253,7 +253,7 @@ async def test_subscription_updated_past_due_transitions_state(
             "status": "past_due",
             "cancel_at_period_end": False,
             "current_period_end": int((datetime.now(timezone.utc) + timedelta(days=30)).timestamp()),
-            "metadata": {"type": "llm_bundle"},
+            "metadata": {"type": "llm_bundle", "user_id": test_user_id},
         },
     )
     resp = await client.post("/api/vps/webhook/stripe", content=payload, headers=headers)
@@ -272,7 +272,7 @@ async def test_subscription_deleted_marks_cancelled(
 
     payload, headers = signed_stripe_event(
         "customer.subscription.deleted",
-        {"id": sub_id, "object": "subscription", "metadata": {"type": "llm_bundle"}},
+        {"id": sub_id, "object": "subscription", "metadata": {"type": "llm_bundle", "user_id": test_user_id}},
     )
     resp = await client.post("/api/vps/webhook/stripe", content=payload, headers=headers)
     assert resp.status_code == 200
@@ -330,7 +330,7 @@ async def test_events_out_of_order_converge_to_correct_state(
             "status": "active",
             "cancel_at_period_end": False,
             "current_period_end": int((datetime.now(timezone.utc) + timedelta(days=30)).timestamp()),
-            "metadata": {"type": "llm_bundle"},
+            "metadata": {"type": "llm_bundle", "user_id": test_user_id},
         },
     )
     r1 = await client.post("/api/vps/webhook/stripe", content=payload1, headers=headers1)
@@ -341,7 +341,7 @@ async def test_events_out_of_order_converge_to_correct_state(
         "invoice.payment_succeeded",
         {"id": "in_test_ooo", "subscription": sub_id, "object": "invoice"},
     )
-    with patch("app.api.vps.get_subscription", side_effect=_fake_get_subscription):
+    with patch("app.services.stripe_service.get_subscription", side_effect=_fake_get_subscription):
         r2 = await client.post("/api/vps/webhook/stripe", content=payload2, headers=headers2)
     assert r2.status_code == 200
 

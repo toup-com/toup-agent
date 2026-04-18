@@ -304,13 +304,22 @@ def verify_webhook(payload: bytes, sig_header: str) -> Optional[dict]:
         )
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, webhook_secret
-        )
-        return dict(event)
+        # construct_event validates the signature and raises on failure.
+        # We don't use its return value — newer stripe-python versions
+        # return a StripeObject that dict()'s inconsistently across SDK
+        # versions. Parse the verified payload back to a plain dict ourselves.
+        stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
     except stripe.error.SignatureVerificationError:
         logger.warning("Stripe webhook signature verification failed")
         return None
     except Exception as exc:
-        logger.exception("Error parsing Stripe webhook: %s", exc)
+        logger.exception("Error verifying Stripe webhook: %s", exc)
+        return None
+
+    try:
+        import json
+        raw = payload.decode("utf-8") if isinstance(payload, (bytes, bytearray)) else payload
+        return json.loads(raw)
+    except Exception as exc:
+        logger.exception("Error parsing Stripe webhook payload: %s", exc)
         return None
