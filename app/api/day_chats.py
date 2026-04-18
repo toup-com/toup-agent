@@ -25,10 +25,31 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/day-chats", tags=["Day Chats"])
 
 
+_PREVIEW_MIMES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def _attachment_urls(message_id: str, att: dict) -> dict:
+    """Compute download_url and (when applicable) preview_url for a stored
+    attachment. Mirrors the live WS event payload built by ws_chat.py so
+    REST-loaded history renders identically to live messages."""
+    from app.config import settings as _settings
+    aid = att.get("id", "")
+    mime = att.get("mime_type", "")
+    out = {"download_url": f"{_settings.api_prefix}/files/{message_id}/{aid}"}
+    if mime in _PREVIEW_MIMES or mime.startswith("image/"):
+        out["preview_url"] = f"{_settings.api_prefix}/files/{message_id}/{aid}/preview?format=html"
+    return out
+
+
 def _serialize_attachments(msg: Message) -> Optional[List[dict]]:
-    """Return Message.attachments as a client-safe list (strip storage_path)
-    or None when there are no attachments. Handles both native-JSON driver
-    returns (list) and legacy TEXT-stored JSON strings."""
+    """Return Message.attachments as a client-safe list (strip storage_path,
+    enrich with download_url + preview_url) or None when there are none.
+    Handles both native-JSON driver returns (list) and legacy TEXT-stored
+    JSON strings."""
     import json as _json
     raw = getattr(msg, "attachments", None)
     if not raw:
@@ -41,7 +62,10 @@ def _serialize_attachments(msg: Message) -> Optional[List[dict]]:
     if not isinstance(raw, list):
         return None
     return [
-        {k: v for k, v in att.items() if k != "storage_path"}
+        {
+            **{k: v for k, v in att.items() if k != "storage_path"},
+            **_attachment_urls(msg.id, att),
+        }
         for att in raw
         if isinstance(att, dict)
     ]

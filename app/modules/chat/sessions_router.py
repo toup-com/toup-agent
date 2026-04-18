@@ -380,6 +380,29 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         except json.JSONDecodeError:
             pass
 
+    # Generated-file attachments — strip storage_path, enrich with the
+    # download_url + preview_url that the live WS event includes so REST
+    # history renders identically. See app/api/day_chats.py for the same
+    # helper; we inline here to avoid a circular import.
+    attachments = None
+    raw_atts = getattr(message, "attachments", None)
+    if raw_atts:
+        if isinstance(raw_atts, str):
+            try:
+                raw_atts = json.loads(raw_atts)
+            except (TypeError, ValueError):
+                raw_atts = None
+        if isinstance(raw_atts, list):
+            from app.api.day_chats import _attachment_urls
+            attachments = [
+                {
+                    **{k: v for k, v in att.items() if k != "storage_path"},
+                    **_attachment_urls(message.id, att),
+                }
+                for att in raw_atts
+                if isinstance(att, dict)
+            ] or None
+
     # Base response fields
     resp = dict(
         id=message.id,
@@ -392,6 +415,7 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         memories_retrieved=memories_retrieved,
         processing_time_ms=message.processing_time_ms,
         media=media,
+        attachments=attachments,
     )
 
     # Enrich job card messages with current BuildJob status
