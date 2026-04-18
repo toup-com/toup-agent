@@ -1,8 +1,12 @@
-"""Radio Mode next-track picker — silent Haiku call.
+"""Radio Mode next-track picker — silent background LLM call.
 
 Takes the current session (seed intent, played titles) and returns a
 YouTube search query for the next track. Does NOT create an assistant
 message or touch the conversation history.
+
+Uses the agent's configured AnthropicService rather than internal_llm
+because most deployments run on Claude Code OAuth (no raw API key
+present for internal_llm to use).
 """
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ import logging
 from typing import Optional
 
 from app.agent.radio.session import RadioSession
-from app.services.internal_llm import call_anthropic_system
+from app.services.anthropic_service import get_anthropic_service
 
 logger = logging.getLogger(__name__)
 
@@ -44,27 +48,35 @@ def _build_user_prompt(sess: RadioSession) -> str:
 
 
 async def pick_next_query(sess: RadioSession) -> Optional[str]:
-    """Return a YouTube search query for the next track, or None on failure."""
+    """Return a YouTube search query for the next track, or None on failure.
+
+    Uses the agent's AnthropicService so OAuth-authenticated deployments
+    (Claude Code mode) work without a separate API key.
+    """
+    svc = get_anthropic_service()
     try:
-        raw = await call_anthropic_system(
-            user_id=sess.user_id,
-            operation_type="system.radio_pick",
+        resp = await svc.create_message(
+            messages=[{"role": "user", "content": _build_user_prompt(sess)}],
+            system=_SYSTEM_PROMPT,
             model=_HAIKU_MODEL,
             max_tokens=60,
-            system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": _build_user_prompt(sess)}],
-            timeout=20,
+            temperature=0.7,
         )
+        raw = (resp.content or "").strip() if resp else ""
     except Exception as e:
-        logger.warning("[radio/picker] Haiku call raised: %s", e)
+        logger.warning("[radio/picker] LLM call raised: %s", e)
+        print(f"[radio/picker] LLM call raised: {type(e).__name__}: {e}", flush=True)
         return None
 
     if not raw:
+        print(f"[radio/picker] empty response seed_intent={sess.seed_intent!r}", flush=True)
         return None
 
     # Strip quotes/newlines the model sometimes adds anyway.
     q = raw.strip().strip('"').strip("'").splitlines()[0].strip()
     if not q or len(q) > 200:
         logger.warning("[radio/picker] bad query output: %r", raw[:120])
+        print(f"[radio/picker] bad query output raw={raw[:120]!r}", flush=True)
         return None
+    print(f"[radio/picker] picked query={q!r} seed_intent={sess.seed_intent!r}", flush=True)
     return q
