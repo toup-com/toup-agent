@@ -18,7 +18,11 @@ from app.services.anthropic_service import get_anthropic_service
 
 logger = logging.getLogger(__name__)
 
-_HAIKU_MODEL = "claude-haiku-4-5-20251001"
+# NOTE: Claude Code OAuth only grants access to a narrow set of models (Sonnet
+# variants). Haiku is not in that allowlist — passing `model="claude-haiku-..."`
+# under OAuth auth returns 401 invalid x-api-key. Leaving `model=None` makes
+# AnthropicService use `settings.anthropic_model`, which is whatever the agent
+# is already authenticated for. That's the safe default.
 
 _SYSTEM_PROMPT = (
     "You are a music curator powering a radio-mode feature. "
@@ -58,7 +62,8 @@ async def pick_next_query(sess: RadioSession) -> Optional[str]:
         resp = await svc.create_message(
             messages=[{"role": "user", "content": _build_user_prompt(sess)}],
             system=_SYSTEM_PROMPT,
-            model=_HAIKU_MODEL,
+            # model intentionally omitted — use whatever the agent's OAuth /
+            # API key can actually access. See note at top of file.
             max_tokens=60,
             temperature=0.7,
         )

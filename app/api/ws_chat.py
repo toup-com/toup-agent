@@ -533,9 +533,10 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
 
     if not found:
         disabled = mgr.record_failure(sess)
-        logger.info(
-            "[radio] pick failed user=%s channel=%s query=%r disabled=%s",
-            user_id[:8], channel, query, disabled,
+        print(
+            f"[radio] pick failed user={user_id[:8]} channel={channel} "
+            f"query={query!r} disabled={disabled}",
+            flush=True,
         )
         if disabled:
             await broadcast_to_user(user_id, {
@@ -552,13 +553,27 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
         return
 
     video_id, title = found
+    print(
+        f"[radio] next track selected user={user_id[:8]} channel={channel} "
+        f"video_id={video_id} title={title!r} query={query!r}",
+        flush=True,
+    )
     # Avoid immediately replaying anything we already played (including seed).
     if video_id in sess.played_track_ids:
-        logger.info("[radio] picker returned dupe video_id=%s — counting as failure", video_id)
+        print(
+            f"[radio] picker returned dupe user={user_id[:8]} video_id={video_id} — "
+            f"counting as failure",
+            flush=True,
+        )
         mgr.record_failure(sess)
         return
 
     mgr.record_auto_play(sess, video_id, title)
+    print(
+        f"[radio] media_player play() called user={user_id[:8]} channel={channel} "
+        f"video_id={video_id}",
+        flush=True,
+    )
     await broadcast_radio_track(user_id=user_id, video_id=video_id, title=title, channel=channel)
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
