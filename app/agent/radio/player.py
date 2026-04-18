@@ -26,12 +26,24 @@ _UA = (
 )
 
 
+# YouTube "Videos" search filter — excludes Shorts, Lives, channels, playlists.
+# Verified empirically (local smoke test 2026-04-18): with this filter,
+# /shorts/ URLs drop from ~22/page to 0/page on music-artist queries. That's
+# the primary Shorts defense; the WEB_PAGE_TYPE_SHORTS id-set below is belt.
+_YT_VIDEOS_FILTER = "EgIQAQ%3D%3D"
+
+
 async def youtube_search_many(query: str, limit: int = 20, timeout: float = 8.0) -> List[Tuple[str, str]]:
-    """Return [(video_id, title)] for up to `limit` search results.
+    """Return [(video_id, title)] for up to `limit` non-Short search results.
 
     Used by the radio-mode picker to fetch a batch of candidates from a
     single query, iterate through them over successive track-end events,
     and only re-search when the batch is exhausted.
+
+    Shorts are filtered two ways:
+      1. `sp=<Videos filter>` query param — YouTube applies it server-side
+      2. Any id that appears in a WEB_PAGE_TYPE_SHORTS navigation block is
+         dropped (catches anything that slips past #1).
     """
     q = (query or "").strip()
     if not q:
@@ -40,7 +52,7 @@ async def youtube_search_many(query: str, limit: int = 20, timeout: float = 8.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as hc:
             resp = await hc.get(
                 "https://www.youtube.com/results",
-                params={"search_query": q},
+                params={"search_query": q, "sp": _YT_VIDEOS_FILTER},
                 headers={"User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9"},
             )
         html = resp.text
@@ -48,12 +60,11 @@ async def youtube_search_many(query: str, limit: int = 20, timeout: float = 8.0)
         print(f"[radio/player] youtube_search_many fetch failed q={q!r} err={e}", flush=True)
         return []
 
+    # Collect Shorts ids so we can reject them regardless of where they appear.
+    shorts_ids = set(re.findall(r'/shorts/([a-zA-Z0-9_-]{11})', html))
+
     # Pull all videoId matches + attempt to align with a nearby title.
-    # Search results embed titles as {"title":{"runs":[{"text":"..."}]}} in
-    # proximity to "videoId":"...". Title is best-effort; picker works with
-    # just videoIds too, since broadcast_radio_track fetches its own metadata.
     ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', html)
-    # Titles in simpleText or runs form, in page order
     title_matches = re.findall(
         r'"title":\{(?:"runs":\[\{"text":"([^"]+)"\}\]|"simpleText":"([^"]+)")',
         html,
@@ -62,14 +73,24 @@ async def youtube_search_many(query: str, limit: int = 20, timeout: float = 8.0)
 
     out: List[Tuple[str, str]] = []
     seen: set = set()
+    shorts_skipped = 0
     for i, vid in enumerate(ids):
         if vid in seen:
             continue
         seen.add(vid)
+        if vid in shorts_ids:
+            shorts_skipped += 1
+            continue
         title = titles[i] if i < len(titles) else ""
-        out.append((vid, title or "YouTube Video"))
+        out.append((vid, title or ""))
         if len(out) >= limit:
             break
+    if shorts_skipped:
+        print(
+            f"[radio/player] search q={q!r} shorts_skipped={shorts_skipped} "
+            f"returned={len(out)}",
+            flush=True,
+        )
     return out
 
 

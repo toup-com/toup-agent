@@ -474,7 +474,12 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
 
 
 async def _handle_media_ended(user_id: str, msg: dict) -> None:
-    from app.agent.radio import get_radio_manager, RadioSessionManager
+    from app.agent.radio import (
+        get_radio_manager,
+        RadioSessionManager,
+        normalize_title,
+        rotate_query,
+    )
     from app.agent.radio.picker import pick_next_query
     from app.agent.radio.player import (
         youtube_search_first,
@@ -520,61 +525,83 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
             ended_video_id, sess.current_track_id, channel,
         )
 
-    # Strategy: search YouTube with the seed intent (what the user originally
-    # asked for — e.g. "play me eminem for gym" → seed_intent="eminem for gym"),
-    # fetch ~20 results, iterate through them across successive track-end
-    # events, skipping anything in played_track_ids. LLM picker is a tiebreaker
-    # when the batch is exhausted AND a fresh search can't find anything new.
+    # ── Candidate filter pipeline ───────────────────────────────────
+    # Each strategy fetches a candidate list, then we run the same filter
+    # chain across all strategies' pooled output:
     #
-    # This does NOT need a working LLM or API key — it only depends on
-    # YouTube's public search page, which is already how play_media works.
+    #   1. Drop unusable titles ("YouTube Video" or empty) — upstream metadata
+    #      scrape failures, not worth playing blind.
+    #   2. Drop by video_id already in played_track_ids.
+    #   3. Drop by normalized title already in played_titles_normalized —
+    #      this is the "Lose Yourself (Official Video)" vs "Lose Yourself
+    #      (Lyrics)" case; different video ids, same song.
+    #   4. Drop candidates whose normalized title == normalized seed — we
+    #      want the vibe, not more uploads of the same track.
+    #
+    # Strategies are tried in rotate_query() order until one yields a
+    # surviving candidate. LLM pick is a tiebreaker only after the rotation
+    # produces nothing new, so it doesn't gate the feature on creds.
     found: Optional[tuple] = None
     query: Optional[str] = None
 
-    # Build the primary search query from whatever best describes the vibe.
-    # Prefer seed_intent (the user's phrasing) over seed_track title (which
-    # is just the video's label and may be verbose / emoji-laden).
     primary_q = (sess.seed_intent or "").strip() or (
         sess.seed_track.title if sess.seed_track else ""
     )
+    seed_norm = normalize_title(sess.seed_track.title if sess.seed_track else primary_q)
 
-    # (a) Seed-intent batch search
-    if primary_q:
-        candidates = await youtube_search_many(primary_q, limit=25)
-        print(
-            f"[radio] strategy=search_batch q={primary_q!r} total={len(candidates)} "
-            f"played={len(sess.played_track_ids)}",
-            flush=True,
-        )
+    def _usable(vid: str, title: str) -> tuple[bool, str]:
+        """Return (ok, reason_if_rejected)."""
+        norm = normalize_title(title)
+        if not title or title.strip().lower() == "youtube video":
+            return False, "missing_title"
+        if vid in sess.played_track_ids:
+            return False, "dupe_id"
+        if norm and norm in sess.played_titles_normalized:
+            return False, "dupe_title"
+        if seed_norm and norm == seed_norm:
+            return False, "same_as_seed"
+        return True, ""
+
+    iteration = sess.pick_iteration
+
+    # (a) Rotated-query search — widens over successive picks so radio
+    # doesn't collapse back to the seed track on iteration 2+.
+    # Try up to 3 different angles per end-event in case the first is stale.
+    for attempt in range(3):
+        q = rotate_query(primary_q, iteration + attempt)
+        if not q:
+            continue
+        candidates = await youtube_search_many(q, limit=25)
+        rejected = {"missing_title": 0, "dupe_id": 0, "dupe_title": 0, "same_as_seed": 0}
         for vid, title in candidates:
-            if vid in sess.played_track_ids:
+            ok, reason = _usable(vid, title)
+            if not ok:
+                rejected[reason] = rejected.get(reason, 0) + 1
                 continue
             found = (vid, title)
-            query = primary_q
+            query = q
+            break
+        print(
+            f"[radio] strategy=rotate iter={iteration + attempt} q={q!r} "
+            f"raw={len(candidates)} rejected={rejected} "
+            f"selected={found[0] if found else None}",
+            flush=True,
+        )
+        if found:
             break
 
-    # (b) LLM picker — invoked only if the batch was exhausted (everything
-    # already played) OR the search returned nothing. Picker may produce a
-    # fresh query angle ("artist X", "similar to Y") that opens up new results.
+    # (b) LLM tiebreaker — only if rotation produced nothing across all angles.
     if not found:
         llm_q = await pick_next_query(sess)
         print(f"[radio] strategy=llm q={llm_q!r}", flush=True)
         if llm_q:
-            found = await youtube_search_first(llm_q)
-            if found:
-                query = llm_q
-
-    # (c) Last-resort: broaden the seed with "radio" / "mix" keywords.
-    if not found and primary_q:
-        broad_q = f"{primary_q} mix"
-        print(f"[radio] strategy=broaden q={broad_q!r}", flush=True)
-        broadened = await youtube_search_many(broad_q, limit=15)
-        for vid, title in broadened:
-            if vid in sess.played_track_ids:
-                continue
-            found = (vid, title)
-            query = broad_q
-            break
+            llm_hits = await youtube_search_many(llm_q, limit=15)
+            for vid, title in llm_hits:
+                ok, _ = _usable(vid, title)
+                if ok:
+                    found = (vid, title)
+                    query = llm_q
+                    break
 
     if not found:
         disabled = mgr.record_failure(sess)

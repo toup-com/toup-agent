@@ -7,6 +7,8 @@ from app.agent.radio.session import (
     RadioSession,
     RadioSessionManager,
     get_radio_manager,
+    normalize_title,
+    rotate_query,
     RADIO_ALLOWED_CHANNELS,
 )
 
@@ -14,5 +16,7 @@ __all__ = [
     "RadioSession",
     "RadioSessionManager",
     "get_radio_manager",
+    "normalize_title",
+    "rotate_query",
     "RADIO_ALLOWED_CHANNELS",
 ]
