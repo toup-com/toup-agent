@@ -476,7 +476,11 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
 async def _handle_media_ended(user_id: str, msg: dict) -> None:
     from app.agent.radio import get_radio_manager, RadioSessionManager
     from app.agent.radio.picker import pick_next_query
-    from app.agent.radio.player import youtube_search_first, broadcast_radio_track
+    from app.agent.radio.player import (
+        youtube_search_first,
+        youtube_search_many,
+        broadcast_radio_track,
+    )
 
     channel = (msg.get("channel") or "").strip().lower()
     ended_video_id = (msg.get("video_id") or "").strip()
@@ -516,20 +520,61 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
             ended_video_id, sess.current_track_id, channel,
         )
 
-    # Try once, and if the YouTube lookup returns nothing, ask the picker to
-    # retry with a broader query hint. Hard cap at 2 attempts per end-event.
-    attempt = 0
+    # Strategy: search YouTube with the seed intent (what the user originally
+    # asked for — e.g. "play me eminem for gym" → seed_intent="eminem for gym"),
+    # fetch ~20 results, iterate through them across successive track-end
+    # events, skipping anything in played_track_ids. LLM picker is a tiebreaker
+    # when the batch is exhausted AND a fresh search can't find anything new.
+    #
+    # This does NOT need a working LLM or API key — it only depends on
+    # YouTube's public search page, which is already how play_media works.
     found: Optional[tuple] = None
     query: Optional[str] = None
-    while attempt < 2 and not found:
-        attempt += 1
-        query = await pick_next_query(sess)
-        if not query:
+
+    # Build the primary search query from whatever best describes the vibe.
+    # Prefer seed_intent (the user's phrasing) over seed_track title (which
+    # is just the video's label and may be verbose / emoji-laden).
+    primary_q = (sess.seed_intent or "").strip() or (
+        sess.seed_track.title if sess.seed_track else ""
+    )
+
+    # (a) Seed-intent batch search
+    if primary_q:
+        candidates = await youtube_search_many(primary_q, limit=25)
+        print(
+            f"[radio] strategy=search_batch q={primary_q!r} total={len(candidates)} "
+            f"played={len(sess.played_track_ids)}",
+            flush=True,
+        )
+        for vid, title in candidates:
+            if vid in sess.played_track_ids:
+                continue
+            found = (vid, title)
+            query = primary_q
             break
-        if attempt == 2:
-            # Broaden: strip leading artist dash if present
-            query = query.split(" - ", 1)[-1]
-        found = await youtube_search_first(query)
+
+    # (b) LLM picker — invoked only if the batch was exhausted (everything
+    # already played) OR the search returned nothing. Picker may produce a
+    # fresh query angle ("artist X", "similar to Y") that opens up new results.
+    if not found:
+        llm_q = await pick_next_query(sess)
+        print(f"[radio] strategy=llm q={llm_q!r}", flush=True)
+        if llm_q:
+            found = await youtube_search_first(llm_q)
+            if found:
+                query = llm_q
+
+    # (c) Last-resort: broaden the seed with "radio" / "mix" keywords.
+    if not found and primary_q:
+        broad_q = f"{primary_q} mix"
+        print(f"[radio] strategy=broaden q={broad_q!r}", flush=True)
+        broadened = await youtube_search_many(broad_q, limit=15)
+        for vid, title in broadened:
+            if vid in sess.played_track_ids:
+                continue
+            found = (vid, title)
+            query = broad_q
+            break
 
     if not found:
         disabled = mgr.record_failure(sess)
