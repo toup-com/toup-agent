@@ -481,12 +481,31 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
     channel = (msg.get("channel") or "").strip().lower()
     ended_video_id = (msg.get("video_id") or "").strip()
 
+    print(
+        f"[radio] media_ended entry user={user_id[:8]} channel={channel!r} video={ended_video_id}",
+        flush=True,
+    )
+
     if not RadioSessionManager.is_channel_allowed(channel):
+        print(f"[radio] media_ended skip — channel_not_allowed channel={channel!r}", flush=True)
         return
 
     mgr = get_radio_manager()
     sess = mgr.get(user_id, channel)
     if sess is None or not sess.enabled:
+        # Frontend likely has a stale ON toggle (e.g. click before a deploy) —
+        # push an authoritative OFF so the UI syncs with reality.
+        print(
+            f"[radio] media_ended — no active session; broadcasting OFF to sync UI "
+            f"user={user_id[:8]} channel={channel!r} sess_none={sess is None} "
+            f"enabled={getattr(sess, 'enabled', None)}",
+            flush=True,
+        )
+        await broadcast_to_user(user_id, {
+            "type": "radio_state",
+            "channel": channel,
+            "enabled": False,
+        })
         return
 
     # Defensive: only act if the ended track matches our notion of current.
@@ -724,6 +743,9 @@ async def ws_chat(
                 if msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
                     continue
+
+                if msg_type in ("radio_toggle", "media_ended"):
+                    print(f"[WS IN] user={user_id[:8]} type={msg_type} keys={list(msg.keys())}", flush=True)
 
                 # ── Radio Mode: toggle / track-ended signals ──
                 if msg_type == "radio_toggle":
