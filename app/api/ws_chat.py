@@ -371,6 +371,9 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
         # Fire-and-forget: check age restriction in background, swap embed if needed
         asyncio.create_task(_check_age_and_swap(video_id, user_id))
 
+        # Radio session: record this as a user-driven seed. Channel is unknown
+        # at this helper layer — caller records after resolving channel.
+
         # Return modified text so agent knows media is already playing
         modified_text = (
             f"{text}\n\n[SYSTEM: The video \"{video_title}\" (https://www.youtube.com/watch?v={video_id}) "
@@ -382,6 +385,145 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
     except Exception as e:
         logger.warning("[FAST-MEDIA] Fast-path failed (agent will handle): %s", e)
         return None
+
+
+# ── Radio Mode orchestration ─────────────────────────────────────────
+# Toggle: enable / disable a per-channel radio session (seed = last played).
+# Track-ended: when current track ends AND radio is ON, pick next via Haiku
+# and broadcast a radio_auto media_play.
+
+async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
+    from app.agent.radio import get_radio_manager, RadioSessionManager
+    from app.agent.radio.session import SeedTrack
+
+    channel = (msg.get("channel") or "").strip().lower()
+    enabled = bool(msg.get("enabled"))
+
+    if not RadioSessionManager.is_channel_allowed(channel):
+        await broadcast_to_user(user_id, {
+            "type": "radio_state",
+            "channel": channel,
+            "enabled": False,
+            "error": "channel_not_supported",
+        })
+        return
+
+    mgr = get_radio_manager()
+    if not enabled:
+        sess = mgr.disable(user_id, channel)
+        if sess is None:
+            sess_dict = {"type": "radio_state", "channel": channel, "enabled": False}
+        else:
+            sess_dict = sess.to_broadcast_dict()
+        await broadcast_to_user(user_id, sess_dict)
+        return
+
+    # Enable — seed from payload if provided, else reuse the existing session's
+    # seed_track, else fall back to the agent's _last_media.
+    seed_video_id = (msg.get("video_id") or "").strip()
+    seed_title = (msg.get("title") or "").strip()
+    seed_intent = (msg.get("seed_intent") or "").strip()
+
+    if not seed_video_id:
+        existing = mgr.get(user_id, channel)
+        if existing and existing.seed_track:
+            seed_video_id = existing.seed_track.video_id
+            seed_title = seed_title or existing.seed_track.title
+            seed_intent = seed_intent or existing.seed_intent
+
+    if not seed_video_id and _agent_runner and getattr(_agent_runner, "tools", None):
+        last = getattr(_agent_runner.tools, "_last_media", None)
+        if last and last.get("video_id"):
+            seed_video_id = last["video_id"]
+            seed_title = seed_title or last.get("title", "") or "Now Playing"
+
+    if not seed_video_id:
+        await broadcast_to_user(user_id, {
+            "type": "radio_state",
+            "channel": channel,
+            "enabled": False,
+            "error": "no_seed_track",
+        })
+        return
+
+    sess = mgr.enable(
+        user_id=user_id,
+        channel=channel,
+        seed_intent=seed_intent or seed_title or "music",
+        seed_track=SeedTrack(video_id=seed_video_id, title=seed_title or "Now Playing"),
+    )
+    await broadcast_to_user(user_id, sess.to_broadcast_dict())
+
+
+async def _handle_media_ended(user_id: str, msg: dict) -> None:
+    from app.agent.radio import get_radio_manager, RadioSessionManager
+    from app.agent.radio.picker import pick_next_query
+    from app.agent.radio.player import youtube_search_first, broadcast_radio_track
+
+    channel = (msg.get("channel") or "").strip().lower()
+    ended_video_id = (msg.get("video_id") or "").strip()
+
+    if not RadioSessionManager.is_channel_allowed(channel):
+        return
+
+    mgr = get_radio_manager()
+    sess = mgr.get(user_id, channel)
+    if sess is None or not sess.enabled:
+        return
+
+    # Defensive: only act if the ended track matches our notion of current.
+    # Tolerate mismatch (client may report a prior track on fast double-end).
+    if ended_video_id and sess.current_track_id and ended_video_id != sess.current_track_id:
+        logger.info(
+            "[radio] ended_video_id=%s != current=%s (channel=%s) — continuing anyway",
+            ended_video_id, sess.current_track_id, channel,
+        )
+
+    # Try once, and if the YouTube lookup returns nothing, ask the picker to
+    # retry with a broader query hint. Hard cap at 2 attempts per end-event.
+    attempt = 0
+    found: Optional[tuple] = None
+    query: Optional[str] = None
+    while attempt < 2 and not found:
+        attempt += 1
+        query = await pick_next_query(sess)
+        if not query:
+            break
+        if attempt == 2:
+            # Broaden: strip leading artist dash if present
+            query = query.split(" - ", 1)[-1]
+        found = await youtube_search_first(query)
+
+    if not found:
+        disabled = mgr.record_failure(sess)
+        logger.info(
+            "[radio] pick failed user=%s channel=%s query=%r disabled=%s",
+            user_id[:8], channel, query, disabled,
+        )
+        if disabled:
+            await broadcast_to_user(user_id, {
+                "type": "radio_state",
+                "channel": channel,
+                "enabled": False,
+                "error": "no_more_tracks",
+            })
+            await broadcast_to_user(user_id, {
+                "type": "radio_notice",
+                "channel": channel,
+                "message": "Couldn't find another track in that vibe — want to pick a new direction?",
+            })
+        return
+
+    video_id, title = found
+    # Avoid immediately replaying anything we already played (including seed).
+    if video_id in sess.played_track_ids:
+        logger.info("[radio] picker returned dupe video_id=%s — counting as failure", video_id)
+        mgr.record_failure(sess)
+        return
+
+    mgr.record_auto_play(sess, video_id, title)
+    await broadcast_radio_track(user_id=user_id, video_id=video_id, title=title, channel=channel)
+    await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
 
 # References set at startup
@@ -563,6 +705,15 @@ async def ws_chat(
 
                 if msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
+                    continue
+
+                # ── Radio Mode: toggle / track-ended signals ──
+                if msg_type == "radio_toggle":
+                    await _handle_radio_toggle(user_id, msg)
+                    continue
+
+                if msg_type == "media_ended":
+                    asyncio.create_task(_handle_media_ended(user_id, msg))
                     continue
 
                 if msg_type != "message":
@@ -844,6 +995,32 @@ async def ws_chat(
                 # Pre-set _last_media so the inline card persists on the saved message
                 if _fast_result and hasattr(_agent_runner, 'tools'):
                     _agent_runner.tools._last_media = _fast_result[1]
+
+                # Radio: record this as a user-driven seed for the current channel.
+                # New unrelated intent while radio is ON → session flips to OFF (per spec).
+                if _fast_result:
+                    try:
+                        from app.agent.radio import get_radio_manager, RadioSessionManager
+                        from app.agent.radio.session import SeedTrack
+                        if RadioSessionManager.is_channel_allowed(channel):
+                            _mgr = get_radio_manager()
+                            _meta = _fast_result[1] or {}
+                            _mgr.record_user_seed(
+                                user_id=user_id,
+                                channel=channel,
+                                seed_intent=text.strip(),
+                                seed_track=SeedTrack(
+                                    video_id=_meta.get("video_id", ""),
+                                    title=_meta.get("title", "") or "YouTube Video",
+                                ),
+                            )
+                            # Sync the toggle UI (toggle stays OFF for a fresh seed,
+                            # unless the user re-enables it explicitly).
+                            _sess = _mgr.get(user_id, channel)
+                            if _sess:
+                                await broadcast_to_user(user_id, _sess.to_broadcast_dict())
+                    except Exception as _re:
+                        logger.warning("[radio] seed-record failed: %s", _re)
 
                 # Task intent detection — detect imperative task requests in regular chat
                 _chat_task_job_id = None

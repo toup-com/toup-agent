@@ -277,6 +277,7 @@ class AgentRunner:
         # Set user context for memory tools and current chat
         self.tools.set_user_id(user_id)
         self.tools.set_chat_id(telegram_chat_id)
+        self.tools.set_channel(channel)
         self.tools._on_tool_progress = on_tool_progress
 
         # Hook: agent run starting

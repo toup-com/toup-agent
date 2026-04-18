@@ -177,6 +177,7 @@ class ToolExecutor:
         self.subagent_manager = subagent_manager  # Set after subagent manager created
         self.skill_loader = None  # Set after skills are loaded
         self._chat_id: Optional[int] = None
+        self._current_channel: Optional[str] = None  # web/telegram/discord/slack/app
         self._on_tool_progress: Optional[Any] = None  # Callback for streaming tool output
         # Track which user workspaces have been bootstrapped this session
         self._bootstrapped_users: Set[str] = set()
@@ -2551,6 +2552,10 @@ class ToolExecutor:
         """Set the current user ID for memory tools."""
         self._current_user_id = user_id
 
+    def set_channel(self, channel: Optional[str]):
+        """Set the active channel for this turn (web/telegram/discord/slack/app)."""
+        self._current_channel = (channel or "").strip().lower() or None
+
     def set_session_workspace(self, path: Optional[str]):
         """Set a per-session workspace override. Relative paths resolve against this.
 
@@ -2835,6 +2840,27 @@ class ToolExecutor:
 
         # Store media metadata for message persistence
         self._last_media = {"type": "youtube", "video_id": video_id, "title": video_title}
+
+        # Radio session: record user-driven seed for this channel. A new intent
+        # while radio is ON flips the toggle OFF (handled inside record_user_seed).
+        if user_id and self._current_channel:
+            try:
+                from app.agent.radio import get_radio_manager, RadioSessionManager
+                from app.agent.radio.session import SeedTrack
+                if RadioSessionManager.is_channel_allowed(self._current_channel):
+                    from app.api.ws_chat import broadcast_to_user as _bcast
+                    _mgr = get_radio_manager()
+                    _mgr.record_user_seed(
+                        user_id=user_id,
+                        channel=self._current_channel,
+                        seed_intent=query,
+                        seed_track=SeedTrack(video_id=video_id, title=video_title),
+                    )
+                    _sess = _mgr.get(user_id, self._current_channel)
+                    if _sess:
+                        await _bcast(user_id, _sess.to_broadcast_dict())
+            except Exception as _re:
+                logger.warning("[play_media] radio seed-record failed: %s", _re)
 
         return f"Now playing \"{video_title}\"\n{yt_url}"
 
