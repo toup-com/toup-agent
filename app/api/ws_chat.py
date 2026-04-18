@@ -393,8 +393,12 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
 # and broadcast a radio_auto media_play.
 
 async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
-    from app.agent.radio import get_radio_manager, RadioSessionManager
-    from app.agent.radio.session import SeedTrack
+    from app.agent.radio import (
+        get_radio_manager,
+        RadioSessionManager,
+        SeedTrack,
+        build_station,
+    )
 
     channel = (msg.get("channel") or "").strip().lower()
     enabled = bool(msg.get("enabled"))
@@ -421,8 +425,8 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         await broadcast_to_user(user_id, sess_dict)
         return
 
-    # Enable — seed from payload if provided, else reuse the existing session's
-    # seed_track, else fall back to the agent's _last_media.
+    # Resolve the seed — payload wins; falls back to existing session or last
+    # played track so a toggle-on without explicit seed still works.
     seed_video_id = (msg.get("video_id") or "").strip()
     seed_title = (msg.get("title") or "").strip()
     seed_intent = (msg.get("seed_intent") or "").strip()
@@ -444,11 +448,8 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
             seed_source = "last_media"
 
     if not seed_video_id:
-        existing_sess = mgr.get(user_id, channel)
-        last_media = getattr(_agent_runner.tools, "_last_media", None) if _agent_runner else None
         print(
-            f"[radio] toggle REJECT no_seed_track user={user_id[:8]} channel={channel!r} "
-            f"existing_sess={existing_sess!r} last_media={last_media!r}",
+            f"[radio] toggle REJECT no_seed_track user={user_id[:8]} channel={channel!r}",
             flush=True,
         )
         await broadcast_to_user(user_id, {
@@ -459,15 +460,41 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         })
         return
 
+    # Build the YT Music station BEFORE we mark the session enabled — if YT
+    # Music rejects the seed (non-music, region-locked, etc.) we don't want
+    # the UI pinned ON with no queue behind it.
+    station = await build_station(seed_video_id, limit=50)
+    if not station:
+        print(
+            f"[radio] toggle REJECT build_station returned empty "
+            f"user={user_id[:8]} seed_video_id={seed_video_id}",
+            flush=True,
+        )
+        await broadcast_to_user(user_id, {
+            "type": "radio_state",
+            "channel": channel,
+            "enabled": False,
+            "error": "station_unavailable",
+        })
+        await broadcast_to_user(user_id, {
+            "type": "radio_notice",
+            "channel": channel,
+            "message": "Couldn't build a radio station from this track — try a different song.",
+        })
+        return
+
     sess = mgr.enable(
         user_id=user_id,
         channel=channel,
         seed_intent=seed_intent or seed_title or "music",
         seed_track=SeedTrack(video_id=seed_video_id, title=seed_title or "Now Playing"),
+        station=station,
     )
+    top = station[0] if station else None
     print(
         f"[radio] toggle OK user={user_id[:8]} channel={channel} "
-        f"seed_source={seed_source} video={seed_video_id} title={seed_title!r}",
+        f"seed_source={seed_source} seed_vid={seed_video_id} "
+        f"station_size={len(station)} next={top.display_title() if top else None!r}",
         flush=True,
     )
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
@@ -477,15 +504,10 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
     from app.agent.radio import (
         get_radio_manager,
         RadioSessionManager,
-        normalize_title,
-        rotate_query,
+        build_station,
+        PLAYLIST_REFILL_THRESHOLD,
     )
-    from app.agent.radio.picker import pick_next_query
-    from app.agent.radio.player import (
-        youtube_search_first,
-        youtube_search_many,
-        broadcast_radio_track,
-    )
+    from app.agent.radio.player import broadcast_radio_track
 
     channel = (msg.get("channel") or "").strip().lower()
     ended_video_id = (msg.get("video_id") or "").strip()
@@ -502,11 +524,11 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
     mgr = get_radio_manager()
     sess = mgr.get(user_id, channel)
     if sess is None or not sess.enabled:
-        # Frontend likely has a stale ON toggle (e.g. click before a deploy) —
-        # push an authoritative OFF so the UI syncs with reality.
+        # Frontend may have a stale ON toggle (e.g. click pre-restart) —
+        # push authoritative OFF so UI syncs with reality.
         print(
-            f"[radio] media_ended — no active session; broadcasting OFF to sync UI "
-            f"user={user_id[:8]} channel={channel!r} sess_none={sess is None} "
+            f"[radio] media_ended — no active session; broadcasting OFF "
+            f"user={user_id[:8]} sess_none={sess is None} "
             f"enabled={getattr(sess, 'enabled', None)}",
             flush=True,
         )
@@ -517,97 +539,42 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
         })
         return
 
-    # Defensive: only act if the ended track matches our notion of current.
-    # Tolerate mismatch (client may report a prior track on fast double-end).
+    # Defensive: tolerate end-event mismatch (frontend may report a prior
+    # track on a fast double-end from YT's replay glitch).
     if ended_video_id and sess.current_track_id and ended_video_id != sess.current_track_id:
         logger.info(
-            "[radio] ended_video_id=%s != current=%s (channel=%s) — continuing anyway",
-            ended_video_id, sess.current_track_id, channel,
+            "[radio] ended_video_id=%s != current=%s — continuing anyway",
+            ended_video_id, sess.current_track_id,
         )
 
-    # ── Candidate filter pipeline ───────────────────────────────────
-    # Each strategy fetches a candidate list, then we run the same filter
-    # chain across all strategies' pooled output:
-    #
-    #   1. Drop unusable titles ("YouTube Video" or empty) — upstream metadata
-    #      scrape failures, not worth playing blind.
-    #   2. Drop by video_id already in played_track_ids.
-    #   3. Drop by normalized title already in played_titles_normalized —
-    #      this is the "Lose Yourself (Official Video)" vs "Lose Yourself
-    #      (Lyrics)" case; different video ids, same song.
-    #   4. Drop candidates whose normalized title == normalized seed — we
-    #      want the vibe, not more uploads of the same track.
-    #
-    # Strategies are tried in rotate_query() order until one yields a
-    # surviving candidate. LLM pick is a tiebreaker only after the rotation
-    # produces nothing new, so it doesn't gate the feature on creds.
-    found: Optional[tuple] = None
-    query: Optional[str] = None
+    # ── Pop next from playlist ─────────────────────────────────────
+    next_track = mgr.pop_next_from_playlist(sess)
 
-    primary_q = (sess.seed_intent or "").strip() or (
-        sess.seed_track.title if sess.seed_track else ""
-    )
-    seed_norm = normalize_title(sess.seed_track.title if sess.seed_track else primary_q)
-
-    def _usable(vid: str, title: str) -> tuple[bool, str]:
-        """Return (ok, reason_if_rejected)."""
-        norm = normalize_title(title)
-        if not title or title.strip().lower() == "youtube video":
-            return False, "missing_title"
-        if vid in sess.played_track_ids:
-            return False, "dupe_id"
-        if norm and norm in sess.played_titles_normalized:
-            return False, "dupe_title"
-        if seed_norm and norm == seed_norm:
-            return False, "same_as_seed"
-        return True, ""
-
-    iteration = sess.pick_iteration
-
-    # (a) Rotated-query search — widens over successive picks so radio
-    # doesn't collapse back to the seed track on iteration 2+.
-    # Try up to 3 different angles per end-event in case the first is stale.
-    for attempt in range(3):
-        q = rotate_query(primary_q, iteration + attempt)
-        if not q:
-            continue
-        candidates = await youtube_search_many(q, limit=25)
-        rejected = {"missing_title": 0, "dupe_id": 0, "dupe_title": 0, "same_as_seed": 0}
-        for vid, title in candidates:
-            ok, reason = _usable(vid, title)
-            if not ok:
-                rejected[reason] = rejected.get(reason, 0) + 1
-                continue
-            found = (vid, title)
-            query = q
-            break
+    # If we're running low OR the pop came up empty, extend the station
+    # from the currently-playing track (or the seed on first pop after
+    # resume). Runs in-line — a 0.5–2s blocking fetch is acceptable once
+    # per ~47 tracks.
+    remaining = len(sess.playlist) - sess.playlist_cursor
+    if next_track is None or remaining <= PLAYLIST_REFILL_THRESHOLD:
+        extend_seed = sess.current_track_id or (sess.seed_track.video_id if sess.seed_track else "")
         print(
-            f"[radio] strategy=rotate iter={iteration + attempt} q={q!r} "
-            f"raw={len(candidates)} rejected={rejected} "
-            f"selected={found[0] if found else None}",
+            f"[radio] playlist extending user={user_id[:8]} seed={extend_seed} "
+            f"cursor={sess.playlist_cursor}/{len(sess.playlist)} remaining={remaining}",
             flush=True,
         )
-        if found:
-            break
+        if extend_seed:
+            new_tracks = await build_station(extend_seed, limit=50)
+            if new_tracks:
+                mgr.extend_playlist(sess, new_tracks)
+        # Re-pop now that we've extended.
+        if next_track is None:
+            next_track = mgr.pop_next_from_playlist(sess)
 
-    # (b) LLM tiebreaker — only if rotation produced nothing across all angles.
-    if not found:
-        llm_q = await pick_next_query(sess)
-        print(f"[radio] strategy=llm q={llm_q!r}", flush=True)
-        if llm_q:
-            llm_hits = await youtube_search_many(llm_q, limit=15)
-            for vid, title in llm_hits:
-                ok, _ = _usable(vid, title)
-                if ok:
-                    found = (vid, title)
-                    query = llm_q
-                    break
-
-    if not found:
+    if next_track is None:
         disabled = mgr.record_failure(sess)
         print(
-            f"[radio] pick failed user={user_id[:8]} channel={channel} "
-            f"query={query!r} disabled={disabled}",
+            f"[radio] pick failed user={user_id[:8]} — playlist exhausted, "
+            f"extension produced no new tracks. disabled={disabled}",
             flush=True,
         )
         if disabled:
@@ -620,33 +587,23 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
             await broadcast_to_user(user_id, {
                 "type": "radio_notice",
                 "channel": channel,
-                "message": "Couldn't find another track in that vibe — want to pick a new direction?",
+                "message": "Ran out of tracks in that vibe — try a different song.",
             })
         return
 
-    video_id, title = found
+    mgr.record_auto_play(sess, next_track)
     print(
-        f"[radio] next track selected user={user_id[:8]} channel={channel} "
-        f"video_id={video_id} title={title!r} query={query!r}",
+        f"[radio] playlist pop cursor={sess.playlist_cursor - 1}/{len(sess.playlist)} "
+        f"track={next_track.title!r} by={next_track.artist!r} "
+        f"length={next_track.length!r} video_id={next_track.video_id}",
         flush=True,
     )
-    # Avoid immediately replaying anything we already played (including seed).
-    if video_id in sess.played_track_ids:
-        print(
-            f"[radio] picker returned dupe user={user_id[:8]} video_id={video_id} — "
-            f"counting as failure",
-            flush=True,
-        )
-        mgr.record_failure(sess)
-        return
-
-    mgr.record_auto_play(sess, video_id, title)
-    print(
-        f"[radio] media_player play() called user={user_id[:8]} channel={channel} "
-        f"video_id={video_id}",
-        flush=True,
+    await broadcast_radio_track(
+        user_id=user_id,
+        video_id=next_track.video_id,
+        title=next_track.display_title(),
+        channel=channel,
     )
-    await broadcast_radio_track(user_id=user_id, video_id=video_id, title=title, channel=channel)
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
 

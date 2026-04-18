@@ -69,3 +69,6 @@ fastmcp==2.9.2
 # Smart Fetch
 trafilatura>=2.0.0
 yt-dlp>=2025.1.0
+
+# Radio Mode — YouTube Music Song Radio (get_watch_playlist)
+ytmusicapi>=1.10.0

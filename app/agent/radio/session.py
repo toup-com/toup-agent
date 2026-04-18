@@ -5,95 +5,29 @@ process restarts. Acceptable for v1 — the user can re-toggle after a
 restart. Promote to Redis if restart-survival becomes a requirement.
 
 Channels: web, telegram, discord, slack, app. Voice is explicitly excluded.
+
+The session holds a pre-built **station** (YT Music Song Radio queue) and
+a cursor into it. Each `media_ended` pops the next unplayed track. When the
+cursor approaches the end, the station is extended from the currently
+playing track's id as a new seed — that's how a long listen drifts.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+from app.agent.radio.playlist import StationTrack
 
 logger = logging.getLogger(__name__)
 
 RADIO_ALLOWED_CHANNELS = frozenset({"web", "telegram", "discord", "slack", "app"})
 
 MAX_CONSECUTIVE_FAILURES = 3
-MAX_PLAYED_HISTORY = 40
-
-
-# ── Title normalization ────────────────────────────────────────────────
-# Used for fuzzy dedupe: two tracks with the same normalized title are
-# treated as the same song even if they have different video IDs.
-#
-# Strips the cosmetic suffixes/prefixes YouTube uploaders routinely add —
-# "(Official Video)", "(Lyrics)", " | NCS Release", "VEVO", etc. Result
-# is lowercase, whitespace-collapsed, and safe to compare by equality.
-
-_TITLE_STRIP_PATTERNS = [
-    # Parentheticals containing cosmetic tags
-    re.compile(
-        r'\s*\([^)]*(?:official|video|audio|music|lyric|lyrics|hd|hq|4k|'
-        r'remaster|remastered|live|cover|acoustic|explicit|extended|'
-        r'visualizer|performance|instrumental|radio\s*edit|clean)\b[^)]*\)',
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r'\s*\[[^\]]*(?:official|video|audio|music|lyric|lyrics|hd|hq|4k|'
-        r'remaster|remastered|live|cover|acoustic|explicit|extended|'
-        r'visualizer|performance|instrumental|radio\s*edit|clean)\b[^\]]*\]',
-        re.IGNORECASE,
-    ),
-    # Trailing uploader / channel marks like " | NoCopyrightSounds", "VEVO"
-    re.compile(r'\s*[|\-–—]\s*(?:[A-Z0-9]+VEVO|NoCopyrightSounds|NCS|Topic)\s*$', re.IGNORECASE),
-    # Featured artist annotations — keep the base title ("Song ft Artist" → "Song")
-    re.compile(r'\s*(?:ft\.?|feat\.?|featuring)\s+[^()[\]{}]*$', re.IGNORECASE),
-    # Dangling tags
-    re.compile(r'\s*\b(?:HD|HQ|4K|Lyrics|Lyric|Official|Audio)\b\s*$', re.IGNORECASE),
-]
-
-
-def normalize_title(title: Optional[str]) -> str:
-    """Return a dedupe-stable key for a track title.
-
-    Empty string (equal to empty-string only) if input is missing/garbage —
-    callers should treat empty as "no usable title, don't dedupe by title".
-    """
-    if not title:
-        return ""
-    t = title.strip()
-    if not t or t.lower() == "youtube video":
-        return ""
-    for pat in _TITLE_STRIP_PATTERNS:
-        t = pat.sub(" ", t)
-    # Collapse whitespace & punctuation-only runs
-    t = re.sub(r"[\s\-–—_·•|]+", " ", t).strip().lower()
-    return t
-
-
-# ── Query rotation strategies ──────────────────────────────────────────
-# As the session picks more tracks, successive search queries get broader
-# so the player walks outward from the seed instead of collapsing back.
-# iteration is 0-indexed: 0 = first auto-pick after the seed.
-
-def rotate_query(seed_intent: str, iteration: int) -> str:
-    """Return the next query string for the given iteration."""
-    seed = (seed_intent or "").strip()
-    if not seed:
-        return ""
-    # First dash-separated chunk is usually the artist: "Eminem - Lose Yourself" → "Eminem".
-    # If there's no dash, treat the whole thing as the artist/vibe.
-    artist = seed.split("-", 1)[0].strip() if "-" in seed else seed
-    strategies = [
-        seed,                          # 0: verbatim seed — already the picker's happy path
-        f"{artist} mix",               # 1: artist's mix playlist — YouTube aggregates these
-        f"{artist} playlist",          # 2: another shape of catalog expansion
-        f"songs like {seed}",          # 3: pivots to genre/vibe peers
-        f"{artist} best songs",        # 4: top catalog for the artist
-        f"{artist} radio",             # 5: YouTube's own "radio:" concept
-    ]
-    return strategies[iteration % len(strategies)]
+MAX_PLAYED_HISTORY = 200           # defensive dedupe window
+PLAYLIST_REFILL_THRESHOLD = 3      # rebuild from current track when this many tracks remain
 
 
 @dataclass
@@ -107,19 +41,15 @@ class RadioSession:
     user_id: str
     channel: str
     enabled: bool = False
-    seed_intent: str = ""
-    seed_track: Optional[SeedTrack] = None
+    seed_intent: str = ""                           # user's original phrasing
+    seed_track: Optional[SeedTrack] = None          # the first video that seeded the session
     current_track_id: Optional[str] = None
-    played_track_ids: List[str] = field(default_factory=list)
-    played_titles: List[str] = field(default_factory=list)
-    # Normalized titles for fuzzy dedupe — keep alongside ids so different
-    # uploads of the same song (e.g. "Lose Yourself (Official Video)" and
-    # "Lose Yourself (Lyrics)") collapse to one entry and get skipped.
-    played_titles_normalized: set = field(default_factory=set)
-    # Monotonic counter: how many auto-picks have been attempted this
-    # session. Used by rotate_query() so successive picks use broader
-    # search angles instead of resurrecting the seed track.
-    pick_iteration: int = 0
+    # The YT Music station — populated on enable, extended when running low.
+    playlist: List[StationTrack] = field(default_factory=list)
+    playlist_cursor: int = 0                        # next index to try on media_ended
+    # Defensive dedupe only — YT Music rarely repeats within one queue, but
+    # extension can append tracks already played earlier in the session.
+    played_track_ids: set = field(default_factory=set)
     consecutive_failures: int = 0
     last_activity_ts: float = field(default_factory=time.time)
 
@@ -170,21 +100,23 @@ class RadioSessionManager:
         channel: str,
         seed_intent: str,
         seed_track: SeedTrack,
+        station: List[StationTrack],
     ) -> RadioSession:
+        """Turn radio on with a freshly-built station."""
         sess = self.get_or_create(user_id, channel)
         sess.enabled = True
         sess.seed_intent = seed_intent or sess.seed_intent
         sess.seed_track = seed_track
         sess.current_track_id = seed_track.video_id
         sess.consecutive_failures = 0
-        sess.pick_iteration = 0
-        # Track the seed in played history so the first auto-pick doesn't
-        # re-broadcast the same video (either by id or by normalized title).
-        self._record_played(sess, seed_track.video_id, seed_track.title)
+        sess.playlist = list(station)
+        sess.playlist_cursor = 0
+        sess.played_track_ids = {seed_track.video_id}
         sess.last_activity_ts = time.time()
         logger.info(
-            "[radio] enabled user=%s channel=%s seed_intent=%r seed_title=%r",
-            user_id[:8], channel, seed_intent, seed_track.title,
+            "[radio] enabled user=%s channel=%s seed_intent=%r seed_title=%r "
+            "station_size=%d",
+            user_id[:8], channel, seed_intent, seed_track.title, len(station),
         )
         return sess
 
@@ -197,18 +129,14 @@ class RadioSessionManager:
     ) -> RadioSession:
         """User directly played a track (not via radio auto-pick).
 
-        Always resets `played_track_ids` so a new seed starts a clean history.
-        Keeps `enabled` flag untouched (if toggle was ON, it stays ON with the
-        new seed; if it was OFF, it stays OFF). But if the new intent clearly
-        differs from the old seed_intent we flip `enabled` OFF per spec:
-        "new unrelated media request cancels radio mode".
+        Radio toggle flips OFF if the intent changed meaningfully — the new
+        user intent is treated as "end of this station, start fresh." The
+        actual new station is built on the next explicit radio_toggle=true.
         """
         sess = self.get_or_create(user_id, channel)
         was_enabled = sess.enabled
         prior_intent = (sess.seed_intent or "").strip().lower()
         new_intent = (seed_intent or "").strip().lower()
-        # Coarse "unrelated" check: any change in intent phrasing counts as new.
-        # User will see the toggle turn OFF and can re-enable.
         unrelated = was_enabled and prior_intent and new_intent and prior_intent != new_intent
         if unrelated:
             sess.enabled = False
@@ -220,20 +148,58 @@ class RadioSessionManager:
         sess.seed_track = seed_track
         sess.current_track_id = seed_track.video_id
         sess.consecutive_failures = 0
-        sess.played_track_ids = []
-        sess.played_titles = []
-        sess.played_titles_normalized = set()
-        sess.pick_iteration = 0
-        self._record_played(sess, seed_track.video_id, seed_track.title)
+        # Reset station state — it gets rebuilt on next enable.
+        sess.playlist = []
+        sess.playlist_cursor = 0
+        sess.played_track_ids = {seed_track.video_id}
         sess.last_activity_ts = time.time()
         return sess
 
-    def record_auto_play(self, sess: RadioSession, video_id: str, title: str) -> None:
-        sess.current_track_id = video_id
+    def record_auto_play(self, sess: RadioSession, track: StationTrack) -> None:
+        """Mark `track` as the now-playing track and bump the cursor."""
+        sess.current_track_id = track.video_id
+        sess.played_track_ids.add(track.video_id)
         sess.consecutive_failures = 0
-        sess.pick_iteration += 1
-        self._record_played(sess, video_id, title)
         sess.last_activity_ts = time.time()
+        # Cap memory usage of the dedupe set over a very long session.
+        if len(sess.played_track_ids) > MAX_PLAYED_HISTORY:
+            # Drop arbitrary oldest entries — set ordering is insertion-order
+            # in CPython 3.7+, which is close enough for this purpose.
+            to_drop = len(sess.played_track_ids) - MAX_PLAYED_HISTORY
+            for vid in list(sess.played_track_ids)[:to_drop]:
+                sess.played_track_ids.discard(vid)
+
+    def pop_next_from_playlist(self, sess: RadioSession) -> Optional[StationTrack]:
+        """Return the next unplayed track from the station, or None if exhausted.
+
+        Advances the cursor past anything already played (defensive — extension
+        can append tracks the user heard earlier this session).
+        """
+        while sess.playlist_cursor < len(sess.playlist):
+            track = sess.playlist[sess.playlist_cursor]
+            sess.playlist_cursor += 1
+            if track.video_id in sess.played_track_ids:
+                continue
+            return track
+        return None
+
+    def extend_playlist(self, sess: RadioSession, new_tracks: List[StationTrack]) -> int:
+        """Append `new_tracks` that haven't been played yet. Returns count added."""
+        before = len(sess.playlist)
+        added = 0
+        for t in new_tracks:
+            if t.video_id in sess.played_track_ids:
+                continue
+            # Also skip anything already queued further down the list.
+            if any(existing.video_id == t.video_id for existing in sess.playlist[sess.playlist_cursor:]):
+                continue
+            sess.playlist.append(t)
+            added += 1
+        logger.info(
+            "[radio] playlist extended user=%s channel=%s before=%d added=%d total=%d",
+            sess.user_id[:8], sess.channel, before, added, len(sess.playlist),
+        )
+        return added
 
     def record_failure(self, sess: RadioSession) -> bool:
         """Bump the failure counter. Returns True if the session was disabled as fail-safe."""
@@ -247,18 +213,6 @@ class RadioSessionManager:
             )
             return True
         return False
-
-    @staticmethod
-    def _record_played(sess: RadioSession, video_id: str, title: str) -> None:
-        if video_id and video_id not in sess.played_track_ids:
-            sess.played_track_ids.append(video_id)
-            sess.played_titles.append(title or "")
-            norm = normalize_title(title)
-            if norm:
-                sess.played_titles_normalized.add(norm)
-            if len(sess.played_track_ids) > MAX_PLAYED_HISTORY:
-                sess.played_track_ids = sess.played_track_ids[-MAX_PLAYED_HISTORY:]
-                sess.played_titles = sess.played_titles[-MAX_PLAYED_HISTORY:]
 
 
 _singleton: Optional[RadioSessionManager] = None
