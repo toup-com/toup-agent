@@ -369,6 +369,17 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         except json.JSONDecodeError:
             memories_retrieved = None
 
+    # Media metadata persisted in metadata_json by agent_runner —
+    # shape: {"media": {"type": "youtube"|"netflix", "video_id": "...", "title": "..."}}.
+    media = None
+    if message.metadata_json:
+        try:
+            meta = json.loads(message.metadata_json)
+            if isinstance(meta, dict) and isinstance(meta.get("media"), dict):
+                media = meta["media"]
+        except json.JSONDecodeError:
+            pass
+
     # Base response fields
     resp = dict(
         id=message.id,
@@ -380,6 +391,7 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         model_used=message.model_used,
         memories_retrieved=memories_retrieved,
         processing_time_ms=message.processing_time_ms,
+        media=media,
     )
 
     # Enrich job card messages with current BuildJob status

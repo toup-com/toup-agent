@@ -47,6 +47,24 @@ def _serialize_attachments(msg: Message) -> Optional[List[dict]]:
     ]
 
 
+def _serialize_media(msg: Message) -> Optional[dict]:
+    """Extract the media payload persisted in metadata_json by agent_runner.
+    Shape: {"type": "youtube"|"netflix", "video_id": "...", "title": "..."}.
+    Returns None when absent or malformed."""
+    import json as _json
+    raw = getattr(msg, "metadata_json", None)
+    if not raw:
+        return None
+    try:
+        parsed = _json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    media = parsed.get("media")
+    return media if isinstance(media, dict) else None
+
+
 # ── Agent proxy (platform mode proxies to user's VPS agent) ──────────
 
 async def _get_agent_proxy_info(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]]:
@@ -311,6 +329,7 @@ async def get_day_chat_messages(
                 "channel": channel_map.get(m.conversation_id, "web"),
                 "conversation_id": m.conversation_id,
                 "attachments": _serialize_attachments(m),
+                "media": _serialize_media(m),
             }
             for m in messages
         ])
@@ -334,6 +353,7 @@ async def get_day_chat_messages(
             "channel": channel or "web",
             "conversation_id": msg.conversation_id,
             "attachments": _serialize_attachments(msg),
+            "media": _serialize_media(msg),
         }
         for msg, channel in rows
     ])
