@@ -1,12 +1,14 @@
 """
-LLM Setup API — key validation, bundle checkout, allocations, usage.
+LLM Setup API — key validation, allocations, usage.
 
 POST /api/llm-setup/validate-key       — validate a provider API key
-POST /api/llm-setup/bundle/checkout    — create Stripe checkout for $40/mo bundle
 GET  /api/llm-setup/bundle/allocations — get current allocations
 PUT  /api/llm-setup/bundle/allocations — update allocations (must sum to 4000 cents)
 GET  /api/llm-setup/bundle/usage       — usage summary for current period
 POST /api/llm-setup/report-usage       — agent reports token usage (agent auth)
+
+Note: subscription purchase goes through /api/billing/create-subscription
+(embedded Stripe Payment Element), not through this module.
 """
 
 import logging
@@ -47,11 +49,8 @@ class ValidateKeyResponse(BaseModel):
 
 
 class BundleCheckoutRequest(BaseModel):
+    # Still used as the payload type for PUT /bundle/allocations below.
     allocations: dict[str, int]  # provider → cents, must sum to 4000
-
-
-class BundleCheckoutResponse(BaseModel):
-    checkout_url: str
 
 
 class AllocationOut(BaseModel):
@@ -112,77 +111,6 @@ async def validate_key(body: ValidateKeyRequest, current_user=Depends(get_curren
     from app.services.llm_key_validator import validate_key as _validate
     result = await _validate(body.provider, body.api_key)
     return ValidateKeyResponse(**result)
-
-
-@router.post("/bundle/checkout", response_model=BundleCheckoutResponse)
-async def bundle_checkout(
-    body: BundleCheckoutRequest,
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Create a Stripe checkout session for the $40/mo LLM bundle."""
-    # Validate allocations sum
-    total = sum(body.allocations.values())
-    if total != BUNDLE_TOTAL_CENTS:
-        raise HTTPException(400, f"Allocations must sum to {BUNDLE_TOTAL_CENTS} cents, got {total}")
-
-    for provider in body.allocations:
-        if provider not in VALID_PROVIDERS:
-            raise HTTPException(400, f"Unknown provider: {provider}")
-        if body.allocations[provider] < 0:
-            raise HTTPException(400, f"Negative allocation for {provider}")
-
-    # Save allocations
-    for provider, cents in body.allocations.items():
-        result = await db.execute(
-            select(LLMBundleAllocation).where(
-                LLMBundleAllocation.user_id == current_user.id,
-                LLMBundleAllocation.provider == provider,
-            )
-        )
-        alloc = result.scalar_one_or_none()
-        if alloc:
-            alloc.allocation_cents = cents
-            alloc.updated_at = datetime.utcnow()
-        else:
-            alloc = LLMBundleAllocation(
-                id=str(uuid.uuid4()),
-                user_id=current_user.id,
-                provider=provider,
-                allocation_cents=cents,
-            )
-            db.add(alloc)
-    await db.commit()
-
-    # Resolve or create Stripe customer
-    from app.db import User
-    from app.services.stripe_service import create_bundle_checkout_session, get_or_create_customer
-    user_result = await db.execute(select(User).where(User.id == current_user.id))
-    user_obj = user_result.scalar_one()
-    stripe_customer_id = user_obj.stripe_customer_id
-    if not stripe_customer_id:
-        stripe_customer_id = get_or_create_customer(
-            user_id=current_user.id,
-            email=current_user.email,
-            name=getattr(current_user, "name", None),
-        )
-        user_obj.stripe_customer_id = stripe_customer_id
-        await db.commit()
-
-    # Create Stripe checkout
-    try:
-        session = create_bundle_checkout_session(
-            user_id=current_user.id,
-            user_email=current_user.email,
-            success_url=f"{settings.platform_api_url.rstrip('/api')}/setup?bundle_success=1",
-            cancel_url=f"{settings.platform_api_url.rstrip('/api')}/setup?bundle_cancelled=1",
-            stripe_customer_id=stripe_customer_id,
-        )
-    except Exception as e:
-        logger.exception("Stripe bundle checkout error: %s", e)
-        raise HTTPException(500, f"Stripe error: {e}")
-
-    return BundleCheckoutResponse(checkout_url=session["url"])
 
 
 @router.get("/bundle/allocations", response_model=list[AllocationOut])

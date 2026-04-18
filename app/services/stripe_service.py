@@ -240,47 +240,6 @@ def create_checkout_session(
     return {"id": session.id, "url": session.url, "customer": session.customer}
 
 
-def create_bundle_checkout_session(
-    user_id: str,
-    user_email: str,
-    success_url: str,
-    cancel_url: str,
-    stripe_customer_id: Optional[str] = None,
-) -> dict:
-    """
-    Create a Stripe Checkout Session for the $40/mo LLM bundle subscription.
-    """
-    client = _get_stripe_client()
-
-    price_id = settings.stripe_llm_bundle_price_id
-    if not price_id:
-        raise ValueError("STRIPE_LLM_BUNDLE_PRICE_ID is not configured")
-
-    params: dict = {
-        "mode": "subscription",
-        "line_items": [{"price": price_id, "quantity": 1}],
-        "success_url": success_url,
-        "cancel_url": cancel_url,
-        "metadata": {
-            "user_id": user_id,
-            "type": "llm_bundle",
-        },
-        "subscription_data": {
-            "metadata": {
-                "user_id": user_id,
-                "type": "llm_bundle",
-            }
-        },
-    }
-    if stripe_customer_id:
-        params["customer"] = stripe_customer_id
-    else:
-        params["customer_email"] = user_email
-
-    session = client.checkout.sessions.create(params=params)
-    return {"id": session.id, "url": session.url, "customer": session.customer}
-
-
 def get_stripe_price_for_plan(plan_id: str) -> str:
     """Return the Stripe Price ID for a VPS plan."""
     attr = PLAN_PRICE_MAP.get(plan_id)
