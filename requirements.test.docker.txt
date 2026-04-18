@@ -1,0 +1,68 @@
+# Slim requirements for the Dockerfile's `test` stage.
+#
+# Omits the heavy ML/agent packages (sentence-transformers, torch, CUDA libs,
+# anthropic, telegram, patchright, fastmcp) that add ~3GB to the image but
+# aren't touched by the billing/webhook/auth code paths the Phase 1 and
+# Phase 2 tests exercise.
+#
+# Verified safe by: the test stack boots, all billing endpoints respond
+# correctly, and the Docker smoke-check CI job passes. If a future router
+# imports one of these packages at module load, move the package back into
+# both files (see SKILL.md "Pattern — any new router with external-lib
+# imports").
+
+# FastAPI & Server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+
+# Database
+sqlalchemy[asyncio]==2.0.25
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+pgvector==0.2.4
+alembic==1.13.1
+
+# Embeddings & NLP — lazy-loaded; module imports only need numpy + tiktoken
+numpy>=1.26.0
+tiktoken>=0.5.0
+openai>=1.0.0
+
+# Auth & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+pydantic[email]>=2.7.0
+pydantic-settings>=2.5.2
+
+# Utils
+python-dateutil==2.8.2
+httpx>=0.27.0
+tenacity==8.2.3
+
+# Billing — stripe + boto3 required for the billing/vps/checkout routers
+# to mount successfully (see SKILL.md "Bugs caught by the Docker stack
+# bring-up" for the pattern).
+stripe>=7.0.0
+boto3>=1.34.0
+
+# Scheduler (app startup touches apscheduler)
+apscheduler==3.10.4
+
+# Document parsing — lazy-imported inside DocumentService methods, but
+# pypdf2 is referenced at module level in at least one import chain.
+PyPDF2>=3.0.0
+python-docx>=1.0.0
+python-pptx>=1.0.0
+
+# Web scraping (likely transitive)
+beautifulsoup4==4.12.3
+
+# Process management
+psutil==5.9.8
+
+# Async file I/O
+aiofiles==23.2.1
+
+# WebSocket client (for agent tunnel proxy — may be module-level imported)
+websockets>=12.0

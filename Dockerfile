@@ -48,16 +48,32 @@ RUN apt-get update && apt-get install -y \
     libwayland-client0 \
     && rm -rf /var/lib/apt/lists/*
 
-# ─── Stage 2: deps ─────────────────────────────────────────────────
-FROM base AS deps
+# ─── Stage 2a: test_deps ───────────────────────────────────────────
+# Slim pip install for the test image — omits sentence-transformers,
+# torch, CUDA, anthropic, telegram, patchright, fastmcp (collectively
+# ~3GB). Caching a 3GB pip layer still costs 2+ minutes to restore from
+# GHA cache and unpack; removing the layer weight is the only real lever.
+# List is kept in sync with prod deps in requirements.test.docker.txt.
+FROM base AS test_deps
 
-# Railway build context is the repo root — backend/ paths reflect that.
+COPY backend/requirements.test.docker.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ .
+
+RUN useradd -m -u 1000 toup && \
+    mkdir -p /app/workspace && \
+    chown -R toup:toup /app
+
+# ─── Stage 2b: prod_deps ───────────────────────────────────────────
+# Full pip install for prod. Unchanged behavior from pre-split.
+FROM base AS prod_deps
+
 COPY backend/requirements.docker.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ .
 
-# Non-root user shared by both test and prod images.
 RUN useradd -m -u 1000 toup && \
     mkdir -p /app/workspace && \
     chown -R toup:toup /app
@@ -65,9 +81,9 @@ RUN useradd -m -u 1000 toup && \
 # ─── Stage 3: test ─────────────────────────────────────────────────
 # Used by docker-compose.test.yml. Skips:
 #   - Chromium browser install (~200MB saved)
-#   - init_startup in CMD (no migrations on Supabase in tests)
+#   - Heavy ML deps (~3GB saved via requirements.test.docker.txt)
 # Defaults to monolith run mode so E2E can exercise register + identity seeding.
-FROM deps AS test
+FROM test_deps AS test
 
 USER toup
 EXPOSE 8000
@@ -78,7 +94,7 @@ CMD python -m app.scripts.init_startup && uvicorn platform_main:app --host 0.0.0
 
 # ─── Stage 4: prod ─────────────────────────────────────────────────
 # Default build target (when no --target is passed).
-FROM deps AS prod
+FROM prod_deps AS prod
 
 RUN python -m patchright install chromium || python -m playwright install chromium
 RUN cp -r /root/.cache/ms-playwright /home/toup/.cache/ms-playwright 2>/dev/null || true && \
