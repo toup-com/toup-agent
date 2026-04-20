@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -76,27 +76,31 @@ def _parse_track(raw: dict) -> Optional[StationTrack]:
     )
 
 
-async def build_station(seed_video_id: str, limit: int = 50) -> List[StationTrack]:
-    """Return the YT Music Song Radio queue for `seed_video_id`.
+async def build_station(
+    seed_video_id: str,
+    limit: int = 50,
+) -> Tuple[Optional[StationTrack], List[StationTrack]]:
+    """Return (seed_meta, station) for `seed_video_id` from YT Music Song Radio.
 
-    - Excludes the seed track itself (always index 0 of the returned queue).
-    - Filters entries missing a `videoId` or `title` (rare for YT Music output,
-      but keeps `StationTrack` invariants clean for downstream code).
-    - Returns an empty list if YT Music rejects the seed (non-music, region-
-      blocked, age-restricted, etc.) — caller decides the fallback.
+    - `seed_meta` is the StationTrack for the seed itself (index 0 of YT Music's
+      watch-playlist response), which carries the real artist / thumbnail /
+      video_type the frontend needs for the toggle-on authoritative play
+      broadcast. `None` if the response doesn't include the seed.
+    - `station` excludes the seed and filters entries missing `videoId` / `title`.
+    - Returns `(None, [])` if YT Music rejects the seed — caller decides fallback.
 
     Runs `get_watch_playlist` in a thread since ytmusicapi uses blocking
     requests and we're in asyncio land.
     """
     seed = (seed_video_id or "").strip()
     if not seed:
-        return []
+        return None, []
 
     try:
         from ytmusicapi import YTMusic
     except ImportError:
         logger.warning("[radio/playlist] ytmusicapi not installed")
-        return []
+        return None, []
 
     def _fetch() -> dict:
         ytm = YTMusic()
@@ -110,14 +114,17 @@ async def build_station(seed_video_id: str, limit: int = 50) -> List[StationTrac
             f"err={type(e).__name__}: {e}",
             flush=True,
         )
-        return []
+        return None, []
 
     tracks_raw = raw.get("tracks") or []
+    seed_meta: Optional[StationTrack] = None
     station: List[StationTrack] = []
     skipped = 0
     for i, t in enumerate(tracks_raw):
-        # Skip the seed (always index 0 of YT Music's watch-playlist response).
+        # Capture the seed's metadata (index 0, matching videoId) and skip it
+        # from the station — it's what's already playing, not the queue.
         if i == 0 and (t or {}).get("videoId") == seed:
+            seed_meta = _parse_track(t or {})
             continue
         parsed = _parse_track(t or {})
         if parsed is None:
@@ -127,10 +134,11 @@ async def build_station(seed_video_id: str, limit: int = 50) -> List[StationTrac
 
     print(
         f"[radio/playlist] built seed={seed} tracks={len(station)} "
+        f"seed_meta={'yes' if seed_meta else 'no'} "
         f"skipped_invalid={skipped} playlistId={raw.get('playlistId')!r}",
         flush=True,
     )
-    return station
+    return seed_meta, station
 
 
 # "MUSIC_VIDEO_TYPE_ATV" is YT Music's enum for audio-only tracks (the

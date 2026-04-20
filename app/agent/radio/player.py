@@ -21,11 +21,22 @@ async def broadcast_radio_track(
     artist: str = "",
     thumbnail_url: str = "",
     video_type: str = "",
+    reason: str = "auto_advance",
 ) -> bool:
     """Emit a media_play event flagged radio_auto + kick age-check in background.
 
     Extra fields (artist, thumbnail_url, video_type) let the frontend render
     the Song-mode now-playing overlay without a secondary fetch.
+
+    `reason` is metadata for the frontend / logs:
+      - "auto_advance"  (default) — radio popped the next queued track.
+      - "toggle_seed"             — Radio was just toggled on; this broadcast
+                                    forces the iframe to load the seed so
+                                    iframe and session sync by construction.
+      - "topic_swap" / "mv_swap"  — mid-track variant swap.
+    Kept as `radio_auto: True` so the frontend skips chat-card attachment
+    (there's no new assistant message for these broadcasts — the seed card
+    already exists, the swap reuses the current card).
     """
     try:
         from app.api.ws_chat import broadcast_to_user, _check_age_and_swap
@@ -36,6 +47,7 @@ async def broadcast_radio_track(
             "title": title,
             "url": f"https://www.youtube.com/watch?v={video_id}",
             "radio_auto": True,
+            "reason": reason,
             "channel": channel,
             "artist": artist,
             "thumbnail_url": thumbnail_url,
@@ -44,8 +56,8 @@ async def broadcast_radio_track(
         asyncio.create_task(_check_age_and_swap(video_id, user_id))
         logger.info(
             "[radio/player] broadcast radio_auto user=%s channel=%s video=%s "
-            "title=%r artist=%r video_type=%r",
-            user_id[:8], channel, video_id, title, artist, video_type,
+            "title=%r artist=%r video_type=%r reason=%s",
+            user_id[:8], channel, video_id, title, artist, video_type, reason,
         )
         return True
     except Exception as e:

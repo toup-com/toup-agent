@@ -462,8 +462,10 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
 
     # Build the YT Music station BEFORE we mark the session enabled — if YT
     # Music rejects the seed (non-music, region-locked, etc.) we don't want
-    # the UI pinned ON with no queue behind it.
-    station = await build_station(seed_video_id, limit=50)
+    # the UI pinned ON with no queue behind it. We also get back the seed's
+    # own metadata from the watch-playlist's index 0 — used below to drive
+    # the authoritative iframe swap on toggle-on (Rule 9).
+    seed_meta, station = await build_station(seed_video_id, limit=50)
     if not station:
         print(
             f"[radio] toggle REJECT build_station returned empty "
@@ -498,6 +500,41 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         f"station_size={len(station)} next={top.display_title() if top else None!r}",
         flush=True,
     )
+
+    # Authoritative iframe swap (Rule 9). Radio toggle-on is a user-initiated
+    # command — iframe, session, and UI must all sync to the clicked card,
+    # NOT wait for whatever the iframe happens to be playing to end. Without
+    # this broadcast, a user clicking Radio on a card that isn't currently
+    # in the iframe gets a seeded session + queue but no playback — and the
+    # stray-end no-op (294e3ee) correctly refuses to advance when the
+    # unrelated iframe track ends. Net: radio does nothing until manual
+    # playback. Broadcast media_play for the seed so loadVideoById runs and
+    # iframe ↔ session sync by construction.
+    already_iframe_synced = (
+        sess.current_track_id == seed_video_id and top is None
+    )
+    print(
+        f"[radio] toggle_seed_playback seed={seed_video_id} source=toggle_on "
+        f"already_playing={already_iframe_synced}",
+        flush=True,
+    )
+    from app.agent.radio.player import broadcast_radio_track
+    seed_title_full = (seed_meta.title if seed_meta else seed_title) or "Now Playing"
+    await broadcast_radio_track(
+        user_id=user_id,
+        video_id=seed_video_id,
+        title=seed_title_full,
+        channel=channel,
+        artist=(seed_meta.artist if seed_meta else ""),
+        thumbnail_url=(seed_meta.thumbnail_url if seed_meta else ""),
+        video_type=(seed_meta.video_type if seed_meta else ""),
+        reason="toggle_seed",
+    )
+    print(
+        f"[radio] iframe_force_sync from=unknown to={seed_video_id} reason=toggle_on",
+        flush=True,
+    )
+
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
 
@@ -539,7 +576,7 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
             flush=True,
         )
         if extend_seed:
-            new_tracks = await build_station(extend_seed, limit=50)
+            _seed_meta, new_tracks = await build_station(extend_seed, limit=50)
             if new_tracks:
                 mgr.extend_playlist(sess, new_tracks)
         if next_track is None:
