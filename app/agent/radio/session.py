@@ -56,16 +56,17 @@ class RadioSession:
     # Defensive dedupe only — YT Music rarely repeats within one queue, but
     # extension can append tracks already played earlier in the session.
     played_track_ids: set = field(default_factory=set)
-    # "song" (default) or "video". Decides whether the frontend renders the
-    # audio-centric overlay (Song) or the full YouTube iframe (Video). Also
-    # decides whether _advance_and_broadcast_next attempts a Topic-variant
-    # swap for non-ATV tracks.
-    display_mode: str = "song"
+    # "video" (default) or "song". Decides whether the frontend renders the
+    # full YouTube iframe (Video) or the audio-centric overlay (Song).
+    # Default is Video because Toup plays in the content area — visual-first
+    # is the common expected behavior. Users who want Song mode toggle into
+    # it and the override persists for the rest of the session.
+    display_mode: str = "video"
     # True once the user has explicitly clicked the Song/Video pill at least
-    # once in this session. Before that, auto-detect drives the mode from
-    # `StationTrack.video_type` on every track load (ATV → song, OMV → video).
-    # Resets to False on enable() / record_user_seed (new seed, new override
-    # context). User's manual pick sticks for the rest of the session.
+    # once in this session. Mid-track auto-advance swaps (Song+OMV → ATV /
+    # Video+ATV → OMV) only fire when this is True — default-mode advances
+    # play whatever the queue gives. Resets to False on enable() /
+    # record_user_seed (new seed, new override context).
     display_mode_user_override: bool = False
     # Full StationTrack for the currently-playing entry (kept alongside
     # `current_track_id` so handlers can access artist / video_type /
@@ -158,7 +159,7 @@ class RadioSessionManager:
         )
         sess.played_history = [seed_station_track]
         sess.history_cursor = 0
-        sess.display_mode = "song"
+        sess.display_mode = "video"
         sess.display_mode_user_override = False
         sess.current_station_track = seed_station_track
         sess.last_activity_ts = time.time()
@@ -215,7 +216,7 @@ class RadioSessionManager:
         sess.played_track_ids = {seed_track.video_id}
         sess.played_history = []
         sess.history_cursor = -1
-        sess.display_mode = "song"
+        sess.display_mode = "video"
         sess.display_mode_user_override = False
         sess.current_station_track = None
         sess.last_activity_ts = time.time()
@@ -314,31 +315,18 @@ class RadioSessionManager:
             )
 
     def maybe_auto_set_mode(self, sess: RadioSession, track: StationTrack) -> str:
-        """Auto-detect display mode from track.video_type unless user has
-        overridden. Returns the effective mode after this call.
+        """No-op retained for call-site compatibility.
 
-          - ATV (Topic/audio upload) → 'song'
-          - OMV (music video)         → 'video'
-          - UGC / unknown / empty     → no change (respect current)
+        Previously auto-detected display mode from StationTrack.video_type
+        (ATV → song, OMV → video). Auto-detect was removed on 2026-04-20:
+        Video is now the session default, and mode only changes when the
+        user explicitly clicks the Song/Video pill. See Rule 9 / 10 in
+        docs/skills/radio-mode/SKILL.md.
 
-        User override wins always — if display_mode_user_override is True,
-        this is a no-op that just returns the existing display_mode.
+        Returns the current display_mode unchanged. Callers may keep using
+        the return value as "the effective mode to broadcast" — it's just
+        always equal to sess.display_mode now.
         """
-        if sess.display_mode_user_override:
-            return sess.display_mode
-        vt = (track.video_type or "").strip()
-        prev = sess.display_mode
-        if vt == "MUSIC_VIDEO_TYPE_ATV":
-            sess.display_mode = "song"
-        elif vt == "MUSIC_VIDEO_TYPE_OMV":
-            sess.display_mode = "video"
-        # UGC / unknown / empty: leave whatever the session already had.
-        if sess.display_mode != prev:
-            logger.info(
-                "[radio] display_mode_mutation source=auto_detect "
-                "user=%s channel=%s from=%s to=%s video_type=%s",
-                sess.user_id[:8], sess.channel, prev, sess.display_mode, vt,
-            )
         return sess.display_mode
 
     def pop_next_from_playlist(self, sess: RadioSession) -> Optional[StationTrack]:

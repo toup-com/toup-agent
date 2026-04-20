@@ -616,42 +616,45 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
         flush=True,
     )
 
-    # Song-mode Topic lookup — best-effort swap to the ATV variant when the
-    # playlist track is an OMV (music video) AND the user is in Song mode.
-    # Failure falls back to original.
-    if effective_mode == "song" and next_track.video_type == "MUSIC_VIDEO_TYPE_OMV":
-        print(
-            f"[radio] topic_lookup query={next_track.title!r} by {next_track.artist!r} "
-            f"from={next_track.video_id}",
-            flush=True,
-        )
-        alt = await find_topic_version(next_track)
-        if alt is not None:
+    # Mid-track variant swaps on auto-advance fire ONLY when the user has
+    # explicitly picked a mode. Default (no override) plays whatever the
+    # queue gives — Video on Topic-audio ATV = same as the original feature
+    # before Song/Video existed. Once the user clicks the Song/Video pill,
+    # subsequent auto-advanced tracks are reshaped to match their pick.
+    # See Rule 9 in docs/skills/radio-mode/SKILL.md.
+    if sess.display_mode_user_override:
+        # Song-mode Topic lookup — swap to ATV when the popped track is an
+        # OMV and the user is in Song mode (needs clean audio variant).
+        if effective_mode == "song" and next_track.video_type == "MUSIC_VIDEO_TYPE_OMV":
             print(
-                f"[radio] topic_swap from={next_track.video_id} to={alt.video_id} "
-                f"title={alt.title!r}",
+                f"[radio] topic_lookup query={next_track.title!r} by {next_track.artist!r} "
+                f"from={next_track.video_id}",
                 flush=True,
             )
-            next_track = alt
+            alt = await find_topic_version(next_track)
+            if alt is not None:
+                print(
+                    f"[radio] topic_swap from={next_track.video_id} to={alt.video_id} "
+                    f"title={alt.title!r}",
+                    flush=True,
+                )
+                next_track = alt
 
-    # Video-mode Music-Video lookup — mirror of the Song-mode Topic path.
-    # When the popped track is an ATV (Topic/audio) AND the user is in Video
-    # mode, try to surface the Official Music Video (OMV) and swap to it so
-    # the iframe shows actual video chrome instead of the audio-only art.
-    elif effective_mode == "video" and next_track.video_type == "MUSIC_VIDEO_TYPE_ATV":
-        print(
-            f"[radio] mv_lookup query={next_track.title!r} by {next_track.artist!r} "
-            f"from={next_track.video_id}",
-            flush=True,
-        )
-        mv = await find_music_video(next_track)
-        if mv is not None:
+        # Video-mode Music-Video lookup — mirror for users who picked Video.
+        elif effective_mode == "video" and next_track.video_type == "MUSIC_VIDEO_TYPE_ATV":
             print(
-                f"[radio] mv_swap from={next_track.video_id} to={mv.video_id} "
-                f"title={mv.title!r}",
+                f"[radio] mv_lookup query={next_track.title!r} by {next_track.artist!r} "
+                f"from={next_track.video_id}",
                 flush=True,
             )
-            next_track = mv
+            mv = await find_music_video(next_track)
+            if mv is not None:
+                print(
+                    f"[radio] mv_swap from={next_track.video_id} to={mv.video_id} "
+                    f"title={mv.title!r}",
+                    flush=True,
+                )
+                next_track = mv
 
     mgr.record_auto_play(sess, next_track, source=trigger)
     print(
