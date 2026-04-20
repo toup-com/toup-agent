@@ -137,6 +137,7 @@ async def build_station(seed_video_id: str, limit: int = 50) -> List[StationTrac
 # auto-generated "- Topic" channel uploads + proper catalog releases).
 # OMV = Official Music Video. UGC = user-generated clip.
 _ATV_VIDEO_TYPE = "MUSIC_VIDEO_TYPE_ATV"
+_OMV_VIDEO_TYPE = "MUSIC_VIDEO_TYPE_OMV"
 
 
 async def find_topic_version(
@@ -206,6 +207,79 @@ async def find_topic_version(
 
     print(
         f"[radio] topic_lookup_failed fallback={track.video_id} q={q!r} "
+        f"results_checked={len(results)}",
+        flush=True,
+    )
+    return None
+
+
+async def find_music_video(
+    track: StationTrack,
+    timeout: float = 6.0,
+) -> Optional[StationTrack]:
+    """Mirror of `find_topic_version` for Video mode.
+
+    Given an ATV (Topic/audio) track, try to find the Official Music Video
+    (OMV) variant via YT Music search with filter='videos'. Returns the OMV
+    StationTrack on success, None on failure.
+
+    UGC/reaction/lyric-video uploads are skipped — we accept only OMV hits
+    where the artist matches (case-insensitive), same discipline as the
+    Topic path. Empty metadata or timeout → fall through.
+    """
+    if track.video_type == _OMV_VIDEO_TYPE:
+        return track  # already the Music Video variant
+    if not track.title:
+        return None
+
+    try:
+        from ytmusicapi import YTMusic
+    except ImportError:
+        return None
+
+    q = f"{track.title} {track.artist}".strip()
+    if not q:
+        return None
+
+    def _search() -> list:
+        ytm = YTMusic()
+        return ytm.search(q, filter="videos", limit=10) or []
+
+    try:
+        results = await asyncio.wait_for(asyncio.to_thread(_search), timeout=timeout)
+    except Exception as e:
+        print(
+            f"[radio/playlist] mv_lookup_failed track={track.video_id} "
+            f"q={q!r} err={type(e).__name__}: {e}",
+            flush=True,
+        )
+        return None
+
+    want_artist = track.artist.strip().lower()
+    for r in results:
+        r_type = (r or {}).get("videoType") or ""
+        if r_type != _OMV_VIDEO_TYPE:
+            continue
+        vid = (r.get("videoId") or "").strip()
+        if not vid or vid == track.video_id:
+            continue
+        r_artists = r.get("artists") or []
+        r_artist_name = ""
+        if r_artists:
+            r_artist_name = (r_artists[0] or {}).get("name", "").strip()
+        if want_artist and r_artist_name.lower() and want_artist != r_artist_name.lower():
+            continue
+        return StationTrack(
+            video_id=vid,
+            title=(r.get("title") or track.title).strip(),
+            artist=r_artist_name or track.artist,
+            length=(r.get("duration") or track.length or "").strip(),
+            video_type=_OMV_VIDEO_TYPE,
+            thumbnail_url=_biggest_thumbnail_url(r) or track.thumbnail_url,
+        )
+
+    print(
+        f"[radio] mv_lookup_failed fallback={track.video_id} q={q!r} "
         f"results_checked={len(results)}",
         flush=True,
     )

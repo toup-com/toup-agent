@@ -507,8 +507,8 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
 
     `trigger` is a log label: 'media_ended' | 'skip_next'.
     """
-    from app.agent.radio import build_station, PLAYLIST_REFILL_THRESHOLD
-    from app.agent.radio.playlist import find_topic_version
+    from app.agent.radio import build_station, PLAYLIST_REFILL_THRESHOLD, get_radio_manager
+    from app.agent.radio.playlist import find_topic_version, find_music_video
     from app.agent.radio.player import broadcast_radio_track
 
     mgr = get_radio_manager()
@@ -595,6 +595,25 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
                 flush=True,
             )
             next_track = alt
+
+    # Video-mode Music-Video lookup — mirror of the Song-mode Topic path.
+    # When the popped track is an ATV (Topic/audio) AND the user is in Video
+    # mode, try to surface the Official Music Video (OMV) and swap to it so
+    # the iframe shows actual video chrome instead of the audio-only art.
+    elif effective_mode == "video" and next_track.video_type == "MUSIC_VIDEO_TYPE_ATV":
+        print(
+            f"[radio] mv_lookup query={next_track.title!r} by {next_track.artist!r} "
+            f"from={next_track.video_id}",
+            flush=True,
+        )
+        mv = await find_music_video(next_track)
+        if mv is not None:
+            print(
+                f"[radio] mv_swap from={next_track.video_id} to={mv.video_id} "
+                f"title={mv.title!r}",
+                flush=True,
+            )
+            next_track = mv
 
     mgr.record_auto_play(sess, next_track)
     print(
@@ -738,7 +757,7 @@ async def _handle_radio_skip_prev(user_id: str, msg: dict) -> None:
 
 async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
     from app.agent.radio import get_radio_manager, RadioSessionManager
-    from app.agent.radio.playlist import find_topic_version
+    from app.agent.radio.playlist import find_topic_version, find_music_video, StationTrack
     from app.agent.radio.player import broadcast_radio_track
 
     channel = (msg.get("channel") or "").strip().lower()
@@ -760,38 +779,51 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
     # subsequent track loads. The pick sticks for the rest of the session.
     mgr.set_display_mode(sess, mode, user_initiated=True)
 
-    # Topic swap: ONLY when (a) user picked Song, (b) a current track exists,
-    # and (c) that track's video_type is OMV (has a Topic variant worth
-    # finding). ATV → already audio, skip swap. UGC / unknown → don't bother.
-    # Video mode → never swap (we leave the original OMV/ATV playing).
+    # Mid-track swap rules (bidirectional, same overwrite-history semantics):
+    #   Song  + OMV current → Topic lookup → swap to ATV if found.
+    #   Video + ATV current → MV lookup    → swap to OMV if found.
+    #   Song  + ATV current → no swap (already audio). Overlay appears.
+    #   Video + OMV current → no swap (already music video). Iframe visible.
+    #   UGC / unknown video_type → no swap in either direction.
+    # A failed lookup stays on the current track; the display-mode still
+    # flips so the overlay / iframe chrome responds.
     reload_needed = False
-    if (
-        sess.enabled
-        and mode == "song"
-        and current_track is not None
-        and current_track.video_type == "MUSIC_VIDEO_TYPE_OMV"
-    ):
-        print(
-            f"[radio] mode_toggle clicked → song reload_needed=candidate "
-            f"current={current_track.video_id} video_type={current_track.video_type}",
-            flush=True,
-        )
-        alt = await find_topic_version(current_track)
+    alt: Optional[StationTrack] = None
+
+    if sess.enabled and current_track is not None:
+        if mode == "song" and current_track.video_type == "MUSIC_VIDEO_TYPE_OMV":
+            print(
+                f"[radio] mode_toggle clicked → song reload_needed=candidate "
+                f"current={current_track.video_id} video_type={current_track.video_type}",
+                flush=True,
+            )
+            alt = await find_topic_version(current_track)
+            swap_log = "topic_swap"
+            fail_log = "topic_lookup_failed"
+        elif mode == "video" and current_track.video_type == "MUSIC_VIDEO_TYPE_ATV":
+            print(
+                f"[radio] mode_toggle clicked → video reload_needed=candidate "
+                f"current={current_track.video_id} video_type={current_track.video_type}",
+                flush=True,
+            )
+            alt = await find_music_video(current_track)
+            swap_log = "mv_swap"
+            fail_log = "mv_lookup_failed"
+        else:
+            swap_log = fail_log = ""
+
         if alt is not None and alt.video_id != current_track.video_id:
             reload_needed = True
             print(
-                f"[radio] topic_swap from={current_track.video_id} to={alt.video_id} "
+                f"[radio] {swap_log} from={current_track.video_id} to={alt.video_id} "
                 f"title={alt.title!r} (mid-track mode toggle)",
                 flush=True,
             )
-            # Replace current with the ATV track — record it so skip_prev
-            # lands on the ATV version on future walk-backs.
             sess.current_track_id = alt.video_id
             sess.current_station_track = alt
             sess.played_track_ids.add(alt.video_id)
-            # Overwrite the current tape entry rather than appending — the
-            # user didn't move forward, they just swapped format of the SAME
-            # track they're listening to.
+            # Overwrite the current tape entry rather than appending — same
+            # song, different format, the user didn't move forward.
             if 0 <= sess.history_cursor < len(sess.played_history):
                 sess.played_history[sess.history_cursor] = alt
             await broadcast_radio_track(
@@ -803,10 +835,11 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
                 thumbnail_url=alt.thumbnail_url,
                 video_type=alt.video_type,
             )
-        else:
+        elif swap_log:
+            # Lookup was attempted but yielded nothing.
             print(
-                f"[radio] topic_lookup_failed fallback={current_track.video_id} "
-                f"(staying on OMV, Song overlay will still apply)",
+                f"[radio] {fail_log} fallback={current_track.video_id} "
+                f"(staying on current track, {mode} UI still applies)",
                 flush=True,
             )
 
