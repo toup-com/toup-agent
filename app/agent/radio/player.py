@@ -18,8 +18,15 @@ async def broadcast_radio_track(
     video_id: str,
     title: str,
     channel: str,
+    artist: str = "",
+    thumbnail_url: str = "",
+    video_type: str = "",
 ) -> bool:
-    """Emit a media_play event flagged radio_auto + kick age-check in background."""
+    """Emit a media_play event flagged radio_auto + kick age-check in background.
+
+    Extra fields (artist, thumbnail_url, video_type) let the frontend render
+    the Song-mode now-playing overlay without a secondary fetch.
+    """
     try:
         from app.api.ws_chat import broadcast_to_user, _check_age_and_swap
         await broadcast_to_user(user_id, {
@@ -30,11 +37,15 @@ async def broadcast_radio_track(
             "url": f"https://www.youtube.com/watch?v={video_id}",
             "radio_auto": True,
             "channel": channel,
+            "artist": artist,
+            "thumbnail_url": thumbnail_url,
+            "video_type": video_type,
         })
         asyncio.create_task(_check_age_and_swap(video_id, user_id))
         logger.info(
-            "[radio/player] broadcast radio_auto user=%s channel=%s video=%s title=%r",
-            user_id[:8], channel, video_id, title,
+            "[radio/player] broadcast radio_auto user=%s channel=%s video=%s "
+            "title=%r artist=%r video_type=%r",
+            user_id[:8], channel, video_id, title, artist, video_type,
         )
         return True
     except Exception as e:

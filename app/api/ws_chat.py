@@ -500,14 +500,113 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
 
-async def _handle_media_ended(user_id: str, msg: dict) -> None:
-    from app.agent.radio import (
-        get_radio_manager,
-        RadioSessionManager,
-        build_station,
-        PLAYLIST_REFILL_THRESHOLD,
-    )
+async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger: str) -> bool:
+    """Shared path for media_ended + skip_next: advance the playlist (possibly
+    extending it first), apply Song-mode Topic lookup if set, record in history,
+    broadcast media_play. Returns True on success, False on exhaustion.
+
+    `trigger` is a log label: 'media_ended' | 'skip_next'.
+    """
+    from app.agent.radio import build_station, PLAYLIST_REFILL_THRESHOLD
+    from app.agent.radio.playlist import find_topic_version
     from app.agent.radio.player import broadcast_radio_track
+
+    mgr = get_radio_manager()
+
+    # Step forward in history first — if the user walked back via skip_prev,
+    # skip_next should replay the tape before advancing the playlist.
+    if trigger == "skip_next":
+        stepped = mgr.step_forward_in_history(sess)
+        if stepped is not None:
+            print(
+                f"[radio] skip_next cursor_step_forward history_cursor="
+                f"{sess.history_cursor}/{len(sess.played_history) - 1} "
+                f"video_id={stepped.video_id}",
+                flush=True,
+            )
+            await _broadcast_track_for_mode(user_id, channel, sess, stepped, trigger, record=False)
+            return True
+
+    # Pop next from playlist; extend if within threshold.
+    next_track = mgr.pop_next_from_playlist(sess)
+    remaining = len(sess.playlist) - sess.playlist_cursor
+    if next_track is None or remaining <= PLAYLIST_REFILL_THRESHOLD:
+        extend_seed = sess.current_track_id or (sess.seed_track.video_id if sess.seed_track else "")
+        print(
+            f"[radio] playlist extending ({trigger}) user={user_id[:8]} seed={extend_seed} "
+            f"cursor={sess.playlist_cursor}/{len(sess.playlist)} remaining={remaining}",
+            flush=True,
+        )
+        if extend_seed:
+            new_tracks = await build_station(extend_seed, limit=50)
+            if new_tracks:
+                mgr.extend_playlist(sess, new_tracks)
+        if next_track is None:
+            next_track = mgr.pop_next_from_playlist(sess)
+
+    if next_track is None:
+        disabled = mgr.record_failure(sess)
+        print(
+            f"[radio] pick failed ({trigger}) user={user_id[:8]} — playlist exhausted, "
+            f"extension produced no new tracks. disabled={disabled}",
+            flush=True,
+        )
+        if disabled:
+            await broadcast_to_user(user_id, {
+                "type": "radio_state",
+                "channel": channel,
+                "enabled": False,
+                "error": "no_more_tracks",
+            })
+            await broadcast_to_user(user_id, {
+                "type": "radio_notice",
+                "channel": channel,
+                "message": "Ran out of tracks in that vibe — try a different song.",
+            })
+        return False
+
+    # Song-mode Topic lookup — best-effort swap to the ATV variant when the
+    # playlist track is an OMV (music video). Failure falls back to original.
+    if sess.display_mode == "song" and next_track.video_type and next_track.video_type != "MUSIC_VIDEO_TYPE_ATV":
+        alt = await find_topic_version(next_track)
+        if alt is not None:
+            print(
+                f"[radio] topic_lookup_ok track={next_track.video_id} → {alt.video_id} "
+                f"title={alt.title!r}",
+                flush=True,
+            )
+            next_track = alt
+
+    mgr.record_auto_play(sess, next_track)
+    print(
+        f"[radio] playlist pop ({trigger}) cursor={sess.playlist_cursor - 1}/{len(sess.playlist)} "
+        f"track={next_track.title!r} by={next_track.artist!r} "
+        f"length={next_track.length!r} video_id={next_track.video_id} "
+        f"history_cursor={sess.history_cursor}/{len(sess.played_history) - 1}",
+        flush=True,
+    )
+    await _broadcast_track_for_mode(user_id, channel, sess, next_track, trigger, record=False)
+    return True
+
+
+async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str, record: bool) -> None:
+    """Broadcast a media_play for `track` plus a radio_state update. `record`
+    is False for skip_prev and history-step-forward (track already in tape)."""
+    from app.agent.radio.player import broadcast_radio_track
+    await broadcast_radio_track(
+        user_id=user_id,
+        video_id=track.video_id,
+        title=track.display_title(),
+        channel=channel,
+        artist=track.artist,
+        thumbnail_url=track.thumbnail_url,
+        video_type=track.video_type,
+    )
+    await broadcast_to_user(user_id, sess.to_broadcast_dict())
+
+
+async def _handle_media_ended(user_id: str, msg: dict) -> None:
+    from app.agent.radio import get_radio_manager, RadioSessionManager
 
     channel = (msg.get("channel") or "").strip().lower()
     ended_video_id = (msg.get("video_id") or "").strip()
@@ -524,8 +623,6 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
     mgr = get_radio_manager()
     sess = mgr.get(user_id, channel)
     if sess is None or not sess.enabled:
-        # Frontend may have a stale ON toggle (e.g. click pre-restart) —
-        # push authoritative OFF so UI syncs with reality.
         print(
             f"[radio] media_ended — no active session; broadcasting OFF "
             f"user={user_id[:8]} sess_none={sess is None} "
@@ -547,62 +644,88 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
             ended_video_id, sess.current_track_id,
         )
 
-    # ── Pop next from playlist ─────────────────────────────────────
-    next_track = mgr.pop_next_from_playlist(sess)
+    await _advance_and_broadcast_next(user_id, channel, sess, trigger="media_ended")
 
-    # If we're running low OR the pop came up empty, extend the station
-    # from the currently-playing track (or the seed on first pop after
-    # resume). Runs in-line — a 0.5–2s blocking fetch is acceptable once
-    # per ~47 tracks.
-    remaining = len(sess.playlist) - sess.playlist_cursor
-    if next_track is None or remaining <= PLAYLIST_REFILL_THRESHOLD:
-        extend_seed = sess.current_track_id or (sess.seed_track.video_id if sess.seed_track else "")
-        print(
-            f"[radio] playlist extending user={user_id[:8]} seed={extend_seed} "
-            f"cursor={sess.playlist_cursor}/{len(sess.playlist)} remaining={remaining}",
-            flush=True,
-        )
-        if extend_seed:
-            new_tracks = await build_station(extend_seed, limit=50)
-            if new_tracks:
-                mgr.extend_playlist(sess, new_tracks)
-        # Re-pop now that we've extended.
-        if next_track is None:
-            next_track = mgr.pop_next_from_playlist(sess)
 
-    if next_track is None:
-        disabled = mgr.record_failure(sess)
-        print(
-            f"[radio] pick failed user={user_id[:8]} — playlist exhausted, "
-            f"extension produced no new tracks. disabled={disabled}",
-            flush=True,
-        )
-        if disabled:
-            await broadcast_to_user(user_id, {
-                "type": "radio_state",
-                "channel": channel,
-                "enabled": False,
-                "error": "no_more_tracks",
-            })
-            await broadcast_to_user(user_id, {
-                "type": "radio_notice",
-                "channel": channel,
-                "message": "Ran out of tracks in that vibe — try a different song.",
-            })
+async def _handle_radio_skip_next(user_id: str, msg: dict) -> None:
+    from app.agent.radio import get_radio_manager, RadioSessionManager
+
+    channel = (msg.get("channel") or "").strip().lower()
+    print(f"[radio] skip_next entry user={user_id[:8]} channel={channel!r}", flush=True)
+
+    if not RadioSessionManager.is_channel_allowed(channel):
         return
-
-    mgr.record_auto_play(sess, next_track)
+    mgr = get_radio_manager()
+    sess = mgr.get(user_id, channel)
+    if sess is None or not sess.enabled:
+        print(f"[radio] skip_next — no active session user={user_id[:8]}", flush=True)
+        await broadcast_to_user(user_id, {
+            "type": "radio_state",
+            "channel": channel,
+            "enabled": False,
+            "error": "not_enabled",
+        })
+        return
     print(
-        f"[radio] playlist pop cursor={sess.playlist_cursor - 1}/{len(sess.playlist)} "
-        f"track={next_track.title!r} by={next_track.artist!r} "
-        f"length={next_track.length!r} video_id={next_track.video_id}",
+        f"[radio] skip_next clicked cursor={sess.playlist_cursor}/{len(sess.playlist)} "
+        f"history={sess.history_cursor}/{len(sess.played_history) - 1}",
         flush=True,
     )
-    await broadcast_radio_track(
-        user_id=user_id,
-        video_id=next_track.video_id,
-        title=next_track.display_title(),
-        channel=channel,
+    await _advance_and_broadcast_next(user_id, channel, sess, trigger="skip_next")
+
+
+async def _handle_radio_skip_prev(user_id: str, msg: dict) -> None:
+    from app.agent.radio import get_radio_manager, RadioSessionManager
+
+    channel = (msg.get("channel") or "").strip().lower()
+    print(f"[radio] skip_prev entry user={user_id[:8]} channel={channel!r}", flush=True)
+
+    if not RadioSessionManager.is_channel_allowed(channel):
+        return
+    mgr = get_radio_manager()
+    sess = mgr.get(user_id, channel)
+    if sess is None or not sess.enabled:
+        print(f"[radio] skip_prev — no active session user={user_id[:8]}", flush=True)
+        return
+    print(
+        f"[radio] skip_prev clicked history_cursor={sess.history_cursor}/{len(sess.played_history) - 1}",
+        flush=True,
+    )
+    prev_track = mgr.skip_prev(sess)
+    if prev_track is None:
+        print(f"[radio] skip_prev — at start of tape, no-op user={user_id[:8]}", flush=True)
+        # Re-broadcast state so frontend knows can_prev is now false.
+        await broadcast_to_user(user_id, sess.to_broadcast_dict())
+        return
+    print(
+        f"[radio] skip_prev replaying history[{sess.history_cursor}] "
+        f"video_id={prev_track.video_id} title={prev_track.title!r}",
+        flush=True,
+    )
+    await _broadcast_track_for_mode(user_id, channel, sess, prev_track, "skip_prev", record=False)
+
+
+async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
+    from app.agent.radio import get_radio_manager, RadioSessionManager
+
+    channel = (msg.get("channel") or "").strip().lower()
+    mode = (msg.get("mode") or "").strip().lower()
+    print(f"[radio] display_mode entry user={user_id[:8]} channel={channel!r} mode={mode!r}", flush=True)
+
+    if not RadioSessionManager.is_channel_allowed(channel):
+        return
+    if mode not in ("song", "video"):
+        return
+    mgr = get_radio_manager()
+    sess = mgr.get(user_id, channel)
+    if sess is None:
+        # No active session yet — create one in disabled state just to remember
+        # the user's mode preference for when they next toggle radio on.
+        sess = mgr.get_or_create(user_id, channel)
+    mgr.set_display_mode(sess, mode)
+    print(
+        f"[radio] display_mode set user={user_id[:8]} channel={channel} mode={sess.display_mode}",
+        flush=True,
     )
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
@@ -788,16 +911,31 @@ async def ws_chat(
                     await websocket.send_json({"type": "pong"})
                     continue
 
-                if msg_type in ("radio_toggle", "media_ended"):
+                if msg_type in (
+                    "radio_toggle", "media_ended",
+                    "radio_skip_next", "radio_skip_prev", "radio_display_mode",
+                ):
                     print(f"[WS IN] user={user_id[:8]} type={msg_type} keys={list(msg.keys())}", flush=True)
 
-                # ── Radio Mode: toggle / track-ended signals ──
+                # ── Radio Mode: toggle / track-ended / skip / display-mode ──
                 if msg_type == "radio_toggle":
                     await _handle_radio_toggle(user_id, msg)
                     continue
 
                 if msg_type == "media_ended":
                     asyncio.create_task(_handle_media_ended(user_id, msg))
+                    continue
+
+                if msg_type == "radio_skip_next":
+                    asyncio.create_task(_handle_radio_skip_next(user_id, msg))
+                    continue
+
+                if msg_type == "radio_skip_prev":
+                    asyncio.create_task(_handle_radio_skip_prev(user_id, msg))
+                    continue
+
+                if msg_type == "radio_display_mode":
+                    await _handle_radio_display_mode(user_id, msg)
                     continue
 
                 if msg_type != "message":

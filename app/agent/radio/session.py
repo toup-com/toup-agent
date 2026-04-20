@@ -47,9 +47,19 @@ class RadioSession:
     # The YT Music station — populated on enable, extended when running low.
     playlist: List[StationTrack] = field(default_factory=list)
     playlist_cursor: int = 0                        # next index to try on media_ended
+    # Ordered tape of what's actually been played this session. Used by
+    # skip_prev to walk back, and by skip_next to re-enter the tape before
+    # advancing the playlist. Distinct from `played_track_ids` (which is
+    # an unordered dedupe set).
+    played_history: List[StationTrack] = field(default_factory=list)
+    history_cursor: int = -1                        # position in played_history; -1 = empty
     # Defensive dedupe only — YT Music rarely repeats within one queue, but
     # extension can append tracks already played earlier in the session.
     played_track_ids: set = field(default_factory=set)
+    # "song" (default) or "video". Decides whether auto-play / skip broadcasts
+    # the ATV (Topic) variant of a track or the original (usually OMV) id.
+    # Frontend also reads this via radio_state to render the now-playing overlay.
+    display_mode: str = "song"
     consecutive_failures: int = 0
     last_activity_ts: float = field(default_factory=time.time)
 
@@ -60,6 +70,9 @@ class RadioSession:
             "enabled": self.enabled,
             "seed_intent": self.seed_intent,
             "current_track_id": self.current_track_id,
+            "display_mode": self.display_mode,
+            # True when the user has nothing earlier to walk back to.
+            "can_prev": self.history_cursor > 0,
         }
 
 
@@ -112,6 +125,16 @@ class RadioSessionManager:
         sess.playlist = list(station)
         sess.playlist_cursor = 0
         sess.played_track_ids = {seed_track.video_id}
+        # Seed the tape with the seed track itself so skip_prev from track 1
+        # lands back on the seed (and from the seed is disabled).
+        seed_station_track = StationTrack(
+            video_id=seed_track.video_id,
+            title=seed_track.title,
+            artist="",
+        )
+        sess.played_history = [seed_station_track]
+        sess.history_cursor = 0
+        sess.display_mode = "song"
         sess.last_activity_ts = time.time()
         logger.info(
             "[radio] enabled user=%s channel=%s seed_intent=%r seed_title=%r "
@@ -152,22 +175,61 @@ class RadioSessionManager:
         sess.playlist = []
         sess.playlist_cursor = 0
         sess.played_track_ids = {seed_track.video_id}
+        sess.played_history = []
+        sess.history_cursor = -1
+        sess.display_mode = "song"
         sess.last_activity_ts = time.time()
         return sess
 
     def record_auto_play(self, sess: RadioSession, track: StationTrack) -> None:
-        """Mark `track` as the now-playing track and bump the cursor."""
+        """Mark `track` as now-playing. Appends to played_history and moves
+        history_cursor to the new end. Called after playlist advances — NOT
+        called on skip_prev (which re-plays a prior entry)."""
         sess.current_track_id = track.video_id
         sess.played_track_ids.add(track.video_id)
+        sess.played_history.append(track)
+        sess.history_cursor = len(sess.played_history) - 1
         sess.consecutive_failures = 0
         sess.last_activity_ts = time.time()
-        # Cap memory usage of the dedupe set over a very long session.
+        # Cap memory usage.
         if len(sess.played_track_ids) > MAX_PLAYED_HISTORY:
-            # Drop arbitrary oldest entries — set ordering is insertion-order
-            # in CPython 3.7+, which is close enough for this purpose.
             to_drop = len(sess.played_track_ids) - MAX_PLAYED_HISTORY
             for vid in list(sess.played_track_ids)[:to_drop]:
                 sess.played_track_ids.discard(vid)
+        if len(sess.played_history) > MAX_PLAYED_HISTORY:
+            drop = len(sess.played_history) - MAX_PLAYED_HISTORY
+            sess.played_history = sess.played_history[drop:]
+            sess.history_cursor = len(sess.played_history) - 1
+
+    def skip_prev(self, sess: RadioSession) -> Optional[StationTrack]:
+        """Walk one step back in played_history. Returns the track to re-broadcast,
+        or None if already at the start. Does NOT append to played_history — this
+        is a re-play of something already played."""
+        if not sess.played_history or sess.history_cursor <= 0:
+            return None
+        sess.history_cursor -= 1
+        track = sess.played_history[sess.history_cursor]
+        sess.current_track_id = track.video_id
+        sess.last_activity_ts = time.time()
+        return track
+
+    def step_forward_in_history(self, sess: RadioSession) -> Optional[StationTrack]:
+        """If the cursor is behind the tape's end (user hit Prev earlier), step
+        forward without touching the playlist. Returns the track or None if
+        we're already at the end of history (caller should advance the playlist
+        instead)."""
+        if sess.history_cursor < len(sess.played_history) - 1:
+            sess.history_cursor += 1
+            track = sess.played_history[sess.history_cursor]
+            sess.current_track_id = track.video_id
+            sess.last_activity_ts = time.time()
+            return track
+        return None
+
+    def set_display_mode(self, sess: RadioSession, mode: str) -> None:
+        """Set 'song' or 'video'. Other values coerce to 'song'."""
+        sess.display_mode = "video" if mode == "video" else "song"
+        sess.last_activity_ts = time.time()
 
     def pop_next_from_playlist(self, sess: RadioSession) -> Optional[StationTrack]:
         """Return the next unplayed track from the station, or None if exhausted.

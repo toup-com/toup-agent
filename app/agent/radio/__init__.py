@@ -8,7 +8,7 @@ is already clean.
 Scope: per-channel in-memory sessions (web, telegram, discord, slack, app).
 Voice is excluded for v1.
 """
-from app.agent.radio.playlist import StationTrack, build_station
+from app.agent.radio.playlist import StationTrack, build_station, find_topic_version
 from app.agent.radio.session import (
     RadioSession,
     RadioSessionManager,
@@ -24,6 +24,7 @@ __all__ = [
     "SeedTrack",
     "StationTrack",
     "build_station",
+    "find_topic_version",
     "get_radio_manager",
     "PLAYLIST_REFILL_THRESHOLD",
     "RADIO_ALLOWED_CHANNELS",
