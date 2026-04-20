@@ -417,7 +417,7 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
 
     mgr = get_radio_manager()
     if not enabled:
-        sess = mgr.disable(user_id, channel)
+        sess = mgr.disable(user_id, channel, source="toggle_off")
         if sess is None:
             sess_dict = {"type": "radio_state", "channel": channel, "enabled": False}
         else:
@@ -489,6 +489,7 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         seed_intent=seed_intent or seed_title or "music",
         seed_track=SeedTrack(video_id=seed_video_id, title=seed_title or "Now Playing"),
         station=station,
+        source="toggle_on",
     )
     top = station[0] if station else None
     print(
@@ -615,7 +616,7 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
             )
             next_track = mv
 
-    mgr.record_auto_play(sess, next_track)
+    mgr.record_auto_play(sess, next_track, source=trigger)
     print(
         f"[radio] playlist pop ({trigger}) cursor={sess.playlist_cursor - 1}/{len(sess.playlist)} "
         f"track={next_track.title!r} by={next_track.artist!r} "
@@ -686,11 +687,49 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
         })
         return
 
-    # Defensive: tolerate end-event mismatch (frontend may report a prior
-    # track on a fast double-end from YT's replay glitch).
-    if ended_video_id and sess.current_track_id and ended_video_id != sess.current_track_id:
+    # End-event provenance check. See Process Rule 7 / Trap 8: the iframe
+    # can play videos outside the radio session (page-refresh restore,
+    # user-pasted URLs, stale state post-reconnect). Narrow tolerance — we
+    # only advance when ended_video_id matches:
+    #   (a) the session's current track
+    #   (b) the active seed
+    #   (c) a recent entry in played_history (last 10)
+    # Commit 1 (this commit) adds the classification log; commit 2 promotes
+    # the stray-end branch to a no-op.
+    recent_history_ids = {
+        t.video_id for t in sess.played_history[-10:]
+    }
+    in_session = (
+        ended_video_id
+        and (
+            ended_video_id == sess.current_track_id
+            or (sess.seed_track and ended_video_id == sess.seed_track.video_id)
+            or ended_video_id in recent_history_ids
+        )
+    )
+    if ended_video_id and not in_session:
         logger.info(
-            "[radio] ended_video_id=%s != current=%s — continuing anyway",
+            "[radio] iframe_out_of_sync iframe=%s session=%s detected_at=media_ended "
+            "seed=%s history_size=%d",
+            ended_video_id,
+            sess.current_track_id,
+            sess.seed_track.video_id if sess.seed_track else None,
+            len(sess.played_history),
+        )
+        logger.info(
+            "[radio] media_ended stray_end video=%s current=%s — no-op (queue intact)",
+            ended_video_id, sess.current_track_id,
+        )
+        # Re-broadcast radio_state so the frontend stays anchored to what
+        # the session actually holds (seed + current), not to whatever the
+        # iframe last played. No queue mutation.
+        await broadcast_to_user(user_id, sess.to_broadcast_dict())
+        return
+    elif ended_video_id and ended_video_id != sess.current_track_id:
+        # Matches the session somewhere (seed or history) but not current —
+        # typically a user replay of an earlier track. Advance.
+        logger.info(
+            "[radio] ended_video_id=%s != current=%s but in_session=true — advancing",
             ended_video_id, sess.current_track_id,
         )
 
@@ -777,7 +816,7 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
     current_track = sess.current_station_track
     # User-initiated click: flip the override flag so auto-detect stops on
     # subsequent track loads. The pick sticks for the rest of the session.
-    mgr.set_display_mode(sess, mode, user_initiated=True)
+    mgr.set_display_mode(sess, mode, user_initiated=True, source="user_mode_toggle")
 
     # Mid-track swap rules (bidirectional, same overwrite-history semantics):
     #   Song  + OMV current → Topic lookup → swap to ATV if found.
@@ -819,6 +858,7 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
                 f"title={alt.title!r} (mid-track mode toggle)",
                 flush=True,
             )
+            prev_current = sess.current_track_id
             sess.current_track_id = alt.video_id
             sess.current_station_track = alt
             sess.played_track_ids.add(alt.video_id)
@@ -826,6 +866,12 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
             # song, different format, the user didn't move forward.
             if 0 <= sess.history_cursor < len(sess.played_history):
                 sess.played_history[sess.history_cursor] = alt
+            logger.info(
+                "[radio] current_track_mutation source=mid_toggle_swap user=%s channel=%s "
+                "from=%s to=%s history_cursor=%d swap=%s",
+                user_id[:8], channel, prev_current, alt.video_id,
+                sess.history_cursor, swap_log,
+            )
             await broadcast_radio_track(
                 user_id=user_id,
                 video_id=alt.video_id,

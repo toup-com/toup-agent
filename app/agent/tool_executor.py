@@ -2855,6 +2855,7 @@ class ToolExecutor:
                         channel=self._current_channel,
                         seed_intent=query,
                         seed_track=SeedTrack(video_id=video_id, title=video_title),
+                        source="tool_play",
                     )
                     _sess = _mgr.get(user_id, self._current_channel)
                     if _sess:

@@ -81,6 +81,11 @@ class RadioSession:
             "channel": self.channel,
             "enabled": self.enabled,
             "seed_intent": self.seed_intent,
+            # The videoId the station was seeded from. Stable across playlist
+            # advances; changes only on explicit re-seed (toggle_on from a
+            # different card OR tool_play). Frontend uses this for per-card
+            # pill binding — only the card whose videoId matches lights up.
+            "seed_video_id": self.seed_track.video_id if self.seed_track else None,
             "current_track_id": self.current_track_id,
             "display_mode": self.display_mode,
             "display_mode_user_override": self.display_mode_user_override,
@@ -111,13 +116,17 @@ class RadioSessionManager:
             self._sessions[key] = sess
         return sess
 
-    def disable(self, user_id: str, channel: str) -> Optional[RadioSession]:
+    def disable(self, user_id: str, channel: str, source: str = "toggle_off") -> Optional[RadioSession]:
         sess = self._sessions.get((user_id, channel))
         if sess is None:
             return None
+        prev_enabled = sess.enabled
         sess.enabled = False
         sess.last_activity_ts = time.time()
-        logger.info("[radio] disabled user=%s channel=%s", user_id[:8], channel)
+        logger.info(
+            "[radio] enabled_mutation source=%s user=%s channel=%s from=%s to=False",
+            source, user_id[:8], channel, prev_enabled,
+        )
         return sess
 
     def enable(
@@ -127,9 +136,11 @@ class RadioSessionManager:
         seed_intent: str,
         seed_track: SeedTrack,
         station: List[StationTrack],
+        source: str = "toggle_on",
     ) -> RadioSession:
         """Turn radio on with a freshly-built station."""
         sess = self.get_or_create(user_id, channel)
+        prior_seed_vid = sess.seed_track.video_id if sess.seed_track else None
         sess.enabled = True
         sess.seed_intent = seed_intent or sess.seed_intent
         sess.seed_track = seed_track
@@ -152,9 +163,10 @@ class RadioSessionManager:
         sess.current_station_track = seed_station_track
         sess.last_activity_ts = time.time()
         logger.info(
-            "[radio] enabled user=%s channel=%s seed_intent=%r seed_title=%r "
-            "station_size=%d",
-            user_id[:8], channel, seed_intent, seed_track.title, len(station),
+            "[radio] seed_bind source=%s user=%s channel=%s videoId=%s "
+            "intent=%r old_seed=%s station=%d",
+            source, user_id[:8], channel, seed_track.video_id,
+            seed_intent, prior_seed_vid, len(station),
         )
         return sess
 
@@ -164,6 +176,7 @@ class RadioSessionManager:
         channel: str,
         seed_intent: str,
         seed_track: SeedTrack,
+        source: str = "tool_play",
     ) -> RadioSession:
         """User directly played a track (not via radio auto-pick).
 
@@ -173,14 +186,24 @@ class RadioSessionManager:
         """
         sess = self.get_or_create(user_id, channel)
         was_enabled = sess.enabled
+        prior_seed_vid = sess.seed_track.video_id if sess.seed_track else None
         prior_intent = (sess.seed_intent or "").strip().lower()
         new_intent = (seed_intent or "").strip().lower()
         unrelated = was_enabled and prior_intent and new_intent and prior_intent != new_intent
+        logger.info(
+            "[radio] station_reseeded by=%s user=%s channel=%s "
+            "old_seed=%s new_seed=%s old_intent=%r new_intent=%r "
+            "was_enabled=%s unrelated=%s",
+            source, user_id[:8], channel,
+            prior_seed_vid, seed_track.video_id,
+            prior_intent, new_intent, was_enabled, unrelated,
+        )
         if unrelated:
             sess.enabled = False
             logger.info(
-                "[radio] new unrelated intent; disabling user=%s channel=%s old=%r new=%r",
-                user_id[:8], channel, prior_intent, new_intent,
+                "[radio] enabled_mutation source=%s user=%s channel=%s from=True to=False "
+                "reason=unrelated_intent",
+                source, user_id[:8], channel,
             )
         sess.seed_intent = seed_intent
         sess.seed_track = seed_track
@@ -198,10 +221,11 @@ class RadioSessionManager:
         sess.last_activity_ts = time.time()
         return sess
 
-    def record_auto_play(self, sess: RadioSession, track: StationTrack) -> None:
+    def record_auto_play(self, sess: RadioSession, track: StationTrack, source: str = "advance") -> None:
         """Mark `track` as now-playing. Appends to played_history and moves
         history_cursor to the new end. Called after playlist advances — NOT
         called on skip_prev (which re-plays a prior entry)."""
+        prev = sess.current_track_id
         sess.current_track_id = track.video_id
         sess.current_station_track = track
         sess.played_track_ids.add(track.video_id)
@@ -209,6 +233,12 @@ class RadioSessionManager:
         sess.history_cursor = len(sess.played_history) - 1
         sess.consecutive_failures = 0
         sess.last_activity_ts = time.time()
+        logger.info(
+            "[radio] current_track_mutation source=%s user=%s channel=%s "
+            "from=%s to=%s history_cursor=%d video_type=%s",
+            source, sess.user_id[:8], sess.channel,
+            prev, track.video_id, sess.history_cursor, track.video_type,
+        )
         # Cap memory usage.
         if len(sess.played_track_ids) > MAX_PLAYED_HISTORY:
             to_drop = len(sess.played_track_ids) - MAX_PLAYED_HISTORY
@@ -225,11 +255,17 @@ class RadioSessionManager:
         is a re-play of something already played."""
         if not sess.played_history or sess.history_cursor <= 0:
             return None
+        prev = sess.current_track_id
         sess.history_cursor -= 1
         track = sess.played_history[sess.history_cursor]
         sess.current_track_id = track.video_id
         sess.current_station_track = track
         sess.last_activity_ts = time.time()
+        logger.info(
+            "[radio] current_track_mutation source=skip_prev user=%s channel=%s "
+            "from=%s to=%s history_cursor=%d",
+            sess.user_id[:8], sess.channel, prev, track.video_id, sess.history_cursor,
+        )
         return track
 
     def step_forward_in_history(self, sess: RadioSession) -> Optional[StationTrack]:
@@ -238,24 +274,44 @@ class RadioSessionManager:
         we're already at the end of history (caller should advance the playlist
         instead)."""
         if sess.history_cursor < len(sess.played_history) - 1:
+            prev = sess.current_track_id
             sess.history_cursor += 1
             track = sess.played_history[sess.history_cursor]
             sess.current_track_id = track.video_id
             sess.current_station_track = track
             sess.last_activity_ts = time.time()
+            logger.info(
+                "[radio] current_track_mutation source=skip_next_step_forward "
+                "user=%s channel=%s from=%s to=%s history_cursor=%d",
+                sess.user_id[:8], sess.channel, prev, track.video_id, sess.history_cursor,
+            )
             return track
         return None
 
-    def set_display_mode(self, sess: RadioSession, mode: str, user_initiated: bool = False) -> None:
+    def set_display_mode(
+        self,
+        sess: RadioSession,
+        mode: str,
+        user_initiated: bool = False,
+        source: str = "user_mode_toggle",
+    ) -> None:
         """Set 'song' or 'video'. Other values coerce to 'song'.
 
         When user_initiated=True, also flips display_mode_user_override so auto-
         detect stops overwriting the user's pick on subsequent track loads.
         """
+        prev = sess.display_mode
         sess.display_mode = "video" if mode == "video" else "song"
         if user_initiated:
             sess.display_mode_user_override = True
         sess.last_activity_ts = time.time()
+        if prev != sess.display_mode or user_initiated:
+            logger.info(
+                "[radio] display_mode_mutation source=%s user=%s channel=%s "
+                "from=%s to=%s override=%s",
+                source, sess.user_id[:8], sess.channel,
+                prev, sess.display_mode, sess.display_mode_user_override,
+            )
 
     def maybe_auto_set_mode(self, sess: RadioSession, track: StationTrack) -> str:
         """Auto-detect display mode from track.video_type unless user has
@@ -271,11 +327,18 @@ class RadioSessionManager:
         if sess.display_mode_user_override:
             return sess.display_mode
         vt = (track.video_type or "").strip()
+        prev = sess.display_mode
         if vt == "MUSIC_VIDEO_TYPE_ATV":
             sess.display_mode = "song"
         elif vt == "MUSIC_VIDEO_TYPE_OMV":
             sess.display_mode = "video"
         # UGC / unknown / empty: leave whatever the session already had.
+        if sess.display_mode != prev:
+            logger.info(
+                "[radio] display_mode_mutation source=auto_detect "
+                "user=%s channel=%s from=%s to=%s video_type=%s",
+                sess.user_id[:8], sess.channel, prev, sess.display_mode, vt,
+            )
         return sess.display_mode
 
     def pop_next_from_playlist(self, sess: RadioSession) -> Optional[StationTrack]:
@@ -317,7 +380,8 @@ class RadioSessionManager:
         if sess.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
             sess.enabled = False
             logger.warning(
-                "[radio] fail-safe disabled user=%s channel=%s after %d failures",
+                "[radio] enabled_mutation source=fail_safe user=%s channel=%s "
+                "from=True to=False failures=%d",
                 sess.user_id[:8], sess.channel, sess.consecutive_failures,
             )
             return True
