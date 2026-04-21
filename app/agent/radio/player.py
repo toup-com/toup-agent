@@ -39,8 +39,13 @@ async def broadcast_radio_track(
     already exists, the swap reuses the current card).
     """
     try:
-        from app.api.ws_chat import broadcast_to_user, _check_age_and_swap
-        await broadcast_to_user(user_id, {
+        from app.api.ws_chat import broadcast_to_user, _check_age_and_swap, _user_ws_queues
+        # Snapshot fan-out width BEFORE the send so a concurrent disconnect
+        # between the count and the send can't confuse the log. Multi-client
+        # diagnosis: if num_ws>1 while session.channel=='app', every other
+        # connected client also receives this frame — see SKILL.md Rule 13.
+        num_ws = len(_user_ws_queues.get(user_id, []))
+        sent = await broadcast_to_user(user_id, {
             "type": "media_play",
             "provider": "youtube",
             "video_id": video_id,
@@ -55,9 +60,9 @@ async def broadcast_radio_track(
         })
         asyncio.create_task(_check_age_and_swap(video_id, user_id))
         logger.info(
-            "[radio/player] broadcast radio_auto user=%s channel=%s video=%s "
-            "title=%r artist=%r video_type=%r reason=%s",
-            user_id[:8], channel, video_id, title, artist, video_type, reason,
+            "[radio/player] broadcast radio_auto user=%s channel=%s num_ws_connections=%d sent=%d "
+            "video=%s title=%r artist=%r video_type=%r reason=%s",
+            user_id[:8], channel, num_ws, sent, video_id, title, artist, video_type, reason,
         )
         return True
     except Exception as e:
