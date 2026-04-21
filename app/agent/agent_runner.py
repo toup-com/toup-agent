@@ -814,6 +814,7 @@ class AgentRunner:
                 save_user_message=save_user_message,
                 client_tz=client_tz,
                 asst_message_id=asst_message_id,
+                channel=channel,
             )
             await db.commit()
         logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
@@ -1781,6 +1782,7 @@ class AgentRunner:
         save_user_message: bool = True,
         client_tz: Optional[str] = None,
         asst_message_id: Optional[str] = None,
+        channel: Optional[str] = None,
     ):
         from sqlalchemy import select
         from app.db.models import Message, Conversation

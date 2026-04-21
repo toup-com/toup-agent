@@ -297,3 +297,55 @@ def test_channel_parity_known_channels_all_render():
 def test_channel_parity_unknown_channel_gets_conservative_guidance():
     out = _runtime_context_fixture("smoke-signal")
     assert "format conservatively" in out
+
+
+# ──────────────────────────────────────────────────────────────
+# Regression: _save_messages accepts `channel` kwarg
+# ──────────────────────────────────────────────────────────────
+# Hotfixed post-#9 deploy when mobile first sent a real message and hit
+# NameError: name 'channel' is not defined at agent_runner.py:1814. The
+# resolve_channel call was inside _save_messages but the method signature
+# lacked `channel`. Caller threading + signature kwarg added in the hotfix.
+# This test locks the signature so it can't regress.
+
+def test_save_messages_accepts_channel_kwarg():
+    """Import inspection — _save_messages must declare `channel` in its
+    signature, otherwise the insert-site resolve_channel call hits NameError
+    at runtime (Rule 5 / helper-scope trap)."""
+    import inspect
+    # Read the source without importing the full module (avoids anthropic dep).
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "app" / "agent" / "agent_runner.py").read_text()
+    # Grab the _save_messages def block and confirm `channel:` is in it.
+    idx = src.index("async def _save_messages(")
+    # Signature ends at first `):` that closes the arg list at column 4+.
+    sig = src[idx:src.index("):", idx) + 2]
+    assert "channel:" in sig, (
+        "_save_messages signature missing `channel:` param — "
+        "resolve_channel(explicit=channel, ...) inside the method will NameError. "
+        "Hotfix: add channel: Optional[str] = None. See run() call site + agent_runner.py:1812."
+    )
+
+
+def test_run_threads_channel_to_save_messages():
+    """Similar inspection — run() must pass `channel=channel` into
+    _save_messages. Without the thread, the param defaults to None and
+    Message.channel won't populate on insert."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "app" / "agent" / "agent_runner.py").read_text()
+    # Find the call site + walk forward ~1000 chars to capture the full
+    # multi-line call block. `src.index(")")` picks up inner-arg parens;
+    # a window-based scan is simpler and the call is not that long.
+    call_idx = src.index("await self._save_messages(")
+    call_block = src[call_idx:call_idx + 1500]
+    # Truncate at the first closing paren that sits alone on its own line
+    # (standard Python formatting for multi-line call closes).
+    lines = call_block.splitlines()
+    end = next((i for i, ln in enumerate(lines) if ln.strip() == ")"), len(lines))
+    call_block = "\n".join(lines[: end + 1])
+    assert "channel=channel" in call_block, (
+        "run() must pass channel=channel to _save_messages so "
+        "Message.channel is stamped at insert time. Missing thread means "
+        "day-context history annotation falls back to Conversation.channel "
+        "for all new rows — drift across mid-day channel switches is lost."
+    )
