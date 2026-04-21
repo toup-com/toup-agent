@@ -227,6 +227,23 @@ async def init_db():
         "ALTER TABLE soul_configs ADD COLUMN IF NOT EXISTS vps_soul_synced_at TIMESTAMP",
         # Rich content metadata on messages (media cards, etc.)
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS metadata_json TEXT",
+        # Per-message channel tag (time-channel-fix PR). Denormalized at
+        # write time from the ingress handler, not from conversations.channel,
+        # so the day-as-chat history can render channel transitions within
+        # a single day. See channel_util.resolve_channel.
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS channel VARCHAR(50)",
+        "CREATE INDEX IF NOT EXISTS ix_messages_channel ON messages (channel)",
+        # Idempotent backfill: messages.channel = conversations.channel when
+        # messages.channel is NULL. Safe to re-run; WHERE clause prevents
+        # re-writing rows that already have a value. Rows where BOTH are
+        # NULL stay NULL (don't guess).
+        """
+        UPDATE messages m SET channel = c.channel
+        FROM conversations c
+        WHERE m.conversation_id = c.id
+          AND m.channel IS NULL
+          AND c.channel IS NOT NULL
+        """,
         # Reconciliation: app source tracking
         "ALTER TABLE apps ADD COLUMN IF NOT EXISTS source VARCHAR(30) DEFAULT 'app_builder'",
         "UPDATE apps SET source = 'vibecoding' WHERE source = 'app_builder' AND app_dir LIKE '%/vibecoding/%'",

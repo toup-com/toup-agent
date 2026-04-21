@@ -725,6 +725,10 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
     # Option A: Use agent_runner (preferred — full tool access + memory)
     if _agent_runner:
         try:
+            # Voice has no client-side tz in the WebRTC payload; agent_runner
+            # will fall back to User.timezone from DB (then UTC with warn log
+            # if that's NULL). Channel is explicit so the unknown-channel
+            # warning path isn't hit for legitimate voice traffic.
             response = await _agent_runner.run(
                 user_message=task,
                 user_id=user_id,

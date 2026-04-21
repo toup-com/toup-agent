@@ -1616,6 +1616,7 @@ class ToupTelegramBot:
                 user_id=user_id,
                 session_id=session_id,
                 telegram_chat_id=chat_id,
+                channel="telegram",  # explicit — no silent "or telegram" fallback
                 on_text_chunk=handler.on_text_chunk,
                 on_tool_start=handler.on_tool_start,
                 on_tool_end=handler.on_tool_end,
@@ -1955,6 +1956,7 @@ class ToupTelegramBot:
                 user_id=user_id,
                 session_id=session_id,
                 telegram_chat_id=chat_id,
+                channel="telegram",  # explicit — no silent "or telegram" fallback
                 on_text_chunk=handler.on_text_chunk,
                 on_tool_start=handler.on_tool_start,
                 on_tool_end=handler.on_tool_end,

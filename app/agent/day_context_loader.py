@@ -60,6 +60,7 @@ async def load_day_context(
     day_chat_id: str,
     model: str = "claude-opus-4-6",
     model_context_tokens: int = 200_000,
+    calling_channel: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Load the full day's message history for context assembly.
 
@@ -76,16 +77,31 @@ async def load_day_context(
     from app.db.models import Message, Conversation
     from app.db.models.day_chat import DayChat
 
+    # Entry-log so operators can see per-channel load behavior in prod
+    # without speculation. Part of the Rule 12 observability sweep.
+    logger.info(
+        "[day_ctx] load_day_context entry day_chat_id=%s calling_channel=%s model=%s",
+        day_chat_id[:8] if day_chat_id else None, calling_channel, model,
+    )
+
     # Load the DayChat row
     dc = (await db.execute(select(DayChat).where(DayChat.id == day_chat_id))).scalar_one_or_none()
     if not dc:
+        logger.warning(
+            "[day_ctx] load_day_context no_day_chat day_chat_id=%s calling_channel=%s — "
+            "empty history returned",
+            day_chat_id[:8] if day_chat_id else None, calling_channel,
+        )
         return {"summary": None, "messages": [], "raw_messages": [], "total_tokens": 0,
                 "summary_was_stale": False, "message_count": 0}
 
     summary = dc.rolling_summary
     summary_was_stale = dc.summary_status not in ("up_to_date", None)
 
-    # Load ALL messages for this day, across all sessions, chronologically
+    # Load ALL messages for this day, across all sessions, chronologically.
+    # Select Conversation.channel as a secondary hint — per-message Message.channel
+    # is preferred (denormalized at write time, survives channel switches
+    # mid-day) but the backfill covers old rows via Conversation.channel.
     result = await db.execute(
         select(Message, Conversation.channel)
         .join(Conversation, Message.conversation_id == Conversation.id)
@@ -98,14 +114,22 @@ async def load_day_context(
     raw_messages: List[Dict[str, Any]] = []
     annotated_messages: List[Dict[str, Any]] = []
 
-    for msg, channel in rows:
+    from app.agent.channel_util import resolve_channel
+    for msg, conv_channel in rows:
         if msg.role not in ("user", "assistant"):
             continue
         raw = {"role": msg.role, "content": msg.content}
         raw_messages.append(raw)
 
-        # Annotate with channel and time
-        annotated_content = annotate_message(msg.content, channel or "web", msg.created_at)
+        # Annotate with channel and time. resolve_channel prefers the
+        # per-message channel (Rule 12), falls back to the conversation's
+        # channel, logs a WARNING on fallback so silent drift is visible.
+        _msg_channel = resolve_channel(
+            payload_hint=getattr(msg, "channel", None),
+            conversation_hint=conv_channel,
+            site="history_annotation",
+        )
+        annotated_content = annotate_message(msg.content, _msg_channel, msg.created_at)
         annotated_messages.append({"role": msg.role, "content": annotated_content})
 
     # Estimate total tokens

@@ -23,7 +23,11 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone as _dt_timezone
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:  # pragma: no cover — VPS Python 3.12 has it
+    ZoneInfo = None  # type: ignore
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -359,11 +363,23 @@ class AgentRunner:
                     from app.db.message_helpers import resolve_day_chat_id_for_now
                     _day_chat_id = await resolve_day_chat_id_for_now(db, user_id, tz_override=client_tz)
                     _ctx_window = get_context_window(settings.agent_model)
-                    _day_context = await load_day_context(db, _day_chat_id, model=settings.agent_model, model_context_tokens=_ctx_window)
+                    _day_context = await load_day_context(db, _day_chat_id, model=settings.agent_model, model_context_tokens=_ctx_window, calling_channel=channel)
                     history = _day_context["messages"]
                     logger.info(f"[PERF] load_day_context: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages (day-chat)")
                 except Exception as _dce:
-                    logger.warning("[AGENT] Day context load failed, falling back to session history: %s", _dce)
+                    # ERROR, not WARNING — this silently degraded mobile day-chat
+                    # recall for who knows how long. If this fires in prod, the
+                    # agent just lost access to the full day's history and is
+                    # running on the local session's last-N messages instead.
+                    # Make it visible per Rule 12 / time-channel-fix PR.
+                    logger.error(
+                        "[AGENT] day_context_load_failed — falling back to session history. "
+                        "user=%s channel=%s session_id=%s client_tz=%r attempted_day_chat_id=%s err=%s: %s",
+                        user_id[:8], channel, session_id, client_tz,
+                        locals().get("_day_chat_id"),
+                        type(_dce).__name__, _dce,
+                        exc_info=True,
+                    )
                     _use_day_ctx = False
                     _day_context = None
                     history = await self._load_history(db, session_id)
@@ -379,7 +395,7 @@ class AgentRunner:
                 logger.info("[AGENT] Overriding intent to FULL — app_builder context detected in history")
 
             t_prompt = time.perf_counter()
-            system_prompt = await self._build_system_prompt(db, user_id, user_message, channel=channel, intent=query_intent)
+            system_prompt = await self._build_system_prompt(db, user_id, user_message, channel=channel, intent=query_intent, client_tz=client_tz)
 
             # Inject <today_so_far> block when using day-chat context with a summary
             if _use_day_ctx and _day_context and _day_context.get("summary"):
@@ -1066,7 +1082,20 @@ class AgentRunner:
                 logger.debug("[AGENT] App conversation lookup failed: %s", _app_err)
 
         # Create new session
-        _channel = "telegram" if telegram_chat_id else (channel or "agent")
+        # Channel resolution — never silently default to "agent". If channel
+        # is missing, resolve_channel logs a warning and returns "unknown".
+        # Telegram is special-cased because telegram_chat_id is a structural
+        # signal that we're in a Telegram session even if the caller forgot
+        # the channel kwarg.
+        from app.agent.channel_util import resolve_channel as _resolve_channel
+        if telegram_chat_id:
+            _channel = "telegram"
+        else:
+            _channel = _resolve_channel(
+                explicit=channel,
+                user_id=user_id,
+                site="session_create",
+            )
         _meta = None
         if telegram_chat_id:
             _meta = json.dumps({"telegram_chat_id": telegram_chat_id})
@@ -1094,6 +1123,7 @@ class AgentRunner:
         user_message: str,
         channel: Optional[str] = None,
         intent: Optional[QueryIntent] = None,
+        client_tz: Optional[str] = None,
     ) -> str:
         """Build a rich system prompt from identities + memories + runtime context.
 
@@ -1441,12 +1471,77 @@ class AgentRunner:
             )
 
         # ── 6. Runtime context ─────────────────────────────────────
-        now = datetime.utcnow()
-        _channel_label = channel or "telegram"
+        # Resolve the user's timezone — one source of truth across every
+        # channel. Priority: explicit client_tz (web/mobile WS payload) →
+        # User.timezone (persisted from prior sessions) → UTC fallback with
+        # loud warning. Never silently present server time as local.
+        now_utc = datetime.now(_dt_timezone.utc)
+        tz_name = (client_tz or "").strip() or None
+        tz_source = "client" if tz_name else None
+        if not tz_name:
+            try:
+                from app.db.models import User
+                _u_for_tz = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+                _profile_tz = getattr(_u_for_tz, "timezone", None) if _u_for_tz else None
+                if _profile_tz:
+                    tz_name = _profile_tz
+                    tz_source = "user_profile"
+            except Exception as _tz_err:
+                logger.debug("[agent] tz user-profile lookup failed: %s", _tz_err)
+        if not tz_name:
+            tz_name = "UTC"
+            tz_source = "utc_default"
+            logger.warning(
+                "[agent] tz_fallback source=utc_default user=%s channel=%s — presenting UTC as local",
+                user_id[:8], channel,
+            )
+        _tz_obj = None
+        if ZoneInfo is not None:
+            try:
+                _tz_obj = ZoneInfo(tz_name)
+            except Exception:
+                logger.warning(
+                    "[agent] tz_fallback source=invalid_tz user=%s channel=%s invalid=%r — using UTC",
+                    user_id[:8], channel, tz_name,
+                )
+                tz_name = "UTC"
+                tz_source = "invalid_tz_fallback"
+                _tz_obj = _dt_timezone.utc
+        else:
+            _tz_obj = _dt_timezone.utc
+        now_local = now_utc.astimezone(_tz_obj)
+        logger.info(
+            "[agent] tz_resolved user=%s channel=%s tz=%s source=%s local=%s utc=%s",
+            user_id[:8], channel, tz_name, tz_source,
+            now_local.strftime("%Y-%m-%d %H:%M"),
+            now_utc.strftime("%Y-%m-%d %H:%M"),
+        )
+
+        # Per-channel formatting guidance. Hardcoded table today; channel_config
+        # wire-up is a follow-up (TODO(time-channel-fix followup)). Keep values
+        # short — this goes into every system prompt, tokens matter.
+        from app.agent.channel_util import resolve_channel
+        _channel_safe = resolve_channel(
+            explicit=channel,
+            user_id=user_id,
+            site="prompt_label",
+        )
+        _channel_guidance = {
+            "web":      "Full markdown and formatting OK. Long code blocks, tables, headings all fine.",
+            "app":      "Full markdown and formatting OK. Long code blocks, tables, headings all fine.",
+            "mobile":   "Keep responses compact — short paragraphs, avoid large code blocks or tables. Users are on small screens.",
+            "voice":    "Conversational tone. No markdown. Sentences should read naturally when spoken aloud.",
+            "telegram": "Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
+            "discord":  "Full markdown and code blocks OK. Keep message length under ~2000 chars.",
+            "slack":    "Slack-flavored markdown (limited). Short messages preferred.",
+        }.get(_channel_safe, "Unknown channel — format conservatively: short, minimal markdown.")
+
         runtime_lines = [
             f"# Runtime Context",
-            f"- Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
-            f"- Channel: {_channel_label}",
+            f"- Current date/time: {now_local.strftime('%Y-%m-%d %H:%M')} {now_local.strftime('%Z')} "
+            f"(UTC offset {now_local.strftime('%z')}; UTC wall clock: {now_utc.strftime('%Y-%m-%d %H:%M')}Z)",
+            f"- User timezone: {tz_name} (source={tz_source})",
+            f"- Channel: {_channel_safe} — {_channel_guidance}",
             f"- Workspace directory: {settings.agent_workspace_dir}",
             f"- Max tool iterations: {self.max_iterations}",
             f"- You have FULL terminal/shell access via the `exec` tool. You can run any command, install packages, write scripts, manage files, use git, curl, python, node, etc.",
@@ -1469,7 +1564,7 @@ class AgentRunner:
         section_parts["runtime"] = "\n".join(runtime_lines)
 
         # ── 6b. Vibe Coding mode ─────────────────────────────────
-        if _channel_label == "vibecoding":
+        if _channel_safe == "vibecoding":
             section_parts["vibecoding"] = (
                 "# VIBE CODING MODE (CRITICAL — READ EVERY WORD)\n"
                 "The user is in a live IDE workspace watching you code. They see a code editor on the left and chat on the right.\n\n"
@@ -1514,10 +1609,10 @@ class AgentRunner:
             )
 
         # ── 7. Formatting rules (channel-aware) ───────────────────
-        if _channel_label in ("app", "web", "vibecoding"):
+        if _channel_safe in ("app", "web", "vibecoding"):
             section_parts["formatting"] = (
                 "# Formatting Rules\n"
-                "You are chatting with the user inside their " + ("app" if _channel_label == "app" else "web browser") + ". Follow these rules:\n"
+                "You are chatting with the user inside their " + ("app" if _channel_safe == "app" else "web browser") + ". Follow these rules:\n"
                 "- Use simple Markdown: **bold**, *italic*, `code`.\n"
                 "- Do NOT use LaTeX math formatting.\n"
                 "- Use plain Unicode symbols for math: × ÷ √ → ⇒ ≤ ≥ ≠ ≈ ∞ π.\n"
@@ -1709,12 +1804,26 @@ class AgentRunner:
         except Exception:
             _day_chat_id = getattr(session, 'day_chat_id', None) if session else None
 
+        # Resolve the channel once for both user and assistant inserts. The
+        # agent-runner layer is the single ingress for all 4 live channels
+        # (web, mobile, telegram, voice) — stamping Message.channel here
+        # means history_annotation in day_context_loader reads it directly
+        # instead of inferring from conversations.channel. See Rule 12.
+        from app.agent.channel_util import resolve_channel as _resolve_channel_for_msg
+        _msg_channel = _resolve_channel_for_msg(
+            explicit=channel,
+            conversation_hint=getattr(session, "channel", None) if session else None,
+            user_id=user_id,
+            site="message_insert",
+        )
+
         if save_user_message:
             user_msg = Message(
                 conversation_id=session_id,
                 day_chat_id=_day_chat_id,
                 role="user",
                 content=user_message,
+                channel=_msg_channel,
             )
             db.add(user_msg)
             msg_count += 1
@@ -1737,6 +1846,7 @@ class AgentRunner:
             day_chat_id=_day_chat_id,
             role="assistant",
             content=assistant_response,
+            channel=_msg_channel,
             tokens_prompt=tokens_input,
             tokens_completion=tokens_output,
             model_used=model,

@@ -67,6 +67,15 @@ class Message(Base):
     # Denormalized from parent session for fast day-level loading
     day_chat_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("day_chats.id"), nullable=True, index=True)
 
+    # Channel this specific message was sent from. Denormalized at write
+    # time from the ingress handler (not from Conversation.channel) so the
+    # agent can see per-message channel in history — a user who starts a
+    # day on mobile and switches to web has the two channels visible in
+    # chronological order, not blended under the conversation's channel.
+    # Null on pre-migration rows; resolver treats null as
+    # conversation.channel then "unknown". See channel_util.resolve_channel.
+    channel: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+
     role: Mapped[str] = mapped_column(String(20))  # "user", "assistant", "system", "job"
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
