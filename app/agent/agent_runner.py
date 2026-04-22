@@ -615,16 +615,28 @@ class AgentRunner:
                     else:
                         # Pick fallback: on auth/rate-limit errors, cross to the OTHER
                         # provider so broken or throttled keys fall back gracefully.
+                        # If the only configured provider is the one that just failed,
+                        # don't pretend we can cross over — re-raise the original error
+                        # so the user sees the real cause, not a spurious "key missing"
+                        # from the other provider.
                         from app.services.key_provider import keys as _keys
-                        if _should_cross_provider and _is_claude_model(active_model) and _keys.has_openai:
+                        primary_is_claude = _is_claude_model(active_model)
+                        fallback = None
+                        if _should_cross_provider and primary_is_claude and _keys.has_openai:
                             fallback = "gpt-5.4"
                             logger.warning(f"[AGENT] {type(e).__name__} on {active_model}, crossing to OpenAI fallback {fallback}")
-                        elif _should_cross_provider and not _is_claude_model(active_model) and _keys.has_anthropic:
-                            fallback = "claude-opus-4-6"
+                        elif _should_cross_provider and not primary_is_claude and _keys.has_anthropic:
+                            fallback = "claude-opus-4-7"
                             logger.warning(f"[AGENT] {type(e).__name__} on {active_model}, crossing to Anthropic fallback {fallback}")
                         else:
-                            fallback = settings.agent_fallback_model
-                            logger.warning(f"[AGENT] Primary model {active_model} failed, trying fallback {fallback}")
+                            configured = settings.agent_fallback_model
+                            fallback_is_claude = _is_claude_model(configured)
+                            if (fallback_is_claude and _keys.has_anthropic) or (not fallback_is_claude and _keys.has_openai):
+                                fallback = configured
+                                logger.warning(f"[AGENT] Primary model {active_model} failed, trying fallback {fallback}")
+                            else:
+                                logger.error(f"[AGENT] Primary model {active_model} failed and no other provider configured — re-raising")
+                                raise
 
                         if active_model != fallback:
                             fallback_llm = self.anthropic if _is_claude_model(fallback) else self.llm
