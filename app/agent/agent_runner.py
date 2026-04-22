@@ -1539,14 +1539,21 @@ class AgentRunner:
             user_id=user_id,
             site="prompt_label",
         )
+        # Each line has two parts: WHERE the user is (so the agent can
+        # answer "where are you chatting with me?" without hallucinating)
+        # + HOW to format. The where-part is mandatory — we saw the agent
+        # say "Telegram on your mobile" when channel=mobile because
+        # "mobile" alone was too terse to distinguish transport from
+        # surface. Names each channel's app explicitly.
         _channel_guidance = {
-            "web":      "Full markdown and formatting OK. Long code blocks, tables, headings all fine.",
-            "app":      "Full markdown and formatting OK. Long code blocks, tables, headings all fine.",
-            "mobile":   "Keep responses compact — short paragraphs, avoid large code blocks or tables. Users are on small screens.",
-            "voice":    "Conversational tone. No markdown. Sentences should read naturally when spoken aloud.",
-            "telegram": "Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
-            "discord":  "Full markdown and code blocks OK. Keep message length under ~2000 chars.",
-            "slack":    "Slack-flavored markdown (limited). Short messages preferred.",
+            "web":       "User is in the Toup web app in a browser (toup.ai). Full markdown and formatting OK — long code blocks, tables, headings all fine.",
+            "app":       "User is inside a Toup in-app workspace (one of their custom apps). Full markdown and formatting OK.",
+            "mobile":    "User is in the Toup mobile app (React Native on iOS or Android). This is the native Toup app — NOT Telegram, NOT a web browser. Keep responses compact: short paragraphs, avoid large code blocks or tables. Small screen.",
+            "voice":     "User is on the Toup voice/realtime surface (spoken audio, not text). Conversational tone. No markdown. Sentences should read naturally when spoken aloud.",
+            "telegram":  "User is on Telegram messenger (talking to the Toup bot there). Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
+            "discord":   "User is on Discord (Toup bot). Full markdown and code blocks OK. Keep message length under ~2000 chars.",
+            "slack":     "User is on Slack (Toup integration). Slack-flavored markdown (limited). Short messages preferred.",
+            "vibecoding":"User is inside the Vibecoding IDE workspace watching you code live. See the Vibecoding rules later in the prompt.",
         }.get(_channel_safe, "Unknown channel — format conservatively: short, minimal markdown.")
 
         runtime_lines = [
