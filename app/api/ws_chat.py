@@ -46,8 +46,18 @@ def _friendly_error(exc: Exception) -> str:
     msg = str(exc)
     msg_lower = msg.lower()
 
-    # ── Quota / billing exhausted (must check before generic 429) ──
-    if any(kw in msg_lower for kw in ("insufficient_quota", "quota", "billing", "credit", "balance", "exceeded your current")):
+    # ── Anthropic Claude subscription quota exhausted (CLI OAuth tokens) ──
+    # Example: "You're out of extra usage. Add more at claude.ai/settings/usage..."
+    if "out of extra" in msg_lower or "claude.ai/settings/usage" in msg_lower:
+        return (
+            "Your Claude subscription usage is exhausted for this window. To continue:\n"
+            "• Wait for the 5-hour rolling window to reset, or\n"
+            "• Add more usage at claude.ai/settings/usage, or\n"
+            "• Set a different API key in Settings"
+        )
+
+    # ── OpenAI quota / billing exhausted (must check before generic 429) ──
+    if any(kw in msg_lower for kw in ("insufficient_quota", "billing", "credit", "balance", "exceeded your current")) or ("quota" in msg_lower and "openai" in msg_lower):
         return (
             "Your API credit limit has been reached. To continue:\n"
             "• Add more credits at platform.openai.com/account/billing\n"
@@ -73,8 +83,14 @@ def _friendly_error(exc: Exception) -> str:
     if status == 403 or "permission" in msg_lower or "forbidden" in msg_lower:
         return "Your API key doesn't have access to this model. Please check your plan or switch models in Settings."
 
-    # ── Bad request ──
+    # ── Bad request — surface Anthropic's own message when it looks human-readable ──
     if status == 400 or "bad_request" in name.lower():
+        import re as _re
+        m = _re.search(r"'message':\s*\"([^\"]+)\"", msg) or _re.search(r"'message':\s*'([^']+)'", msg)
+        if m:
+            provider_msg = m.group(1).strip()
+            if provider_msg and len(provider_msg) < 400:
+                return provider_msg
         return "There was an issue with the request. Please try rephrasing your message."
 
     # ── Server errors ──

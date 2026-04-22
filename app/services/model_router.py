@@ -46,23 +46,23 @@ def classify_request(
     Select the model based on available API keys. No complexity classification.
 
     Priority:
-      1. Anthropic key available → Claude Opus 4.6
+      1. Anthropic key available → Claude Opus 4.7
       2. OpenAI key available    → GPT-5.4
-      3. No keys                 → Claude Opus 4.6 (will fail, but sane default)
+      3. No keys                 → Claude Opus 4.7 (will fail, but sane default)
     """
     from app.services.key_provider import keys
 
     if keys.has_anthropic:
-        model = "claude-opus-4-6"
-        label = "Claude Opus 4.6"
+        model = "claude-opus-4-7"
+        label = "Claude Opus 4.7"
         reason = "anthropic key available → opus"
     elif keys.has_openai:
         model = "gpt-5.4"
         label = "GPT-5.4"
         reason = "openai key only → gpt-5.4"
     else:
-        model = "claude-opus-4-6"
-        label = "Claude Opus 4.6"
+        model = "claude-opus-4-7"
+        label = "Claude Opus 4.7"
         reason = "no keys → default opus"
 
     logger.info(f"[ROUTER] {reason}")
