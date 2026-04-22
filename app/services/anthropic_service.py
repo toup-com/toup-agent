@@ -20,6 +20,13 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _model_rejects_sampling(model: str) -> bool:
+    """Opus 4.7+ returns 400 on temperature/top_p/top_k and on extended-thinking
+    budgets. Detect models that require the new calling convention."""
+    m = (model or "").lower()
+    return "opus-4-7" in m
+
+
 def _convert_messages_for_anthropic(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert OpenAI-format messages to Anthropic format.
 
@@ -193,11 +200,14 @@ class AnthropicService:
         kwargs: Dict[str, Any] = dict(
             model=model,
             max_tokens=max_tokens,
-            temperature=temperature,
             messages=messages,
         )
+        rejects_sampling = _model_rejects_sampling(model)
+        if not rejects_sampling:
+            kwargs["temperature"] = temperature
         # Extended thinking: if budget > 0, enable thinking with budget control
-        if thinking_budget > 0:
+        # (Opus 4.7+ removed budget-based thinking — use adaptive thinking instead)
+        if thinking_budget > 0 and not rejects_sampling:
             kwargs["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": thinking_budget,
@@ -281,11 +291,14 @@ class AnthropicService:
         kwargs: Dict[str, Any] = dict(
             model=model,
             max_tokens=max_tokens,
-            temperature=temperature,
             messages=messages,
         )
+        rejects_sampling = _model_rejects_sampling(model)
+        if not rejects_sampling:
+            kwargs["temperature"] = temperature
         # Extended thinking: if budget > 0, enable thinking with budget control
-        if thinking_budget > 0:
+        # (Opus 4.7+ removed budget-based thinking — use adaptive thinking instead)
+        if thinking_budget > 0 and not rejects_sampling:
             kwargs["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": thinking_budget,

@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     
     # Anthropic Claude (kept for future use)
     anthropic_api_key: Optional[str] = None  # Set via ANTHROPIC_API_KEY env var
-    anthropic_model: str = "claude-opus-4-6"  # Default Claude model
+    anthropic_model: str = "claude-opus-4-7"  # Default Claude model
     anthropic_max_tokens: int = 16000
     
     # LLM Provider Keys (set by platform setup wizard)
@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     deepseek_api_key: Optional[str] = None
 
     # Agent Runtime
-    agent_model: str = "claude-opus-4-6"  # Primary agent model
+    agent_model: str = "claude-opus-4-7"  # Primary agent model
     agent_fallback_model: str = "gpt-5.4"  # Fallback if primary model fails (cross-provider)
     agent_max_tokens: int = 16000  # Max output tokens for agent
     agent_max_tool_iterations: int = 40  # Max tool call loops before forcing stop

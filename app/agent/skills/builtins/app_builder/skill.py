@@ -2,7 +2,7 @@
 App Builder Skill — Conversational app builder for React Native/Expo.
 
 The agent converses with the user (using Opus 4.6) to understand requirements,
-presents a plan for approval, then builds in the background (using Sonnet 4.6).
+presents a plan for approval, then builds in the background (using Opus 4.7).
 After build, the user can preview and iterate.
 
 Tools:
@@ -1663,7 +1663,7 @@ class AppBuilderSkill(Skill):
         from .build_logger import BuildLogger
 
         blog = BuildLogger(job_id, user_id, ws_broadcast=self._ws_broadcast)
-        blog.set_model(settings.agent_model or "claude-opus-4-6")
+        blog.set_model(settings.agent_model or "claude-opus-4-7")
         blog.set_step("init")
         await blog.info(f"Starting build for '{name}'", f"app={app_id}")
         await blog.info(f"app_dir={app_dir} slug={slug}")
@@ -2389,7 +2389,7 @@ class AppBuilderSkill(Skill):
             )
 
             await blog.persist()
-            _actual_model = getattr(self, '_last_llm_provider', None) or "claude-opus-4-6"
+            _actual_model = getattr(self, '_last_llm_provider', None) or "claude-opus-4-7"
             async with async_session_maker() as db:
                 job = await db.get(BuildJob, job_id)
                 if job:
@@ -2672,7 +2672,7 @@ class AppBuilderSkill(Skill):
             await self._update_step(job_id, user_id, "ready", "done")
 
             await blog.persist()
-            _actual_model = getattr(self, '_last_llm_provider', None) or "claude-opus-4-6"
+            _actual_model = getattr(self, '_last_llm_provider', None) or "claude-opus-4-7"
             async with async_session_maker() as db:
                 job = await db.get(BuildJob, job_id)
                 if job:
@@ -3771,11 +3771,11 @@ const _webDb = {
             try:
                 result = await self._call_anthropic(
                     system_prompt, user_message,
-                    model=model or "claude-sonnet-4-6",
+                    model=model or "claude-opus-4-7",
                     anthropic_key=anthropic_key,
                     max_tokens=max_tokens, blog=blog, purpose=purpose,
                 )
-                self._last_llm_provider = f"anthropic/{model or 'claude-sonnet-4-6'}"
+                self._last_llm_provider = f"anthropic/{model or 'claude-opus-4-7'}"
                 return result
             except TokenLimitError:
                 # Rate-limit / overload — only pause if no OpenAI fallback
