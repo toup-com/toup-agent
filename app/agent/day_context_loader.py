@@ -36,21 +36,49 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def _format_time(dt: datetime) -> str:
-    """Format datetime as h:MMam/pm for message annotations."""
+def _format_time(dt: datetime, tz_name: Optional[str] = None) -> str:
+    """Format datetime as h:MMam/pm for message annotations, in the user's
+    local timezone when provided.
+
+    Every stored `created_at` is tz-naive UTC from the DB. Historically
+    this function also formatted in UTC regardless of user tz, so a
+    Toronto user saw labels like `[mobile 6:41pm]` when their local clock
+    said 2:41pm. That conflicted with the Runtime Context (which was
+    correctly local) and GPT-class models echoed the UTC number as "your
+    time." Local annotation is the fix — the agent should NEVER see a
+    UTC timestamp in its prompt.
+
+    Falls back to UTC only if tz_name is None or invalid (last resort).
+    """
     if dt is None:
         return ""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            dt = dt.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            # Invalid tz → stay on UTC rather than crashing history load.
+            # Caller's tz resolution chain should log the failure upstream.
+            pass
     return dt.strftime("%-I:%M%p").lower()
 
 
-def annotate_message(content: str, channel: str, created_at: datetime) -> str:
+def annotate_message(
+    content: str,
+    channel: str,
+    created_at: datetime,
+    tz_name: Optional[str] = None,
+) -> str:
     """Prefix message content with channel and time annotation.
 
     Example: [web 9:14am] Original message content here...
+
+    `tz_name` formats the time in the user's local zone. When None, times
+    render in UTC — keep this as a last-resort fallback, not the default.
     """
-    time_str = _format_time(created_at)
+    time_str = _format_time(created_at, tz_name=tz_name)
     tag = f"[{channel} {time_str}]" if time_str else f"[{channel}]"
     return f"{tag} {content}"
 
@@ -61,6 +89,7 @@ async def load_day_context(
     model: str = "claude-opus-4-6",
     model_context_tokens: int = 200_000,
     calling_channel: Optional[str] = None,
+    tz_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Load the full day's message history for context assembly.
 
@@ -129,7 +158,7 @@ async def load_day_context(
             conversation_hint=conv_channel,
             site="history_annotation",
         )
-        annotated_content = annotate_message(msg.content, _msg_channel, msg.created_at)
+        annotated_content = annotate_message(msg.content, _msg_channel, msg.created_at, tz_name=tz_name)
         annotated_messages.append({"role": msg.role, "content": annotated_content})
 
     # Estimate total tokens

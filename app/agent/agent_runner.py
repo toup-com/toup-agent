@@ -363,7 +363,10 @@ class AgentRunner:
                     from app.db.message_helpers import resolve_day_chat_id_for_now
                     _day_chat_id = await resolve_day_chat_id_for_now(db, user_id, tz_override=client_tz)
                     _ctx_window = get_context_window(settings.agent_model)
-                    _day_context = await load_day_context(db, _day_chat_id, model=settings.agent_model, model_context_tokens=_ctx_window, calling_channel=channel)
+                    # Pass client_tz so history annotations render in the
+                    # user's LOCAL time (e.g. "[mobile 2:41pm]"), never UTC.
+                    # Same tz the Runtime Context uses — single source.
+                    _day_context = await load_day_context(db, _day_chat_id, model=settings.agent_model, model_context_tokens=_ctx_window, calling_channel=channel, tz_name=client_tz)
                     history = _day_context["messages"]
                     logger.info(f"[PERF] load_day_context: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages (day-chat)")
                 except Exception as _dce:
@@ -1556,11 +1559,17 @@ class AgentRunner:
             "vibecoding":"User is inside the Vibecoding IDE workspace watching you code live. See the Vibecoding rules later in the prompt.",
         }.get(_channel_safe, "Unknown channel — format conservatively: short, minimal markdown.")
 
+        # Time is rendered in the USER'S LOCAL TIMEZONE, never UTC. The
+        # agent faces the user; the user cares about their clock, not the
+        # server's. Earlier versions included a "(UTC wall clock: ...Z)"
+        # anchor for cross-tz reasoning and GPT-class models grabbed the
+        # UTC number and echoed it as "your time." So: local only.
+        # Day name included ("Wednesday") so phrases like "today" resolve
+        # cleanly without the agent having to parse a date string.
         runtime_lines = [
             f"# Runtime Context",
-            f"- Current date/time: {now_local.strftime('%Y-%m-%d %H:%M')} {now_local.strftime('%Z')} "
-            f"(UTC offset {now_local.strftime('%z')}; UTC wall clock: {now_utc.strftime('%Y-%m-%d %H:%M')}Z)",
-            f"- User timezone: {tz_name} (source={tz_source})",
+            f"- Current date/time: {now_local.strftime('%A, %B %d, %Y at %-I:%M %p')} "
+            f"({tz_name})",
             f"- Channel: {_channel_safe} — {_channel_guidance}",
             f"- Workspace directory: {settings.agent_workspace_dir}",
             f"- Max tool iterations: {self.max_iterations}",
