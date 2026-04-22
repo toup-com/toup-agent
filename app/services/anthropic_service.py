@@ -27,6 +27,17 @@ def _model_rejects_sampling(model: str) -> bool:
     return "opus-4-7" in m
 
 
+def _mark_tools_cacheable(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    """Add ephemeral cache_control to the last tool so the whole tools block
+    gets cached by Anthropic. Saves ~2–3k prompt tokens per turn on a 70+ tool
+    loadout — big deal for agents that iterate many turns per user message."""
+    if not tools:
+        return tools
+    marked = [dict(t) for t in tools]
+    marked[-1] = {**marked[-1], "cache_control": {"type": "ephemeral"}}
+    return marked
+
+
 def _convert_messages_for_anthropic(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert OpenAI-format messages to Anthropic format.
 
@@ -219,7 +230,7 @@ class AnthropicService:
         if prepared_system:
             kwargs["system"] = prepared_system
         if tools:
-            kwargs["tools"] = tools
+            kwargs["tools"] = _mark_tools_cacheable(tools)
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -310,7 +321,7 @@ class AnthropicService:
         if prepared_system:
             kwargs["system"] = prepared_system
         if tools:
-            kwargs["tools"] = tools
+            kwargs["tools"] = _mark_tools_cacheable(tools)
             if tool_choice == "required":
                 kwargs["tool_choice"] = {"type": "any"}
 
