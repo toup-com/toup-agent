@@ -107,24 +107,66 @@ async def overview(
         _fetch_bridge(), _fetch_managed(), total_users_task
     )
 
-    # Host stats — use bridge data if we got it, else degraded stubs
+    def _fmt_bytes(n: int) -> str:
+        """Human-readable bytes like `df -h` — 5.8G / 24M / ... so the UI
+        backwards-compat format keeps rendering without a frontend redeploy."""
+        if n <= 0:
+            return "0B"
+        for unit, div in (("T", 1024**4), ("G", 1024**3), ("M", 1024**2), ("K", 1024)):
+            if n >= div:
+                return f"{n / div:.1f}{unit}".rstrip("0").rstrip(".") + ("" if unit == "B" else "")
+        return f"{n}B"
+
+    # Host stats — use bridge data if we got it, else degraded stubs.
+    # Bridge returns numeric fields (*_bytes, percent as float, cpu_pct as float);
+    # the existing frontend reads `disk.total/used` as strings (like `df -h`) and
+    # `container_stats[name].cpu` as a percentage string. Keep both shapes here
+    # so both old frontend builds and any future bytes-aware callers work.
     if bridge_data:
+        d = bridge_data["host"]["disk"]
         host = {
             "ip": (settings.bridge_url or "").replace("https://", "").replace("http://", "").split("/")[0],
             "hostname": bridge_data["host"]["hostname"],
             "uptime_sec": bridge_data["host"]["uptime_sec"],
-            "disk": bridge_data["host"]["disk"],
+            "disk": {
+                # string forms (frontend-facing)
+                "total": _fmt_bytes(d.get("total_bytes", 0)),
+                "used": _fmt_bytes(d.get("used_bytes", 0)),
+                "free": _fmt_bytes(d.get("free_bytes", 0)),
+                "percent": f"{d.get('percent', 0):.0f}%",
+                # numeric forms (future callers)
+                "total_bytes": d.get("total_bytes", 0),
+                "used_bytes": d.get("used_bytes", 0),
+                "free_bytes": d.get("free_bytes", 0),
+                "percent_num": d.get("percent", 0),
+            },
             "memory": bridge_data["host"]["memory"],
             "cpu": bridge_data["host"]["cpu"],
         }
         containers_running = bridge_data.get("containers_running", [])
-        container_stats = bridge_data.get("container_stats", {})
+        # Translate container_stats: bridge uses cpu_pct/mem_mb/mem_pct,
+        # frontend reads cpu/mem_usage/mem_percent as strings.
+        container_stats = {}
+        for name, s in (bridge_data.get("container_stats") or {}).items():
+            if "error" in s:
+                container_stats[name] = {"cpu": "?", "mem_usage": "?", "mem_percent": "?", "error": s["error"]}
+            else:
+                container_stats[name] = {
+                    "cpu": f"{s.get('cpu_pct', 0):.1f}%",
+                    "mem_usage": f"{s.get('mem_mb', 0):.0f}MB",
+                    "mem_percent": f"{s.get('mem_pct', 0):.1f}%",
+                    # numeric forms for future use
+                    "cpu_pct": s.get("cpu_pct", 0),
+                    "mem_mb": s.get("mem_mb", 0),
+                    "mem_pct": s.get("mem_pct", 0),
+                }
     else:
         host = {
             "ip": "bridge unreachable",
             "hostname": "?",
             "uptime_sec": 0,
-            "disk": {"total_bytes": 0, "used_bytes": 0, "free_bytes": 0, "percent": 0},
+            "disk": {"total": "?", "used": "?", "free": "?", "percent": "?",
+                     "total_bytes": 0, "used_bytes": 0, "free_bytes": 0, "percent_num": 0},
             "memory": {"total_mb": 0, "available_mb": 0, "used_mb": 0, "percent": 0},
             "cpu": {"cores": 0, "load_1m": 0, "load_5m": 0, "load_15m": 0},
         }
