@@ -81,11 +81,20 @@ def _bridge_client(timeout_s: Optional[int] = None) -> httpx.AsyncClient:
             "bridge mTLS certs missing from settings — set bridge_ca_cert, bridge_client_cert, bridge_client_key"
         )
 
-    ca_path = _write_cert_tmpfile("ca", settings.bridge_ca_cert)
     cert_path = _write_cert_tmpfile("client_cert", settings.bridge_client_cert)
     key_path = _write_cert_tmpfile("client_key", settings.bridge_client_key)
 
-    ctx = ssl.create_default_context(cafile=ca_path)
+    # TLS architecture has TWO cert surfaces:
+    #   1. server cert — Caddy presents a Let's Encrypt wildcard for
+    #      *.agents.toup.ai. We verify it via the SYSTEM CA bundle.
+    #   2. client cert auth — Caddy requires a client cert signed by our
+    #      bridge CA (bridge_ca_cert). We PRESENT bridge_client_cert/key;
+    #      the server side verifies against bridge_ca_cert on the VPS.
+    # So we do NOT need bridge_ca_cert in the platform client's SSL context
+    # at all — using it as cafile would reject the Let's Encrypt server cert
+    # with "unable to get local issuer certificate". The CA only lives on
+    # the server side, burned into /etc/caddy/bridge-ca.crt.
+    ctx = ssl.create_default_context()
     ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
 
     return httpx.AsyncClient(
