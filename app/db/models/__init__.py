@@ -55,7 +55,7 @@ from .rollout import (
 )
 
 # Streaming credentials
-from .streaming import StreamingCredential
+from .streaming import StreamingCredential, CredentialAccessLog
 
 __all__ = [
     # Base
@@ -76,6 +76,6 @@ __all__ = [
     "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord", "LLMProxyEvent",
     "Rollout", "RolloutAttempt",
     "ROLLOUT_STATUSES", "ROLLOUT_ATTEMPT_STATUSES", "ROLLOUT_TRIGGERS",
-    "StreamingCredential",
+    "StreamingCredential", "CredentialAccessLog",
     "DayChat", "ContextBudgetLog", "MigrationStatus",
 ]

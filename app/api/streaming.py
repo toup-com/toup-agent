@@ -1,5 +1,6 @@
 """Streaming credentials API — store/retrieve/delete per-user channel credentials."""
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -11,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.api.auth import get_current_user
+
+_audit_log = logging.getLogger("streaming.audit")
 
 router = APIRouter(prefix="/streaming", tags=["Streaming"])
 
@@ -121,7 +124,7 @@ async def get_credential_internal(
     if not x_agent_key:
         raise HTTPException(status_code=401, detail="X-Agent-Key required")
 
-    from app.db.models import AgentConfig, StreamingCredential
+    from app.db.models import AgentConfig, CredentialAccessLog, StreamingCredential
 
     # Verify agent key belongs to this user
     cfg = await db.execute(
@@ -131,6 +134,24 @@ async def get_credential_internal(
     )
     if not cfg.scalar_one_or_none():
         raise HTTPException(status_code=403, detail="Invalid agent key")
+
+    # Fail-closed audit: commit the access-log row BEFORE reading plaintext.
+    # If this commit raises (table missing, DB down, disk full, etc.) the
+    # endpoint returns 503 and the credential is never fetched.
+    try:
+        audit = CredentialAccessLog(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            channel=channel,
+            agent_key_fingerprint=x_agent_key[:8],
+            source="http",
+        )
+        db.add(audit)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        _audit_log.exception("credential_access_log write failed; refusing to return plaintext")
+        raise HTTPException(status_code=503, detail="audit log unavailable")
 
     result = await db.execute(
         select(StreamingCredential).where(

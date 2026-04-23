@@ -107,6 +107,7 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "agent_configs",
     # Streaming credentials (platform stores, agent fetches via API)
     "streaming_credentials",
+    "credential_access_log",
 }
 
 SHARED_TABLES: set[str] = {
