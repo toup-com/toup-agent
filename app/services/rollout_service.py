@@ -161,12 +161,18 @@ async def _poll_health(agent_url: str, attempts: int, interval_s: float) -> int:
 
 
 async def _upgrade_one(
-    db: AsyncSession,
+    _shared_db: AsyncSession,  # kept for signature compat; NOT used for writes
     rollout: Rollout,
     container: ManagedContainer,
     new_tag: str,
 ) -> RolloutAttempt:
     """Upgrade a single tenant to new_tag; record the attempt.
+
+    IMPORTANT: opens its OWN AsyncSession. When called via asyncio.gather for
+    parallel batch upgrades, multiple invocations share nothing — no SQLAlchemy
+    session race. The passed `_shared_db` is the orchestrator's session and is
+    intentionally ignored for writes; we only use the in-memory `rollout` and
+    `container` objects from it (detached read-only snapshots).
 
     Returns the RolloutAttempt row with status in
     {'ok', 'failed', 'rolled_back', 'rollback_failed'}.
@@ -174,64 +180,66 @@ async def _upgrade_one(
     Never raises — failures are captured in the attempt's error field.
     """
     prior_tag = container.image_tag or "unknown"
-    attempt = RolloutAttempt(
-        rollout_id=rollout.id,
-        container_id=container.id,
-        prior_tag=prior_tag,
-        new_tag=new_tag,
-        status="upgrading",
-    )
-    db.add(attempt)
-    await db.commit()
-    await db.refresh(attempt)
 
-    t0 = time.time()
-    try:
-        result = await upgrade_tenant_image(
-            db, container.user_id, new_tag, rollout_id=rollout.id,
+    async with async_session_maker() as db:
+        attempt = RolloutAttempt(
+            rollout_id=rollout.id,
+            container_id=container.id,
+            prior_tag=prior_tag,
+            new_tag=new_tag,
+            status="upgrading",
         )
-        attempt.status = "ok"
-        attempt.health_checks_passed = result.get("health_checks_passed", 0)
-        attempt.duration_ms = result.get("duration_ms") or int((time.time() - t0) * 1000)
-        attempt.completed_at = datetime.utcnow()
+        db.add(attempt)
         await db.commit()
+        await db.refresh(attempt)
+
+        t0 = time.time()
+        try:
+            result = await upgrade_tenant_image(
+                db, container.user_id, new_tag, rollout_id=rollout.id,
+            )
+            attempt.status = "ok"
+            attempt.health_checks_passed = result.get("health_checks_passed", 0)
+            attempt.duration_ms = result.get("duration_ms") or int((time.time() - t0) * 1000)
+            attempt.completed_at = datetime.utcnow()
+            await db.commit()
+            return attempt
+        except BridgeUpgradeUnhealthy as e:
+            attempt.status = "failed"
+            attempt.error = f"unhealthy after upgrade: {e.detail}"[:1000]
+            attempt.health_checks_passed = e.detail.get("health_checks_passed", 0)
+            attempt.duration_ms = int((time.time() - t0) * 1000)
+            await db.commit()
+        except Exception as e:
+            attempt.status = "failed"
+            attempt.error = f"{type(e).__name__}: {str(e)[:1000]}"
+            attempt.duration_ms = int((time.time() - t0) * 1000)
+            await db.commit()
+
+        # Failed — attempt rollback
+        try:
+            await upgrade_tenant_image(
+                db, container.user_id, prior_tag, rollout_id=rollout.id,
+            )
+            attempt.status = "rolled_back"
+            attempt.completed_at = datetime.utcnow()
+            await db.commit()
+            await _send_telegram(
+                "warning",
+                f"Tenant <code>{container.user_id[:8]}</code> failed upgrade to "
+                f"<code>{new_tag}</code> — rolled back to <code>{prior_tag}</code>",
+            )
+        except Exception as e:
+            attempt.status = "rollback_failed"
+            attempt.error = (attempt.error or "") + f" | ROLLBACK FAILED: {str(e)[:500]}"
+            attempt.completed_at = datetime.utcnow()
+            await db.commit()
+            await _send_telegram(
+                "critical",
+                f"Tenant <code>{container.user_id[:8]}</code> upgrade AND rollback "
+                f"failed — manual intervention needed. Error: {str(e)[:200]}",
+            )
         return attempt
-    except BridgeUpgradeUnhealthy as e:
-        attempt.status = "failed"
-        attempt.error = f"unhealthy after upgrade: {e.detail}"[:1000]
-        attempt.health_checks_passed = e.detail.get("health_checks_passed", 0)
-        attempt.duration_ms = int((time.time() - t0) * 1000)
-        await db.commit()
-    except Exception as e:
-        attempt.status = "failed"
-        attempt.error = f"{type(e).__name__}: {str(e)[:1000]}"
-        attempt.duration_ms = int((time.time() - t0) * 1000)
-        await db.commit()
-
-    # Failed — attempt rollback
-    try:
-        await upgrade_tenant_image(
-            db, container.user_id, prior_tag, rollout_id=rollout.id,
-        )
-        attempt.status = "rolled_back"
-        attempt.completed_at = datetime.utcnow()
-        await db.commit()
-        await _send_telegram(
-            "warning",
-            f"Tenant <code>{container.user_id[:8]}</code> failed upgrade to "
-            f"<code>{new_tag}</code> — rolled back to <code>{prior_tag}</code>",
-        )
-    except Exception as e:
-        attempt.status = "rollback_failed"
-        attempt.error = (attempt.error or "") + f" | ROLLBACK FAILED: {str(e)[:500]}"
-        attempt.completed_at = datetime.utcnow()
-        await db.commit()
-        await _send_telegram(
-            "critical",
-            f"Tenant <code>{container.user_id[:8]}</code> upgrade AND rollback "
-            f"failed — manual intervention needed. Error: {str(e)[:200]}",
-        )
-    return attempt
 
 
 # ─── Main orchestration loop ──────────────────────────────────────
