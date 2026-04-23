@@ -2242,6 +2242,7 @@ async def _netflix_silent_login(page, user_id: str, content_url: str):
                 await el.type(password, delay=30)
                 logger.info("[NETFLIX-SILENT] Password filled via %s", selector)
                 break
+        password = ""  # Vault CP3: drop the local reference; chars already in browser.
 
         await asyncio.sleep(0.5)
 
@@ -2284,30 +2285,10 @@ async def _netflix_silent_login(page, user_id: str, content_url: str):
 
 
 async def _get_netflix_credentials(user_id: str) -> tuple:
-    """Fetch Netflix email/password for a user. Returns (email, password) or ('', '')."""
-    # Method 1: Direct DB access (platform side)
-    try:
-        from app.db.database import async_session_maker
-        from app.db.models import StreamingCredential
-        from sqlalchemy import select, and_
-
-        async with async_session_maker() as db:
-            result = await db.execute(
-                select(StreamingCredential).where(
-                    and_(
-                        StreamingCredential.user_id == user_id,
-                        StreamingCredential.channel == "netflix",
-                    )
-                )
-            )
-            cred = result.scalar_one_or_none()
-            if cred and cred.email and cred.password:
-                logger.info("[NETFLIX] Got credentials from DB for %s", cred.email)
-                return (cred.email, cred.password)
-    except Exception as e:
-        logger.info("[NETFLIX] DB lookup failed: %s", e)
-
-    # Method 2: HTTP fallback (agent side)
+    # Single audited HTTP path (Vault CP3). The platform endpoint writes a
+    # credential_access_log row (CP1) and decrypts the Fernet token (CP2)
+    # before returning plaintext. Direct DB reads were removed to keep
+    # exactly one egress point.
     try:
         import httpx
         from app.config import settings
@@ -2322,8 +2303,9 @@ async def _get_netflix_credentials(user_id: str) -> tuple:
             if r.status_code == 200:
                 creds = r.json()
                 return (creds.get("email", ""), creds.get("password", ""))
+            logger.info("[NETFLIX] credential fetch returned status=%d", r.status_code)
     except Exception as e:
-        logger.info("[NETFLIX] HTTP credential fetch failed: %s", e)
+        logger.warning("[NETFLIX] credential fetch failed: %s", e)
 
     return ("", "")
 
@@ -2355,52 +2337,10 @@ async def _netflix_auto_login(page, user_id: str, websocket: WebSocket, overlay)
             logger.info("[NETFLIX] Already logged in or no sign-in detected")
             return
 
-        # Fetch Netflix credentials — try direct DB first, then HTTP fallback
-        email = ""
-        password = ""
-
-        # Method 1: Direct DB access (works when running on platform)
-        try:
-            from app.db.database import async_session_maker
-            from app.db.models import StreamingCredential
-            from sqlalchemy import select, and_
-
-            async with async_session_maker() as db:
-                result = await db.execute(
-                    select(StreamingCredential).where(
-                        and_(
-                            StreamingCredential.user_id == user_id,
-                            StreamingCredential.channel == "netflix",
-                        )
-                    )
-                )
-                cred = result.scalar_one_or_none()
-                if cred:
-                    email = cred.email or ""
-                    password = cred.password or ""
-                    logger.info("[NETFLIX] Got credentials from DB for user %s: email=%s", user_id, email)
-        except Exception as db_err:
-            logger.info("[NETFLIX] DB lookup failed (may be on agent): %s", db_err)
-
-        # Method 2: HTTP fallback (works when running on agent VPS)
-        if not email:
-            from app.config import settings
-            platform_url = getattr(settings, 'platform_api_url', 'https://toup.ai/api')
-            agent_key = getattr(settings, 'agent_api_key', '')
-
-            logger.info("[NETFLIX] Fetching credentials via HTTP for user %s", user_id)
-
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(
-                    f"{platform_url}/streaming/credentials/internal/netflix",
-                    params={"user_id": user_id},
-                    headers={"X-Agent-Key": agent_key},
-                )
-                logger.info("[NETFLIX] Credentials HTTP response: status=%d", r.status_code)
-                if r.status_code == 200:
-                    creds = r.json()
-                    email = creds.get("email", "")
-                    password = creds.get("password", "")
+        # Single audited HTTP path (Vault CP3): _get_netflix_credentials
+        # hits the platform's internal endpoint which writes an audit row
+        # and decrypts the Fernet token.
+        email, password = await _get_netflix_credentials(user_id)
 
         if not email or not password:
             logger.warning("[NETFLIX] No credentials found for user %s", user_id)
@@ -2455,6 +2395,7 @@ async def _netflix_auto_login(page, user_id: str, websocket: WebSocket, overlay)
                 pass_filled = True
                 logger.info("[NETFLIX] Password filled via %s", selector)
                 break
+        password = ""  # Vault CP3: drop the local reference; chars already in browser.
         if not pass_filled:
             logger.warning("[NETFLIX] Could not find password input")
             return
