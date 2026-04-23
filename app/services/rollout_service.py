@@ -138,23 +138,22 @@ async def _poll_health(agent_url: str, attempts: int, interval_s: float) -> int:
     """
     consecutive_ok = 0
     best = 0
+    logger.info("[POLL_HEALTH] start url=%s attempts=%d interval=%s", agent_url, attempts, interval_s)
     async with httpx.AsyncClient(timeout=10, verify=True) as client:
-        for _ in range(attempts):
+        for i in range(attempts):
             try:
                 r = await client.get(f"{agent_url.rstrip('/')}/agent/health")
                 if r.status_code == 200:
                     consecutive_ok += 1
                     best = max(best, consecutive_ok)
-                    if consecutive_ok >= 3:
-                        # Sufficient for a health pass, but keep polling
-                        # during canary window (we want steady-state health,
-                        # not just startup)
-                        pass
                 else:
+                    logger.warning("[POLL_HEALTH] poll %d HTTP %d body=%r", i, r.status_code, r.text[:100])
                     consecutive_ok = 0
-            except httpx.HTTPError:
+            except httpx.HTTPError as e:
+                logger.warning("[POLL_HEALTH] poll %d exception %s: %s", i, type(e).__name__, str(e)[:200])
                 consecutive_ok = 0
             await asyncio.sleep(interval_s)
+    logger.info("[POLL_HEALTH] end best=%d", best)
     return best
 
 
