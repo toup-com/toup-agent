@@ -632,10 +632,39 @@ def start_scheduler():
 def stop_scheduler():
     """Stop the scheduler if running."""
     global scheduler
-    
+
     if scheduler and scheduler.running:
         scheduler.shutdown()
         logger.info("Memory maintenance scheduler stopped")
+
+
+def schedule_one_shot(func, kwargs: dict, job_id: str, delay_s: int = 0):
+    """Fire a one-shot async job on the shared scheduler.
+
+    Used by the rollout service to kick off background rollout execution
+    without holding the HTTP handler's request context. The job runs once
+    then is auto-removed; we tag it with job_id so callers can query/cancel.
+
+    Starts the scheduler on first use if it's not yet running (e.g. in test
+    or single-worker contexts where start_scheduler() hasn't been invoked).
+    """
+    from datetime import datetime, timedelta
+    from apscheduler.triggers.date import DateTrigger
+    global scheduler
+    if scheduler is None:
+        scheduler = setup_scheduler()
+    if not scheduler.running:
+        scheduler.start()
+    run_at = datetime.utcnow() + timedelta(seconds=delay_s)
+    scheduler.add_job(
+        func,
+        trigger=DateTrigger(run_date=run_at),
+        kwargs=kwargs,
+        id=job_id,
+        replace_existing=True,
+        misfire_grace_time=300,  # if the executor is busy, still run up to 5 min late
+    )
+    logger.info(f"[SCHED] one-shot job {job_id} scheduled for {run_at.isoformat()}Z")
 
 
 # Optional: Run scheduled tasks manually for testing

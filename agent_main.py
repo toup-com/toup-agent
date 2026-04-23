@@ -197,27 +197,18 @@ async def lifespan(app: FastAPI):
     await init_db()
     print("✅ Database initialized")
 
-    # ── Auto-update check (non-blocking) ────────────────────
-    try:
-        import subprocess
-        agent_dir = os.environ.get("AGENT_DIR") or os.path.abspath(os.path.dirname(__file__))
-        result = subprocess.run(
-            ["git", "pull", "--ff-only"],
-            cwd=agent_dir, capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0 and "Already up to date" not in result.stdout:
-            print(f"📦 Auto-updated: {result.stdout.strip()[:100]}")
-            # Install any new deps
-            venv_pip = os.path.join(agent_dir, "venv", "bin", "pip")
-            if os.path.exists(venv_pip):
-                subprocess.run(
-                    [venv_pip, "install", "-q", "-r", os.path.join(agent_dir, "requirements.txt")],
-                    cwd=agent_dir, capture_output=True, timeout=60,
-                )
-    except Exception as e:
-        print(f"⚠️ Auto-update check skipped: {e}")
-
-    _boot_progress.update(percent=10, phase="auto_update")
+    # ── Auto-update: REMOVED in Phase 3 ────────────────────────
+    # This block used to run `git pull --ff-only` at startup from the agent's
+    # working directory. In practice it was ALWAYS a silent no-op — `.git` is
+    # excluded by .dockerignore so the container image never contained a
+    # working tree for `git` to update. The log warning "Auto-update check
+    # skipped" fired on every boot.
+    #
+    # Phase 3 ships SHA-tagged images via CI (docs/new-vps/14-*.md). The
+    # image IS the release artifact. Remove any future impulse to add
+    # startup self-update logic — it defeats the immutable-image invariant
+    # that the rollout service's audit log depends on.
+    _boot_progress.update(percent=10, phase="ready")
     # ── Ensure owner user exists in DB ─────────────────────────
     # Must run BEFORE session migration (which references user_id as FK)
     if settings.user_id:

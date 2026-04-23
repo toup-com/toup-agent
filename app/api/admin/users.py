@@ -837,25 +837,21 @@ async def delete_user(
         except Exception:
             pass  # table/column missing or other DB error — continue
 
-    # ── 1. Destroy ALL VPS artifacts for this user ──
+    # ── 1. Destroy ALL VPS artifacts for this user via the bridge ──
+    # Phase 3: platform uses the typed provisioning bridge instead of
+    # SSH-as-root. DELETE /v1/tenants/<prefix> on the bridge handles:
+    #   - docker rm -f toup-agent-<prefix>
+    #   - docker network rm tnt_<prefix>
+    #   - DROP DATABASE + DROP ROLE via /usr/local/sbin/revoke_tenant_db
+    #   - remove Caddy tenant route via admin API
+    # It does NOT yet wipe /data/agents/<prefix>/workspace+skills. That's
+    # intentional for backups — restic already has the data, and we preserve
+    # the bind-mount source in case of accidental user deletion. A separate
+    # "destroy-tenant-data" admin action can be added if genuinely needed.
     prefix = user_id[:8]
     try:
-        from app.services.docker_host_service import _run_ssh
-        mc_result = await db.execute(
-            select(ManagedContainer).where(ManagedContainer.user_id == user_id)
-        )
-        mc = mc_result.scalar_one_or_none()
-        if mc:
-            # Stop and remove Docker container
-            await _run_ssh(f"docker rm -f {mc.container_name} 2>/dev/null || true")
-            # Drop per-user agent Postgres database
-            await _run_ssh(
-                f"PGPASSWORD=postgres psql -U postgres -h localhost -c "
-                f"\"DROP DATABASE IF EXISTS {mc.db_name}\" 2>/dev/null || true"
-            )
-        # Remove data directory (.env with API keys, workspace, skills) —
-        # always attempt with prefix even if no ManagedContainer row existed
-        await _run_ssh(f"rm -rf /data/agents/{prefix}")
+        from app.services.docker_host_service import destroy_container
+        await destroy_container(db, user_id)
     except Exception as e:
         logger.warning("[DELETE-USER] VPS cleanup failed for %s: %s", prefix, e)
 

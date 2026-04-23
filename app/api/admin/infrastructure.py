@@ -21,67 +21,47 @@ router = APIRouter(prefix="/admin/infrastructure", tags=["admin-infrastructure"]
 
 
 async def _ssh_cmd(cmd: str) -> str:
-    """Run a command on the Docker host and return stdout. Uses stdin to avoid quoting issues."""
-    if not settings.docker_host_ip:
-        return ""
-    from app.services.docker_host_service import _get_ssh_key_file
-    key_file = _get_ssh_key_file()
-    ssh_args = ["ssh"]
-    if key_file:
-        ssh_args += ["-i", key_file, "-o", "PasswordAuthentication=no"]
-    ssh_args += [
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=5",
-        f"root@{settings.docker_host_ip}",
-        "bash", "-s",
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *ssh_args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=cmd.encode()),
-            timeout=15,
-        )
-        if proc.returncode != 0:
-            logger.warning(f"[INFRA-SSH] cmd='{cmd[:60]}' rc={proc.returncode} stderr={stderr.decode()[:200]}")
-        return stdout.decode().strip()
-    except Exception as e:
-        logger.warning(f"[INFRA-SSH] exception: {e}")
-        return ""
+    """DEPRECATED — SSH-as-root to the Docker host is removed in Phase 3.
+
+    Left as a stub so existing admin endpoints don't crash on import, but
+    every caller will get an empty string. Admin metrics / log views that
+    rely on this are degraded until someone builds equivalent endpoints
+    on the provisioning bridge (Phase 4 work).
+
+    Call sites that still invoke this are:
+      - overview()      host-level metrics (disk, mem, CPU, container list)
+      - container_details()   per-container logs, ps, env
+      - various tenant data_volume queries
+
+    All of those will show empty/N-A in the admin UI until ported.
+    """
+    logger.debug("[INFRA-SSH] _ssh_cmd called but SSH is removed (cmd=%s...)", cmd[:60])
+    return ""
 
 
-@router.get("/debug-ssh")
-async def debug_ssh(_=Depends(require_admin)):
-    """Debug SSH connectivity to Docker host."""
-    from app.services.docker_host_service import _get_ssh_key_file
-    key_file = _get_ssh_key_file()
+@router.get("/debug-bridge")
+async def debug_bridge(_=Depends(require_admin)):
+    """Debug provisioning-bridge connectivity (replaces debug-ssh).
 
+    Returns whether bridge mTLS is configured + a round-trip health check.
+    """
     info = {
-        "docker_host_ip": settings.docker_host_ip or "(not set)",
-        "ssh_key_configured": bool(settings.docker_host_ssh_key),
-        "ssh_key_length": len(settings.docker_host_ssh_key) if settings.docker_host_ssh_key else 0,
-        "ssh_key_file": key_file,
-        "ssh_password_configured": bool(settings.docker_host_ssh_password),
+        "bridge_url": settings.bridge_url or "(not set)",
+        "bridge_ca_cert_configured": bool(settings.bridge_ca_cert),
+        "bridge_client_cert_configured": bool(settings.bridge_client_cert),
+        "bridge_client_key_configured": bool(settings.bridge_client_key),
         "managed_hosting_enabled": settings.managed_hosting_enabled,
     }
-
-    # Try SSH
-    import shutil
-    info["ssh_binary"] = shutil.which("ssh") or "NOT FOUND"
-
-    if key_file:
-        import os
-        info["key_file_exists"] = os.path.exists(key_file)
-        info["key_file_perms"] = oct(os.stat(key_file).st_mode)[-3:] if os.path.exists(key_file) else "N/A"
-
-    # Test connection
-    test_result = await _ssh_cmd("echo OK")
-    info["ssh_test"] = test_result or "FAILED"
-
+    if not settings.bridge_url or not settings.bridge_ca_cert:
+        info["bridge_health"] = "NOT CONFIGURED"
+        return info
+    try:
+        from app.services.docker_host_service import _bridge_client
+        async with _bridge_client(timeout_s=5) as client:
+            r = await client.get("/v1/health")
+            info["bridge_health"] = f"{r.status_code} {r.text[:100]}"
+    except Exception as e:
+        info["bridge_health"] = f"FAILED: {type(e).__name__}: {str(e)[:200]}"
     return info
 
 
@@ -289,71 +269,27 @@ async def destroy_container(
     return {"status": "deleted"}
 
 
-@router.post("/deploy-update")
-async def deploy_update(
+@router.post("/deploy-update", deprecated=True)
+async def deploy_update_deprecated(
     _=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Rebuild agent image and rolling-update all managed containers."""
-    steps = []
+    """DEPRECATED — use POST /api/admin/rollout/start (W4) instead.
 
-    # 1. Pull latest code
-    out = await _ssh_cmd("cd /opt/toup-agent && git pull --ff-only 2>&1")
-    steps.append({"step": "git_pull", "output": out})
+    The old implementation SSH'd to /opt/toup-agent, ran `git pull` +
+    `docker build` on the VPS, and rolling-updated containers inline.
+    Phase 3 replaced all of that with:
 
-    # 2. Build new image
-    out = await _ssh_cmd("cd /opt/toup-agent && docker build -f Dockerfile.agent -t toup-agent:latest . 2>&1 | tail -5")
-    steps.append({"step": "build_image", "output": out})
+      - CI builds + pushes ghcr.io/toup-com/toup-agent:<sha>  (build-agent.yml)
+      - CI POSTs to /api/admin/rollout/start                   (webhook)
+      - rollout_service.py orchestrates canary → batches → health gates
 
-    # 3. Rolling update each container
-    containers_raw = await _ssh_cmd("docker ps -a --filter 'name=toup-agent-' --format '{{.Names}}'")
-    updated = []
-    if containers_raw:
-        for name in containers_raw.strip().split("\n"):
-            if not name.startswith("toup-agent-"):
-                continue
-            user_prefix = name.replace("toup-agent-", "")
-            # Get current port
-            port_raw = await _ssh_cmd(f"docker port {name} 8001 2>/dev/null | head -1 | cut -d: -f2")
-            port = port_raw.strip() if port_raw else ""
-            if not port:
-                steps.append({"step": f"skip_{name}", "output": "no port mapping"})
-                continue
-
-            # Stop + remove + recreate
-            await _ssh_cmd(f"docker stop {name} 2>/dev/null; docker rm {name} 2>/dev/null")
-            out = await _ssh_cmd(
-                f"docker run -d --name {name} --restart unless-stopped "
-                f"--env-file /data/agents/{user_prefix}/.env "
-                f"-p {port}:8001 "
-                f"-v /data/agents/{user_prefix}/workspace:/app/workspace "
-                f"-v /data/agents/{user_prefix}/skills:/app/skills "
-                f"-v /root/.cache/ms-playwright:/root/.cache/ms-playwright:ro "
-                f"--add-host host.docker.internal:host-gateway "
-                f"--memory=2g --cpus=1 "
-                f"toup-agent:latest 2>&1"
-            )
-            updated.append(name)
-            steps.append({"step": f"update_{name}", "output": out.strip()[:50]})
-
-    # 4. Health check
-    await asyncio.sleep(8)
-    health_results = {}
-    for name in updated:
-        port_raw = await _ssh_cmd(f"docker port {name} 8001 2>/dev/null | head -1 | cut -d: -f2")
-        if port_raw:
-            h = await _ssh_cmd(f"curl -sf http://localhost:{port_raw.strip()}/agent/health 2>/dev/null | head -c 100")
-            health_results[name] = h or "starting..."
-
-    # Cleanup — prune dangling images AND build cache to prevent disk bloat
-    await _ssh_cmd("docker image prune -f 2>/dev/null")
-    await _ssh_cmd("docker builder prune -a -f 2>/dev/null")
-
+    See docs/new-vps/14-AUTOMATED-DEPLOYMENT-DESIGN.md for the pipeline.
+    """
     return {
-        "success": True,
-        "updated": updated,
-        "steps": steps,
-        "health": health_results,
+        "error": "deploy_update is removed in Phase 3",
+        "use_instead": "POST /api/admin/rollout/start or POST /api/admin/rollout/manual",
+        "docs": "docs/new-vps/14-AUTOMATED-DEPLOYMENT-DESIGN.md",
     }
 
 

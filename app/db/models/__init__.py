@@ -48,6 +48,12 @@ from .soul_config import SoulConfig
 # Platform (VPS, invites, billing)
 from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent
 
+# Rollouts (Phase 3 automated deployment)
+from .rollout import (
+    Rollout, RolloutAttempt,
+    ROLLOUT_STATUSES, ROLLOUT_ATTEMPT_STATUSES, ROLLOUT_TRIGGERS,
+)
+
 # Streaming credentials
 from .streaming import StreamingCredential
 
@@ -68,6 +74,8 @@ __all__ = [
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
     "SoulConfig",
     "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord", "LLMProxyEvent",
+    "Rollout", "RolloutAttempt",
+    "ROLLOUT_STATUSES", "ROLLOUT_ATTEMPT_STATUSES", "ROLLOUT_TRIGGERS",
     "StreamingCredential",
     "DayChat", "ContextBudgetLog", "MigrationStatus",
 ]

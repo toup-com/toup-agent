@@ -365,10 +365,10 @@ fi
 echo "Setting up database..."
 sudo -u postgres psql -c "CREATE USER toup WITH PASSWORD 'toup';" 2>/dev/null || \\
     sudo -u postgres psql -c "ALTER USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
-sudo -u postgres psql -c "DROP DATABASE IF EXISTS toup_brain;" 2>/dev/null || true
-sudo -u postgres psql -c "CREATE DATABASE toup_brain OWNER toup;" 2>/dev/null || true
-sudo -u postgres psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
-echo "[OK] Database toup_brain ready (user: toup, pgvector enabled, clean slate)"
+sudo -u postgres psql -c "DROP DATABASE IF EXISTS toup_dev;" 2>/dev/null || true
+sudo -u postgres psql -c "CREATE DATABASE toup_dev OWNER toup;" 2>/dev/null || true
+sudo -u postgres psql -d toup_dev -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
+echo "[OK] Database toup_dev ready (user: toup, pgvector enabled, clean slate)"
 """
 
     return f"""#!/bin/bash
@@ -575,9 +575,9 @@ fi
 # Create database and user
 createuser toup 2>/dev/null || true
 psql postgres -c "ALTER USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
-createdb -O toup toup_brain 2>/dev/null || true
-psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
-echo "[OK] Database toup_brain ready"
+createdb -O toup toup_dev 2>/dev/null || true
+psql -d toup_dev -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
+echo "[OK] Database toup_dev ready"
 """
 
     return f"""#!/bin/bash
@@ -824,14 +824,14 @@ echo "  Creating database..."
 if [[ "$OSTYPE" == "darwin"* ]]; then
   createuser toup 2>/dev/null || true
   psql postgres -c "ALTER USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
-  dropdb toup_brain 2>/dev/null || true
-  createdb -O toup toup_brain 2>/dev/null || true
-  psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
+  dropdb toup_dev 2>/dev/null || true
+  createdb -O toup toup_dev 2>/dev/null || true
+  psql -d toup_dev -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
 else
   sudo -u postgres psql -c "CREATE USER toup WITH PASSWORD 'toup';" 2>/dev/null || true
-  sudo -u postgres psql -c "DROP DATABASE IF EXISTS toup_brain;" 2>/dev/null || true
-  sudo -u postgres psql -c "CREATE DATABASE toup_brain OWNER toup;" 2>/dev/null || true
-  sudo -u postgres psql -d toup_brain -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
+  sudo -u postgres psql -c "DROP DATABASE IF EXISTS toup_dev;" 2>/dev/null || true
+  sudo -u postgres psql -c "CREATE DATABASE toup_dev OWNER toup;" 2>/dev/null || true
+  sudo -u postgres psql -d toup_dev -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
 fi
 echo "  PostgreSQL + pgvector ready"
 '''
@@ -1368,7 +1368,7 @@ def generate_env_content(
     if db_mode == "own_supabase" and supabase_url:
         lines.append(f"DATABASE_URL={supabase_url}")
     elif db_mode == "local_postgres":
-        lines.append("DATABASE_URL=postgresql+asyncpg://toup:toup@localhost:5432/toup_brain")
+        lines.append("DATABASE_URL=postgresql+asyncpg://toup:toup@localhost:5432/toup_dev")
     else:
         lines.append(f"DATABASE_URL={settings.database_url}")
     lines += [

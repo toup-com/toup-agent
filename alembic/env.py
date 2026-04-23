@@ -32,7 +32,15 @@ if config.config_file_name is not None:
 db_url = settings.DATABASE_URL
 # Convert async driver to sync for Alembic migrations
 sync_url = db_url.replace("+asyncpg", "").replace("+aiosqlite", "")
-config.set_main_option("sqlalchemy.url", sync_url)
+# asyncpg accepts ?ssl=require; psycopg2 (sync driver used by alembic)
+# rejects that param and wants ?sslmode=require instead. Normalize.
+sync_url = sync_url.replace("?ssl=require", "?sslmode=require") \
+                   .replace("&ssl=require", "&sslmode=require")
+# configparser (used under set_main_option) treats '%' as an interpolation
+# marker. URL-encoded passwords (e.g. %21 for '!') trigger ValueError
+# "invalid interpolation syntax". Escape every bare '%' to '%%' before set.
+sync_url_cfg_safe = sync_url.replace("%", "%%")
+config.set_main_option("sqlalchemy.url", sync_url_cfg_safe)
 
 # Add your model's MetaData object here for 'autogenerate' support
 target_metadata = Base.metadata

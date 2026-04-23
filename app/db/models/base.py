@@ -95,10 +95,14 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "vps_plans",
     "vps_instances",
     "managed_containers",
+    # Automated deployment pipeline (Phase 3)
+    "rollouts",
+    "rollout_attempts",
     # Billing & invites
     "invites",
     "llm_bundle_allocations",
     "llm_usage_records",
+    "llm_proxy_events",
     # Agent configuration (platform manages, agent reads via API)
     "agent_configs",
     # Streaming credentials (platform stores, agent fetches via API)

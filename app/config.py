@@ -12,8 +12,8 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "sqlite+aiosqlite:///./toup.db"
     
-    # For production PostgreSQL with pgvector:
-    # database_url: str = "postgresql+asyncpg://user:pass@localhost:5432/toup_brain"
+    # For production PostgreSQL with pgvector (per-tenant DBs on the VPS):
+    # database_url: str = "postgresql+asyncpg://toup_agent_<prefix>:pw@host.docker.internal:6432/toup_agent_<prefix>"
     
     # Property alias for Alembic compatibility
     @property
@@ -248,17 +248,38 @@ class Settings(BaseSettings):
     hetzner_enabled: bool = False                 # Gate: set True once Hetzner is configured
 
     # ── Managed Docker Host (containerized multi-tenant) ──────────
-    docker_host_url: str = ""               # Docker API URL, e.g. "ssh://root@76.13.116.149"
-    docker_host_ip: str = ""                # Public IP of Docker host (for agent_url)
-    docker_host_ssh_key: str = ""           # SSH private key (ed25519) for Docker host
-    docker_host_ssh_password: str = ""      # SSH password fallback
-    docker_host_pg_url: str = ""            # Admin PostgreSQL URL on Docker host for creating per-user DBs
-    docker_agent_image: str = "toup-agent:latest"  # Docker image for agent containers
-    docker_port_range_start: int = 9000     # Start of port range for agent containers
-    docker_port_range_end: int = 9999       # End of port range
-    managed_hosting_enabled: bool = False   # Gate: set True once Docker host is configured
-    admin_alert_telegram_token: str = ""   # Bot token for admin alerts (separate from user bots)
-    admin_alert_telegram_chat_id: str = "" # Your Telegram user/group ID for alerts
+    #
+    # Phase 3 cutover: the platform no longer SSHes to the Docker host. All
+    # tenant lifecycle goes through a typed FastAPI provisioning bridge
+    # (see new-vps/08-provisioning-bridge.sh + docs/new-vps/14-AUTOMATED-DEPLOYMENT-DESIGN.md).
+    #
+    # Legacy SSH-related vars (docker_host_url, docker_host_ssh_key,
+    # docker_host_ssh_password, docker_host_pg_url) are gone. Anything still
+    # reading them is a bug.
+    docker_host_ip: str = ""                # Public IP of Docker host — used only by legacy callers being phased out
+    docker_agent_image: str = "toup-agent:latest"  # Deprecated default; bridge populates ManagedContainer.image_tag with real SHAs
+    docker_port_range_start: int = 9000     # Kept for the bridge's port allocation
+    docker_port_range_end: int = 9999
+    managed_hosting_enabled: bool = False   # Gate: set True once bridge is reachable
+    admin_alert_telegram_token: str = ""    # Bot token for admin alerts (shared / user-facing bot)
+    admin_alert_telegram_chat_id: str = ""
+
+    # ── Provisioning bridge (Phase 3, replaces SSH-as-root) ───────
+    # mTLS-secured FastAPI service on the VPS. Platform talks to it with a
+    # client cert; bridge does all docker / PG lifecycle work.
+    bridge_url: str = ""                    # e.g. https://bridge.agents.toup.ai
+    bridge_ca_cert: str = ""                # CA cert (PEM) that issued bridge's server cert
+    bridge_client_cert: str = ""            # Client cert (PEM) platform presents for mTLS
+    bridge_client_key: str = ""             # Client private key (PEM)
+    bridge_request_timeout_s: int = 30      # default httpx timeout for non-upgrade calls
+    bridge_upgrade_timeout_s: int = 180     # upgrade endpoint can take longer (pull + recreate + health)
+
+    # ── Rollout pipeline (Phase 3) ────────────────────────────────
+    rollout_secret: str = ""                # Shared secret CI → platform webhook (X-Rollout-Secret)
+    rollout_canary_wait_minutes_default: int = 10
+    rollout_batch_size: int = 5             # Post-canary parallel upgrades per batch
+    infra_alert_telegram_token: str = ""    # Dedicated infra bot (split from admin_alert_*)
+    infra_alert_telegram_chat_id: str = ""
 
     # ── Browser Proxy & Captcha ──
     browser_proxy: str = ""  # e.g. "http://user:pass@proxy.example.com:8080"

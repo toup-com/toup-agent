@@ -73,7 +73,16 @@ class ManagedContainer(Base):
     host_port: Mapped[int] = mapped_column(Integer, nullable=False)  # Mapped port on Docker host
     db_name: Mapped[str] = mapped_column(String(100), nullable=False)  # Per-user PostgreSQL database
     status: Mapped[str] = mapped_column(String(20), default="provisioning")  # provisioning|running|stopped|error
-    image_tag: Mapped[str] = mapped_column(String(100), default="toup-agent:latest")
+    # image_tag: currently-running agent image for this tenant.
+    # Phase 2 defaulted to "toup-agent:latest"; Phase 3 makes it nullable and
+    # populates it with ghcr.io/toup-com/toup-agent:<sha> via the provisioning
+    # bridge on create + every rollout attempt.
+    image_tag: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # pin_image_tag: if set, the rollout service SKIPS this tenant (status
+    # 'skipped_pinned'). Used to hold a user on a specific SHA — e.g. for
+    # regression isolation or branch testing. Admin SQL only in Phase 3; UI
+    # deferred until there's real need.
+    pin_image_tag: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

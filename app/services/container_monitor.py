@@ -27,11 +27,34 @@ ALERT_COOLDOWN = timedelta(hours=1)  # Don't spam — max 1 alert per container 
 
 
 async def _check_container_health(container: ManagedContainer) -> bool:
-    """Check if a container's agent is healthy by hitting its health endpoint."""
-    if not container.host_port or not settings.docker_host_ip:
+    """Check if a container's agent is healthy by hitting its health endpoint.
+
+    Phase 3: URL is the HTTPS subdomain per AgentConfig.agent_url, fronted
+    by Caddy on 443. The platform doesn't need bridge mTLS for this check —
+    /agent/health is reachable without client cert (the tenant's own agent
+    responds publicly; X-Agent-Key only gates authenticated endpoints).
+    """
+    from app.db.models import AgentConfig
+    from app.db.database import async_session_maker
+    from sqlalchemy import select
+
+    # Prefer AgentConfig.agent_url (HTTPS subdomain) over the legacy
+    # http://{docker_host_ip}:{port} form.
+    url: str | None = None
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(AgentConfig.agent_url).where(AgentConfig.user_id == container.user_id)
+        )
+        agent_url = result.scalar_one_or_none()
+    if agent_url:
+        url = f"{agent_url.rstrip('/')}/agent/health"
+    elif container.host_port and settings.docker_host_ip:
+        # Legacy fallback — only hit during the Phase 3 transition window
+        # when AgentConfig rows haven't been populated with HTTPS URLs yet.
+        url = f"http://{settings.docker_host_ip}:{container.host_port}/agent/health"
+    else:
         return False
 
-    url = f"http://{settings.docker_host_ip}:{container.host_port}/agent/health"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url)

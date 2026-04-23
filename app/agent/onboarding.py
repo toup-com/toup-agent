@@ -144,7 +144,7 @@ def get_wizard_steps() -> List[WizardStep]:
             prompt="Database URL",
             env_var="DATABASE_URL",
             required=True,
-            default="postgresql+asyncpg://toup:toup_secret@localhost:5432/toup_brain",
+            default="postgresql+asyncpg://toup:toup_secret@localhost:5432/toup_dev",
             validator=validate_url,
             category="database",
             help_text="PostgreSQL connection string with asyncpg driver",
