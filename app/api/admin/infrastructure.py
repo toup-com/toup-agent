@@ -6,6 +6,7 @@ resource usage per user.
 import asyncio
 import logging
 from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import select, func
@@ -294,6 +295,33 @@ async def admin_provision(
         return {"error": str(e)}
 
 
+async def _bridge_get(path: str, timeout_s: int = 15) -> Optional[dict]:
+    """Helper: GET a bridge endpoint. Returns the parsed JSON or None on failure."""
+    from app.services.docker_host_service import _bridge_client
+    try:
+        async with _bridge_client(timeout_s=timeout_s) as client:
+            r = await client.get(path)
+            if r.status_code == 200:
+                return r.json()
+            logger.warning("bridge %s → HTTP %s: %s", path, r.status_code, r.text[:200])
+    except Exception as e:
+        logger.warning("bridge %s failed: %s", path, e)
+    return None
+
+
+async def _bridge_post(path: str, json_body: dict, timeout_s: int = 35) -> Optional[dict]:
+    from app.services.docker_host_service import _bridge_client
+    try:
+        async with _bridge_client(timeout_s=timeout_s) as client:
+            r = await client.post(path, json=json_body)
+            if r.status_code == 200:
+                return r.json()
+            logger.warning("bridge POST %s → HTTP %s: %s", path, r.status_code, r.text[:200])
+    except Exception as e:
+        logger.warning("bridge POST %s failed: %s", path, e)
+    return None
+
+
 @router.get("/containers/{container_id}/files")
 async def list_files(
     container_id: str,
@@ -309,38 +337,22 @@ async def list_files(
     if not container:
         return {"error": "Not found"}
 
-    # Sanitize path
-    clean_path = path.strip("/").replace("..", "")
-    target = f"/app/{clean_path}" if clean_path else "/app"
-
-    # List files INSIDE the container via docker exec
-    raw = await _ssh_cmd(
-        f"docker exec {container.container_name} "
-        f"find {target} -maxdepth 1 -printf '%y|%s|%T@|%f\\n' 2>/dev/null | head -200"
-    )
-    if not raw:
-        return {"path": clean_path, "files": [], "base": "/app"}
+    # Delegate to bridge's ls endpoint (runs `find` inside the container).
+    prefix = container.user_id[:8]
+    from urllib.parse import quote
+    data = await _bridge_get(f"/v1/tenants/{prefix}/ls?path={quote(path)}")
+    if not data:
+        return {"path": path, "files": [], "base": "/app", "error": "bridge unreachable"}
 
     files = []
-    for line in raw.strip().split("\n"):
-        parts = line.split("|", 3)
-        if len(parts) < 4 or parts[3] == ".":
-            continue
-        ftype = "dir" if parts[0] == "d" else "file"
-        size = int(parts[1]) if parts[1].isdigit() else 0
-        mtime = float(parts[2]) if parts[2].replace(".", "").isdigit() else 0
-        name = parts[3]
+    for f in data.get("files", []):
         files.append({
-            "name": name,
-            "type": ftype,
-            "size": size,
-            "modified": datetime.fromtimestamp(mtime).isoformat() if mtime else None,
+            "name": f["name"],
+            "type": f["type"],
+            "size": f["size"],
+            "modified": datetime.fromtimestamp(f["mtime"]).isoformat() if f.get("mtime") else None,
         })
-
-    # Sort: dirs first, then by name
-    files.sort(key=lambda f: (0 if f["type"] == "dir" else 1, f["name"]))
-
-    return {"path": clean_path, "files": files, "base": "/app"}
+    return {"path": data.get("path", path), "files": files, "base": data.get("base", "/app")}
 
 
 @router.get("/containers/{container_id}/file-content")
@@ -358,20 +370,12 @@ async def read_file(
     if not container:
         return {"error": "Not found"}
 
-    clean_path = path.strip("/").replace("..", "")
-    target = f"/app/{clean_path}"
-
-    # Check file size inside container
-    size_check = await _ssh_cmd(
-        f"docker exec {container.container_name} stat -c%s {target} 2>/dev/null"
-    )
-    if not size_check or not size_check.isdigit() or int(size_check) > 1_000_000:
-        return {"error": "File too large or not found", "path": clean_path}
-
-    content = await _ssh_cmd(
-        f"docker exec {container.container_name} cat {target} 2>/dev/null"
-    )
-    return {"path": clean_path, "content": content, "size": int(size_check)}
+    prefix = container.user_id[:8]
+    from urllib.parse import quote
+    data = await _bridge_get(f"/v1/tenants/{prefix}/cat?path={quote(path)}")
+    if not data:
+        return {"error": "bridge unreachable or file not found", "path": path}
+    return {"path": data["path"], "content": data["content"], "size": data["size"]}
 
 
 @router.post("/containers/{container_id}/terminal")
@@ -393,12 +397,11 @@ async def terminal_exec(
     if not container:
         return {"error": "Container not found"}
 
-    # Run command inside the Docker container
-    # We pipe to the SSH host which then pipes to docker exec
-    output = await _ssh_cmd(
-        f"echo {repr(cmd)} | docker exec -i {container.container_name} bash 2>&1"
-    )
-    return {"output": output, "command": cmd}
+    prefix = container.user_id[:8]
+    data = await _bridge_post(f"/v1/tenants/{prefix}/exec", {"command": cmd})
+    if not data:
+        return {"output": "(bridge unreachable)", "command": cmd, "exit_code": -1}
+    return {"output": data.get("output", ""), "command": cmd, "exit_code": data.get("exit_code", -1)}
 
 
 @router.get("/containers/{container_id}/details")
@@ -420,28 +423,42 @@ async def container_details(
     container, user_name, user_email = row
     name = container.container_name
 
-    # Gather info in parallel
-    logs_task = _ssh_cmd(f"docker logs --tail 50 {name} 2>&1")
-    processes_task = _ssh_cmd(f"docker exec {name} ps aux 2>&1")
-    disk_task = _ssh_cmd(f"du -sh /data/agents/{container.user_id[:8]}/workspace /data/agents/{container.user_id[:8]}/skills 2>/dev/null")
-    env_task = _ssh_cmd(f"cat /data/agents/{container.user_id[:8]}/.env 2>/dev/null")
-    health_task = _ssh_cmd(f"curl -sf http://localhost:{container.host_port}/agent/health 2>/dev/null")
+    # Gather info in parallel via bridge
+    prefix = container.user_id[:8]
+    logs_task = _bridge_get(f"/v1/tenants/{prefix}/logs?tail=50")
+    ps_task = _bridge_get(f"/v1/tenants/{prefix}/ps")
+    disk_task = _bridge_get(f"/v1/tenants/{prefix}/disk")
+    env_task = _bridge_get(f"/v1/tenants/{prefix}/env")
 
-    logs, processes, disk, env_raw, health = await asyncio.gather(
-        logs_task, processes_task, disk_task, env_task, health_task
+    logs_d, ps_d, disk_d, env_d = await asyncio.gather(
+        logs_task, ps_task, disk_task, env_task
     )
 
-    # Mask API keys in env
-    env_lines = []
-    for line in (env_raw or "").split("\n"):
-        if "=" in line:
-            key, val = line.split("=", 1)
-            if any(s in key.upper() for s in ["KEY", "TOKEN", "PASSWORD", "SECRET"]):
-                env_lines.append(f"{key}={val[:8]}...{val[-4:]}" if len(val) > 16 else f"{key}=****")
-            else:
-                env_lines.append(line)
-        else:
-            env_lines.append(line)
+    logs = (logs_d or {}).get("logs", "(bridge unreachable)")
+    # docker top format → flatten to `ps aux`-like string
+    if ps_d:
+        titles = ps_d.get("titles") or []
+        rows = ps_d.get("processes") or []
+        processes = "\t".join(titles) + "\n" + "\n".join("\t".join(r) for r in rows)
+    else:
+        processes = "(bridge unreachable)"
+    disk = f"workspace={(disk_d or {}).get('workspace_bytes', 0)} skills={(disk_d or {}).get('skills_bytes', 0)}"
+    # Bridge already masks secrets
+    env_lines = ((env_d or {}).get("env_masked") or "").split("\n")
+    # Self-probe health via public URL
+    from app.db.models import AgentConfig
+    ac_row = (await db.execute(
+        select(AgentConfig.agent_url).where(AgentConfig.user_id == container.user_id)
+    )).first()
+    health = "unknown"
+    if ac_row and ac_row[0]:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5) as hc:
+                r = await hc.get(f"{ac_row[0].rstrip('/')}/agent/health")
+                health = f"HTTP {r.status_code}: {r.text[:100]}" if r.status_code != 200 else r.text[:200]
+        except Exception as e:
+            health = f"unreachable: {type(e).__name__}"
 
     # Get user's apps
     from app.db.models import App
