@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.api.auth import get_current_user
+from app.services.credential_crypto import encrypt_str, decrypt_str
 
 _audit_log = logging.getLogger("streaming.audit")
 
@@ -73,9 +74,10 @@ async def upsert_credential(
     )
     cred = result.scalar_one_or_none()
 
+    ciphertext = encrypt_str(body.password)
     if cred:
         cred.email = body.email.strip()
-        cred.password = body.password
+        cred.password = ciphertext
         cred.updated_at = datetime.utcnow()
     else:
         cred = StreamingCredential(
@@ -83,7 +85,7 @@ async def upsert_credential(
             user_id=user.id,
             channel=body.channel,
             email=body.email.strip(),
-            password=body.password,
+            password=ciphertext,
         )
         db.add(cred)
 
@@ -165,7 +167,15 @@ async def get_credential_internal(
     if not cred:
         raise HTTPException(status_code=404, detail=f"No {channel} credentials found")
 
-    return {"channel": cred.channel, "email": cred.email, "password": cred.password}
+    try:
+        plaintext = decrypt_str(cred.password)
+    except Exception:
+        _audit_log.exception(
+            "credential decrypt failed for user=%s channel=%s", user_id, channel
+        )
+        raise HTTPException(status_code=500, detail="credential decrypt failed")
+
+    return {"channel": cred.channel, "email": cred.email, "password": plaintext}
 
 
 @router.get("/netflix-search")

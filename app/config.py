@@ -301,7 +301,8 @@ class Settings(BaseSettings):
     # ── Platform LLM Proxy (bundle mode) ───────────────────
     platform_anthropic_api_key: Optional[str] = None  # Platform-owned Anthropic key
     platform_openai_api_key: Optional[str] = None     # Platform-owned OpenAI key
-    platform_encryption_key: str = ""                  # Fernet key for encrypting secrets at rest
+    platform_encryption_key: str = ""                  # Fernet key (primary, used for encrypt + decrypt)
+    platform_encryption_key_previous: str = ""          # Optional comma-separated list of prior Fernet keys — decrypt-only, used during rotation
 
     # Bundle budget configuration (all values in cents)
     bundle_total_budget_cents: int = 4000              # $40/month total
