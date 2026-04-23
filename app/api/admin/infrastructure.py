@@ -70,77 +70,69 @@ async def overview(
     _=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get full VPS infrastructure overview."""
+    """Get full VPS infrastructure overview.
 
-    # Get image version
-    image_info = await _ssh_cmd("docker inspect toup-agent:latest --format '{{.Created}}' 2>/dev/null | cut -c1-19")
+    Host + docker stats come from the bridge's /v1/host/overview endpoint
+    (Phase 4 rebuild — was previously SSH-as-root which is now removed).
+    If the bridge is unreachable, the host sections come back as a
+    degraded stub and the UI shows a banner — better than hard-500'ing.
+    """
+    from app.services.docker_host_service import _bridge_client
 
-    # Get host stats via SSH (parallel)
-    # NOTE: avoid single quotes in commands — they break inside the SSH wrapper's single-quoted string
-    disk_task = _ssh_cmd("df -h / | tail -1 | awk '{print $2, $3, $4, $5}'")
-    mem_task = _ssh_cmd("free -m | grep Mem | awk '{print $2, $3, $4}'")
-    cpu_task = _ssh_cmd("nproc && awk '{print $1, $2, $3}' /proc/loadavg")
-    docker_task = _ssh_cmd("docker ps --format '{{.Names}}~{{.Status}}~{{.Ports}}~{{.Image}}' 2>/dev/null")
-    uptime_task = _ssh_cmd("uptime -p")
+    # Bridge host overview (parallel with DB reads below)
+    async def _fetch_bridge():
+        try:
+            async with _bridge_client(timeout_s=10) as client:
+                r = await client.get("/v1/host/overview")
+                if r.status_code == 200:
+                    return r.json()
+                logger.warning("bridge /v1/host/overview returned HTTP %s", r.status_code)
+        except Exception as e:
+            logger.warning("bridge host overview fetch failed: %s", e)
+        return None
 
-    disk, mem, cpu, docker_ps, uptime = await asyncio.gather(
-        disk_task, mem_task, cpu_task, docker_task, uptime_task
-    )
-
-    # Parse host stats
-    disk_parts = disk.split() if disk else []
-    mem_parts = mem.split() if mem else []
-    cpu_parts = cpu.split() if cpu else []
-
-    host = {
-        "ip": settings.docker_host_ip,
-        "uptime": uptime or "unknown",
-        "disk": {
-            "total": disk_parts[0] if len(disk_parts) > 0 else "?",
-            "used": disk_parts[1] if len(disk_parts) > 1 else "?",
-            "free": disk_parts[2] if len(disk_parts) > 2 else "?",
-            "percent": disk_parts[3] if len(disk_parts) > 3 else "?",
-        },
-        "memory": {
-            "total_mb": int(mem_parts[0]) if mem_parts and mem_parts[0].isdigit() else 0,
-            "used_mb": int(mem_parts[1]) if len(mem_parts) > 1 and mem_parts[1].isdigit() else 0,
-            "free_mb": int(mem_parts[2]) if len(mem_parts) > 2 and mem_parts[2].isdigit() else 0,
-        },
-        "cpu": {
-            "cores": int(cpu_parts[0]) if cpu_parts and cpu_parts[0].isdigit() else 0,
-            "load_1m": cpu_parts[1] if len(cpu_parts) > 1 else "?",
-            "load_5m": cpu_parts[2] if len(cpu_parts) > 2 else "?",
-            "load_15m": cpu_parts[3] if len(cpu_parts) > 3 else "?",
-        },
-    }
-
-    # Parse running containers
-    containers_running = []
-    if docker_ps:
-        for line in docker_ps.strip().split("\n"):
-            parts = line.split("~")
-            if len(parts) >= 3:
-                containers_running.append({
-                    "name": parts[0],
-                    "status": parts[1],
-                    "ports": parts[2],
-                    "image": parts[3] if len(parts) > 3 else "",
-                })
-
-    # Get managed containers from DB
-    result = await db.execute(
-        select(
-            ManagedContainer,
-            User.name,
-            User.email,
+    # Managed containers from platform DB
+    async def _fetch_managed():
+        result = await db.execute(
+            select(ManagedContainer, User.name, User.email)
+            .outerjoin(User, ManagedContainer.user_id == User.id)
+            .order_by(ManagedContainer.created_at.desc())
         )
-        .outerjoin(User, ManagedContainer.user_id == User.id)
-        .order_by(ManagedContainer.created_at.desc())
-    )
-    rows = result.all()
+        return result.all()
 
+    total_users_task = db.execute(select(func.count(User.id)))
+
+    bridge_data, managed_rows, total_users_result = await asyncio.gather(
+        _fetch_bridge(), _fetch_managed(), total_users_task
+    )
+
+    # Host stats — use bridge data if we got it, else degraded stubs
+    if bridge_data:
+        host = {
+            "ip": (settings.bridge_url or "").replace("https://", "").replace("http://", "").split("/")[0],
+            "hostname": bridge_data["host"]["hostname"],
+            "uptime_sec": bridge_data["host"]["uptime_sec"],
+            "disk": bridge_data["host"]["disk"],
+            "memory": bridge_data["host"]["memory"],
+            "cpu": bridge_data["host"]["cpu"],
+        }
+        containers_running = bridge_data.get("containers_running", [])
+        container_stats = bridge_data.get("container_stats", {})
+    else:
+        host = {
+            "ip": "bridge unreachable",
+            "hostname": "?",
+            "uptime_sec": 0,
+            "disk": {"total_bytes": 0, "used_bytes": 0, "free_bytes": 0, "percent": 0},
+            "memory": {"total_mb": 0, "available_mb": 0, "used_mb": 0, "percent": 0},
+            "cpu": {"cores": 0, "load_1m": 0, "load_5m": 0, "load_15m": 0},
+        }
+        containers_running = []
+        container_stats = {}
+
+    # Managed containers from DB
     managed = []
-    for container, user_name, user_email in rows:
+    for container, user_name, user_email in managed_rows:
         managed.append({
             "id": container.id,
             "user_id": container.user_id,
@@ -158,26 +150,9 @@ async def overview(
             "stopped_at": container.stopped_at.isoformat() if container.stopped_at else None,
         })
 
-    # Count totals
-    total_users = (await db.execute(select(func.count(User.id)))).scalar() or 0
+    total_users = total_users_result.scalar() or 0
     total_containers = len(managed)
     running_containers = sum(1 for c in managed if c["status"] == "running")
-
-    # Memory per container via docker stats
-    container_stats = {}
-    if containers_running:
-        stats_raw = await _ssh_cmd(
-            "docker stats --no-stream --format '{{.Name}}~{{.CPUPerc}}~{{.MemUsage}}~{{.MemPerc}}' 2>/dev/null"
-        )
-        if stats_raw:
-            for line in stats_raw.strip().split("\n"):
-                parts = line.split("~")
-                if len(parts) >= 4:
-                    container_stats[parts[0]] = {
-                        "cpu": parts[1],
-                        "mem_usage": parts[2],
-                        "mem_percent": parts[3],
-                    }
 
     return {
         "host": host,
@@ -193,7 +168,7 @@ async def overview(
             "port_range": f"{settings.docker_port_range_start}-{settings.docker_port_range_end}",
             "max_capacity": settings.docker_port_range_end - settings.docker_port_range_start + 1,
         },
-        "image_built": image_info or "unknown",
+        "bridge_reachable": bridge_data is not None,
     }
 
 
