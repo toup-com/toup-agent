@@ -1351,6 +1351,13 @@ async def ws_chat(
                     except Exception:
                         pass
 
+                async def on_credential_confirm_request(payload: dict):
+                    """Vault CP4: forward the confirmation-card frame to the client."""
+                    try:
+                        await websocket.send_json(payload)
+                    except Exception:
+                        logger.exception("on_credential_confirm_request send_json failed")
+
                 # Collect build job info during tool execution for later persistence
                 _pending_job_cards: list = []
 
@@ -1489,6 +1496,7 @@ async def ws_chat(
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
                     on_attachment=on_attachment,
+                    on_credential_confirm_request=on_credential_confirm_request,
                     model_override=model,
                     save_user_message=not is_onboarding_msg and not _user_msg_presaved and not _is_system_action,
                     media_paths=_media_paths if _media_paths else None,

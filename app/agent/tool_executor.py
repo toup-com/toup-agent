@@ -2535,6 +2535,114 @@ class ToolExecutor:
             return f"ERROR: Unknown action '{action}'. Use: get, set."
 
     # ------------------------------------------------------------------
+    # save_streaming_credential — Vault CP4 chat-save
+    # ------------------------------------------------------------------
+    async def _tool_save_streaming_credential(self, inp: Dict[str, Any]) -> str:
+        from app.agent.pending_credential_confirms import (
+            register_attempt,
+            create_pending,
+            RATE_LIMIT_MAX_ATTEMPTS,
+            RATE_LIMIT_WINDOW_SECONDS,
+            DEFAULT_TTL_SECONDS,
+        )
+
+        # Channel gate — hard check matches the tool-list filter in
+        # agent_runner.py. Defense in depth: even if the LLM hallucinates
+        # the tool on a blocked channel, it never runs.
+        blocked = {"telegram", "voice", "mobile"}
+        if (self._current_channel or "") in blocked:
+            return (
+                "ERROR: save_streaming_credential is not available on this channel. "
+                "Tell the user to use the web app."
+            )
+
+        user_id = self._current_user_id or ""
+        if not user_id:
+            return "ERROR: no user context — cannot save credentials."
+
+        # Explicit field filtering — never spread **inp into the pending
+        # entry or the WS frame. If the LLM tries to smuggle in a password
+        # or other field, log a WARNING with KEY NAMES ONLY (no values)
+        # and proceed with only the allowed fields.
+        allowed = {"channel", "email_hint"}
+        unexpected_keys = [k for k in inp.keys() if k not in allowed]
+        if unexpected_keys:
+            logger.warning(
+                "save_streaming_credential received unexpected field(s): %s",
+                list(unexpected_keys),
+            )
+
+        channel = (inp.get("channel") or "").strip().lower()
+        email_hint = inp.get("email_hint")
+        if isinstance(email_hint, str):
+            email_hint = email_hint.strip() or None
+        else:
+            email_hint = None
+
+        # The input_schema enum is authoritative, but double-check because
+        # the schema is enforced by Anthropic and nothing on our side.
+        valid_channels = {
+            "netflix", "prime_video", "disney_plus", "apple_tv", "hbo_max",
+            "hulu", "paramount_plus", "peacock", "crave",
+        }
+        if channel not in valid_channels:
+            return f"ERROR: unknown channel '{channel}'. Valid: {', '.join(sorted(valid_channels))}."
+
+        # Rate limit — every invocation ticks the counter, regardless of
+        # whether the user confirms. Defends against LLM loops.
+        under_limit = await register_attempt(user_id)
+        if not under_limit:
+            return (
+                f"ERROR: rate_limited — more than {RATE_LIMIT_MAX_ATTEMPTS} "
+                f"save attempts in the last {RATE_LIMIT_WINDOW_SECONDS // 60} minutes. "
+                "Wait a few minutes and try again."
+            )
+
+        # Create the pending entry AFTER the rate check so a rate-limited
+        # call leaves no side effect — no pending entry, no WS frame.
+        entry = await create_pending(
+            user_id=user_id,
+            channel=channel,
+            email_hint=email_hint,
+            ttl_seconds=DEFAULT_TTL_SECONDS,
+        )
+
+        # Emit the WS frame to the client.
+        cb = getattr(self, "_on_credential_confirm_request", None)
+        if cb is None:
+            # No WS sink registered (e.g. non-WS entry point like a cron).
+            # Treat as a failure to deliver — the LLM should tell the user
+            # to retry via chat.
+            logger.warning(
+                "save_streaming_credential: no on_credential_confirm_request "
+                "callback registered for user=%s", user_id,
+            )
+            return (
+                "ERROR: could not deliver confirmation card. "
+                "Ask the user to refresh the chat and try again."
+            )
+
+        try:
+            await cb({
+                "type": "credential_confirm_request",
+                "request_id": entry.request_id,
+                "channel": entry.channel,
+                "email_hint": entry.email_hint or "",
+                "expires_at": entry.expires_at,
+            })
+        except Exception as e:
+            logger.exception("on_credential_confirm_request callback raised")
+            return (
+                f"ERROR: could not deliver confirmation card ({type(e).__name__}). "
+                "Ask the user to refresh the chat and try again."
+            )
+
+        return (
+            "Credential confirmation card sent to the user. "
+            "Wait for their reply before taking further action."
+        )
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _resolve_path(self, path: str) -> str:

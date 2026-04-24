@@ -1302,6 +1302,51 @@ def get_extended_tools():
                 "required": ["job_id"],
             },
         },
+        # ------------------------------------------------------------------
+        # save_streaming_credential — Vault CP4 chat-save
+        # ------------------------------------------------------------------
+        {
+            "name": "save_streaming_credential",
+            "description": (
+                "Send the user a confirmation card to save a streaming service login "
+                "(Netflix, Prime Video, Disney+, etc.) into their encrypted Vault. "
+                "The user will fill in email + password through a secure card — do NOT "
+                "ask for the password in chat, and NEVER include a password in this tool's input. "
+                "NEVER call on Telegram or voice channels — the tool will reject and the user "
+                "should be told to use the web or mobile app. "
+                "After calling this tool, wait for the user to confirm via the card before "
+                "taking further action."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "enum": [
+                            "netflix",
+                            "prime_video",
+                            "disney_plus",
+                            "apple_tv",
+                            "hbo_max",
+                            "hulu",
+                            "paramount_plus",
+                            "peacock",
+                            "crave",
+                        ],
+                        "description": "Streaming service slug.",
+                    },
+                    "email_hint": {
+                        "type": "string",
+                        "description": (
+                            "OPTIONAL. If the user already mentioned an email, pass it as a hint "
+                            "so the card pre-fills the field. Leave absent otherwise. "
+                            "NEVER include a password."
+                        ),
+                    },
+                },
+                "required": ["channel"],
+            },
+        },
     ]
 
 

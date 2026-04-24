@@ -62,6 +62,23 @@ def _is_claude_model(model: str) -> bool:
     return model.startswith("claude-")
 
 
+# Vault CP4.1: channels that cannot render the CredentialConfirmCard today.
+# `telegram` and `voice` are permanently excluded (their retention model
+# makes chat-save the wrong UX). `mobile` is excluded until the RN
+# renderer ships; CP4.4 removes `mobile` from this set.
+VAULT_TOOL_CHANNEL_BLOCK = frozenset({"telegram", "voice", "mobile"})
+VAULT_TOOL_NAME = "save_streaming_credential"
+
+
+def strip_vault_tool_for_channel(tools, channel):
+    if not channel or channel.strip().lower() not in VAULT_TOOL_CHANNEL_BLOCK:
+        return tools
+    return [
+        t for t in tools
+        if (t.get("name", "") or t.get("function", {}).get("name", "")) != VAULT_TOOL_NAME
+    ]
+
+
 @dataclass
 class AgentResponse:
     """Final response from a single agent run."""
@@ -83,6 +100,9 @@ OnToolEnd = Callable[[str, str], Coroutine[Any, Any, None]]
 OnToolProgress = Callable[[str, str], Coroutine[Any, Any, None]]
 # Emitted per generated attachment. (message_id, attachment_dict)
 OnAttachment = Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]
+# Vault CP4: emitted when save_streaming_credential is invoked; carries
+# the full frame payload (already shaped for the WS wire).
+OnCredentialConfirmRequest = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 class AgentRunner:
@@ -244,6 +264,7 @@ class AgentRunner:
         on_tool_end: Optional[OnToolEnd] = None,
         on_tool_progress: Optional[OnToolProgress] = None,
         on_attachment: Optional[OnAttachment] = None,
+        on_credential_confirm_request: Optional[OnCredentialConfirmRequest] = None,
         media_paths: Optional[List[str]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         model_override: Optional[str] = None,
@@ -283,6 +304,8 @@ class AgentRunner:
         self.tools.set_chat_id(telegram_chat_id)
         self.tools.set_channel(channel)
         self.tools._on_tool_progress = on_tool_progress
+        # Vault CP4: handler uses this to emit credential_confirm_request frames.
+        self.tools._on_credential_confirm_request = on_credential_confirm_request
 
         # Hook: agent run starting
         _hb = get_hook_bus()
@@ -485,6 +508,11 @@ class AgentRunner:
         all_tools = self.tool_defs
         filtered_tools = filter_tools_by_intent(all_tools, query_intent)
         current_tools = filtered_tools
+
+        # Vault CP4.1: strip save_streaming_credential on channels that
+        # cannot render the confirmation card today (see module-level
+        # VAULT_TOOL_CHANNEL_BLOCK).
+        current_tools = strip_vault_tool_for_channel(current_tools, channel)
 
         # In vibecoding mode, strip all app_builder tools — agent should code directly
         _vibe_job_id: Optional[str] = None
@@ -772,6 +800,8 @@ class AgentRunner:
                         t for t in current_tools
                         if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
                     ]
+                # Vault CP4.1: re-strip save_streaming_credential on blocked channels.
+                current_tools = strip_vault_tool_for_channel(current_tools, channel)
                 logger.info(f"[AGENT] Escalated to full toolset ({len(current_tools)} tools) after tool use")
 
             # ── Mid-loop context compaction ──────────────────────
