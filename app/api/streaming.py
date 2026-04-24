@@ -12,7 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.api.auth import get_current_user
-from app.services.credential_crypto import encrypt_str, decrypt_str
+from app.services.credential_crypto import decrypt_str
+from app.services.credential_save_service import save_encrypted_credential
 
 _audit_log = logging.getLogger("streaming.audit")
 
@@ -61,35 +62,19 @@ async def upsert_credential(
     user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Connect or update a streaming channel."""
-    from app.db.models import StreamingCredential
+    """Connect or update a streaming channel.
 
-    result = await db.execute(
-        select(StreamingCredential).where(
-            and_(
-                StreamingCredential.user_id == user.id,
-                StreamingCredential.channel == body.channel,
-            )
-        )
+    Thin adapter — the real work (encrypt + upsert + commit) lives in
+    `save_encrypted_credential` so the chat-save WS path converges on the
+    same persistence helper.
+    """
+    await save_encrypted_credential(
+        db=db,
+        user_id=user.id,
+        channel=body.channel,
+        email=body.email,
+        password=body.password,
     )
-    cred = result.scalar_one_or_none()
-
-    ciphertext = encrypt_str(body.password)
-    if cred:
-        cred.email = body.email.strip()
-        cred.password = ciphertext
-        cred.updated_at = datetime.utcnow()
-    else:
-        cred = StreamingCredential(
-            id=str(uuid.uuid4()),
-            user_id=user.id,
-            channel=body.channel,
-            email=body.email.strip(),
-            password=ciphertext,
-        )
-        db.add(cred)
-
-    await db.commit()
     return {"status": "connected", "channel": body.channel}
 
 

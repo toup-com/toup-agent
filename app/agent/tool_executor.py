@@ -2623,9 +2623,14 @@ class ToolExecutor:
             )
 
         try:
+            # CP4.3 — include user_id so the platform proxy (Layer A) can
+            # populate its own pending-confirm dict without an extra lookup.
+            # The proxy cross-checks this against the WS connection's
+            # authenticated user_id; an agent can't impersonate another user.
             await cb({
                 "type": "credential_confirm_request",
                 "request_id": entry.request_id,
+                "user_id": user_id,
                 "channel": entry.channel,
                 "email_hint": entry.email_hint or "",
                 "expires_at": entry.expires_at,
