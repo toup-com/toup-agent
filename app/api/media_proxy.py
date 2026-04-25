@@ -156,36 +156,132 @@ def _pick_artwork(info: dict) -> str:
     return (info.get("thumbnail") or "").strip()
 
 
+# YouTube anti-bot detection on cloud-provider IPs (Railway, AWS, GCP) is
+# aggressive and tightens over time. The default `web` extractor is the
+# easiest signature for YouTube to flag — it gets the "Sign in to confirm
+# you're not a bot" challenge first. We fall through a chain of clients
+# that hit different YouTube API endpoints with different headers; the
+# lighter-weight non-web clients are far less frequently flagged.
+#
+# Order chosen by empirical hit rate on Railway egress IPs (2026-04):
+#   - tv_embedded   YouTube TV embedded player; most permissive overall.
+#   - android_music YouTube Music app on Android; ideal for music tracks
+#                   because that's literally what these are designed to
+#                   stream. Often returns higher-bitrate audio than `web`.
+#   - ios           iOS YouTube app extractor; reliable for non-music too.
+#   - android       Android YouTube app; falls back here when the music
+#                   client refuses (live streams, podcasts).
+#
+# Web/mweb deliberately omitted: they're the first to be bot-flagged and
+# rarely succeed when the others fail. Adding them just burns latency.
+_PLAYER_CLIENTS = ("tv_embedded", "android_music", "ios", "android")
+
+
+def _is_bot_block(err: BaseException) -> bool:
+    """Match YouTube's anti-bot challenge specifically.
+
+    Other DownloadError reasons (private/removed/region-blocked/age-gated)
+    are real and won't change with a different client — burning the whole
+    fallback chain for them just adds latency. Match conservatively on the
+    distinctive challenge phrases.
+    """
+    msg = str(err).lower()
+    return (
+        "sign in to confirm you're not a bot" in msg
+        or "sign in to confirm you" in msg
+        or "confirm you're not a bot" in msg
+    )
+
+
 def _extract_audio(video_id: str) -> dict:
-    """Blocking extract; callers must run in a thread / executor."""
+    """Blocking extract; callers must run in a thread / executor.
+
+    Multi-client fallback is the production posture for working around
+    YouTube's anti-bot challenges on cloud egress. We try clients in
+    order of empirical reliability and short-circuit on first success.
+    Bot-block errors fall through to the next client; non-bot errors
+    (real "this video is unavailable") abort the chain so the caller
+    sees a fast, accurate 502 rather than waiting on every client.
+
+    Optional cookies file: set YT_DLP_COOKIES_PATH in the Railway env to
+    a Netscape-format cookies.txt for the operator's own YouTube session.
+    Last-resort defense if every client gets blocked simultaneously.
+    Cookies aren't shipped by default — keeping the operator-credential
+    surface area small until we actually need it.
+    """
     import yt_dlp
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        # Prefer m4a/aac — iOS AVFoundation decodes it natively. Fall back
-        # to any bestaudio (usually webm/opus) only if m4a is unavailable.
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "socket_timeout": 10,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(
-            f"https://www.youtube.com/watch?v={video_id}",
-            download=False,
+    import os
+
+    cookiefile = os.environ.get("YT_DLP_COOKIES_PATH") or None
+    last_err: BaseException | None = None
+
+    for client in _PLAYER_CLIENTS:
+        opts: dict = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            # Prefer m4a/aac — iOS AVFoundation decodes it natively. Fall
+            # back to any bestaudio (usually webm/opus) only if m4a is
+            # unavailable.
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "socket_timeout": 10,
+            "extractor_args": {"youtube": {"player_client": [client]}},
+        }
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(
+                    f"https://www.youtube.com/watch?v={video_id}",
+                    download=False,
+                )
+        except Exception as e:
+            last_err = e
+            if _is_bot_block(e):
+                logger.warning(
+                    "[media_proxy] client=%s bot-blocked video_id=%s; trying next",
+                    client, video_id,
+                )
+                continue
+            # Non-bot DownloadError (private/removed/region-blocked/age-gated):
+            # the same video on a different client will fail the same way.
+            # Abort the chain so the caller gets a fast, accurate error.
+            logger.warning(
+                "[media_proxy] client=%s non-bot error video_id=%s: %s — abort",
+                client, video_id, e,
+            )
+            return {"error": "extraction_failed", "detail": str(e)}
+
+        if not info or not info.get("url"):
+            # Some clients return None or empty for unsupported video types
+            # (e.g. android_music on a non-music video). Try the next one.
+            last_err = RuntimeError(f"no_stream_url client={client}")
+            continue
+
+        url = info["url"]
+        ext = info.get("ext") or "m4a"
+        logger.info(
+            "[media_proxy] audio_url ok video_id=%s client=%s ext=%s bitrate=%s",
+            video_id, client, ext, info.get("abr"),
         )
-    if not info or not info.get("url"):
-        return {"error": "no_stream_url"}
-    url = info["url"]
-    ext = info.get("ext") or "m4a"
+        return {
+            "url": url,
+            "expires_at": _parse_expires(url),
+            "duration": int(info.get("duration") or 0),
+            "mime_type": _mime_from_ext(ext),
+            "ext": ext,
+            "bitrate": int(info.get("abr") or 0),
+            "title": info.get("title") or "",
+            "artwork_url": _pick_artwork(info),
+        }
+
+    # Every client got blocked or returned no URL. This is rare in
+    # practice; if it starts happening at scale, set YT_DLP_COOKIES_PATH
+    # before reaching for residential proxies.
     return {
-        "url": url,
-        "expires_at": _parse_expires(url),
-        "duration": int(info.get("duration") or 0),
-        "mime_type": _mime_from_ext(ext),
-        "ext": ext,
-        "bitrate": int(info.get("abr") or 0),
-        "title": info.get("title") or "",
-        "artwork_url": _pick_artwork(info),
+        "error": "all_clients_blocked",
+        "detail": str(last_err) if last_err else "all clients returned no stream",
     }
 
 
