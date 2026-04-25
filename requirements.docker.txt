@@ -46,7 +46,7 @@ python-pptx>=1.0.0
 # stripe + boto3 (vps.py imports aws_service → boto3 at module load).
 # Without either, the billing routes return 404 and the embedded
 # subscription flow hangs at "Activating your subscription…"
-stripe>=7.0.0
+stripe>=15.0.0,<16.0.0  # pinned: Basil 2025-03-31 broke invoice.payment_intent; see stripe_service.py header
 boto3>=1.34.0
 
 # Web scraping

@@ -13,6 +13,12 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Pin Stripe API version explicitly. Default-version drift through wheel
+# upgrades is what removed `invoice.payment_intent` in Basil 2025-03-31 and
+# silently broke create-subscription in prod. Keep the contract loud in code.
+# When bumping, audit changelogs for affected fields and update tests + skill.
+stripe.api_version = "2025-03-31.basil"
+
 # Map plan IDs to Stripe Price IDs from config
 PLAN_PRICE_MAP = {
     "starter": "stripe_starter_price_id",
@@ -83,13 +89,12 @@ def create_subscription_with_intent(
                 "user_id": user_id,
                 "type": "llm_bundle",
             },
-            "expand": ["latest_invoice.payment_intent"],
+            "expand": ["latest_invoice.confirmation_secret"],
         }
     )
-    pi = sub.latest_invoice.payment_intent
     return {
         "subscription_id": sub.id,
-        "client_secret": pi.client_secret,
+        "client_secret": sub.latest_invoice.confirmation_secret.client_secret,
         "status": sub.status,
     }
 
@@ -115,14 +120,14 @@ def get_active_subscription_for_customer(customer_id: str, price_id: str) -> Opt
                 "price": price_id,
                 "status": "incomplete",
                 "limit": 1,
-                "expand": ["data.latest_invoice.payment_intent"],
+                "expand": ["data.latest_invoice.confirmation_secret"],
             }
         )
         if subs_inc.data:
-            pi = subs_inc.data[0].latest_invoice.payment_intent
+            cs = subs_inc.data[0].latest_invoice.confirmation_secret
             return {
                 "subscription_id": subs_inc.data[0].id,
-                "client_secret": pi.client_secret if pi else None,
+                "client_secret": cs.client_secret if cs else None,
                 "status": "incomplete",
             }
         return None

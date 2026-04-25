@@ -389,13 +389,17 @@ async def test_create_subscription_end_to_end_live_stripe(
     sub_id = body["subscription_id"]
     stripe_cleanup["subscription"](sub_id)
 
-    # Retrieve the PaymentIntent from the invoice, attach a test PaymentMethod,
-    # confirm it. In test mode pm_card_visa auto-succeeds.
-    sub = stripe.Subscription.retrieve(sub_id, expand=["latest_invoice.payment_intent"])
+    # Pay the freshly-created invoice. Basil 2025-03-31 removed
+    # `invoice.payment_intent`; the supported confirmation path is
+    # `stripe.Invoice.pay(...)` with a PaymentMethod that must already
+    # be attached to the customer (unlike the old PaymentIntent.confirm
+    # flow which would accept the global `pm_card_visa` token directly).
+    # Create + attach a real PM, then pay.
+    sub = stripe.Subscription.retrieve(sub_id)
     stripe_cleanup["customer"](sub.customer)
-    pi_id = sub.latest_invoice.payment_intent.id
-
-    stripe.PaymentIntent.confirm(pi_id, payment_method="pm_card_visa")
+    pm = stripe.PaymentMethod.create(type="card", card={"token": "tok_visa"})
+    stripe.PaymentMethod.attach(pm.id, customer=sub.customer)
+    stripe.Invoice.pay(sub.latest_invoice, payment_method=pm.id)
 
     # Poll Stripe briefly for the subscription to go active, then assert our DB state.
     # (In a real CI run with `stripe listen`, the webhook path fires on its own.
