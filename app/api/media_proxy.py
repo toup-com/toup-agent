@@ -177,20 +177,34 @@ def _pick_artwork(info: dict) -> str:
 _PLAYER_CLIENTS = ("tv_embedded", "android_music", "ios", "android")
 
 
-def _is_bot_block(err: BaseException) -> bool:
-    """Match YouTube's anti-bot challenge specifically.
+def _should_try_next_client(err: BaseException) -> bool:
+    """Should this error fall through to the next client in the chain?
 
-    Other DownloadError reasons (private/removed/region-blocked/age-gated)
-    are real and won't change with a different client — burning the whole
-    fallback chain for them just adds latency. Match conservatively on the
-    distinctive challenge phrases.
+    Two distinct fall-through cases:
+
+    1. **Bot-block.** YouTube's "Sign in to confirm you're not a bot"
+       challenge — a different extractor client uses different headers
+       and API endpoints, so it may slip past.
+
+    2. **Per-client format gap.** Some clients (notably `ios`) expose
+       only a subset of formats. yt-dlp emits "Requested format is not
+       available" rather than degrading. Trying a different client
+       (e.g. `android`) often surfaces the full format catalog.
+
+    Real "video unavailable" errors (private / removed / region-blocked
+    / age-gated) are unchanged across clients and abort the chain so
+    callers get a fast, accurate 502.
     """
     msg = str(err).lower()
-    return (
+    if (
         "sign in to confirm you're not a bot" in msg
         or "sign in to confirm you" in msg
         or "confirm you're not a bot" in msg
-    )
+    ):
+        return True
+    if "requested format is not available" in msg:
+        return True
+    return False
 
 
 def _extract_audio(video_id: str) -> dict:
@@ -238,17 +252,17 @@ def _extract_audio(video_id: str) -> dict:
                 )
         except Exception as e:
             last_err = e
-            if _is_bot_block(e):
+            if _should_try_next_client(e):
                 logger.warning(
-                    "[media_proxy] client=%s bot-blocked video_id=%s; trying next",
-                    client, video_id,
+                    "[media_proxy] client=%s fall-through video_id=%s err=%s",
+                    client, video_id, str(e)[:120],
                 )
                 continue
-            # Non-bot DownloadError (private/removed/region-blocked/age-gated):
-            # the same video on a different client will fail the same way.
-            # Abort the chain so the caller gets a fast, accurate error.
+            # Real "video unavailable" (private/removed/region-blocked/
+            # age-gated) — won't change with a different client. Abort
+            # so the caller gets a fast, accurate error.
             logger.warning(
-                "[media_proxy] client=%s non-bot error video_id=%s: %s — abort",
+                "[media_proxy] client=%s permanent error video_id=%s: %s — abort",
                 client, video_id, e,
             )
             return {"error": "extraction_failed", "detail": str(e)}
