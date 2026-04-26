@@ -36,9 +36,38 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.models import ManagedContainer, AgentConfig
+from app.db.models import ManagedContainer, AgentConfig, Rollout
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Image-tag resolution for new tenants ────────────────────────
+
+
+async def _latest_known_good_image_tag(db: AsyncSession) -> Optional[str]:
+    """Image_tag of the most recent successfully-completed rollout.
+
+    The "last-good SHA" already running in the tenant fleet — what new
+    tenants should be provisioned onto. Skips `aborted_canary_failed`,
+    `cancelled`, `pending`, and `running` rollouts; only `complete`
+    rollouts mean "this SHA passed canary + reached the rest of the
+    fleet healthily."
+
+    Returns None only on a fresh platform install with no rollout
+    history. Callers fall back to settings.docker_agent_image in that
+    case (which is intentionally a safe sentinel, not a deployable tag).
+
+    See: 2026-04-26 Alireza incident — first-time bundle subscriber's
+    provision_container call hit the bridge with `toup-agent:latest` (the
+    sentinel) → 404 because the rollout pipeline only publishes SHA tags.
+    """
+    result = await db.execute(
+        select(Rollout.image_tag)
+        .where(Rollout.status == "complete")
+        .order_by(Rollout.completed_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 # ─── Bridge httpx client (mTLS) ───────────────────────────────────
@@ -154,10 +183,15 @@ async def provision_container(
         )
         agent_config = result.scalar_one_or_none()
 
+    # Resolve image_tag from the latest successful rollout. The settings
+    # default ("toup-agent:latest") is only a fresh-install sentinel — it
+    # is NOT published to GHCR, so falling through to it for new tenants
+    # is what caused the 2026-04-26 Alireza incident.
+    image_tag = await _latest_known_good_image_tag(db) or settings.docker_agent_image
     body = {
         "prefix": prefix,
         "user_id": user_id,
-        "image_tag": settings.docker_agent_image,
+        "image_tag": image_tag,
         "agent_config": _agent_config_to_bridge_body(agent_config),
     }
 

@@ -257,7 +257,11 @@ class Settings(BaseSettings):
     # docker_host_ssh_password, docker_host_pg_url) are gone. Anything still
     # reading them is a bug.
     docker_host_ip: str = ""                # Public IP of Docker host — used only by legacy callers being phased out
-    docker_agent_image: str = "toup-agent:latest"  # Deprecated default; bridge populates ManagedContainer.image_tag with real SHAs
+    # Sentinel only — fresh-install hard fallback. Production resolves the
+    # real SHA via _latest_known_good_image_tag() in docker_host_service.py.
+    # Do NOT publish this tag to GHCR; if it ever reaches the bridge, that's
+    # a fresh-install-with-no-rollouts edge case that should be visible.
+    docker_agent_image: str = "toup-agent:latest"
     docker_port_range_start: int = 9000     # Kept for the bridge's port allocation
     docker_port_range_end: int = 9999
     managed_hosting_enabled: bool = False   # Gate: set True once bridge is reachable
