@@ -48,7 +48,6 @@ async def _make_engine():
                     id VARCHAR(36) PRIMARY KEY,
                     email VARCHAR(255) UNIQUE,
                     hashed_password VARCHAR(255),
-                    password_plain VARCHAR(255),
                     name VARCHAR(255),
                     password_changed_at TIMESTAMP,
                     role VARCHAR(20) DEFAULT 'beta_user',

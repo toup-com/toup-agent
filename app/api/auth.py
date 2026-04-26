@@ -314,7 +314,6 @@ async def delete_account(
     current_user.email = f"deleted-{current_user.id}@deleted.toup.ai"
     current_user.name = "Deleted User"
     current_user.hashed_password = "deleted"
-    current_user.password_plain = None
     current_user.stripe_customer_id = None
     current_user.timezone = None
     current_user.is_active = False

@@ -40,7 +40,7 @@ async def _make_engine():
         for stmt in [
             """CREATE TABLE IF NOT EXISTS users (
                 id VARCHAR(36) PRIMARY KEY, email VARCHAR(255) UNIQUE,
-                hashed_password VARCHAR(255), password_plain VARCHAR(255),
+                hashed_password VARCHAR(255),
                 name VARCHAR(255), password_changed_at TIMESTAMP,
                 role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
                 updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
