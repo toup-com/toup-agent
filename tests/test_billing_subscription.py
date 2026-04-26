@@ -435,3 +435,53 @@ async def test_create_subscription_is_idempotent_for_active_user(
     body = resp.json()
     assert body["status"] == "already_active"
     assert body["subscription_id"] == sub_id
+
+
+@pytest.mark.asyncio
+async def test_create_subscription_resumes_existing_stripe_customer(
+    client: AsyncClient,
+    auth_headers: dict[str, str],
+    test_user_id: str,
+    _test_user: dict[str, str],
+    stripe_test_mode: str,
+    stripe_cleanup,
+):
+    """
+    Live Stripe test-mode: pre-create a Stripe Customer with the user's email
+    BEFORE calling /create-subscription, so `get_or_create_customer` enters
+    the existing-customer branch (customers.list().data is non-empty).
+
+    Regression guard for the 2026-04-26 incident: stripe-python 15.x exposes
+    `cust.metadata` as a StripeObject, not a dict. The line
+    `cust.metadata.get("user_id")` raised `AttributeError: get`, surfacing as
+    HTTP 500. The fresh-email live e2e test never enters this branch, so the
+    bug went latent through CI. This test exercises that path explicitly.
+    """
+    import stripe
+    stripe.api_key = stripe_test_mode
+
+    from app.config import settings
+    if not settings.stripe_llm_bundle_price_id:
+        pytest.skip("STRIPE_LLM_BUNDLE_PRICE_ID not configured")
+
+    # Pre-create a Stripe Customer with the test user's email + a stale
+    # user_id in metadata so the "metadata mismatch → update" branch also fires.
+    existing_cust = stripe.Customer.create(
+        email=_test_user["email"],
+        metadata={"user_id": "stale-prior-user-id"},
+    )
+    stripe_cleanup["customer"](existing_cust.id)
+
+    await _seed_agent_config(test_user_id, bundle_status="none")
+
+    resp = await client.post("/api/billing/create-subscription", headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("status") == "incomplete", body
+    assert body.get("client_secret"), body
+    stripe_cleanup["subscription"](body["subscription_id"])
+
+    # Confirm the existing customer was reused (not duplicated) and the
+    # endpoint refreshed metadata.user_id to the real test user.
+    refreshed = stripe.Customer.retrieve(existing_cust.id)
+    assert refreshed.metadata.user_id == test_user_id

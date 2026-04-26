@@ -47,8 +47,11 @@ def get_or_create_customer(user_id: str, email: str, name: Optional[str] = None)
     existing = client.customers.list(params={"email": email, "limit": 1})
     if existing.data:
         cust = existing.data[0]
-        # Ensure our user_id is in metadata
-        if cust.metadata.get("user_id") != user_id:
+        # Ensure our user_id is in metadata. NB: stripe-python 15.x exposes
+        # `cust.metadata` as a StripeObject, not a dict — calling `.get(...)`
+        # raises `AttributeError: get`. Use `getattr` so the lookup works on
+        # both StripeObject (via __getattr__) and plain dicts.
+        if getattr(cust.metadata, "user_id", None) != user_id:
             client.customers.update(
                 cust.id,
                 params={"metadata": {"user_id": user_id}},
