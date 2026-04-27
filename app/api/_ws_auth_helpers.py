@@ -78,6 +78,18 @@ def log_deprecated_query_token(endpoint_label: str) -> None:
     )
 
 
+def log_deprecated_agent_key_url(endpoint_label: str) -> None:
+    """Vault Ticket 1 / ST-3: parallel marker for `agent_key` migration
+    from URL query param to `X-Agent-Key` header. Call only when the
+    URL fallback was actually used for auth (not just present), so a
+    future grep "[DEPRECATED-AGENT-KEY-URL]" reflects live exposure."""
+    logger.warning(
+        "[DEPRECATED-AGENT-KEY-URL] %s used ?agent_key= query param for auth — "
+        "migrate caller to X-Agent-Key request header",
+        endpoint_label,
+    )
+
+
 async def safe_send_close_ws(
     websocket: WebSocket,
     code: int,

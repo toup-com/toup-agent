@@ -998,16 +998,33 @@ async def ws_chat(
     Auth: agent_key (proxy mode) OR JWT (subprotocol/?token=/first-frame).
     """
     # ST-2: accept + subprotocol JWT extraction.
+    # ST-3a: agent_key now preferred via X-Agent-Key request header
+    # (read from the upgrade-request headers). The ?agent_key= query
+    # path stays alive as a bake-window fallback and emits
+    # [DEPRECATED-AGENT-KEY-URL] when used for auth.
     from app.api._ws_auth_helpers import (
         accept_with_subprotocol_auth,
         log_deprecated_query_token,
+        log_deprecated_agent_key_url,
         safe_send_close_ws,
     )
+    # Headers are populated from the upgrade request; available before
+    # or after accept (we read after, for readability).
+    header_agent_key = websocket.headers.get("x-agent-key") or ""
     subprotocol_token = await accept_with_subprotocol_auth(websocket)
     user_id: Optional[str] = None
 
-    # Try agent_key auth first (platform proxy mode)
-    if agent_key and settings.agent_api_key and agent_key == settings.agent_api_key:
+    # Try agent_key auth first (platform proxy mode).
+    # 1. X-Agent-Key header (preferred — no URL leak).
+    # 2. ?agent_key= query (deprecated — fires marker on use).
+    matched_agent_key: Optional[str] = None
+    if header_agent_key and settings.agent_api_key and header_agent_key == settings.agent_api_key:
+        matched_agent_key = header_agent_key
+    elif agent_key and settings.agent_api_key and agent_key == settings.agent_api_key:
+        log_deprecated_agent_key_url("/api/ws/chat")
+        matched_agent_key = agent_key
+
+    if matched_agent_key:
         user_id = settings.user_id
         if user_id:
             # Ensure stub user exists (same as auth.py agent mode)
