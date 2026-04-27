@@ -216,8 +216,10 @@ Documents:
 Return ONLY valid JSON: {{"scores": [{{"index": 0, "score": 7.5}}, ...]}}"""
 
         try:
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=self.openai_api_key)
+            from app.services.bundle_client import make_openai_client
+            client = make_openai_client(byok_key=self.openai_api_key)
+            if client is None:
+                raise RuntimeError("No OpenAI client available (no key, not in bundle mode)")
             oai_resp = await client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],

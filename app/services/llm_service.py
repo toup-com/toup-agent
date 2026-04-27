@@ -67,8 +67,10 @@ class LLMService:
             self._anthropic_svc = AnthropicService()
             self.default_model = settings.agent_model or "claude-sonnet-4-6"
         else:
+            from app.services.bundle_client import make_openai_client
             from openai import AsyncOpenAI
-            self._openai_client = AsyncOpenAI(api_key=api_key or keys.openai or "missing")
+            client = make_openai_client(byok_key=api_key or keys.openai or None)
+            self._openai_client = client or AsyncOpenAI(api_key="missing")
             self.default_model = settings.default_model
 
         self.default_temperature = settings.temperature

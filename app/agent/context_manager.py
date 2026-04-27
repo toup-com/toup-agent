@@ -179,8 +179,10 @@ async def compact_messages(
 async def _llm_summarize(text: str, model: str) -> str:
     """Use the LLM to generate a concise conversation summary."""
     try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        from app.services.bundle_client import make_openai_client
+        client = make_openai_client()
+        if client is None:
+            return ""  # Summarization is best-effort; no key → no summary.
 
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",  # Use cheap model for summarization

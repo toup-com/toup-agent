@@ -72,31 +72,15 @@ class OpenAIAgentService:
             return
         self._key_version = self._keys.version
 
-        # Bundle mode: route OpenAI calls through the Toup proxy
-        # (analogous to AnthropicService — see anthropic_service._ensure_client
-        # for the matin incident context, including the Cloudflare WAF block
-        # on the SDK's default user-agent).
-        if settings.llm_mode == "bundle" and settings.toup_token:
-            import httpx
-            base_url = f"{settings.platform_api_url.rstrip('/')}/llm/openai/v1"
-            _http_client = httpx.AsyncClient(
-                headers={"user-agent": "toup-agent/1.0 (bundle-proxy)"},
-                timeout=120,
-            )
-            self.client = AsyncOpenAI(
-                api_key=settings.toup_token,
-                base_url=base_url,
-                http_client=_http_client,
-            )
-            logger.info("[OPENAI] Client rebuilt for bundle proxy at %s (v%d)",
-                        base_url, self._key_version)
+        from app.services.bundle_client import make_openai_client
+        client = make_openai_client(byok_key=self._keys.openai or None)
+        if client is None:
+            logger.warning("OpenAI client could not be built (no key, not in bundle mode)")
+            self.client = AsyncOpenAI(api_key="missing")
             return
-
-        api_key = self._keys.openai or ""
-        if not api_key:
-            logger.warning("OPENAI_API_KEY not set — OpenAIAgentService will fail on calls")
-        self.client = AsyncOpenAI(api_key=api_key or "missing")
-        logger.info("[OPENAI] Client rebuilt (v%d)", self._key_version)
+        self.client = client
+        logger.info("[OPENAI] Client rebuilt (mode=%s, v%d)",
+                    settings.llm_mode, self._key_version)
 
     # ------------------------------------------------------------------
     # Streaming completion  (main interface used by agent_runner)

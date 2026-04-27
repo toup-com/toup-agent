@@ -3824,10 +3824,13 @@ const _webDb = {
         """
         import time as _time
         import anthropic
-        import os
+        from app.config import settings as _settings
+        from app.services.bundle_client import make_anthropic_client
 
-        is_oauth = "sk-ant-oat" in anthropic_key
+        # OAuth (sk-ant-oat) only meaningful in BYOK; bundle proxy never sees it.
+        is_oauth = (_settings.llm_mode != "bundle") and "sk-ant-oat" in (anthropic_key or "")
         if is_oauth:
+            import os
             os.environ.pop("ANTHROPIC_API_KEY", None)
             client = anthropic.AsyncAnthropic(
                 auth_token=anthropic_key,
@@ -3838,7 +3841,9 @@ const _webDb = {
                 },
             )
         else:
-            client = anthropic.AsyncAnthropic(api_key=anthropic_key)
+            client = make_anthropic_client(byok_key=anthropic_key)
+            if client is None:
+                raise RuntimeError("No Anthropic client available (no key, not in bundle mode)")
 
         _sys = ([
             {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
@@ -3918,9 +3923,12 @@ const _webDb = {
     ) -> str:
         """Call OpenAI API with streaming and proper error handling."""
         import time as _time
-        from openai import AsyncOpenAI, AuthenticationError, RateLimitError, APIStatusError
+        from openai import AuthenticationError, RateLimitError, APIStatusError
+        from app.services.bundle_client import make_openai_client
 
-        client = AsyncOpenAI(api_key=openai_key)
+        client = make_openai_client(byok_key=openai_key)
+        if client is None:
+            raise RuntimeError("No OpenAI client available (no key, not in bundle mode)")
         model = self._resolve_openai_model()
         print(f"[LLM] Calling OpenAI ({model})...", flush=True)
 

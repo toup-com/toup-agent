@@ -132,60 +132,23 @@ class AnthropicService:
             return
         self._key_version = self._keys.version
 
-        # Bundle mode: route every Anthropic call through the Toup LLM proxy
-        # using TOUP_TOKEN as the api_key. The proxy handles the real Anthropic
-        # call (with platform's master Anthropic key + per-user budget gating).
-        # Without this branch, llm_mode=bundle subscribers' agents call
-        # api.anthropic.com directly with no usable key — every chat returns
-        # "API key invalid" (matin incident, 2026-04-27).
-        if settings.llm_mode == "bundle" and settings.toup_token:
-            self.is_oauth = False
-            base_url = f"{settings.platform_api_url.rstrip('/')}/llm"
-            # Override the SDK's default user-agent. Cloudflare in front of
-            # toup.ai blocks the bare "Anthropic/Python X.Y.Z" user-agent as
-            # a known automation signature → 403 "Your request was blocked."
-            # Identifying as a Toup-internal client passes the WAF cleanly.
-            # (matin incident, 2026-04-27 — chained 4th root cause.)
-            import httpx
-            _http_client = httpx.AsyncClient(
-                headers={"user-agent": "toup-agent/1.0 (bundle-proxy)"},
-                timeout=120,
-            )
-            self.client = anthropic.AsyncAnthropic(
-                api_key=settings.toup_token,
-                base_url=base_url,
-                http_client=_http_client,
-            )
-            logger.info("[ANTHROPIC] Client rebuilt for bundle proxy at %s (v%d)",
-                        base_url, self._key_version)
-            return
+        from app.services.bundle_client import make_anthropic_client
 
         api_key = self._keys.anthropic or ""
-
-        if not api_key:
-            logger.warning("ANTHROPIC_API_KEY not set — AnthropicService will fail on calls")
-
-        # Detect OAuth tokens (sk-ant-oat*) vs regular API keys (sk-ant-api*)
-        self.is_oauth = bool(api_key and "sk-ant-oat" in api_key)
-        if self.is_oauth:
-            logger.info("Using Anthropic OAuth token authentication (Claude Code mode)")
-            import os
-            os.environ.pop("ANTHROPIC_API_KEY", None)
-            import httpx
-            _http_client = httpx.AsyncClient(
-                headers={"user-agent": "claude-code/1.0.33"},
-            )
-            self.client = anthropic.AsyncAnthropic(
-                auth_token=api_key,
-                http_client=_http_client,
-                default_headers={
-                    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-                    "x-app": "claude-code",
-                },
-            )
-        else:
-            self.client = anthropic.AsyncAnthropic(api_key=api_key or "missing")
-        logger.info("[ANTHROPIC] Client rebuilt (oauth=%s, v%d)", self.is_oauth, self._key_version)
+        # OAuth detection only matters for BYOK; bundle mode never uses OAuth.
+        self.is_oauth = bool(
+            settings.llm_mode != "bundle"
+            and api_key
+            and "sk-ant-oat" in api_key
+        )
+        client = make_anthropic_client(byok_key=api_key or None)
+        if client is None:
+            logger.warning("Anthropic client could not be built (no key, not in bundle mode)")
+            self.client = anthropic.AsyncAnthropic(api_key="missing")
+            return
+        self.client = client
+        logger.info("[ANTHROPIC] Client rebuilt (mode=%s, oauth=%s, v%d)",
+                    settings.llm_mode, self.is_oauth, self._key_version)
     
     def _prepare_system(self, system: str) -> any:
         """

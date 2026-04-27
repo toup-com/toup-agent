@@ -1728,15 +1728,18 @@ async def _run_browser_agent_inner(
     _requested_model = model_override or "claude-opus-4-6"
     _is_openai_model = _requested_model.startswith("gpt-") or _requested_model.startswith("o1-") or _requested_model.startswith("o3-")
 
+    from app.services.bundle_client import make_openai_client, make_anthropic_client
+
     if _is_openai_model:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        client = make_openai_client()
         model = _requested_model
         _llm_provider = "openai"
     elif _use_claude:
-        from anthropic import AsyncAnthropic
-        _is_oauth = "sk-ant-oat" in _ant_key
-        if _is_oauth:
+        # OAuth handling for the interleaved-thinking beta is only valid in
+        # BYOK mode (bundle proxy never sees an sk-ant-oat token). Bundle
+        # subscribers go through the standard proxy path.
+        if settings.llm_mode != "bundle" and "sk-ant-oat" in (_ant_key or ""):
+            from anthropic import AsyncAnthropic
             import os
             os.environ.pop("ANTHROPIC_API_KEY", None)
             client = AsyncAnthropic(
@@ -1748,13 +1751,11 @@ async def _run_browser_agent_inner(
                 },
             )
         else:
-            client = AsyncAnthropic(api_key=_ant_key)
+            client = make_anthropic_client(byok_key=_ant_key)
         model = _requested_model
-
         _llm_provider = "anthropic"
     else:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        client = make_openai_client()
         model = _requested_model if _is_openai_model else "gpt-5.4"
         _llm_provider = "openai"
 
