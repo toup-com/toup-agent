@@ -103,11 +103,17 @@ async def _sync_active_subscription_to_db(
     config.bundle_period_start = now
     if period_end:
         config.bundle_period_end = period_end
+    # Hash the agent's connect_token (= TOUP_TOKEN env in the container) so
+    # the LLM proxy can authenticate the agent's incoming Bearer header.
+    # Generating a fresh random secret here would never reach the agent.
+    if not config.connect_token:
+        config.connect_token = f"toup_ct_{secrets.token_urlsafe(32)}"
     if not config.llm_token_hash:
-        token = secrets.token_urlsafe(32)
-        config.llm_token_hash = hashlib.sha256(token.encode()).hexdigest()
+        config.llm_token_hash = hashlib.sha256(
+            config.connect_token.encode()
+        ).hexdigest()
         logger.info(
-            "Generated LLM proxy token for user %s via already_active sync",
+            "Synced llm_token_hash from connect_token for user %s via already_active sync",
             config.user_id,
         )
     await db.commit()

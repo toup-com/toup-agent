@@ -23,6 +23,7 @@ gives CI full end-to-end coverage when the secret is wired.
 from __future__ import annotations
 
 import secrets as secrets_mod
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -170,6 +171,73 @@ async def test_invoice_payment_succeeded_activates_bundle(
     assert cfg.bundle_started_at is not None
     assert cfg.bundle_period_end is not None
     assert cfg.llm_mode == "bundle"
+
+
+@pytest.mark.asyncio
+async def test_llm_token_hash_matches_sha256_of_connect_token(
+    client: AsyncClient, auth_headers: dict[str, str], test_user_id: str, signed_stripe_event
+):
+    """
+    THE contract that makes the LLM proxy work: after bundle activation,
+    `llm_token_hash` MUST equal sha256(connect_token). The agent's env has
+    TOUP_TOKEN=<connect_token>; agent presents it as Bearer to /api/llm;
+    proxy hashes incoming and looks up by llm_token_hash. If these don't
+    match, every bundle agent's LLM call returns 401.
+
+    Regression guard for the 2026-04-27 latent bug: the webhook used to
+    mint a fresh random token, hash that, and discard the cleartext —
+    the agent had no way to obtain the matching secret.
+    """
+    import hashlib
+    sub_id = "sub_test_token_contract_" + secrets_mod.token_hex(4)
+    await _seed_agent_config(test_user_id, bundle_status="none", subscription_id=sub_id)
+
+    payload, headers = signed_stripe_event(
+        "invoice.payment_succeeded",
+        {"id": f"in_test_{secrets_mod.token_hex(4)}", "subscription": sub_id, "object": "invoice"},
+    )
+    with patch("app.services.stripe_service.get_subscription", side_effect=_fake_get_subscription):
+        resp = await client.post("/api/vps/webhook/stripe", content=payload, headers=headers)
+    assert resp.status_code == 200
+
+    cfg = await _get_agent_config(test_user_id)
+    assert cfg.connect_token, "connect_token must be set after webhook"
+    assert cfg.llm_token_hash, "llm_token_hash must be set after webhook"
+    expected = hashlib.sha256(cfg.connect_token.encode()).hexdigest()
+    assert cfg.llm_token_hash == expected, (
+        f"llm_token_hash != sha256(connect_token) — agent's TOUP_TOKEN won't auth.\n"
+        f"  connect_token={cfg.connect_token[:12]}...\n"
+        f"  llm_token_hash={cfg.llm_token_hash[:16]}...\n"
+        f"  expected={expected[:16]}..."
+    )
+
+
+@pytest.mark.asyncio
+async def test_subscription_updated_out_of_order_uses_connect_token_for_hash(
+    client: AsyncClient, auth_headers: dict[str, str], test_user_id: str, signed_stripe_event
+):
+    """Out-of-order path (subscription.updated lands first) must use the same
+    connect_token-based hashing — otherwise the convergence is wrong."""
+    import hashlib
+    sub_id = "sub_test_order_" + secrets_mod.token_hex(4)
+    await _seed_agent_config(test_user_id, bundle_status="none", subscription_id=sub_id)
+
+    payload, headers = signed_stripe_event(
+        "customer.subscription.updated",
+        {
+            "id": sub_id, "object": "subscription", "status": "active",
+            "cancel_at_period_end": False,
+            "metadata": {"type": "llm_bundle", "user_id": test_user_id},
+            "current_period_end": int(time.time()) + 30 * 86400,
+        },
+    )
+    resp = await client.post("/api/vps/webhook/stripe", content=payload, headers=headers)
+    assert resp.status_code == 200
+
+    cfg = await _get_agent_config(test_user_id)
+    assert cfg.bundle_status == "active"
+    assert cfg.connect_token, "connect_token must be lazily generated on out-of-order activation"
+    assert cfg.llm_token_hash == hashlib.sha256(cfg.connect_token.encode()).hexdigest()
 
 
 @pytest.mark.asyncio
