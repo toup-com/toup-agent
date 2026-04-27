@@ -383,6 +383,27 @@ _openai = OpenAIBackend()
 _toup = ToupModelBackend()
 
 
+# Toup-internal model aliases → real provider model identifiers.
+# The agent's model_router emits stable Toup-internal names (e.g.
+# "claude-opus-4-7") so we can swap the underlying upstream model
+# without redeploying every tenant container. Update the right-hand
+# side when our platform Anthropic / OpenAI key gains access to a
+# newer tier (matin incident, 2026-04-27 — bare "claude-opus-4-7"
+# was rejected by Anthropic upstream because the platform master key
+# was provisioned for the dated 4-1 model).
+MODEL_ALIASES: dict[str, str] = {
+    "claude-opus-4-7": "claude-opus-4-1-20250805",
+    "claude-sonnet-4-6": "claude-sonnet-4-5-20250929",
+}
+
+
+def _resolve_model_alias(model: str) -> str:
+    """Translate a Toup-internal model name to a real provider model id.
+    Pass-through for names that aren't aliases (allows callers to send
+    real provider names directly when they want)."""
+    return MODEL_ALIASES.get(model, model)
+
+
 def _route_chat(model: str, config: AgentConfig) -> tuple[LLMBackend, str]:
     """
     Pick the backend + API key for a chat request.
@@ -501,7 +522,8 @@ async def proxy_chat(
     """
     config = await _auth_agent(request, db)
     body = await request.json()
-    model = body.get("model", "claude-sonnet-4-6")
+    model = _resolve_model_alias(body.get("model", "claude-sonnet-4-6"))
+    body["model"] = model  # rewrite so the upstream call uses the real id
     is_stream = body.get("stream", False)
 
     backend, api_key = _route_chat(model, config)
@@ -597,6 +619,38 @@ async def proxy_chat(
         )
 
         return resp_data
+
+
+# ── SDK-compatible path aliases ──────────────────────────────────────
+#
+# Drop-in compatibility for the official Anthropic & OpenAI Python SDKs
+# when they're configured with our proxy as `base_url`. Each SDK appends
+# its own canonical path on every call, so we alias those paths to the
+# main `/chat` handler. Without these, the agent's bundle-mode client
+# constructed in anthropic_service / openai_agent_service hits 405 (no
+# route) because /llm/chat alone isn't enough.
+#   - Anthropic SDK → POST {base_url}/v1/messages
+#   - OpenAI SDK    → POST {base_url}/v1/chat/completions
+# We mount /openai/v1/... so the agent can pick base_url=".../llm/openai/v1"
+# and keep the Anthropic path at /v1/messages from the same proxy root.
+
+
+@router.post("/v1/messages")
+async def proxy_anthropic_messages(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Anthropic SDK compatibility shim — body is already in Anthropic format."""
+    return await proxy_chat(request, db)
+
+
+@router.post("/openai/v1/chat/completions")
+async def proxy_openai_chat_completions(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """OpenAI SDK compatibility shim — body is already in OpenAI format."""
+    return await proxy_chat(request, db)
 
 
 @router.post("/embeddings")

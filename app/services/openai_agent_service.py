@@ -71,6 +71,20 @@ class OpenAIAgentService:
         if self._key_version == self._keys.version and self.client is not None:
             return
         self._key_version = self._keys.version
+
+        # Bundle mode: route OpenAI calls through the Toup proxy
+        # (analogous to AnthropicService — see anthropic_service._ensure_client
+        # for the matin incident context).
+        if settings.llm_mode == "bundle" and settings.toup_token:
+            base_url = f"{settings.platform_api_url.rstrip('/')}/llm/openai/v1"
+            self.client = AsyncOpenAI(
+                api_key=settings.toup_token,
+                base_url=base_url,
+            )
+            logger.info("[OPENAI] Client rebuilt for bundle proxy at %s (v%d)",
+                        base_url, self._key_version)
+            return
+
         api_key = self._keys.openai or ""
         if not api_key:
             logger.warning("OPENAI_API_KEY not set — OpenAIAgentService will fail on calls")

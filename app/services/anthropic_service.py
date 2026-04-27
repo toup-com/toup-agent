@@ -131,6 +131,24 @@ class AnthropicService:
         if self._key_version == self._keys.version and self.client is not None:
             return
         self._key_version = self._keys.version
+
+        # Bundle mode: route every Anthropic call through the Toup LLM proxy
+        # using TOUP_TOKEN as the api_key. The proxy handles the real Anthropic
+        # call (with platform's master Anthropic key + per-user budget gating).
+        # Without this branch, llm_mode=bundle subscribers' agents call
+        # api.anthropic.com directly with no usable key — every chat returns
+        # "API key invalid" (matin incident, 2026-04-27).
+        if settings.llm_mode == "bundle" and settings.toup_token:
+            self.is_oauth = False
+            base_url = f"{settings.platform_api_url.rstrip('/')}/llm"
+            self.client = anthropic.AsyncAnthropic(
+                api_key=settings.toup_token,
+                base_url=base_url,
+            )
+            logger.info("[ANTHROPIC] Client rebuilt for bundle proxy at %s (v%d)",
+                        base_url, self._key_version)
+            return
+
         api_key = self._keys.anthropic or ""
 
         if not api_key:
