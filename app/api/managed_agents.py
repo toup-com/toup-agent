@@ -40,6 +40,22 @@ async def provision(
     if not agent_config:
         raise HTTPException(400, "Agent config not found. Complete setup first.")
 
+    # Defense-in-depth: bundle users must have an active subscription before
+    # we'll provision a container. Without this gate, a frontend bug or a
+    # direct API call could create a paid agent without a paid subscription
+    # (the 2026-04-27 incident: PaymentForm auto-onSuccess on already_active
+    # without a corresponding webhook activation skipped Stripe entirely).
+    # BYO ('manual') users are not gated — they bring their own keys.
+    # 'cancelling' is allowed because the user is paid through period_end;
+    # 'past_due' / 'cancelled' / 'none' are not.
+    if agent_config.llm_mode == "bundle":
+        if agent_config.bundle_status not in ("active", "cancelling"):
+            raise HTTPException(
+                402,
+                "Bundle subscription is not active. "
+                "Complete payment before provisioning a managed agent.",
+            )
+
     try:
         container = await docker_host_service.provision_container(
             db, current_user.id, agent_config

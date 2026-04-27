@@ -485,3 +485,155 @@ async def test_create_subscription_resumes_existing_stripe_customer(
     # endpoint refreshed metadata.user_id to the real test user.
     refreshed = stripe.Customer.retrieve(existing_cust.id)
     assert refreshed.metadata.user_id == test_user_id
+
+
+@pytest.mark.asyncio
+async def test_create_subscription_syncs_db_when_existing_sub_is_active(
+    client: AsyncClient,
+    auth_headers: dict[str, str],
+    test_user_id: str,
+    _test_user: dict[str, str],
+    stripe_test_mode: str,
+    stripe_cleanup,
+):
+    """
+    Live Stripe test-mode: pre-create a Stripe Customer + active subscription
+    matching the test user's email, then call /create-subscription. The
+    endpoint must return status='already_active' AND sync the platform DB:
+    bundle_status='active', bundle_stripe_subscription_id set, llm_token_hash
+    minted, llm_mode='bundle'.
+
+    Regression guard for the 2026-04-27 incident: a deleted-then-re-signed-up
+    user re-attached to their old Stripe customer's still-active subscription
+    via email match. The endpoint returned already_active correctly but never
+    updated platform DB → bundle_status stayed 'none' → LLM proxy denied the
+    user → half-broken paid agent.
+
+    Without Fix 2 (DB sync on already_active), this test fails with
+    bundle_status='none' after the endpoint call.
+    """
+    import stripe
+    stripe.api_key = stripe_test_mode
+
+    from app.config import settings
+    if not settings.stripe_llm_bundle_price_id:
+        pytest.skip("STRIPE_LLM_BUNDLE_PRICE_ID not configured")
+
+    # Pre-create customer + ATTACHED PaymentMethod + active sub by paying its
+    # invoice immediately (Basil-API flow: Invoice.pay requires PM attached).
+    existing_cust = stripe.Customer.create(
+        email=_test_user["email"],
+        metadata={"user_id": "stale-prior-user-id"},
+    )
+    stripe_cleanup["customer"](existing_cust.id)
+    pm = stripe.PaymentMethod.create(type="card", card={"token": "tok_visa"})
+    stripe.PaymentMethod.attach(pm.id, customer=existing_cust.id)
+    # Setting default_payment_method on Subscription.create makes Stripe
+    # auto-charge the first invoice → sub flips to 'active' immediately
+    # (no explicit Invoice.pay needed; calling it would 400 "already paid").
+    pre_sub = stripe.Subscription.create(
+        customer=existing_cust.id,
+        items=[{"price": settings.stripe_llm_bundle_price_id}],
+        default_payment_method=pm.id,
+        metadata={"user_id": "stale-prior-user-id", "type": "llm_bundle"},
+    )
+    stripe_cleanup["subscription"](pre_sub.id)
+    # Sub may briefly be 'incomplete' before auto-charge settles. Poll until
+    # 'active'. Test-mode is normally instant; cap at 5s.
+    import time
+    for _ in range(10):
+        pre_sub = stripe.Subscription.retrieve(pre_sub.id)
+        if pre_sub.status == "active":
+            break
+        time.sleep(0.5)
+    assert pre_sub.status == "active", \
+        f"setup precondition failed: pre-existing sub did not activate: {pre_sub.status}"
+
+    await _seed_agent_config(test_user_id, bundle_status="none")
+
+    resp = await client.post("/api/billing/create-subscription", headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("status") == "already_active", body
+    assert body["subscription_id"] == pre_sub.id
+
+    # ── The whole point of this test: platform DB must reflect Stripe truth ──
+    cfg = await _get_agent_config(test_user_id)
+    assert cfg is not None
+    assert cfg.bundle_status == "active", \
+        f"bundle_status not synced from Stripe: {cfg.bundle_status!r}"
+    assert cfg.bundle_stripe_subscription_id == pre_sub.id, \
+        "bundle_stripe_subscription_id not written"
+    assert cfg.llm_token_hash, "llm_token_hash not minted on already_active sync"
+    assert cfg.llm_mode == "bundle", f"llm_mode not set: {cfg.llm_mode!r}"
+    assert cfg.bundle_started_at is not None
+
+
+@pytest.mark.asyncio
+async def test_provision_blocked_when_bundle_inactive(
+    client: AsyncClient,
+    auth_headers: dict[str, str],
+    test_user_id: str,
+):
+    """
+    /api/managed-agent/provision must return 402 when llm_mode='bundle' and
+    bundle_status is not in ('active','cancelling'). Defense-in-depth gate
+    against the 2026-04-27 incident pattern: even if frontend / Stripe state
+    were wrong and the call reached this endpoint, no paid agent gets
+    provisioned without a paid subscription.
+
+    This is a deterministic test — it never reaches the bridge because the
+    endpoint short-circuits before docker_host_service.provision_container.
+    """
+    # Seed an AgentConfig with llm_mode='bundle' but bundle_status='none' —
+    # the leak scenario. managed_hosting_enabled defaults False on the test
+    # app; the gate must fire BEFORE that 503, so override.
+    from app.config import settings
+    settings.managed_hosting_enabled = True
+    try:
+        await _seed_agent_config(test_user_id, bundle_status="none")
+        # _seed_agent_config defaults llm_mode='bundle' (see helper); confirm.
+        from app.db import AgentConfig, async_session_maker
+        from sqlalchemy import select
+        async with async_session_maker() as db:
+            cfg = (await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == test_user_id)
+            )).scalar_one()
+            cfg.llm_mode = "bundle"
+            cfg.bundle_status = "none"
+            await db.commit()
+
+        resp = await client.post("/api/managed-agent/provision", headers=auth_headers)
+        assert resp.status_code == 402, \
+            f"expected 402 Payment Required, got {resp.status_code}: {resp.text}"
+        assert "subscription" in resp.text.lower()
+    finally:
+        settings.managed_hosting_enabled = False
+
+
+@pytest.mark.asyncio
+async def test_provision_blocked_for_past_due_bundle(
+    client: AsyncClient,
+    auth_headers: dict[str, str],
+    test_user_id: str,
+):
+    """past_due is also blocked — only 'active' and 'cancelling' (paid through
+    period_end) are allowed."""
+    from app.config import settings
+    settings.managed_hosting_enabled = True
+    try:
+        await _seed_agent_config(test_user_id, bundle_status="past_due")
+        from app.db import AgentConfig, async_session_maker
+        from sqlalchemy import select
+        async with async_session_maker() as db:
+            cfg = (await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == test_user_id)
+            )).scalar_one()
+            cfg.llm_mode = "bundle"
+            cfg.bundle_status = "past_due"
+            await db.commit()
+
+        resp = await client.post("/api/managed-agent/provision", headers=auth_headers)
+        assert resp.status_code == 402
+    finally:
+        settings.managed_hosting_enabled = False

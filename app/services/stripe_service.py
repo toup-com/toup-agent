@@ -139,6 +139,47 @@ def get_active_subscription_for_customer(customer_id: str, price_id: str) -> Opt
         return None
 
 
+def delete_customer(customer_id: str) -> bool:
+    """Delete a Stripe Customer. Cascade-cancels all of their subscriptions
+    as a Stripe-side side effect (per Stripe docs).
+
+    Returns True if the call succeeded (or the customer was already deleted),
+    False on any other Stripe error. Idempotent — calling twice is safe.
+
+    Used by admin user-delete to wipe Stripe state alongside platform DB.
+    Without this, deleting a user from the admin panel leaves an orphan
+    Stripe customer + active subscription that keeps charging.
+    """
+    try:
+        client = _get_stripe_client()
+        client.customers.delete(customer_id)
+        return True
+    except stripe.error.InvalidRequestError as exc:
+        # 'No such customer' or 'already deleted' — treat as idempotent success.
+        if "No such customer" in str(exc) or "already" in str(exc).lower():
+            return True
+        logger.warning("Stripe delete_customer InvalidRequest %s: %s", customer_id, exc)
+        return False
+    except Exception as exc:
+        logger.warning("Stripe delete_customer failed %s: %s", customer_id, exc)
+        return False
+
+
+def find_customers_by_email(email: str) -> list[str]:
+    """Return all Stripe Customer IDs matching the given email. Used as a
+    defense-in-depth fallback by admin user-delete: even if `User.stripe_
+    customer_id` was somehow not synced, we still find + delete any orphan
+    customer whose email matches. Returns [] on lookup error.
+    """
+    try:
+        client = _get_stripe_client()
+        result = client.customers.list(params={"email": email, "limit": 10})
+        return [c.id for c in result.data]
+    except Exception as exc:
+        logger.warning("Stripe find_customers_by_email failed %s: %s", email, exc)
+        return []
+
+
 def create_billing_portal_session(customer_id: str, return_url: str) -> str:
     """Create a Stripe Customer Portal session. Returns the portal URL."""
     client = _get_stripe_client()

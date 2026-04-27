@@ -852,6 +852,32 @@ async def delete_user(
     except Exception as e:
         logger.warning("[DELETE-USER] VPS cleanup failed for %s: %s", prefix, e)
 
+    # ── 1b. Wipe Stripe state. Admin-delete is "this user no longer exists,
+    #    anywhere" — that includes Stripe. Deleting the Stripe Customer
+    #    auto-cancels every subscription tied to it, so the user stops
+    #    being billed. Without this, signing up again with the same email
+    #    would re-attach to the orphan customer's still-active subscription
+    #    and grant a paid agent without payment (the 2026-04-27 incident).
+    #    Defense-in-depth: also email-search for any customer whose
+    #    metadata.user_id matches, in case `User.stripe_customer_id` was
+    #    not synced for some reason.
+    from app.services.stripe_service import delete_customer, find_customers_by_email
+    customer_ids_to_delete: set[str] = set()
+    if user.stripe_customer_id:
+        customer_ids_to_delete.add(user.stripe_customer_id)
+    if user.email:
+        try:
+            for cid in find_customers_by_email(user.email):
+                customer_ids_to_delete.add(cid)
+        except Exception as e:
+            logger.warning("[DELETE-USER] Stripe email-search failed for %s: %s",
+                           user.email, e)
+    for cid in customer_ids_to_delete:
+        ok = delete_customer(cid)
+        if not ok:
+            logger.warning("[DELETE-USER] Stripe customer cleanup failed for %s "
+                           "(user=%s) — orphan may remain", cid, user_id[:8])
+
     # ── 2. Clean up agent-only tables (legacy monolith data) ──
     # Each wrapped in savepoint — tables/columns may not exist.
     # Order: children before parents (FK deps).

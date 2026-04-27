@@ -70,6 +70,53 @@ class PricesResponse(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
+async def _sync_active_subscription_to_db(
+    db: AsyncSession, config: AgentConfig, subscription_id: str
+) -> None:
+    """Mirror what `_handle_invoice_succeeded` does on first-time activation,
+    for the case where `create-subscription` discovered an existing active
+    Stripe subscription via customer-by-email match (e.g., a re-signup with
+    a previously-paying email, or any path where the webhook didn't fire
+    against this AgentConfig row).
+
+    Sets bundle_status='active', bundle_stripe_subscription_id, llm_mode,
+    bundle_started_at, period_{start,end}, and mints llm_token_hash if
+    none exists yet. Idempotent: if bundle_status is already 'active', does
+    nothing (caller's webhook is the source of truth for ongoing renewals).
+    """
+    from app.services.stripe_service import get_subscription
+    import secrets, hashlib
+
+    if config.bundle_status == "active":
+        return  # Webhook already synced; don't clobber period_end with stale data.
+
+    sub_info = get_subscription(subscription_id)
+    period_end = sub_info["current_period_end"] if sub_info else None
+    now = datetime.utcnow()
+
+    config.bundle_stripe_subscription_id = subscription_id
+    config.bundle_status = "active"
+    config.llm_mode = "bundle"
+    config.bundle_current_period_end = period_end
+    if not config.bundle_started_at:
+        config.bundle_started_at = now
+    config.bundle_period_start = now
+    if period_end:
+        config.bundle_period_end = period_end
+    if not config.llm_token_hash:
+        token = secrets.token_urlsafe(32)
+        config.llm_token_hash = hashlib.sha256(token.encode()).hexdigest()
+        logger.info(
+            "Generated LLM proxy token for user %s via already_active sync",
+            config.user_id,
+        )
+    await db.commit()
+    logger.info(
+        "Synced already-active Stripe sub %s to platform DB for user %s",
+        subscription_id, config.user_id,
+    )
+
+
 async def _ensure_stripe_customer(user, db: AsyncSession) -> str:
     """Return user's stripe_customer_id, creating one if needed."""
     from app.services.stripe_service import get_or_create_customer
@@ -139,6 +186,19 @@ async def create_subscription(
     existing = get_active_subscription_for_customer(customer_id, price_id)
     if existing:
         if existing["status"] == "active":
+            # Stripe says active; sync platform DB to match BEFORE returning
+            # already_active. Without this, the frontend's PaymentForm fires
+            # onSuccess() → triggers /managed-agent/provision, but the LLM
+            # proxy's bundle_status gate denies the user (they have an agent
+            # but it can't reach the LLM). The 2026-04-27 incident: fresh
+            # signup re-uses orphan Stripe customer's still-active sub via
+            # email match → no payment fires → no webhook fires → bundle_
+            # status stays 'none' forever. Mirror what _handle_invoice_
+            # succeeded does on first activation.
+            if config:
+                await _sync_active_subscription_to_db(
+                    db, config, existing["subscription_id"]
+                )
             return CreateSubscriptionResponse(
                 subscription_id=existing["subscription_id"],
                 status="already_active",

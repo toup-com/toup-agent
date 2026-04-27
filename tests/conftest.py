@@ -46,6 +46,7 @@ def _build_test_app() -> FastAPI:
     from app.api.vps import router as vps_router
     from app.api.llm_setup import router as llm_setup_router
     from app.api.media_proxy import router as media_proxy_router
+    from app.api.managed_agents import router as managed_agents_router
     from app.config import settings
 
     app = FastAPI()
@@ -55,6 +56,9 @@ def _build_test_app() -> FastAPI:
     app.include_router(vps_router, prefix=settings.api_prefix)
     app.include_router(llm_setup_router, prefix=settings.api_prefix)
     app.include_router(media_proxy_router, prefix=settings.api_prefix)
+    # Mounted so test_provision_blocked_when_bundle_inactive can hit
+    # /api/managed-agent/provision (Fix 3 — defense-in-depth subscription gate).
+    app.include_router(managed_agents_router, prefix=settings.api_prefix)
     return app
 
 
