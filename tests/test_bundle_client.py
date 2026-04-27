@@ -48,15 +48,31 @@ def test_anthropic_client_in_bundle_mode_routes_through_proxy():
 def test_anthropic_client_carries_waf_safe_user_agent():
     """Cloudflare in front of toup.ai blocks the SDK's default
     "Anthropic/Python X.Y.Z" user-agent as a bot. Bundle clients MUST
-    override this. (matin incident — fourth chained root cause.)"""
+    rewrite UA at the httpx layer via event hook. (matin incident —
+    fourth chained root cause.)"""
     from app.services.bundle_client import make_anthropic_client
 
     with _bundle_settings():
         client = make_anthropic_client()
 
-    ua = client._client.headers.get("user-agent", "")
-    assert "toup-agent" in ua, f"expected toup-agent UA, got: {ua!r}"
-    assert "Anthropic/Python" not in ua, "must not pass through SDK default UA"
+    # The event hook is what does the override; assert it's installed and
+    # rewrites both UA and stainless headers when invoked.
+    hooks = client._client.event_hooks.get("request", [])
+    assert hooks, "expected request event hook to be installed"
+
+    import httpx, asyncio
+    req = httpx.Request(
+        "POST", "https://toup.ai/x",
+        headers={
+            "user-agent": "AsyncAnthropic/Python 0.96.0",
+            "x-stainless-package-version": "0.96.0",
+            "x-stainless-lang": "python",
+        },
+    )
+    asyncio.run(hooks[0](req))
+    assert req.headers["user-agent"] == "toup-agent/1.0 (bundle-proxy)"
+    assert "x-stainless-package-version" not in req.headers
+    assert "x-stainless-lang" not in req.headers
 
 
 def test_openai_client_in_bundle_mode_routes_through_proxy():
@@ -74,12 +90,23 @@ def test_openai_client_in_bundle_mode_routes_through_proxy():
 
 def test_openai_client_carries_waf_safe_user_agent():
     from app.services.bundle_client import make_openai_client
+    import httpx, asyncio
 
     with _bundle_settings():
         client = make_openai_client()
 
-    ua = client._client.headers.get("user-agent", "")
-    assert "toup-agent" in ua, f"expected toup-agent UA, got: {ua!r}"
+    hooks = client._client.event_hooks.get("request", [])
+    assert hooks, "expected request event hook to be installed"
+    req = httpx.Request(
+        "POST", "https://toup.ai/x",
+        headers={
+            "user-agent": "AsyncOpenAI/Python 1.50.0",
+            "x-stainless-package-version": "1.50.0",
+        },
+    )
+    asyncio.run(hooks[0](req))
+    assert req.headers["user-agent"] == "toup-agent/1.0 (bundle-proxy)"
+    assert "x-stainless-package-version" not in req.headers
 
 
 def test_byok_anthropic_falls_back_to_direct_when_not_bundle():
@@ -105,9 +132,13 @@ def test_byok_oauth_token_uses_claude_code_headers():
         client = make_anthropic_client(byok_key="sk-ant-oat01-OAUTHTOKEN")
 
     assert client is not None
-    # OAuth path uses auth_token, not api_key
+    # OAuth path sets static headers on the http_client; assert at that layer.
     ua = client._client.headers.get("user-agent", "")
     assert "claude-code" in ua, f"OAuth path must use claude-code UA, got: {ua!r}"
+    # Beta headers come via SDK default_headers
+    default_h = getattr(client, "default_headers", {}) or {}
+    assert "anthropic-beta" in default_h
+    assert "claude-code-20250219" in default_h["anthropic-beta"]
 
 
 def test_returns_none_when_not_bundle_and_no_byok_key():
