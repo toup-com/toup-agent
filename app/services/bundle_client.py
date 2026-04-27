@@ -42,12 +42,36 @@ def _bundle_active() -> bool:
     return settings.llm_mode == "bundle" and bool(settings.toup_token)
 
 
+async def _normalize_headers_for_waf(request):
+    """httpx event hook that rewrites outbound headers to bypass Cloudflare WAF.
+
+    The Anthropic / OpenAI SDKs add bot-signature headers regardless of what
+    we pass at construction time:
+      - user-agent: "AsyncAnthropic/Python 0.96.0" — flagged as automation
+      - x-stainless-*: telemetry headers (lang, package-version, os, arch,
+        runtime, async/stream helper, retry-count) — Stainless is the SDK
+        generator Anthropic and OpenAI both use, and Cloudflare matches on
+        the x-stainless-package-version pattern.
+
+    Setting these in the SDK's `default_headers` *appends* values rather than
+    overriding (we get "AsyncAnthropic/Python 0.96.0, toup-agent/1.0"). The
+    only way to fully override is at the httpx layer, just before the request
+    goes on the wire. This hook does that.
+    """
+    request.headers["user-agent"] = _WAF_SAFE_UA
+    for h in list(request.headers.keys()):
+        if h.lower().startswith("x-stainless-"):
+            del request.headers[h]
+
+
 def _proxy_http_client(timeout: float = 120.0):
-    """Build an httpx.AsyncClient with the WAF-safe user-agent."""
+    """Build an httpx.AsyncClient with the WAF-bypass header normalizer
+    installed. All bundle-mode requests go through this client so the
+    SDK's bot-signature headers are scrubbed before reaching Cloudflare."""
     import httpx
     return httpx.AsyncClient(
-        headers={"user-agent": _WAF_SAFE_UA},
         timeout=timeout,
+        event_hooks={"request": [_normalize_headers_for_waf]},
     )
 
 
