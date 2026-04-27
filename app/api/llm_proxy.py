@@ -68,14 +68,32 @@ def _hash_token(token: str) -> str:
 
 
 async def _auth_agent(request: Request, db: AsyncSession) -> AgentConfig:
-    """Validate TOUP_LLM_TOKEN and return the AgentConfig."""
-    auth_header = request.headers.get("authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(401, "Missing or invalid Authorization header")
+    """Validate TOUP_LLM_TOKEN and return the AgentConfig.
 
-    token = auth_header[7:].strip()
+    Accepts the token from EITHER `Authorization: Bearer <token>` OR
+    `x-api-key: <token>`. Both conventions are valid because:
+      - OpenAI Python SDK sends `Authorization: Bearer <key>`
+      - Anthropic Python SDK sends `x-api-key: <key>` (their canonical header)
+    The agent's llm_client_factory configures both SDKs with `api_key=
+    settings.toup_token`; whichever header the SDK chooses, we accept it.
+    Without this, every Anthropic-routed call returned 401 → the agent's
+    friendly-error handler converted to "Your API key is invalid" — the
+    2026-04-27 latent bug uncovered by matin's smoke test.
+    """
+    # Prefer Authorization: Bearer (OpenAI SDK), fall back to x-api-key
+    # (Anthropic SDK). Both are equivalent for our auth model.
+    token: str = ""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
     if not token:
-        raise HTTPException(401, "Empty token")
+        token = request.headers.get("x-api-key", "").strip()
+    if not token:
+        raise HTTPException(
+            401,
+            "Missing token. Provide either 'Authorization: Bearer <TOUP_TOKEN>' "
+            "or 'x-api-key: <TOUP_TOKEN>' (Anthropic SDK convention).",
+        )
 
     token_hash = _hash_token(token)
     result = await db.execute(

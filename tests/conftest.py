@@ -47,6 +47,7 @@ def _build_test_app() -> FastAPI:
     from app.api.llm_setup import router as llm_setup_router
     from app.api.media_proxy import router as media_proxy_router
     from app.api.managed_agents import router as managed_agents_router
+    from app.api.llm_proxy import router as llm_proxy_router
     from app.config import settings
 
     app = FastAPI()
@@ -59,6 +60,9 @@ def _build_test_app() -> FastAPI:
     # Mounted so test_provision_blocked_when_bundle_inactive can hit
     # /api/managed-agent/provision (Fix 3 — defense-in-depth subscription gate).
     app.include_router(managed_agents_router, prefix=settings.api_prefix)
+    # Mounted so test_llm_proxy_accepts_x_api_key_header_for_anthropic_sdk
+    # can hit /api/llm/usage and verify the dual-auth-header contract.
+    app.include_router(llm_proxy_router, prefix=settings.api_prefix)
     return app
 
 

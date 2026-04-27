@@ -213,6 +213,68 @@ async def test_llm_token_hash_matches_sha256_of_connect_token(
 
 
 @pytest.mark.asyncio
+async def test_llm_proxy_accepts_x_api_key_header_for_anthropic_sdk(
+    client: AsyncClient, auth_headers: dict[str, str], test_user_id: str, signed_stripe_event
+):
+    """
+    The Anthropic Python SDK sends `x-api-key: <key>` (NOT Authorization
+    Bearer). The OpenAI SDK sends `Authorization: Bearer <key>`. The proxy
+    MUST accept both — without this, every bundle agent's Claude call
+    returns 401 → friendly-error converts to "Your API key is invalid".
+
+    Regression guard for the 2026-04-27 latent bug uncovered by matin's
+    smoke test. Phase 1 set up the hash chain correctly but only the
+    Bearer path was tested; x-api-key was unchecked.
+
+    We don't fully exercise the chat forwarding here (would hit live
+    Anthropic), just the auth layer: a request with x-api-key + a valid
+    token should NOT 401. We use the /usage endpoint which uses the same
+    _auth_agent and doesn't touch providers.
+    """
+    import hashlib
+    sub_id = "sub_test_xapi_" + secrets_mod.token_hex(4)
+    # Seed bundle_status='none' so the webhook hits the first-activation
+    # branch and generates connect_token + llm_token_hash.
+    await _seed_agent_config(test_user_id, bundle_status="none", subscription_id=sub_id)
+
+    # Activate so connect_token + llm_token_hash are populated.
+    payload, headers = signed_stripe_event(
+        "invoice.payment_succeeded",
+        {"id": f"in_test_{secrets_mod.token_hex(4)}", "subscription": sub_id, "object": "invoice"},
+    )
+    with patch("app.services.stripe_service.get_subscription", side_effect=_fake_get_subscription):
+        await client.post("/api/vps/webhook/stripe", content=payload, headers=headers)
+
+    cfg = await _get_agent_config(test_user_id)
+    assert cfg.connect_token, "precondition: connect_token must be set"
+
+    # Bearer path (OpenAI SDK convention)
+    r1 = await client.get(
+        "/api/llm/usage",
+        headers={"Authorization": f"Bearer {cfg.connect_token}"},
+    )
+    assert r1.status_code != 401, f"Bearer auth must work: {r1.status_code} {r1.text}"
+
+    # x-api-key path (Anthropic SDK convention) — THE bug
+    r2 = await client.get(
+        "/api/llm/usage",
+        headers={"x-api-key": cfg.connect_token},
+    )
+    assert r2.status_code != 401, f"x-api-key auth must work: {r2.status_code} {r2.text}"
+
+    # Wrong token via either header should still 401
+    r3 = await client.get(
+        "/api/llm/usage",
+        headers={"x-api-key": "totally-wrong-token"},
+    )
+    assert r3.status_code == 401
+
+    # Empty / missing token → 401
+    r4 = await client.get("/api/llm/usage")
+    assert r4.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_subscription_updated_out_of_order_uses_connect_token_for_hash(
     client: AsyncClient, auth_headers: dict[str, str], test_user_id: str, signed_stripe_event
 ):
