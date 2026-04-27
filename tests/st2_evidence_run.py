@@ -220,7 +220,17 @@ def check_live_bundles() -> None:
     import urllib.request
 
     def _fetch(u: str) -> str:
-        with urllib.request.urlopen(u, timeout=20) as r:
+        # Cloudflare returns 403 to default urllib UA; pose as a real browser.
+        req = urllib.request.Request(
+            u,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/126.0.0.0 Safari/537.36",
+                "Accept": "*/*",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
             return r.read().decode("utf-8", errors="replace")
 
     try:
@@ -272,8 +282,10 @@ def check_live_bundles() -> None:
 
 def check_log_audit() -> None:
     print("\n[logs] Railway platform-api log audit")
-    # Wait briefly for log forwarding lag, then pull.
-    time.sleep(6)
+    # Wait for log forwarding lag — needs longer than ST-1's 8s because
+    # ST-2 fires several deprecation lines back-to-back and we want the
+    # last endpoint's line to land before grep.
+    time.sleep(15)
     proc = subprocess.run(
         ["railway", "logs", "--service", "platform-api"],
         capture_output=True, text=True, timeout=30,
