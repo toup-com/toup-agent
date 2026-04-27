@@ -129,6 +129,15 @@ class AgentConfig(Base):
     bundle_period_start: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     bundle_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # Per-user OpenAI project + key, auto-provisioned on bundle activation via
+    # OpenAI Admin API. The proxy uses bundle_openai_api_key on outbound (so
+    # OpenAI bills per project for granular usage attribution) without ever
+    # putting the key in the agent's container env. On admin user-delete,
+    # bundle_openai_project_id is used to archive the project (cascade-revokes
+    # all keys, stops billing). Distinct from BYOK `openai_api_key` above.
+    bundle_openai_project_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    bundle_openai_api_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
     # Step 3: Channels
     telegram_bot_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     discord_bot_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

@@ -878,6 +878,31 @@ async def delete_user(
             logger.warning("[DELETE-USER] Stripe customer cleanup failed for %s "
                            "(user=%s) — orphan may remain", cid, user_id[:8])
 
+    # ── 1c. Archive per-user OpenAI project (β bundle architecture).
+    #    Read AgentConfig.bundle_openai_project_id BEFORE the platform DB
+    #    cleanup wipes the row. Archiving cascade-revokes all of the
+    #    project's service-account keys + stops billing for that project.
+    #    Idempotent + non-fatal: if the admin key isn't configured or the
+    #    project is already archived, log and continue.
+    try:
+        ac_result = await db.execute(
+            select(AgentConfig).where(AgentConfig.user_id == user_id)
+        )
+        ac = ac_result.scalar_one_or_none()
+        openai_project_id = ac.bundle_openai_project_id if ac else None
+    except Exception:
+        openai_project_id = None
+    if openai_project_id:
+        try:
+            from app.services.openai_admin_service import archive_project
+            archive_project(openai_project_id)
+        except Exception as e:
+            logger.warning(
+                "[DELETE-USER] OpenAI project archive failed for %s "
+                "(user=%s) — orphan project may remain in OpenAI dashboard: %s",
+                openai_project_id, user_id[:8], e,
+            )
+
     # ── 2. Clean up agent-only tables (legacy monolith data) ──
     # Each wrapped in savepoint — tables/columns may not exist.
     # Order: children before parents (FK deps).

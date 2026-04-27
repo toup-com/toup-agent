@@ -231,6 +231,16 @@ class Settings(BaseSettings):
     stripe_pro_price_id: str = ""                  # Stripe Price ID for Pro plan
     stripe_llm_bundle_price_id: str = ""           # Stripe Price ID for $40/mo LLM bundle
     stripe_supabase_price_id: str = ""             # Stripe Price ID for $5/mo managed Supabase
+
+    # ── OpenAI Admin API (per-user project + key auto-provisioning) ──
+    # Optional. When set, bundle activation auto-creates an OpenAI project
+    # + service-account key per user and stores it in
+    # AgentConfig.bundle_openai_{project_id,api_key}. The LLM proxy uses
+    # that per-user key on outbound (β architecture: proxy-mediated, per-
+    # user billing). When unset, bundle OpenAI calls fall back to the
+    # platform_openai_api_key master key.
+    openai_admin_api_key: Optional[str] = None     # Set via OPENAI_ADMIN_API_KEY (sk-admin-...)
+
     vps_provisioning_enabled: bool = False         # Gate: set True once AWS creds are configured
     ssh_lambda_function_name: str = "toup-ssh-proxy"  # Lambda function for SSH proxy
 

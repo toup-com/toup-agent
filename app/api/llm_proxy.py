@@ -365,11 +365,22 @@ _openai = OpenAIBackend()
 _toup = ToupModelBackend()
 
 
-def _route_chat(model: str) -> tuple[LLMBackend, str]:
+def _route_chat(model: str, config: AgentConfig) -> tuple[LLMBackend, str]:
     """
     Pick the backend + API key for a chat request.
     This is the ONE function to change when adding new providers or our own model.
     Returns (backend, api_key).
+
+    For OpenAI: prefer the per-user `bundle_openai_api_key` (auto-provisioned
+    via OpenAI Admin API on bundle activation, billed per project for
+    granular usage attribution). Fall back to the platform master key if the
+    user's project hasn't been provisioned yet (e.g. activated before Phase 2
+    deployed, or transient OpenAI Admin API outage during webhook). This is
+    the β architecture's defense-in-depth: agent never sees the OpenAI key,
+    proxy always authenticates the agent and forwards with the right outbound.
+
+    For Anthropic: always use the platform master key (no Admin API for
+    per-user Anthropic key auto-provisioning; tracked as future work).
     """
     m = (model or "").lower()
 
@@ -382,7 +393,7 @@ def _route_chat(model: str) -> tuple[LLMBackend, str]:
 
     # OpenAI models (GPT, o1, o3, o4, etc.)
     if m.startswith(("gpt", "o1", "o3", "o4")):
-        key = settings.platform_openai_api_key
+        key = config.bundle_openai_api_key or settings.platform_openai_api_key
         if not key:
             raise HTTPException(500, "Platform OpenAI key not configured")
         return _openai, key
@@ -475,18 +486,20 @@ async def proxy_chat(
     model = body.get("model", "claude-sonnet-4-6")
     is_stream = body.get("stream", False)
 
-    backend, api_key = _route_chat(model)
+    backend, api_key = _route_chat(model, config)
 
     # Budget check
     budget_result = await _check_budget(config, backend.name, db)
     if budget_result == "monthly_exceeded":
         raise HTTPException(429, f"Monthly {backend.name} budget exceeded")
     if budget_result == "daily_exceeded":
-        # Anthropic daily cap hit — try OpenAI fallback
-        if backend.name == "anthropic" and settings.platform_openai_api_key:
+        # Anthropic daily cap hit — try OpenAI fallback. Prefer the user's
+        # auto-provisioned per-project key here too, fall back to master.
+        fallback_key = config.bundle_openai_api_key or settings.platform_openai_api_key
+        if backend.name == "anthropic" and fallback_key:
             logger.info("Daily Anthropic cap hit for user %s, falling back to OpenAI", config.user_id[:8])
             backend = _openai
-            api_key = settings.platform_openai_api_key
+            api_key = fallback_key
             # Convert Anthropic request to OpenAI format
             body = _anthropic_to_openai_request(body)
             model = body.get("model", "gpt-4o-mini")
@@ -578,7 +591,10 @@ async def proxy_embeddings(
     body = await request.json()
     model = body.get("model", "text-embedding-3-small")
 
-    api_key = settings.platform_openai_api_key
+    # Prefer the user's auto-provisioned per-project key (β architecture);
+    # fall back to platform master if not yet provisioned. Same pattern as
+    # _route_chat for OpenAI; embeddings stays OpenAI-only for now.
+    api_key = config.bundle_openai_api_key or settings.platform_openai_api_key
     if not api_key:
         raise HTTPException(500, "Platform OpenAI key not configured")
 

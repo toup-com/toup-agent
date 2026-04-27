@@ -116,11 +116,52 @@ async def _sync_active_subscription_to_db(
             "Synced llm_token_hash from connect_token for user %s via already_active sync",
             config.user_id,
         )
+    # Per-user OpenAI project auto-provisioning (β architecture). Idempotent:
+    # only fires if no project_id is set yet. Failures are logged + non-fatal
+    # so a transient OpenAI Admin API outage doesn't block bundle activation.
+    _provision_openai_project_if_needed(config)
     await db.commit()
     logger.info(
         "Synced already-active Stripe sub %s to platform DB for user %s",
         subscription_id, config.user_id,
     )
+
+
+def _provision_openai_project_if_needed(config: AgentConfig) -> None:
+    """Idempotent: if config has no bundle_openai_project_id yet, call the
+    OpenAI Admin API to create a per-user project + service-account key, and
+    write both onto the AgentConfig (caller commits).
+
+    Failures are logged + swallowed — bundle activation must NOT fail because
+    of a transient OpenAI outage. The proxy's outbound logic falls back to
+    the platform master OpenAI key in that case (defense-in-depth).
+    """
+    if config.bundle_openai_project_id and config.bundle_openai_api_key:
+        return  # already provisioned
+    try:
+        from app.services.openai_admin_service import (
+            provision_tenant, OpenAIAdminUnavailable,
+        )
+        prefix = (config.user_id or "")[:8] or "unknown"
+        project_id, api_key = provision_tenant(prefix)
+        config.bundle_openai_project_id = project_id
+        config.bundle_openai_api_key = api_key
+        logger.info(
+            "Provisioned OpenAI project %s for user %s",
+            project_id, config.user_id,
+        )
+    except OpenAIAdminUnavailable as e:
+        logger.warning(
+            "OpenAI admin not configured; bundle for user %s falls back to "
+            "master key: %s",
+            config.user_id, e,
+        )
+    except Exception as e:
+        logger.warning(
+            "OpenAI auto-provisioning failed for user %s — proxy will fall "
+            "back to master key. Error: %s",
+            config.user_id, e,
+        )
 
 
 async def _ensure_stripe_customer(user, db: AsyncSession) -> str:
