@@ -155,6 +155,12 @@ def _agent_config_to_bridge_body(agent_config: Optional[AgentConfig]) -> dict:
     # `connect_token`.
     if getattr(agent_config, "connect_token", None):
         out["connect_token"] = agent_config.connect_token
+    # llm_mode tells the bridge to write LLM_MODE into the tenant container
+    # env. Without it the agent falls back to BYOK and bundle subscribers
+    # see "API key invalid" on every chat. The matin incident on 2026-04-27
+    # was caused by this field never being forwarded.
+    if getattr(agent_config, "llm_mode", None):
+        out["llm_mode"] = agent_config.llm_mode
     return out
 
 
