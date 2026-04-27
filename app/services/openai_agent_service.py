@@ -74,12 +74,19 @@ class OpenAIAgentService:
 
         # Bundle mode: route OpenAI calls through the Toup proxy
         # (analogous to AnthropicService — see anthropic_service._ensure_client
-        # for the matin incident context).
+        # for the matin incident context, including the Cloudflare WAF block
+        # on the SDK's default user-agent).
         if settings.llm_mode == "bundle" and settings.toup_token:
+            import httpx
             base_url = f"{settings.platform_api_url.rstrip('/')}/llm/openai/v1"
+            _http_client = httpx.AsyncClient(
+                headers={"user-agent": "toup-agent/1.0 (bundle-proxy)"},
+                timeout=120,
+            )
             self.client = AsyncOpenAI(
                 api_key=settings.toup_token,
                 base_url=base_url,
+                http_client=_http_client,
             )
             logger.info("[OPENAI] Client rebuilt for bundle proxy at %s (v%d)",
                         base_url, self._key_version)

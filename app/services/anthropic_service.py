@@ -141,9 +141,20 @@ class AnthropicService:
         if settings.llm_mode == "bundle" and settings.toup_token:
             self.is_oauth = False
             base_url = f"{settings.platform_api_url.rstrip('/')}/llm"
+            # Override the SDK's default user-agent. Cloudflare in front of
+            # toup.ai blocks the bare "Anthropic/Python X.Y.Z" user-agent as
+            # a known automation signature → 403 "Your request was blocked."
+            # Identifying as a Toup-internal client passes the WAF cleanly.
+            # (matin incident, 2026-04-27 — chained 4th root cause.)
+            import httpx
+            _http_client = httpx.AsyncClient(
+                headers={"user-agent": "toup-agent/1.0 (bundle-proxy)"},
+                timeout=120,
+            )
             self.client = anthropic.AsyncAnthropic(
                 api_key=settings.toup_token,
                 base_url=base_url,
+                http_client=_http_client,
             )
             logger.info("[ANTHROPIC] Client rebuilt for bundle proxy at %s (v%d)",
                         base_url, self._key_version)
