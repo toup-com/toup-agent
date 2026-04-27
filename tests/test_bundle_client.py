@@ -118,7 +118,7 @@ def test_byok_anthropic_falls_back_to_direct_when_not_bundle():
         client = make_anthropic_client(byok_key="sk-ant-api03-USERKEY")
 
     assert client is not None
-    assert str(client.base_url) == "https://api.anthropic.com/"
+    assert str(client.base_url).rstrip("/") == "https://api.anthropic.com"
     assert client.api_key == "sk-ant-api03-USERKEY"
 
 
