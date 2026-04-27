@@ -40,7 +40,9 @@ class AgentTunnelClient:
         ws_url = ws_url.rstrip("/")
         if ws_url.endswith("/api"):
             ws_url = ws_url[:-4]
-        self.ws_url = f"{ws_url}/api/ws/agent-tunnel?token={auth_token}"
+        # ST-2: token travels via WebSocket subprotocol header, not the URL.
+        # Keeps the tunnel auth out of platform-api / Caddy access logs.
+        self.ws_url = f"{ws_url}/api/ws/agent-tunnel"
         self._auth_token = auth_token
 
         self.tool_executor = tool_executor
@@ -94,12 +96,17 @@ class AgentTunnelClient:
 
     async def _connect_and_listen(self):
         """Connect to platform and handle messages."""
-        # Mask the token in logs
-        safe_url = self.ws_url.split("?")[0]
-        logger.info("[TUNNEL-CLIENT] Connecting to %s", safe_url)
+        logger.info("[TUNNEL-CLIENT] Connecting to %s", self.ws_url)
 
+        # ST-2: pass the token via the WebSocket subprotocol negotiation
+        # header, not the URL. The platform's /api/ws/agent-tunnel endpoint
+        # extracts `bearer.<token>` from Sec-WebSocket-Protocol; if the
+        # platform is on an older build that doesn't recognize the
+        # subprotocol, the first-frame {"type":"auth"} message below
+        # still authenticates (bake-window backward compat).
         async with websockets.connect(
             self.ws_url,
+            subprotocols=["toup.auth.v1", f"bearer.{self._auth_token}"],
             max_size=10 * 1024 * 1024,
             ping_interval=15,   # Protocol-level pings every 15s (keeps proxies alive)
             ping_timeout=30,
@@ -108,7 +115,9 @@ class AgentTunnelClient:
             self._connected = True
             logger.info("[TUNNEL-CLIENT] Connected to platform tunnel")
 
-            # Send auth token as first message (fallback if query param is stripped by proxy)
+            # Send auth token as first message — keeps backward compat
+            # with platform builds that don't accept the subprotocol path
+            # yet, AND covers the "subprotocol stripped by proxy" case.
             await ws.send(json.dumps({"type": "auth", "token": self._auth_token}))
 
             print("🔗 Connected to toup.ai — voice tools will execute locally")

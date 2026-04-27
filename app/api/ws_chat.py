@@ -995,9 +995,15 @@ async def ws_chat(
     WebSocket endpoint for real-time chat with the agent.
 
     Supports streaming text chunks, tool call indicators, and session management.
-    Auth: JWT token (query param or first message) OR agent_key (for platform proxy).
+    Auth: agent_key (proxy mode) OR JWT (subprotocol/?token=/first-frame).
     """
-    await websocket.accept()
+    # ST-2: accept + subprotocol JWT extraction.
+    from app.api._ws_auth_helpers import (
+        accept_with_subprotocol_auth,
+        log_deprecated_query_token,
+        safe_send_close_ws,
+    )
+    subprotocol_token = await accept_with_subprotocol_auth(websocket)
     user_id: Optional[str] = None
 
     # Try agent_key auth first (platform proxy mode)
@@ -1015,24 +1021,35 @@ async def ws_chat(
                     _db.add(u)
                     await _db.commit()
 
-    # Try JWT query-param auth
+    # Try subprotocol JWT auth (ST-2 — header-based, no URL leak)
+    if not user_id and subprotocol_token:
+        user_id = await _authenticate_ws(subprotocol_token)
+
+    # Try ?token= JWT (deprecated bake-window fallback)
     if not user_id and token:
+        log_deprecated_query_token("/api/ws/chat (agent)")
         user_id = await _authenticate_ws(token)
 
     try:
-        # If not authenticated via query param, expect auth message
+        # If still not authenticated, expect first-frame auth message.
+        client_disconnected = False
         if not user_id:
             try:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
                 msg = json.loads(raw)
                 if msg.get("type") == "auth" and msg.get("token"):
                     user_id = await _authenticate_ws(msg["token"])
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, json.JSONDecodeError):
                 pass
+            except WebSocketDisconnect:
+                client_disconnected = True
 
         if not user_id:
-            await websocket.send_json({"type": "error", "message": "Authentication required"})
-            await websocket.close(code=4001, reason="Unauthorized")
+            if client_disconnected:
+                return
+            await safe_send_close_ws(
+                websocket, code=4001, message="Authentication required",
+            )
             return
 
         if not _agent_runner:

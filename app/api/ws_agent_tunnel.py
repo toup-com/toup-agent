@@ -216,7 +216,7 @@ async def _authenticate_tunnel(token: str) -> Optional[str]:
                     logger.info("[TUNNEL] Token auth OK for user %s", row[0][:8])
                     return row[0]
                 else:
-                    logger.warning("[TUNNEL] Token not found in DB: %s...%s", token[:12], token[-4:])
+                    logger.warning("[TUNNEL] Token not found in DB (len=%d)", len(token))
         except Exception as e:
             logger.exception("[TUNNEL] Token auth DB error: %s", e)
         return None
@@ -242,26 +242,35 @@ async def agent_tunnel_ws(
     The terminal agent connects here on startup. The platform uses this
     tunnel to dispatch voice tool calls to the agent.
     """
-    await websocket.accept()
+    # ST-2: accept + subprotocol JWT/connect-token extraction. Falls
+    # back to ?token= for the bake window.
+    from app.api._ws_auth_helpers import (
+        accept_with_subprotocol_auth,
+        log_deprecated_query_token,
+    )
+    subprotocol_token = await accept_with_subprotocol_auth(websocket)
 
     # ── Authenticate ──
-    # Try multiple sources for the token:
-    # 1. FastAPI Query injection
-    # 2. websocket.query_params
-    # 3. First message from client ({"type": "auth", "token": "..."})
+    # Order: subprotocol → ?token= (deprecated) → first-frame.
     if not token:
         token = websocket.query_params.get("token")
 
-    logger.info("[TUNNEL] Auth — query param token: %s (len=%d)",
-                "present" if token else "MISSING", len(token) if token else 0)
-
     user_id = None
-    if token:
+    if subprotocol_token:
+        user_id = await _authenticate_tunnel(subprotocol_token)
+        if user_id:
+            token = subprotocol_token
+
+    if not user_id and token:
+        log_deprecated_query_token("/api/ws/agent-tunnel")
+        logger.info("[TUNNEL] Auth — query param token len=%d",
+                    len(token) if token else 0)
         user_id = await _authenticate_tunnel(token)
 
     # If query param auth failed, wait for auth message from client
+    client_disconnected = False
     if not user_id:
-        logger.info("[TUNNEL] Query param auth failed, waiting for auth message...")
+        logger.info("[TUNNEL] Query/subprotocol auth failed, waiting for auth message...")
         try:
             raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
             msg = json.loads(raw)
@@ -271,14 +280,22 @@ async def agent_tunnel_ws(
                 user_id = await _authenticate_tunnel(token)
         except asyncio.TimeoutError:
             logger.warning("[TUNNEL] No auth message received within 10s")
+        except WebSocketDisconnect:
+            client_disconnected = True
         except Exception as e:
             logger.warning("[TUNNEL] Error reading auth message: %s", e)
 
     if not user_id:
-        logger.warning("[TUNNEL] Auth failed — token: %s",
-                       f"{token[:12]}...{token[-4:]}" if token else "None")
-        await websocket.send_json({"type": "error", "message": "Authentication failed"})
-        await websocket.close(code=4401)
+        logger.warning(
+            "[TUNNEL] Auth failed — token len=%d",
+            len(token) if token else 0,
+        )
+        if client_disconnected:
+            return
+        from app.api._ws_auth_helpers import safe_send_close_ws
+        await safe_send_close_ws(
+            websocket, code=4401, message="Authentication failed",
+        )
         return
 
     # ── Register tunnel ──

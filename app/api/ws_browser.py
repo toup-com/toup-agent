@@ -2585,19 +2585,31 @@ async def ws_browser(
     token: Optional[str] = Query(None),
     agent_key: Optional[str] = Query(None),
 ):
-    await websocket.accept()
+    # ST-2: accept + subprotocol JWT extraction in one helper call.
+    from app.api._ws_auth_helpers import (
+        accept_with_subprotocol_auth,
+        log_deprecated_query_token,
+        safe_send_close_ws,
+    )
+    subprotocol_token = await accept_with_subprotocol_auth(websocket)
     print("[BROWSER WS] Connection accepted!", flush=True)
     user_id: Optional[str] = None
 
+    # Order: agent_key (proxy mode) → subprotocol JWT → ?token= JWT (deprecated).
     if agent_key and settings.agent_api_key and agent_key == settings.agent_api_key:
         user_id = settings.user_id
 
+    if not user_id and subprotocol_token:
+        user_id = await _authenticate_ws(subprotocol_token)
+
     if not user_id and token:
+        log_deprecated_query_token("/api/ws/browser")
         user_id = await _authenticate_ws(token)
 
     if not user_id:
-        await websocket.send_json({"type": "error", "message": "Authentication required"})
-        await websocket.close(code=4001, reason="Unauthorized")
+        await safe_send_close_ws(
+            websocket, code=4001, message="Authentication required",
+        )
         return
 
     # Import browser module — now uses stealth context

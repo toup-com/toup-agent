@@ -954,13 +954,24 @@ async def realtime_voice_ws(
 ):
     """WebSocket proxy to OpenAI Realtime API for ChatGPT-speed voice conversation."""
 
-    await websocket.accept()
+    # ST-2: accept + subprotocol JWT extraction.
+    from app.api._ws_auth_helpers import (
+        accept_with_subprotocol_auth,
+        log_deprecated_query_token,
+        safe_send_close_ws,
+    )
+    subprotocol_token = await accept_with_subprotocol_auth(websocket)
 
     # ── 1. Authenticate ───────────────────────────────────────
     user_id = None
-    if token:
+    if subprotocol_token:
+        user_id = await _authenticate_ws(subprotocol_token)
+
+    if not user_id and token:
+        log_deprecated_query_token("/api/ws/realtime")
         user_id = await _authenticate_ws(token)
 
+    client_disconnected = False
     if not user_id:
         # Try auth message
         try:
@@ -968,12 +979,19 @@ async def realtime_voice_ws(
             msg = json.loads(raw)
             if msg.get("type") == "auth" and msg.get("token"):
                 user_id = await _authenticate_ws(msg["token"])
+        except (asyncio.TimeoutError, json.JSONDecodeError):
+            pass
+        except WebSocketDisconnect:
+            client_disconnected = True
         except Exception:
             pass
 
     if not user_id:
-        await websocket.send_json({"type": "error", "message": "Authentication failed"})
-        await websocket.close(code=4401)
+        if client_disconnected:
+            return
+        await safe_send_close_ws(
+            websocket, code=4401, message="Authentication failed",
+        )
         return
 
     logger.info("[REALTIME] Session starting for user %s", user_id[:8])
