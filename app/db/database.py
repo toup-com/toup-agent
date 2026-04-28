@@ -349,18 +349,26 @@ async def init_db():
         # Remove ALL plans except the 3 user-facing tiers
         "DELETE FROM vps_plans WHERE id NOT IN ('starter', 'standard', 'pro')",
     ]
-    async with engine.begin() as conn:
-        from sqlalchemy import text
-        for stmt in _alter_statements:
-            try:
+    # Each migration statement runs in its OWN transaction so a failure
+    # doesn't poison the rest of the loop. With a single transaction
+    # (engine.begin), one failed ALTER aborts the whole thing — every
+    # subsequent statement then fails with "current transaction is
+    # aborted". This was the root cause of the 2026-04-28 incident
+    # where preferred_provider + rollouts.phase columns silently failed
+    # to land on production despite being in the loop.
+    from sqlalchemy import text
+    for stmt in _alter_statements:
+        try:
+            async with engine.begin() as conn:
                 await conn.execute(text(stmt))
-            except Exception:
-                pass  # column already exists or DB doesn't support IF NOT EXISTS
-        for stmt in _seed_statements:
-            try:
+        except Exception as _e:
+            _logger.warning("[init_db] alter skipped: %s — %s", stmt[:80], str(_e)[:200])
+    for stmt in _seed_statements:
+        try:
+            async with engine.begin() as conn:
                 await conn.execute(text(stmt))
-            except Exception:
-                pass  # already seeded or table doesn't exist yet
+        except Exception as _e:
+            _logger.warning("[init_db] seed skipped: %s — %s", stmt[:80], str(_e)[:200])
 
 
 async def drop_db():
