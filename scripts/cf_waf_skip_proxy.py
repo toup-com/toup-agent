@@ -50,7 +50,7 @@ import urllib.request
 
 ZONE_NAME = "toup.ai"
 RULE_DESCRIPTION = "Skip bot detection on LLM proxy paths"
-RULE_EXPRESSION = '(http.request.uri.path matches "^/api/llm/")'
+RULE_EXPRESSION = '(starts_with(http.request.uri.path, "/api/llm/"))'
 # `skip` action with `phases: [http_ratelimit, http_request_sbfm]` and
 # `products: ["bic","hot","securityLevel","uaBlock","zoneLockdown"]`
 # disables Bot Fight Mode + UA Block + IP Reputation gating + Zone Lockdown
@@ -93,13 +93,40 @@ def main() -> int:
     zone_id = zones["result"][0]["id"]
     print(f"zone_id={zone_id} name={ZONE_NAME}")
 
-    # 2. Fetch the http_request_firewall_custom ruleset entrypoint
+    # 2. Fetch the http_request_firewall_custom ruleset entrypoint.
+    # If no custom rules have ever been created on this zone, Cloudflare has
+    # not materialized an entrypoint ruleset yet (error 10003). In that case
+    # we PUT the entrypoint with our single rule, which creates and seeds it
+    # in one call.
+    rule_body = {
+        "description": RULE_DESCRIPTION,
+        "expression": RULE_EXPRESSION,
+        "action": RULE_ACTION,
+        "action_parameters": RULE_ACTION_PARAMETERS,
+        "enabled": True,
+    }
+
     rs = _api(
         token,
         "GET",
         f"/zones/{zone_id}/rulesets/phases/http_request_firewall_custom/entrypoint",
     )
     if not rs.get("success"):
+        errs = rs.get("errors") or []
+        if any(e.get("code") == 10003 for e in errs):
+            # No entrypoint yet — create it with our rule via PUT.
+            put_result = _api(
+                token,
+                "PUT",
+                f"/zones/{zone_id}/rulesets/phases/http_request_firewall_custom/entrypoint",
+                {"rules": [rule_body]},
+            )
+            if not put_result.get("success"):
+                print(f"ERROR: entrypoint create failed: {put_result}", file=sys.stderr)
+                return 1
+            created = put_result["result"]["rules"][0]
+            print(f"CREATED entrypoint ruleset + rule id={created['id']}  expr={RULE_EXPRESSION}")
+            return 0
         print(f"ERROR: ruleset fetch failed (need 'Zone WAF: Edit' scope): {rs}",
               file=sys.stderr)
         return 1
@@ -108,14 +135,6 @@ def main() -> int:
         (r for r in rules if r.get("description") == RULE_DESCRIPTION),
         None,
     )
-
-    rule_body = {
-        "description": RULE_DESCRIPTION,
-        "expression": RULE_EXPRESSION,
-        "action": RULE_ACTION,
-        "action_parameters": RULE_ACTION_PARAMETERS,
-        "enabled": True,
-    }
 
     ruleset_id = rs["result"]["id"]
 

@@ -415,15 +415,16 @@ _toup = ToupModelBackend()
 # Toup-internal model aliases → real provider model identifiers.
 # The agent's model_router emits stable Toup-internal names (e.g.
 # "claude-opus-4-7") so we can swap the underlying upstream model
-# without redeploying every tenant container. Update the right-hand
-# side when our platform Anthropic / OpenAI key gains access to a
-# newer tier (matin incident, 2026-04-27 — bare "claude-opus-4-7"
-# was rejected by Anthropic upstream because the platform master key
-# was provisioned for the dated 4-1 model).
-MODEL_ALIASES: dict[str, str] = {
-    "claude-opus-4-7": "claude-opus-4-1-20250805",
-    "claude-sonnet-4-6": "claude-sonnet-4-5-20250929",
-}
+# without redeploying every tenant container. Add an entry here if a
+# Toup-internal name needs to resolve to a *different* upstream model
+# (e.g. degraded tier on a master key without entitlement). Empty by
+# default — bare names pass through to Anthropic / OpenAI unchanged.
+#
+# History: during the matin incident (2026-04-27) we mapped 4-7→4-1 and
+# 4-6→4-5 as a temporary downgrade because the platform master key
+# returned 404 on the bare 4-7/4-6 names. Verified 2026-04-28 that the
+# key now has full 4-7/4-6 entitlement, so the downgrade was removed.
+MODEL_ALIASES: dict[str, str] = {}
 
 
 def _resolve_model_alias(model: str) -> str:
