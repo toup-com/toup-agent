@@ -77,6 +77,19 @@ async def lifespan(app: FastAPI):
             print("✅ Memory maintenance scheduler started")
         except Exception as e:
             print(f"⚠️ Could not start scheduler: {e}")
+
+    # Resume any rollout that was mid-canary-observation when the previous
+    # process died (Railway redeploy, OOM, etc.). Without this, an orphaned
+    # rollout stays in `running` forever and blocks every subsequent CI
+    # rollout with HTTP 409. See rollout_service.resume_orphaned_rollouts.
+    try:
+        from app.services.rollout_service import resume_orphaned_rollouts
+        await resume_orphaned_rollouts()
+    except Exception as e:
+        # Swallow — rollout resumer must never block app startup. A failed
+        # resume just means the next CI push will get a 409 (existing pain),
+        # not that the platform refuses to boot.
+        print(f"⚠️ Rollout resumer failed: {e}")
     
     # Start Telegram bot if configured
     telegram_bot = None

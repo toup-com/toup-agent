@@ -281,6 +281,11 @@ async def init_db():
         # Doc-delivery feature (generated-file attachments on assistant messages).
         # JSONB on Postgres, TEXT on SQLite — ORM uses Text for portability, ALTER promotes to JSONB on PG.
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachments JSONB",
+        # Orphan-proof rollouts: persisted phase + canary observation deadline so
+        # a Railway redeploy mid-rollout can be resumed by the startup hook
+        # (see rollout_service.resume_orphaned_rollouts).
+        "ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS phase VARCHAR(32) NOT NULL DEFAULT ''",
+        "ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS resume_after TIMESTAMP",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

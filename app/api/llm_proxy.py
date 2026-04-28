@@ -276,6 +276,23 @@ class LLMBackend:
         raise NotImplementedError
 
 
+class UpstreamProviderError(Exception):
+    """Raised by chat_stream when the provider returns a non-2xx status
+    BEFORE any SSE bytes were forwarded to the client. proxy_chat catches
+    this and converts it to a clean HTTPException so the agent's SDK
+    surfaces a useful error instead of a half-streamed empty response.
+
+    Carries `body` (truncated upstream response) so logs and error pages
+    can show what the provider actually said (model-not-found, rate-limit,
+    plan restriction, etc.).
+    """
+    def __init__(self, status: int, body: bytes, provider: str):
+        self.status = status
+        self.body = body[:500]
+        self.provider = provider
+        super().__init__(f"{provider} returned {status}: {self.body[:200]!r}")
+
+
 class AnthropicBackend(LLMBackend):
     name = "anthropic"
     BASE_URL = "https://api.anthropic.com"
@@ -306,6 +323,15 @@ class AnthropicBackend(LLMBackend):
                     "content-type": "application/json",
                 },
             ) as resp:
+                # Detect 4xx/5xx BEFORE forwarding bytes. Once we yield a
+                # single chunk the StreamingResponse commits its 200 OK
+                # headers and the agent SDK starts parsing SSE — too late
+                # to surface a clean error. (matin incident, 2026-04-27 —
+                # cryptic "Your request was blocked." instead of the real
+                # "model not found" body from Anthropic.)
+                if resp.status_code >= 400:
+                    body_bytes = await resp.aread()
+                    raise UpstreamProviderError(resp.status_code, body_bytes, "anthropic")
                 async for chunk in resp.aiter_bytes():
                     yield chunk
 
@@ -339,6 +365,9 @@ class OpenAIBackend(LLMBackend):
                     "content-type": "application/json",
                 },
             ) as resp:
+                if resp.status_code >= 400:
+                    body_bytes = await resp.aread()
+                    raise UpstreamProviderError(resp.status_code, body_bytes, "openai")
                 async for chunk in resp.aiter_bytes():
                     yield chunk
 
@@ -522,9 +551,16 @@ async def proxy_chat(
     """
     config = await _auth_agent(request, db)
     body = await request.json()
-    model = _resolve_model_alias(body.get("model", "claude-sonnet-4-6"))
+    requested_model = body.get("model", "claude-sonnet-4-6")
+    model = _resolve_model_alias(requested_model)
     body["model"] = model  # rewrite so the upstream call uses the real id
     is_stream = body.get("stream", False)
+
+    # Surface the resolved upstream model id back to the agent so the UI can
+    # show the real provider model (e.g. "claude-opus-4-1-20250805") instead
+    # of the Toup-internal alias (e.g. "claude-opus-4-7"). Read by the agent's
+    # response handler from the response headers.
+    resolved_model_header = {"x-toup-resolved-model": model}
 
     backend, api_key = _route_chat(model, config)
 
@@ -552,13 +588,41 @@ async def proxy_chat(
     start_ts = time.time()
 
     if is_stream:
-        # Streaming: collect bytes for usage extraction, forward in real-time
-        collected_bytes = bytearray()
+        # Streaming: collect bytes for usage extraction, forward in real-time.
+        # Pre-flight the upstream by pulling the first chunk INSIDE a try
+        # block — chat_stream raises UpstreamProviderError before yielding
+        # if the upstream returned non-2xx, so we can convert to a clean
+        # HTTPException BEFORE committing the StreamingResponse headers.
+        gen = backend.chat_stream(body, api_key)
+        try:
+            first_chunk = await gen.__anext__()
+        except UpstreamProviderError as e:
+            await _log_event(
+                db, config.user_id, backend.name, model, "chat",
+                0, 0, 0, int((time.time() - start_ts) * 1000), is_fallback, "error",
+            )
+            logger.warning(
+                "[LLM-PROXY] %s upstream %d for user=%s model=%s body=%r",
+                e.provider, e.status, config.user_id[:8], model, e.body,
+            )
+            # Re-raise the upstream status so the agent SDK surfaces a useful
+            # error (NotFound for invalid model, RateLimit for 429, etc.)
+            # rather than the previous opaque "Your request was blocked".
+            try:
+                detail = e.body.decode("utf-8", errors="replace")
+            except Exception:
+                detail = str(e.body)
+            raise HTTPException(e.status, detail=detail)
+        except StopAsyncIteration:
+            first_chunk = b""
+
+        collected_bytes = bytearray(first_chunk)
 
         async def stream_and_log():
-            nonlocal collected_bytes
             try:
-                async for chunk in backend.chat_stream(body, api_key):
+                if first_chunk:
+                    yield first_chunk
+                async for chunk in gen:
                     collected_bytes.extend(chunk)
                     yield chunk
             finally:
@@ -577,14 +641,14 @@ async def proxy_chat(
                 except Exception as e:
                     logger.warning("Failed to log usage event: %s", e)
 
-        media_type = "text/event-stream" if backend.name == "anthropic" else "text/event-stream"
         return StreamingResponse(
             stream_and_log(),
-            media_type=media_type,
+            media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                **resolved_model_header,
             },
         )
     else:
@@ -598,6 +662,18 @@ async def proxy_chat(
                 0, 0, 0, latency, is_fallback, "error",
             )
             raise HTTPException(502, f"Provider error: {e}")
+        # Surface clean upstream errors (model-not-found, rate-limit, etc.)
+        if resp.status_code >= 400:
+            body_bytes = resp.content
+            await _log_event(
+                db, config.user_id, backend.name, model, "chat",
+                0, 0, 0, int((time.time() - start_ts) * 1000), is_fallback, "error",
+            )
+            try:
+                detail = body_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                detail = str(body_bytes)
+            raise HTTPException(resp.status_code, detail=detail)
 
         latency = int((time.time() - start_ts) * 1000)
 
@@ -618,7 +694,9 @@ async def proxy_chat(
             inp, out, cost, latency, is_fallback,
         )
 
-        return resp_data
+        # Use JSONResponse so we can attach the resolved-model header.
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=resp_data, headers=resolved_model_header)
 
 
 # ── SDK-compatible path aliases ──────────────────────────────────────

@@ -86,6 +86,17 @@ class Rollout(Base):
     # Configurable per-rollout; 10 min default from the API.
     canary_wait_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
 
+    # Persisted rollout phase. Used by the startup resumer to figure out where
+    # to pick up an orphan: "" (just created) → "canary_upgrading" →
+    # "canary_observing" → "batching" → "" (terminal). The resumer only ever
+    # touches rollouts with status='running' AND phase='canary_observing'.
+    phase: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
+
+    # Wall-clock deadline for the canary observation window. Set when entering
+    # phase='canary_observing'. The startup resumer uses this to compute
+    # remaining wait (or skip the wait if the deadline has already passed).
+    resume_after: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 

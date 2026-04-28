@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -317,6 +317,7 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
         return
 
     rollout.canary_prefix = canary.user_id[:8]
+    rollout.phase = "canary_upgrading"
     await db.commit()
 
     # ── Phase A: upgrade canary ────────────────────────────────────
@@ -327,6 +328,7 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
         # Canary upgrade failed (and was rolled back, or rollback also failed)
         rollout.status = "aborted_canary_failed"
         rollout.completed_at = datetime.utcnow()
+        rollout.phase = ""
         rollout.notes = f"canary {canary.user_id[:8]} status={canary_attempt.status}: {canary_attempt.error}"
         await db.commit()
         await _send_telegram(
@@ -337,32 +339,23 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
         return
 
     # ── Canary observation window ─────────────────────────────────
+    # Persist the deadline so resume_orphaned_rollouts() can pick this up
+    # if the platform redeploys mid-observation. canary_observe_loop()
+    # below is idempotent — safe to call from either start_rollout's task
+    # or the resumer.
+    if rollout.canary_wait_minutes > 0:
+        rollout.phase = "canary_observing"
+        rollout.resume_after = datetime.utcnow() + timedelta(minutes=rollout.canary_wait_minutes)
+        await db.commit()
+
     agent_url = await _agent_url(db, canary)
-    if agent_url and rollout.canary_wait_minutes > 0:
-        logger.info(
-            "[ROLLOUT] %s canary observation for %d min", rollout.id, rollout.canary_wait_minutes
-        )
-        # Poll every 20 s for the full window. 60 min * 3 = max 180 polls.
-        interval_s = 20.0
-        attempts = int(rollout.canary_wait_minutes * 60 / interval_s)
-        best_consecutive = await _poll_health(agent_url, attempts=attempts, interval_s=interval_s)
-        if best_consecutive < 3:
-            # Degraded during observation → rollback + abort
-            logger.warning(
-                "[ROLLOUT] %s canary degraded during observation (best=%d)",
-                rollout.id, best_consecutive,
-            )
-            await _upgrade_one(db, rollout, canary, canary_attempt.prior_tag)
-            rollout.status = "aborted_canary_failed"
-            rollout.completed_at = datetime.utcnow()
-            rollout.notes = f"canary degraded during {rollout.canary_wait_minutes}-min observation"
-            await db.commit()
-            await _send_telegram(
-                "critical",
-                f"Rollout <code>{rollout.image_tag}</code> aborted — canary degraded "
-                f"during {rollout.canary_wait_minutes}-min observation window",
-            )
-            return
+    proceed = await _canary_observe_loop(db, rollout, canary, canary_attempt.prior_tag, agent_url)
+    if not proceed:
+        return
+
+    rollout.phase = "batching"
+    rollout.resume_after = None
+    await db.commit()
 
     await _send_telegram(
         "info",
@@ -386,6 +379,8 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
 
     rollout.status = "complete"
     rollout.completed_at = datetime.utcnow()
+    rollout.phase = ""
+    rollout.resume_after = None
     rollout.notes = f"completed: {total_ok} ok, {total_fail} failed/rolled-back of {len(tenants)} total"
     await db.commit()
 
@@ -395,6 +390,204 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
         f"Rollout <code>{rollout.image_tag}</code> complete: "
         f"{total_ok}/{len(tenants)} upgraded, {total_fail} failed",
     )
+
+
+async def _canary_observe_loop(
+    db: AsyncSession,
+    rollout: Rollout,
+    canary: ManagedContainer,
+    prior_tag: Optional[str],
+    agent_url: Optional[str],
+) -> bool:
+    """Poll the canary's /agent/health until rollout.resume_after, returning
+    True if observation passed (proceed to batch phase) or False if it
+    failed (caller should return early — abort already written by us).
+
+    Idempotent across resumer invocations: reads `resume_after` from the
+    rollout row each call, so picking up after a crash with N seconds
+    remaining is identical to a fresh run. If `resume_after` is in the
+    past (or canary_wait_minutes=0), short-circuits with success.
+    """
+    if not agent_url or rollout.canary_wait_minutes <= 0:
+        return True
+
+    deadline = rollout.resume_after or datetime.utcnow()
+    remaining_s = max(0.0, (deadline - datetime.utcnow()).total_seconds())
+    if remaining_s <= 0:
+        logger.info(
+            "[ROLLOUT] %s canary observation deadline already passed — proceeding to batch",
+            rollout.id,
+        )
+        return True
+
+    interval_s = 20.0
+    attempts = max(1, int(remaining_s / interval_s))
+    logger.info(
+        "[ROLLOUT] %s canary observing for %.0fs remaining (%d polls)",
+        rollout.id, remaining_s, attempts,
+    )
+    best_consecutive = await _poll_health(agent_url, attempts=attempts, interval_s=interval_s)
+    if best_consecutive < 3:
+        logger.warning(
+            "[ROLLOUT] %s canary degraded during observation (best=%d)",
+            rollout.id, best_consecutive,
+        )
+        await _upgrade_one(db, rollout, canary, prior_tag)
+        rollout.status = "aborted_canary_failed"
+        rollout.completed_at = datetime.utcnow()
+        rollout.phase = ""
+        rollout.resume_after = None
+        rollout.notes = f"canary degraded during {rollout.canary_wait_minutes}-min observation"
+        await db.commit()
+        await _send_telegram(
+            "critical",
+            f"Rollout <code>{rollout.image_tag}</code> aborted — canary degraded "
+            f"during {rollout.canary_wait_minutes}-min observation window",
+        )
+        return False
+    return True
+
+
+async def resume_orphaned_rollouts() -> None:
+    """Startup hook: pick up any rollout that was mid-canary-observation when
+    the platform process died. Without this, a Railway redeploy during the
+    10-minute canary window leaves the rollout row stuck in `running` forever
+    and blocks the next CI rollout with a 409.
+
+    Only resumes rollouts in phase='canary_observing'. Rollouts in
+    'canary_upgrading' or 'batching' are NOT auto-resumed — those phases
+    issue calls to the bridge that may have completed but lost their result;
+    safer to mark `aborted_orphan` and let the operator retry.
+
+    Called from app startup (FastAPI lifespan).
+    """
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(Rollout).where(Rollout.status == "running")
+        )
+        running = result.scalars().all()
+        if not running:
+            return
+        for rollout in running:
+            if rollout.phase == "canary_observing":
+                logger.info(
+                    "[ROLLOUT-RESUMER] resuming %s (canary_observing, deadline=%s)",
+                    rollout.id, rollout.resume_after,
+                )
+                from app.scripts.scheduled_tasks import schedule_one_shot
+                schedule_one_shot(
+                    func=_resume_rollout_task,
+                    kwargs={"rollout_id": rollout.id},
+                    job_id=f"rollout_resume_{rollout.id}",
+                )
+            else:
+                # Mid-bridge-call orphan — can't safely resume because the
+                # bridge may have finished the upgrade (so retrying would
+                # double-deploy). Mark and alert.
+                logger.warning(
+                    "[ROLLOUT-RESUMER] orphaning %s (phase=%r, status=running)",
+                    rollout.id, rollout.phase,
+                )
+                rollout.status = "aborted_orphan"
+                rollout.completed_at = datetime.utcnow()
+                rollout.notes = (rollout.notes or "") + (
+                    f"\nORPHANED at startup; was in phase={rollout.phase!r}. "
+                    f"Operator should re-trigger the rollout if needed."
+                )
+                await db.commit()
+                await _send_telegram(
+                    "warning",
+                    f"Rollout <code>{rollout.image_tag}</code> orphaned "
+                    f"(phase={rollout.phase!r}) — re-trigger if still needed",
+                )
+
+
+async def _resume_rollout_task(rollout_id: str) -> None:
+    """Resumer entry point — re-enters _drive_rollout from the canary
+    observation phase. Same lifecycle as _run_rollout_task but skips the
+    initial "pending → running" transition since we're already running.
+    """
+    async with async_session_maker() as db:
+        result = await db.execute(select(Rollout).where(Rollout.id == rollout_id))
+        rollout = result.scalar_one_or_none()
+        if not rollout or rollout.status != "running":
+            logger.warning(
+                "[ROLLOUT-RESUMER] %s no longer eligible (status=%s)",
+                rollout_id, rollout.status if rollout else "missing",
+            )
+            return
+        if rollout.phase != "canary_observing":
+            logger.warning(
+                "[ROLLOUT-RESUMER] %s phase changed to %r before resume",
+                rollout_id, rollout.phase,
+            )
+            return
+
+        # Find the canary container from the prefix we stored at start
+        canary_result = await db.execute(
+            select(ManagedContainer).where(
+                ManagedContainer.user_id.like(f"{rollout.canary_prefix}%")
+            )
+        )
+        canary = canary_result.scalar_one_or_none()
+        if not canary:
+            rollout.status = "aborted_orphan"
+            rollout.completed_at = datetime.utcnow()
+            rollout.notes = (rollout.notes or "") + "\nResumer: canary container not found"
+            await db.commit()
+            return
+
+        # Look up the canary's prior tag from its successful attempt row
+        prior = None
+        for a in (rollout.attempts or []):
+            if a.status == "ok":
+                prior = a.prior_tag
+                break
+
+        agent_url = await _agent_url(db, canary)
+        proceed = await _canary_observe_loop(db, rollout, canary, prior, agent_url)
+        if not proceed:
+            return
+
+        rollout.phase = "batching"
+        rollout.resume_after = None
+        await db.commit()
+        await _send_telegram(
+            "info",
+            f"Rollout <code>{rollout.image_tag}</code>: canary passed (resumed), "
+            f"proceeding to rest",
+        )
+
+        # Continue with the batch phase. Need to re-enumerate tenants.
+        tenants = await _running_tenants(db)
+        rest = [t for t in tenants if t.id != canary.id]
+        batch_size = settings.rollout_batch_size or 5
+        total_ok = 1
+        total_fail = 0
+        for i in range(0, len(rest), batch_size):
+            batch = rest[i : i + batch_size]
+            tasks = [_upgrade_one(db, rollout, c, rollout.image_tag) for c in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            for r in results:
+                if r.status == "ok":
+                    total_ok += 1
+                else:
+                    total_fail += 1
+
+        rollout.status = "complete"
+        rollout.completed_at = datetime.utcnow()
+        rollout.phase = ""
+        rollout.resume_after = None
+        rollout.notes = (
+            f"completed (resumed from orphan): {total_ok} ok, "
+            f"{total_fail} failed/rolled-back of {len(tenants)} total"
+        )
+        await db.commit()
+        await _send_telegram(
+            "info" if total_fail == 0 else "warning",
+            f"Rollout <code>{rollout.image_tag}</code> complete (resumed): "
+            f"{total_ok}/{len(tenants)} upgraded, {total_fail} failed",
+        )
 
 
 # ─── Public entry points ──────────────────────────────────────────
