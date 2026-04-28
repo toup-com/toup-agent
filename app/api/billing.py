@@ -108,12 +108,16 @@ async def _sync_active_subscription_to_db(
     # Generating a fresh random secret here would never reach the agent.
     if not config.connect_token:
         config.connect_token = f"toup_ct_{secrets.token_urlsafe(32)}"
-    if not config.llm_token_hash:
-        config.llm_token_hash = hashlib.sha256(
-            config.connect_token.encode()
-        ).hexdigest()
+    # ALWAYS recompute the hash — sha256(token) is idempotent and cheap.
+    # The previous `if not config.llm_token_hash` guard let stale hashes
+    # from earlier BYOK setups survive bundle activation, causing 401s
+    # at the proxy because hash(connect_token) != stored hash.
+    # Root cause of the Nariman incident (2026-04-28).
+    new_hash = hashlib.sha256(config.connect_token.encode()).hexdigest()
+    if config.llm_token_hash != new_hash:
+        config.llm_token_hash = new_hash
         logger.info(
-            "Synced llm_token_hash from connect_token for user %s via already_active sync",
+            "Refreshed llm_token_hash from connect_token for user %s via already_active sync",
             config.user_id,
         )
     # Per-user OpenAI project auto-provisioning (β architecture). Idempotent:
