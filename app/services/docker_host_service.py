@@ -168,18 +168,27 @@ async def provision_container(
     db: AsyncSession,
     user_id: str,
     agent_config: Optional[AgentConfig] = None,
+    recreate: bool = False,
 ) -> ManagedContainer:
     """Provision a new Docker container for a user's agent, via the bridge.
 
-    Idempotent: if a running container already exists for this user, returns
-    the existing row.
+    Idempotent for new provisions: if a running container already exists for
+    this user, returns the existing row WITHOUT re-calling the bridge.
+
+    Pass `recreate=True` to force the bridge POST /v1/tenants call even when
+    a container is already running. The bridge's create flow is itself
+    idempotent (force-removes the stale container, rewrites .env, re-runs
+    with fresh env). This is the path used by `update_container_env` after
+    bundle activation flips llm_mode / connect_token, since the existing
+    container started with the pre-activation env and won't pick up the
+    new values otherwise (Arshia incident, 2026-04-28).
     """
     prefix = user_id[:8]
     result = await db.execute(
         select(ManagedContainer).where(ManagedContainer.user_id == user_id)
     )
     existing = result.scalar_one_or_none()
-    if existing and existing.status in ("running", "provisioning"):
+    if existing and existing.status in ("running", "provisioning") and not recreate:
         return existing
 
     # Fetch agent_config if caller didn't pass one
@@ -398,7 +407,14 @@ async def update_container_env(
 
     In Phase 2 this SSH'd to rewrite the .env file then `docker rm/run`.
     In Phase 3 we re-provision via bridge (idempotent — bridge detects
-    existing container and updates in place).
+    existing container, force-removes it, rewrites the .env file, and
+    re-runs with fresh env).
+
+    Must pass `recreate=True` — without it, provision_container's
+    new-tenant idempotency early-return would skip the bridge call
+    entirely and leave the container running with stale env (the bug that
+    let Arshia's freshly-activated bundle tenant keep `LLM_MODE=manual`
+    and an empty `TOUP_TOKEN` after Stripe checkout completed).
     """
     result = await db.execute(
         select(ManagedContainer).where(ManagedContainer.user_id == user_id)
@@ -406,9 +422,9 @@ async def update_container_env(
     container = result.scalar_one_or_none()
     if not container:
         return None
-    # Delegate to provision_container (bridge handles the in-place update)
-    # with the fresh agent_config payload.
-    return await provision_container(db, user_id, agent_config=agent_config)
+    return await provision_container(
+        db, user_id, agent_config=agent_config, recreate=True,
+    )
 
 
 async def upgrade_tenant_image(

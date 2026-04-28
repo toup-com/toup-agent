@@ -129,6 +129,26 @@ async def _sync_active_subscription_to_db(
         "Synced already-active Stripe sub %s to platform DB for user %s",
         subscription_id, config.user_id,
     )
+    # Refresh the running tenant container's env so the bundle activation
+    # (llm_mode + connect_token + hash) actually reaches the agent. The
+    # container was provisioned during onboarding before Stripe finished,
+    # so its env still has llm_mode=manual + empty TOUP_TOKEN. Without this,
+    # the agent stays in BYOK fallback and every chat returns "API key
+    # invalid". (Arshia incident, 2026-04-28.) Failures are non-fatal —
+    # the DB-level activation already succeeded.
+    try:
+        from app.services.docker_host_service import update_container_env
+        refreshed = await update_container_env(db, str(config.user_id), config)
+        if refreshed:
+            logger.info(
+                "Refreshed tenant container env after already-active sync for user %s",
+                config.user_id,
+            )
+    except Exception as _e:
+        logger.warning(
+            "Container env refresh failed after already-active sync for user %s: %s",
+            config.user_id, _e,
+        )
 
 
 def _provision_openai_project_if_needed(config: AgentConfig) -> None:
