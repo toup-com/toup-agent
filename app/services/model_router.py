@@ -41,17 +41,44 @@ def classify_request(
     user_message: str,
     conversation_history: Optional[List[Dict]] = None,
     has_media: bool = False,
+    preferred_provider: Optional[str] = None,
 ) -> RoutingDecision:
     """
-    Select the model based on available API keys. No complexity classification.
+    Select the model based on configured preference + available providers.
 
     Priority:
-      1. Anthropic key available → Claude Opus 4.7
-      2. OpenAI key available    → GPT-5.4
-      3. No keys                 → Claude Opus 4.7 (will fail, but sane default)
+      1. Bundle mode: respect `preferred_provider` (anthropic/openai). Both
+         providers are reachable via the proxy regardless of local keys.
+      2. BYOK Anthropic key → Claude Opus 4.7
+      3. BYOK OpenAI key    → GPT-5.4
+      4. No keys + no bundle → Claude Opus 4.7 (sane default; will fail)
+
+    Bundle subscribers always have BOTH providers available through the
+    Toup proxy, so the local key_provider check (which sees no keys for
+    bundle agents) would always fall through to the default — not what
+    the user wants. The preferred_provider arg lets the caller (the chat
+    handler) pass the user's choice from agent_configs.preferred_provider.
     """
     from app.services.key_provider import keys
+    from app.config import settings
 
+    # Bundle mode: trust preferred_provider, fall back to anthropic
+    if settings.llm_mode == "bundle" and settings.toup_token:
+        choice = (preferred_provider or "anthropic").lower()
+        if choice == "openai":
+            model = "gpt-5.4"
+            label = "GPT-5.4"
+            reason = f"bundle mode + preferred=openai"
+        else:
+            model = "claude-opus-4-7"
+            label = "Claude Opus 4.7"
+            reason = f"bundle mode + preferred=anthropic"
+        logger.info(f"[ROUTER] {reason}")
+        return RoutingDecision(
+            tier="default", model=model, label=label, confidence=1.0, reason=reason,
+        )
+
+    # BYOK paths
     if keys.has_anthropic:
         model = "claude-opus-4-7"
         label = "Claude Opus 4.7"

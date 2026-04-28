@@ -115,6 +115,15 @@ class AgentConfig(Base):
     agent_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     agent_model: Mapped[str] = mapped_column(String(50), default="claude-opus-4-6")
 
+    # User's preferred LLM provider for bundle mode (anthropic | openai).
+    # Routes which model the model_router picks when no explicit override.
+    # Bundle subscribers can flip this from /agent/settings without code
+    # changes — useful for "I want my agent on GPT" preferences. Default
+    # 'anthropic' matches today's behavior.
+    preferred_provider: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="anthropic", server_default="anthropic"
+    )
+
     # LLM Bundle subscription
     bundle_stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     bundle_status: Mapped[str] = mapped_column(String(20), default="none")

@@ -1314,18 +1314,21 @@ async def ws_chat(
                 # Skip if no session_id yet (first message — agent_runner creates session)
                 # Skip for system actions (customize_app) — no user message to save
                 _user_msg_presaved = False
+                _persisted_user_msg_id: Optional[str] = None
+                _persisted_day_chat_id: Optional[str] = None
                 if session_id and not _is_system_action:
                     try:
                         from app.db.database import async_session_maker
                         from app.db.models import Message as DbMessage, Conversation
                         async with async_session_maker() as _presave_db:
                             _presave_dc_id = await _resolve_day_chat_id_for_now(_presave_db, user_id, tz_override=client_tz)
-                            _presave_db.add(DbMessage(
+                            _new_msg = DbMessage(
                                 conversation_id=session_id,
                                 day_chat_id=_presave_dc_id,
                                 role="user",
                                 content=_original_user_text,
-                            ))
+                            )
+                            _presave_db.add(_new_msg)
                             # Update conversation timestamp
                             _conv = (await _presave_db.execute(
                                 __import__('sqlalchemy').select(Conversation).where(Conversation.id == session_id)
@@ -1334,7 +1337,29 @@ async def ws_chat(
                                 _conv.message_count = (_conv.message_count or 0) + 1
                                 _conv.updated_at = __import__('datetime').datetime.utcnow()
                             await _presave_db.commit()
+                            await _presave_db.refresh(_new_msg)
+                            _persisted_user_msg_id = _new_msg.id
+                            _persisted_day_chat_id = _presave_dc_id
                         _user_msg_presaved = True
+
+                        # Reconcile the client's optimistic message: echo back
+                        # the server-assigned id so the frontend can swap its
+                        # temporary `msg-${Date.now()}` placeholder for the
+                        # canonical id. Without this, the day-chat refetch
+                        # dropped the optimistic entry until the page was
+                        # refreshed (matin-era UX bug).
+                        _client_msg_id = msg.get("client_msg_id")
+                        if _client_msg_id:
+                            try:
+                                await websocket.send_json({
+                                    "type": "user_message_persisted",
+                                    "client_msg_id": _client_msg_id,
+                                    "server_msg_id": _persisted_user_msg_id,
+                                    "day_chat_id": _persisted_day_chat_id,
+                                    "session_id": session_id,
+                                })
+                            except Exception:
+                                pass
                     except Exception as _pse:
                         logger.warning(f"[WS] Failed to pre-save user message: {_pse}")
 

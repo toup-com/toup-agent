@@ -286,6 +286,9 @@ async def init_db():
         # (see rollout_service.resume_orphaned_rollouts).
         "ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS phase VARCHAR(32) NOT NULL DEFAULT ''",
         "ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS resume_after TIMESTAMP",
+        # User-selectable LLM provider for bundle mode (anthropic | openai).
+        # See model_router.classify_request — overrides the bundle default.
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS preferred_provider VARCHAR(20) NOT NULL DEFAULT 'anthropic'",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

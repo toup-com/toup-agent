@@ -489,10 +489,23 @@ class AgentRunner:
             model_override = self._session_model_override
 
         if model_override == "auto" or model_override is None:
+            # Read user's preferred provider from agent_config (bundle mode).
+            # Defaults to anthropic if not set or BYOK.
+            preferred = None
+            try:
+                from app.db import AgentConfig as _AC
+                from sqlalchemy import select as _sel
+                _pref = (await db.execute(
+                    _sel(_AC.preferred_provider).where(_AC.user_id == user_id)
+                )).scalar_one_or_none()
+                preferred = _pref
+            except Exception:
+                pass
             routing_decision = classify_request(
                 user_message=user_message,
                 conversation_history=messages[:-1],
                 has_media=bool(media_paths),
+                preferred_provider=preferred,
             )
             active_model = routing_decision.model
             logger.info(f"[AGENT] Auto-routed: {routing_decision.reason}")
@@ -1234,6 +1247,32 @@ class AgentRunner:
 
         section_parts["identity"] = "\n\n".join(identity_parts)
 
+        # ── 1b. Identity anchor — kill the "I'm Claude / GPT" hallucination ──
+        # LLMs have stale self-identity baked into their training data
+        # ("I'm Claude 3.5 Sonnet"). Without this anchor, when a user asks
+        # "what model are you?" the agent breaks the white-label illusion
+        # by naming the underlying provider. We override that explicitly:
+        # the agent identifies as the user's agent name (or generic "your
+        # agent" until they've named it), period.
+        try:
+            from app.db.models import AgentConfig as _AC
+            async with db.begin_nested():
+                _name_cfg = (await db.execute(
+                    select(_AC.agent_name).where(_AC.user_id == user_id)
+                )).scalar_one_or_none()
+        except Exception:
+            _name_cfg = None
+        _agent_label = (_name_cfg or "").strip() or "your agent"
+        section_parts["identity_anchor"] = (
+            "# Identity\n"
+            f"You are **{_agent_label}** — a Toup agent. You are NOT Claude, "
+            "NOT GPT, NOT Sonnet, NOT Opus, NOT any specific provider model. "
+            "When the user asks what you are, who built you, or what model "
+            "is powering you, answer as the agent — never name the underlying "
+            "LLM provider or version. The provider may change without notice; "
+            "your identity to the user is stable."
+        )
+
         # ── 2. Agent Brain — disabled (Soul page is source of truth) ──
         agent_memories = []
         AGENT_BRAIN_ENABLED = os.environ.get("AGENT_BRAIN_ENABLED", "false").lower() == "true"
@@ -1768,8 +1807,9 @@ class AgentRunner:
 
         # ── Assemble in order ──────────────────────────────────────
         SECTION_ORDER = [
-            "identity",       # WHO the agent is
-            "user_brain",     # WHO the user is
+            "identity",         # WHO the agent is (soul + behavioral)
+            "identity_anchor",  # Don't break white-label by naming underlying LLM
+            "user_brain",       # WHO the user is
             "agent_brain",    # Agent brain (disabled by default)
             "work_brain",     # Work brain (disabled by default)
             "skills",         # WHAT the agent can do
