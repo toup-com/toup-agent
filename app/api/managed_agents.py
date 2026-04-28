@@ -49,6 +49,42 @@ async def provision(
     # 'cancelling' is allowed because the user is paid through period_end;
     # 'past_due' / 'cancelled' / 'none' are not.
     if agent_config.llm_mode == "bundle":
+        # Webhook race: PaymentForm's onSuccess fires the moment Stripe Elements
+        # confirms the PaymentIntent client-side, which is *before* the
+        # invoice.payment_succeeded webhook lands at our backend. If we just
+        # gate on DB state, the user gets a 402 here even though they paid 200ms
+        # ago. Sync from Stripe directly so post-payment provision is reliable
+        # without depending on webhook ordering. (Arshia incident, 2026-04-28.)
+        if agent_config.bundle_status not in ("active", "cancelling"):
+            try:
+                from app.services.stripe_service import (
+                    get_active_subscription_for_customer,
+                )
+                from app.api.billing import _sync_active_subscription_to_db
+                user_result = await db.execute(
+                    select(AgentConfig.user_id).where(AgentConfig.user_id == current_user.id)
+                )
+                # Resolve customer_id off the user row
+                from app.db.models import User as _U
+                u = (await db.execute(select(_U).where(_U.id == current_user.id))).scalar_one_or_none()
+                price_id = settings.stripe_llm_bundle_price_id
+                if u and u.stripe_customer_id and price_id:
+                    found = get_active_subscription_for_customer(u.stripe_customer_id, price_id)
+                    if found and found.get("status") == "active":
+                        await _sync_active_subscription_to_db(
+                            db, agent_config, found["subscription_id"]
+                        )
+                        # Refresh from DB after sync so downstream sees active status
+                        await db.refresh(agent_config)
+                        logger.info(
+                            "[PROVISION] Synced Stripe→DB for user %s before container provision",
+                            str(current_user.id)[:8],
+                        )
+            except Exception as _e:
+                logger.warning(
+                    "[PROVISION] Stripe sync attempt failed for user %s: %s",
+                    str(current_user.id)[:8], _e,
+                )
         if agent_config.bundle_status not in ("active", "cancelling"):
             raise HTTPException(
                 402,
