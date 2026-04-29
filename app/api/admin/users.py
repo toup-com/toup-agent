@@ -372,9 +372,26 @@ async def get_usage_overview(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get platform-wide usage overview: per-user totals + aggregate. Admin only."""
+    """Get platform-wide usage overview: per-user totals + aggregate. Admin only.
+
+    Source-of-truth strategy:
+      1. `llm_proxy_events` is authoritative for bundle-mode traffic — every
+         hit through `make_anthropic_client`/`make_openai_client` lands there
+         tagged with the user_id, INCLUDING auto-builder, voice, day archival,
+         and any other internal_llm callers. Source of cost truth.
+      2. For users with no proxy events (manual mode, or fresh accounts), fall
+         back to the agent's local DB via /api/llm-setup/usage/summary which
+         queries Message + BuildUsage on the tenant container.
+      3. If the agent proxy is unreachable, fall back to platform-local DB
+         (covers self-hosted edge cases).
+
+    This avoids double-counting (bundle users' chat is logged in BOTH
+    llm_proxy_events on platform AND messages on agent — we trust the
+    platform's record and skip the agent for those users).
+    """
     import httpx, logging
     from app.db import Message, Conversation, AgentConfig
+    from app.db.models import LLMProxyEvent
     from app.api.llm_setup import model_to_provider
     from app.config import settings
     from datetime import timedelta
@@ -392,7 +409,32 @@ async def get_usage_overview(
     users_result = await db.execute(select(User).order_by(User.created_at.desc()))
     all_users = users_result.scalars().all()
 
-    # For each user, try agent proxy first, then local DB
+    # Bulk-aggregate llm_proxy_events per (user_id, period) in 2 round-trips
+    # rather than N×M. Both system.* and user-attributable events count for
+    # the admin dashboard — admins want total cost visibility, not just
+    # cap-relevant cost.
+    proxy_aggs: dict[str, dict[str, dict]] = {}
+    for suffix, since in [("30d", periods["30d"]), ("all", periods["all"])]:
+        stmt = (
+            select(
+                LLMProxyEvent.user_id,
+                func.coalesce(
+                    func.sum(LLMProxyEvent.input_tokens + LLMProxyEvent.output_tokens), 0
+                ).label("toks"),
+                func.coalesce(func.sum(LLMProxyEvent.cost_cents), 0).label("cost_c"),
+                func.count().label("reqs"),
+            )
+            .where(LLMProxyEvent.created_at >= since)
+            .group_by(LLMProxyEvent.user_id)
+        )
+        for uid, toks, cost_c, reqs in (await db.execute(stmt)).all():
+            proxy_aggs.setdefault(uid, {})[suffix] = {
+                "tokens": int(toks),
+                "cost": round(float(cost_c) / 100.0, 4),
+                "requests": int(reqs),
+            }
+
+    # For each user, choose the best source: proxy events > agent > local DB.
     user_usage_list = []
     pricing = settings.pricing_per_1k
 
@@ -404,7 +446,18 @@ async def get_usage_overview(
             "role": getattr(u, "role", "beta_user"),
         }
 
-        # Try agent proxy
+        # Source 1: platform's llm_proxy_events (authoritative for bundle).
+        if u.id in proxy_aggs:
+            for suffix in ("30d", "all"):
+                d = proxy_aggs[u.id].get(suffix, {"tokens": 0, "cost": 0.0, "requests": 0})
+                user_entry[f"total_tokens_{suffix}"] = d["tokens"]
+                user_entry[f"total_cost_{suffix}"] = d["cost"]
+                user_entry[f"total_requests_{suffix}"] = d["requests"]
+            user_entry["source"] = "proxy_events"
+            user_usage_list.append(user_entry)
+            continue
+
+        # Source 2: agent's /usage/summary (manual mode, or bundle user yet to use proxy).
         agent_data = None
         try:
             result = await db.execute(
@@ -422,6 +475,7 @@ async def get_usage_overview(
             pass
 
         if agent_data:
+            user_entry["source"] = "agent_local"
             # Extract 30d summary for the overview row
             summary_30d = next((s for s in agent_data if s.get("period") == "30d"), None)
             if summary_30d:
@@ -442,9 +496,10 @@ async def get_usage_overview(
                 user_entry["total_cost_all"] = 0.0
                 user_entry["total_requests_all"] = 0
         else:
-            # Local DB fallback: chat messages + auto-builder BuildUsage rows.
-            # BuildUsage is queried in an isolated session so a missing table on
-            # platform-only DBs can't poison the outer transaction.
+            # Source 3: Local DB (chat messages + BuildUsage). Only reached
+            # when (a) no proxy events for this user AND (b) the agent is
+            # unreachable. Mostly hits self-hosted edge cases.
+            user_entry["source"] = "platform_local"
             from app.db.models import BuildUsage  # noqa: WPS433
             from app.db.database import async_session_maker  # noqa: WPS433
 
