@@ -297,7 +297,11 @@ async def get_usage_summary(
     """Get detailed usage summary broken down by provider and model for multiple time periods."""
     from datetime import timedelta
 
-    # Try proxying to remote agent first (platform has no local messages)
+    # Try proxying to remote agent first (platform has no local messages).
+    # On agent containers `agent_configs` doesn't exist — that throws, leaves
+    # the asyncpg session in InFailedSQLTransaction, then the local-DB
+    # fallback below also fails. Rollback after the probe so the fallback
+    # can reuse the same session.
     try:
         result = await db.execute(
             select(AgentConfig.agent_url, AgentConfig.agent_api_key)
@@ -313,6 +317,10 @@ async def get_usage_summary(
             logger.warning("Agent usage proxy failed, falling back to local DB")
     except Exception as e:
         logger.warning("Agent usage proxy error: %s, falling back to local DB", e)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
     now = datetime.utcnow()
     periods = {
