@@ -448,19 +448,58 @@ async def _canary_observe_loop(
     return True
 
 
-async def resume_orphaned_rollouts() -> None:
-    """Startup hook: pick up any rollout that was mid-canary-observation when
-    the platform process died. Without this, a Railway redeploy during the
-    10-minute canary window leaves the rollout row stuck in `running` forever
-    and blocks the next CI rollout with a 409.
+# In-flight resume tracking so the reconciler tick doesn't double-fire when
+# a previous resume is still running. Process-local; not shared across
+# replicas — but we only ever run one platform-api instance, and the
+# database `phase` advance is the real source of truth either way.
+_resume_inflight: set[str] = set()
 
-    Only resumes rollouts in phase='canary_observing'. Rollouts in
-    'canary_upgrading' or 'batching' are NOT auto-resumed — those phases
-    issue calls to the bridge that may have completed but lost their result;
-    safer to mark `aborted_orphan` and let the operator retry.
 
-    Called from app startup (FastAPI lifespan).
+# Stuck-rollout threshold. canary_wait_minutes (default 10) + ~5 min for
+# canary upgrade + ~3 min for batch = 18 min worst-case happy path. We use
+# 30 min as the auto-orphan trigger to absorb slow bridge calls without
+# false-positiving a real successful rollout.
+_STUCK_ROLLOUT_THRESHOLD_MIN = 30
+
+
+async def rollout_reconciler_loop() -> None:
+    """Long-running background task — wakes every 30 s, advances rollouts
+    that need it, and orphans the ones stuck way past their budget.
+
+    Why this exists: previously a Railway redeploy during the 10-min canary
+    observation window killed the in-memory `asyncio.sleep` driving the
+    rollout. The startup hook tried to recover via APScheduler, which
+    sometimes fails to start (logged `name 'asyncio' is not defined` was the
+    most recent symptom). Result: rollouts wedged in `running/canary_observing`
+    forever, blocking every subsequent CI push with HTTP 409 and leaving
+    tenants on stale images.
+
+    This reconciler is self-contained — no APScheduler, no external clock
+    source. It re-derives intent from the DB on every tick, so any process
+    death is recovered within 30 s of the next start. Idempotent: if a
+    resume is already in-flight in this process, the next tick skips it.
+
+    Two responsibilities, kept in one loop because they share the same
+    "list rollouts in 'running'" query:
+      1. Resume rollouts in phase='canary_observing' once `resume_after`
+         has passed. This is the recovery path for redeploys mid-canary.
+      2. Auto-orphan rollouts that have been `running` for longer than
+         `_STUCK_ROLLOUT_THRESHOLD_MIN`, regardless of phase. Catches
+         double failures (e.g. resume crashes too) and rare phase corruptions.
     """
+    logger.info("[ROLLOUT-RECONCILER] started (tick=30s)")
+    while True:
+        try:
+            await _reconcile_once()
+        except Exception:
+            # Never let a tick exception kill the loop. Log and keep going.
+            logger.exception("[ROLLOUT-RECONCILER] tick failed; will retry")
+        await asyncio.sleep(30)
+
+
+async def _reconcile_once() -> None:
+    """One reconciler tick — split out so tests can call it deterministically."""
+    now = datetime.utcnow()
     async with async_session_maker() as db:
         result = await db.execute(
             select(Rollout).where(Rollout.status == "running")
@@ -468,38 +507,76 @@ async def resume_orphaned_rollouts() -> None:
         running = result.scalars().all()
         if not running:
             return
+
         for rollout in running:
-            if rollout.phase == "canary_observing":
-                logger.info(
-                    "[ROLLOUT-RESUMER] resuming %s (canary_observing, deadline=%s)",
-                    rollout.id, rollout.resume_after,
-                )
-                from app.scripts.scheduled_tasks import schedule_one_shot
-                schedule_one_shot(
-                    func=_resume_rollout_task,
-                    kwargs={"rollout_id": rollout.id},
-                    job_id=f"rollout_resume_{rollout.id}",
-                )
-            else:
-                # Mid-bridge-call orphan — can't safely resume because the
-                # bridge may have finished the upgrade (so retrying would
-                # double-deploy). Mark and alert.
+            age_min = (now - rollout.started_at).total_seconds() / 60 if rollout.started_at else 0
+
+            # (2) Auto-orphan rollouts past the budget — runs FIRST so a
+            # truly-stuck rollout doesn't keep getting "resumed" forever.
+            if age_min > _STUCK_ROLLOUT_THRESHOLD_MIN:
                 logger.warning(
-                    "[ROLLOUT-RESUMER] orphaning %s (phase=%r, status=running)",
-                    rollout.id, rollout.phase,
+                    "[ROLLOUT-RECONCILER] auto-orphaning %s (age=%.1fmin, phase=%r)",
+                    rollout.id, age_min, rollout.phase,
                 )
                 rollout.status = "aborted_orphan"
-                rollout.completed_at = datetime.utcnow()
+                rollout.completed_at = now
                 rollout.notes = (rollout.notes or "") + (
-                    f"\nORPHANED at startup; was in phase={rollout.phase!r}. "
-                    f"Operator should re-trigger the rollout if needed."
+                    f"\nAuto-orphaned by reconciler at age={age_min:.1f}min "
+                    f"(phase={rollout.phase!r}, threshold={_STUCK_ROLLOUT_THRESHOLD_MIN}min)"
                 )
                 await db.commit()
                 await _send_telegram(
                     "warning",
-                    f"Rollout <code>{rollout.image_tag}</code> orphaned "
-                    f"(phase={rollout.phase!r}) — re-trigger if still needed",
+                    f"Rollout <code>{rollout.image_tag}</code> auto-orphaned "
+                    f"after {age_min:.0f} min (phase={rollout.phase!r}). "
+                    f"Re-trigger if still needed.",
                 )
+                continue
+
+            # (1) Resume canary_observing rollouts whose deadline passed.
+            # Other phases (canary_upgrading, batching) make bridge calls
+            # whose results we lost — replaying would risk double-deploys,
+            # so we leave them for the orphan threshold above.
+            if rollout.phase != "canary_observing":
+                continue
+            if not rollout.resume_after or rollout.resume_after > now:
+                continue
+            if rollout.id in _resume_inflight:
+                logger.debug("[ROLLOUT-RECONCILER] %s already resuming, skip", rollout.id)
+                continue
+
+            logger.info(
+                "[ROLLOUT-RECONCILER] resuming %s (deadline %s passed at age %.1fmin)",
+                rollout.id, rollout.resume_after, age_min,
+            )
+            _resume_inflight.add(rollout.id)
+            asyncio.create_task(_resume_with_cleanup(rollout.id))
+
+
+async def _resume_with_cleanup(rollout_id: str) -> None:
+    """Wrap _resume_rollout_task to always release the in-flight slot."""
+    try:
+        await _resume_rollout_task(rollout_id)
+    except Exception:
+        logger.exception("[ROLLOUT-RECONCILER] resume of %s crashed", rollout_id)
+    finally:
+        _resume_inflight.discard(rollout_id)
+
+
+async def resume_orphaned_rollouts() -> None:
+    """Startup hook (kept for fast recovery on redeploy).
+
+    Triggers one reconcile cycle immediately so a redeploy doesn't have to
+    wait the full 30 s reconciler tick to pick up an orphan. The reconciler
+    loop is the durable mechanism — this is just the warm-start.
+
+    Called from app startup (FastAPI lifespan).
+    """
+    try:
+        await _reconcile_once()
+    except Exception:
+        # Must not block app boot. The reconciler loop will retry shortly.
+        logger.exception("[ROLLOUT-RESUMER] startup reconcile failed")
 
 
 async def _resume_rollout_task(rollout_id: str) -> None:

@@ -78,18 +78,29 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ Could not start scheduler: {e}")
 
-    # Resume any rollout that was mid-canary-observation when the previous
-    # process died (Railway redeploy, OOM, etc.). Without this, an orphaned
-    # rollout stays in `running` forever and blocks every subsequent CI
-    # rollout with HTTP 409. See rollout_service.resume_orphaned_rollouts.
+    # Rollout reconciler — runs forever in the background, ticks every 30 s.
+    # This replaces the APScheduler-dependent recovery path. It re-derives
+    # rollout intent from the DB on every tick, so any process death is
+    # recovered within 30 s of the next process start. Also auto-orphans
+    # rollouts stuck past 30 min, preventing them from blocking future CI
+    # rollouts with HTTP 409 indefinitely.
+    #
+    # The startup `resume_orphaned_rollouts()` call is kept as a warm-start
+    # so a fresh process picks up orphans immediately rather than waiting
+    # the full 30 s tick.
+    import asyncio as _asyncio
+    rollout_reconciler_task = None
     try:
-        from app.services.rollout_service import resume_orphaned_rollouts
+        from app.services.rollout_service import (
+            resume_orphaned_rollouts,
+            rollout_reconciler_loop,
+        )
         await resume_orphaned_rollouts()
+        rollout_reconciler_task = _asyncio.create_task(rollout_reconciler_loop())
     except Exception as e:
-        # Swallow — rollout resumer must never block app startup. A failed
-        # resume just means the next CI push will get a 409 (existing pain),
-        # not that the platform refuses to boot.
-        print(f"⚠️ Rollout resumer failed: {e}")
+        # Must not block app boot. If startup recovery fails the loop will
+        # retry on its next tick anyway.
+        print(f"⚠️ Rollout reconciler bootstrap failed: {e}")
     
     # Start Telegram bot if configured
     telegram_bot = None
@@ -274,7 +285,15 @@ async def lifespan(app: FastAPI):
 
     # Shutdown — reverse order for clean teardown
     print("🧠 Toup Agent shutting down gracefully...")
-    
+
+    # 0. Cancel rollout reconciler so its 30 s sleep doesn't drag shutdown.
+    if rollout_reconciler_task and not rollout_reconciler_task.done():
+        rollout_reconciler_task.cancel()
+        try:
+            await rollout_reconciler_task
+        except (Exception, BaseException):
+            pass
+
     # 1. Stop cron scheduler first (no new jobs)
     if cron_service:
         try:
