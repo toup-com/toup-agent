@@ -297,6 +297,13 @@ async def get_usage_summary(
     """Get detailed usage summary broken down by provider and model for multiple time periods."""
     from datetime import timedelta
 
+    # Cache primitive user_id BEFORE any session manipulation. Once we
+    # rollback the session below, current_user becomes expired and any
+    # later attribute access (e.g. current_user.id) triggers a lazy
+    # SELECT that can fail in surprising ways. Working with a plain str
+    # avoids the entire ORM-state-machine class of bug.
+    current_user_id = current_user.id
+
     # Try proxying to remote agent first (platform has no local messages).
     # On agent containers `agent_configs` doesn't exist — that throws, leaves
     # the asyncpg session in InFailedSQLTransaction, then the local-DB
@@ -305,7 +312,7 @@ async def get_usage_summary(
     try:
         result = await db.execute(
             select(AgentConfig.agent_url, AgentConfig.agent_api_key)
-            .where(AgentConfig.user_id == current_user.id, AgentConfig.deploy_status == "active")
+            .where(AgentConfig.user_id == current_user_id, AgentConfig.deploy_status == "active")
         )
         row = result.first()
         if row and row.agent_url and row.agent_api_key:
@@ -332,7 +339,7 @@ async def get_usage_summary(
 
     # Get user's conversations
     conv_result = await db.execute(
-        select(Conversation.id).where(Conversation.user_id == current_user.id)
+        select(Conversation.id).where(Conversation.user_id == current_user_id)
     )
     conv_ids = [r[0] for r in conv_result.all()]
 
@@ -388,7 +395,7 @@ async def get_usage_summary(
                     "source": "chat",
                 })
 
-        await _merge_build_usage(current_user.id, since, provider_map, db)
+        await _merge_build_usage(current_user_id, since, provider_map, db)
 
         providers_sorted = sorted(provider_map.values(), key=lambda p: p["total_tokens"], reverse=True)
         total_inp = sum(p["input_tokens"] for p in providers_sorted)
