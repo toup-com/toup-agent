@@ -219,6 +219,28 @@ class AgentConfig(Base):
     # POST on /api/whatsapp/webhook. Surfaces a "Connected" badge in the
     # Settings UI; cleared on disconnect.
     whatsapp_connected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Which WhatsApp transport this tenant uses.
+    #   "cloud_api"  — Path A / BYOA Cloud API (Meta-sanctioned, user's own Meta App)
+    #   "qr_link"    — Path C / Baileys-style QR pairing via neonize
+    #   None         — WhatsApp not configured at all
+    # Mode is mutually exclusive: only one channel adapter spawns per
+    # container. The other mode's columns are ignored.
+    whatsapp_mode: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # E.164 of the dedicated phone number that holds the linked-device
+    # session (number "B" in the user-facing docs). Display only — the
+    # JID derived from this is what neonize actually uses.
+    whatsapp_self_e164: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # Comma-separated E.164 list of numbers the agent will respond to.
+    # Inbound from any other sender is silently dropped at the ACL gate.
+    # Empty / NULL = "block everything", which matches the secure default.
+    whatsapp_baileys_allowlist: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Lifecycle of the QR-link session.
+    #   "not_linked"  — never paired, or logged out
+    #   "linking"     — QR rendered, waiting for the user to scan
+    #   "linked"      — paired, session live (or transiently disconnected;
+    #                   reconnect logic recovers automatically)
+    #   "logged_out"  — Meta forced a 401; user must re-pair
+    whatsapp_session_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     # Step 4: Services
     brave_api_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

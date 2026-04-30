@@ -219,6 +219,14 @@ async def init_db():
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_verify_token VARCHAR(100)",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_app_secret VARCHAR(200)",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_connected_at TIMESTAMP",
+        # WhatsApp QR-link mode (migration 032). Per-tenant transport
+        # mode, dedicated phone identity, allowlist of senders, and the
+        # current session lifecycle state. NULL whatsapp_mode = the
+        # tenant hasn't picked a WhatsApp transport yet.
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_mode VARCHAR(20)",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_self_e164 VARCHAR(20)",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_baileys_allowlist TEXT",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_session_status VARCHAR(20)",
         # ── VPS ──
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS hostinger_plan_id VARCHAR(50)",

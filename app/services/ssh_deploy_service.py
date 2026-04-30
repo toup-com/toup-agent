@@ -1351,6 +1351,9 @@ def generate_env_content(
     whatsapp_access_token: str = "",
     whatsapp_verify_token: str = "",
     whatsapp_app_secret: str = "",
+    whatsapp_mode: str = "",
+    whatsapp_self_e164: str = "",
+    whatsapp_baileys_allowlist: str = "",
     brave_api_key: str = "",
     elevenlabs_api_key: str = "",
     toup_token: str = "",
@@ -1451,6 +1454,16 @@ def generate_env_content(
         channel_lines.append(f"WHATSAPP_VERIFY_TOKEN={whatsapp_verify_token}")
     if whatsapp_app_secret:
         channel_lines.append(f"WHATSAPP_APP_SECRET={whatsapp_app_secret}")
+    # QR-link mode (Path C). When WHATSAPP_MODE=qr_link the agent
+    # spawns the Baileys/neonize channel adapter instead of the
+    # Cloud-API webhook adapter; the other mode's vars are ignored.
+    if whatsapp_mode:
+        channel_lines.append(f"WHATSAPP_MODE={whatsapp_mode}")
+    if whatsapp_self_e164:
+        channel_lines.append(f"WHATSAPP_SELF_E164={whatsapp_self_e164}")
+    if whatsapp_baileys_allowlist:
+        # Comma-joined E.164 list. The adapter splits on commas at boot.
+        channel_lines.append(f"WHATSAPP_BAILEYS_ALLOWLIST={whatsapp_baileys_allowlist}")
     if channel_lines:
         lines.extend(["", "# --- Channels ---"] + channel_lines)
 

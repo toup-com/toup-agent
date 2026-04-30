@@ -154,12 +154,26 @@ class Settings(BaseSettings):
     slack_app_token: Optional[str] = None  # xapp-... via SLACK_APP_TOKEN env var
     slack_allowed_channels: list[str] = []  # Restrict to specific channel IDs
 
-    # ── WhatsApp (Cloud API) ─────────────────────────────────
+    # ── WhatsApp ─────────────────────────────────────────────
+    # Transport mode. "cloud_api" (Path A / BYOA Meta App) or
+    # "qr_link" (Path C / Baileys-style QR pairing via neonize).
+    # Empty / unset = no WhatsApp configured for this tenant.
+    whatsapp_mode: Optional[str] = None
+    # Cloud API (Path A) credentials
     whatsapp_phone_number_id: Optional[str] = None  # via WHATSAPP_PHONE_NUMBER_ID
     whatsapp_access_token: Optional[str] = None  # via WHATSAPP_ACCESS_TOKEN
     whatsapp_verify_token: str = ""  # Webhook verification token
     whatsapp_app_secret: Optional[str] = None  # For payload signature verification
     whatsapp_allowed_numbers: list[str] = []  # Restrict to specific phone numbers
+    # QR-link mode (Path C) state
+    # The dedicated phone number "B" that holds the linked-device session.
+    # Display only; the JID derived from the actual scanned device is what
+    # neonize uses internally.
+    whatsapp_self_e164: Optional[str] = None
+    # Comma-separated E.164 list of senders the agent will respond to.
+    # Anything else is silently dropped at the ACL gate. Empty = block all
+    # (the secure default — pairs scan-then-allowlist into one explicit step).
+    whatsapp_baileys_allowlist: str = ""
 
     # ── Thinking / Extended Thinking ─────────────────────────
     thinking_budget_default: int = 0  # 0 = disabled, >0 = max thinking tokens
