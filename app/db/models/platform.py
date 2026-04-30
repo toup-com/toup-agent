@@ -178,3 +178,33 @@ class LLMProxyEvent(Base):
         Index("ix_llm_proxy_user_provider_created", "user_id", "provider", "created_at"),
         Index("ix_llm_proxy_operation_type", "operation_type"),
     )
+
+
+class PlatformSetting(Base):
+    """Generic key-value table for admin-editable runtime settings.
+
+    Used for things that change occasionally and live outside the deploy
+    cycle: monthly fixed costs (Anthropic Max sub, VPS bill, Railway plan)
+    that the admin needs to edit when contracts change, without touching
+    Railway env vars or shipping a deploy.
+
+    Why not env vars: business numbers shouldn't require infra access to
+    update. The env-var defaults from settings.py are still honored as
+    fallbacks when no DB row exists yet — so newly-deployed environments
+    pick up sensible defaults from settings.platform_cost_*_monthly_usd
+    and only diverge once an admin saves a custom value.
+
+    Stored as TEXT so the same table can also hold non-numeric settings
+    (feature flags, banner messages, etc.) in the future.
+    """
+
+    __tablename__ = "platform_settings"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
+    )
+    updated_by_user_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True,
+    )

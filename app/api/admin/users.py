@@ -367,6 +367,100 @@ async def get_user_usage(
     return await _build_usage_for_conv_ids(conv_ids, db, user_id=user_id)
 
 
+# ─────────────────────────────────────────────────────────────────────
+#  Platform Costs — admin-editable monthly fixed costs
+#  Stored in platform_settings table (key/value). Reads cascade:
+#    DB row → settings.platform_cost_*_monthly_usd env default → 0.0
+#  This way newly-deployed environments start with sensible env defaults
+#  and only diverge once an admin saves a custom value.
+# ─────────────────────────────────────────────────────────────────────
+
+
+_COST_KEYS = ["anthropic_max", "openai_fixed", "vps", "railway", "other"]
+
+
+async def _get_platform_cost(db: AsyncSession, key: str) -> float:
+    """Read a single cost from DB; fall back to settings.platform_cost_*."""
+    from app.db.models import PlatformSetting
+    from app.config import settings as _s
+
+    db_key = f"cost.{key}"
+    row = await db.execute(select(PlatformSetting).where(PlatformSetting.key == db_key))
+    setting = row.scalar_one_or_none()
+    if setting:
+        try:
+            return float(setting.value)
+        except ValueError:
+            pass
+    # Fallback to env default
+    env_attr = f"platform_cost_{key if key != 'openai_fixed' else 'openai'}_monthly_usd"
+    return float(getattr(_s, env_attr, 0.0))
+
+
+async def _get_all_platform_costs(db: AsyncSession) -> dict[str, float]:
+    return {k: await _get_platform_cost(db, k) for k in _COST_KEYS}
+
+
+@router.get("/platform-costs")
+async def get_platform_costs(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get current monthly platform costs. Reads DB-saved values, falling
+    back to env-var defaults from settings.platform_cost_*_monthly_usd."""
+    costs = await _get_all_platform_costs(db)
+    return {
+        "costs": costs,
+        "total": round(sum(costs.values()), 4),
+    }
+
+
+class PlatformCostsUpdate(BaseModel):
+    """Partial-update payload — only present keys are written."""
+    anthropic_max: Optional[float] = None
+    openai_fixed: Optional[float] = None
+    vps: Optional[float] = None
+    railway: Optional[float] = None
+    other: Optional[float] = None
+
+
+@router.put("/platform-costs")
+async def update_platform_costs(
+    body: PlatformCostsUpdate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upsert one or more platform costs. Returns the new full snapshot."""
+    from app.db.models import PlatformSetting
+
+    payload = body.dict(exclude_unset=True)
+    for key, value in payload.items():
+        if key not in _COST_KEYS:
+            continue
+        if value is None or value < 0:
+            raise HTTPException(400, f"{key}: value must be non-negative")
+        db_key = f"cost.{key}"
+        existing = (await db.execute(
+            select(PlatformSetting).where(PlatformSetting.key == db_key)
+        )).scalar_one_or_none()
+        if existing:
+            existing.value = str(value)
+            existing.updated_at = datetime.utcnow()
+            existing.updated_by_user_id = admin.id
+        else:
+            db.add(PlatformSetting(
+                key=db_key,
+                value=str(value),
+                updated_by_user_id=admin.id,
+            ))
+    await db.commit()
+    costs = await _get_all_platform_costs(db)
+    return {
+        "costs": costs,
+        "total": round(sum(costs.values()), 4),
+    }
+
+
 @router.get("/usage/overview")
 async def get_usage_overview(
     admin: User = Depends(require_admin),
@@ -688,13 +782,11 @@ async def get_usage_overview(
     # `total_margin_all` is only meaningful as "P&L of the most recent
     # billing month". A future enhancement could backfill from a billing
     # ledger; for now this matches what the admin actually wants to see.
-    fixed_costs_breakdown = {
-        "anthropic_max": round(settings.platform_cost_anthropic_max_monthly_usd, 4),
-        "openai_fixed": round(settings.platform_cost_openai_monthly_usd, 4),
-        "vps": round(settings.platform_cost_vps_monthly_usd, 4),
-        "railway": round(settings.platform_cost_railway_monthly_usd, 4),
-        "other": round(settings.platform_cost_other_monthly_usd, 4),
-    }
+    # Read cost values from DB (admin-edited via /admin/platform-costs);
+    # the helper falls back to settings.platform_cost_* env defaults if
+    # the row hasn't been written yet.
+    fixed_costs_breakdown_raw = await _get_all_platform_costs(db)
+    fixed_costs_breakdown = {k: round(v, 4) for k, v in fixed_costs_breakdown_raw.items()}
     fixed_costs_total = round(sum(fixed_costs_breakdown.values()), 4)
 
     # LLM (variable) costs — sum of per-user proxy event costs.

@@ -108,6 +108,8 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # Streaming credentials (platform stores, agent fetches via API)
     "streaming_credentials",
     "credential_access_log",
+    # Platform-wide admin settings (editable via admin panel)
+    "platform_settings",
 }
 
 SHARED_TABLES: set[str] = {

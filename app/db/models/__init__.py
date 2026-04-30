@@ -46,7 +46,7 @@ from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig
 from .soul_config import SoulConfig
 
 # Platform (VPS, invites, billing)
-from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent
+from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent, PlatformSetting
 
 # Rollouts (Phase 3 automated deployment)
 from .rollout import (
@@ -73,7 +73,7 @@ __all__ = [
     "App", "BuildJob", "BuildUsage", "ReconciliationLog",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
     "SoulConfig",
-    "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord", "LLMProxyEvent",
+    "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord", "LLMProxyEvent", "PlatformSetting",
     "Rollout", "RolloutAttempt",
     "ROLLOUT_STATUSES", "ROLLOUT_ATTEMPT_STATUSES", "ROLLOUT_TRIGGERS",
     "StreamingCredential", "CredentialAccessLog",
