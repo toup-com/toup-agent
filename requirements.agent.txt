@@ -54,6 +54,13 @@ discord.py>=2.3.0
 slack-bolt>=1.18.0
 slack-sdk>=3.27.0
 
+# WhatsApp QR-link mode (Path C). neonize wraps whatsmeow Go binary
+# (pre-built wheels on PyPI for Linux x86_64; no Go toolchain needed
+# at install time). qrcode renders neonize's pairing string into a
+# PNG data URL the Settings modal serves to the user.
+neonize>=0.4
+qrcode[pil]>=7.4
+
 # Anthropic
 anthropic>=0.30.0
 
