@@ -85,6 +85,9 @@ AGENT_ONLY_TABLES: set[str] = {
     "telegram_user_mappings",
     "agent_errors",
     "api_keys",
+    # WhatsApp Cloud API webhook dedupe (agent-side; survives container
+    # restarts so Meta retries within a 7-day window cannot re-run the LLM)
+    "whatsapp_inbound_dedupe",
     # Identity & soul
     "identities",
     "soul_configs",

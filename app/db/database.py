@@ -212,6 +212,13 @@ async def init_db():
         # Existing rows are untouched here; the matching alembic migration 029 does
         # the gpt-5.2 → NULL backfill on platform DBs.
         "ALTER TABLE agent_configs ALTER COLUMN agent_model DROP DEFAULT",
+        # WhatsApp BYOA (migration 030). Per-tenant Meta Cloud API
+        # credentials and connection status. Mirrors the alembic
+        # migration so platform boots that skip alembic still get the
+        # columns. All three nullable so existing rows remain valid.
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_verify_token VARCHAR(100)",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_app_secret VARCHAR(200)",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_connected_at TIMESTAMP",
         # ── VPS ──
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS hostinger_plan_id VARCHAR(50)",
