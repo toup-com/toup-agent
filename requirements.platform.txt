@@ -43,7 +43,7 @@ python-pptx==1.0.2
 markdown==3.5.2
 python-magic==0.4.27
 chardet==5.2.0
-pillow==10.2.0
+pillow>=11.1.0
 
 # Document Generation (doc-delivery feature). weasyprint is NOT installed here —
 # it's agent-only (needs Pango/Cairo system libs). generate_html_to_pdf catches

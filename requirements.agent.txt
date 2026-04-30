@@ -34,7 +34,7 @@ mammoth==1.7.1
 weasyprint==61.2
 
 # Media
-pillow==10.2.0
+pillow>=11.1.0
 
 # Auth & Security
 python-jose[cryptography]==3.3.0

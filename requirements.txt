@@ -46,7 +46,7 @@ mammoth==1.7.1
 weasyprint==61.2
 
 # Media Processing
-pillow==10.2.0
+pillow>=11.1.0
 # moviepy==1.0.3  # Optional: for video processing
 # openai-whisper==20231117  # Optional: for audio transcription
 
