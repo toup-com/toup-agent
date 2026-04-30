@@ -680,10 +680,43 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ Slack error: {e}")
 
     # ── WhatsApp Channel ──────────────────────────────────────
-    # The inbound message callback is wired BEFORE start() to avoid a
-    # startup race where Meta posts a webhook before the handler is set.
+    # Mode-gated: pick exactly one transport per container based on
+    # settings.whatsapp_mode. Cloud API (Path A) and QR-link (Path C)
+    # are mutually exclusive — both extend BaseChannel(WHATSAPP) so
+    # only one slot in the registry is ever populated.
+    #
+    # Backwards compat: if whatsapp_mode is unset but the legacy
+    # phone_number_id + access_token are present, default to Cloud
+    # API. That keeps existing tenants working without forcing a
+    # one-time settings save.
     whatsapp_channel = None
-    if settings.whatsapp_phone_number_id and settings.whatsapp_access_token:
+    _wa_mode = (settings.whatsapp_mode or "").strip().lower()
+    if not _wa_mode and settings.whatsapp_phone_number_id and settings.whatsapp_access_token:
+        _wa_mode = "cloud_api"
+
+    if _wa_mode == "qr_link":
+        try:
+            from app.agent.channels.whatsapp_baileys import BaileysWhatsAppChannel
+            from app.agent.channels.registry import ChannelRegistry
+            from app.agent.channels.shared import make_channel_handler
+            _allowlist = [
+                s.strip() for s in (settings.whatsapp_baileys_allowlist or "").split(",")
+                if s.strip()
+            ]
+            whatsapp_channel = BaileysWhatsAppChannel(allowed_numbers=_allowlist)
+            whatsapp_channel.set_message_callback(
+                make_channel_handler(
+                    channel=whatsapp_channel,
+                    agent_runner=agent_runner,
+                    user_id=settings.user_id,
+                )
+            )
+            await whatsapp_channel.start()
+            ChannelRegistry.register(whatsapp_channel)
+            print("📱 WhatsApp channel started (QR-link / Baileys via neonize)")
+        except Exception as e:
+            print(f"⚠️ WhatsApp QR-link error: {e}")
+    elif _wa_mode == "cloud_api" and settings.whatsapp_phone_number_id and settings.whatsapp_access_token:
         try:
             from app.agent.channels.whatsapp_channel import WhatsAppChannel
             from app.agent.channels.registry import ChannelRegistry
@@ -705,9 +738,9 @@ async def lifespan(app: FastAPI):
             whatsapp_channel.register_routes(app)
             await whatsapp_channel.start()
             ChannelRegistry.register(whatsapp_channel)
-            print("📱 WhatsApp channel started")
+            print("📱 WhatsApp channel started (Cloud API)")
         except Exception as e:
-            print(f"⚠️ WhatsApp error: {e}")
+            print(f"⚠️ WhatsApp Cloud API error: {e}")
 
     # ── Platform Tunnel (connect terminal agent to toup.ai) ──
     tunnel_client = None
@@ -1058,14 +1091,24 @@ async def agent_health():
 
     # WhatsApp surfaces a rich status object so an operator can
     # diagnose "is it working?" without SSHing into the container.
-    # Falls back to "disabled" when no creds are configured at all.
+    # Two transport modes (Cloud API vs QR-link via Baileys) are
+    # mutually exclusive — check QR-link first since it's the newer
+    # default; fall through to Cloud API; then "configured" when
+    # creds exist but no channel is active; then "disabled".
     try:
-        from app.agent.channels.whatsapp_channel import get_active_channel
-        _wa_channel = get_active_channel()
-        whatsapp_status = (
-            _wa_channel.health() if _wa_channel
-            else ("configured" if settings.whatsapp_phone_number_id else "disabled")
-        )
+        from app.agent.channels.whatsapp_channel import get_active_channel as _wa_cloud
+        from app.agent.channels.whatsapp_baileys import get_active_baileys_channel as _wa_baileys
+        _baileys = _wa_baileys()
+        if _baileys is not None:
+            whatsapp_status = _baileys.health()
+        else:
+            _cloud = _wa_cloud()
+            if _cloud is not None:
+                whatsapp_status = _cloud.health()
+            elif settings.whatsapp_mode or settings.whatsapp_phone_number_id:
+                whatsapp_status = "configured"
+            else:
+                whatsapp_status = "disabled"
     except Exception:
         whatsapp_status = "disabled"
 
