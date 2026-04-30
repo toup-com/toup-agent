@@ -378,21 +378,55 @@ class BaileysWhatsAppChannel(BaseChannel):
         if logged_out_ev:
             self._client.event(logged_out_ev)(self._on_logged_out_ev)  # type: ignore
 
+        # Confirm what got registered. neonize 0.3.x's connect() serialises
+        # `event.list_func.keys()` into a bytearray that the Go binary uses
+        # as the event-filter list — events whose codes are absent here will
+        # NEVER fire. If this log shows fewer codes than we expected, the
+        # `getattr(ev, "...", None)` lookup above silently missed an alias.
+        try:
+            keys = list(getattr(self._client.event, "list_func", {}).keys())
+            logger.info(
+                "[WHATSAPP-BAILEYS] events.registered codes=%s count=%d",
+                keys, len(keys),
+            )
+        except Exception:
+            pass
+
     async def _on_qr_bytes(self, _client, qr_data: bytes) -> None:
         """Direct QR-bytes callback — registered via ``event.qr(self._on_qr_bytes)``.
-        neonize delivers the raw pairing string here as bytes.
+
+        neonize hands us a comma-separated list of pairing strings —
+        whatsmeow rotates them every ~20 s until the user scans. We MUST
+        pick the freshest single code; rendering the whole CSV blob into
+        one QR produces a giant unparseable QR that some WhatsApp
+        clients accept as "linked" on the server side without the local
+        Go binary ever seeing the post-pair handshake. That manifests
+        as: phone shows "Active", agent shows session_status=linking
+        forever, no Connected event, no inbound messages — and the
+        whatsmeow_device row never persists.
+
+        First code is the freshest (whatsmeow appends rotations to the
+        front of the list).
         """
         try:
-            qr_str = qr_data.decode("utf-8") if isinstance(qr_data, (bytes, bytearray)) else str(qr_data)
+            raw = qr_data.decode("utf-8") if isinstance(qr_data, (bytes, bytearray)) else str(qr_data)
         except Exception:
-            qr_str = ""
+            raw = ""
+        if not raw:
+            return
+        # CSV → first non-empty token. Tolerates trailing commas / spaces.
+        qr_str = next((c.strip() for c in raw.split(",") if c.strip()), "")
         if not qr_str:
+            logger.warning("[WHATSAPP-BAILEYS] qr.empty_after_split raw_len=%d", len(raw))
             return
         self._latest_qr = qr_str
         self._latest_qr_data_url = render_qr_png_data_url(qr_str)
         self._latest_qr_at = datetime.utcnow()
         self._session_status = "linking"
-        logger.info("[WHATSAPP-BAILEYS] qr.emitted len=%d", len(qr_str))
+        logger.info(
+            "[WHATSAPP-BAILEYS] qr.emitted raw_len=%d picked_len=%d",
+            len(raw), len(qr_str),
+        )
 
     async def _on_qr_ev(self, _client, qr_payload) -> None:
         """neonize emits the pairing string repeatedly while waiting
@@ -461,6 +495,10 @@ class BaileysWhatsAppChannel(BaseChannel):
         """The hot path: convert neonize's message struct into Toup's
         ``InboundMessage`` and call ``BaseChannel.dispatch()``.
         """
+        logger.info(
+            "[WHATSAPP-BAILEYS] message.event payload_type=%s",
+            type(message).__name__,
+        )
         try:
             await self._handle_message(message)
         except Exception:
