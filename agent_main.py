@@ -54,6 +54,9 @@ from app.api.apps import router as apps_router, set_app_manager, set_app_gateway
 # Generated-file attachments (doc-delivery feature). Serves the actual files
 # from local disk on the agent; the platform's files_router proxies here.
 from app.api.files import router as files_router
+# WhatsApp QR-pairing endpoints (agent-side; platform proxies via
+# /api/agent-setup/whatsapp/qr-* using X-Agent-Key over Caddy TLS).
+from app.api.whatsapp_qr import router as whatsapp_qr_router
 
 _app_start_time = None
 _skill_loader = None
@@ -1038,6 +1041,7 @@ app.include_router(soul_router, prefix=settings.api_prefix)
 app.include_router(llm_setup_router, prefix=settings.api_prefix)
 # Generated-file attachments — data + files live here on the agent.
 app.include_router(files_router, prefix=settings.api_prefix)
+app.include_router(whatsapp_qr_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
 try:
