@@ -168,6 +168,23 @@ class BaileysWhatsAppChannel(BaseChannel):
             from neonize.proto.waCompanionReg.WAWebProtobufsCompanionReg_pb2 import (  # type: ignore
                 DeviceProps,
             )
+            # Surface whatsmeow's internal logs (Client / Database) into
+            # docker logs so pair-failure root causes (network errors,
+            # signature mismatches, persist failures) are visible without
+            # a live debugger. neonize routes them through stdlib loggers
+            # named "whatsmeow.Client" and "whatsmeow.Database".
+            import logging as _stdlogging
+            _stdlogging.getLogger("whatsmeow").setLevel(_stdlogging.DEBUG)
+            _stdlogging.getLogger("neonize").setLevel(_stdlogging.DEBUG)
+            # neonize's connect() reads the LEVEL of `neonize.utils.log.log`
+            # (NOT the prefix "neonize") to decide what whatsmeow Go-side
+            # logs to emit. Set it explicitly so we get pair / handshake /
+            # WS logs from Go through to docker logs.
+            try:
+                from neonize.utils.log import log as _neonize_log
+                _neonize_log.setLevel(_stdlogging.DEBUG)
+            except Exception:
+                pass
         except ImportError:
             logger.error(
                 "[WHATSAPP-BAILEYS] neonize is not installed — "
@@ -395,37 +412,31 @@ class BaileysWhatsAppChannel(BaseChannel):
     async def _on_qr_bytes(self, _client, qr_data: bytes) -> None:
         """Direct QR-bytes callback — registered via ``event.qr(self._on_qr_bytes)``.
 
-        neonize hands us a comma-separated list of pairing strings —
-        whatsmeow rotates them every ~20 s until the user scans. We MUST
-        pick the freshest single code; rendering the whole CSV blob into
-        one QR produces a giant unparseable QR that some WhatsApp
-        clients accept as "linked" on the server side without the local
-        Go binary ever seeing the post-pair handshake. That manifests
-        as: phone shows "Active", agent shows session_status=linking
-        forever, no Connected event, no inbound messages — and the
-        whatsmeow_device row never persists.
+        neonize hands us the full WhatsApp pairing string verbatim.
+        Per whatsmeow's protocol the string is a CSV of FOUR components
+        in one logical token — ``ref,publicKey,identityKey,advSecret`` —
+        and the entire string must be encoded into a single QR. Splitting
+        on the comma is incorrect; WhatsApp rejects the resulting QR with
+        "Invalid QR code" because three of the four cryptographic
+        components are missing.
 
-        First code is the freshest (whatsmeow appends rotations to the
-        front of the list).
+        Pass-through: render the full bytes as one QR exactly as
+        neonize's default segno renderer does for terminal display.
         """
         try:
             raw = qr_data.decode("utf-8") if isinstance(qr_data, (bytes, bytearray)) else str(qr_data)
         except Exception:
             raw = ""
+        raw = raw.strip().rstrip("\x00")
         if not raw:
             return
-        # CSV → first non-empty token. Tolerates trailing commas / spaces.
-        qr_str = next((c.strip() for c in raw.split(",") if c.strip()), "")
-        if not qr_str:
-            logger.warning("[WHATSAPP-BAILEYS] qr.empty_after_split raw_len=%d", len(raw))
-            return
-        self._latest_qr = qr_str
-        self._latest_qr_data_url = render_qr_png_data_url(qr_str)
+        self._latest_qr = raw
+        self._latest_qr_data_url = render_qr_png_data_url(raw)
         self._latest_qr_at = datetime.utcnow()
         self._session_status = "linking"
         logger.info(
-            "[WHATSAPP-BAILEYS] qr.emitted raw_len=%d picked_len=%d",
-            len(raw), len(qr_str),
+            "[WHATSAPP-BAILEYS] qr.emitted len=%d parts=%d",
+            len(raw), len(raw.split(",")),
         )
 
     async def _on_qr_ev(self, _client, qr_payload) -> None:
@@ -462,6 +473,14 @@ class BaileysWhatsAppChannel(BaseChannel):
         """Fired on first successful pair. ``payload.ID`` carries the
         scanned device's JID; we extract its E.164 for display.
         """
+        # Log payload shape so any future failure mode where the pair
+        # event fires but we mis-parse the JID is debuggable from logs
+        # alone (no live attach needed).
+        logger.info(
+            "[WHATSAPP-BAILEYS] pair.event payload_type=%s attrs=%s",
+            type(payload).__name__,
+            [a for a in dir(payload) if not a.startswith("_")][:20],
+        )
         self._session_status = "linked"
         self._latest_qr = None
         self._latest_qr_data_url = None
