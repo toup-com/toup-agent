@@ -1093,28 +1093,51 @@ async def agent_health():
     uptime = _time.time() - _app_start_time if _app_start_time else 0
     from app.services.model_resolver import default_model
 
-    # WhatsApp surfaces a rich status object so an operator can
-    # diagnose "is it working?" without SSHing into the container.
-    # Two transport modes (Cloud API vs QR-link via Baileys) are
-    # mutually exclusive — check QR-link first since it's the newer
-    # default; fall through to Cloud API; then "configured" when
-    # creds exist but no channel is active; then "disabled".
+    # WhatsApp surfaces a rich status object so an operator (and the
+    # Settings UI) can diagnose "is it working?" without SSHing into
+    # the container. Two transport modes are mutually exclusive —
+    # check QR-link first (newer default), fall through to Cloud API,
+    # then "configured" / "disabled" fallbacks.
+    #
+    # Always attaches `qr_supported` (bool): whether neonize would
+    # work on this agent if QR mode were enabled. Detects the worst-
+    # case "build silently dropped neonize" scenario so the Settings
+    # UI can surface "QR mode not available on this image" instead of
+    # letting the user wait forever for a QR that'll never come.
     try:
         from app.agent.channels.whatsapp_channel import get_active_channel as _wa_cloud
         from app.agent.channels.whatsapp_baileys import get_active_baileys_channel as _wa_baileys
+
+        _qr_supported = False
+        try:
+            import neonize  # type: ignore # noqa: F401
+            _qr_supported = True
+        except Exception:
+            pass
+
         _baileys = _wa_baileys()
         if _baileys is not None:
             whatsapp_status = _baileys.health()
+            whatsapp_status["qr_supported"] = _qr_supported
         else:
             _cloud = _wa_cloud()
             if _cloud is not None:
                 whatsapp_status = _cloud.health()
-            elif settings.whatsapp_mode or settings.whatsapp_phone_number_id:
-                whatsapp_status = "configured"
+                whatsapp_status["qr_supported"] = _qr_supported
             else:
-                whatsapp_status = "disabled"
+                # Wrap the fallback into a dict so the frontend always
+                # gets a consistent shape it can read qr_supported from.
+                whatsapp_status = {
+                    "configured": bool(
+                        settings.whatsapp_mode or settings.whatsapp_phone_number_id
+                    ),
+                    "started": False,
+                    "mode": settings.whatsapp_mode or None,
+                    "qr_supported": _qr_supported,
+                    "session_status": "not_linked",
+                }
     except Exception:
-        whatsapp_status = "disabled"
+        whatsapp_status = {"configured": False, "started": False, "qr_supported": False}
 
     return {
         "status": "healthy",
