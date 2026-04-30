@@ -137,15 +137,41 @@ def _bridge_client(timeout_s: Optional[int] = None) -> httpx.AsyncClient:
 
 
 def _agent_config_to_bridge_body(agent_config: Optional[AgentConfig]) -> dict:
-    """Flatten an AgentConfig row into the shape bridge's CreateTenantReq expects."""
+    """Flatten an AgentConfig row into the shape bridge's CreateTenantReq expects.
+
+    Whitelist-based: every field a tenant container needs in its .env
+    must be explicitly listed. Forgetting a field is silent — the
+    bridge writes the .env without it and the agent boots with that
+    env var unset (e.g. WHATSAPP_MODE missing → BaileysWhatsAppChannel
+    never spawns even though the platform DB has whatsapp_mode='qr_link').
+
+    Trip wires that previously caused incidents:
+    * llm_mode missing → bundle subscribers got "API key invalid"
+      (matin incident, 2026-04-27)
+    * whatsapp_* fields missing → QR-mode rollout failed silently
+      (this incident, 2026-04-30)
+
+    Slack tokens, service keys (brave, elevenlabs) and all WhatsApp
+    fields are added here — they were latent bugs from earlier work
+    that hadn't surfaced because nobody was using those features on
+    managed-mode containers yet.
+    """
     if not agent_config:
         return {}
-    out = {}
+    out: dict = {}
+    # API keys + agent identity
     for field in (
         "openai_api_key", "anthropic_api_key", "google_api_key",
         "mistral_api_key", "xai_api_key", "deepseek_api_key",
-        "telegram_bot_token", "discord_bot_token",
         "agent_color", "agent_model",
+    ):
+        val = getattr(agent_config, field, None)
+        if val:
+            out[field] = val
+    # Channel tokens + tunnel
+    for field in (
+        "telegram_bot_token", "discord_bot_token",
+        "slack_bot_token", "slack_app_token",
     ):
         val = getattr(agent_config, field, None)
         if val:
@@ -161,6 +187,29 @@ def _agent_config_to_bridge_body(agent_config: Optional[AgentConfig]) -> dict:
     # was caused by this field never being forwarded.
     if getattr(agent_config, "llm_mode", None):
         out["llm_mode"] = agent_config.llm_mode
+    # Service keys (Brave search, ElevenLabs TTS).
+    for field in ("brave_api_key", "elevenlabs_api_key"):
+        val = getattr(agent_config, field, None)
+        if val:
+            out[field] = val
+    # WhatsApp (Cloud API / Path A — BYOA Meta App).
+    for field in (
+        "whatsapp_phone_number_id", "whatsapp_access_token",
+        "whatsapp_verify_token", "whatsapp_app_secret",
+    ):
+        val = getattr(agent_config, field, None)
+        if val:
+            out[field] = val
+    # WhatsApp (QR-link / Path C — Baileys via neonize). whatsapp_mode
+    # is the gate that decides which channel adapter agent_main.py
+    # spawns at boot; without it in the .env, the BaileysWhatsAppChannel
+    # never starts even after the user toggles QR mode in Settings.
+    if getattr(agent_config, "whatsapp_mode", None):
+        out["whatsapp_mode"] = agent_config.whatsapp_mode
+    if getattr(agent_config, "whatsapp_self_e164", None):
+        out["whatsapp_self_e164"] = agent_config.whatsapp_self_e164
+    if getattr(agent_config, "whatsapp_baileys_allowlist", None):
+        out["whatsapp_baileys_allowlist"] = agent_config.whatsapp_baileys_allowlist
     return out
 
 
