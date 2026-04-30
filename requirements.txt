@@ -72,15 +72,9 @@ discord.py>=2.3.0
 slack-bolt>=1.18.0
 slack-sdk>=3.27.0
 
-# WhatsApp QR-link mode (Path C — neonize wraps whatsmeow Go binary).
-# Used by app/agent/channels/whatsapp_baileys.py when the user opts into
-# the QR-pairing flow. The Go binary ships pre-built via PyPI wheels;
-# no Go toolchain needed at install time. session store lives at
-# /data/whatsapp/store.db per-tenant.
-neonize>=0.3.17
-# QR code rendering — turns neonize's pairing string into a PNG data URL
-# the frontend can render in its modal.
-qrcode[pil]>=7.4
+# WhatsApp QR-link mode (Path C) is now handled by a Node.js Baileys
+# sidecar — see backend/whatsapp_sidecar/. Python only speaks HTTP/SSE
+# to it. No Python WhatsApp deps remain.
 
 # Cohere (Re-ranker)
 cohere>=5.0.0

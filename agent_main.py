@@ -716,7 +716,7 @@ async def lifespan(app: FastAPI):
             )
             await whatsapp_channel.start()
             ChannelRegistry.register(whatsapp_channel)
-            print("📱 WhatsApp channel started (QR-link / Baileys via neonize)")
+            print("📱 WhatsApp channel started (QR-link / Baileys sidecar)")
         except Exception as e:
             print(f"⚠️ WhatsApp QR-link error: {e}")
     elif _wa_mode == "cloud_api" and settings.whatsapp_phone_number_id and settings.whatsapp_access_token:
@@ -1099,19 +1099,22 @@ async def agent_health():
     # check QR-link first (newer default), fall through to Cloud API,
     # then "configured" / "disabled" fallbacks.
     #
-    # Always attaches `qr_supported` (bool): whether neonize would
-    # work on this agent if QR mode were enabled. Detects the worst-
-    # case "build silently dropped neonize" scenario so the Settings
-    # UI can surface "QR mode not available on this image" instead of
-    # letting the user wait forever for a QR that'll never come.
+    # Always attaches `qr_supported` (bool): whether the Baileys
+    # sidecar bundle is present on this image so the Settings UI can
+    # surface "QR mode not available on this image" instead of letting
+    # the user wait forever for a QR that'll never come.
     try:
         from app.agent.channels.whatsapp_channel import get_active_channel as _wa_cloud
         from app.agent.channels.whatsapp_baileys import get_active_baileys_channel as _wa_baileys
 
         _qr_supported = False
         try:
-            import neonize  # type: ignore # noqa: F401
-            _qr_supported = True
+            from pathlib import Path as _Path
+            _sidecar_dir = _Path("/app/whatsapp_sidecar")
+            _qr_supported = (
+                (_sidecar_dir / "sidecar.mjs").is_file()
+                and (_sidecar_dir / "node_modules").is_dir()
+            )
         except Exception:
             pass
 

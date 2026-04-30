@@ -1,52 +1,76 @@
-"""WhatsApp QR-link channel adapter (Path C).
+"""WhatsApp QR-link channel adapter (Path C) — Baileys sidecar bridge.
 
-Built on `neonize` — a Python wrapper around the Go `whatsmeow`
-library. The user pairs a dedicated phone number ("B") with the agent
-by scanning a QR code on first run; thereafter the agent's neonize
-session is a "linked device" on B's WhatsApp account, and Meta routes
-inbound messages to all linked devices simultaneously.
+We tried `neonize` (Python wrapper around the Go `whatsmeow` binary)
+first. Pairing kept failing with "Can't link new devices right now"
+on the scanning phone — even though the same number successfully
+paired the real WhatsApp Desktop app a minute later. Root cause:
+Meta's anti-abuse rejects WhatsApp Web clients advertising stale
+`version` triples, and `neonize` 0.3.x ships an outdated
+`whatsmeow` build. Baileys exposes `fetchLatestBaileysVersion()`
+which polls Meta's own check-update endpoint for the freshest
+accepted triple, so it stays current automatically.
 
-Mutually exclusive with ``WhatsAppChannel`` (Cloud API). Both extend
-``BaseChannel(ChannelType.WHATSAPP)`` and only one is registered per
-container, gated on ``settings.whatsapp_mode`` at boot.
+Architecture
+------------
+* **Sidecar** — Node.js process at `backend/whatsapp_sidecar/`
+  speaks Baileys to Meta. Listens on `127.0.0.1:8002`
+  (container-internal only). Auth lives at `/data/whatsapp/auth/`
+  (multi-file Baileys layout, survives container restart).
+* **This adapter** — spawns the sidecar at `start()`, polls health
+  until ready, then opens a long-lived SSE stream to receive
+  inbound messages. Outbound goes via `POST /messages/send`. The
+  Settings UI's QR pairing endpoints proxy through `force_logout()`
+  → sidecar `/pair/logout` and `kick_pair()` → sidecar `/pair/start`.
 
-Production behaviours (mirrored from the Cloud API adapter so ops
-parity stays consistent):
+Production behaviours preserved from the previous implementation:
 
-* **ACL** — ``whatsapp_baileys_allowlist`` (E.164 list). Anything from
-  outside the list is silently dropped at the gate. Empty allowlist
-  = block all (secure default; the user must explicitly opt-in their
-  own number when they pair).
-* **Dedupe** — same DB-backed ``whatsapp_inbound_dedupe`` table the
-  Cloud API path uses. Meta retransmits to linked devices on flaky
+* **ACL** — `whatsapp_baileys_allowlist` (E.164 list). Anything
+  from outside the list is silently dropped at the gate. Empty
+  allowlist = block all (secure default).
+* **Dedupe** — DB-backed `whatsapp_inbound_dedupe` table the Cloud
+  API path uses; Meta retransmits to linked devices on flaky
   networks; without dedupe a transport blip would re-run the LLM.
-* **Day-as-Chat** — every inbound flows through the existing shared
-  ``make_channel_handler`` so messages share the same
-  ``Message.day_chat_id`` as web / Telegram / voice on the same local
-  date. Zero WhatsApp-specific code in the agent runtime.
-* **Outbound polish** — reuses ``markdown_to_whatsapp`` / chunking /
-  ``redact_phone`` from ``whatsapp_helpers``.
-* **Reconnect** — bounded-backoff supervisor loop wraps neonize's
-  ``connect()``. Logged-out (401-equivalent) and conflict states are
-  terminal: we mark ``whatsapp_session_status='logged_out'`` and stop
-  retrying so the user sees "needs relink" in Settings.
-* **Health surface** — same shape as the Cloud API ``health()`` so
-  ``/agent/health`` rendering doesn't branch on mode.
+* **Day-as-Chat** — every inbound flows through the existing
+  `make_channel_handler` so messages share the same
+  `Message.day_chat_id` as web / Telegram / voice on the same
+  local date.
+* **Outbound polish** — reuses `markdown_to_whatsapp` / chunking /
+  `redact_phone` from `whatsapp_helpers`.
+* **Reconnect** — Baileys handles reconnection internally; the
+  sidecar exposes connection state via `/health`. We don't run a
+  Python-side supervisor anymore.
+* **Health surface** — same shape as the Cloud API `health()` so
+  `/agent/health` rendering doesn't branch on mode.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
+import shutil
+import signal
+import sys
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
+
+import httpx
 
 from app.agent.channels.base import (
     BaseChannel,
     ChannelType,
     InboundMessage,
 )
+from app.agent.channels.whatsapp_helpers import (
+    chunk_for_whatsapp,
+    markdown_to_whatsapp,
+    redact_phone,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_e164(raw: str) -> str:
@@ -64,26 +88,41 @@ def _normalize_e164(raw: str) -> str:
     if digits.startswith("00"):
         digits = digits[2:]
     return f"+{digits}" if digits else ""
-from app.agent.channels.whatsapp_baileys_session import (
-    e164_to_jid,
-    ensure_store_dir,
-    jid_to_e164,
-    render_qr_png_data_url,
-    session_file_exists,
-    store_path,
-)
-from app.agent.channels.whatsapp_helpers import (
-    chunk_for_whatsapp,
-    markdown_to_whatsapp,
-    redact_phone,
-)
-
-logger = logging.getLogger(__name__)
 
 
-# Module-level reference. /agent/health and the QR-pairing endpoints
-# fetch the live channel via get_active_baileys_channel(). Mirrors the
-# pattern in whatsapp_channel.py (Cloud API adapter).
+# ── Sidecar config ─────────────────────────────────────────────────
+
+_SIDECAR_HOST = "127.0.0.1"
+_SIDECAR_PORT = int(os.environ.get("WHATSAPP_SIDECAR_PORT", "8002"))
+_SIDECAR_BASE = f"http://{_SIDECAR_HOST}:{_SIDECAR_PORT}"
+_SIDECAR_BOOT_TIMEOUT_S = 20.0   # how long start() waits for /health 200
+_SIDECAR_HTTP_TIMEOUT_S = 10.0
+_SSE_RECONNECT_BACKOFF_S = 2.0
+
+
+def _resolve_sidecar_dir() -> Path:
+    """Find the directory containing `sidecar.mjs` + `node_modules/`.
+
+    Production layout (`Dockerfile.agent`) puts it at
+    `/app/whatsapp_sidecar/`. Local dev / tests can override via
+    `WHATSAPP_SIDECAR_DIR`. Falls back to a relative path resolved
+    from this file's location so test environments without an explicit
+    env var still work.
+    """
+    override = os.environ.get("WHATSAPP_SIDECAR_DIR")
+    if override:
+        return Path(override)
+    # /app/whatsapp_sidecar — production container layout.
+    prod = Path("/app/whatsapp_sidecar")
+    if (prod / "sidecar.mjs").is_file():
+        return prod
+    # Repo-relative fallback: backend/whatsapp_sidecar
+    repo_path = Path(__file__).resolve().parents[3] / "whatsapp_sidecar"
+    return repo_path
+
+
+# ── Module-level reference (consumed by `/agent/health` + QR API) ──
+
 _active_channel: Optional["BaileysWhatsAppChannel"] = None
 
 
@@ -91,510 +130,311 @@ def get_active_baileys_channel() -> Optional["BaileysWhatsAppChannel"]:
     return _active_channel
 
 
-# Reconnect policy — match OpenClaw's defaults so behaviour is
-# predictable for anyone who's debugged Baileys before.
-_RECONNECT_INITIAL_S = 2.0
-_RECONNECT_MAX_S = 30.0
-_RECONNECT_FACTOR = 1.8
-_RECONNECT_MAX_ATTEMPTS = 12
-
-# QR strings rotate quickly. Cache the latest emitted string + a
-# pre-rendered data URL keyed by emit time so a /qr-status poll can
-# return the freshest QR even if the client missed the WS event.
-_QR_TTL_SECONDS = 180  # 3 min — neonize regenerates every ~20s while pending
-
-
 class BaileysWhatsAppChannel(BaseChannel):
-    """neonize-backed WhatsApp adapter."""
+    """Baileys-sidecar-backed WhatsApp adapter."""
 
     def __init__(self, allowed_numbers: Optional[list[str]] = None):
         super().__init__(ChannelType.WHATSAPP)
-        # Normalise allowlist to canonical E.164 ("+" + digits only).
-        # Users paste numbers in mixed formats; the inbound side
-        # always derives a clean E.164 from the JID, so both sides
-        # must converge on the same form. _normalize_e164 strips
-        # whitespace, parens, dashes, dots; handles "00" prefix.
-        # Empty set = block everyone (secure default before pairing).
         self.allowed_numbers: set[str] = {
             normalised
             for raw in (allowed_numbers or [])
             for normalised in [_normalize_e164(raw)]
             if normalised
         }
-        self._client = None  # neonize.aioze.client.NewAClient instance
-        self._supervisor_task: Optional[asyncio.Task] = None
+        # Sidecar lifecycle
+        self._sidecar_proc: Optional[asyncio.subprocess.Process] = None
+        self._event_task: Optional[asyncio.Task] = None
         self._sweep_task: Optional[asyncio.Task] = None
+        self._http: Optional[httpx.AsyncClient] = None
         self._stopping: bool = False
 
-        # QR pairing state
-        self._latest_qr: Optional[str] = None
+        # Cached state — refreshed on each /pair/status or sidecar event.
+        self._session_status: str = "not_linked"
+        self._connected: bool = False
+        self._self_e164: Optional[str] = None
         self._latest_qr_data_url: Optional[str] = None
         self._latest_qr_at: Optional[datetime] = None
-
-        # Lifecycle / health surface
-        self._self_e164: Optional[str] = None
-        self._session_status: str = (
-            "linked" if session_file_exists() else "not_linked"
-        )
-        self._connected: bool = False
         self._inbound_count: int = 0
         self._last_inbound_at: Optional[datetime] = None
         self._last_send_at: Optional[datetime] = None
         self._last_send_error: Optional[dict] = None
-        self._reconnect_attempts: int = 0
+        self._sidecar_booted_at: Optional[datetime] = None
 
     # ── Lifecycle ──────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Boot the supervisor loop and the inbound-dedupe sweep.
+        """Spawn the sidecar + open the inbound event stream.
 
-        ``connect()`` is called inside the supervisor so we control
-        the reconnect schedule. We do NOT block ``start()`` on a
-        successful connect — if the session is fresh and the user
-        hasn't scanned the QR yet, ``start()`` returns immediately and
-        the QR gets emitted asynchronously via the QR event handler.
-
-        Degrades gracefully when prerequisites are missing — neonize
-        not installed, ``/data`` not mounted, etc. — so a startup
-        failure here doesn't take down the whole agent runtime.
+        Degrades gracefully: if Node isn't installed, the sidecar dir
+        is missing, or the sidecar fails to boot within the timeout,
+        we log + bail without crashing the rest of the agent.
         """
         global _active_channel
 
-        # Acquire the neonize client lazily so a missing dep surfaces
-        # at start-time with a clear error rather than at module
-        # import.
-        try:
-            from neonize.aioze.client import NewAClient  # type: ignore
-            from neonize.proto.waCompanionReg.WAWebProtobufsCompanionReg_pb2 import (  # type: ignore
-                DeviceProps,
+        sidecar_dir = _resolve_sidecar_dir()
+        if not (sidecar_dir / "sidecar.mjs").is_file():
+            logger.error(
+                "[WHATSAPP-BAILEYS] sidecar.mjs not found at %s — "
+                "QR-link mode disabled. Rebuild the agent image.",
+                sidecar_dir,
             )
-            # Surface whatsmeow's internal logs (Client / Database) into
-            # docker logs so pair-failure root causes (network errors,
-            # signature mismatches, persist failures) are visible without
-            # a live debugger. neonize routes them through stdlib loggers
-            # named "whatsmeow.Client" and "whatsmeow.Database".
-            import logging as _stdlogging
-            _stdlogging.getLogger("whatsmeow").setLevel(_stdlogging.DEBUG)
-            _stdlogging.getLogger("neonize").setLevel(_stdlogging.DEBUG)
-            # neonize's connect() reads the LEVEL of `neonize.utils.log.log`
-            # (NOT the prefix "neonize") to decide what whatsmeow Go-side
-            # logs to emit. Set it explicitly so we get pair / handshake /
-            # WS logs from Go through to docker logs.
+            return
+        if not (sidecar_dir / "node_modules").is_dir():
+            logger.error(
+                "[WHATSAPP-BAILEYS] node_modules missing at %s — "
+                "QR-link mode disabled. The Dockerfile.agent should "
+                "`npm install` during build.",
+                sidecar_dir,
+            )
+            return
+
+        node_bin = shutil.which("node")
+        if not node_bin:
+            logger.error(
+                "[WHATSAPP-BAILEYS] `node` binary not on PATH — "
+                "QR-link mode disabled. Install Node 20+."
+            )
+            return
+
+        # Spawn the sidecar. Its stdout/stderr are inherited so log
+        # lines flow into `docker logs <container>` alongside Python
+        # output.
+        try:
+            env = os.environ.copy()
+            env.setdefault("WHATSAPP_SIDECAR_PORT", str(_SIDECAR_PORT))
+            self._sidecar_proc = await asyncio.create_subprocess_exec(
+                node_bin,
+                "sidecar.mjs",
+                cwd=str(sidecar_dir),
+                env=env,
+                stdout=sys.stdout.fileno() if hasattr(sys.stdout, "fileno") else None,
+                stderr=sys.stderr.fileno() if hasattr(sys.stderr, "fileno") else None,
+            )
+            logger.info(
+                "[WHATSAPP-BAILEYS] sidecar spawned pid=%s port=%s dir=%s",
+                self._sidecar_proc.pid, _SIDECAR_PORT, sidecar_dir,
+            )
+        except Exception:
+            logger.exception("[WHATSAPP-BAILEYS] sidecar spawn failed")
+            return
+
+        # Wait for /health to come up — Node startup takes ~1-2s with
+        # warm node_modules; allow up to _SIDECAR_BOOT_TIMEOUT_S.
+        self._http = httpx.AsyncClient(
+            base_url=_SIDECAR_BASE, timeout=_SIDECAR_HTTP_TIMEOUT_S,
+        )
+        deadline = asyncio.get_event_loop().time() + _SIDECAR_BOOT_TIMEOUT_S
+        while asyncio.get_event_loop().time() < deadline:
             try:
-                from neonize.utils.log import log as _neonize_log
-                _neonize_log.setLevel(_stdlogging.DEBUG)
+                resp = await self._http.get("/health")
+                if resp.status_code == 200:
+                    body = resp.json()
+                    self._sidecar_booted_at = datetime.utcnow()
+                    self._session_status = body.get("session_status") or "not_linked"
+                    self._connected = bool(body.get("connected"))
+                    self._self_e164 = body.get("self_e164")
+                    logger.info(
+                        "[WHATSAPP-BAILEYS] sidecar healthy session=%s connected=%s",
+                        self._session_status, self._connected,
+                    )
+                    break
             except Exception:
                 pass
-        except ImportError:
+            await asyncio.sleep(0.5)
+        else:
             logger.error(
-                "[WHATSAPP-BAILEYS] neonize is not installed — "
-                "QR-link mode is disabled. Add `neonize>=0.4` to "
-                "requirements.txt and rebuild."
+                "[WHATSAPP-BAILEYS] sidecar didn't reach /health within %ds — bailing",
+                int(_SIDECAR_BOOT_TIMEOUT_S),
             )
+            await self._teardown()
             return
-
-        # Provision the on-disk store. In Contabo containers this is a
-        # bind-mounted /data volume; in dev environments it may not
-        # exist — log + bail rather than crash the whole agent boot.
-        try:
-            ensure_store_dir()
-        except OSError as exc:
-            logger.error(
-                "[WHATSAPP-BAILEYS] cannot create store dir — %s. "
-                "QR-link mode disabled. Ensure /data is writable in "
-                "the container's bind mount.",
-                exc,
-            )
-            return
-
-        # Identify as a real WhatsApp Desktop client. Meta's anti-abuse
-        # system fingerprints the *full* DeviceProps payload, not just
-        # `os` — sending os="Mac OS X" without a `version` is still
-        # caught and the phone shows "Can't link new devices at this
-        # time" even when the same phone successfully pairs the actual
-        # WhatsApp Desktop app to the same number a second later.
-        #
-        # Real WhatsApp Desktop reports its build number through the
-        # AppVersion sub-message (primary.secondary.tertiary). The
-        # values below match a recent stable Desktop release; bump
-        # them periodically as Meta deprecates older clients.
-        device_props = DeviceProps(
-            os="Mac OS X",
-            platformType=DeviceProps.DESKTOP,
-            version=DeviceProps.AppVersion(
-                primary=2,
-                secondary=2412,
-                tertiary=54,
-            ),
-            requireFullSync=False,
-        )
-        self._client = NewAClient(str(store_path()), props=device_props)
-        self._register_event_handlers()
 
         # Periodic sweep of the inbound dedupe table — same module the
-        # Cloud API path uses. Cancel-on-stop so we don't leak across
-        # container reloads.
-        from app.agent.channels.whatsapp_dedupe import run_sweep_loop
-        self._sweep_task = asyncio.create_task(run_sweep_loop())
-        self._supervisor_task = asyncio.create_task(self._run_supervisor())
+        # Cloud API path uses.
+        try:
+            from app.agent.channels.whatsapp_dedupe import run_sweep_loop
+            self._sweep_task = asyncio.create_task(run_sweep_loop())
+        except Exception:
+            logger.exception("[WHATSAPP-BAILEYS] dedupe sweep init failed")
+
+        # Long-lived SSE consumer.
+        self._event_task = asyncio.create_task(self._consume_events_forever())
+
         _active_channel = self
         logger.info(
-            "[WHATSAPP-BAILEYS] Channel started — store=%s allowlist_size=%d",
-            store_path(), len(self.allowed_numbers),
+            "[WHATSAPP-BAILEYS] Channel started — sidecar=%s allowlist_size=%d",
+            _SIDECAR_BASE, len(self.allowed_numbers),
         )
 
     async def stop(self) -> None:
-        """Graceful shutdown — cancels the supervisor + sweep, closes
-        the neonize client. Identity-aware: only clears the global
-        active reference if it still points at *this* instance.
-        """
+        """Graceful shutdown — cancels the SSE consumer + sweep, then
+        SIGTERMs the sidecar and waits for it to exit."""
         self._stopping = True
         global _active_channel
         if _active_channel is self:
             _active_channel = None
+        await self._teardown()
 
-        if self._supervisor_task:
-            self._supervisor_task.cancel()
-            try:
-                await self._supervisor_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._supervisor_task = None
+    async def _teardown(self) -> None:
+        # Cancel background tasks first so they don't observe a
+        # dying sidecar mid-iteration.
+        for task in (self._event_task, self._sweep_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._event_task = None
+        self._sweep_task = None
 
-        if self._sweep_task:
-            self._sweep_task.cancel()
+        if self._http is not None:
             try:
-                await self._sweep_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._sweep_task = None
-
-        if self._client is not None:
-            try:
-                # neonize's async client exposes disconnect(); guard
-                # for API drift.
-                disconnect = getattr(self._client, "disconnect", None)
-                if disconnect:
-                    res = disconnect()
-                    if asyncio.iscoroutine(res):
-                        await res
+                await self._http.aclose()
             except Exception:
-                logger.exception("[WHATSAPP-BAILEYS] disconnect failed")
-            self._client = None
+                pass
+            self._http = None
+
+        if self._sidecar_proc is not None:
+            try:
+                self._sidecar_proc.send_signal(signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(self._sidecar_proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    self._sidecar_proc.kill()
+                    await self._sidecar_proc.wait()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                logger.exception("[WHATSAPP-BAILEYS] sidecar shutdown failed")
+            self._sidecar_proc = None
 
         logger.info("[WHATSAPP-BAILEYS] Channel stopped")
 
-    # ── Supervisor loop ────────────────────────────────────────
+    # ── SSE consumer ───────────────────────────────────────────
 
-    async def _run_supervisor(self) -> None:
-        """Wraps neonize's ``connect()`` in a bounded-backoff loop.
+    async def _consume_events_forever(self) -> None:
+        """Stream inbound events from the sidecar's SSE endpoint.
 
-        ``connect()`` blocks while the session is alive and returns /
-        raises on disconnect. On unexpected exit we sleep for a
-        backoff window and try again. Logged-out / conflict states
-        flip ``_session_status`` and we stop retrying so the user sees
-        "needs relink" in Settings.
+        SSE drops cleanly when the sidecar restarts; we reconnect
+        with a small backoff so a sidecar bounce doesn't strand us.
         """
-        backoff = _RECONNECT_INITIAL_S
+        backoff = _SSE_RECONNECT_BACKOFF_S
         while not self._stopping:
             try:
-                logger.info(
-                    "[WHATSAPP-BAILEYS] supervisor.connecting attempt=%d",
-                    self._reconnect_attempts + 1,
-                )
-                # neonize's async connect() returns a Task — it does NOT
-                # block until disconnect. Awaiting the function only
-                # awaits its setup; we have to await the returned Task
-                # itself to block on the actual session lifetime.
-                # Without this, the supervisor spins in a tight loop
-                # logging "attempt=1" forever and never lets neonize
-                # actually finish connecting.
-                connect_task = await self._client.connect()  # type: ignore[union-attr]
-                if connect_task is not None:
-                    await connect_task
-                # Clean exit: connect() returned without error — only
-                # happens on graceful stop. Bail.
-                if self._stopping:
-                    return
+                async with httpx.AsyncClient(
+                    base_url=_SIDECAR_BASE, timeout=None,
+                ) as client:
+                    async with client.stream("GET", "/events") as resp:
+                        if resp.status_code != 200:
+                            logger.warning(
+                                "[WHATSAPP-BAILEYS] sse.bad_status %d — backing off %.1fs",
+                                resp.status_code, backoff,
+                            )
+                            await asyncio.sleep(backoff)
+                            continue
+                        backoff = _SSE_RECONNECT_BACKOFF_S  # reset on success
+                        async for line in resp.aiter_lines():
+                            if not line or line.startswith(":"):
+                                continue  # heartbeats / blank lines
+                            if not line.startswith("data:"):
+                                continue
+                            payload_str = line[len("data:"):].strip()
+                            if not payload_str:
+                                continue
+                            try:
+                                payload = json.loads(payload_str)
+                            except json.JSONDecodeError:
+                                logger.debug(
+                                    "[WHATSAPP-BAILEYS] sse.malformed_json %s",
+                                    payload_str[:200],
+                                )
+                                continue
+                            try:
+                                await self._on_sidecar_event(payload)
+                            except Exception:
+                                logger.exception(
+                                    "[WHATSAPP-BAILEYS] event.handler_failed"
+                                )
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                # Distinguish terminal states from transient ones. The
-                # exact classification depends on neonize's error
-                # surface — we use string matching defensively.
-                msg = str(exc).lower()
-                if "logged out" in msg or "loggedout" in msg or "401" in msg:
-                    logger.warning(
-                        "[WHATSAPP-BAILEYS] supervisor.logged_out — "
-                        "session is terminal, user must relink"
-                    )
-                    self._session_status = "logged_out"
-                    self._connected = False
-                    return
-                if "conflict" in msg or "440" in msg:
-                    logger.warning(
-                        "[WHATSAPP-BAILEYS] supervisor.conflict — "
-                        "another linked device displaced us"
-                    )
-                    self._session_status = "logged_out"
-                    self._connected = False
-                    return
-                self._reconnect_attempts += 1
-                if self._reconnect_attempts >= _RECONNECT_MAX_ATTEMPTS:
-                    logger.error(
-                        "[WHATSAPP-BAILEYS] supervisor.exhausted attempts=%d "
-                        "last_error=%s",
-                        self._reconnect_attempts, exc,
-                    )
-                    return
                 logger.warning(
-                    "[WHATSAPP-BAILEYS] supervisor.transient err=%s "
-                    "backing off %.1fs (attempt %d/%d)",
-                    exc, backoff, self._reconnect_attempts, _RECONNECT_MAX_ATTEMPTS,
+                    "[WHATSAPP-BAILEYS] sse.disconnected err=%s — backing off %.1fs",
+                    exc, backoff,
                 )
-                self._connected = False
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * _RECONNECT_FACTOR, _RECONNECT_MAX_S)
-                continue
-            # Successful clean-exit path: reset backoff for next loop.
-            backoff = _RECONNECT_INITIAL_S
+                backoff = min(backoff * 1.6, 30.0)
 
-    # ── Event handlers (registered with neonize) ───────────────
+    async def _on_sidecar_event(self, payload: dict) -> None:
+        """Route a single SSE event into the channel's state machine."""
+        kind = payload.get("type")
 
-    def _register_event_handlers(self) -> None:
-        """Wire neonize event callbacks. Defensive about API drift —
-        we look up event classes by attribute access so a neonize
-        version that renames a symbol surfaces as a clear log line
-        instead of an import-time crash.
-        """
-        if self._client is None:
-            return
-        try:
-            import neonize.events as ev  # type: ignore
-        except ImportError:
-            logger.error("[WHATSAPP-BAILEYS] neonize.events unavailable")
+        if kind == "qr":
+            # The PNG data URL itself is fetched lazily via
+            # /pair/status to avoid bloating SSE frames.
+            self._session_status = "linking"
             return
 
-        message_ev = getattr(ev, "MessageEv", None)
-        qr_ev = getattr(ev, "QREv", None) or getattr(ev, "PairingQREv", None)
-        pair_ev = getattr(ev, "PairStatusEv", None) or getattr(ev, "PairSuccessEv", None)
-        connected_ev = getattr(ev, "ConnectedEv", None)
-        disconnected_ev = getattr(ev, "DisconnectedEv", None)
-        logged_out_ev = getattr(ev, "LoggedOutEv", None) or getattr(ev, "LogoutEv", None)
-
-        if message_ev:
-            self._client.event(message_ev)(self._on_message_ev)  # type: ignore
-        # QR is special in neonize — it goes through ``event.qr(callback)``,
-        # NOT ``event(QREv)(callback)``. The default handler just prints
-        # the QR to stdout via segno.make_qr().terminal(); to capture
-        # the bytes, we override via the .qr setter. Callback signature
-        # is ``(client, bytes)``.
-        try:
-            qr_setter = getattr(self._client.event, "qr", None)
-            if callable(qr_setter):
-                qr_setter(self._on_qr_bytes)  # type: ignore
-        except Exception:
-            logger.exception("[WHATSAPP-BAILEYS] qr setter registration failed")
-        if pair_ev:
-            self._client.event(pair_ev)(self._on_pair_ev)  # type: ignore
-        if connected_ev:
-            self._client.event(connected_ev)(self._on_connected_ev)  # type: ignore
-        if disconnected_ev:
-            self._client.event(disconnected_ev)(self._on_disconnected_ev)  # type: ignore
-        if logged_out_ev:
-            self._client.event(logged_out_ev)(self._on_logged_out_ev)  # type: ignore
-
-        # Confirm what got registered. neonize 0.3.x's connect() serialises
-        # `event.list_func.keys()` into a bytearray that the Go binary uses
-        # as the event-filter list — events whose codes are absent here will
-        # NEVER fire. If this log shows fewer codes than we expected, the
-        # `getattr(ev, "...", None)` lookup above silently missed an alias.
-        try:
-            keys = list(getattr(self._client.event, "list_func", {}).keys())
+        if kind == "connection_open":
+            self._connected = True
+            self._session_status = "linked"
+            self._self_e164 = payload.get("self_e164") or self._self_e164
             logger.info(
-                "[WHATSAPP-BAILEYS] events.registered codes=%s count=%d",
-                keys, len(keys),
+                "[WHATSAPP-BAILEYS] connection.open self=%s",
+                redact_phone(self._self_e164 or ""),
             )
-        except Exception:
-            pass
-
-    async def _on_qr_bytes(self, _client, qr_data: bytes) -> None:
-        """Direct QR-bytes callback — registered via ``event.qr(self._on_qr_bytes)``.
-
-        neonize hands us the full WhatsApp pairing string verbatim.
-        Per whatsmeow's protocol the string is a CSV of FOUR components
-        in one logical token — ``ref,publicKey,identityKey,advSecret`` —
-        and the entire string must be encoded into a single QR. Splitting
-        on the comma is incorrect; WhatsApp rejects the resulting QR with
-        "Invalid QR code" because three of the four cryptographic
-        components are missing.
-
-        Pass-through: render the full bytes as one QR exactly as
-        neonize's default segno renderer does for terminal display.
-        """
-        try:
-            raw = qr_data.decode("utf-8") if isinstance(qr_data, (bytes, bytearray)) else str(qr_data)
-        except Exception:
-            raw = ""
-        raw = raw.strip().rstrip("\x00")
-        if not raw:
             return
-        self._latest_qr = raw
-        self._latest_qr_data_url = render_qr_png_data_url(raw)
-        self._latest_qr_at = datetime.utcnow()
-        self._session_status = "linking"
-        logger.info(
-            "[WHATSAPP-BAILEYS] qr.emitted len=%d parts=%d",
-            len(raw), len(raw.split(",")),
-        )
 
-    async def _on_qr_ev(self, _client, qr_payload) -> None:
-        """neonize emits the pairing string repeatedly while waiting
-        for the user to scan. We render it once per emit and cache so
-        ``/qr-status`` polls return the freshest value without
-        re-rendering on every poll.
-
-        ``qr_payload`` is a ``QREv`` protobuf with a ``Codes`` field —
-        a list of pairing strings (whatsmeow rotates them every ~20 s
-        until the user scans). We always pick the first.
-        """
-        qr_str = ""
-        try:
-            codes = getattr(qr_payload, "Codes", None)
-            if codes:
-                first = codes[0]
-                qr_str = first.decode("utf-8") if isinstance(first, (bytes, bytearray)) else str(first)
-            elif isinstance(qr_payload, (bytes, bytearray)):
-                qr_str = qr_payload.decode("utf-8")
-        except Exception:
-            logger.exception("[WHATSAPP-BAILEYS] qr.parse_failed")
-            qr_str = ""
-        if not qr_str:
-            logger.warning("[WHATSAPP-BAILEYS] qr.empty payload_type=%s", type(qr_payload).__name__)
+        if kind == "logged_out":
+            self._connected = False
+            self._session_status = "logged_out"
+            self._self_e164 = None
+            logger.warning("[WHATSAPP-BAILEYS] logged_out — relink required")
             return
-        self._latest_qr = qr_str
-        self._latest_qr_data_url = render_qr_png_data_url(qr_str)
-        self._latest_qr_at = datetime.utcnow()
-        self._session_status = "linking"
-        logger.info("[WHATSAPP-BAILEYS] qr.emitted len=%d", len(qr_str))
 
-    async def _on_pair_ev(self, _client, payload) -> None:
-        """Fired on first successful pair. ``payload.ID`` carries the
-        scanned device's JID; we extract its E.164 for display.
-        """
-        # Log payload shape so any future failure mode where the pair
-        # event fires but we mis-parse the JID is debuggable from logs
-        # alone (no live attach needed).
-        logger.info(
-            "[WHATSAPP-BAILEYS] pair.event payload_type=%s attrs=%s",
-            type(payload).__name__,
-            [a for a in dir(payload) if not a.startswith("_")][:20],
-        )
-        self._session_status = "linked"
-        self._latest_qr = None
-        self._latest_qr_data_url = None
-        try:
-            jid = getattr(payload, "ID", None) or getattr(payload, "id", None)
-            jid_str = str(jid) if jid is not None else ""
-            self._self_e164 = jid_to_e164(jid_str) or self._self_e164
-        except Exception:
-            pass
-        logger.info(
-            "[WHATSAPP-BAILEYS] pair.success self=%s",
-            redact_phone(self._self_e164 or ""),
-        )
+        if kind == "message":
+            await self._handle_inbound_message(payload)
+            return
 
-    async def _on_connected_ev(self, _client, _payload) -> None:
-        self._connected = True
-        self._reconnect_attempts = 0
-        self._session_status = "linked"
-        logger.info("[WHATSAPP-BAILEYS] connected")
+        # Unknown event types — log at debug, don't fail.
+        logger.debug("[WHATSAPP-BAILEYS] event.unknown_type type=%s", kind)
 
-    async def _on_disconnected_ev(self, _client, _payload) -> None:
-        self._connected = False
-        logger.info("[WHATSAPP-BAILEYS] disconnected")
-
-    async def _on_logged_out_ev(self, _client, _payload) -> None:
-        self._connected = False
-        self._session_status = "logged_out"
-        logger.warning("[WHATSAPP-BAILEYS] logged_out — relink required")
-
-    async def _on_message_ev(self, _client, message) -> None:
-        """The hot path: convert neonize's message struct into Toup's
-        ``InboundMessage`` and call ``BaseChannel.dispatch()``.
-        """
-        logger.info(
-            "[WHATSAPP-BAILEYS] message.event payload_type=%s",
-            type(message).__name__,
-        )
-        try:
-            await self._handle_message(message)
-        except Exception:
-            logger.exception("[WHATSAPP-BAILEYS] message_handler.unhandled")
-
-    async def _handle_message(self, message) -> None:
-        # Extract sender + body. neonize message layout is whatsmeow's
-        # protobuf shape; we access defensively so an unexpected
-        # message kind (status, reaction, system) just gets dropped.
-        sender_jid = ""
-        message_id = ""
-        text = ""
-        is_from_me = False
-        try:
-            info = getattr(message, "Info", None)
-            if info is not None:
-                src = getattr(info, "MessageSource", None)
-                if src is not None:
-                    sender = getattr(src, "Sender", None)
-                    if sender is not None:
-                        sender_jid = str(sender) if sender else ""
-                    is_from_me = bool(getattr(src, "IsFromMe", False))
-                message_id = str(getattr(info, "ID", "") or "")
-            content = getattr(message, "Message", None)
-            if content is not None:
-                text = (
-                    getattr(content, "conversation", "")
-                    or getattr(getattr(content, "extendedTextMessage", None), "text", "")
-                    or ""
-                )
-        except Exception:
-            pass
-
-        if is_from_me:
-            return  # echo of our own outbound
-
-        sender_e164 = jid_to_e164(sender_jid)
-        chat_label = redact_phone(sender_e164)
+    async def _handle_inbound_message(self, payload: dict) -> None:
+        sender_e164 = (payload.get("from") or "").strip()
+        text = (payload.get("text") or "").strip()
+        message_id = (payload.get("message_id") or "").strip()
+        push_name = payload.get("push_name") or sender_e164
 
         # ACL gate. Empty allowlist = block all.
-        if not sender_e164 or sender_e164 not in self.allowed_numbers:
+        sender_norm = _normalize_e164(sender_e164)
+        if not sender_norm or sender_norm not in self.allowed_numbers:
             logger.info(
                 "[WHATSAPP-BAILEYS] inbound.blocked_by_acl chat=%s",
-                chat_label or "unknown",
+                redact_phone(sender_norm) or "unknown",
             )
             return
 
-        # Dedupe — same DB table the Cloud API path uses. Surviving
-        # container restarts is exactly the case Meta retries hit.
-        from app.agent.channels.whatsapp_dedupe import claim as _dedupe_claim
-        from app.config import settings as _settings
-        owner_user_id = getattr(_settings, "user_id", "") or ""
-        if message_id and owner_user_id:
-            first_seen = await _dedupe_claim(owner_user_id, message_id)
-            if not first_seen:
-                logger.info(
-                    "[WHATSAPP-BAILEYS] dedupe.skipped_retry chat=%s msg_id=%s",
-                    chat_label, message_id[:16],
-                )
-                return
+        # Dedupe — same DB table the Cloud API path uses.
+        try:
+            from app.agent.channels.whatsapp_dedupe import claim as _dedupe_claim
+            from app.config import settings as _settings
+            owner_user_id = getattr(_settings, "user_id", "") or ""
+            if message_id and owner_user_id:
+                first_seen = await _dedupe_claim(owner_user_id, message_id)
+                if not first_seen:
+                    logger.info(
+                        "[WHATSAPP-BAILEYS] dedupe.skipped_retry chat=%s msg_id=%s",
+                        redact_phone(sender_norm), message_id[:16],
+                    )
+                    return
+        except Exception:
+            logger.exception("[WHATSAPP-BAILEYS] dedupe.claim_failed")
 
         if not text:
-            # Drop non-text messages for now (media support lands in a
-            # later commit). The dedupe claim above means a retry with
-            # text won't be deduped because no claim was made.
             logger.info(
                 "[WHATSAPP-BAILEYS] inbound.unsupported_kind chat=%s",
-                chat_label,
+                redact_phone(sender_norm),
             )
             return
 
@@ -603,13 +443,13 @@ class BaileysWhatsAppChannel(BaseChannel):
 
         inbound = InboundMessage(
             channel=ChannelType.WHATSAPP,
-            channel_user_id=sender_e164,
-            channel_chat_id=sender_e164,
+            channel_user_id=sender_norm,
+            channel_chat_id=sender_norm,
             text=text,
             media_paths=[],
-            username=sender_e164,
-            display_name=sender_e164,
-            raw=message,
+            username=push_name,
+            display_name=push_name,
+            raw=payload,
         )
         await self.dispatch(inbound)
 
@@ -618,32 +458,22 @@ class BaileysWhatsAppChannel(BaseChannel):
     async def send_text(
         self, chat_id: str, text: str, parse_mode: Optional[str] = None
     ) -> None:
-        """Send a text message via the linked-device session.
+        """Send a text message via the sidecar.
 
-        ``chat_id`` is the recipient's E.164 (matches ``InboundMessage.
-        channel_chat_id`` from the inbound handler). We convert to a
-        whatsmeow JID at send time, apply the markdown→WA transform,
-        chunk to fit WhatsApp's per-message limit, and send each chunk
-        sequentially.
+        ``chat_id`` is the recipient's E.164 (matches
+        ``InboundMessage.channel_chat_id``). The sidecar accepts E.164
+        directly and converts to a JID internally.
         """
-        if self._client is None or not self._connected:
+        if self._http is None:
             logger.warning(
-                "[WHATSAPP-BAILEYS] send.no_session chat=%s — dropping",
+                "[WHATSAPP-BAILEYS] send.no_session chat=%s — sidecar down, dropping",
                 redact_phone(chat_id),
             )
             self._last_send_error = {
                 "status": 0,
                 "at": datetime.utcnow().isoformat() + "Z",
-                "message_excerpt": "session not connected",
+                "message_excerpt": "sidecar not started",
             }
-            return
-
-        jid = e164_to_jid(chat_id)
-        if not jid:
-            logger.warning(
-                "[WHATSAPP-BAILEYS] send.invalid_chat_id chat=%s",
-                redact_phone(chat_id),
-            )
             return
 
         converted = markdown_to_whatsapp(text or "")
@@ -654,16 +484,22 @@ class BaileysWhatsAppChannel(BaseChannel):
         redacted = redact_phone(chat_id)
         for idx, chunk in enumerate(chunks, start=1):
             try:
-                # neonize's send_message accepts a JID + body. The
-                # exact API call may be `send_message`, `SendMessage`,
-                # or wrapped in a content type — we try the canonical
-                # form first.
-                send_message = getattr(self._client, "send_message", None)
-                if send_message is None:
-                    raise RuntimeError("neonize client has no send_message")
-                result = send_message(jid, chunk)
-                if asyncio.iscoroutine(result):
-                    await result
+                resp = await self._http.post(
+                    "/messages/send",
+                    json={"to": chat_id, "text": chunk},
+                )
+                if resp.status_code != 200:
+                    body = resp.text[:300]
+                    logger.warning(
+                        "[WHATSAPP-BAILEYS] send.http_%d chat=%s chunk=%d/%d body=%s",
+                        resp.status_code, redacted, idx, len(chunks), body,
+                    )
+                    self._last_send_error = {
+                        "status": resp.status_code,
+                        "at": datetime.utcnow().isoformat() + "Z",
+                        "message_excerpt": body,
+                    }
+                    return
                 self._last_send_at = datetime.utcnow()
                 self._last_send_error = None
             except Exception as exc:
@@ -679,61 +515,82 @@ class BaileysWhatsAppChannel(BaseChannel):
                 return
 
     async def send_typing(self, chat_id: str) -> None:
-        """Best-effort typing presence. Not all WhatsApp Web clients
-        show this for linked devices; we attempt it and swallow
-        errors.
+        """Best-effort typing presence. The sidecar doesn't expose a
+        typing endpoint yet (Baileys' presence API is per-conversation
+        and rarely visible on linked-device sessions). No-op for now.
         """
-        if self._client is None or not self._connected:
-            return
-        try:
-            send_presence = getattr(self._client, "send_chat_presence", None)
-            if send_presence is None:
-                return
-            jid = e164_to_jid(chat_id)
-            if not jid:
-                return
-            result = send_presence(jid, "composing")
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception:
-            pass
+        return
 
     # ── QR pairing API (consumed by /qr-* endpoints) ───────────
 
     def get_pairing_status(self) -> dict:
-        """Snapshot for the ``/qr-status`` polling endpoint."""
-        emitted_at = (
-            self._latest_qr_at.isoformat() + "Z"
-            if self._latest_qr_at else None
-        )
-        return {
+        """Snapshot for the ``/qr-status`` polling endpoint.
+
+        Reaches into the sidecar synchronously via httpx — this method
+        is called from inside FastAPI request handlers which are
+        already async-friendly, but the API surface must stay sync to
+        avoid breaking older callers. We use a short blocking client.
+        """
+        # Default snapshot uses cached state if sidecar is down.
+        snapshot = {
             "session_status": self._session_status,
             "connected": self._connected,
             "self_e164": self._self_e164,
             "qr_data_url": self._latest_qr_data_url,
-            "qr_emitted_at": emitted_at,
+            "qr_emitted_at": (
+                self._latest_qr_at.isoformat() + "Z"
+                if self._latest_qr_at else None
+            ),
         }
+        try:
+            with httpx.Client(base_url=_SIDECAR_BASE, timeout=2.0) as client:
+                resp = client.get("/pair/status")
+                if resp.status_code == 200:
+                    body = resp.json()
+                    # Cache for next call + for SSE-driven status display.
+                    self._session_status = body.get("session_status") or self._session_status
+                    self._connected = bool(body.get("connected"))
+                    self._self_e164 = body.get("self_e164")
+                    self._latest_qr_data_url = body.get("qr_data_url")
+                    qr_at = body.get("qr_emitted_at")
+                    if qr_at:
+                        try:
+                            self._latest_qr_at = datetime.fromisoformat(
+                                qr_at.replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            pass
+                    return body
+        except Exception as exc:
+            logger.debug("[WHATSAPP-BAILEYS] pair_status.fetch_failed %s", exc)
+        return snapshot
+
+    async def kick_pair(self) -> None:
+        """Tell the sidecar to wipe auth + start a fresh QR flow."""
+        if self._http is None:
+            return
+        try:
+            await self._http.post("/pair/start")
+            self._session_status = "linking"
+            self._connected = False
+            self._self_e164 = None
+            self._latest_qr_data_url = None
+            self._latest_qr_at = None
+        except Exception:
+            logger.exception("[WHATSAPP-BAILEYS] pair_start.failed")
 
     async def force_logout(self) -> None:
-        """User clicked "Disconnect" in Settings. Tear down session
-        and remove on-disk state so the next pair starts fresh.
-        """
-        from app.agent.channels.whatsapp_baileys_session import clear_session_files
-        try:
-            if self._client is not None:
-                logout = getattr(self._client, "logout", None)
-                if logout:
-                    res = logout()
-                    if asyncio.iscoroutine(res):
-                        await res
-        except Exception:
-            logger.exception("[WHATSAPP-BAILEYS] logout call failed")
-        clear_session_files()
+        """User clicked "Disconnect" in Settings."""
+        if self._http is not None:
+            try:
+                await self._http.post("/pair/logout")
+            except Exception:
+                logger.exception("[WHATSAPP-BAILEYS] logout.sidecar_call_failed")
         self._session_status = "not_linked"
         self._connected = False
         self._self_e164 = None
-        self._latest_qr = None
         self._latest_qr_data_url = None
+        self._latest_qr_at = None
         logger.info("[WHATSAPP-BAILEYS] force_logout — session cleared")
 
     # ── Health surface ─────────────────────────────────────────
@@ -744,7 +601,7 @@ class BaileysWhatsAppChannel(BaseChannel):
         """
         return {
             "configured": True,
-            "started": self._client is not None,
+            "started": self._sidecar_proc is not None,
             "mode": "qr_link",
             "session_status": self._session_status,
             "connected": self._connected,
@@ -760,5 +617,11 @@ class BaileysWhatsAppChannel(BaseChannel):
                 if self._last_send_at else None
             ),
             "last_send_error": self._last_send_error,
-            "reconnect_attempts": self._reconnect_attempts,
+            "sidecar_pid": (
+                self._sidecar_proc.pid if self._sidecar_proc else None
+            ),
+            "sidecar_booted_at": (
+                self._sidecar_booted_at.isoformat() + "Z"
+                if self._sidecar_booted_at else None
+            ),
         }

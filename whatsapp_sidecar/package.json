@@ -1,0 +1,19 @@
+{
+  "name": "toup-whatsapp-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Baileys-based WhatsApp pairing sidecar — speaks Baileys to Meta, exposes HTTP/SSE to the Python agent.",
+  "main": "sidecar.mjs",
+  "scripts": {
+    "start": "node sidecar.mjs"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.18",
+    "pino": "9.5.0",
+    "qrcode": "1.5.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

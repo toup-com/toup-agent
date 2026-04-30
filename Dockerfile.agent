@@ -34,9 +34,9 @@ RUN apt-get update && apt-get install -y \
     libreoffice-core \
     libreoffice-writer \
     libreoffice-impress \
-    # libmagic — required by python-magic, which neonize imports at module load.
-    # Without it, `import neonize` raises ImportError and /agent/health reports
-    # qr_supported=false even though the wheel is installed.
+    # libmagic — used by python-magic for content-type sniffing in
+    # several adapters (file-upload routes, doc-delivery). Cheap to
+    # keep installed even if no current code path requires it.
     libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -51,6 +51,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 # Python deps
 COPY requirements.agent.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+
+# WhatsApp sidecar — Baileys (Node.js) handles QR pairing because
+# Meta's anti-abuse rejects clients with stale `version` triples and
+# Baileys' `fetchLatestBaileysVersion()` is the only reliable way to
+# stay current. Install BEFORE `COPY . .` so node_modules is cached
+# across rebuilds when only Python code changes.
+COPY whatsapp_sidecar/package.json whatsapp_sidecar/package.json
+RUN cd whatsapp_sidecar && npm install --omit=dev --no-audit --no-fund
 
 # Agent code
 COPY . .

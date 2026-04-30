@@ -62,19 +62,13 @@ def _require_active_channel():
 async def qr_start(_user=Depends(get_current_user)):
     """Trigger a fresh QR pairing.
 
-    Idempotent — calling it while a pairing is already in flight is
-    safe; neonize's connect loop simply continues, and the next
-    ``/qr/status`` poll returns the latest QR. Calling it after a
-    successful pair re-emits a QR (intended UX for "I want to relink
-    on a different phone").
+    Always wipes any existing auth state and tells the Baileys
+    sidecar to spin up a brand new socket. Calling while a pairing
+    is already in flight cancels it and starts a new one — exactly
+    what the user wants when they click "Connect via QR" again.
     """
     channel = _require_active_channel()
-    # If there's a logged_out terminal state, force_logout() clears
-    # it so the next supervisor iteration re-pairs from scratch.
-    if channel.health().get("session_status") == "logged_out":
-        await channel.force_logout()
-    # Otherwise the supervisor is already running; QR will appear in
-    # the next status poll. Return ok and let the client poll.
+    await channel.kick_pair()
     return {"ok": True}
 
 

@@ -1,0 +1,556 @@
+/**
+ * Toup WhatsApp Sidecar — Baileys ↔ Python bridge.
+ *
+ * Why this exists
+ * ---------------
+ * We tried `neonize` (Python wrapper around `whatsmeow` Go binary) first.
+ * Pairing kept failing with "Can't link new devices right now" on the
+ * scanning phone, despite the same number successfully pairing real
+ * WhatsApp Desktop. Root cause: Meta's anti-abuse rejects WhatsApp Web
+ * clients advertising stale `version` triples, and `neonize 0.3.17` /
+ * `whatsmeow` ships a baked-in version that's now too old. Baileys
+ * 6.x exposes `fetchLatestBaileysVersion()` which polls
+ * `web.whatsapp.com/check-update` for the freshest accepted triple —
+ * the only reliable way to stay un-fingerprinted long-term.
+ *
+ * Architecture
+ * ------------
+ * One Node child process, spawned by the Python `BaileysWhatsAppChannel`
+ * adapter at agent boot. Listens on `127.0.0.1:$PORT` (default 8002,
+ * container-internal only — never exposed via Caddy).
+ *
+ *   POST /pair/start     wipe auth + start fresh QR flow
+ *   POST /pair/logout    teardown + wipe on-disk auth
+ *   GET  /pair/status    snapshot for /qr-status polling
+ *   POST /messages/send  body { to: E.164, text }  → outbound text
+ *   GET  /events         SSE stream: { type:"message", from, text, message_id, timestamp_ms }
+ *   GET  /health         liveness + diagnostics
+ *
+ * Auth lives at $AUTH_DIR (default /data/whatsapp/auth). Multi-file
+ * Baileys layout — survives container restarts.
+ *
+ * The 515-restart dance is mandatory: post-QR-scan Baileys throws a
+ * synthetic stream-errored 515 disconnect. Caller must close the
+ * socket and recreate against the same auth dir; the second socket
+ * transitions to "connection: open" and pairing is durable. Skipping
+ * this step is the #2 cause of "QR scan worked but agent never
+ * connects" reports.
+ */
+
+import {
+  makeWASocket,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  useMultiFileAuthState,
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import QRCode from 'qrcode';
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+
+// ── Config ──────────────────────────────────────────────────────────
+const PORT = parseInt(process.env.WHATSAPP_SIDECAR_PORT || '8002', 10);
+const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || '/data/whatsapp/auth';
+const BROWSER_NAME = process.env.WHATSAPP_BROWSER_NAME || 'Toup';
+const BROWSER_PLATFORM = process.env.WHATSAPP_BROWSER_PLATFORM || 'Chrome';
+const BROWSER_VERSION = process.env.WHATSAPP_BROWSER_VERSION || '1.0.0';
+const LOG_LEVEL = process.env.WHATSAPP_LOG_LEVEL || 'info';
+
+// ── Logger ──────────────────────────────────────────────────────────
+// Pino → stderr so the parent Python process captures it via journalctl.
+const logger = pino({ level: LOG_LEVEL }, pino.destination(2));
+const log = (msg, fields = {}) => logger.info(fields, msg);
+const warn = (msg, fields = {}) => logger.warn(fields, msg);
+const error = (msg, fields = {}) => logger.error(fields, msg);
+
+// ── State ───────────────────────────────────────────────────────────
+let sock = null;                         // current Baileys socket
+let restarting = false;                  // re-entrancy guard during 515 dance
+let sessionStatus = 'not_linked';        // not_linked | linking | linked | logged_out
+let connected = false;
+let selfE164 = null;
+let selfJid = null;
+let latestQrString = null;
+let latestQrPngDataUrl = null;
+let latestQrAt = null;                   // ISO timestamp
+let inboundCount = 0;
+let lastInboundAt = null;
+let lastSendAt = null;
+let lastSendError = null;
+let bootedAt = new Date().toISOString();
+
+const sseClients = new Set();            // open SSE response streams
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/** Ensure the auth dir exists with restrictive perms (0700). */
+function ensureAuthDir() {
+  fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+}
+
+/** Wipe everything inside AUTH_DIR but keep the directory itself. */
+function wipeAuthDir() {
+  if (!fs.existsSync(AUTH_DIR)) return;
+  for (const entry of fs.readdirSync(AUTH_DIR)) {
+    const p = path.join(AUTH_DIR, entry);
+    try {
+      fs.rmSync(p, { recursive: true, force: true });
+    } catch (e) {
+      warn('auth.wipe.entry_failed', { path: p, err: String(e) });
+    }
+  }
+}
+
+/** Convert "+15555550100" → "15555550100@s.whatsapp.net" for Baileys. */
+function e164ToJid(e164) {
+  if (!e164) return '';
+  const digits = e164.replace(/\D/g, '');
+  return digits ? `${digits}@s.whatsapp.net` : '';
+}
+
+/** Convert "15555550100@s.whatsapp.net" → "+15555550100". */
+function jidToE164(jid) {
+  if (!jid || !jid.includes('@')) return '';
+  const [user, server] = jid.split('@', 2);
+  if (server !== 's.whatsapp.net' && server !== 'c.us') return '';
+  const digits = user.split(':', 1)[0];
+  if (!/^\d+$/.test(digits)) return '';
+  return `+${digits}`;
+}
+
+/** Normalise outbound JID. Accepts E.164 or full JID. */
+function toJid(target) {
+  if (!target) return '';
+  if (target.includes('@')) return target;
+  return e164ToJid(target);
+}
+
+/** Push an event to all open SSE listeners. Drops stalled clients. */
+function emitEvent(payload) {
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(data);
+    } catch {
+      sseClients.delete(res);
+    }
+  }
+}
+
+/** Render a QR string into a base64 PNG data URL for the Settings UI. */
+async function renderQrDataUrl(qrString) {
+  try {
+    return await QRCode.toDataURL(qrString, {
+      errorCorrectionLevel: 'M',
+      margin: 2,
+      width: 320,
+    });
+  } catch (e) {
+    error('qr.render_failed', { err: String(e) });
+    return null;
+  }
+}
+
+/** Extract the human-readable text from an inbound Baileys message. */
+function extractText(message) {
+  if (!message) return '';
+  return (
+    message.conversation ||
+    message.extendedTextMessage?.text ||
+    message.imageMessage?.caption ||
+    message.videoMessage?.caption ||
+    message.documentMessage?.caption ||
+    ''
+  );
+}
+
+// ── Socket lifecycle ───────────────────────────────────────────────
+
+/**
+ * Build a fresh Baileys socket. Reads existing creds if present
+ * (resume) or starts blank (fresh QR flow).
+ *
+ * Returns { sock, saveCreds } — caller wires lifecycle handlers.
+ */
+async function createSocket() {
+  ensureAuthDir();
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  log('socket.creating', { version, isLatest, auth_dir: AUTH_DIR });
+
+  const baileysLogger = pino({ level: 'silent' });
+  const newSock = makeWASocket({
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+    },
+    version,
+    logger: baileysLogger,
+    printQRInTerminal: false,
+    browser: [BROWSER_NAME, BROWSER_PLATFORM, BROWSER_VERSION],
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    keepAliveIntervalMs: 25_000,
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000,
+    generateHighQualityLinkPreview: false,
+  });
+
+  return { sock: newSock, saveCreds };
+}
+
+/**
+ * Wire all event handlers on a freshly-created socket. Runs the 515
+ * restart dance internally so the caller doesn't see it.
+ */
+function wireSocket(s, saveCreds) {
+  s.ev.on('creds.update', async () => {
+    try {
+      await saveCreds();
+    } catch (e) {
+      warn('creds.save_failed', { err: String(e) });
+    }
+  });
+
+  s.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      latestQrString = qr;
+      latestQrAt = new Date().toISOString();
+      latestQrPngDataUrl = await renderQrDataUrl(qr);
+      sessionStatus = 'linking';
+      log('qr.emitted', { len: qr.length });
+      emitEvent({ type: 'qr', qr_emitted_at: latestQrAt });
+    }
+
+    if (connection === 'open') {
+      connected = true;
+      sessionStatus = 'linked';
+      latestQrString = null;
+      latestQrPngDataUrl = null;
+      // After socket open, our own JID is on the user creds.
+      try {
+        selfJid = s.user?.id || null;
+        selfE164 = jidToE164(selfJid || '') || null;
+      } catch {
+        // ignore
+      }
+      log('connection.open', { self: selfE164 });
+      emitEvent({ type: 'connection_open', self_e164: selfE164 });
+    }
+
+    if (connection === 'close') {
+      connected = false;
+      // Boom-style error shape Baileys uses: error.output.statusCode.
+      // Fall back to `.status` for non-Boom errors.
+      const status =
+        lastDisconnect?.error?.output?.statusCode ||
+        lastDisconnect?.error?.status ||
+        null;
+      log('connection.close', { status, message: String(lastDisconnect?.error || '') });
+
+      // 515 — Baileys signals "stream-errored, restart required" right
+      // after pair-success. The auth dir is now populated; closing
+      // and recreating completes the link.
+      if (status === 515) {
+        log('connection.restart_required');
+        if (!restarting) {
+          restarting = true;
+          try {
+            sock = null;
+            const { sock: next, saveCreds: nextSave } = await createSocket();
+            wireSocket(next, nextSave);
+            sock = next;
+          } finally {
+            restarting = false;
+          }
+        }
+        return;
+      }
+
+      if (status === DisconnectReason.loggedOut || status === 401) {
+        sessionStatus = 'logged_out';
+        wipeAuthDir();
+        warn('logged_out — auth dir wiped, awaiting fresh pair');
+        emitEvent({ type: 'logged_out' });
+        return;
+      }
+
+      // Any other close: Baileys + our caller's reconnect supervisor
+      // handle this. Recreate after a short delay so we don't tight-loop.
+      if (sessionStatus === 'linked' || sessionStatus === 'linking') {
+        setTimeout(async () => {
+          try {
+            if (!sock) {
+              const { sock: next, saveCreds: nextSave } = await createSocket();
+              wireSocket(next, nextSave);
+              sock = next;
+            }
+          } catch (e) {
+            error('reconnect_failed', { err: String(e) });
+          }
+        }, 2000);
+      }
+    }
+  });
+
+  s.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    for (const m of messages) {
+      try {
+        // Drop our own outbound echoes; drop status / system frames.
+        if (m.key?.fromMe) continue;
+        if (m.key?.remoteJid?.endsWith('@broadcast')) continue;
+        if (m.key?.remoteJid?.endsWith('@g.us')) continue;  // skip groups for v1
+        const text = extractText(m.message || {});
+        const fromJid = m.key?.remoteJid || '';
+        const fromE164 = jidToE164(fromJid);
+        const messageId = m.key?.id || '';
+        const timestampMs = (m.messageTimestamp ? Number(m.messageTimestamp) * 1000 : Date.now());
+        if (!fromE164) continue;
+        inboundCount += 1;
+        lastInboundAt = new Date().toISOString();
+        emitEvent({
+          type: 'message',
+          from: fromE164,
+          from_jid: fromJid,
+          text,
+          message_id: messageId,
+          timestamp_ms: timestampMs,
+          push_name: m.pushName || null,
+        });
+      } catch (e) {
+        warn('inbound.handle_failed', { err: String(e) });
+      }
+    }
+  });
+}
+
+/** Boot — resume if creds exist, otherwise wait for /pair/start. */
+async function boot() {
+  ensureAuthDir();
+  const credsPath = path.join(AUTH_DIR, 'creds.json');
+  const hasCreds = fs.existsSync(credsPath) && fs.statSync(credsPath).size > 1;
+
+  if (hasCreds) {
+    log('boot.resuming');
+    sessionStatus = 'linking';  // until connection.open
+    try {
+      const { sock: s, saveCreds } = await createSocket();
+      wireSocket(s, saveCreds);
+      sock = s;
+    } catch (e) {
+      error('boot.resume_failed', { err: String(e) });
+      sessionStatus = 'not_linked';
+    }
+  } else {
+    log('boot.no_creds_awaiting_pair');
+    // /pair/start will create the socket on demand.
+  }
+}
+
+// ── HTTP API ───────────────────────────────────────────────────────
+
+/** Read full request body as UTF-8 string (with 1MB cap). */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (c) => {
+      total += c.length;
+      if (total > 1_000_000) {
+        reject(new Error('body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+async function handlePairStart(req, res) {
+  log('pair.start');
+  // Tear down any existing socket + wipe auth so we always emit a
+  // fresh QR. Idempotent — calling while already linking is a no-op.
+  try {
+    if (sock) {
+      try { sock.end(undefined); } catch {}
+      sock = null;
+    }
+    wipeAuthDir();
+    sessionStatus = 'linking';
+    connected = false;
+    selfE164 = null;
+    selfJid = null;
+    latestQrString = null;
+    latestQrPngDataUrl = null;
+    latestQrAt = null;
+    const { sock: s, saveCreds } = await createSocket();
+    wireSocket(s, saveCreds);
+    sock = s;
+    sendJson(res, 200, { ok: true });
+  } catch (e) {
+    error('pair.start_failed', { err: String(e) });
+    sendJson(res, 500, { ok: false, error: String(e) });
+  }
+}
+
+async function handlePairLogout(req, res) {
+  log('pair.logout');
+  try {
+    if (sock) {
+      try { await sock.logout(); } catch {}
+      try { sock.end(undefined); } catch {}
+      sock = null;
+    }
+    wipeAuthDir();
+    sessionStatus = 'not_linked';
+    connected = false;
+    selfE164 = null;
+    selfJid = null;
+    latestQrString = null;
+    latestQrPngDataUrl = null;
+    latestQrAt = null;
+    sendJson(res, 200, { ok: true });
+  } catch (e) {
+    error('pair.logout_failed', { err: String(e) });
+    sendJson(res, 500, { ok: false, error: String(e) });
+  }
+}
+
+function handlePairStatus(req, res) {
+  sendJson(res, 200, {
+    session_status: sessionStatus,
+    connected,
+    self_e164: selfE164,
+    qr_data_url: latestQrPngDataUrl,
+    qr_emitted_at: latestQrAt,
+  });
+}
+
+async function handleSend(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch (e) {
+    sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+    return;
+  }
+  const to = (payload.to || '').toString();
+  const text = (payload.text || '').toString();
+  if (!to || !text) {
+    sendJson(res, 400, { ok: false, error: 'to + text required' });
+    return;
+  }
+  if (!sock || !connected) {
+    sendJson(res, 503, { ok: false, error: 'not connected' });
+    return;
+  }
+  const jid = toJid(to);
+  if (!jid) {
+    sendJson(res, 400, { ok: false, error: 'invalid to' });
+    return;
+  }
+  try {
+    const result = await sock.sendMessage(jid, { text });
+    lastSendAt = new Date().toISOString();
+    lastSendError = null;
+    sendJson(res, 200, { ok: true, message_id: result?.key?.id || null });
+  } catch (e) {
+    lastSendError = { at: new Date().toISOString(), message: String(e).slice(0, 300) };
+    error('send.failed', { err: String(e) });
+    sendJson(res, 502, { ok: false, error: String(e) });
+  }
+}
+
+function handleEventsStream(req, res) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no',
+  });
+  res.write(`: connected\n\n`);
+  // Heartbeat every 25s — keeps long-lived intermediaries from idling.
+  const heartbeat = setInterval(() => {
+    try { res.write(`: ping\n\n`); } catch {}
+  }, 25_000);
+  sseClients.add(res);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+  });
+}
+
+function handleHealth(req, res) {
+  sendJson(res, 200, {
+    ok: true,
+    booted_at: bootedAt,
+    session_status: sessionStatus,
+    connected,
+    self_e164: selfE164,
+    has_socket: sock !== null,
+    inbound_count: inboundCount,
+    last_inbound_at: lastInboundAt,
+    last_send_at: lastSendAt,
+    last_send_error: lastSendError,
+    sse_listeners: sseClients.size,
+    auth_dir: AUTH_DIR,
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  // 127.0.0.1 only — defence in depth, in case Docker net mapping ever
+  // exposes the port externally by accident.
+  const remote = req.socket.remoteAddress || '';
+  if (!remote.includes('127.0.0.1') && !remote.includes('::1') && !remote.startsWith('::ffff:127.')) {
+    res.writeHead(403);
+    res.end('forbidden');
+    return;
+  }
+
+  const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+  const route = `${req.method} ${url.pathname}`;
+
+  try {
+    switch (route) {
+      case 'POST /pair/start':   return await handlePairStart(req, res);
+      case 'POST /pair/logout':  return await handlePairLogout(req, res);
+      case 'GET /pair/status':   return handlePairStatus(req, res);
+      case 'POST /messages/send': return await handleSend(req, res);
+      case 'GET /events':        return handleEventsStream(req, res);
+      case 'GET /health':        return handleHealth(req, res);
+      default:
+        sendJson(res, 404, { ok: false, error: 'not found' });
+    }
+  } catch (e) {
+    error('http.unhandled', { route, err: String(e) });
+    try { sendJson(res, 500, { ok: false, error: String(e) }); } catch {}
+  }
+});
+
+server.listen(PORT, '127.0.0.1', async () => {
+  log('sidecar.listening', { port: PORT, auth_dir: AUTH_DIR });
+  await boot();
+});
+
+// Graceful shutdown — close socket cleanly so Meta sees a controlled
+// disconnect rather than a TCP RST (which can spook anti-abuse).
+const shutdown = async (signal) => {
+  log('shutdown.received', { signal });
+  try { if (sock) { sock.end(undefined); } } catch {}
+  try { server.close(); } catch {}
+  setTimeout(() => process.exit(0), 1500).unref();
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

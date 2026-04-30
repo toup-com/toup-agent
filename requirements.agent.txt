@@ -54,14 +54,13 @@ discord.py>=2.3.0
 slack-bolt>=1.18.0
 slack-sdk>=3.27.0
 
-# WhatsApp QR-link mode (Path C). neonize wraps whatsmeow Go binary
-# (pre-built wheels on PyPI for Linux x86_64; no Go toolchain needed
-# at install time). qrcode renders neonize's pairing string into a
-# PNG data URL the Settings modal serves to the user.
-# Pinned to the 0.3.x line because that's the actual latest series
-# on PyPI (0.4 doesn't exist — earlier commit assumed wrongly).
-neonize>=0.3.17
-qrcode[pil]>=7.4
+# WhatsApp QR-link mode (Path C) is now handled by the Node.js
+# Baileys sidecar — see backend/whatsapp_sidecar/. neonize/whatsmeow
+# was retired because its baked-in WhatsApp Web `version` triple gets
+# rejected by Meta's anti-abuse with "Can't link new devices right
+# now"; Baileys' fetchLatestBaileysVersion() is the only reliable
+# stay-current option. The Python channel adapter speaks HTTP/SSE to
+# the sidecar on 127.0.0.1:8002 — no Python WhatsApp deps remain.
 
 # Anthropic
 anthropic>=0.30.0
