@@ -342,3 +342,124 @@ async def test_force_orphan_active_orphans_in_flight_lock():
     assert active.status == "aborted_orphan"
     assert active.completed_at is not None
     assert "lock wedged" in (active.notes or "")
+
+
+# ─── signal-based canary observation ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_observe_canary_signal_passes_on_healthy():
+    """Healthy canary: 3+ consecutive 200s, sustained healthy in stability
+    hold → pass. Was: always-elapsed-time wait of canary_wait_minutes."""
+    import httpx
+    from app.services.rollout_service import _observe_canary_signal
+
+    ok = httpx.Response(200, content=b'{"ok":true}')
+
+    class _Client:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url): return ok
+
+    with patch("httpx.AsyncClient", _Client), \
+         patch("asyncio.sleep", AsyncMock()):
+        passed, reason = await _observe_canary_signal(
+            "https://test.local",
+            cap_seconds=2.0, boot_gate_s=1.0, boot_interval_s=0.0,
+            required_ok=3, stability_hold_s=0.5, stability_interval_s=0.0,
+        )
+
+    assert passed, f"healthy canary must pass; got reason={reason}"
+    assert "healthy" in reason
+
+
+@pytest.mark.asyncio
+async def test_observe_canary_signal_fails_when_boot_never_passes():
+    """Canary that never returns 200 within the boot gate must fail — not
+    silently succeed when the cap is wide."""
+    import httpx
+    from app.services.rollout_service import _observe_canary_signal
+
+    bad = httpx.Response(503, content=b"unavailable")
+
+    class _Client:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url): return bad
+
+    with patch("httpx.AsyncClient", _Client), \
+         patch("asyncio.sleep", AsyncMock()):
+        passed, reason = await _observe_canary_signal(
+            "https://test.local",
+            cap_seconds=2.0, boot_gate_s=1.0, boot_interval_s=0.05,
+            required_ok=3, stability_hold_s=0.5, stability_interval_s=0.05,
+        )
+
+    assert not passed
+    assert "boot gate failed" in reason
+
+
+@pytest.mark.asyncio
+async def test_observe_canary_signal_fails_on_post_boot_regression():
+    """Canary boots fine (3 consecutive 200s) then degrades during
+    stability hold. Must fail — without this, a canary that crashes
+    after boot would be promoted before the stability hold catches it."""
+    import httpx
+    from app.services.rollout_service import _observe_canary_signal
+
+    ok = httpx.Response(200, content=b'{"ok":true}')
+    bad = httpx.Response(503, content=b"crashed after boot")
+
+    # First 5 calls return 200 (boot gate passes after the 3rd), then
+    # subsequent calls return 503 (stability hold sees a regression).
+    call_count = {"n": 0}
+
+    class _Client:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url):
+            call_count["n"] += 1
+            return ok if call_count["n"] <= 5 else bad
+
+    with patch("httpx.AsyncClient", _Client), \
+         patch("asyncio.sleep", AsyncMock()):
+        passed, reason = await _observe_canary_signal(
+            "https://test.local",
+            cap_seconds=5.0, boot_gate_s=1.0, boot_interval_s=0.0,
+            required_ok=3, stability_hold_s=2.0, stability_interval_s=0.0,
+        )
+
+    assert not passed
+    assert "stability hold failed" in reason
+
+
+@pytest.mark.asyncio
+async def test_observe_canary_signal_respects_cap_as_hard_deadline():
+    """`cap_seconds` is a hard deadline. With cap=0 (degenerate operator
+    setting), the function must exit immediately rather than burn the
+    full default stability hold. This is what makes
+    `canary_wait_minutes` an upper bound rather than a target."""
+    import httpx
+    from app.services.rollout_service import _observe_canary_signal
+
+    ok = httpx.Response(200, content=b'{"ok":true}')
+
+    class _Client:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url): return ok
+
+    # cap=0 means deadline already passed at function entry. Boot loop's
+    # `while time.time() < boot_deadline` is false on first iteration, so
+    # consecutive_ok stays 0 → returns boot-gate-failed. This proves the
+    # cap is enforced as a hard deadline, not a "best effort" budget.
+    with patch("httpx.AsyncClient", _Client), \
+         patch("asyncio.sleep", AsyncMock()):
+        passed, reason = await _observe_canary_signal("https://t", cap_seconds=0.0)
+
+    assert not passed
+    assert "boot gate failed" in reason

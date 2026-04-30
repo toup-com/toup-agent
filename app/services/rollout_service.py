@@ -131,11 +131,9 @@ async def _agent_url(db: AsyncSession, container: ManagedContainer) -> Optional[
 
 
 async def _poll_health(agent_url: str, attempts: int, interval_s: float) -> int:
-    """Poll <agent_url>/agent/health until 3 consecutive 200s or attempts
-    exhausted. Returns the max consecutive-OK count observed. Used by the
-    canary observation window — longer interval than bridge's internal
-    post-upgrade health check.
-    """
+    """Legacy elapsed-time poll. Kept for any external caller; new code uses
+    `_observe_canary_signal` which short-circuits on real signal instead of
+    burning the full window."""
     consecutive_ok = 0
     best = 0
     logger.info("[POLL_HEALTH] start url=%s attempts=%d interval=%s", agent_url, attempts, interval_s)
@@ -155,6 +153,107 @@ async def _poll_health(agent_url: str, attempts: int, interval_s: float) -> int:
             await asyncio.sleep(interval_s)
     logger.info("[POLL_HEALTH] end best=%d", best)
     return best
+
+
+# Signal-based canary observation — replaces the elapsed-time wait.
+#
+# Rationale: the prior algorithm polled /agent/health for the full
+# canary_wait_minutes (default 10), then promoted if `best_consecutive >= 3`
+# was seen anywhere in the window. After ~30s of healthy boot, the
+# remaining ~9.5 minutes contributed zero signal — they were pure
+# wall-clock buffer hoping a regression manifested. With ~10 tenants, no
+# real traffic hit the canary during that window, so the buffer was
+# theatre.
+#
+# The signal-based approach has two phases:
+#   1. Boot gate: require 3 consecutive 200s within the first 30s.
+#      Failure here = rollback. ~10-15s typical on healthy code.
+#   2. Stability hold: after boot gate passes, watch /agent/health for
+#      another `_CANARY_STABILITY_HOLD_S` seconds. Any non-200 or
+#      exception triggers abort+rollback. ~60s default — long enough
+#      to catch slow crashes, fast enough to not wait pointlessly.
+#
+# Operator-set canary_wait_minutes is treated as a HARD CAP (not target):
+# the observe never runs longer than that. So setting `canary_wait_minutes=30`
+# for a high-risk schema migration extends the cap; default of 5 is fine
+# for routine deploys.
+
+_CANARY_BOOT_GATE_S = 30.0          # consecutive-OK gate must clear in this long
+_CANARY_BOOT_INTERVAL_S = 5.0       # poll cadence during boot gate
+_CANARY_REQUIRED_OK = 3             # consecutive 200s to pass boot gate
+_CANARY_STABILITY_HOLD_S = 60.0     # additional sustained-healthy window
+_CANARY_STABILITY_INTERVAL_S = 10.0 # poll cadence during stability hold
+
+
+async def _observe_canary_signal(
+    agent_url: str,
+    *,
+    cap_seconds: float,
+    boot_gate_s: float = _CANARY_BOOT_GATE_S,
+    boot_interval_s: float = _CANARY_BOOT_INTERVAL_S,
+    required_ok: int = _CANARY_REQUIRED_OK,
+    stability_hold_s: float = _CANARY_STABILITY_HOLD_S,
+    stability_interval_s: float = _CANARY_STABILITY_INTERVAL_S,
+) -> tuple[bool, str]:
+    """Signal-based canary observation. Returns (passed, reason).
+
+    `cap_seconds` is a hard timeout — the function never runs longer than
+    this regardless of boot/stability progress. It's the caller's
+    operator-set safety budget. Boot gate + stability hold defaults sum
+    to ~90s; setting cap_seconds < 90 effectively disables stability hold
+    (acceptable trade-off for ultra-fast deploys).
+
+    The timing parameters default to module constants for production but
+    are injectable so tests can run the full algorithm with tiny windows
+    without burning real wall-clock time.
+    """
+    deadline = time.time() + cap_seconds
+    boot_deadline = min(time.time() + boot_gate_s, deadline)
+    consecutive_ok = 0
+
+    async with httpx.AsyncClient(timeout=10, verify=True) as client:
+        # Phase 1: boot gate — need `required_ok` consecutive 200s.
+        logger.info(
+            "[CANARY-OBSERVE] boot gate: need %d consecutive 200s within %.0fs",
+            required_ok, boot_gate_s,
+        )
+        while time.time() < boot_deadline and consecutive_ok < required_ok:
+            try:
+                r = await client.get(f"{agent_url.rstrip('/')}/agent/health")
+                if r.status_code == 200:
+                    consecutive_ok += 1
+                    logger.info("[CANARY-OBSERVE] boot ok %d/%d", consecutive_ok, required_ok)
+                else:
+                    logger.warning("[CANARY-OBSERVE] boot HTTP %d body=%r", r.status_code, r.text[:100])
+                    consecutive_ok = 0
+            except httpx.HTTPError as e:
+                logger.warning("[CANARY-OBSERVE] boot exception %s: %s", type(e).__name__, str(e)[:200])
+                consecutive_ok = 0
+            if consecutive_ok < required_ok:
+                await asyncio.sleep(boot_interval_s)
+
+        if consecutive_ok < required_ok:
+            return (False, f"boot gate failed: only {consecutive_ok}/{required_ok} consecutive 200s within {boot_gate_s:.0f}s")
+
+        # Phase 2: stability hold — sustained healthy window. Any non-200
+        # or exception during this phase aborts the canary.
+        stability_deadline = min(time.time() + stability_hold_s, deadline)
+        stability_window_s = stability_deadline - time.time()
+        logger.info(
+            "[CANARY-OBSERVE] boot ok; entering %.0fs stability hold",
+            stability_window_s,
+        )
+        while time.time() < stability_deadline:
+            try:
+                r = await client.get(f"{agent_url.rstrip('/')}/agent/health")
+                if r.status_code != 200:
+                    return (False, f"stability hold failed: HTTP {r.status_code} after boot")
+            except httpx.HTTPError as e:
+                return (False, f"stability hold failed: {type(e).__name__}: {str(e)[:200]}")
+            await asyncio.sleep(stability_interval_s)
+
+    elapsed = cap_seconds - max(0.0, deadline - time.time())
+    return (True, f"healthy (boot + stability passed in {elapsed:.0f}s)")
 
 
 # ─── Per-tenant upgrade + rollback ────────────────────────────────
@@ -399,14 +498,20 @@ async def _canary_observe_loop(
     prior_tag: Optional[str],
     agent_url: Optional[str],
 ) -> bool:
-    """Poll the canary's /agent/health until rollout.resume_after, returning
-    True if observation passed (proceed to batch phase) or False if it
-    failed (caller should return early — abort already written by us).
+    """Signal-based canary observation: boot gate (3 consecutive 200s in 30s)
+    + stability hold (sustained healthy for 60s). Operator-set
+    `canary_wait_minutes` is the HARD CAP. Returns True on pass, False on
+    fail (in which case canary has already been rolled back and rollout
+    row marked aborted_canary_failed).
+
+    Typical cap-bounded happy path: ~90 seconds. Was previously always
+    `canary_wait_minutes` (default 10 min) of pure wall-clock burn after
+    the first 3 OKs. The observation now exits as soon as it has the
+    signal it needs.
 
     Idempotent across resumer invocations: reads `resume_after` from the
-    rollout row each call, so picking up after a crash with N seconds
-    remaining is identical to a fresh run. If `resume_after` is in the
-    past (or canary_wait_minutes=0), short-circuits with success.
+    rollout row, computes the remaining cap from there. If `resume_after`
+    is already past or `canary_wait_minutes=0`, short-circuits success.
     """
     if not agent_url or rollout.canary_wait_minutes <= 0:
         return True
@@ -420,32 +525,28 @@ async def _canary_observe_loop(
         )
         return True
 
-    interval_s = 20.0
-    attempts = max(1, int(remaining_s / interval_s))
     logger.info(
-        "[ROLLOUT] %s canary observing for %.0fs remaining (%d polls)",
-        rollout.id, remaining_s, attempts,
+        "[ROLLOUT] %s canary signal-based observe (cap=%.0fs)",
+        rollout.id, remaining_s,
     )
-    best_consecutive = await _poll_health(agent_url, attempts=attempts, interval_s=interval_s)
-    if best_consecutive < 3:
-        logger.warning(
-            "[ROLLOUT] %s canary degraded during observation (best=%d)",
-            rollout.id, best_consecutive,
-        )
-        await _upgrade_one(db, rollout, canary, prior_tag)
-        rollout.status = "aborted_canary_failed"
-        rollout.completed_at = datetime.utcnow()
-        rollout.phase = ""
-        rollout.resume_after = None
-        rollout.notes = f"canary degraded during {rollout.canary_wait_minutes}-min observation"
-        await db.commit()
-        await _send_telegram(
-            "critical",
-            f"Rollout <code>{rollout.image_tag}</code> aborted — canary degraded "
-            f"during {rollout.canary_wait_minutes}-min observation window",
-        )
-        return False
-    return True
+    passed, reason = await _observe_canary_signal(agent_url, cap_seconds=remaining_s)
+    if passed:
+        logger.info("[ROLLOUT] %s canary %s", rollout.id, reason)
+        return True
+
+    logger.warning("[ROLLOUT] %s canary failed observation: %s", rollout.id, reason)
+    await _upgrade_one(db, rollout, canary, prior_tag)
+    rollout.status = "aborted_canary_failed"
+    rollout.completed_at = datetime.utcnow()
+    rollout.phase = ""
+    rollout.resume_after = None
+    rollout.notes = f"canary observation failed: {reason}"
+    await db.commit()
+    await _send_telegram(
+        "critical",
+        f"Rollout <code>{rollout.image_tag}</code> aborted — canary failed: {reason}",
+    )
+    return False
 
 
 # In-flight resume tracking so the reconciler tick doesn't double-fire when
@@ -455,10 +556,11 @@ async def _canary_observe_loop(
 _resume_inflight: set[str] = set()
 
 
-# Stuck-rollout threshold. canary_wait_minutes (default 10) + ~5 min for
-# canary upgrade + ~3 min for batch = 18 min worst-case happy path. We use
-# 30 min as the auto-orphan trigger to absorb slow bridge calls without
-# false-positiving a real successful rollout.
+# Stuck-rollout threshold. With signal-based canary observation
+# (typical ~90s) + ~30s canary upgrade + <1 min batch, worst-case happy
+# path is well under 5 min. The 30-min threshold absorbs slow bridge
+# calls and operator-extended canary windows (canary_wait_minutes can
+# be set up to 60), and won't false-positive any legitimate rollout.
 _STUCK_ROLLOUT_THRESHOLD_MIN = 30
 
 # Pending-rollout threshold — much shorter than the running threshold. A

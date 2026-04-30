@@ -330,7 +330,12 @@ class Settings(BaseSettings):
 
     # ── Rollout pipeline (Phase 3) ────────────────────────────────
     rollout_secret: str = ""                # Shared secret CI → platform webhook (X-Rollout-Secret)
-    rollout_canary_wait_minutes_default: int = 10
+    # Hard cap (NOT target) on canary observation duration. The observe
+    # loop is signal-based: it exits as soon as boot gate + stability hold
+    # pass (~90s on healthy code). This setting is the upper bound — set
+    # higher for high-risk migrations to extend the safety budget. 5 min
+    # comfortably covers the ~90s happy path with margin for slow boots.
+    rollout_canary_wait_minutes_default: int = 5
     rollout_batch_size: int = 5             # Post-canary parallel upgrades per batch
     infra_alert_telegram_token: str = ""    # Dedicated infra bot (split from admin_alert_*)
     infra_alert_telegram_chat_id: str = ""
