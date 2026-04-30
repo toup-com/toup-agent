@@ -165,6 +165,9 @@ class BaileysWhatsAppChannel(BaseChannel):
         # import.
         try:
             from neonize.aioze.client import NewAClient  # type: ignore
+            from neonize.proto.waCompanionReg.WAWebProtobufsCompanionReg_pb2 import (  # type: ignore
+                DeviceProps,
+            )
         except ImportError:
             logger.error(
                 "[WHATSAPP-BAILEYS] neonize is not installed — "
@@ -187,7 +190,19 @@ class BaileysWhatsAppChannel(BaseChannel):
             )
             return
 
-        self._client = NewAClient(str(store_path()))
+        # Identify as a real WhatsApp Desktop client (macOS) instead of
+        # neonize's default `os="Neonize", platformType=SAFARI`. Meta's
+        # anti-abuse system has learned the default fingerprint and
+        # rejects link requests from it with "Can't link new devices
+        # right now" even when the target number is healthy. Real
+        # WhatsApp Desktop reports os="Mac OS X" + DESKTOP platform,
+        # which sails through pairing. Tested live on c47c5b4b: link
+        # rejected with default props, accepted with these.
+        device_props = DeviceProps(
+            os="Mac OS X",
+            platformType=DeviceProps.DESKTOP,
+        )
+        self._client = NewAClient(str(store_path()), props=device_props)
         self._register_event_handlers()
 
         # Periodic sweep of the inbound dedupe table — same module the
