@@ -463,3 +463,116 @@ async def test_observe_canary_signal_respects_cap_as_hard_deadline():
 
     assert not passed
     assert "boot gate failed" in reason
+
+
+# ─── heartbeat-based orphan detection ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphans_running_with_stale_heartbeat():
+    """The heartbeat fix: a `running` rollout whose `last_progress_at` is
+    older than _STUCK_HEARTBEAT_MIN must be orphaned regardless of total
+    age. Catches the rapid-redeploy case where each new platform-api
+    boot kills the previous orchestrator before it can complete."""
+    from datetime import datetime, timedelta
+    from app.services.rollout_service import (
+        _reconcile_once_in_session, _STUCK_HEARTBEAT_MIN,
+    )
+    from app.db.models import Rollout
+
+    stuck = Rollout(
+        id="hb-stale-1",
+        image_tag="ghcr.io/toup-com/toup-agent:abcd1234",
+        status="running",
+        phase="canary_observing",
+        trigger="ci",
+        started_at=datetime.utcnow() - timedelta(minutes=10),  # under 30-min total
+        last_progress_at=datetime.utcnow() - timedelta(minutes=_STUCK_HEARTBEAT_MIN + 1),
+    )
+
+    db = MagicMock()
+    mock_result = MagicMock()
+    mock_result.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[stuck])))
+    db.execute = AsyncMock(return_value=mock_result)
+    db.commit = AsyncMock()
+
+    with patch("app.services.rollout_service._send_telegram", AsyncMock()):
+        await _reconcile_once_in_session(db)
+
+    assert stuck.status == "aborted_orphan", (
+        "stale-heartbeat running rollout must be orphaned"
+    )
+    assert stuck.completed_at is not None
+    assert "heartbeat stale" in (stuck.notes or "")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_running_with_fresh_heartbeat():
+    """Fresh heartbeat means the orchestrator is making progress. The
+    heartbeat path must NOT orphan it just because the rollout is
+    several minutes old (e.g. genuine canary observation in progress)."""
+    from datetime import datetime, timedelta
+    from app.services.rollout_service import _reconcile_once_in_session
+    from app.db.models import Rollout
+
+    healthy = Rollout(
+        id="hb-fresh-1",
+        image_tag="ghcr.io/toup-com/toup-agent:abcd1234",
+        status="running",
+        phase="batching",
+        trigger="ci",
+        started_at=datetime.utcnow() - timedelta(minutes=2),
+        last_progress_at=datetime.utcnow() - timedelta(seconds=10),
+    )
+
+    db = MagicMock()
+    mock_result = MagicMock()
+    mock_result.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[healthy])))
+    db.execute = AsyncMock(return_value=mock_result)
+    db.commit = AsyncMock()
+
+    with patch("app.services.rollout_service._send_telegram", AsyncMock()):
+        await _reconcile_once_in_session(db)
+
+    # Heartbeat path runs FIRST in the reconciler. With fresh heartbeat
+    # it must skip — and total-age (2 min) is also under the threshold,
+    # so the rollout stays running. Phase != canary_observing means
+    # the resume path also skips. Net: status unchanged.
+    assert healthy.status == "running", "fresh-heartbeat row must not be orphaned"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_falls_back_to_started_at_when_heartbeat_null():
+    """Backward compat: rows created before `last_progress_at` column
+    existed have NULL heartbeat. Reconciler must fall back to
+    `started_at` so old stuck rows still get orphaned (NULL → infinite
+    idle would be a footgun, but NULL → fresh would never orphan
+    legacy state — neither is right; falling back to started_at is
+    the only safe choice)."""
+    from datetime import datetime, timedelta
+    from app.services.rollout_service import (
+        _reconcile_once_in_session, _STUCK_HEARTBEAT_MIN,
+    )
+    from app.db.models import Rollout
+
+    legacy = Rollout(
+        id="legacy-null-1",
+        image_tag="ghcr.io/toup-com/toup-agent:legacy",
+        status="running",
+        phase="canary_observing",
+        trigger="ci",
+        started_at=datetime.utcnow() - timedelta(minutes=_STUCK_HEARTBEAT_MIN + 1),
+        last_progress_at=None,
+    )
+
+    db = MagicMock()
+    mock_result = MagicMock()
+    mock_result.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[legacy])))
+    db.execute = AsyncMock(return_value=mock_result)
+    db.commit = AsyncMock()
+
+    with patch("app.services.rollout_service._send_telegram", AsyncMock()):
+        await _reconcile_once_in_session(db)
+
+    assert legacy.status == "aborted_orphan"
+    assert "heartbeat stale" in (legacy.notes or "")

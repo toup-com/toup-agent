@@ -100,6 +100,21 @@ class Rollout(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # Heartbeat — stamped by the orchestrator at every state transition.
+    # The reconciler orphans rollouts whose heartbeat is older than
+    # `_STUCK_HEARTBEAT_MIN`, regardless of total age. Without this, a
+    # rollout whose orchestrator gets killed mid-canary-observe by a
+    # Railway redeploy would sit "running" until the 30-min total-age
+    # fallback. Heartbeat tightens that to ~3 min and works correctly
+    # even under rapid-redeploy churn (multiple commits in quick
+    # succession on main).
+    #
+    # NULL on rows created before this column existed; the reconciler
+    # falls back to `started_at` when reading.
+    last_progress_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+    )
+
     # Free-form operator notes; reason for manual rollouts, aborted cause, etc.
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

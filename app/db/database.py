@@ -309,6 +309,16 @@ async def init_db():
         # (see rollout_service.resume_orphaned_rollouts).
         "ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS phase VARCHAR(32) NOT NULL DEFAULT ''",
         "ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS resume_after TIMESTAMP",
+        # Heartbeat for stuck-rollout detection: reconciler orphans
+        # rollouts with no progress in N min, regardless of total age.
+        # Catches the "Railway redeploys keep killing the orchestrator"
+        # case that the 30-min total-age fallback was too slow for.
+        "ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMP",
+        "CREATE INDEX IF NOT EXISTS ix_rollouts_last_progress_at ON rollouts (last_progress_at)",
+        # Backfill: set last_progress_at = started_at on existing rows
+        # so the threshold check treats them consistently until they
+        # pick up real heartbeats from new orchestrator activity.
+        "UPDATE rollouts SET last_progress_at = started_at WHERE last_progress_at IS NULL",
         # User-selectable LLM provider for bundle mode (anthropic | openai).
         # See model_router.classify_request — overrides the bundle default.
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS preferred_provider VARCHAR(20) NOT NULL DEFAULT 'anthropic'",

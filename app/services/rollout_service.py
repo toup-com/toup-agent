@@ -365,6 +365,7 @@ async def _run_rollout_task(rollout_id: str) -> None:
             return
 
         rollout.status = "running"
+        rollout.last_progress_at = datetime.utcnow()
         await db.commit()
 
         await _send_telegram(
@@ -381,6 +382,7 @@ async def _run_rollout_task(rollout_id: str) -> None:
             logger.exception("[ROLLOUT] id=%s crashed: %s", rollout_id, e)
             rollout.status = "complete"
             rollout.completed_at = datetime.utcnow()
+            rollout.last_progress_at = datetime.utcnow()
             rollout.notes = (rollout.notes or "") + f"\nORCHESTRATOR CRASH: {type(e).__name__}: {str(e)[:500]}"
             await db.commit()
             await _send_telegram(
@@ -397,6 +399,7 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
     if not tenants:
         rollout.status = "complete"
         rollout.completed_at = datetime.utcnow()
+        rollout.last_progress_at = datetime.utcnow()
         rollout.notes = "no running tenants; nothing to do"
         await db.commit()
         await _send_telegram("info", f"Rollout <code>{rollout.image_tag}</code>: no tenants to upgrade")
@@ -406,6 +409,7 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
     if not canary:
         rollout.status = "aborted_canary_failed"
         rollout.completed_at = datetime.utcnow()
+        rollout.last_progress_at = datetime.utcnow()
         rollout.notes = "no user with is_canary=TRUE in the running set; rollout refuses to proceed"
         await db.commit()
         await _send_telegram(
@@ -417,6 +421,7 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
 
     rollout.canary_prefix = canary.user_id[:8]
     rollout.phase = "canary_upgrading"
+    rollout.last_progress_at = datetime.utcnow()
     await db.commit()
 
     # ── Phase A: upgrade canary ────────────────────────────────────
@@ -427,6 +432,7 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
         # Canary upgrade failed (and was rolled back, or rollback also failed)
         rollout.status = "aborted_canary_failed"
         rollout.completed_at = datetime.utcnow()
+        rollout.last_progress_at = datetime.utcnow()
         rollout.phase = ""
         rollout.notes = f"canary {canary.user_id[:8]} status={canary_attempt.status}: {canary_attempt.error}"
         await db.commit()
@@ -445,6 +451,7 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
     if rollout.canary_wait_minutes > 0:
         rollout.phase = "canary_observing"
         rollout.resume_after = datetime.utcnow() + timedelta(minutes=rollout.canary_wait_minutes)
+        rollout.last_progress_at = datetime.utcnow()
         await db.commit()
 
     agent_url = await _agent_url(db, canary)
@@ -454,6 +461,7 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
 
     rollout.phase = "batching"
     rollout.resume_after = None
+    rollout.last_progress_at = datetime.utcnow()
     await db.commit()
 
     await _send_telegram(
@@ -475,9 +483,15 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
                 total_ok += 1
             else:
                 total_fail += 1
+        # Heartbeat after each batch so a stuck mid-batch sequence is
+        # detected by the reconciler within minutes, not at the 30-min
+        # total-age fallback.
+        rollout.last_progress_at = datetime.utcnow()
+        await db.commit()
 
     rollout.status = "complete"
     rollout.completed_at = datetime.utcnow()
+    rollout.last_progress_at = datetime.utcnow()
     rollout.phase = ""
     rollout.resume_after = None
     rollout.notes = f"completed: {total_ok} ok, {total_fail} failed/rolled-back of {len(tenants)} total"
@@ -538,6 +552,7 @@ async def _canary_observe_loop(
     await _upgrade_one(db, rollout, canary, prior_tag)
     rollout.status = "aborted_canary_failed"
     rollout.completed_at = datetime.utcnow()
+    rollout.last_progress_at = datetime.utcnow()
     rollout.phase = ""
     rollout.resume_after = None
     rollout.notes = f"canary observation failed: {reason}"
@@ -569,6 +584,43 @@ _STUCK_ROLLOUT_THRESHOLD_MIN = 30
 # scheduler is supposed to fire within seconds; 5 min is a generous SLA
 # that won't false-positive a healthy startup.
 _STUCK_PENDING_THRESHOLD_MIN = 5
+
+# Heartbeat threshold — orphan if `last_progress_at` is older than this,
+# regardless of total age. The orchestrator stamps `last_progress_at` at
+# every state transition; if no stamp lands for 3 min, the orchestrator
+# is dead (typically: Railway redeploy killed it). This is the primary
+# stuck-rollout detection; the 30-min total-age threshold remains as a
+# fallback for the case where heartbeat itself somehow isn't updating
+# (e.g. orchestrator hung between state changes during a long single
+# operation).
+#
+# 3 min is sized against the actual operations:
+#   - Boot gate: 30s
+#   - Stability hold: 60s (heartbeat stamps once at start, once at end)
+#   - Per-batch: <30s (heartbeat stamps after each batch)
+# So normal operation never has a >2-min gap between heartbeats. 3 min
+# adds a buffer for slow bridge calls without false-positiving.
+_STUCK_HEARTBEAT_MIN = 3
+
+
+async def _stamp_progress(db: AsyncSession, rollout: Rollout) -> None:
+    """Update the rollout's heartbeat. Call after every state transition.
+
+    Use ALONGSIDE existing field updates: we set last_progress_at on
+    `rollout`, and the caller's `await db.commit()` flushes both fields
+    in one transaction. We only commit here ourselves when the caller
+    has nothing else to commit (use `_stamp_progress_and_commit` for
+    that path).
+    """
+    rollout.last_progress_at = datetime.utcnow()
+
+
+async def _stamp_progress_and_commit(db: AsyncSession, rollout: Rollout) -> None:
+    """Stamp + commit. Use when there are no other field changes to flush
+    (i.e. the orchestrator wants to refresh the heartbeat without
+    advancing state)."""
+    rollout.last_progress_at = datetime.utcnow()
+    await db.commit()
 
 
 async def rollout_reconciler_loop() -> None:
@@ -642,6 +694,37 @@ async def _reconcile_once_in_session(db: AsyncSession) -> None:
 
     for rollout in inflight:
         age_min = (now - rollout.started_at).total_seconds() / 60 if rollout.started_at else 0
+        # Heartbeat — fall back to started_at for rows created before the
+        # last_progress_at column existed (or rolled over from a backfill).
+        last_progress = rollout.last_progress_at or rollout.started_at
+        idle_min = (now - last_progress).total_seconds() / 60 if last_progress else 0
+
+        # (0) Heartbeat-stale orphan — orchestrator hasn't stamped progress
+        # in `_STUCK_HEARTBEAT_MIN` minutes. Catches the rapid-redeploy case
+        # where each new platform-api boot kills the previous orchestrator
+        # before it can complete. Only applies once a `running` rollout has
+        # had a chance to make at least one heartbeat — pending rollouts
+        # are handled by their own threshold below.
+        if rollout.status == "running" and idle_min > _STUCK_HEARTBEAT_MIN:
+            logger.warning(
+                "[ROLLOUT-RECONCILER] auto-orphaning %s (idle=%.1fmin, age=%.1fmin, phase=%r)",
+                rollout.id, idle_min, age_min, rollout.phase,
+            )
+            rollout.status = "aborted_orphan"
+            rollout.completed_at = now
+            rollout.notes = (rollout.notes or "") + (
+                f"\nAuto-orphaned by reconciler — heartbeat stale "
+                f"({idle_min:.1f}min idle, age={age_min:.1f}min, "
+                f"phase={rollout.phase!r}, threshold={_STUCK_HEARTBEAT_MIN}min)"
+            )
+            await db.commit()
+            await _send_telegram(
+                "warning",
+                f"Rollout <code>{rollout.image_tag}</code> auto-orphaned "
+                f"(no progress in {idle_min:.0f}min, phase={rollout.phase!r}). "
+                f"Re-trigger if still needed.",
+            )
+            continue
 
         # (1) `pending` orphan path — the row was created but the
         # APScheduler one-shot never fired. Short threshold (5 min): the
@@ -772,6 +855,7 @@ async def _resume_rollout_task(rollout_id: str) -> None:
         if not canary:
             rollout.status = "aborted_orphan"
             rollout.completed_at = datetime.utcnow()
+            rollout.last_progress_at = datetime.utcnow()
             rollout.notes = (rollout.notes or "") + "\nResumer: canary container not found"
             await db.commit()
             return
@@ -790,6 +874,7 @@ async def _resume_rollout_task(rollout_id: str) -> None:
 
         rollout.phase = "batching"
         rollout.resume_after = None
+        rollout.last_progress_at = datetime.utcnow()
         await db.commit()
         await _send_telegram(
             "info",
@@ -812,9 +897,13 @@ async def _resume_rollout_task(rollout_id: str) -> None:
                     total_ok += 1
                 else:
                     total_fail += 1
+            # Heartbeat after each batch — same rationale as _drive_rollout.
+            rollout.last_progress_at = datetime.utcnow()
+            await db.commit()
 
         rollout.status = "complete"
         rollout.completed_at = datetime.utcnow()
+        rollout.last_progress_at = datetime.utcnow()
         rollout.phase = ""
         rollout.resume_after = None
         rollout.notes = (
@@ -876,6 +965,7 @@ async def start_rollout(
         triggered_by=triggered_by,
         canary_wait_minutes=wait_min,
         notes=notes,
+        last_progress_at=datetime.utcnow(),
     )
     db.add(rollout)
     await db.commit()
@@ -914,6 +1004,7 @@ async def force_orphan_active(db: AsyncSession, reason: str = "operator force-or
     age_min = (datetime.utcnow() - active.started_at).total_seconds() / 60 if active.started_at else 0
     active.status = "aborted_orphan"
     active.completed_at = datetime.utcnow()
+    active.last_progress_at = datetime.utcnow()
     active.notes = (active.notes or "") + f"\nForce-orphaned by operator: {reason} (age={age_min:.1f}min)"
     await db.commit()
     await _send_telegram(
@@ -941,6 +1032,7 @@ async def cancel_rollout(db: AsyncSession, rollout_id: str) -> Optional[Rollout]
         return rollout
     rollout.status = "cancelled"
     rollout.completed_at = datetime.utcnow()
+    rollout.last_progress_at = datetime.utcnow()
     rollout.notes = (rollout.notes or "") + "\ncancelled by operator"
     await db.commit()
     # Note: we don't kill the APScheduler job directly. The _drive_rollout
