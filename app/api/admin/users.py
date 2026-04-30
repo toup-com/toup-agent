@@ -561,22 +561,149 @@ async def get_usage_overview(
 
         user_usage_list.append(user_entry)
 
+    # ── Revenue + ROI ─────────────────────────────────────────────
+    # Per-user revenue from Stripe paid invoices on the user's customer.
+    # `bundle_status`, `bundle_currency`, `subscription_id` shipped on each
+    # row so the frontend can show the right labels / health indicators
+    # without a second roundtrip. Manual users contribute $0 — that's the
+    # truthful number; they're not paying us.
+    from app.services.stripe_service import sum_invoice_revenue_for_customer
+
+    # Bulk-load each user's bundle config + customer id once. agent_configs
+    # rows are 1:1 with users; if a user has none they're flagged as no-bundle.
+    cfg_rows = (
+        await db.execute(
+            select(
+                AgentConfig.user_id,
+                AgentConfig.bundle_status,
+                AgentConfig.bundle_stripe_subscription_id,
+            )
+        )
+    ).all()
+    cfg_by_user: dict[str, dict] = {
+        row.user_id: {
+            "bundle_status": row.bundle_status or "none",
+            "subscription_id": row.bundle_stripe_subscription_id,
+        }
+        for row in cfg_rows
+    }
+
+    since_30d_unix = int(periods["30d"].timestamp())
+    since_all_unix = int(periods["all"].timestamp())
+
+    # Revenue lookups are network calls; they share the run loop so we'd
+    # rather not block the whole endpoint on Stripe latency. Run them in
+    # parallel — Stripe's rate limit is ~100 req/s/account so 9 users is
+    # comfortably fine.
+    import asyncio
+    user_id_to_record = {u.id: u for u in all_users}
+
+    async def _revenue_for_user(uid: str) -> dict:
+        u = user_id_to_record.get(uid)
+        cfg = cfg_by_user.get(uid, {})
+        if not u or not u.stripe_customer_id:
+            return {
+                "user_id": uid,
+                "revenue_30d": 0.0,
+                "revenue_all": 0.0,
+                "currency_30d": {},
+                "currency_all": {},
+                "bundle_status": cfg.get("bundle_status", "none"),
+                "subscription_id": cfg.get("subscription_id"),
+            }
+        # Off-load the sync Stripe SDK calls to a thread so we don't block
+        # the event loop. Two calls: one for 30d, one for all-time.
+        rev_30d = await asyncio.to_thread(
+            sum_invoice_revenue_for_customer, u.stripe_customer_id, since_30d_unix
+        )
+        rev_all = await asyncio.to_thread(
+            sum_invoice_revenue_for_customer, u.stripe_customer_id, since_all_unix
+        )
+        return {
+            "user_id": uid,
+            "revenue_30d": rev_30d["total_usd"],
+            "revenue_all": rev_all["total_usd"],
+            "currency_30d": rev_30d["currency_breakdown"],
+            "currency_all": rev_all["currency_breakdown"],
+            "bundle_status": cfg.get("bundle_status", "none"),
+            "subscription_id": cfg.get("subscription_id"),
+        }
+
+    revenue_results = await asyncio.gather(
+        *(_revenue_for_user(u.id) for u in all_users),
+        return_exceptions=False,
+    )
+    rev_by_user = {r["user_id"]: r for r in revenue_results}
+
+    # Decorate each user row with revenue + margin.
+    for entry in user_usage_list:
+        rev = rev_by_user.get(entry["user_id"], {})
+        cost_30d = entry.get("total_cost_30d", 0.0)
+        cost_all = entry.get("total_cost_all", 0.0)
+        rev_30d = rev.get("revenue_30d", 0.0)
+        rev_all = rev.get("revenue_all", 0.0)
+        entry["revenue_30d"] = rev_30d
+        entry["revenue_all"] = rev_all
+        entry["margin_30d"] = round(rev_30d - cost_30d, 4)
+        entry["margin_all"] = round(rev_all - cost_all, 4)
+        # Margin pct as fraction of revenue (None when revenue=0 to avoid div/0).
+        entry["margin_pct_30d"] = (
+            round((rev_30d - cost_30d) / rev_30d * 100, 1) if rev_30d > 0 else None
+        )
+        entry["margin_pct_all"] = (
+            round((rev_all - cost_all) / rev_all * 100, 1) if rev_all > 0 else None
+        )
+        entry["bundle_status"] = rev.get("bundle_status", "none")
+        entry["subscription_id"] = rev.get("subscription_id")
+        entry["currency_breakdown_30d"] = rev.get("currency_30d", {})
+        entry["currency_breakdown_all"] = rev.get("currency_all", {})
+
     # Aggregate totals
     agg_tokens_30d = sum(u.get("total_tokens_30d", 0) for u in user_usage_list)
     agg_cost_30d = round(sum(u.get("total_cost_30d", 0) for u in user_usage_list), 4)
     agg_reqs_30d = sum(u.get("total_requests_30d", 0) for u in user_usage_list)
+    agg_revenue_30d = round(sum(u.get("revenue_30d", 0.0) for u in user_usage_list), 4)
+    agg_margin_30d = round(agg_revenue_30d - agg_cost_30d, 4)
+    agg_margin_pct_30d = (
+        round(agg_margin_30d / agg_revenue_30d * 100, 1) if agg_revenue_30d > 0 else None
+    )
+
     agg_tokens_all = sum(u.get("total_tokens_all", 0) for u in user_usage_list)
     agg_cost_all = round(sum(u.get("total_cost_all", 0) for u in user_usage_list), 4)
     agg_reqs_all = sum(u.get("total_requests_all", 0) for u in user_usage_list)
+    agg_revenue_all = round(sum(u.get("revenue_all", 0.0) for u in user_usage_list), 4)
+    agg_margin_all = round(agg_revenue_all - agg_cost_all, 4)
+    agg_margin_pct_all = (
+        round(agg_margin_all / agg_revenue_all * 100, 1) if agg_revenue_all > 0 else None
+    )
+
+    # Counts of users in each bundle bucket — for quick at-a-glance health.
+    paying_users = sum(1 for u in user_usage_list if u.get("bundle_status") == "active")
+    free_users = sum(1 for u in user_usage_list if u.get("bundle_status") in (None, "none"))
+    cancelling_users = sum(1 for u in user_usage_list if u.get("bundle_status") == "cancelling")
+    losing_money_users = sum(
+        1 for u in user_usage_list if u.get("margin_30d", 0.0) < 0
+    )
 
     return {
         "aggregate": {
             "total_tokens_30d": agg_tokens_30d,
             "total_cost_30d": agg_cost_30d,
             "total_requests_30d": agg_reqs_30d,
+            "total_revenue_30d": agg_revenue_30d,
+            "total_margin_30d": agg_margin_30d,
+            "margin_pct_30d": agg_margin_pct_30d,
             "total_tokens_all": agg_tokens_all,
             "total_cost_all": agg_cost_all,
             "total_requests_all": agg_reqs_all,
+            "total_revenue_all": agg_revenue_all,
+            "total_margin_all": agg_margin_all,
+            "margin_pct_all": agg_margin_pct_all,
+            "paying_users": paying_users,
+            "free_users": free_users,
+            "cancelling_users": cancelling_users,
+            "losing_money_users": losing_money_users,
+            "total_users": len(user_usage_list),
         },
         "users": sorted(user_usage_list, key=lambda u: u.get("total_tokens_30d", 0), reverse=True),
     }

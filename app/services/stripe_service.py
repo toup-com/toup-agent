@@ -372,3 +372,47 @@ def verify_webhook(payload: bytes, sig_header: str) -> Optional[dict]:
     except Exception as exc:
         logger.exception("Error parsing Stripe webhook payload: %s", exc)
         return None
+
+
+# ── Revenue aggregation (admin ROI dashboard) ──────────────────────
+
+
+def sum_invoice_revenue_for_customer(customer_id: str, since_unix: int) -> dict:
+    """Sum paid invoice revenue for a Stripe customer since `since_unix`.
+
+    Returns a dict with `total_usd` (float, rounded to 4 dp) and `currency_breakdown`
+    keyed by ISO currency code. Currency normalization to USD is intentionally
+    skipped — admin dashboard surfaces the per-currency split so mixed-region
+    revenue (e.g. CAD payments alongside USD) doesn't get silently lossy-converted.
+
+    For ROI math we use the USD-major bucket; CAD revenue is reported separately
+    so the admin can apply their own FX rate. (Toup's pricing is USD-anchored;
+    CAD is just a localized display of the same product.)
+
+    Returns {"total_usd": 0.0, "currency_breakdown": {}} on any error so the
+    caller never has to handle exceptions — admin overview must not 500
+    just because Stripe is briefly unreachable.
+    """
+    if not settings.stripe_secret_key or not customer_id:
+        return {"total_usd": 0.0, "currency_breakdown": {}}
+    try:
+        breakdown: dict[str, float] = {}
+        # Stripe paginates at 100/page. For our scale (≤1k invoices/customer),
+        # one page is plenty; the auto_paging_iter handles edge cases anyway.
+        invoices = stripe.Invoice.list(
+            customer=customer_id,
+            status="paid",
+            created={"gte": since_unix},
+            limit=100,
+            api_key=settings.stripe_secret_key,
+        )
+        for inv in invoices.auto_paging_iter():
+            currency = (inv.get("currency") or "usd").lower()
+            paid_minor = inv.get("amount_paid") or 0  # cents
+            breakdown[currency] = round(breakdown.get(currency, 0.0) + paid_minor / 100.0, 4)
+        # USD-major bucket (CAD reported separately for admin's FX call).
+        total_usd = breakdown.get("usd", 0.0)
+        return {"total_usd": total_usd, "currency_breakdown": breakdown}
+    except Exception as exc:
+        logger.warning("Stripe invoice list failed for %s: %s", customer_id, exc)
+        return {"total_usd": 0.0, "currency_breakdown": {}}
