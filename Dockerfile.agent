@@ -34,6 +34,10 @@ RUN apt-get update && apt-get install -y \
     libreoffice-core \
     libreoffice-writer \
     libreoffice-impress \
+    # libmagic — required by python-magic, which neonize imports at module load.
+    # Without it, `import neonize` raises ImportError and /agent/health reports
+    # qr_supported=false even though the wheel is installed.
+    libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20 — needed for Expo project scaffolding and preview servers
