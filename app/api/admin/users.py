@@ -377,28 +377,89 @@ async def get_user_usage(
 
 
 _COST_KEYS = ["anthropic_max", "openai_fixed", "vps", "railway", "other"]
+_SUPPORTED_CURRENCIES = {"USD", "CAD"}
 
 
-async def _get_platform_cost(db: AsyncSession, key: str) -> float:
-    """Read a single cost from DB; fall back to settings.platform_cost_*."""
+async def _get_fx_rate(db: AsyncSession) -> float:
+    """CAD→USD rate. Stored as a platform setting; defaults to ~0.73 (1 USD ≈ 1.36 CAD).
+    Admin can update via PUT /admin/platform-costs body.fx_cad_to_usd."""
     from app.db.models import PlatformSetting
-    from app.config import settings as _s
-
-    db_key = f"cost.{key}"
-    row = await db.execute(select(PlatformSetting).where(PlatformSetting.key == db_key))
+    row = await db.execute(select(PlatformSetting).where(PlatformSetting.key == "fx.cad_to_usd"))
     setting = row.scalar_one_or_none()
     if setting:
         try:
             return float(setting.value)
         except ValueError:
             pass
-    # Fallback to env default
+    return 0.73  # current ~ as of 2026-04
+
+
+def _to_usd(amount: float, currency: str, fx_cad_to_usd: float) -> float:
+    """Convert a native amount to USD. Unknown currencies pass through (assumed USD)."""
+    if currency == "CAD":
+        return round(amount * fx_cad_to_usd, 4)
+    return round(amount, 4)
+
+
+async def _get_platform_cost(db: AsyncSession, key: str, fx_cad_to_usd: float) -> dict:
+    """Read a single cost from DB; fall back to settings.platform_cost_*.
+
+    Returns: {value: float, currency: str, value_usd: float, source: str}
+    where `source` is 'db' (admin saved) or 'env_default' (still on the
+    deploy-time default).
+
+    Storage format is JSON: {"value": 71.39, "currency": "USD"}. Legacy rows
+    stored as a bare number string are read as USD for backwards compat.
+    """
+    from app.db.models import PlatformSetting
+    from app.config import settings as _s
+    import json as _json
+
+    db_key = f"cost.{key}"
+    row = await db.execute(select(PlatformSetting).where(PlatformSetting.key == db_key))
+    setting = row.scalar_one_or_none()
+    if setting:
+        value = 0.0
+        currency = "USD"
+        raw = setting.value or ""
+        # Try JSON first; fall back to plain-number (legacy pre-currency rows).
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, dict):
+                value = float(parsed.get("value", 0.0))
+                currency = str(parsed.get("currency", "USD")).upper()
+            elif isinstance(parsed, (int, float)):
+                # Legacy: just `71.39`. Treat as USD.
+                value = float(parsed)
+                currency = "USD"
+            else:
+                value = 0.0
+                currency = "USD"
+        except (ValueError, _json.JSONDecodeError):
+            try:
+                value = float(raw)
+                currency = "USD"
+            except ValueError:
+                pass
+        if currency not in _SUPPORTED_CURRENCIES:
+            currency = "USD"
+        return {
+            "value": value,
+            "currency": currency,
+            "value_usd": _to_usd(value, currency, fx_cad_to_usd),
+            "source": "db",
+        }
+    # Fallback to env default (always treated as USD)
     env_attr = f"platform_cost_{key if key != 'openai_fixed' else 'openai'}_monthly_usd"
-    return float(getattr(_s, env_attr, 0.0))
+    value = float(getattr(_s, env_attr, 0.0))
+    return {"value": value, "currency": "USD", "value_usd": value, "source": "env_default"}
 
 
-async def _get_all_platform_costs(db: AsyncSession) -> dict[str, float]:
-    return {k: await _get_platform_cost(db, k) for k in _COST_KEYS}
+async def _get_all_platform_costs(db: AsyncSession) -> dict:
+    fx = await _get_fx_rate(db)
+    rows = {k: await _get_platform_cost(db, k, fx) for k in _COST_KEYS}
+    total_usd = round(sum(r["value_usd"] for r in rows.values()), 4)
+    return {"costs": rows, "fx_cad_to_usd": fx, "total_usd": total_usd}
 
 
 @router.get("/platform-costs")
@@ -406,22 +467,29 @@ async def get_platform_costs(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get current monthly platform costs. Reads DB-saved values, falling
-    back to env-var defaults from settings.platform_cost_*_monthly_usd."""
-    costs = await _get_all_platform_costs(db)
-    return {
-        "costs": costs,
-        "total": round(sum(costs.values()), 4),
-    }
+    """Get current monthly platform costs with currency.
+
+    Each cost line returns native value + currency + USD-converted value, so
+    the admin UI can show both "what you actually pay" (e.g. $215 CAD for
+    Anthropic Max) and "USD-equivalent for P&L math" (~$158 USD).
+    """
+    return await _get_all_platform_costs(db)
+
+
+class CostLine(BaseModel):
+    """One cost edit. Either send `value` alone (currency unchanged) or both."""
+    value: float = Field(..., ge=0)
+    currency: Optional[str] = Field(None, pattern="^(USD|CAD)$")
 
 
 class PlatformCostsUpdate(BaseModel):
     """Partial-update payload — only present keys are written."""
-    anthropic_max: Optional[float] = None
-    openai_fixed: Optional[float] = None
-    vps: Optional[float] = None
-    railway: Optional[float] = None
-    other: Optional[float] = None
+    anthropic_max: Optional[CostLine] = None
+    openai_fixed: Optional[CostLine] = None
+    vps: Optional[CostLine] = None
+    railway: Optional[CostLine] = None
+    other: Optional[CostLine] = None
+    fx_cad_to_usd: Optional[float] = Field(None, gt=0, lt=10)
 
 
 @router.put("/platform-costs")
@@ -430,35 +498,62 @@ async def update_platform_costs(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upsert one or more platform costs. Returns the new full snapshot."""
-    from app.db.models import PlatformSetting
+    """Upsert one or more platform costs (value + currency) and/or FX rate.
 
+    Returns the full snapshot so the UI can re-render without a second roundtrip.
+    """
+    from app.db.models import PlatformSetting
+    import json as _json
+
+    # Costs
     payload = body.dict(exclude_unset=True)
-    for key, value in payload.items():
-        if key not in _COST_KEYS:
+    for key in _COST_KEYS:
+        line = payload.get(key)
+        if line is None:
             continue
-        if value is None or value < 0:
+        if line.get("value") is None or line.get("value") < 0:
             raise HTTPException(400, f"{key}: value must be non-negative")
+        currency = (line.get("currency") or "USD").upper()
+        if currency not in _SUPPORTED_CURRENCIES:
+            raise HTTPException(400, f"{key}: currency must be USD or CAD")
         db_key = f"cost.{key}"
+        new_val = _json.dumps({"value": float(line["value"]), "currency": currency})
         existing = (await db.execute(
             select(PlatformSetting).where(PlatformSetting.key == db_key)
         )).scalar_one_or_none()
         if existing:
-            existing.value = str(value)
+            existing.value = new_val
             existing.updated_at = datetime.utcnow()
             existing.updated_by_user_id = admin.id
         else:
             db.add(PlatformSetting(
-                key=db_key,
-                value=str(value),
+                key=db_key, value=new_val, updated_by_user_id=admin.id,
+            ))
+
+    # FX rate (separate setting key)
+    if body.fx_cad_to_usd is not None:
+        existing_fx = (await db.execute(
+            select(PlatformSetting).where(PlatformSetting.key == "fx.cad_to_usd")
+        )).scalar_one_or_none()
+        if existing_fx:
+            existing_fx.value = str(body.fx_cad_to_usd)
+            existing_fx.updated_at = datetime.utcnow()
+            existing_fx.updated_by_user_id = admin.id
+        else:
+            db.add(PlatformSetting(
+                key="fx.cad_to_usd", value=str(body.fx_cad_to_usd),
                 updated_by_user_id=admin.id,
             ))
+
     await db.commit()
-    costs = await _get_all_platform_costs(db)
-    return {
-        "costs": costs,
-        "total": round(sum(costs.values()), 4),
-    }
+    return await _get_all_platform_costs(db)
+
+
+# Legacy USD-only view of costs, used by the overview endpoint until it's
+# fully ported to the currency-aware shape. Returns {key: usd_amount}.
+async def _legacy_costs_usd_only(db: AsyncSession) -> dict[str, float]:
+    snapshot = await _get_all_platform_costs(db)
+    return {k: v["value_usd"] for k, v in snapshot["costs"].items()}
 
 
 @router.get("/usage/overview")
@@ -784,9 +879,12 @@ async def get_usage_overview(
     # ledger; for now this matches what the admin actually wants to see.
     # Read cost values from DB (admin-edited via /admin/platform-costs);
     # the helper falls back to settings.platform_cost_* env defaults if
-    # the row hasn't been written yet.
-    fixed_costs_breakdown_raw = await _get_all_platform_costs(db)
-    fixed_costs_breakdown = {k: round(v, 4) for k, v in fixed_costs_breakdown_raw.items()}
+    # the row hasn't been written yet. Each cost has native value +
+    # currency + USD-equivalent for the unified P&L math.
+    cost_snapshot = await _get_all_platform_costs(db)
+    fixed_costs_rich = cost_snapshot["costs"]   # {key: {value, currency, value_usd, source}}
+    fixed_costs_breakdown = {k: v["value_usd"] for k, v in fixed_costs_rich.items()}
+    fx_cad_to_usd = cost_snapshot["fx_cad_to_usd"]
     fixed_costs_total = round(sum(fixed_costs_breakdown.values()), 4)
 
     # LLM (variable) costs — sum of per-user proxy event costs.
@@ -835,6 +933,62 @@ async def get_usage_overview(
         if avg_revenue_per_paying_user > 0 else None
     )
 
+    # Revenue currency mix: aggregate paid invoices by currency across users.
+    # Stripe gives us native paid amounts (USD vs CAD); we keep both visible
+    # so the admin sees "you collected $X USD + $Y CAD" rather than a
+    # silently-FX'd blob.
+    revenue_by_currency_30d: dict[str, float] = {}
+    revenue_by_currency_all: dict[str, float] = {}
+    for u in user_usage_list:
+        for cur, amt in (u.get("currency_breakdown_30d") or {}).items():
+            revenue_by_currency_30d[cur] = round(revenue_by_currency_30d.get(cur, 0.0) + float(amt), 4)
+        for cur, amt in (u.get("currency_breakdown_all") or {}).items():
+            revenue_by_currency_all[cur] = round(revenue_by_currency_all.get(cur, 0.0) + float(amt), 4)
+
+    # Connection / data-source disclosure. Honest about what's pulled live
+    # vs estimated. Drives the "Connection Status" panel on the frontend so
+    # the admin knows which numbers come from actual provider invoices vs
+    # token-cost calculations.
+    data_sources = {
+        "stripe_revenue": {
+            "connected": bool(settings.stripe_secret_key),
+            "mode": (
+                "live" if settings.stripe_secret_key and settings.stripe_secret_key.startswith("sk_live_")
+                else "test" if settings.stripe_secret_key
+                else "not_configured"
+            ),
+            "label": "Stripe (revenue)",
+            "kind": "actual",
+        },
+        "openai_billing": {
+            # Stub for future official OpenAI Costs API integration.
+            "connected": bool(settings.openai_admin_key),
+            "label": "OpenAI Costs API",
+            "kind": "estimated" if not settings.openai_admin_key else "actual",
+            "note": (
+                "Set OPENAI_ADMIN_KEY to pull official invoice numbers."
+                if not settings.openai_admin_key else
+                "Pulling official invoice numbers."
+            ),
+        },
+        "anthropic_billing": {
+            "connected": bool(settings.anthropic_admin_key),
+            "label": "Anthropic Costs API",
+            "kind": "estimated" if not settings.anthropic_admin_key else "actual",
+            "note": (
+                "Set ANTHROPIC_ADMIN_KEY to pull official invoice numbers."
+                if not settings.anthropic_admin_key else
+                "Pulling official invoice numbers."
+            ),
+        },
+        "llm_proxy_events": {
+            "connected": True,
+            "label": "Per-call token tracking (estimated cost)",
+            "kind": "estimated",
+            "note": "Cost computed from input/output tokens × current pricing tables. Within ~5% of official invoices.",
+        },
+    }
+
     return {
         "aggregate": {
             # Variable + total
@@ -847,6 +1001,7 @@ async def get_usage_overview(
             "total_revenue_30d": agg_revenue_30d,
             "total_margin_30d": agg_margin_30d,        # includes fixed costs
             "margin_pct_30d": agg_margin_pct_30d,
+            "revenue_by_currency_30d": revenue_by_currency_30d,
             "total_tokens_all": agg_tokens_all,
             "total_cost_all": llm_cost_all,
             "llm_cost_all": llm_cost_all,
@@ -856,6 +1011,7 @@ async def get_usage_overview(
             "total_revenue_all": agg_revenue_all,
             "total_margin_all": agg_margin_all,
             "margin_pct_all": agg_margin_pct_all,
+            "revenue_by_currency_all": revenue_by_currency_all,
             # User buckets
             "paying_users": paying_users,
             "free_users": free_users,
@@ -865,10 +1021,16 @@ async def get_usage_overview(
             # Break-even
             "avg_revenue_per_paying_user": round(avg_revenue_per_paying_user, 2),
             "breakeven_users": breakeven_users,
-            # Cost line items
+            # Cost line items (USD-equivalents)
             "fixed_costs_breakdown": fixed_costs_breakdown,
+            # Currency-aware fixed-cost breakdown:
+            # {key: {value, currency, value_usd, source}}
+            "fixed_costs_rich": fixed_costs_rich,
+            "fx_cad_to_usd": fx_cad_to_usd,
             "llm_cost_by_provider_30d": llm_cost_by_provider["30d"],
             "llm_cost_by_provider_all": llm_cost_by_provider["all"],
+            # Data sources / connection status
+            "data_sources": data_sources,
         },
         "users": sorted(user_usage_list, key=lambda u: u.get("total_tokens_30d", 0), reverse=True),
     }
