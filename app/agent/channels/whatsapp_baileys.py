@@ -207,17 +207,26 @@ class BaileysWhatsAppChannel(BaseChannel):
             )
             return
 
-        # Identify as a real WhatsApp Desktop client (macOS) instead of
-        # neonize's default `os="Neonize", platformType=SAFARI`. Meta's
-        # anti-abuse system has learned the default fingerprint and
-        # rejects link requests from it with "Can't link new devices
-        # right now" even when the target number is healthy. Real
-        # WhatsApp Desktop reports os="Mac OS X" + DESKTOP platform,
-        # which sails through pairing. Tested live on c47c5b4b: link
-        # rejected with default props, accepted with these.
+        # Identify as a real WhatsApp Desktop client. Meta's anti-abuse
+        # system fingerprints the *full* DeviceProps payload, not just
+        # `os` — sending os="Mac OS X" without a `version` is still
+        # caught and the phone shows "Can't link new devices at this
+        # time" even when the same phone successfully pairs the actual
+        # WhatsApp Desktop app to the same number a second later.
+        #
+        # Real WhatsApp Desktop reports its build number through the
+        # AppVersion sub-message (primary.secondary.tertiary). The
+        # values below match a recent stable Desktop release; bump
+        # them periodically as Meta deprecates older clients.
         device_props = DeviceProps(
             os="Mac OS X",
             platformType=DeviceProps.DESKTOP,
+            version=DeviceProps.AppVersion(
+                primary=2,
+                secondary=2412,
+                tertiary=54,
+            ),
+            requireFullSync=False,
         )
         self._client = NewAClient(str(store_path()), props=device_props)
         self._register_event_handlers()
