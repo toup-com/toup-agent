@@ -2,11 +2,13 @@
 Rollout API — endpoints for CI + admin rollout orchestration.
 
 Endpoints:
-  POST   /api/admin/rollout/start     CI webhook (X-Rollout-Secret)
-  POST   /api/admin/rollout/manual    Admin-authenticated manual trigger
-  GET    /api/admin/rollout/latest    Active rollout (or most recent)
-  GET    /api/admin/rollout/{id}      Rollout with full attempt breakdown
+  POST   /api/admin/rollout/start         CI webhook (X-Rollout-Secret)
+  POST   /api/admin/rollout/manual        Admin-authenticated manual trigger
+  GET    /api/admin/rollout/latest        Active rollout (or most recent)
+  GET    /api/admin/rollout/{id}          Rollout with full attempt breakdown
   POST   /api/admin/rollout/{id}/cancel   Mark in-flight rollout cancelled
+  POST   /api/admin/rollout/force-orphan  Force any active rollout → aborted_orphan
+                                          (operator escape hatch — frees the lock)
 
 See docs/new-vps/14-AUTOMATED-DEPLOYMENT-DESIGN.md §5-§6.
 """
@@ -28,7 +30,7 @@ from app.config import settings
 from app.db.database import get_db
 from app.db.models import Rollout, RolloutAttempt, User
 from app.services.rollout_service import (
-    start_rollout, cancel_rollout, active_rollout,
+    start_rollout, cancel_rollout, active_rollout, force_orphan_active,
     RolloutInProgress,
 )
 
@@ -304,4 +306,29 @@ async def cancel(
     rollout = await cancel_rollout(db, rollout_id)
     if not rollout:
         raise HTTPException(404, "rollout not found")
+    return await _build_summary(db, rollout)
+
+
+class ForceOrphanReq(BaseModel):
+    reason: str = Field(default="operator force-orphan", max_length=200)
+
+
+@router.post("/force-orphan")
+async def force_orphan(
+    body: ForceOrphanReq | None = None,
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Operator escape hatch: force the currently-active pending/running
+    rollout into `aborted_orphan`, freeing the lock immediately.
+
+    Use when the orchestrator is known-dead but the reconciler hasn't yet
+    aged the row past its threshold (running >30 min, pending >5 min).
+
+    Returns the orphaned rollout summary, or 404 if no rollout was active.
+    """
+    reason = (body.reason if body else None) or "operator force-orphan"
+    rollout = await force_orphan_active(db, reason=reason)
+    if not rollout:
+        raise HTTPException(404, "no active rollout to orphan")
     return await _build_summary(db, rollout)

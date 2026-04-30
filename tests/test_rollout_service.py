@@ -119,13 +119,51 @@ async def test_start_rollout_raises_in_progress_when_active():
         trigger="ci",
     )
 
-    # Patch active_rollout to return a fake in-flight rollout
-    with patch("app.services.rollout_service.active_rollout", AsyncMock(return_value=mock_active)):
+    # Patch active_rollout to return a fake in-flight rollout. Also patch
+    # _reconcile_once: the self-heal pass added to start_rollout (eb2ecc31487
+    # incident fix) runs BEFORE this lock check, and we want the test to
+    # exercise the lock-collision path, not the reconciliation path.
+    with patch("app.services.rollout_service.active_rollout", AsyncMock(return_value=mock_active)), \
+         patch("app.services.rollout_service._reconcile_once", AsyncMock(return_value=None)):
         db = MagicMock()
         with pytest.raises(RolloutInProgress) as exc_info:
             await start_rollout(db, image_tag="ghcr.io/toup-com/toup-agent:abcd1234", trigger="ci")
         assert exc_info.value.active_id == "active-id-123"
         assert exc_info.value.active_tag == "ghcr.io/toup-com/toup-agent:earlier1234"
+
+
+@pytest.mark.asyncio
+async def test_start_rollout_invokes_reconcile_before_lock_check():
+    """start_rollout must self-heal — run reconcile BEFORE the lock check.
+
+    Without this ordering, a single stuck rollout from a dead orchestrator
+    blocks every subsequent CI push with HTTP 409 indefinitely. The
+    reconciler loop catches it eventually, but the next CI push immediately
+    after is racy. (eb2ecc314879 incident, 2026-04-29 — 5h stuck.)
+    """
+    from app.services.rollout_service import start_rollout
+
+    call_order: list[str] = []
+
+    async def _tracker_reconcile(db_arg=None):
+        call_order.append("reconcile")
+
+    async def _tracker_active(db_arg):
+        call_order.append("active_rollout")
+        return None
+
+    with patch("app.services.rollout_service._reconcile_once", _tracker_reconcile), \
+         patch("app.services.rollout_service.active_rollout", _tracker_active), \
+         patch("app.scripts.scheduled_tasks.schedule_one_shot"):
+        db = MagicMock()
+        db.add = MagicMock()
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+        await start_rollout(db, image_tag="ghcr.io/toup-com/toup-agent:abcd1234", trigger="ci")
+
+    assert call_order == ["reconcile", "active_rollout"], (
+        f"expected reconcile before active_rollout, got: {call_order}"
+    )
 
 
 # ─── canary selection ────────────────────────────────────────────
@@ -195,3 +233,112 @@ async def test_canary_container_canary_user_not_in_set():
 
     result = await _canary_container(db, cand)
     assert result is None, "canary absent from running set → rollout must refuse"
+
+
+# ─── reconciler orphan paths ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphans_pending_past_threshold():
+    """A row in `pending` status past _STUCK_PENDING_THRESHOLD_MIN means
+    APScheduler never fired. The reconciler must orphan it so subsequent
+    CI pushes don't 409 forever."""
+    from datetime import datetime, timedelta
+    from app.services.rollout_service import _reconcile_once_in_session, _STUCK_PENDING_THRESHOLD_MIN
+    from app.db.models import Rollout
+
+    stuck = Rollout(
+        id="pending-orphan-1",
+        image_tag="ghcr.io/toup-com/toup-agent:abcd1234",
+        status="pending",
+        trigger="ci",
+        started_at=datetime.utcnow() - timedelta(minutes=_STUCK_PENDING_THRESHOLD_MIN + 1),
+    )
+
+    db = MagicMock()
+    mock_result = MagicMock()
+    mock_result.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[stuck])))
+    db.execute = AsyncMock(return_value=mock_result)
+    db.commit = AsyncMock()
+
+    with patch("app.services.rollout_service._send_telegram", AsyncMock()):
+        await _reconcile_once_in_session(db)
+
+    assert stuck.status == "aborted_orphan"
+    assert stuck.completed_at is not None
+    assert "pending" in (stuck.notes or "")
+    db.commit.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_fresh_pending_alone():
+    """A `pending` row younger than the threshold is healthy in-flight work
+    (APScheduler about to fire). Reconciler must NOT touch it."""
+    from datetime import datetime, timedelta
+    from app.services.rollout_service import _reconcile_once_in_session, _STUCK_PENDING_THRESHOLD_MIN
+    from app.db.models import Rollout
+
+    fresh = Rollout(
+        id="pending-fresh-1",
+        image_tag="ghcr.io/toup-com/toup-agent:abcd1234",
+        status="pending",
+        trigger="ci",
+        started_at=datetime.utcnow() - timedelta(minutes=max(0, _STUCK_PENDING_THRESHOLD_MIN - 1)),
+    )
+
+    db = MagicMock()
+    mock_result = MagicMock()
+    mock_result.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[fresh])))
+    db.execute = AsyncMock(return_value=mock_result)
+    db.commit = AsyncMock()
+
+    with patch("app.services.rollout_service._send_telegram", AsyncMock()):
+        await _reconcile_once_in_session(db)
+
+    assert fresh.status == "pending", "fresh pending row must not be orphaned"
+    db.commit.assert_not_awaited()
+
+
+# ─── force-orphan operator escape hatch ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_force_orphan_active_returns_none_when_no_lock():
+    """Idempotent no-op when no rollout is in flight."""
+    from app.services.rollout_service import force_orphan_active
+
+    with patch("app.services.rollout_service.active_rollout", AsyncMock(return_value=None)):
+        db = MagicMock()
+        result = await force_orphan_active(db, reason="t")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_force_orphan_active_orphans_in_flight_lock():
+    """Force-orphan flips the active rollout to aborted_orphan, freeing
+    the lock immediately regardless of age. Used when operator knows the
+    orchestrator is dead and the reconciler hasn't aged it out yet."""
+    from datetime import datetime, timedelta
+    from app.services.rollout_service import force_orphan_active
+    from app.db.models import Rollout
+
+    active = Rollout(
+        id="lock-holder",
+        image_tag="ghcr.io/toup-com/toup-agent:zzzzzzz",
+        status="running",
+        phase="canary_observing",
+        trigger="ci",
+        started_at=datetime.utcnow() - timedelta(minutes=2),  # under threshold
+    )
+
+    with patch("app.services.rollout_service.active_rollout", AsyncMock(return_value=active)), \
+         patch("app.services.rollout_service._send_telegram", AsyncMock()):
+        db = MagicMock()
+        db.commit = AsyncMock()
+        result = await force_orphan_active(db, reason="lock wedged")
+
+    assert result is active
+    assert active.status == "aborted_orphan"
+    assert active.completed_at is not None
+    assert "lock wedged" in (active.notes or "")

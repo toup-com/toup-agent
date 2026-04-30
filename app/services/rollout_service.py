@@ -461,6 +461,13 @@ _resume_inflight: set[str] = set()
 # false-positiving a real successful rollout.
 _STUCK_ROLLOUT_THRESHOLD_MIN = 30
 
+# Pending-rollout threshold — much shorter than the running threshold. A
+# row sitting in 'pending' means the APScheduler one-shot job never fired
+# (process died before pickup, scheduler crashed, jobstore stale). The
+# scheduler is supposed to fire within seconds; 5 min is a generous SLA
+# that won't false-positive a healthy startup.
+_STUCK_PENDING_THRESHOLD_MIN = 5
+
 
 async def rollout_reconciler_loop() -> None:
     """Long-running background task — wakes every 30 s, advances rollouts
@@ -497,41 +504,94 @@ async def rollout_reconciler_loop() -> None:
         await asyncio.sleep(30)
 
 
-async def _reconcile_once() -> None:
-    """One reconciler tick — split out so tests can call it deterministically."""
+async def _reconcile_once(db: Optional[AsyncSession] = None) -> None:
+    """One reconciler tick — split out so tests can call it deterministically.
+
+    Accepts an optional pre-existing session so callers like `start_rollout`
+    can run the reconcile pass inside their own transaction (lock self-heal
+    before the active-rollout check). When called with no argument the loop
+    creates its own session.
+    """
+    if db is None:
+        async with async_session_maker() as own_db:
+            await _reconcile_once_in_session(own_db)
+    else:
+        await _reconcile_once_in_session(db)
+
+
+async def _reconcile_once_in_session(db: AsyncSession) -> None:
+    """The body of one reconciler tick. Operates on the provided session.
+
+    Watches BOTH `pending` and `running` statuses:
+      - `pending` past `_STUCK_PENDING_THRESHOLD_MIN`: APScheduler never
+        fired. Orphan and free the lock.
+      - `running` past `_STUCK_ROLLOUT_THRESHOLD_MIN`: orchestrator died
+        mid-flight. Orphan, free the lock.
+      - `running` AND `phase='canary_observing'` AND `resume_after` passed:
+        resume the canary observation in this process.
+    """
     now = datetime.utcnow()
-    async with async_session_maker() as db:
-        result = await db.execute(
-            select(Rollout).where(Rollout.status == "running")
-        )
-        running = result.scalars().all()
-        if not running:
-            return
+    result = await db.execute(
+        select(Rollout).where(Rollout.status.in_(["pending", "running"]))
+    )
+    inflight = result.scalars().all()
+    if not inflight:
+        return
 
-        for rollout in running:
-            age_min = (now - rollout.started_at).total_seconds() / 60 if rollout.started_at else 0
+    for rollout in inflight:
+        age_min = (now - rollout.started_at).total_seconds() / 60 if rollout.started_at else 0
 
-            # (2) Auto-orphan rollouts past the budget — runs FIRST so a
-            # truly-stuck rollout doesn't keep getting "resumed" forever.
-            if age_min > _STUCK_ROLLOUT_THRESHOLD_MIN:
-                logger.warning(
-                    "[ROLLOUT-RECONCILER] auto-orphaning %s (age=%.1fmin, phase=%r)",
-                    rollout.id, age_min, rollout.phase,
-                )
-                rollout.status = "aborted_orphan"
-                rollout.completed_at = now
-                rollout.notes = (rollout.notes or "") + (
-                    f"\nAuto-orphaned by reconciler at age={age_min:.1f}min "
-                    f"(phase={rollout.phase!r}, threshold={_STUCK_ROLLOUT_THRESHOLD_MIN}min)"
-                )
-                await db.commit()
-                await _send_telegram(
-                    "warning",
-                    f"Rollout <code>{rollout.image_tag}</code> auto-orphaned "
-                    f"after {age_min:.0f} min (phase={rollout.phase!r}). "
-                    f"Re-trigger if still needed.",
-                )
-                continue
+        # (1) `pending` orphan path — the row was created but the
+        # APScheduler one-shot never fired. Short threshold (5 min): the
+        # scheduler is supposed to pick this up within seconds.
+        if rollout.status == "pending" and age_min > _STUCK_PENDING_THRESHOLD_MIN:
+            logger.warning(
+                "[ROLLOUT-RECONCILER] auto-orphaning pending %s (age=%.1fmin)",
+                rollout.id, age_min,
+            )
+            rollout.status = "aborted_orphan"
+            rollout.completed_at = now
+            rollout.notes = (rollout.notes or "") + (
+                f"\nAuto-orphaned by reconciler at age={age_min:.1f}min "
+                f"(status=pending — APScheduler never fired; "
+                f"threshold={_STUCK_PENDING_THRESHOLD_MIN}min)"
+            )
+            await db.commit()
+            await _send_telegram(
+                "warning",
+                f"Rollout <code>{rollout.image_tag}</code> auto-orphaned in "
+                f"<b>pending</b> after {age_min:.0f} min (scheduler never fired). "
+                f"Re-trigger if still needed.",
+            )
+            continue
+
+        # (2) Auto-orphan rollouts past the budget — runs FIRST so a
+        # truly-stuck rollout doesn't keep getting "resumed" forever.
+        if rollout.status == "running" and age_min > _STUCK_ROLLOUT_THRESHOLD_MIN:
+            logger.warning(
+                "[ROLLOUT-RECONCILER] auto-orphaning %s (age=%.1fmin, phase=%r)",
+                rollout.id, age_min, rollout.phase,
+            )
+            rollout.status = "aborted_orphan"
+            rollout.completed_at = now
+            rollout.notes = (rollout.notes or "") + (
+                f"\nAuto-orphaned by reconciler at age={age_min:.1f}min "
+                f"(phase={rollout.phase!r}, threshold={_STUCK_ROLLOUT_THRESHOLD_MIN}min)"
+            )
+            await db.commit()
+            await _send_telegram(
+                "warning",
+                f"Rollout <code>{rollout.image_tag}</code> auto-orphaned "
+                f"after {age_min:.0f} min (phase={rollout.phase!r}). "
+                f"Re-trigger if still needed.",
+            )
+            continue
+
+        # Pending rows under the threshold are healthy in-flight work; skip
+        # them entirely (no resume logic applies). Only `running` rows
+        # continue past this point.
+        if rollout.status != "running":
+            continue
 
             # (1) Resume canary_observing rollouts whose deadline passed.
             # Other phases (canary_upgrading, batching) make bridge calls
@@ -691,6 +751,13 @@ async def start_rollout(
             f"image_tag must start with 'ghcr.io/toup-com/toup-agent:', got: {image_tag}"
         )
 
+    # Self-heal: run a reconcile pass BEFORE checking the lock. If a prior
+    # rollout died and is sitting past its threshold (running >30 min, or
+    # pending >5 min), this orphans it and frees the lock so the new one
+    # can proceed. Without this, every CI push hit 409 indefinitely after
+    # the very first stuck rollout — operators had to manually cancel.
+    await _reconcile_once(db)
+
     active = await active_rollout(db)
     if active:
         raise RolloutInProgress(active.id, active.image_tag)
@@ -726,6 +793,37 @@ async def start_rollout(
         rollout.id, image_tag, trigger, wait_min,
     )
     return rollout
+
+
+async def force_orphan_active(db: AsyncSession, reason: str = "operator force-orphan") -> Optional[Rollout]:
+    """Operator escape hatch — force any current pending/running rollout to
+    `aborted_orphan`, freeing the lock immediately.
+
+    Returns the orphaned Rollout (or None if no lock was held). Useful when
+    the reconciler hasn't yet aged a stuck rollout past the threshold but
+    the operator knows the orchestrator is dead and wants to push a new
+    deploy now.
+
+    Idempotent: if no rollout is active this is a no-op returning None.
+    """
+    active = await active_rollout(db)
+    if not active:
+        return None
+    age_min = (datetime.utcnow() - active.started_at).total_seconds() / 60 if active.started_at else 0
+    active.status = "aborted_orphan"
+    active.completed_at = datetime.utcnow()
+    active.notes = (active.notes or "") + f"\nForce-orphaned by operator: {reason} (age={age_min:.1f}min)"
+    await db.commit()
+    await _send_telegram(
+        "warning",
+        f"Rollout <code>{active.image_tag}</code> force-orphaned by operator "
+        f"(age {age_min:.0f}min, was status={active.status!r}, phase={active.phase!r}).",
+    )
+    logger.warning(
+        "[ROLLOUT] force-orphan id=%s tag=%s age=%.1fmin reason=%r",
+        active.id, active.image_tag, age_min, reason,
+    )
+    return active
 
 
 async def cancel_rollout(db: AsyncSession, rollout_id: str) -> Optional[Rollout]:
