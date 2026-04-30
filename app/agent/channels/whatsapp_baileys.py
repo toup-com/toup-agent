@@ -261,7 +261,16 @@ class BaileysWhatsAppChannel(BaseChannel):
                     "[WHATSAPP-BAILEYS] supervisor.connecting attempt=%d",
                     self._reconnect_attempts + 1,
                 )
-                await self._client.connect()  # type: ignore[union-attr]
+                # neonize's async connect() returns a Task — it does NOT
+                # block until disconnect. Awaiting the function only
+                # awaits its setup; we have to await the returned Task
+                # itself to block on the actual session lifetime.
+                # Without this, the supervisor spins in a tight loop
+                # logging "attempt=1" forever and never lets neonize
+                # actually finish connecting.
+                connect_task = await self._client.connect()  # type: ignore[union-attr]
+                if connect_task is not None:
+                    await connect_task
                 # Clean exit: connect() returned without error — only
                 # happens on graceful stop. Bail.
                 if self._stopping:
