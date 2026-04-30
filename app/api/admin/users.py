@@ -434,6 +434,29 @@ async def get_usage_overview(
                 "requests": int(reqs),
             }
 
+    # Provider-level cost breakdown for the platform P&L. Two queries (30d, all)
+    # grouped by provider. Lets the admin see the anthropic-vs-openai split at a
+    # glance and verify that the Claude Max subscription is being utilized
+    # (low Anthropic API cost = users mostly hitting the included sub quota).
+    llm_cost_by_provider: dict[str, dict[str, float]] = {"30d": {}, "all": {}}
+    for suffix, since in [("30d", periods["30d"]), ("all", periods["all"])]:
+        stmt = (
+            select(
+                LLMProxyEvent.provider,
+                func.coalesce(func.sum(LLMProxyEvent.cost_cents), 0).label("cost_c"),
+                func.coalesce(func.sum(LLMProxyEvent.input_tokens + LLMProxyEvent.output_tokens), 0).label("toks"),
+                func.count().label("reqs"),
+            )
+            .where(LLMProxyEvent.created_at >= since)
+            .group_by(LLMProxyEvent.provider)
+        )
+        for provider, cost_c, toks, reqs in (await db.execute(stmt)).all():
+            llm_cost_by_provider[suffix][provider or "unknown"] = {
+                "cost": round(float(cost_c) / 100.0, 4),
+                "tokens": int(toks),
+                "requests": int(reqs),
+            }
+
     # For each user, choose the best source: proxy events > agent > local DB.
     user_usage_list = []
     pricing = settings.pricing_per_1k
@@ -658,21 +681,43 @@ async def get_usage_overview(
         entry["currency_breakdown_30d"] = rev.get("currency_30d", {})
         entry["currency_breakdown_all"] = rev.get("currency_all", {})
 
+    # ── Fixed (recurring) platform costs ─────────────────────────
+    # These cover one calendar month each. The 30d window is one full month
+    # by convention. For "all time" we conservatively report one month of
+    # fixed costs since we don't track when each subscription started — so
+    # `total_margin_all` is only meaningful as "P&L of the most recent
+    # billing month". A future enhancement could backfill from a billing
+    # ledger; for now this matches what the admin actually wants to see.
+    fixed_costs_breakdown = {
+        "anthropic_max": round(settings.platform_cost_anthropic_max_monthly_usd, 4),
+        "openai_fixed": round(settings.platform_cost_openai_monthly_usd, 4),
+        "vps": round(settings.platform_cost_vps_monthly_usd, 4),
+        "railway": round(settings.platform_cost_railway_monthly_usd, 4),
+        "other": round(settings.platform_cost_other_monthly_usd, 4),
+    }
+    fixed_costs_total = round(sum(fixed_costs_breakdown.values()), 4)
+
+    # LLM (variable) costs — sum of per-user proxy event costs.
+    llm_cost_30d = round(sum(u.get("total_cost_30d", 0) for u in user_usage_list), 4)
+    llm_cost_all = round(sum(u.get("total_cost_all", 0) for u in user_usage_list), 4)
+
+    # True total cost = LLM (variable) + fixed (subscriptions/infra).
+    true_total_cost_30d = round(llm_cost_30d + fixed_costs_total, 4)
+    true_total_cost_all = round(llm_cost_all + fixed_costs_total, 4)
+
     # Aggregate totals
     agg_tokens_30d = sum(u.get("total_tokens_30d", 0) for u in user_usage_list)
-    agg_cost_30d = round(sum(u.get("total_cost_30d", 0) for u in user_usage_list), 4)
     agg_reqs_30d = sum(u.get("total_requests_30d", 0) for u in user_usage_list)
     agg_revenue_30d = round(sum(u.get("revenue_30d", 0.0) for u in user_usage_list), 4)
-    agg_margin_30d = round(agg_revenue_30d - agg_cost_30d, 4)
+    agg_margin_30d = round(agg_revenue_30d - true_total_cost_30d, 4)
     agg_margin_pct_30d = (
         round(agg_margin_30d / agg_revenue_30d * 100, 1) if agg_revenue_30d > 0 else None
     )
 
     agg_tokens_all = sum(u.get("total_tokens_all", 0) for u in user_usage_list)
-    agg_cost_all = round(sum(u.get("total_cost_all", 0) for u in user_usage_list), 4)
     agg_reqs_all = sum(u.get("total_requests_all", 0) for u in user_usage_list)
     agg_revenue_all = round(sum(u.get("revenue_all", 0.0) for u in user_usage_list), 4)
-    agg_margin_all = round(agg_revenue_all - agg_cost_all, 4)
+    agg_margin_all = round(agg_revenue_all - true_total_cost_all, 4)
     agg_margin_pct_all = (
         round(agg_margin_all / agg_revenue_all * 100, 1) if agg_revenue_all > 0 else None
     )
@@ -681,29 +726,57 @@ async def get_usage_overview(
     paying_users = sum(1 for u in user_usage_list if u.get("bundle_status") == "active")
     free_users = sum(1 for u in user_usage_list if u.get("bundle_status") in (None, "none"))
     cancelling_users = sum(1 for u in user_usage_list if u.get("bundle_status") == "cancelling")
+    # Per-user margin uses ONLY their own LLM cost vs revenue (no fixed-cost
+    # allocation — those are platform-level, not per-user). The "losing money"
+    # bucket means "this user spent more on LLM than they paid us".
     losing_money_users = sum(
         1 for u in user_usage_list if u.get("margin_30d", 0.0) < 0
     )
 
+    # Break-even analysis: how many paying customers would we need to clear
+    # all fixed costs at the current ARPU? Useful goal-setting metric.
+    avg_revenue_per_paying_user = (
+        agg_revenue_30d / paying_users if paying_users > 0 else 0.0
+    )
+    breakeven_users = (
+        int(fixed_costs_total // avg_revenue_per_paying_user) + 1
+        if avg_revenue_per_paying_user > 0 else None
+    )
+
     return {
         "aggregate": {
+            # Variable + total
             "total_tokens_30d": agg_tokens_30d,
-            "total_cost_30d": agg_cost_30d,
+            "total_cost_30d": llm_cost_30d,            # variable LLM cost only (legacy field)
+            "llm_cost_30d": llm_cost_30d,              # explicit variable cost
+            "fixed_cost_30d": fixed_costs_total,
+            "total_cost_with_fixed_30d": true_total_cost_30d,
             "total_requests_30d": agg_reqs_30d,
             "total_revenue_30d": agg_revenue_30d,
-            "total_margin_30d": agg_margin_30d,
+            "total_margin_30d": agg_margin_30d,        # includes fixed costs
             "margin_pct_30d": agg_margin_pct_30d,
             "total_tokens_all": agg_tokens_all,
-            "total_cost_all": agg_cost_all,
+            "total_cost_all": llm_cost_all,
+            "llm_cost_all": llm_cost_all,
+            "fixed_cost_all": fixed_costs_total,       # one billing month of fixed (see comment)
+            "total_cost_with_fixed_all": true_total_cost_all,
             "total_requests_all": agg_reqs_all,
             "total_revenue_all": agg_revenue_all,
             "total_margin_all": agg_margin_all,
             "margin_pct_all": agg_margin_pct_all,
+            # User buckets
             "paying_users": paying_users,
             "free_users": free_users,
             "cancelling_users": cancelling_users,
             "losing_money_users": losing_money_users,
             "total_users": len(user_usage_list),
+            # Break-even
+            "avg_revenue_per_paying_user": round(avg_revenue_per_paying_user, 2),
+            "breakeven_users": breakeven_users,
+            # Cost line items
+            "fixed_costs_breakdown": fixed_costs_breakdown,
+            "llm_cost_by_provider_30d": llm_cost_by_provider["30d"],
+            "llm_cost_by_provider_all": llm_cost_by_provider["all"],
         },
         "users": sorted(user_usage_list, key=lambda u: u.get("total_tokens_30d", 0), reverse=True),
     }

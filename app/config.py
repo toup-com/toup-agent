@@ -288,6 +288,22 @@ class Settings(BaseSettings):
     bridge_request_timeout_s: int = 30      # default httpx timeout for non-upgrade calls
     bridge_upgrade_timeout_s: int = 180     # upgrade endpoint can take longer (pull + recreate + health)
 
+    # ── Platform fixed costs (admin ROI dashboard) ───────────────
+    # Recurring monthly costs that don't scale with user count: subscriptions
+    # we pay regardless of usage, plus infrastructure. These flow into the
+    # admin Revenue & Usage tab as a "Fixed costs" row in the platform P&L
+    # so net margin reflects reality, not just LLM cost.
+    # All values are USD/month. Override per-environment via env vars.
+    platform_cost_anthropic_max_monthly_usd: float = 158.20  # Claude Max subscription
+    platform_cost_openai_monthly_usd: float = 0.0            # Any fixed OpenAI plan (Team etc.)
+    platform_cost_vps_monthly_usd: float = 0.0               # Contabo / DigitalOcean / etc.
+    platform_cost_railway_monthly_usd: float = 5.0           # Railway hobby plan baseline
+    platform_cost_other_monthly_usd: float = 0.0             # Domain, Cloudflare paid tier, misc.
+    # Optional admin-API keys for pulling actual provider bills (vs proxy
+    # estimates). Leave blank to fall back to llm_proxy_events sums.
+    openai_admin_key: str = ""                               # OpenAI org admin key (sk-org-admin-...)
+    anthropic_admin_key: str = ""                            # Anthropic admin key for org cost API
+
     # ── Rollout pipeline (Phase 3) ────────────────────────────────
     rollout_secret: str = ""                # Shared secret CI → platform webhook (X-Rollout-Secret)
     rollout_canary_wait_minutes_default: int = 10
