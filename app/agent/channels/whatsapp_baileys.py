@@ -343,8 +343,17 @@ class BaileysWhatsAppChannel(BaseChannel):
 
         if message_ev:
             self._client.event(message_ev)(self._on_message_ev)  # type: ignore
-        if qr_ev:
-            self._client.event(qr_ev)(self._on_qr_ev)  # type: ignore
+        # QR is special in neonize — it goes through ``event.qr(callback)``,
+        # NOT ``event(QREv)(callback)``. The default handler just prints
+        # the QR to stdout via segno.make_qr().terminal(); to capture
+        # the bytes, we override via the .qr setter. Callback signature
+        # is ``(client, bytes)``.
+        try:
+            qr_setter = getattr(self._client.event, "qr", None)
+            if callable(qr_setter):
+                qr_setter(self._on_qr_bytes)  # type: ignore
+        except Exception:
+            logger.exception("[WHATSAPP-BAILEYS] qr setter registration failed")
         if pair_ev:
             self._client.event(pair_ev)(self._on_pair_ev)  # type: ignore
         if connected_ev:
@@ -354,20 +363,45 @@ class BaileysWhatsAppChannel(BaseChannel):
         if logged_out_ev:
             self._client.event(logged_out_ev)(self._on_logged_out_ev)  # type: ignore
 
+    async def _on_qr_bytes(self, _client, qr_data: bytes) -> None:
+        """Direct QR-bytes callback — registered via ``event.qr(self._on_qr_bytes)``.
+        neonize delivers the raw pairing string here as bytes.
+        """
+        try:
+            qr_str = qr_data.decode("utf-8") if isinstance(qr_data, (bytes, bytearray)) else str(qr_data)
+        except Exception:
+            qr_str = ""
+        if not qr_str:
+            return
+        self._latest_qr = qr_str
+        self._latest_qr_data_url = render_qr_png_data_url(qr_str)
+        self._latest_qr_at = datetime.utcnow()
+        self._session_status = "linking"
+        logger.info("[WHATSAPP-BAILEYS] qr.emitted len=%d", len(qr_str))
+
     async def _on_qr_ev(self, _client, qr_payload) -> None:
         """neonize emits the pairing string repeatedly while waiting
         for the user to scan. We render it once per emit and cache so
         ``/qr-status`` polls return the freshest value without
         re-rendering on every poll.
+
+        ``qr_payload`` is a ``QREv`` protobuf with a ``Codes`` field —
+        a list of pairing strings (whatsmeow rotates them every ~20 s
+        until the user scans). We always pick the first.
         """
+        qr_str = ""
         try:
-            qr_str = (
-                qr_payload.decode("utf-8") if isinstance(qr_payload, (bytes, bytearray))
-                else str(qr_payload)
-            )
+            codes = getattr(qr_payload, "Codes", None)
+            if codes:
+                first = codes[0]
+                qr_str = first.decode("utf-8") if isinstance(first, (bytes, bytearray)) else str(first)
+            elif isinstance(qr_payload, (bytes, bytearray)):
+                qr_str = qr_payload.decode("utf-8")
         except Exception:
+            logger.exception("[WHATSAPP-BAILEYS] qr.parse_failed")
             qr_str = ""
         if not qr_str:
+            logger.warning("[WHATSAPP-BAILEYS] qr.empty payload_type=%s", type(qr_payload).__name__)
             return
         self._latest_qr = qr_str
         self._latest_qr_data_url = render_qr_png_data_url(qr_str)
