@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 import uuid
 
-from sqlalchemy import String, Text, DateTime, Integer, BigInteger, Boolean, ForeignKey, Index
+from sqlalchemy import String, Text, DateTime, Integer, BigInteger, Boolean, ForeignKey, Index, PrimaryKeyConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -81,6 +81,41 @@ class ApiKey(Base):
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class WhatsAppInboundDedupe(Base):
+    """Persistent dedupe of WhatsApp Cloud API inbound webhook messages.
+
+    Meta retries webhook deliveries when the receiving endpoint returns a
+    non-2xx, times out, or the connection drops mid-response. The retry
+    cadence is roughly 0s / 30s / 5min / 30min / ... within a 7-day window.
+    Without this table every retry would re-run the LLM, double-charge the
+    user, and post duplicate replies.
+
+    On every inbound webhook the channel adapter calls ``claim(user_id,
+    message_id)`` BEFORE dispatch. ``claim`` is a single ``INSERT ... ON
+    CONFLICT DO NOTHING`` that returns True only the first time the
+    composite key is seen. A periodic sweep deletes rows older than the
+    retention window (default 20 minutes — comfortably longer than Meta's
+    initial retry burst, short enough to keep the table tiny).
+
+    Survives container restarts on purpose: an in-memory dedupe would lose
+    state during the agent's boot window, which is exactly when Meta is
+    most likely to redeliver (if the previous instance went down mid-POST).
+    """
+
+    __tablename__ = "whatsapp_inbound_dedupe"
+
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    message_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("user_id", "message_id", name="pk_whatsapp_inbound_dedupe"),
+        Index("ix_whatsapp_inbound_dedupe_received_at", "received_at"),
+    )
 
 
 class AgentConfig(Base):
@@ -171,6 +206,19 @@ class AgentConfig(Base):
     slack_app_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     whatsapp_phone_number_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     whatsapp_access_token: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # Webhook verification token. User picks any string and pastes the same
+    # value into the Meta App webhook configuration. Compared in
+    # constant-time during the GET /api/whatsapp/webhook handshake.
+    whatsapp_verify_token: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # App Secret from Meta App → Settings → Basic. Used to verify the
+    # X-Hub-Signature-256 header on every inbound webhook POST. If null,
+    # signature verification is skipped (and a warning is logged at boot
+    # so operators see the security degrade explicitly).
+    whatsapp_app_secret: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    # Set the first time the agent successfully receives a non-handshake
+    # POST on /api/whatsapp/webhook. Surfaces a "Connected" badge in the
+    # Settings UI; cleared on disconnect.
+    whatsapp_connected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # Step 4: Services
     brave_api_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

@@ -36,7 +36,7 @@ FROZEN_FIELDS: Set[str] = {
     "database_url", "jwt_secret", "jwt_algorithm",
     "telegram_bot_token", "discord_bot_token",
     "slack_bot_token", "slack_app_token", "whatsapp_access_token",
-    "whatsapp_app_secret",
+    "whatsapp_app_secret", "whatsapp_verify_token",
 }
 
 

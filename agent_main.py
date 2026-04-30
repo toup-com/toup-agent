@@ -680,17 +680,27 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ Slack error: {e}")
 
     # ── WhatsApp Channel ──────────────────────────────────────
+    # The inbound message callback is wired BEFORE start() to avoid a
+    # startup race where Meta posts a webhook before the handler is set.
     whatsapp_channel = None
     if settings.whatsapp_phone_number_id and settings.whatsapp_access_token:
         try:
             from app.agent.channels.whatsapp_channel import WhatsAppChannel
             from app.agent.channels.registry import ChannelRegistry
+            from app.agent.channels.shared import make_channel_handler
             whatsapp_channel = WhatsAppChannel(
                 phone_number_id=settings.whatsapp_phone_number_id,
                 access_token=settings.whatsapp_access_token,
                 verify_token=settings.whatsapp_verify_token,
                 app_secret=settings.whatsapp_app_secret,
                 allowed_numbers=settings.whatsapp_allowed_numbers or None,
+            )
+            whatsapp_channel.set_message_callback(
+                make_channel_handler(
+                    channel=whatsapp_channel,
+                    agent_runner=agent_runner,
+                    user_id=settings.user_id,
+                )
             )
             whatsapp_channel.register_routes(app)
             await whatsapp_channel.start()
@@ -1045,6 +1055,20 @@ async def agent_health():
     import time as _time
     uptime = _time.time() - _app_start_time if _app_start_time else 0
     from app.services.model_resolver import default_model
+
+    # WhatsApp surfaces a rich status object so an operator can
+    # diagnose "is it working?" without SSHing into the container.
+    # Falls back to "disabled" when no creds are configured at all.
+    try:
+        from app.agent.channels.whatsapp_channel import get_active_channel
+        _wa_channel = get_active_channel()
+        whatsapp_status = (
+            _wa_channel.health() if _wa_channel
+            else ("configured" if settings.whatsapp_phone_number_id else "disabled")
+        )
+    except Exception:
+        whatsapp_status = "disabled"
+
     return {
         "status": "healthy",
         "version": _agent_version,
@@ -1059,7 +1083,7 @@ async def agent_health():
             "telegram": "enabled" if settings.telegram_bot_token else "disabled",
             "discord": "enabled" if settings.discord_bot_token else "disabled",
             "slack": "enabled" if settings.slack_bot_token else "disabled",
-            "whatsapp": "enabled" if settings.whatsapp_phone_number_id else "disabled",
+            "whatsapp": whatsapp_status,
         },
     }
 

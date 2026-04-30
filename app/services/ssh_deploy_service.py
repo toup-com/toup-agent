@@ -1349,6 +1349,8 @@ def generate_env_content(
     slack_app_token: str = "",
     whatsapp_phone_number_id: str = "",
     whatsapp_access_token: str = "",
+    whatsapp_verify_token: str = "",
+    whatsapp_app_secret: str = "",
     brave_api_key: str = "",
     elevenlabs_api_key: str = "",
     toup_token: str = "",
@@ -1445,6 +1447,10 @@ def generate_env_content(
         channel_lines.append(f"WHATSAPP_PHONE_NUMBER_ID={whatsapp_phone_number_id}")
     if whatsapp_access_token:
         channel_lines.append(f"WHATSAPP_ACCESS_TOKEN={whatsapp_access_token}")
+    if whatsapp_verify_token:
+        channel_lines.append(f"WHATSAPP_VERIFY_TOKEN={whatsapp_verify_token}")
+    if whatsapp_app_secret:
+        channel_lines.append(f"WHATSAPP_APP_SECRET={whatsapp_app_secret}")
     if channel_lines:
         lines.extend(["", "# --- Channels ---"] + channel_lines)
 

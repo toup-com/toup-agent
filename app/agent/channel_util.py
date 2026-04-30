@@ -34,6 +34,7 @@ KNOWN_CHANNELS = frozenset({
     "telegram",
     "discord",
     "slack",
+    "whatsapp",
     "vibecoding",
     "agent",  # internal / legacy
 })
