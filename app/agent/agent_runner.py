@@ -664,13 +664,17 @@ class AgentRunner:
                         # so the user sees the real cause, not a spurious "key missing"
                         # from the other provider.
                         from app.services.key_provider import keys as _keys
+                        from app.services.model_resolver import (
+                            default_anthropic_model as _default_anthropic_model,
+                            default_openai_model as _default_openai_model,
+                        )
                         primary_is_claude = _is_claude_model(active_model)
                         fallback = None
                         if _should_cross_provider and primary_is_claude and _keys.has_openai:
-                            fallback = "gpt-5.4"
+                            fallback = _default_openai_model()
                             logger.warning(f"[AGENT] {type(e).__name__} on {active_model}, crossing to OpenAI fallback {fallback}")
                         elif _should_cross_provider and not primary_is_claude and _keys.has_anthropic:
-                            fallback = "claude-opus-4-7"
+                            fallback = _default_anthropic_model()
                             logger.warning(f"[AGENT] {type(e).__name__} on {active_model}, crossing to Anthropic fallback {fallback}")
                         else:
                             configured = settings.agent_fallback_model

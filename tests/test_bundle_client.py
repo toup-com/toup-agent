@@ -16,6 +16,15 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import pytest
+import pytest_asyncio
+
+
+# Override the suite-wide DB autouse fixture; these tests don't touch DB.
+# Without this, sync tests collide with the async fixture's teardown and
+# emit `Connection._cancel was never awaited` errors.
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_database():
+    yield
 
 
 def _bundle_settings(llm_mode: str = "bundle", toup_token: str = "toup_ct_test_xyz",
@@ -122,11 +131,21 @@ def test_byok_anthropic_falls_back_to_direct_when_not_bundle():
     assert client.api_key == "sk-ant-api03-USERKEY"
 
 
-def test_byok_oauth_token_uses_claude_code_headers():
-    """sk-ant-oat tokens are Claude Code OAuth — caller wants the
-    claude-code beta headers + claude-code user-agent. Only meaningful
-    in BYOK; bundle proxy never sees these tokens."""
-    from app.services.bundle_client import make_anthropic_client
+def test_byok_oauth_token_uses_claude_cli_identity():
+    """sk-ant-oat tokens are Claude Code OAuth. The wire identity must
+    match the actual Claude Code CLI's outbound signature so Anthropic
+    classifies traffic into the same entitlement / billing bucket the
+    user's CLI sessions consume from. Only meaningful in BYOK; bundle
+    proxy never sees these tokens.
+
+    Source: anthropics/claude-code release 2.1.2 (verified 2026-04-27).
+    """
+    from app.services.bundle_client import (
+        make_anthropic_client,
+        _CLAUDE_CLI_USER_AGENT,
+        _CLAUDE_CLI_X_APP,
+        _CLAUDE_CODE_BETA,
+    )
 
     with _bundle_settings(llm_mode="manual", toup_token=""):
         client = make_anthropic_client(byok_key="sk-ant-oat01-OAUTHTOKEN")
@@ -134,11 +153,33 @@ def test_byok_oauth_token_uses_claude_code_headers():
     assert client is not None
     # OAuth path sets static headers on the http_client; assert at that layer.
     ua = client._client.headers.get("user-agent", "")
-    assert "claude-code" in ua, f"OAuth path must use claude-code UA, got: {ua!r}"
-    # Beta headers come via SDK default_headers
+    assert ua == _CLAUDE_CLI_USER_AGENT, (
+        f"OAuth path must send the exact Claude Code CLI user-agent; got: {ua!r}"
+    )
+    # x-app + anthropic-beta come via SDK default_headers.
     default_h = getattr(client, "default_headers", {}) or {}
-    assert "anthropic-beta" in default_h
-    assert "claude-code-20250219" in default_h["anthropic-beta"]
+    assert default_h.get("x-app") == _CLAUDE_CLI_X_APP, (
+        f"OAuth path must send x-app: {_CLAUDE_CLI_X_APP!r}; got: {default_h.get('x-app')!r}"
+    )
+    assert default_h.get("anthropic-beta") == _CLAUDE_CODE_BETA
+
+
+def test_oauth_headers_match_canonical_constants():
+    """The CLI identity is defined in exactly one place — `bundle_client`'s
+    module-private constants. Any client-construction site that bypasses
+    this factory will drift; this test pins the constants so the
+    decision is auditable."""
+    from app.services.bundle_client import (
+        _CLAUDE_CLI_USER_AGENT,
+        _CLAUDE_CLI_X_APP,
+        _CLAUDE_CODE_BETA,
+    )
+
+    # If you bump the CLI version, update these assertions in lockstep
+    # so the source-of-truth for the identity travels with the test.
+    assert _CLAUDE_CLI_USER_AGENT == "claude-cli/2.1.2 (external, cli)"
+    assert _CLAUDE_CLI_X_APP == "cli"
+    assert _CLAUDE_CODE_BETA == "claude-code-20250219,oauth-2025-04-20"
 
 
 def test_returns_none_when_not_bundle_and_no_byok_key():

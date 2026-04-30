@@ -1725,8 +1725,13 @@ async def _run_browser_agent_inner(
     _use_claude = _ant_key and (_ant_key.startswith("sk-ant-api") or _ant_key.startswith("sk-ant-oat"))
 
     # Model override from frontend selector
-    _requested_model = model_override or "claude-opus-4-6"
-    _is_openai_model = _requested_model.startswith("gpt-") or _requested_model.startswith("o1-") or _requested_model.startswith("o3-")
+    from app.services.model_resolver import (
+        default_model as _default_model,
+        default_openai_model as _default_openai_model,
+        is_openai_model as _is_openai_model_fn,
+    )
+    _requested_model = model_override or _default_model()
+    _is_openai_model = _is_openai_model_fn(_requested_model)
 
     from app.services.bundle_client import make_openai_client, make_anthropic_client
 
@@ -1756,7 +1761,7 @@ async def _run_browser_agent_inner(
         _llm_provider = "anthropic"
     else:
         client = make_openai_client()
-        model = _requested_model if _is_openai_model else "gpt-5.4"
+        model = _requested_model if _is_openai_model else _default_openai_model()
         _llm_provider = "openai"
 
     # OAuth tool name mapping — Claude Code OAuth requires canonical tool names

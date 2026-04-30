@@ -204,6 +204,14 @@ async def init_db():
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_anthropic_daily_cap_cents INTEGER DEFAULT 100",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_period_start TIMESTAMP",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS bundle_period_end TIMESTAMP",
+        # Auto-builder Planner/Builder split (migration 029).
+        # NULL means "fall through to agent_model" — see model_resolver.app_builder_*_model().
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS app_builder_planner_model VARCHAR(50)",
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS app_builder_builder_model VARCHAR(50)",
+        # Drop the stale agent_model server_default (was 'gpt-5.2' in migration 015).
+        # Existing rows are untouched here; the matching alembic migration 029 does
+        # the gpt-5.2 → NULL backfill on platform DBs.
+        "ALTER TABLE agent_configs ALTER COLUMN agent_model DROP DEFAULT",
         # ── VPS ──
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS hostinger_plan_id VARCHAR(50)",

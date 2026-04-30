@@ -141,12 +141,18 @@ class AnthropicService:
             and api_key
             and "sk-ant-oat" in api_key
         )
-        client = make_anthropic_client(byok_key=api_key or None)
-        if client is None:
-            logger.warning("Anthropic client could not be built (no key, not in bundle mode)")
-            self.client = anthropic.AsyncAnthropic(api_key="missing")
+        # bundle_client.make_anthropic_client returns None when there's no
+        # way to talk to a provider (no bundle, no BYOK key). Leaving
+        # self.client = None and surfacing an actionable error from the
+        # entry-point methods is cleaner than the previous sentinel that
+        # masked the cause as a generic "Incorrect API key provided: missing"
+        # 401 from Anthropic.
+        self.client = make_anthropic_client(byok_key=api_key or None)
+        if self.client is None:
+            logger.warning(
+                "Anthropic client could not be built (no key, not in bundle mode)"
+            )
             return
-        self.client = client
         logger.info("[ANTHROPIC] Client rebuilt (mode=%s, oauth=%s, v%d)",
                     settings.llm_mode, self.is_oauth, self._key_version)
     
@@ -197,6 +203,11 @@ class AnthropicService:
         """
         model = model or self.default_model
         self._ensure_client()
+        if self.client is None:
+            raise RuntimeError(
+                "Anthropic client is not configured. Add ANTHROPIC_API_KEY "
+                "(or activate bundle mode with TOUP_TOKEN) and try again."
+            )
         max_tokens = max_tokens or self.default_max_tokens
         messages = _convert_messages_for_anthropic(messages)
 
@@ -287,6 +298,11 @@ class AnthropicService:
         tool use blocks, and the final message_end event.
         """
         self._ensure_client()
+        if self.client is None:
+            raise RuntimeError(
+                "Anthropic client is not configured. Add ANTHROPIC_API_KEY "
+                "(or activate bundle mode with TOUP_TOKEN) and try again."
+            )
         model = model or self.default_model
         max_tokens = max_tokens or self.default_max_tokens
         messages = _convert_messages_for_anthropic(messages)

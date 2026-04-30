@@ -2,9 +2,13 @@
 Model Router — simple key-based model selection.
 
 No classifier, no tiers. Just picks the best model based on available keys:
-  - Anthropic (with or without OpenAI): Claude Opus 4.6 for everything
-  - OpenAI only: GPT-5.4 for everything
-  - Rate limit / auth fallback: cross to the other provider
+  - Anthropic key available: agent default (resolved through model_resolver)
+  - OpenAI key only:         cross-provider fallback (also resolved)
+  - No keys:                 agent default (will fail, but sane default)
+
+All literal model strings live in `app.services.model_resolver`. To
+upgrade the platform-wide default, change `settings.agent_model`
+(env var `AGENT_MODEL`).
 
 Voice:
   - Both keys: OpenAI realtime (default)
@@ -17,13 +21,18 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from app.config import settings
+from app.services.model_resolver import (
+    default_model,
+    default_fallback_model,
+    is_claude_model,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def _is_claude_model(model: str) -> bool:
-    """Check if a model name refers to an Anthropic Claude model."""
-    return model.startswith("claude-")
+    """Backwards-compatible local alias for resolver's classifier."""
+    return is_claude_model(model)
 
 
 @dataclass
@@ -48,16 +57,21 @@ def classify_request(
 
     Priority:
       1. Bundle mode: respect `preferred_provider` (anthropic/openai). Both
-         providers are reachable via the proxy regardless of local keys.
-      2. BYOK Anthropic key → Claude Opus 4.7
-      3. BYOK OpenAI key    → GPT-5.4
-      4. No keys + no bundle → Claude Opus 4.7 (sane default; will fail)
+         providers are reachable via the proxy regardless of local keys;
+         the model id is resolved through `model_resolver`.
+      2. BYOK Anthropic key → agent default model (model_resolver)
+      3. BYOK OpenAI key    → cross-provider fallback (model_resolver)
+      4. No keys + no bundle → agent default (will fail, but sane default)
 
     Bundle subscribers always have BOTH providers available through the
     Toup proxy, so the local key_provider check (which sees no keys for
     bundle agents) would always fall through to the default — not what
     the user wants. The preferred_provider arg lets the caller (the chat
     handler) pass the user's choice from agent_configs.preferred_provider.
+
+    All literal model strings live in `app.services.model_resolver`. To
+    upgrade the platform-wide default, change `settings.agent_model`
+    (env var `AGENT_MODEL`).
     """
     from app.services.key_provider import keys
     from app.config import settings
@@ -66,13 +80,13 @@ def classify_request(
     if settings.llm_mode == "bundle" and settings.toup_token:
         choice = (preferred_provider or "anthropic").lower()
         if choice == "openai":
-            model = "gpt-5.4"
-            label = "GPT-5.4"
-            reason = f"bundle mode + preferred=openai"
+            model = default_fallback_model()
+            label = model
+            reason = f"bundle mode + preferred=openai → {model}"
         else:
-            model = "claude-opus-4-7"
-            label = "Claude Opus 4.7"
-            reason = f"bundle mode + preferred=anthropic"
+            model = default_model()
+            label = model
+            reason = f"bundle mode + preferred=anthropic → {model}"
         logger.info(f"[ROUTER] {reason}")
         return RoutingDecision(
             tier="default", model=model, label=label, confidence=1.0, reason=reason,
@@ -80,18 +94,16 @@ def classify_request(
 
     # BYOK paths
     if keys.has_anthropic:
-        model = "claude-opus-4-7"
-        label = "Claude Opus 4.7"
-        reason = "anthropic key available → opus"
+        model = default_model()
+        reason = f"anthropic key available → {model}"
     elif keys.has_openai:
-        model = "gpt-5.4"
-        label = "GPT-5.4"
-        reason = "openai key only → gpt-5.4"
+        model = default_fallback_model()
+        reason = f"openai key only → {model}"
     else:
-        model = "claude-opus-4-7"
-        label = "Claude Opus 4.7"
-        reason = "no keys → default opus"
+        model = default_model()
+        reason = f"no keys → default {model}"
 
+    label = model  # downstream UI prettifies; logs use id directly
     logger.info(f"[ROUTER] {reason}")
 
     return RoutingDecision(

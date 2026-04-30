@@ -64,8 +64,9 @@ class LLMService:
         if self._use_anthropic:
             logger.info("LLMService: using Anthropic backend")
             from app.services.anthropic_service import AnthropicService
+            from app.services.model_resolver import default_anthropic_model
             self._anthropic_svc = AnthropicService()
-            self.default_model = settings.agent_model or "claude-sonnet-4-6"
+            self.default_model = settings.agent_model or default_anthropic_model()
         else:
             from app.services.bundle_client import make_openai_client
             from openai import AsyncOpenAI

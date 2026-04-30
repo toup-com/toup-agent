@@ -42,6 +42,7 @@ from app.api.day_chats import router as day_chats_router
 from app.api.chat import router as chat_router
 from app.api.ws_chat import router as ws_chat_router, set_ws_refs, broadcast_to_user
 from app.api.api_v1 import router as api_v1_router
+from app.api.models import router as models_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router, set_voice_refs
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
@@ -977,6 +978,7 @@ app.include_router(day_chats_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
 app.include_router(ws_chat_router, prefix=settings.api_prefix)
 app.include_router(api_v1_router, prefix=settings.api_prefix)
+app.include_router(models_router, prefix=settings.api_prefix)    # GET /api/models — model registry
 app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
@@ -1001,6 +1003,14 @@ try:
     app.mount("/api/app-mcp", mcp_app)
 except Exception as _mcp_err:
     print(f"⚠️ App MCP server not mounted: {_mcp_err}")
+
+
+def _resolved_default_model() -> str:
+    """Lazy resolver call so health endpoints report the actual default
+    a tenant call would resolve to, not whatever stale value was on
+    `settings.agent_model` at import time."""
+    from app.services.model_resolver import default_model
+    return default_model()
 
 
 @app.get("/")
@@ -1034,12 +1044,16 @@ async def root():
 async def agent_health():
     import time as _time
     uptime = _time.time() - _app_start_time if _app_start_time else 0
+    from app.services.model_resolver import default_model
     return {
         "status": "healthy",
         "version": _agent_version,
         "mode": "agent",
         "uptime_seconds": round(uptime, 1),
-        "agent_model": settings.agent_model,
+        # Reports the actual resolved default — what the runtime will use —
+        # not just the raw settings field. Closes the gap where /agent/health
+        # advertised a stale model after a settings.agent_model bump.
+        "agent_model": default_model(),
         "boot_progress": _boot_progress,
         "channels": {
             "telegram": "enabled" if settings.telegram_bot_token else "disabled",
@@ -1162,7 +1176,8 @@ async def agent_system_info():
         "hostname": os.uname().nodename if hasattr(os, "uname") else "unknown",
         "uptime_seconds": round(uptime, 1),
         "apps_running": apps_running,
-        "agent_model": settings.agent_model,
+        # Resolved default — see /agent/health for the same rationale.
+        "agent_model": _resolved_default_model(),
         "version": "6.0.0",
     }
 

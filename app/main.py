@@ -23,6 +23,7 @@ from app.api.soul import router as soul_router
 from app.api.api_v1 import router as api_v1_router
 from app.api.graph import router as graph_router
 from app.api.feedback import router as feedback_router
+from app.api.models import router as models_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 # Chat routers
 from app.api.chat import router as chat_router
@@ -399,6 +400,7 @@ app.include_router(soul_router, prefix=settings.api_prefix)
 app.include_router(api_v1_router, prefix=settings.api_prefix)
 app.include_router(graph_router, prefix=settings.api_prefix)  # Entity graph API
 app.include_router(feedback_router, prefix=settings.api_prefix)  # Phase 5: Retrieval feedback
+app.include_router(models_router, prefix=settings.api_prefix)    # GET /api/models — model registry
 app.include_router(webhooks_router, prefix=settings.api_prefix)  # Webhook triggers
 # Chat
 app.include_router(sessions_router, prefix=settings.api_prefix)
@@ -454,6 +456,8 @@ async def health():
 
     uptime = _time.time() - _app_start_time if _app_start_time else 0
 
+    from app.services.model_resolver import default_model as _default_model
+
     return {
         "status": "healthy" if db_status == "connected" else "degraded",
         "version": "6.0.0",
@@ -461,7 +465,9 @@ async def health():
         "database": db_status,
         "embedding_model": settings.embedding_model,
         "chat_model": settings.default_model,
-        "agent_model": settings.agent_model,
+        # Resolved default — tracks settings.agent_model + per-tenant
+        # overrides + canonical fallback through `model_resolver`.
+        "agent_model": _default_model(),
         "thinking_budget": settings.thinking_budget_default,
         "tts_mode": settings.tts_auto_mode,
         "platform": "Toup Agent Platform v6",

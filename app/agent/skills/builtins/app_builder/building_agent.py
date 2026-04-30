@@ -103,9 +103,10 @@ async def run_building_questions(
     questions = await call_llm(
         system_prompt=BUILDING_SYSTEM_PROMPT,
         user_message=user_message,
-        model="",  # dynamic — _call_llm picks best available provider
+        model="",  # dynamic — _call_llm resolves via planner role
         purpose="building_agent_questions",
         max_tokens=4000,
+        role="planner",
     )
 
     return questions.strip()

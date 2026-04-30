@@ -606,12 +606,14 @@ async def _vision_solve_image_captcha(screenshot_bytes: bytes, instruction: str)
         else:
             _headers["x-api-key"] = api_key
 
+        from app.services.model_resolver import default_anthropic_model
+
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers=_headers,
                 json={
-                    "model": "claude-opus-4-6",
+                    "model": default_anthropic_model(),
                     "max_tokens": 100,
                     "messages": [{
                         "role": "user",

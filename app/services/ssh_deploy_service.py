@@ -1341,7 +1341,7 @@ def generate_env_content(
     groq_api_key: str = "",
     xai_api_key: str = "",
     deepseek_api_key: str = "",
-    agent_model: str = "claude-sonnet-4-6",
+    agent_model: str = "",   # empty → caller / resolver supplies the agent default at deploy-time
     llm_mode: str = "manual",
     telegram_bot_token: str = "",
     discord_bot_token: str = "",
@@ -1403,7 +1403,12 @@ def generate_env_content(
         lines.append(f"XAI_API_KEY={xai_api_key}")
     if deepseek_api_key:
         lines.append(f"DEEPSEEK_API_KEY={deepseek_api_key}")
-    lines.append(f"AGENT_MODEL={agent_model}")
+    # Empty agent_model omits the line entirely so the deployed agent
+    # falls through to its own settings.agent_model default (resolved
+    # via app.services.model_resolver). Avoids baking a stale literal
+    # into per-tenant .env files.
+    if agent_model:
+        lines.append(f"AGENT_MODEL={agent_model}")
 
     # Workspace (local mode uses agent dir, not /app)
     lines.extend([

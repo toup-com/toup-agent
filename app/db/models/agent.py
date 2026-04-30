@@ -113,7 +113,24 @@ class AgentConfig(Base):
     xai_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     deepseek_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     agent_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    agent_model: Mapped[str] = mapped_column(String(50), default="claude-opus-4-6")
+    # NULL = "follow platform default at use-time via model_resolver.default_model()".
+    # The old "claude-opus-4-6" hardcoded default predated the resolver; new rows
+    # now correctly inherit from settings.agent_model. Migration 029 dropped the
+    # stale server_default and backfilled lingering gpt-5.2 rows to NULL.
+    agent_model: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # Auto-builder Planner/Builder split (migration 029). NULL on either column
+    # means "fall through to agent_model" — see model_resolver.app_builder_*_model().
+    app_builder_planner_model: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    app_builder_builder_model: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # User's preferred LLM provider for bundle mode (anthropic | openai).
+    # Routes which model the model_router picks when no explicit override.
+    # Bundle subscribers can flip this from /agent/settings without code
+    # changes — useful for "I want my agent on GPT" preferences. Default
+    # 'anthropic' matches today's behavior.
+    preferred_provider: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="anthropic", server_default="anthropic"
+    )
 
     # User's preferred LLM provider for bundle mode (anthropic | openai).
     # Routes which model the model_router picks when no explicit override.

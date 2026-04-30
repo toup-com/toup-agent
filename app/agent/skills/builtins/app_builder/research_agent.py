@@ -384,6 +384,7 @@ async def _run_research_inner(
         model="",
         purpose="research_agent_questions",
         max_tokens=4000,
+        role="planner",
     )
     logger.info("%s Step 3 done in %.1fs — %d chars", log_prefix, time.time() - t3, len(questions))
 
@@ -410,5 +411,6 @@ async def _generate_fallback_questions(
         model="",
         purpose="research_fallback_questions",
         max_tokens=4000,
+        role="planner",
     )
     return questions.strip()

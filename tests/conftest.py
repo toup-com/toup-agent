@@ -68,12 +68,22 @@ def _build_test_app() -> FastAPI:
 
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_database():
-    """Fresh in-memory schema for every test — no cross-test pollution."""
+    """Fresh schema for every test — no cross-test pollution.
+
+    Disposes the engine after each test so connections are released back to
+    Postgres. Without this, the module-level engine accumulates connections
+    across per-test event loops and exhausts `max_connections=100` after a
+    few dozen tests — surfacing as `TooManyConnectionsError` (1145 in a
+    full run) and `RuntimeError: Event loop is closed` (118) when the pool
+    tries to terminate stale connections on already-closed loops.
+    """
     from app.db import init_db, drop_db
+    from app.db.database import engine
 
     await init_db()
     yield
     await drop_db()
+    await engine.dispose()
 
 
 @pytest_asyncio.fixture

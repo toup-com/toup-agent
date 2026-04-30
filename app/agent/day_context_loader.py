@@ -86,7 +86,7 @@ def annotate_message(
 async def load_day_context(
     db: AsyncSession,
     day_chat_id: str,
-    model: str = "claude-opus-4-6",
+    model: str = "",  # empty → resolves to model_resolver.default_model() below
     model_context_tokens: int = 200_000,
     calling_channel: Optional[str] = None,
     tz_name: Optional[str] = None,
@@ -105,6 +105,10 @@ async def load_day_context(
     """
     from app.db.models import Message, Conversation
     from app.db.models.day_chat import DayChat
+
+    if not model:
+        from app.services.model_resolver import default_model
+        model = default_model()
 
     # Entry-log so operators can see per-channel load behavior in prod
     # without speculation. Part of the Rule 12 observability sweep.

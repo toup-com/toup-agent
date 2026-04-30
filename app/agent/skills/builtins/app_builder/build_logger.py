@@ -12,7 +12,7 @@ Log entry format:
     "level": "info",                     # info, warn, error, debug, success
     "step": "planning",                  # Current build step type
     "message": "Calling Claude Opus...", # Human-readable log line
-    "detail": "model=claude-opus-4-6",   # Optional extra context
+    "detail": "model=<resolved-id>",     # Optional extra context
     "meta": { ... }                      # Optional structured data (tokens, file sizes, etc.)
 }
 """
@@ -29,20 +29,22 @@ logger = logging.getLogger(__name__)
 class BuildLogger:
     """Captures structured logs for a single build job and broadcasts them."""
 
-    # Model context windows for token budget tracking
-    _MODEL_CONTEXT = {
-        "claude-opus-4-7": 1_000_000,
-        "claude-opus-4-6": 200_000,
-        "claude-sonnet-4-6": 200_000,
-        "claude-sonnet-4-5-20250514": 200_000,
-        "claude-sonnet-4-20250514": 200_000,
-        "gpt-5.4": 1_000_000,
-        "gpt-5.2": 400_000,
-        "gpt-5": 128_000,
-        "gpt-4o": 128_000,
-        "gpt-4o-mini": 128_000,
-    }
+    # Model context windows for token budget tracking — DELEGATED.
+    # The canonical source is `app.services.model_resolver.context_window_for(model)`,
+    # which wraps `app.agent.context_manager.MODEL_CONTEXT_WINDOWS`. The
+    # local `_MODEL_CONTEXT` dict that used to live here was a verbatim
+    # duplicate of that registry and drifted twice. Use the resolver via
+    # `_lookup_context_window()` below instead.
     _DEFAULT_CONTEXT = 200_000
+
+    @staticmethod
+    def _lookup_context_window(model: str) -> int:
+        """Resolve the context-window budget for a model id."""
+        try:
+            from app.services.model_resolver import context_window_for
+            return context_window_for(model)
+        except Exception:
+            return BuildLogger._DEFAULT_CONTEXT
 
     def __init__(
         self,
@@ -120,7 +122,7 @@ class BuildLogger:
 
     def set_model(self, model: str):
         """Set the model being used so we can track context budget accurately."""
-        self._model_context_window = self._MODEL_CONTEXT.get(model, self._DEFAULT_CONTEXT)
+        self._model_context_window = self._lookup_context_window(model)
 
     @property
     def context_usage_pct(self) -> float:

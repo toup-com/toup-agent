@@ -38,6 +38,26 @@ logger = logging.getLogger(__name__)
 _WAF_SAFE_UA = "toup-agent/1.0 (bundle-proxy)"
 
 
+# ── Claude Code CLI identity (OAuth-token traffic) ────────────────────
+# The actual Claude Code CLI's outbound request signature. Anthropic
+# classifies OAuth-token traffic into entitlement / billing buckets
+# via these headers; matching the real CLI is the safest bet for
+# consistent behaviour on Claude subscription tokens.
+#
+# Source: anthropics/claude-code release 2.1.2 (verified 2026-04-27).
+# Update both strings in lockstep when bumping to a newer CLI version.
+#
+# Decision history: previously we sent `claude-code/1.0.33` + `x-app:
+# claude-code`. That worked until shared-subscription debugging surfaced
+# evidence Anthropic may differentiate billing buckets by these strings.
+# Switched to the CLI's exact identity to match the bucket Claude Code
+# users would normally consume from. See docs/llm-model-refactor-plan.md
+# §2.1 for the full reasoning.
+_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.2 (external, cli)"
+_CLAUDE_CLI_X_APP = "cli"
+_CLAUDE_CODE_BETA = "claude-code-20250219,oauth-2025-04-20"
+
+
 def _bundle_active() -> bool:
     return settings.llm_mode == "bundle" and bool(settings.toup_token)
 
@@ -100,7 +120,8 @@ def make_anthropic_client(byok_key: Optional[str] = None):
     if not key:
         return None
 
-    # OAuth token (Claude Code style) needs special headers
+    # OAuth token (Claude Code style) — needs the CLI identity headers.
+    # See _CLAUDE_CLI_USER_AGENT / _CLAUDE_CLI_X_APP / _CLAUDE_CODE_BETA above.
     if "sk-ant-oat" in key:
         import os
         os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -108,11 +129,11 @@ def make_anthropic_client(byok_key: Optional[str] = None):
         return anthropic.AsyncAnthropic(
             auth_token=key,
             http_client=httpx.AsyncClient(
-                headers={"user-agent": "claude-code/1.0.33"},
+                headers={"user-agent": _CLAUDE_CLI_USER_AGENT},
             ),
             default_headers={
-                "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-                "x-app": "claude-code",
+                "anthropic-beta": _CLAUDE_CODE_BETA,
+                "x-app": _CLAUDE_CLI_X_APP,
             },
         )
     return anthropic.AsyncAnthropic(api_key=key)

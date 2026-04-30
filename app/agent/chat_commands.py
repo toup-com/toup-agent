@@ -164,7 +164,8 @@ class CommandRegistry:
         return {"text": f"Command /{name} not yet implemented."}
 
     async def _cmd_status(self, ctx: dict) -> dict:
-        model = ctx.get("model", "claude-opus-4-6")
+        from app.services.model_resolver import default_model
+        model = ctx.get("model") or default_model()
         uptime = ctx.get("uptime", 0)
         channel = ctx.get("channel", "unknown")
         session_id = ctx.get("session_id", "N/A")
@@ -173,9 +174,19 @@ class CommandRegistry:
         }
 
     async def _cmd_model(self, args: str, ctx: dict) -> dict:
+        from app.services.model_resolver import default_model, default_fallback_model
         if not args.strip():
-            current = ctx.get("model", "claude-opus-4-6")
-            available = ["claude-opus-4-6", "gpt-4o", "gpt-4o-mini", "claude-sonnet-4-20250514"]
+            current = ctx.get("model") or default_model()
+            # Surface a small set of likely-supported alternates. The
+            # canonical list lives in app.agent.model_providers / the
+            # /api/models endpoint; this is a chat-shortcut hint, not
+            # the source of truth.
+            available = sorted({
+                default_model(),
+                default_fallback_model(),
+                "gpt-4o",
+                "gpt-4o-mini",
+            })
             return {
                 "text": f"Current model: {current}\nAvailable: {', '.join(available)}\nUsage: /model <name>"
             }

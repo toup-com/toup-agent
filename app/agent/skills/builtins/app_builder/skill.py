@@ -1,8 +1,20 @@
 """
 App Builder Skill — Conversational app builder for React Native/Expo.
 
-The agent converses with the user (using Opus 4.6) to understand requirements,
-presents a plan for approval, then builds in the background (using Opus 4.7).
+The agent converses with the user to understand requirements, presents a
+plan for approval, then builds in the background. The two phases run as
+separate sub-agents:
+
+  - **Planner** — research, requirements gathering, plan synthesis,
+    modify-analysis. Resolves its model via
+    `app.services.model_resolver.app_builder_planner_model()`.
+  - **Builder** — file generation, JSON repair, retries on truncated
+    output. Resolves its model via
+    `app.services.model_resolver.app_builder_builder_model()`.
+
+Both default to the agent's `agent_model` when not split per-tenant —
+preserves single-model behaviour until an operator deliberately splits.
+
 After build, the user can preview and iterate.
 
 Tools:
@@ -1662,8 +1674,13 @@ class AppBuilderSkill(Skill):
         from app.db.models import App, BuildJob
         from .build_logger import BuildLogger
 
+        from app.services.model_resolver import app_builder_builder_model
         blog = BuildLogger(job_id, user_id, ws_broadcast=self._ws_broadcast)
-        blog.set_model(settings.agent_model or "claude-opus-4-7")
+        # Initial label — actual call-by-call model gets stamped via
+        # `_last_llm_provider` once the first LLM hop runs. Builder role
+        # is the right pre-label because the heavy file-generation phase
+        # dominates a build's runtime.
+        blog.set_model(app_builder_builder_model())
         blog.set_step("init")
         await blog.info(f"Starting build for '{name}'", f"app={app_id}")
         await blog.info(f"app_dir={app_dir} slug={slug}")
@@ -1902,6 +1919,7 @@ class AppBuilderSkill(Skill):
                                 user_message=fix_prompt,
                                 model="", purpose="repair_package_json",
                                 blog=blog,
+                                role="builder",   # JSON repair is part of the build phase
                             )
                             import re as _re
                             json_match = _re.search(r'\{[\s\S]*\}', fixed_json)
@@ -2389,7 +2407,8 @@ class AppBuilderSkill(Skill):
             )
 
             await blog.persist()
-            _actual_model = getattr(self, '_last_llm_provider', None) or "claude-opus-4-7"
+            from app.services.model_resolver import app_builder_builder_model as _builder_model_resolver
+            _actual_model = getattr(self, '_last_llm_provider', None) or _builder_model_resolver()
             async with async_session_maker() as db:
                 job = await db.get(BuildJob, job_id)
                 if job:
@@ -2494,6 +2513,7 @@ class AppBuilderSkill(Skill):
                     changes=_esc_fmt(changes),
                 ),
                 "Analyze which files need modification.",
+                role="planner",  # Modify-analysis is reasoning, not code-gen
                 blog=blog,
                 purpose="Modification analysis",
             )
@@ -2672,7 +2692,8 @@ class AppBuilderSkill(Skill):
             await self._update_step(job_id, user_id, "ready", "done")
 
             await blog.persist()
-            _actual_model = getattr(self, '_last_llm_provider', None) or "claude-opus-4-7"
+            from app.services.model_resolver import app_builder_builder_model as _builder_model_resolver
+            _actual_model = getattr(self, '_last_llm_provider', None) or _builder_model_resolver()
             async with async_session_maker() as db:
                 job = await db.get(BuildJob, job_id)
                 if job:
@@ -2722,6 +2743,7 @@ class AppBuilderSkill(Skill):
             llm_response = await self._call_llm(
                 PLANNING_PROMPT.format(description=_esc_plan(description), extra_context=_esc_plan(extra_context)),
                 "Plan this app and output JSON.",
+                role="planner",  # Architectural planning — reasoning sub-agent
                 blog=blog,
                 purpose="App architecture planning",
             )
@@ -2832,6 +2854,7 @@ class AppBuilderSkill(Skill):
                         prompt, f"Generate code for {file_path}",
                         blog=blog, purpose=f"Generate {file_path}",
                         max_tokens=32000,
+                        role="builder",
                     )
                     code = self._strip_fences(code)
 
@@ -2853,6 +2876,7 @@ class AppBuilderSkill(Skill):
                                 f"Generate code for {file_path} (retry — garbage response)",
                                 blog=blog, purpose=f"Retry {file_path} (garbage)",
                                 max_tokens=32000,
+                                role="builder",
                             )
                             code = self._strip_fences(code)
                         except Exception as retry_err:
@@ -2880,6 +2904,7 @@ class AppBuilderSkill(Skill):
                             retry_prompt, f"Generate code for {file_path} (retry — previous was truncated)",
                             blog=blog, purpose=f"Retry {file_path} (truncated)",
                             max_tokens=32000,
+                            role="builder",
                         )
                         code = self._strip_fences(code)
 
@@ -3746,8 +3771,21 @@ const _webDb = {
     async def _call_llm(
         self, system_prompt: str, user_message: str, model: str = "",
         blog=None, purpose: str = "", max_tokens: int = 32000,
+        role: str = "builder",
     ) -> str:
         """Call the best available LLM based on the user's configured API keys.
+
+        `role` selects the auto-builder sub-agent's default model when the
+        caller doesn't pass an explicit `model`. Two roles:
+          - "planner"  — conversational reasoning (research, analysis,
+                         requirements, plan synthesis). Resolves through
+                         model_resolver.app_builder_planner_model().
+          - "builder"  — code generation, file writes, JSON repair.
+                         Resolves through model_resolver.app_builder_builder_model().
+
+        Both default to the agent's default model when not configured
+        per-tenant — preserves today's single-model behaviour until an
+        operator splits them.
 
         Routing logic:
           1. If Anthropic key is available and valid → use Claude
@@ -3756,6 +3794,10 @@ const _webDb = {
           4. If both fail or neither key exists → raise with clear message
         """
         from app.services.key_provider import keys
+        from app.services.model_resolver import (
+            app_builder_planner_model,
+            app_builder_builder_model,
+        )
 
         anthropic_key = keys.anthropic or ""
         openai_key = keys.openai or ""
@@ -3766,16 +3808,24 @@ const _webDb = {
                 "No LLM API key configured. Add ANTHROPIC_API_KEY or OPENAI_API_KEY in Settings."
             )
 
+        # Resolve role default when the caller didn't pin a model.
+        if not model:
+            model = (
+                app_builder_planner_model()
+                if role == "planner"
+                else app_builder_builder_model()
+            )
+
         # ── Try Anthropic first (if key exists) ──────────────────────
         if anthropic_key:
             try:
                 result = await self._call_anthropic(
                     system_prompt, user_message,
-                    model=model or "claude-opus-4-7",
+                    model=model,
                     anthropic_key=anthropic_key,
                     max_tokens=max_tokens, blog=blog, purpose=purpose,
                 )
-                self._last_llm_provider = f"anthropic/{model or 'claude-opus-4-7'}"
+                self._last_llm_provider = f"anthropic/{model}"
                 return result
             except TokenLimitError:
                 # Rate-limit / overload — only pause if no OpenAI fallback
@@ -3828,22 +3878,14 @@ const _webDb = {
         from app.services.bundle_client import make_anthropic_client
 
         # OAuth (sk-ant-oat) only meaningful in BYOK; bundle proxy never sees it.
+        # The detection here is reused below to decide whether `_sys` needs the
+        # Claude Code identity prefix block (a prompt-structure concern, not a
+        # client-construction one). All wire-level header / OAuth-token logic
+        # is centralised in `bundle_client.make_anthropic_client`.
         is_oauth = (_settings.llm_mode != "bundle") and "sk-ant-oat" in (anthropic_key or "")
-        if is_oauth:
-            import os
-            os.environ.pop("ANTHROPIC_API_KEY", None)
-            client = anthropic.AsyncAnthropic(
-                auth_token=anthropic_key,
-                default_headers={
-                    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-                    "user-agent": "claude-cli/2.1.2 (external, cli)",
-                    "x-app": "cli",
-                },
-            )
-        else:
-            client = make_anthropic_client(byok_key=anthropic_key)
-            if client is None:
-                raise RuntimeError("No Anthropic client available (no key, not in bundle mode)")
+        client = make_anthropic_client(byok_key=anthropic_key)
+        if client is None:
+            raise RuntimeError("No Anthropic client available (no key, not in bundle mode)")
 
         _sys = ([
             {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
@@ -3910,12 +3952,15 @@ const _webDb = {
     @staticmethod
     def _resolve_openai_model() -> str:
         """Pick the right OpenAI model name. Never pass a Claude model to OpenAI."""
+        from app.services.model_resolver import default_openai_model, is_claude_model
         from app.config import settings
-        model = settings.agent_model or ""
-        # If the configured model is a Claude model (or blank), use gpt-5.4 (best for code gen)
-        if not model or "claude" in model.lower() or "haiku" in model.lower() or "sonnet" in model.lower() or "opus" in model.lower():
-            return "gpt-5.4"
-        return model
+        configured = settings.agent_model or ""
+        # If the configured agent model is Claude (or unset), pick the
+        # canonical OpenAI default from the resolver (best for code gen).
+        # Otherwise the configured model is already an OpenAI model, use it.
+        if not configured or is_claude_model(configured):
+            return default_openai_model()
+        return configured
 
     async def _call_openai(
         self, system_prompt: str, user_message: str,

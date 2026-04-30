@@ -67,7 +67,12 @@ class Settings(BaseSettings):
     
     # Anthropic Claude (kept for future use)
     anthropic_api_key: Optional[str] = None  # Set via ANTHROPIC_API_KEY env var
-    anthropic_model: str = "claude-opus-4-7"  # Default Claude model
+    # DEPRECATED: prefer `agent_model`. Kept here so existing .env files in
+    # the wild don't fail validation (pydantic-settings rejects unknown env
+    # vars). `model_resolver.default_anthropic_model()` reads it only as a
+    # last-resort fallback when the primary model is OpenAI; otherwise
+    # ignored at runtime. Slated for removal in a future config sweep.
+    anthropic_model: str = "claude-opus-4-7"
     anthropic_max_tokens: int = 16000
     
     # LLM Provider Keys (set by platform setup wizard)
@@ -81,6 +86,11 @@ class Settings(BaseSettings):
     # Agent Runtime
     agent_model: str = "claude-opus-4-7"  # Primary agent model
     agent_fallback_model: str = "gpt-5.4"  # Fallback if primary model fails (cross-provider)
+    # Auto-builder Planner/Builder model overrides. None means "share the
+    # agent's default model" — both phases use `agent_model` unless an
+    # operator deliberately splits them. See model_resolver.app_builder_*_model().
+    app_builder_planner_model: Optional[str] = None
+    app_builder_builder_model: Optional[str] = None
     agent_max_tokens: int = 16000  # Max output tokens for agent
     agent_max_tool_iterations: int = 40  # Max tool call loops before forcing stop
     agent_workspace_dir: str = "/app/workspace"  # Working directory for file operations

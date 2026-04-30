@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 # Fields that are safe to reload at runtime
 RELOADABLE_FIELDS: Set[str] = {
     "temperature", "max_tokens", "agent_model", "agent_fallback_model",
+    # Auto-builder split — keep in lockstep with config.py + model_resolver.
+    "app_builder_planner_model", "app_builder_builder_model",
     "agent_max_tokens", "agent_max_tool_iterations", "thinking_budget_default",
     "thinking_model_override", "memory_recall_limit", "similarity_threshold",
     "max_history_messages", "auto_extract_memories", "tts_auto_mode",

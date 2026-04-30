@@ -63,12 +63,19 @@ class SessionStatus:
         }
 
 
+def _default_model_str() -> str:
+    """Lazy resolver call so `model_resolver` is imported only at use-time
+    (avoids circular import + boot-order issues for dataclass defaults)."""
+    from app.services.model_resolver import default_model
+    return default_model()
+
+
 @dataclass
 class AgentInfo:
     """Information about an available agent."""
     agent_id: str
     name: str
-    model: str = "claude-opus-4-6"
+    model: str = field(default_factory=_default_model_str)
     description: str = ""
     tools: List[str] = field(default_factory=list)
     max_sessions: int = 10
@@ -99,7 +106,7 @@ class SessionManager:
         self._agents["default"] = AgentInfo(
             agent_id="default",
             name="Toup Agent",
-            model="claude-opus-4-6",
+            model=_default_model_str(),
             description="Primary Toup agent",
             tools=["read_file", "write_file", "edit_file", "exec", "web_search", "web_fetch"],
         )
@@ -107,7 +114,7 @@ class SessionManager:
     def create_session(
         self,
         kind: SessionKind = SessionKind.MAIN,
-        model: str = "claude-opus-4-6",
+        model: str = "",       # empty → resolves to model_resolver.default_model() below
         channel: str = "unknown",
         user_id: str = "",
         agent_id: str = "default",
@@ -116,7 +123,7 @@ class SessionManager:
         session = SessionStatus(
             session_id=str(uuid.uuid4()),
             kind=kind,
-            model=model,
+            model=model or _default_model_str(),
             channel=channel,
             user_id=user_id,
             agent_id=agent_id,
