@@ -77,7 +77,7 @@ slack-sdk>=3.27.0
 # the QR-pairing flow. The Go binary ships pre-built via PyPI wheels;
 # no Go toolchain needed at install time. session store lives at
 # /data/whatsapp/store.db per-tenant.
-neonize>=0.4
+neonize>=0.3.17
 # QR code rendering — turns neonize's pairing string into a PNG data URL
 # the frontend can render in its modal.
 qrcode[pil]>=7.4

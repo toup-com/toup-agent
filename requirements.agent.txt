@@ -58,7 +58,9 @@ slack-sdk>=3.27.0
 # (pre-built wheels on PyPI for Linux x86_64; no Go toolchain needed
 # at install time). qrcode renders neonize's pairing string into a
 # PNG data URL the Settings modal serves to the user.
-neonize>=0.4
+# Pinned to the 0.3.x line because that's the actual latest series
+# on PyPI (0.4 doesn't exist — earlier commit assumed wrongly).
+neonize>=0.3.17
 qrcode[pil]>=7.4
 
 # Anthropic
