@@ -188,7 +188,12 @@ async function createSocket() {
   const { version, isLatest } = await fetchLatestBaileysVersion();
   log('socket.creating', { version, isLatest, auth_dir: AUTH_DIR });
 
-  const baileysLogger = pino({ level: 'silent' });
+  // Bump to 'debug' temporarily — Baileys silently drops a *lot* of
+  // edge cases (history-sync stalls, decryption failures, prekey
+  // misses) that surface only at debug level. When messages.upsert
+  // refuses to fire, this is the only way to see what Baileys is
+  // actually doing on the wire.
+  const baileysLogger = pino({ level: process.env.WHATSAPP_BAILEYS_LOG_LEVEL || 'silent' }, pino.destination(2));
   const newSock = makeWASocket({
     auth: {
       creds: state.creds,
@@ -331,21 +336,72 @@ function wireSocket(s, saveCreds) {
   });
 
   s.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    log('messages.upsert', { type, count: messages?.length ?? 0 });
+    // Baileys 6.x emits inbound under several `type` values:
+    //   - "notify"  — fresh, real-time inbound (the case we care about)
+    //   - "append"  — newer-than-history append (e.g. self-sent from
+    //                 another device, or messages received during a
+    //                 brief disconnect that Baileys is replaying)
+    //   - "prepend" — backfill from history sync
+    //   - "replace" — edits / revoke
+    // We process notify + append; everything else is sync noise.
+    if (type !== 'notify' && type !== 'append') return;
     for (const m of messages) {
       try {
-        // Drop our own outbound echoes; drop status / system frames.
+        // Log the raw shape — incl. all JID-ish fields — so any future
+        // WhatsApp identity-format change surfaces from logs alone.
+        log('messages.upsert.entry', {
+          remoteJid: m.key?.remoteJid,
+          remoteJidAlt: m.key?.remoteJidAlt,
+          participant: m.key?.participant,
+          participantAlt: m.key?.participantAlt,
+          senderPn: m.key?.senderPn,
+          fromMe: m.key?.fromMe,
+          id: m.key?.id,
+          messageKeys: m.message ? Object.keys(m.message) : [],
+          pushName: m.pushName,
+        });
         if (m.key?.fromMe) continue;
         if (m.key?.remoteJid?.endsWith('@broadcast')) continue;
         if (m.key?.remoteJid?.endsWith('@g.us')) continue;  // skip groups for v1
         const text = extractText(m.message || {});
-        const fromJid = m.key?.remoteJid || '';
-        const fromE164 = jidToE164(fromJid);
+        // WhatsApp's 2024+ "LID" (Local IDentifier) privacy migration
+        // means inbound messages from individuals can have
+        // `remoteJid` as `<opaque>@lid` instead of the legacy
+        // `<phone>@s.whatsapp.net`. Baileys 6.7+ exposes the user's
+        // actual phone-number JID in alternative fields:
+        //   - key.remoteJidAlt   — for direct chats via LID
+        //   - key.senderPn       — explicit phone-number JID
+        //   - key.participantAlt — for group/multi-user contexts
+        // Fall back through them in order; if everything still
+        // resolves to LID, use the LID itself as the chat key. Tests
+        // can still allowlist by phone because senderPn or
+        // remoteJidAlt is preserved when present.
+        const candidateJids = [
+          m.key?.remoteJid,
+          m.key?.remoteJidAlt,
+          m.key?.senderPn,
+          m.key?.participant,
+          m.key?.participantAlt,
+        ].filter(Boolean);
+        let fromJid = m.key?.remoteJid || '';
+        let fromE164 = '';
+        for (const j of candidateJids) {
+          const e = jidToE164(j);
+          if (e) { fromE164 = e; fromJid = j; break; }
+        }
         const messageId = m.key?.id || '';
         const timestampMs = (m.messageTimestamp ? Number(m.messageTimestamp) * 1000 : Date.now());
-        if (!fromE164) continue;
+        if (!fromE164) {
+          log('inbound.dropped_no_e164', {
+            tried: candidateJids,
+            remoteJid: m.key?.remoteJid,
+          });
+          continue;
+        }
         inboundCount += 1;
         lastInboundAt = new Date().toISOString();
+        log('inbound.dispatching', { from: fromE164, text_len: text.length, msg_id: messageId });
         emitEvent({
           type: 'message',
           from: fromE164,
@@ -360,6 +416,19 @@ function wireSocket(s, saveCreds) {
       }
     }
   });
+
+  // Belt-and-suspenders: log every event Baileys fires so we can see
+  // if `messages.upsert` is genuinely silent or if the dispatch path
+  // is broken downstream.
+  const _origEmit = s.ev.emit?.bind(s.ev);
+  if (_origEmit) {
+    s.ev.emit = (event, ...args) => {
+      if (event !== 'creds.update' && event !== 'connection.update') {
+        log('baileys.event', { event });
+      }
+      return _origEmit(event, ...args);
+    };
+  }
 }
 
 /** Boot — resume if creds exist, otherwise wait for /pair/start. */
