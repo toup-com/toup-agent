@@ -382,10 +382,11 @@ class AgentRunner:
             # client_tz override when the surface supplies one.
             if not client_tz:
                 try:
+                    from sqlalchemy import select as _select_for_tz
                     from app.db.models import User as _User_for_tz
                     _u_tz_row = (
                         await db.execute(
-                            select(_User_for_tz).where(_User_for_tz.id == user_id)
+                            _select_for_tz(_User_for_tz).where(_User_for_tz.id == user_id)
                         )
                     ).scalar_one_or_none()
                     _profile_tz = (

@@ -81,6 +81,15 @@ ENV EMBEDDING_PROVIDER=openai \
     EMBEDDING_MODEL=text-embedding-3-small \
     EMBEDDING_DIMENSION=1536
 
+# Cross-day recall — without this, the agent's `recall_day` tool
+# returns "ERROR: recall_day is not enabled on this agent" and the
+# user sees "session history tool bugged out on me. Lovely 😑". For
+# per-tenant agents the user explicitly expects "remember things
+# from yesterday" behavior across channels (WhatsApp ↔ web ↔ mobile),
+# so this should be on by default in the agent image. Tenant can
+# still flip it off via `.env` if needed.
+ENV ENABLE_DAY_RECALL=true
+
 # Agent listens on 8001 internally (mapped to unique host port)
 EXPOSE 8001
 
