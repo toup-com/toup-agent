@@ -266,6 +266,28 @@ class BaileysWhatsAppChannel(BaseChannel):
             _SIDECAR_BASE, len(self.allowed_numbers),
         )
 
+        # Self-healing: if the sidecar booted without on-disk Baileys
+        # creds (fresh container, post-rollout volume wipe, or first-
+        # time setup) it sits idle in `not_linked` until something
+        # calls `/pair/start`. Without this proactive kick, the user
+        # sees "linked" in the UI from stale DB state, sends a
+        # message, and gets no response — exactly the symptom we just
+        # debugged. Auto-fire `/pair/start` so a fresh QR is always
+        # ready the moment the user opens Settings, no extra click
+        # required.
+        if self._session_status == "not_linked":
+            logger.info(
+                "[WHATSAPP-BAILEYS] no creds on boot — auto-kicking pair flow"
+            )
+            try:
+                await self._http.post("/pair/start")
+                self._session_status = "linking"
+            except Exception:
+                logger.exception(
+                    "[WHATSAPP-BAILEYS] auto-pair kick failed — user can "
+                    "still trigger from Settings"
+                )
+
     async def stop(self) -> None:
         """Graceful shutdown — cancels the SSE consumer + sweep, then
         SIGTERMs the sidecar and waits for it to exit."""
