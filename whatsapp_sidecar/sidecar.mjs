@@ -252,6 +252,14 @@ function wireSocket(s, saveCreds) {
         null;
       log('connection.close', { status, message: String(lastDisconnect?.error || '') });
 
+      // Drop the socket reference — every reconnect path below will
+      // reassign it via createSocket(). Forgetting to clear this was
+      // a real bug: the timer-based reconnect checked `if (!sock)`
+      // and noop'd because sock still pointed at the closed instance,
+      // so 408 ("QR refs attempts ended") + any other transient close
+      // left the agent permanently dead.
+      sock = null;
+
       // 515 — Baileys signals "stream-errored, restart required" right
       // after pair-success. The auth dir is now populated; closing
       // and recreating completes the link.
@@ -260,7 +268,6 @@ function wireSocket(s, saveCreds) {
         if (!restarting) {
           restarting = true;
           try {
-            sock = null;
             const { sock: next, saveCreds: nextSave } = await createSocket();
             wireSocket(next, nextSave);
             sock = next;
@@ -274,25 +281,43 @@ function wireSocket(s, saveCreds) {
       if (status === DisconnectReason.loggedOut || status === 401) {
         sessionStatus = 'logged_out';
         wipeAuthDir();
+        selfE164 = null;
+        selfJid = null;
         warn('logged_out — auth dir wiped, awaiting fresh pair');
         emitEvent({ type: 'logged_out' });
         return;
       }
 
-      // Any other close: Baileys + our caller's reconnect supervisor
-      // handle this. Recreate after a short delay so we don't tight-loop.
-      if (sessionStatus === 'linked' || sessionStatus === 'linking') {
+      // 408 "QR refs attempts ended" — Baileys emitted a handful of
+      // QR rotations and the user never scanned. Don't let the
+      // session sit dead; immediately rebuild the socket so a fresh
+      // QR appears and the next time the user opens Settings (or the
+      // modal is already open) it just shows up.
+      // Also handles the generic transient-close path (e.g. brief
+      // network blip) — Baileys creds will be reused if they exist,
+      // so a `linked` session reconnects without re-pairing.
+      log('connection.reconnecting', { status });
+      sessionStatus = 'linking';
+      latestQrString = null;
+      latestQrPngDataUrl = null;
+      try {
+        const { sock: next, saveCreds: nextSave } = await createSocket();
+        wireSocket(next, nextSave);
+        sock = next;
+      } catch (e) {
+        error('reconnect_failed', { err: String(e) });
+        // Back off briefly before the next attempt so we don't
+        // tight-loop on a fundamentally broken environment.
         setTimeout(async () => {
+          if (sock) return;
           try {
-            if (!sock) {
-              const { sock: next, saveCreds: nextSave } = await createSocket();
-              wireSocket(next, nextSave);
-              sock = next;
-            }
-          } catch (e) {
-            error('reconnect_failed', { err: String(e) });
+            const { sock: next, saveCreds: nextSave } = await createSocket();
+            wireSocket(next, nextSave);
+            sock = next;
+          } catch (e2) {
+            error('reconnect_retry_failed', { err: String(e2) });
           }
-        }, 2000);
+        }, 5000);
       }
     }
   });
