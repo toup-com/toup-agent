@@ -688,14 +688,23 @@ async def lifespan(app: FastAPI):
     # are mutually exclusive — both extend BaseChannel(WHATSAPP) so
     # only one slot in the registry is ever populated.
     #
-    # Backwards compat: if whatsapp_mode is unset but the legacy
-    # phone_number_id + access_token are present, default to Cloud
-    # API. That keeps existing tenants working without forcing a
-    # one-time settings save.
+    # Defaulting:
+    #   1) Legacy Cloud API tenants (phone_id + access_token in DB,
+    #      mode column never set) → cloud_api. Keeps them working
+    #      without forcing a one-time settings save.
+    #   2) Everyone else (new users, mode column empty) → qr_link.
+    #      This makes Connect-via-QR work on first click. Without
+    #      this, brand-new users got "Agent didn't come back in QR
+    #      mode within 90 s" because the agent booted with NO
+    #      WhatsApp channel and the mode-switch save never had a
+    #      live channel to flip into.
     whatsapp_channel = None
     _wa_mode = (settings.whatsapp_mode or "").strip().lower()
-    if not _wa_mode and settings.whatsapp_phone_number_id and settings.whatsapp_access_token:
-        _wa_mode = "cloud_api"
+    if not _wa_mode:
+        if settings.whatsapp_phone_number_id and settings.whatsapp_access_token:
+            _wa_mode = "cloud_api"
+        else:
+            _wa_mode = "qr_link"
 
     if _wa_mode == "qr_link":
         try:
