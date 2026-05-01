@@ -288,8 +288,21 @@ async def logout_user(response: Response):
 
 # ── Delete Account ───────────────────────────────────────────────
 # Apple App Store Guideline 5.1.1(v): users must be able to initiate
-# account deletion from within the app. We anonymize PII and disable
-# the account immediately; a background job later purges the row.
+# account deletion from within the app. Runs the SAME cascade as the
+# admin DELETE /users/{id} endpoint — destroys the managed container +
+# tenant DB + Caddy route via the bridge, deletes the Stripe customer
+# (cancels every subscription tied to it), archives the per-user
+# OpenAI bundle project, wipes 17+ tables (messages, memories, agent
+# configs with API keys, etc.), then DELETEs the user row.
+#
+# Earlier this endpoint only anonymised the User row (email rename +
+# is_active=False) and added a "background job later purges the row"
+# comment for a job that never shipped. The audit on 2026-05-01 proved
+# the gap end-to-end: container kept running, tenant DB intact, Stripe
+# kept billing, OpenAI project still active, AgentConfig with every
+# API key the user had entered still in the DB. Single source of truth
+# for "delete me everywhere" lives in
+# `app.services.user_deletion.cascade_delete_user`.
 
 class DeleteAccountRequest(BaseModel):
     password: str
@@ -302,28 +315,36 @@ async def delete_account(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete current user's account. Requires password confirmation.
+    """Delete the current user's account and ALL associated data.
 
-    Immediate effects: email/name/password/payment info are cleared,
-    account is deactivated, all outstanding tokens are invalidated.
+    Requires password confirmation. Synchronous — by the time this
+    returns, the managed container is destroyed, Stripe customer is
+    deleted, OpenAI project is archived, and the user row is gone.
+
+    Last admin / cannot-delete-self guards do not apply here: this is
+    the user's own account. Apple's guideline doesn't let us refuse
+    deletion just because the user happens to be an admin.
     """
     if not verify_password(body.password, current_user.hashed_password):
         raise HTTPException(status_code=400, detail="Password is incorrect")
 
-    now = datetime.utcnow()
-    current_user.email = f"deleted-{current_user.id}@deleted.toup.ai"
-    current_user.name = "Deleted User"
-    current_user.hashed_password = "deleted"
-    current_user.stripe_customer_id = None
-    current_user.timezone = None
-    current_user.is_active = False
-    current_user.updated_at = now
-    current_user.password_changed_at = now
-
-    await db.commit()
+    from app.services.user_deletion import cascade_delete_user
+    try:
+        report = await cascade_delete_user(db, current_user)
+    except Exception:
+        # cascade_delete_user is engineered to never raise mid-way,
+        # but defence-in-depth: don't leak a 500 + stale session if
+        # something does throw. The user's data is already partially
+        # gone at this point, so we still clear the cookie.
+        logger.exception("[DELETE-ACCOUNT] cascade raised unexpectedly")
+        report = {"steps": {"unexpected_error": True}}
 
     response.delete_cookie(key=SSO_COOKIE_NAME, domain=SSO_COOKIE_DOMAIN, path="/")
-    return {"success": True, "message": "Account deletion initiated"}
+    return {
+        "success": True,
+        "message": "Account and all associated data deleted.",
+        "report": report,
+    }
 
 
 # ── Demo ─────────────────────────────────────────────────────────

@@ -1302,21 +1302,10 @@ async def delete_user(
 ):
     """Delete a user and all their data. Only admins.
 
-    The platform DB is a legacy monolith — it has both platform-only tables
-    AND agent-only tables (conversations, memories, etc.) with FK constraints
-    to users. We must clean up BOTH to delete the user row. Newer agent-only
-    tables (day_chats, context_budget_logs) may not exist, so each cleanup
-    step uses a savepoint to avoid poisoning the transaction.
+    Cascade implementation lives in `app.services.user_deletion` so the
+    user-facing /auth/delete-account endpoint runs the same logic. This
+    handler only adds the admin-specific safety checks on top.
     """
-    from app.db.models import (
-        Identity, Conversation, Message, Memory, Entity, EntityLink,
-        EntityRelationship, BrainStats, MemoryEvent, RetrievalEvent,
-        Document, DocumentChunk, Media, CronJob, TelegramUserMapping,
-        AgentError, ApiKey, VPSInstance, ManagedContainer, AgentConfig,
-        LLMBundleAllocation, LLMUsageRecord,
-        App, BuildJob, SoulConfig, StreamingCredential,
-    )
-
     # Safety: cannot delete yourself
     if user_id == admin.id:
         raise HTTPException(400, "Cannot delete your own account")
@@ -1334,197 +1323,11 @@ async def delete_user(
         if admin_count.scalar() <= 1:
             raise HTTPException(400, "Cannot delete the last admin")
 
-    # ── Helper: run a delete inside a savepoint so missing tables/columns
-    #    don't abort the outer transaction ──
-    async def _safe_exec(stmt):
-        try:
-            async with db.begin_nested():
-                await db.execute(stmt)
-        except Exception:
-            pass  # table/column missing or other DB error — continue
+    from app.services.user_deletion import cascade_delete_user
+    user_email = user.email
+    await cascade_delete_user(db, user)
+    return {"success": True, "message": f"User {user_email} and all data deleted"}
 
-    # ── 1. Destroy ALL VPS artifacts for this user via the bridge ──
-    # Phase 3: platform uses the typed provisioning bridge instead of
-    # SSH-as-root. DELETE /v1/tenants/<prefix> on the bridge handles:
-    #   - docker rm -f toup-agent-<prefix>
-    #   - docker network rm tnt_<prefix>
-    #   - DROP DATABASE + DROP ROLE via /usr/local/sbin/revoke_tenant_db
-    #   - remove Caddy tenant route via admin API
-    # It does NOT yet wipe /data/agents/<prefix>/workspace+skills. That's
-    # intentional for backups — restic already has the data, and we preserve
-    # the bind-mount source in case of accidental user deletion. A separate
-    # "destroy-tenant-data" admin action can be added if genuinely needed.
-    prefix = user_id[:8]
-    try:
-        from app.services.docker_host_service import destroy_container
-        await destroy_container(db, user_id)
-    except Exception as e:
-        logger.warning("[DELETE-USER] VPS cleanup failed for %s: %s", prefix, e)
-
-    # ── 1b. Wipe Stripe state. Admin-delete is "this user no longer exists,
-    #    anywhere" — that includes Stripe. Deleting the Stripe Customer
-    #    auto-cancels every subscription tied to it, so the user stops
-    #    being billed. Without this, signing up again with the same email
-    #    would re-attach to the orphan customer's still-active subscription
-    #    and grant a paid agent without payment (the 2026-04-27 incident).
-    #    Defense-in-depth: also email-search for any customer whose
-    #    metadata.user_id matches, in case `User.stripe_customer_id` was
-    #    not synced for some reason.
-    from app.services.stripe_service import delete_customer, find_customers_by_email
-    customer_ids_to_delete: set[str] = set()
-    if user.stripe_customer_id:
-        customer_ids_to_delete.add(user.stripe_customer_id)
-    if user.email:
-        try:
-            for cid in find_customers_by_email(user.email):
-                customer_ids_to_delete.add(cid)
-        except Exception as e:
-            logger.warning("[DELETE-USER] Stripe email-search failed for %s: %s",
-                           user.email, e)
-    for cid in customer_ids_to_delete:
-        ok = delete_customer(cid)
-        if not ok:
-            logger.warning("[DELETE-USER] Stripe customer cleanup failed for %s "
-                           "(user=%s) — orphan may remain", cid, user_id[:8])
-
-    # ── 1c. Archive per-user OpenAI project (β bundle architecture).
-    #    Read AgentConfig.bundle_openai_project_id BEFORE the platform DB
-    #    cleanup wipes the row. Archiving cascade-revokes all of the
-    #    project's service-account keys + stops billing for that project.
-    #    Idempotent + non-fatal: if the admin key isn't configured or the
-    #    project is already archived, log and continue.
-    try:
-        ac_result = await db.execute(
-            select(AgentConfig).where(AgentConfig.user_id == user_id)
-        )
-        ac = ac_result.scalar_one_or_none()
-        openai_project_id = ac.bundle_openai_project_id if ac else None
-    except Exception:
-        openai_project_id = None
-    if openai_project_id:
-        try:
-            from app.services.openai_admin_service import archive_project
-            archive_project(openai_project_id)
-        except Exception as e:
-            logger.warning(
-                "[DELETE-USER] OpenAI project archive failed for %s "
-                "(user=%s) — orphan project may remain in OpenAI dashboard: %s",
-                openai_project_id, user_id[:8], e,
-            )
-
-    # ── 2. Clean up agent-only tables (legacy monolith data) ──
-    # Each wrapped in savepoint — tables/columns may not exist.
-    # Order: children before parents (FK deps).
-
-    # Nullify Memory → Message FK before deleting messages
-    await _safe_exec(text(
-        "UPDATE memories SET source_message_id = NULL WHERE user_id = :uid"
-    ).bindparams(uid=user_id))
-
-    # Messages (FK to conversations)
-    await _safe_exec(text(
-        "DELETE FROM messages WHERE conversation_id IN "
-        "(SELECT id FROM conversations WHERE user_id = :uid)"
-    ).bindparams(uid=user_id))
-
-    # Document chunks (FK to documents and memories)
-    await _safe_exec(text(
-        "DELETE FROM document_chunks WHERE document_id IN "
-        "(SELECT id FROM documents WHERE user_id = :uid)"
-    ).bindparams(uid=user_id))
-    await _safe_exec(text(
-        "DELETE FROM document_chunks WHERE memory_id IN "
-        "(SELECT id FROM memories WHERE user_id = :uid)"
-    ).bindparams(uid=user_id))
-
-    # Entity links and relationships
-    await _safe_exec(text(
-        "DELETE FROM entity_links WHERE entity_id IN "
-        "(SELECT id FROM entities WHERE user_id = :uid)"
-    ).bindparams(uid=user_id))
-    await _safe_exec(text(
-        "DELETE FROM entity_links WHERE memory_id IN "
-        "(SELECT id FROM memories WHERE user_id = :uid)"
-    ).bindparams(uid=user_id))
-    await _safe_exec(text(
-        "DELETE FROM entity_relationships WHERE user_id = :uid"
-    ).bindparams(uid=user_id))
-
-    # Memory children
-    await _safe_exec(text(
-        "DELETE FROM memory_events WHERE memory_id IN "
-        "(SELECT id FROM memories WHERE user_id = :uid)"
-    ).bindparams(uid=user_id))
-    await _safe_exec(text(
-        "DELETE FROM memory_events WHERE user_id = :uid"
-    ).bindparams(uid=user_id))
-    await _safe_exec(text(
-        "DELETE FROM media WHERE memory_id IN "
-        "(SELECT id FROM memories WHERE user_id = :uid)"
-    ).bindparams(uid=user_id))
-    await _safe_exec(text(
-        "DELETE FROM media WHERE user_id = :uid"
-    ).bindparams(uid=user_id))
-    await _safe_exec(text(
-        "DELETE FROM memory_relationships WHERE source_id IN "
-        "(SELECT id FROM memories WHERE user_id = :uid) "
-        "OR target_id IN (SELECT id FROM memories WHERE user_id = :uid)"
-    ).bindparams(uid=user_id))
-
-    # Retrieval events
-    await _safe_exec(text(
-        "DELETE FROM retrieval_events WHERE user_id = :uid"
-    ).bindparams(uid=user_id))
-
-    # Build jobs, reconciliation logs, apps
-    await _safe_exec(text("DELETE FROM build_jobs WHERE user_id = :uid").bindparams(uid=user_id))
-    await _safe_exec(text("DELETE FROM reconciliation_logs WHERE user_id = :uid").bindparams(uid=user_id))
-    await _safe_exec(text("DELETE FROM apps WHERE user_id = :uid").bindparams(uid=user_id))
-
-    # Context budget logs + day chats (may not exist on platform DB)
-    await _safe_exec(text("DELETE FROM context_budget_logs WHERE user_id = :uid").bindparams(uid=user_id))
-
-    # Direct user_id tables
-    for table_name in [
-        "identities", "documents", "memories", "conversations",
-        "entities", "brain_stats", "cron_jobs", "telegram_user_mappings",
-        "api_keys", "agent_errors", "soul_configs",
-        "workflows",
-    ]:
-        await _safe_exec(text(
-            f"DELETE FROM {table_name} WHERE user_id = :uid"
-        ).bindparams(uid=user_id))
-
-    # Day chats (may not exist)
-    await _safe_exec(text("DELETE FROM day_chats WHERE user_id = :uid").bindparams(uid=user_id))
-
-    # ── 3. Delete platform-only tables ──
-    try:
-        from app.db.models import LLMProxyEvent
-        await _safe_exec(sa_delete(LLMProxyEvent).where(LLMProxyEvent.user_id == user_id))
-    except Exception:
-        pass
-
-    await db.execute(sa_delete(StreamingCredential).where(StreamingCredential.user_id == user_id))
-    await db.execute(sa_delete(LLMUsageRecord).where(LLMUsageRecord.user_id == user_id))
-    await db.execute(sa_delete(LLMBundleAllocation).where(LLMBundleAllocation.user_id == user_id))
-    await db.execute(sa_delete(ManagedContainer).where(ManagedContainer.user_id == user_id))
-    await db.execute(sa_delete(VPSInstance).where(VPSInstance.user_id == user_id))
-    await db.execute(sa_delete(AgentConfig).where(AgentConfig.user_id == user_id))
-
-    # ── 4. Update/delete invites ──
-    inv_result = await db.execute(select(Invite).where(Invite.used_by == user_id))
-    for inv in inv_result.scalars().all():
-        inv.used_by = None
-        inv.used_at = None
-    await db.execute(sa_delete(Invite).where(Invite.created_by == user_id))
-
-    # ── 5. Delete the user (raw SQL to avoid ORM loading relationships
-    #    that reference columns missing from legacy platform DB) ──
-    await db.execute(text("DELETE FROM users WHERE id = :uid").bindparams(uid=user_id))
-    await db.commit()
-
-    return {"success": True, "message": f"User {user.email} and all data deleted"}
 
 
 # ─── Public Invite Endpoints (no auth) ────────────────────────
