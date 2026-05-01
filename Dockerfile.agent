@@ -68,6 +68,19 @@ RUN useradd -m -u 1000 toup && \
     mkdir -p /app/workspace /app/skills && \
     chown -R toup:toup /app/workspace /app/skills /home/toup
 
+# Memory & retrieval — agent containers do NOT bundle
+# `sentence-transformers`/torch (saves ~2.5 GB image weight). The
+# embedding service falls back to "local" mode by default and dies
+# with `No module named 'sentence_transformers'`, which silently
+# breaks BOTH automatic memory extraction and recall — so the agent's
+# Brain stays empty forever and `memory_search` always returns
+# "failed". OPENAI_API_KEY is reliably injected per-tenant by the
+# bridge, so default the agent image to OpenAI embeddings; settings
+# can still be overridden via .env if a tenant needs local.
+ENV EMBEDDING_PROVIDER=openai \
+    EMBEDDING_MODEL=text-embedding-3-small \
+    EMBEDDING_DIMENSION=1536
+
 # Agent listens on 8001 internally (mapped to unique host port)
 EXPOSE 8001
 

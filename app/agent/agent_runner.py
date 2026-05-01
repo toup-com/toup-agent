@@ -368,6 +368,41 @@ class AgentRunner:
                 self._disabled_tool_names = set()
             logger.info(f"[PERF] load_agent_config: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
+            # Resolve effective timezone here (not just inside
+            # _build_system_prompt) so day-chat resolution + history
+            # rendering both use the user's local time. Without this,
+            # Telegram/WhatsApp/voice channels — which never pass
+            # `client_tz` — got `tz_name=None` in
+            # `resolve_day_chat_id_for_now` / `load_day_context`,
+            # which then defaulted to UTC. Result: history messages
+            # the agent saw were stamped in UTC, so a 9:58 PM EDT
+            # message rendered as "1:58am" in the LLM context and
+            # the agent confidently told the user "you sent that at
+            # 1:58 AM". Single source of truth: User.timezone, with
+            # client_tz override when the surface supplies one.
+            if not client_tz:
+                try:
+                    from app.db.models import User as _User_for_tz
+                    _u_tz_row = (
+                        await db.execute(
+                            select(_User_for_tz).where(_User_for_tz.id == user_id)
+                        )
+                    ).scalar_one_or_none()
+                    _profile_tz = (
+                        getattr(_u_tz_row, "timezone", None) if _u_tz_row else None
+                    )
+                    if _profile_tz:
+                        client_tz = _profile_tz
+                        logger.info(
+                            "[AGENT] tz_seeded_from_profile user=%s channel=%s tz=%s",
+                            user_id[:8], channel, _profile_tz,
+                        )
+                except Exception as _tz_seed_err:
+                    logger.debug(
+                        "[AGENT] tz_seed_failed user=%s err=%s",
+                        user_id[:8], _tz_seed_err,
+                    )
+
             t_db = time.perf_counter()
             # ── Day-Chat context path (feature-flagged) ──
             _day_chat_id = None
