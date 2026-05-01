@@ -111,6 +111,25 @@ const sseClients = new Set();            // open SSE response streams
 // just works.
 const lidToPhone = new Map();
 
+// Forward mapping: phone (E.164, "+digits") → preferred outbound JID.
+// WhatsApp's 2024+ LID privacy migration broke the assumption that
+// `<phone>@s.whatsapp.net` is a stable address. Once a contact's
+// primary device is on LID, sending to the legacy `@s.whatsapp.net`
+// form encrypts against a session the recipient's primary device
+// doesn't trust — first message often slips through (initial session
+// fan-out), then every subsequent reply renders as "Waiting for this
+// message" because the ratchet has drifted relative to the LID
+// session. Symptom seen end-to-end: agent's outbound shows single ✓
+// and recipient's app shows the placeholder forever.
+//
+// Fix: track the JID form each contact actually USES — populated by
+// (a) `onWhatsApp` at connection.open (LID preferred when present)
+// and (b) every inbound message's `remoteJid` so we always send back
+// against the same identity the user just sent us from. Inbound
+// updates trump pre-resolved values because that's the freshest
+// signal of what the user's current device is using right now.
+const phoneToJid = new Map();
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /** Ensure the auth dir exists with restrictive perms (0700). */
@@ -231,10 +250,19 @@ async function resolveAllowlistLids(s) {
       // Cache both directions where available.
       if (entry.jid) lidToPhone.set(entry.jid, phone);
       if (entry.lid) lidToPhone.set(entry.lid, phone);
+      // Forward: prefer LID for outbound (post-migration sessions are
+      // anchored to LID). Only fall back to phone JID if the contact
+      // hasn't migrated yet (no `lid` in the response). An inbound
+      // message will overwrite this with the actually-used JID later.
+      const preferred = entry.lid || entry.jid || null;
+      if (preferred && !phoneToJid.has(phone)) {
+        phoneToJid.set(phone, preferred);
+      }
       log('lid.resolved', {
         phone,
         jid: entry.jid || null,
         lid: entry.lid || null,
+        preferred_for_send: preferred,
       });
     } catch (e) {
       warn('lid.resolve_failed', { phone, err: String(e) });
@@ -500,6 +528,22 @@ function wireSocket(s, saveCreds) {
           });
           continue;
         }
+        // Pin the JID the user is actually using right now, so our
+        // outbound replies travel against the same e2e session.
+        // remoteJid is what Baileys uses internally as the chat key,
+        // so encrypting to it stays consistent with the session
+        // Baileys already established for this thread.
+        if (m.key?.remoteJid) {
+          const previous = phoneToJid.get(fromE164);
+          if (previous !== m.key.remoteJid) {
+            phoneToJid.set(fromE164, m.key.remoteJid);
+            log('phone_to_jid.updated_from_inbound', {
+              phone: fromE164,
+              jid: m.key.remoteJid,
+              previous: previous || null,
+            });
+          }
+        }
         inboundCount += 1;
         lastInboundAt = new Date().toISOString();
         log('inbound.dispatching', { from: fromE164, text_len: text.length, msg_id: messageId });
@@ -659,19 +703,48 @@ async function handleSend(req, res) {
     sendJson(res, 503, { ok: false, error: 'not connected' });
     return;
   }
-  const jid = toJid(to);
+  // Resolve the JID we should encrypt against. Order:
+  //   1. caller passed a full JID — trust it
+  //   2. caller passed E.164 + we have a learned/resolved JID — use it
+  //   3. fall back to legacy <phone>@s.whatsapp.net
+  // Path (2) is the LID-migration fix: matches the JID form the user
+  // last contacted us from so the Signal session stays consistent.
+  let jid = '';
+  let jidSource = 'unknown';
+  if (to.includes('@')) {
+    jid = to;
+    jidSource = 'caller_jid';
+  } else {
+    const phone = (() => {
+      // Reuse the same E.164 normalisation the parser uses so a
+      // caller-supplied "4155552671" or "+1 (415) 555-2671" hits the
+      // same key the cache stores.
+      let digits = to.replace(/\D/g, '');
+      if (digits.startsWith('00')) digits = digits.slice(2);
+      return digits ? `+${digits}` : '';
+    })();
+    const cached = phone ? phoneToJid.get(phone) : null;
+    if (cached) {
+      jid = cached;
+      jidSource = 'phone_to_jid_cache';
+    } else {
+      jid = e164ToJid(to);
+      jidSource = 'e164_fallback';
+    }
+  }
   if (!jid) {
     sendJson(res, 400, { ok: false, error: 'invalid to' });
     return;
   }
+  log('send.dispatch', { jid, jid_source: jidSource, len: text.length });
   try {
     const result = await sock.sendMessage(jid, { text });
     lastSendAt = new Date().toISOString();
     lastSendError = null;
-    sendJson(res, 200, { ok: true, message_id: result?.key?.id || null });
+    sendJson(res, 200, { ok: true, message_id: result?.key?.id || null, jid, jid_source: jidSource });
   } catch (e) {
     lastSendError = { at: new Date().toISOString(), message: String(e).slice(0, 300) };
-    error('send.failed', { err: String(e) });
+    error('send.failed', { err: String(e), jid, jid_source: jidSource });
     sendJson(res, 502, { ok: false, error: String(e) });
   }
 }
