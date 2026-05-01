@@ -52,7 +52,15 @@ import path from 'node:path';
 
 // ── Config ──────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.WHATSAPP_SIDECAR_PORT || '8002', 10);
-const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || '/data/whatsapp/auth';
+// Auth must live on a bind-mounted path so it survives container
+// recreation (rollouts, restarts, image bumps). The bridge mounts
+// `/data/agents/<id>/workspace` → `/app/workspace`, so anything
+// under `/app/workspace/` is durable. `/data/whatsapp/` is NOT
+// mounted in the production container — putting auth there meant
+// every rollout wiped the pair and the user had to relink, which
+// was the actual root cause of "agent linked but ignores all
+// messages" reports. Override path via env for local/dev.
+const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || '/app/workspace/.whatsapp_auth';
 const BROWSER_NAME = process.env.WHATSAPP_BROWSER_NAME || 'Toup';
 const BROWSER_PLATFORM = process.env.WHATSAPP_BROWSER_PLATFORM || 'Chrome';
 const BROWSER_VERSION = process.env.WHATSAPP_BROWSER_VERSION || '1.0.0';
