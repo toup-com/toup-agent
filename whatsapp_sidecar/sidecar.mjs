@@ -52,6 +52,17 @@ import path from 'node:path';
 
 // ── Config ──────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.WHATSAPP_SIDECAR_PORT || '8002', 10);
+// Allowlist of phone numbers (CSV, E.164). The sidecar uses this to
+// pre-resolve corresponding @lid identifiers via `onWhatsApp` once
+// connected, so inbound messages from LID-encoded senders can be
+// mapped back to a phone the agent's allowlist can match against.
+// WhatsApp's 2024+ LID privacy migration means many inbound users
+// arrive ONLY with `<opaque>@lid` in `key.remoteJid` — no phone
+// number anywhere in the message frame, no native LID→PN lookup
+// in Baileys 6.7.x. Pre-resolving the allowlist forward-direction
+// is the only reliable workaround until Baileys ships a LID
+// mapping store.
+const RAW_ALLOWLIST = process.env.WHATSAPP_BAILEYS_ALLOWLIST || '';
 // Auth must live on a bind-mounted path so it survives container
 // recreation (rollouts, restarts, image bumps). The bridge mounts
 // `/data/agents/<id>/workspace` → `/app/workspace`, so anything
@@ -90,6 +101,15 @@ let lastSendError = null;
 let bootedAt = new Date().toISOString();
 
 const sseClients = new Set();            // open SSE response streams
+
+// LID ↔ phone map, built lazily by `resolveAllowlistLids` once the
+// socket is open + by inbound messages we successfully resolve.
+// Keys are JIDs ("digits@lid" / "digits@s.whatsapp.net"), values
+// are canonical E.164 ("+digits"). When an inbound message's
+// `remoteJid` is a LID and we have it in the cache, we substitute
+// the phone-number form so the Python adapter's E.164 allowlist
+// just works.
+const lidToPhone = new Map();
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -159,6 +179,68 @@ async function renderQrDataUrl(qrString) {
     error('qr.render_failed', { err: String(e) });
     return null;
   }
+}
+
+/** Parse the comma-separated allowlist env var into canonical E.164.
+ *
+ * Same normalisation as the Python adapter's `_normalize_e164` so the
+ * two halves agree on the canonical form: digits-only, strip "00"
+ * prefix, prepend "+".
+ */
+function parseAllowlist(raw) {
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => {
+      let digits = s.replace(/\D/g, '');
+      if (digits.startsWith('00')) digits = digits.slice(2);
+      return digits ? `+${digits}` : '';
+    })
+    .filter(Boolean);
+}
+
+/** Resolve every allowlisted phone to its current @lid via `onWhatsApp`.
+ *
+ * Populates the `lidToPhone` cache so inbound LIDs from these users
+ * decode back to their phone-number form. Idempotent — safe to call
+ * on every reconnect (`connection === "open"`).
+ *
+ * Each `onWhatsApp` reply looks like:
+ *   [{ exists: true, jid: "14155552671@s.whatsapp.net",
+ *      lid: "<opaque>@lid" }]
+ * Either field may be absent depending on the contact's account
+ * state. We cache whichever direction(s) resolve.
+ */
+async function resolveAllowlistLids(s) {
+  const allowlist = parseAllowlist(RAW_ALLOWLIST);
+  if (allowlist.length === 0) {
+    log('lid.allowlist_empty');
+    return;
+  }
+  log('lid.resolving', { count: allowlist.length });
+  for (const phone of allowlist) {
+    try {
+      const result = await s.onWhatsApp(phone);
+      const entry = Array.isArray(result) ? result[0] : null;
+      if (!entry || !entry.exists) {
+        warn('lid.not_on_whatsapp', { phone });
+        continue;
+      }
+      // Cache both directions where available.
+      if (entry.jid) lidToPhone.set(entry.jid, phone);
+      if (entry.lid) lidToPhone.set(entry.lid, phone);
+      log('lid.resolved', {
+        phone,
+        jid: entry.jid || null,
+        lid: entry.lid || null,
+      });
+    } catch (e) {
+      warn('lid.resolve_failed', { phone, err: String(e) });
+    }
+  }
+  log('lid.resolved_total', { cache_size: lidToPhone.size });
 }
 
 /** Extract the human-readable text from an inbound Baileys message. */
@@ -253,6 +335,14 @@ function wireSocket(s, saveCreds) {
       }
       log('connection.open', { self: selfE164 });
       emitEvent({ type: 'connection_open', self_e164: selfE164 });
+
+      // Pre-resolve allowlisted phone numbers to their @lid
+      // counterparts so subsequent inbound LID-encoded messages can
+      // be mapped back to phones for ACL matching. Run async so the
+      // open event returns immediately; we don't block on it.
+      resolveAllowlistLids(s).catch((e) => {
+        warn('lid.resolve_unhandled', { err: String(e) });
+      });
     }
 
     if (connection === 'close') {
@@ -350,16 +440,15 @@ function wireSocket(s, saveCreds) {
       try {
         // Log the raw shape — incl. all JID-ish fields — so any future
         // WhatsApp identity-format change surfaces from logs alone.
+        // Dump ALL key fields, not just the ones we know about, so a
+        // newly-introduced identity field surfaces in the very next
+        // message instead of needing another debug round-trip.
         log('messages.upsert.entry', {
-          remoteJid: m.key?.remoteJid,
-          remoteJidAlt: m.key?.remoteJidAlt,
-          participant: m.key?.participant,
-          participantAlt: m.key?.participantAlt,
-          senderPn: m.key?.senderPn,
-          fromMe: m.key?.fromMe,
-          id: m.key?.id,
+          allKeyFields: m.key ? Object.fromEntries(Object.entries(m.key)) : null,
           messageKeys: m.message ? Object.keys(m.message) : [],
           pushName: m.pushName,
+          messageContextInfoKeys: m.message?.messageContextInfo ? Object.keys(m.message.messageContextInfo) : [],
+          messageContextInfo: m.message?.messageContextInfo,
         });
         if (m.key?.fromMe) continue;
         if (m.key?.remoteJid?.endsWith('@broadcast')) continue;
@@ -386,9 +475,20 @@ function wireSocket(s, saveCreds) {
         ].filter(Boolean);
         let fromJid = m.key?.remoteJid || '';
         let fromE164 = '';
+        // First pass: look in the pre-resolved LID cache (populated by
+        // resolveAllowlistLids on connection.open). Hits = the sender
+        // is on the agent's allowlist.
         for (const j of candidateJids) {
-          const e = jidToE164(j);
-          if (e) { fromE164 = e; fromJid = j; break; }
+          const cached = lidToPhone.get(j);
+          if (cached) { fromE164 = cached; fromJid = j; break; }
+        }
+        // Second pass: maybe the JID is already in phone form (legacy
+        // @s.whatsapp.net). Decode directly.
+        if (!fromE164) {
+          for (const j of candidateJids) {
+            const e = jidToE164(j);
+            if (e) { fromE164 = e; fromJid = j; break; }
+          }
         }
         const messageId = m.key?.id || '';
         const timestampMs = (m.messageTimestamp ? Number(m.messageTimestamp) * 1000 : Date.now());
@@ -396,6 +496,7 @@ function wireSocket(s, saveCreds) {
           log('inbound.dropped_no_e164', {
             tried: candidateJids,
             remoteJid: m.key?.remoteJid,
+            cache_size: lidToPhone.size,
           });
           continue;
         }
