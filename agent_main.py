@@ -132,6 +132,87 @@ async def restart_telegram_bot():
         _telegram_bot = None
 
 
+async def restart_whatsapp_channel():
+    """Hot-restart the WhatsApp channel after config sync.
+
+    Called by tunnel_client when whatsapp_mode / allowlist / cloud-API
+    creds change. Stops the existing channel (if any), then re-runs the
+    same selection logic main() uses at boot to pick the right adapter.
+
+    Without this, a tunnel-pushed config change writes the new mode to
+    .env but the running process still has whichever channel main()
+    spawned at boot — typically NONE for fresh users where mode was
+    NULL. They click Connect via QR, the platform proxies /qr/start to
+    the agent, and `_require_active_channel()` returns 503 because
+    `BaileysWhatsAppChannel` was never instantiated. This function
+    closes the gap.
+    """
+    global _agent_runner
+    from app.config import settings as _s
+    from app.agent.channels.registry import ChannelRegistry
+    from app.agent.channels.shared import make_channel_handler
+
+    if not _agent_runner:
+        logging.warning("[RESTART] Cannot start WhatsApp channel — agent_runner not initialized")
+        return
+
+    # Tear down whichever WhatsApp adapter is currently registered. Both
+    # cloud-API and QR-link extend BaseChannel(WHATSAPP), so the
+    # registry slot is the same.
+    from app.agent.channels.base import ChannelType as _CT
+    existing = ChannelRegistry.get(_CT.WHATSAPP)
+    if existing is not None:
+        try:
+            await existing.stop()
+            print("🛑 WhatsApp channel stopped (config changed)")
+        except Exception as e:
+            logging.warning(f"[RESTART] WhatsApp stop error: {e}")
+        # Unregister so the next register() doesn't log a "replacing" warning.
+        try:
+            ChannelRegistry._channels.pop(_CT.WHATSAPP, None)
+        except Exception:
+            pass
+
+    _wa_mode = (_s.whatsapp_mode or "").strip().lower()
+    if not _wa_mode:
+        if _s.whatsapp_phone_number_id and _s.whatsapp_access_token:
+            _wa_mode = "cloud_api"
+        else:
+            _wa_mode = "qr_link"
+
+    try:
+        if _wa_mode == "qr_link":
+            from app.agent.channels.whatsapp_baileys import BaileysWhatsAppChannel
+            _allowlist = [
+                s.strip() for s in (_s.whatsapp_baileys_allowlist or "").split(",")
+                if s.strip()
+            ]
+            ch = BaileysWhatsAppChannel(allowed_numbers=_allowlist)
+            ch.set_message_callback(
+                make_channel_handler(channel=ch, agent_runner=_agent_runner, user_id=_s.user_id)
+            )
+            await ch.start()
+            ChannelRegistry.register(ch)
+            print("📱 WhatsApp channel restarted (QR-link / Baileys sidecar)")
+        elif _wa_mode == "cloud_api" and _s.whatsapp_phone_number_id and _s.whatsapp_access_token:
+            from app.agent.channels.whatsapp_channel import WhatsAppChannel
+            ch = WhatsAppChannel(
+                phone_number_id=_s.whatsapp_phone_number_id,
+                access_token=_s.whatsapp_access_token,
+                verify_token=_s.whatsapp_verify_token,
+                app_secret=_s.whatsapp_app_secret,
+                allowed_numbers=_s.whatsapp_allowed_numbers or None,
+            )
+            ch.set_message_callback(
+                make_channel_handler(channel=ch, agent_runner=_agent_runner, user_id=_s.user_id)
+            )
+            await ch.start()
+            ChannelRegistry.register(ch)
+            print("📱 WhatsApp channel restarted (Cloud API)")
+    except Exception as e:
+        logging.exception(f"[RESTART] Failed to start WhatsApp channel: {e}")
+
+
 class AgentAPIKeyMiddleware:
     """Raw ASGI middleware that validates the X-Agent-Key header.
 

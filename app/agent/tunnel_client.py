@@ -316,6 +316,21 @@ class AgentTunnelClient:
         except Exception as e:
             logger.warning("[TUNNEL-CLIENT] Telegram bot restart check failed: %s", e)
 
+        # Hot-restart WhatsApp channel on every config_update. Without
+        # this, fresh users who clicked Connect via QR were stuck at 503:
+        # the platform pushed `whatsapp_mode=qr_link` to the .env via
+        # tunnel, but the running process still had no WhatsApp channel
+        # spawned at boot (mode was NULL then), and `_require_active_
+        # channel()` rejected the /qr/start proxy. Always re-evaluate
+        # mode on settings reload — `restart_whatsapp_channel` is a
+        # no-op when the active adapter already matches the new config.
+        try:
+            import agent_main
+            import asyncio
+            asyncio.create_task(agent_main.restart_whatsapp_channel())
+        except Exception as e:
+            logger.warning("[TUNNEL-CLIENT] WhatsApp channel restart failed: %s", e)
+
     async def _handle_http_forward(self, ws, msg: dict):
         """Forward an HTTP request to the local agent server and return the result."""
         call_id = msg.get("id", "")
