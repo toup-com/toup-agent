@@ -7,7 +7,7 @@ import uuid
 from jose import JWTError, jwt
 import bcrypt
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.config import settings
 from app.db.models import User, Identity
@@ -67,12 +67,20 @@ async def authenticate_user(
     email: str,
     password: str
 ) -> Optional[User]:
-    """Authenticate a user by email and password"""
+    """Authenticate a user by email and password.
+
+    Email lookup is case-insensitive — without this, signing up as
+    `Arshia@toup.ai` and `arshia@toup.ai` produced two separate User
+    rows (the 2026-05-01 incident: a fresh signup hit a 500 on /config,
+    user retried with a different case, ended up with a duplicate
+    account whose AgentConfig the original was never going to get).
+    """
+    email_norm = (email or "").strip().lower()
     result = await db.execute(
-        select(User).where(User.email == email)
+        select(User).where(func.lower(User.email) == email_norm)
     )
     user = result.scalar_one_or_none()
-    
+
     if not user:
         return None
     if not verify_password(password, user.hashed_password):
@@ -86,9 +94,14 @@ async def create_user(
     password: str,
     name: Optional[str] = None
 ) -> User:
-    """Create a new user with default identities"""
+    """Create a new user with default identities.
+
+    Email is canonicalised to lowercase before storage so the unique
+    constraint on `users.email` actually enforces "one account per
+    address" rather than "one per case spelling".
+    """
     user = User(
-        email=email,
+        email=(email or "").strip().lower(),
         hashed_password=get_password_hash(password),
         name=name,
     )
@@ -193,8 +206,9 @@ async def get_user_by_id(db: AsyncSession, user_id: str) -> Optional[User]:
 
 
 async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
-    """Get a user by email"""
+    """Get a user by email (case-insensitive)."""
+    email_norm = (email or "").strip().lower()
     result = await db.execute(
-        select(User).where(User.email == email)
+        select(User).where(func.lower(User.email) == email_norm)
     )
     return result.scalar_one_or_none()
