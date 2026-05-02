@@ -286,7 +286,19 @@ async def provision_container(
             await db.commit()
         raise RuntimeError(err)
 
-    # Upsert ManagedContainer row
+    # Upsert ManagedContainer row. INSERT-then-fall-through used to
+    # race two concurrent provisions (e.g. user clicks Next twice in
+    # /setup/channel — frontend retry on transient errors makes this
+    # easier to hit) — both saw existing=None, both INSERT'd, second
+    # hit `managed_containers_user_id_key` UniqueViolation and
+    # poisoned the session. Now we re-SELECT after the bridge call so
+    # whichever request committed first is reused; only if there
+    # really is no row do we INSERT.
+    if not existing:
+        existing = (await db.execute(
+            select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+        )).scalar_one_or_none()
+
     if existing:
         container = existing
     else:
@@ -315,7 +327,34 @@ async def provision_container(
         agent_config.hosting_mode = "managed"
         agent_config.deploy_status = "active"
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        # Last-line backstop for the same race — if a different request
+        # raced in between our re-SELECT and commit, the INSERT path
+        # would still UniqueViolate. Recover by rolling back to a fresh
+        # transaction and merging onto whatever row is now there.
+        await db.rollback()
+        existing = (await db.execute(
+            select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+        )).scalar_one_or_none()
+        if not existing:
+            raise
+        existing.container_id = data["container_id"]
+        existing.container_name = data["container_name"]
+        existing.host_port = int(data["host_port"])
+        existing.image_tag = data["image_tag"]
+        existing.status = "running"
+        existing.started_at = datetime.utcnow()
+        existing.error_message = None
+        existing.db_name = f"toup_agent_{prefix}"
+        if agent_config:
+            agent_config.agent_url = data["agent_url"]
+            agent_config.agent_api_key = data["agent_api_key"]
+            agent_config.hosting_mode = "managed"
+            agent_config.deploy_status = "active"
+        await db.commit()
+        container = existing
     await db.refresh(container)
     logger.info(
         "provisioned_container user=%s prefix=%s port=%s agent_url=%s",
