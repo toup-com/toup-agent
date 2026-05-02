@@ -78,6 +78,25 @@ async def save_soul(
     db: AsyncSession = Depends(get_db),
 ):
     """Save soul config → compile → update Identity record."""
+    try:
+        return await _save_soul_impl(req, current_user, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # FastAPI's default 500 returns a bare {"detail":"Internal Server Error"}
+        # body, which becomes "HTTP 500" in the frontend's apiFetch fallback.
+        # Re-raise as an explicit 500 with the underlying exception type +
+        # truncated message so the user (and Railway logs) see what broke.
+        await db.rollback()
+        logger.exception("[SOUL] save failed for user %s", current_user.id)
+        raise HTTPException(500, f"{type(e).__name__}: {str(e)[:300]}")
+
+
+async def _save_soul_impl(
+    req: SoulConfigUpdate,
+    current_user: User,
+    db: AsyncSession,
+) -> "SoulConfigResponse":
     # Validate style
     if req.style not in VALID_SOUL_STYLES:
         raise HTTPException(400, f"Invalid style. Must be one of: {VALID_SOUL_STYLES}")
@@ -360,6 +379,24 @@ async def sync_soul(
                         if hasattr(ac, field):
                             setattr(ac, field, value)
                     logger.info(f"[SOUL] Updated AgentConfig on VPS: {list(req.agent_config_updates.keys())}")
+                else:
+                    # Older tenant containers were provisioned before the
+                    # platform started writing AgentConfig rows into the
+                    # tenant DB, so the row simply doesn't exist — and the
+                    # sync silently no-ops, leaving WhatsApp self-chat
+                    # headers stuck on the "Agent" fallback. Create a row
+                    # with the synced fields so future reads return the
+                    # user's chosen agent name.
+                    valid = {
+                        f: v for f, v in req.agent_config_updates.items()
+                        if hasattr(AgentConfig, f)
+                    }
+                    if valid:
+                        db.add(AgentConfig(user_id=req.user_id, **valid))
+                        logger.info(
+                            f"[SOUL] Created AgentConfig on VPS for {req.user_id[:8]} "
+                            f"with {list(valid.keys())}"
+                        )
         except Exception as e:
             logger.warning(f"[SOUL] Failed to update AgentConfig on VPS (table may not exist): {e}")
 

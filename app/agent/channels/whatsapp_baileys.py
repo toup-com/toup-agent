@@ -558,6 +558,7 @@ class BaileysWhatsAppChannel(BaseChannel):
             from sqlalchemy import select, and_
             user_id = getattr(_s, "user_id", None)
             if not user_id:
+                logger.warning("[WHATSAPP-BAILEYS] agent_name.no_user_id — settings.user_id empty")
                 return None
             async with async_session_maker() as db:
                 row = await db.execute(
@@ -566,6 +567,10 @@ class BaileysWhatsAppChannel(BaseChannel):
                 name = row.scalar_one_or_none()
                 if name and name.strip():
                     return name.strip()
+                logger.info(
+                    "[WHATSAPP-BAILEYS] agent_name.no_agent_config_row user=%s — falling back to Identity",
+                    user_id[:8],
+                )
                 # Fallback to Identity(type='soul').name (e.g. "doodool Soul")
                 row = await db.execute(
                     select(Identity.name).where(and_(
@@ -579,6 +584,10 @@ class BaileysWhatsAppChannel(BaseChannel):
                     cleaned = ident[:-5].strip() if ident.endswith(" Soul") else ident.strip()
                     if cleaned:
                         return cleaned
+                logger.warning(
+                    "[WHATSAPP-BAILEYS] agent_name.no_identity_row user=%s — sidecar default 'Agent' will be used",
+                    user_id[:8],
+                )
         except Exception:
             logger.exception("[WHATSAPP-BAILEYS] agent_name.lookup_failed")
         return None
