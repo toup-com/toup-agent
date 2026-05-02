@@ -90,6 +90,26 @@ let restarting = false;                  // re-entrancy guard during 515 dance
 let sessionStatus = 'not_linked';        // not_linked | linking | linked | logged_out
 let connected = false;
 let selfE164 = null;
+// Message IDs we generated via handleSend. messages.upsert will fire
+// for our own outbound replies with key.fromMe=true; we drop those by
+// ID here so the agent doesn't reply to itself in self-chat mode.
+// Bounded LRU-ish window (keep last 256 ids) so memory is flat over
+// long-running sessions.
+const outboundMsgIds = new Set();
+const OUTBOUND_HISTORY_MAX = 256;
+function rememberOutbound(id) {
+  if (!id) return;
+  outboundMsgIds.add(id);
+  if (outboundMsgIds.size > OUTBOUND_HISTORY_MAX) {
+    // Drop the oldest (Set preserves insertion order). Trim back to ~3/4 max.
+    const trim = outboundMsgIds.size - Math.floor(OUTBOUND_HISTORY_MAX * 0.75);
+    let i = 0;
+    for (const v of outboundMsgIds) {
+      outboundMsgIds.delete(v);
+      if (++i >= trim) break;
+    }
+  }
+}
 let selfJid = null;
 let latestQrString = null;
 let latestQrPngDataUrl = null;
@@ -478,7 +498,29 @@ function wireSocket(s, saveCreds) {
           messageContextInfoKeys: m.message?.messageContextInfo ? Object.keys(m.message.messageContextInfo) : [],
           messageContextInfo: m.message?.messageContextInfo,
         });
-        if (m.key?.fromMe) continue;
+        // Skip our own replies: messages.upsert fires for the message
+        // we just sent, key.fromMe=true with the id rememberOutbound()
+        // captured. Without this guard a self-chat reply would bounce
+        // straight back to the agent.
+        if (m.key?.fromMe && m.key?.id && outboundMsgIds.has(m.key.id)) {
+          log('inbound.skipped_own_outbound', { id: m.key.id });
+          continue;
+        }
+        // Self-chat ("Message Yourself"): user has only one number, so
+        // they DM themselves and the agent (linked device) sees it as
+        // fromMe=true. We want to process those — but only when the
+        // chat is the user's own number AND the id wasn't ours. Other
+        // fromMe messages (user replying to a contact from their primary
+        // phone) we still ignore: those aren't directed at the agent.
+        if (m.key?.fromMe) {
+          const remoteE164 = jidToE164(m.key?.remoteJid || '')
+            || jidToE164(m.key?.remoteJidAlt || '')
+            || (lidToPhone.get(m.key?.remoteJid || '') || '')
+            || (lidToPhone.get(m.key?.remoteJidAlt || '') || '');
+          const selfChat = !!(selfE164 && remoteE164 && remoteE164 === selfE164);
+          if (!selfChat) continue;
+          log('inbound.self_chat', { id: m.key.id, self: selfE164 });
+        }
         if (m.key?.remoteJid?.endsWith('@broadcast')) continue;
         if (m.key?.remoteJid?.endsWith('@g.us')) continue;  // skip groups for v1
         const text = extractText(m.message || {});
@@ -741,6 +783,10 @@ async function handleSend(req, res) {
     const result = await sock.sendMessage(jid, { text });
     lastSendAt = new Date().toISOString();
     lastSendError = null;
+    // Remember our own outbound id so messages.upsert can drop the
+    // echo it'll fire for this message — otherwise a self-chat reply
+    // bounces back into the agent and triggers an infinite loop.
+    rememberOutbound(result?.key?.id || '');
     sendJson(res, 200, { ok: true, message_id: result?.key?.id || null, jid, jid_source: jidSource });
   } catch (e) {
     lastSendError = { at: new Date().toISOString(), message: String(e).slice(0, 300) };
