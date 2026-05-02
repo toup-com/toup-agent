@@ -576,3 +576,162 @@ async def test_reconcile_falls_back_to_started_at_when_heartbeat_null():
 
     assert legacy.status == "aborted_orphan"
     assert "heartbeat stale" in (legacy.notes or "")
+
+
+# ─── T17: resume-path dead-code fix ───────────────────────────────
+# Before the indentation fix at rollout_service.py:781-798, the resume
+# block was unreachable: the `if rollout.status != "running": continue`
+# guard at line 778 swallowed every code path that would have reached the
+# resume checks. These three tests cover the post-fix flow.
+
+
+@pytest.mark.asyncio
+async def test_reconcile_resumes_canary_observing_after_resume_after():
+    """T17: a `running` rollout in `phase='canary_observing'` whose
+    `resume_after` deadline has passed must be added to _resume_inflight
+    and have a resume task scheduled. Heartbeat fresh + age young so the
+    orphan paths don't fire — only the resume path should activate.
+    """
+    import asyncio
+    from datetime import datetime, timedelta
+    from app.services.rollout_service import (
+        _reconcile_once_in_session, _resume_inflight,
+    )
+    from app.db.models import Rollout
+
+    _resume_inflight.clear()
+
+    eligible = Rollout(
+        id="resume-eligible-1",
+        image_tag="ghcr.io/toup-com/toup-agent:abcd1234",
+        status="running",
+        phase="canary_observing",
+        trigger="ci",
+        started_at=datetime.utcnow() - timedelta(minutes=2),
+        last_progress_at=datetime.utcnow() - timedelta(seconds=30),
+        resume_after=datetime.utcnow() - timedelta(seconds=10),
+    )
+
+    db = MagicMock()
+    mock_result = MagicMock()
+    mock_result.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[eligible])))
+    db.execute = AsyncMock(return_value=mock_result)
+    db.commit = AsyncMock()
+
+    async def _noop_resume(_rollout_id):
+        pass
+
+    with patch("app.services.rollout_service._resume_with_cleanup", _noop_resume), \
+         patch("app.services.rollout_service._send_telegram", AsyncMock()):
+        await _reconcile_once_in_session(db)
+        # Yield once to let the scheduled noop drain so we don't get
+        # "coroutine was never awaited" warnings.
+        await asyncio.sleep(0)
+
+    assert "resume-eligible-1" in _resume_inflight, (
+        "resume-eligible rollout must be added to _resume_inflight — "
+        "this fails if the dedent fix at rollout_service.py:781-798 is reverted"
+    )
+    assert eligible.status == "running", "must NOT orphan a resume-eligible rollout"
+
+    _resume_inflight.discard("resume-eligible-1")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_resume_when_resume_after_is_future():
+    """T17: a `running` canary_observing rollout whose `resume_after` is
+    still in the future must NOT be resumed (deadline check at
+    rollout_service.py:787). Heartbeat fresh + age young, so no orphan
+    either — status must remain `running`.
+    """
+    import asyncio
+    from datetime import datetime, timedelta
+    from app.services.rollout_service import (
+        _reconcile_once_in_session, _resume_inflight,
+    )
+    from app.db.models import Rollout
+
+    _resume_inflight.clear()
+
+    too_early = Rollout(
+        id="resume-too-early-1",
+        image_tag="ghcr.io/toup-com/toup-agent:abcd1234",
+        status="running",
+        phase="canary_observing",
+        trigger="ci",
+        started_at=datetime.utcnow() - timedelta(minutes=1),
+        last_progress_at=datetime.utcnow() - timedelta(seconds=30),
+        resume_after=datetime.utcnow() + timedelta(minutes=5),
+    )
+
+    db = MagicMock()
+    mock_result = MagicMock()
+    mock_result.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[too_early])))
+    db.execute = AsyncMock(return_value=mock_result)
+    db.commit = AsyncMock()
+
+    async def _noop_resume(_rollout_id):
+        pass
+
+    with patch("app.services.rollout_service._resume_with_cleanup", _noop_resume), \
+         patch("app.services.rollout_service._send_telegram", AsyncMock()):
+        await _reconcile_once_in_session(db)
+        await asyncio.sleep(0)
+
+    assert "resume-too-early-1" not in _resume_inflight, (
+        "resume must not fire while resume_after is in the future"
+    )
+    assert too_early.status == "running", "must not orphan a healthy in-flight canary"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_resume_batching_phase():
+    """T17: a `running` rollout in `phase='batching'` (not 'canary_observing')
+    must NOT be resumed even with `resume_after` in the past — the resume
+    guard at rollout_service.py:785 explicitly excludes non-canary_observing
+    phases because mid-bridge-call resume risks double-deploys. With stale
+    heartbeat, Path 0 fires and orphans the rollout. Confirms guard
+    semantics survive the indentation fix.
+    """
+    import asyncio
+    from datetime import datetime, timedelta
+    from app.services.rollout_service import (
+        _reconcile_once_in_session, _STUCK_HEARTBEAT_MIN, _resume_inflight,
+    )
+    from app.db.models import Rollout
+
+    _resume_inflight.clear()
+
+    batching_orphan = Rollout(
+        id="batching-orphan-1",
+        image_tag="ghcr.io/toup-com/toup-agent:abcd1234",
+        status="running",
+        phase="batching",
+        trigger="ci",
+        started_at=datetime.utcnow() - timedelta(minutes=10),
+        last_progress_at=datetime.utcnow() - timedelta(minutes=_STUCK_HEARTBEAT_MIN + 1),
+        resume_after=datetime.utcnow() - timedelta(seconds=10),
+    )
+
+    db = MagicMock()
+    mock_result = MagicMock()
+    mock_result.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[batching_orphan])))
+    db.execute = AsyncMock(return_value=mock_result)
+    db.commit = AsyncMock()
+
+    async def _noop_resume(_rollout_id):
+        pass
+
+    with patch("app.services.rollout_service._resume_with_cleanup", _noop_resume), \
+         patch("app.services.rollout_service._send_telegram", AsyncMock()):
+        await _reconcile_once_in_session(db)
+        await asyncio.sleep(0)
+
+    assert batching_orphan.status == "aborted_orphan", (
+        "stale-heartbeat batching rollout must be orphaned via Path 0"
+    )
+    assert "heartbeat stale" in (batching_orphan.notes or "")
+    assert "batching-orphan-1" not in _resume_inflight, (
+        "resume guard must block non-canary_observing phases — "
+        "this fails if the resume path were to fire on phase!='canary_observing'"
+    )

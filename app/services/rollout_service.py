@@ -778,24 +778,24 @@ async def _reconcile_once_in_session(db: AsyncSession) -> None:
         if rollout.status != "running":
             continue
 
-            # (1) Resume canary_observing rollouts whose deadline passed.
-            # Other phases (canary_upgrading, batching) make bridge calls
-            # whose results we lost — replaying would risk double-deploys,
-            # so we leave them for the orphan threshold above.
-            if rollout.phase != "canary_observing":
-                continue
-            if not rollout.resume_after or rollout.resume_after > now:
-                continue
-            if rollout.id in _resume_inflight:
-                logger.debug("[ROLLOUT-RECONCILER] %s already resuming, skip", rollout.id)
-                continue
+        # (1) Resume canary_observing rollouts whose deadline passed.
+        # Other phases (canary_upgrading, batching) make bridge calls
+        # whose results we lost — replaying would risk double-deploys,
+        # so we leave them for the orphan threshold above.
+        if rollout.phase != "canary_observing":
+            continue
+        if not rollout.resume_after or rollout.resume_after > now:
+            continue
+        if rollout.id in _resume_inflight:
+            logger.debug("[ROLLOUT-RECONCILER] %s already resuming, skip", rollout.id)
+            continue
 
-            logger.info(
-                "[ROLLOUT-RECONCILER] resuming %s (deadline %s passed at age %.1fmin)",
-                rollout.id, rollout.resume_after, age_min,
-            )
-            _resume_inflight.add(rollout.id)
-            asyncio.create_task(_resume_with_cleanup(rollout.id))
+        logger.info(
+            "[ROLLOUT-RECONCILER] resuming %s (deadline %s passed at age %.1fmin)",
+            rollout.id, rollout.resume_after, age_min,
+        )
+        _resume_inflight.add(rollout.id)
+        asyncio.create_task(_resume_with_cleanup(rollout.id))
 
 
 async def _resume_with_cleanup(rollout_id: str) -> None:
