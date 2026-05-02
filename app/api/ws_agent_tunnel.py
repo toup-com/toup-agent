@@ -29,7 +29,7 @@ import time
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect, Query
 
 logger = logging.getLogger(__name__)
 
@@ -405,15 +405,33 @@ async def tunnel_status(user_id: str = Query(None)):
 
 @router.get("/agent/tunnel-status/me")
 async def tunnel_status_me(
+    request: Request,
     token: str = Query(None),
 ):
     """Check if the current user's terminal agent is connected.
 
-    Uses JWT auth (same as other endpoints) — no need to pass user_id.
+    Auth order (Ticket 1 / ST-4a):
+      1. Authorization: Bearer <token> header (preferred)
+      2. ?token= URL query param (deprecated — bake-window fallback,
+         emits [DEPRECATED-HTTP-AUTH] when used so the cutover gate
+         can detect zero usage before the legacy path is removed)
     """
+    from app.api._ws_auth_helpers import log_deprecated_http_query_token
+
     user_id = None
-    if token:
+
+    # 1. Authorization header (preferred)
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        header_token = auth_header[7:].strip()
+        if header_token:
+            user_id = await _authenticate_tunnel(header_token)
+
+    # 2. ?token= URL fallback (deprecated)
+    if not user_id and token:
         user_id = await _authenticate_tunnel(token)
+        if user_id:
+            log_deprecated_http_query_token("/api/agent/tunnel-status/me")
 
     if not user_id:
         return {"connected": False, "error": "auth required"}
@@ -429,16 +447,45 @@ async def tunnel_status_me(
 
 
 @router.get("/agent/tunnel-debug")
-async def tunnel_debug(token: str = Query(None)):
-    """Debug endpoint: test token auth and show tunnel state."""
+async def tunnel_debug(
+    request: Request,
+    token: str = Query(None),
+):
+    """Debug endpoint: test token auth and show tunnel state.
+
+    Auth order (Ticket 1 / ST-4a):
+      1. Authorization: Bearer <token> header (preferred)
+      2. ?token= URL query param (deprecated — emits [DEPRECATED-HTTP-AUTH])
+    """
+    from app.api._ws_auth_helpers import log_deprecated_http_query_token
+
     result: dict = {"tunnels_active": list(_tunnels.keys())}
 
-    if not token:
+    user_id = None
+    auth_token: Optional[str] = None
+
+    # 1. Authorization header (preferred)
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        header_token = auth_header[7:].strip()
+        if header_token:
+            user_id = await _authenticate_tunnel(header_token)
+            if user_id:
+                auth_token = header_token
+                result["auth_source"] = "header"
+
+    # 2. ?token= URL fallback (deprecated)
+    if not user_id and token:
+        user_id = await _authenticate_tunnel(token)
+        if user_id:
+            auth_token = token
+            result["auth_source"] = "query"
+            log_deprecated_http_query_token("/api/agent/tunnel-debug")
+
+    if not auth_token:
         result["error"] = "no token provided"
         return result
 
-    # Test authentication
-    user_id = await _authenticate_tunnel(token)
     result["auth_user_id"] = user_id
 
     if user_id:
@@ -455,11 +502,13 @@ async def tunnel_debug(token: str = Query(None)):
             # Count total configs with connect tokens
             r = await conn.execute(text("SELECT COUNT(*) FROM agent_configs WHERE connect_token IS NOT NULL"))
             result["configs_with_tokens"] = r.scalar()
-            # Check if this specific token exists
-            if token.startswith("toup_ct_"):
+            # Check if this specific token exists. Uses the resolved
+            # auth_token (header or query) so DB lookup matches whichever
+            # path actually authenticated.
+            if auth_token and auth_token.startswith("toup_ct_"):
                 r2 = await conn.execute(
                     text("SELECT user_id, LENGTH(connect_token) FROM agent_configs WHERE connect_token = :t"),
-                    {"t": token},
+                    {"t": auth_token},
                 )
                 row = r2.first()
                 result["token_found_in_db"] = row is not None

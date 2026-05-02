@@ -90,6 +90,21 @@ def log_deprecated_agent_key_url(endpoint_label: str) -> None:
     )
 
 
+def log_deprecated_http_query_token(endpoint_label: str) -> None:
+    """Vault Ticket 1 / ST-4a: parallel marker for HTTP endpoint JWT
+    migration from `?token=` URL query param to `Authorization: Bearer`
+    header. Distinct from [DEPRECATED-WS-AUTH] (WebSocket subprotocol
+    migration) so the two cutover gates are independently observable —
+    ST-3 / WS bake clock and ST-4a / HTTP bake clock have separate
+    7-day-zero windows. Call only when the URL fallback was actually
+    used for auth (not just present)."""
+    logger.warning(
+        "[DEPRECATED-HTTP-AUTH] %s used ?token= URL param for auth — "
+        "migrate caller to Authorization: Bearer header",
+        endpoint_label,
+    )
+
+
 async def safe_send_close_ws(
     websocket: WebSocket,
     code: int,
