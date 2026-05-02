@@ -737,6 +737,10 @@ async function handleSend(req, res) {
   }
   const to = (payload.to || '').toString();
   const text = (payload.text || '').toString();
+  // Optional override — Python adapter passes the user's chosen agent
+  // name (AgentConfig.agent_name). Used as the self-chat bold header
+  // so the user sees "*🤖 [theirName]*" instead of a generic label.
+  const displayName = (payload.display_name || '').toString().trim() || 'Agent';
   if (!to || !text) {
     sendJson(res, 400, { ok: false, error: 'to + text required' });
     return;
@@ -778,9 +782,19 @@ async function handleSend(req, res) {
     sendJson(res, 400, { ok: false, error: 'invalid to' });
     return;
   }
-  log('send.dispatch', { jid, jid_source: jidSource, len: text.length });
+  // Self-chat ("Message Yourself"): everything in the thread is fromMe
+  // so WhatsApp paints user-typed and agent-typed messages with the
+  // same green bubble — the user can't tell who said what. Wrap the
+  // agent's reply with a clear bold header so it visually stands out
+  // even though we can't influence the bubble colour itself.
+  const isSelfChat = !!(selfE164 && (
+    jidToE164(jid) === selfE164 ||
+    (lidToPhone.get(jid) || '') === selfE164
+  ));
+  const outboundText = isSelfChat ? `*🤖 ${displayName}*\n${text}` : text;
+  log('send.dispatch', { jid, jid_source: jidSource, len: outboundText.length, self_chat: isSelfChat, display_name: isSelfChat ? displayName : undefined });
   try {
-    const result = await sock.sendMessage(jid, { text });
+    const result = await sock.sendMessage(jid, { text: outboundText });
     lastSendAt = new Date().toISOString();
     lastSendError = null;
     // Remember our own outbound id so messages.upsert can drop the

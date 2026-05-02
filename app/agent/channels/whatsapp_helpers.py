@@ -59,6 +59,14 @@ _BOLD_DOUBLE_UNDER_RE = re.compile(r"__(.+?)__", re.DOTALL)
 # ~~strike~~ collapses to ~strike~.
 _STRIKE_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
 
+# Chip / quick-reply markers — `[[button:Label|callback]]`. The web +
+# mobile chat UIs render these as clickable chips; WhatsApp has no way
+# to render an interactive chip in linked-device sessions, so the raw
+# `[[button:...]]` text would just leak into the message body. Strip
+# them entirely — the agent's prose almost always lists the same
+# options as bullet points right above the chip block.
+_BUTTON_CHIP_RE = re.compile(r"\[\[button:[^|\]]+\|[^\]]+\]\]")
+
 
 def markdown_to_whatsapp(text: str) -> str:
     """Convert GFM-ish markdown into WhatsApp formatting.
@@ -81,6 +89,17 @@ def markdown_to_whatsapp(text: str) -> str:
     GFM italics (``*italic*`` / ``_italic_``) are already valid
     WhatsApp italics — we leave them alone.
     """
+    if not text:
+        return text
+
+    # Drop chip markers first — they live outside fences/inlines and
+    # carry no meaning for WhatsApp. A trailing run of blank lines left
+    # behind by the strip is collapsed afterwards.
+    text = _BUTTON_CHIP_RE.sub("", text)
+    # Squash 3+ consecutive newlines that the chip removal can produce
+    # (chip blocks usually sit on their own paragraph) down to a single
+    # blank line so the rendered message doesn't have awkward gaps.
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return text
 

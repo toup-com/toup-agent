@@ -147,6 +147,13 @@ class BaileysWhatsAppChannel(BaseChannel):
         self._sweep_task: Optional[asyncio.Task] = None
         self._http: Optional[httpx.AsyncClient] = None
         self._stopping: bool = False
+        # Cached agent display name — used as the *bold header* on
+        # self-chat replies so users can tell the agent's bubble apart
+        # from their own (both are fromMe in Message Yourself, so the
+        # bubble colour is identical). Loaded lazily on first send;
+        # refreshed if a 'NAMECHANGE' style flag is added later.
+        self._agent_display_name: Optional[str] = None
+        self._agent_display_name_loaded: bool = False
 
         # Cached state — refreshed on each /pair/status or sidecar event.
         self._session_status: str = "not_linked"
@@ -503,12 +510,14 @@ class BaileysWhatsAppChannel(BaseChannel):
         if not chunks:
             return
 
+        display_name = await self._resolve_agent_display_name()
+
         redacted = redact_phone(chat_id)
         for idx, chunk in enumerate(chunks, start=1):
             try:
                 resp = await self._http.post(
                     "/messages/send",
-                    json={"to": chat_id, "text": chunk},
+                    json={"to": chat_id, "text": chunk, "display_name": display_name},
                 )
                 if resp.status_code != 200:
                     body = resp.text[:300]
@@ -535,6 +544,36 @@ class BaileysWhatsAppChannel(BaseChannel):
                     "message_excerpt": str(exc)[:300],
                 }
                 return
+
+    async def _resolve_agent_display_name(self) -> Optional[str]:
+        """Look up `agent_configs.agent_name` once per process.
+
+        Mirrors the pattern in telegram_bot.py — read once on the first
+        outbound message and cache. The Soul page persists name changes
+        to the same column, so a container restart picks them up. (Live
+        rename without restart is rare; we'd refresh on a settings event
+        when that becomes a real ask.)
+        """
+        if self._agent_display_name_loaded:
+            return self._agent_display_name
+        try:
+            from app.config import settings as _s
+            from app.db.database import async_session_maker
+            from app.db.models import AgentConfig
+            from sqlalchemy import select
+            user_id = getattr(_s, "user_id", None)
+            if user_id:
+                async with async_session_maker() as db:
+                    row = await db.execute(
+                        select(AgentConfig.agent_name).where(AgentConfig.user_id == user_id)
+                    )
+                    name = row.scalar_one_or_none()
+                    if name and name.strip():
+                        self._agent_display_name = name.strip()
+        except Exception:
+            logger.exception("[WHATSAPP-BAILEYS] agent_name.lookup_failed")
+        self._agent_display_name_loaded = True
+        return self._agent_display_name
 
     async def send_typing(self, chat_id: str) -> None:
         """Best-effort typing presence. The sidecar doesn't expose a
