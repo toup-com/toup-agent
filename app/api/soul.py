@@ -209,8 +209,24 @@ async def _save_soul_impl(
         and not onboarding_was_done
     )
 
+    # Snapshot the now-known field values BEFORE commit so we can build
+    # the response without re-touching `config` (post-commit refresh has
+    # been the suspect for the bare 500s we've been seeing — pgbouncer
+    # can drop the named-prepared-statement session between commit and
+    # refresh, surfacing as an unhandled DBAPIError outside any except).
+    saved_at = datetime.utcnow()
+    response_payload = SoulConfigResponse(
+        name=req.name,
+        color=req.color,
+        pronouns=req.pronouns,
+        style=req.style,
+        traits=list(req.traits or []),
+        custom_instructions=req.custom_instructions or "",
+        compiled_text=compiled_text,
+        updated_at=saved_at,
+    )
+
     await db.commit()
-    await db.refresh(config)
 
     # ── VPS sync (invisible to user) ──
     if agent_cfg and agent_cfg.agent_url and agent_cfg.agent_api_key:
@@ -232,21 +248,21 @@ async def _save_soul_impl(
                 },
             )
             if vps_synced:
-                config.vps_soul_synced_at = datetime.now(timezone.utc)
-                await db.commit()
+                # Best-effort timestamp update — failure here doesn't
+                # invalidate the save, so swallow any DB error rather
+                # than letting it 500 a successful save.
+                try:
+                    config.vps_soul_synced_at = datetime.now(timezone.utc)
+                    await db.commit()
+                except Exception as inner:
+                    logger.warning(
+                        "[SOUL] vps_soul_synced_at update skipped: %s",
+                        type(inner).__name__,
+                    )
         except Exception as e:
             logger.error(f"[SOUL] VPS sync failed for user {current_user.id}: {e}")
 
-    return SoulConfigResponse(
-        name=config.name,
-        color=config.color,
-        pronouns=config.pronouns,
-        style=config.style,
-        traits=config.traits or [],
-        custom_instructions=config.custom_instructions or "",
-        compiled_text=config.compiled_text or "",
-        updated_at=config.updated_at,
-    )
+    return response_payload
 
 
 async def _sync_soul_to_vps(
