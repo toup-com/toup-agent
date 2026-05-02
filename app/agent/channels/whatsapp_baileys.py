@@ -147,13 +147,6 @@ class BaileysWhatsAppChannel(BaseChannel):
         self._sweep_task: Optional[asyncio.Task] = None
         self._http: Optional[httpx.AsyncClient] = None
         self._stopping: bool = False
-        # Cached agent display name — used as the *bold header* on
-        # self-chat replies so users can tell the agent's bubble apart
-        # from their own (both are fromMe in Message Yourself, so the
-        # bubble colour is identical). Loaded lazily on first send;
-        # refreshed if a 'NAMECHANGE' style flag is added later.
-        self._agent_display_name: Optional[str] = None
-        self._agent_display_name_loaded: bool = False
 
         # Cached state — refreshed on each /pair/status or sidecar event.
         self._session_status: str = "not_linked"
@@ -546,34 +539,49 @@ class BaileysWhatsAppChannel(BaseChannel):
                 return
 
     async def _resolve_agent_display_name(self) -> Optional[str]:
-        """Look up `agent_configs.agent_name` once per process.
+        """Look up the user's chosen agent name for self-chat headers.
 
-        Mirrors the pattern in telegram_bot.py — read once on the first
-        outbound message and cache. The Soul page persists name changes
-        to the same column, so a container restart picks them up. (Live
-        rename without restart is rare; we'd refresh on a settings event
-        when that becomes a real ask.)
+        Order of preference (mirrors `telegram_bot._cmd_start`):
+          1. ``agent_configs.agent_name`` (set by Soul page's VPS sync)
+          2. ``identities.name`` for the active ``soul`` record, with
+             the trailing " Soul" stripped
+          3. None — sidecar's "Agent" default kicks in
+
+        No caching: a single indexed SELECT per outbound message is
+        cheap, and skipping the cache means a Soul-page rename takes
+        effect on the very next reply rather than requiring a restart.
         """
-        if self._agent_display_name_loaded:
-            return self._agent_display_name
         try:
             from app.config import settings as _s
             from app.db.database import async_session_maker
-            from app.db.models import AgentConfig
-            from sqlalchemy import select
+            from app.db.models import AgentConfig, Identity
+            from sqlalchemy import select, and_
             user_id = getattr(_s, "user_id", None)
-            if user_id:
-                async with async_session_maker() as db:
-                    row = await db.execute(
-                        select(AgentConfig.agent_name).where(AgentConfig.user_id == user_id)
-                    )
-                    name = row.scalar_one_or_none()
-                    if name and name.strip():
-                        self._agent_display_name = name.strip()
+            if not user_id:
+                return None
+            async with async_session_maker() as db:
+                row = await db.execute(
+                    select(AgentConfig.agent_name).where(AgentConfig.user_id == user_id)
+                )
+                name = row.scalar_one_or_none()
+                if name and name.strip():
+                    return name.strip()
+                # Fallback to Identity(type='soul').name (e.g. "doodool Soul")
+                row = await db.execute(
+                    select(Identity.name).where(and_(
+                        Identity.user_id == user_id,
+                        Identity.identity_type == "soul",
+                        Identity.is_active == True,
+                    ))
+                )
+                ident = row.scalar_one_or_none()
+                if ident:
+                    cleaned = ident[:-5].strip() if ident.endswith(" Soul") else ident.strip()
+                    if cleaned:
+                        return cleaned
         except Exception:
             logger.exception("[WHATSAPP-BAILEYS] agent_name.lookup_failed")
-        self._agent_display_name_loaded = True
-        return self._agent_display_name
+        return None
 
     async def send_typing(self, chat_id: str) -> None:
         """Best-effort typing presence. The sidecar doesn't expose a
