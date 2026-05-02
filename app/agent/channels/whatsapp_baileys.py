@@ -541,25 +541,32 @@ class BaileysWhatsAppChannel(BaseChannel):
     async def _resolve_agent_display_name(self) -> Optional[str]:
         """Look up the user's chosen agent name for self-chat headers.
 
-        Order of preference (mirrors `telegram_bot._cmd_start`):
-          1. ``agent_configs.agent_name`` (set by Soul page's VPS sync)
-          2. ``identities.name`` for the active ``soul`` record, with
-             the trailing " Soul" stripped
-          3. None — sidecar's "Agent" default kicks in
+        On agents, ``agent_configs`` is in PLATFORM_ONLY_TABLES so the
+        table doesn't exist on the tenant DB. We still try AgentConfig
+        first (so the same code path works in monolith / platform-mode
+        runs), but the exception is caught locally rather than aborting
+        the whole lookup. The real source of truth on agents is the
+        ``Identity`` table, which the Soul page's `/api/soul/sync` keeps
+        up to date with rows like ``Identity(name='doodool Soul')``.
 
-        No caching: a single indexed SELECT per outbound message is
-        cheap, and skipping the cache means a Soul-page rename takes
-        effect on the very next reply rather than requiring a restart.
+        No caching: one indexed SELECT per outbound message is cheap,
+        and skipping the cache means a Soul-page rename takes effect on
+        the very next reply rather than requiring a restart.
         """
+        from app.config import settings as _s
+        from app.db.database import async_session_maker
+        from app.db.models import AgentConfig, Identity
+        from sqlalchemy import select, and_
+
+        user_id = getattr(_s, "user_id", None)
+        if not user_id:
+            logger.warning("[WHATSAPP-BAILEYS] agent_name.no_user_id — settings.user_id empty")
+            return None
+
+        # Each query gets its own session so a failed query (e.g.
+        # UndefinedTableError on agent containers, where agent_configs
+        # doesn't exist) doesn't poison the transaction for the next.
         try:
-            from app.config import settings as _s
-            from app.db.database import async_session_maker
-            from app.db.models import AgentConfig, Identity
-            from sqlalchemy import select, and_
-            user_id = getattr(_s, "user_id", None)
-            if not user_id:
-                logger.warning("[WHATSAPP-BAILEYS] agent_name.no_user_id — settings.user_id empty")
-                return None
             async with async_session_maker() as db:
                 row = await db.execute(
                     select(AgentConfig.agent_name).where(AgentConfig.user_id == user_id)
@@ -567,11 +574,20 @@ class BaileysWhatsAppChannel(BaseChannel):
                 name = row.scalar_one_or_none()
                 if name and name.strip():
                     return name.strip()
-                logger.info(
-                    "[WHATSAPP-BAILEYS] agent_name.no_agent_config_row user=%s — falling back to Identity",
-                    user_id[:8],
-                )
-                # Fallback to Identity(type='soul').name (e.g. "doodool Soul")
+        except Exception as e:
+            # Expected on agent tenants — agent_configs lives on the
+            # platform DB only. Log at debug, not exception, so we
+            # don't spam logs once per outbound message.
+            logger.debug(
+                "[WHATSAPP-BAILEYS] agent_name.agent_config_unavailable user=%s: %s",
+                user_id[:8], type(e).__name__,
+            )
+
+        # Fallback to Identity(type='soul').name (e.g. "doodool Soul").
+        # This is the canonical source on agents because soul.py:sync_soul
+        # upserts it from the platform's PUT /api/soul.
+        try:
+            async with async_session_maker() as db:
                 row = await db.execute(
                     select(Identity.name).where(and_(
                         Identity.user_id == user_id,
@@ -589,7 +605,7 @@ class BaileysWhatsAppChannel(BaseChannel):
                     user_id[:8],
                 )
         except Exception:
-            logger.exception("[WHATSAPP-BAILEYS] agent_name.lookup_failed")
+            logger.exception("[WHATSAPP-BAILEYS] agent_name.identity_lookup_failed")
         return None
 
     async def send_typing(self, chat_id: str) -> None:
