@@ -60,6 +60,10 @@ class PriceItem(BaseModel):
     name: str
     amount_cents: int
     interval: str
+    # ISO 4217 currency code (lowercase, e.g. "usd", "cad"). Sourced
+    # from the Stripe Price object so the frontend can render the right
+    # symbol instead of guessing from the user's browser locale.
+    currency: str = "usd"
 
 
 class PricesResponse(BaseModel):
@@ -96,6 +100,7 @@ async def _sync_active_subscription_to_db(
 
     config.bundle_stripe_subscription_id = subscription_id
     config.bundle_status = "active"
+    config.bundle_cancelled_at = None  # already-active sync also clears the reaper marker
     config.llm_mode = "bundle"
     config.bundle_current_period_end = period_end
     if not config.bundle_started_at:
@@ -367,6 +372,7 @@ async def get_prices(db: AsyncSession = Depends(get_db)):
                 name=price_info["product_name"] or "Toup LLM Bundle",
                 amount_cents=price_info["unit_amount"],
                 interval=price_info["interval"] or "month",
+                currency=(price_info.get("currency") or "usd").lower(),
             )
 
     plans_result = await db.execute(select(VPSPlan).order_by(VPSPlan.price_cents))

@@ -181,6 +181,11 @@ class AgentConfig(Base):
     bundle_status: Mapped[str] = mapped_column(String(20), default="none")
     bundle_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     bundle_current_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # When the subscription transitioned to bundle_status='cancelled'.
+    # Drives the managed-container reaper grace period — see
+    # `scheduled_tasks.run_managed_container_reaper`. NULL until the
+    # first cancellation; reset on resubscribe via _handle_invoice_succeeded.
+    bundle_cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # LLM Proxy auth + budget
     llm_token_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)

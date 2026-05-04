@@ -299,6 +299,12 @@ class Settings(BaseSettings):
     docker_port_range_start: int = 9000     # Kept for the bridge's port allocation
     docker_port_range_end: int = 9999
     managed_hosting_enabled: bool = False   # Gate: set True once bridge is reachable
+    # Container reaper grace period — how many days a managed tenant
+    # container keeps running after its bundle is cancelled before the
+    # nightly reaper destroys it. 7 days gives users a generous re-sub
+    # window without burning Contabo resources indefinitely. Set to 0
+    # in dev to disable the reaper entirely.
+    bundle_cancel_grace_days: int = 7
     admin_alert_telegram_token: str = ""    # Bot token for admin alerts (shared / user-facing bot)
     admin_alert_telegram_chat_id: str = ""
 

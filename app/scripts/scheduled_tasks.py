@@ -524,6 +524,100 @@ async def run_account_purge():
     )
 
 
+async def run_managed_container_reaper():
+    """Destroy managed-tenant containers whose bundle was cancelled
+    longer than ``settings.bundle_cancel_grace_days`` ago.
+
+    Closes the post-cancellation resource leak on Contabo: without this
+    job, a user can cancel their LLM Bundle subscription and keep their
+    tenant container running indefinitely (see May 2026 review). The
+    grace window — 7 days by default — gives users a re-subscribe path
+    that doesn't require re-provisioning.
+
+    Filtering is conservative on purpose:
+      * `hosting_mode == 'managed'` — never touches self-hosted agents
+      * `bundle_status == 'cancelled'` — `cancelling` (period not over)
+        and `past_due` (could recover) are explicitly skipped
+      * `bundle_cancelled_at` is set AND older than grace window —
+        rows missing the timestamp are skipped (the timestamp will be
+        backfilled by the next webhook event for this user)
+      * `ManagedContainer.status` already in {`deleted`, `destroyed`}
+        is skipped — destroy_container is idempotent but we don't want
+        to log noise for already-reaped tenants
+
+    Failures of `destroy_container` are logged and counted; the loop
+    continues so one stuck tenant doesn't block the rest. Set
+    `settings.bundle_cancel_grace_days = 0` to disable the job.
+    """
+    from datetime import timedelta
+    from app.config import settings as _s
+    from app.db.models import AgentConfig
+    from app.db.models.managed_container import ManagedContainer
+    from app.services import docker_host_service
+
+    grace_days = int(getattr(_s, "bundle_cancel_grace_days", 7) or 0)
+    if grace_days <= 0:
+        logger.info("[bundle_reaper] disabled (bundle_cancel_grace_days=%s)", grace_days)
+        return
+
+    cutoff = datetime.utcnow() - timedelta(days=grace_days)
+
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(AgentConfig.user_id, AgentConfig.bundle_cancelled_at).where(
+                AgentConfig.hosting_mode == "managed",
+                AgentConfig.bundle_status == "cancelled",
+                AgentConfig.bundle_cancelled_at.is_not(None),
+                AgentConfig.bundle_cancelled_at < cutoff,
+            )
+        )
+        candidates = list(result.all())
+
+    if not candidates:
+        logger.info("[bundle_reaper] no candidates (grace=%dd, cutoff=%s)", grace_days, cutoff.isoformat())
+        return
+
+    logger.info("[bundle_reaper] %d candidate(s) past %dd grace", len(candidates), grace_days)
+
+    reaped = 0
+    skipped = 0
+    failed = 0
+    for user_id, cancelled_at in candidates:
+        try:
+            async with async_session_maker() as cdb:
+                cresult = await cdb.execute(
+                    select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+                )
+                container = cresult.scalar_one_or_none()
+                if not container:
+                    skipped += 1
+                    continue
+                if container.status in ("deleted", "destroyed"):
+                    skipped += 1
+                    continue
+
+                ok = await docker_host_service.destroy_container(cdb, user_id)
+                if ok:
+                    reaped += 1
+                    logger.info(
+                        "[bundle_reaper] destroyed container user=%s cancelled_at=%s",
+                        user_id[:8], cancelled_at.isoformat() if cancelled_at else "?",
+                    )
+                else:
+                    failed += 1
+        except Exception as e:
+            failed += 1
+            logger.error(
+                "[bundle_reaper] destroy failed user=%s err=%s",
+                user_id[:8], e, exc_info=True,
+            )
+
+    logger.info(
+        "[bundle_reaper] complete reaped=%d skipped=%d failed=%d",
+        reaped, skipped, failed,
+    )
+
+
 def setup_scheduler(
     decay_interval_hours: int = 6,
     consolidation_interval_hours: int = 24,
@@ -588,6 +682,19 @@ def setup_scheduler(
         id="account_purge",
         name="Account Purge (>30d after deletion)",
         replace_existing=True,
+    )
+
+    # Managed-tenant container reaper — daily at 5:00 AM. Destroys
+    # containers whose bundle was cancelled longer than
+    # settings.bundle_cancel_grace_days (default 7) ago. Self-disables
+    # when the grace setting is 0; safe to run on every deployment.
+    scheduler.add_job(
+        run_managed_container_reaper,
+        trigger=CronTrigger(hour=5, minute=0),
+        id="bundle_container_reaper",
+        name="Managed Container Reaper (post-cancel grace)",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     # Day-as-Chat archival — runs hourly, gated on feature flag. Not timezone-bound:
