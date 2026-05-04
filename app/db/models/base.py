@@ -113,6 +113,9 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "credential_access_log",
     # Platform-wide admin settings (editable via admin panel)
     "platform_settings",
+    # Account deletion audit + sensitive-action replay defense (§1.3).
+    "deletion_audit_events",
+    "sensitive_action_redemptions",
 }
 
 SHARED_TABLES: set[str] = {

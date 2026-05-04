@@ -295,55 +295,126 @@ async def logout_user(response: Response):
 # OpenAI bundle project, wipes 17+ tables (messages, memories, agent
 # configs with API keys, etc.), then DELETEs the user row.
 #
-# Earlier this endpoint only anonymised the User row (email rename +
-# is_active=False) and added a "background job later purges the row"
-# comment for a job that never shipped. The audit on 2026-05-01 proved
-# the gap end-to-end: container kept running, tenant DB intact, Stripe
-# kept billing, OpenAI project still active, AgentConfig with every
-# API key the user had entered still in the DB. Single source of truth
-# for "delete me everywhere" lives in
-# `app.services.user_deletion.cascade_delete_user`.
+# Authentication is two-step (per §1.3 sign-off, 2026-05-01):
+#   1. Client calls POST /auth/reauth with its existing access token
+#      to obtain a 5-minute single-use sensitive-action token.
+#   2. Client calls POST /auth/delete-account passing the token in
+#      the X-Sensitive-Action-Token header.
+#
+# Why fresh-JWT instead of password re-entry: avoids storing or
+# transmitting the plaintext password on mobile (SecureStore doesn't
+# expose it). The token has a stable replay defense via the
+# sensitive_action_redemptions table.
+#
+# Single source of truth for "delete me everywhere" lives in
+# `app.services.user_deletion.delete_user_completely`.
 
-class DeleteAccountRequest(BaseModel):
-    password: str
+from app.services.sensitive_action_token import (
+    SensitiveActionPurpose,
+    issue_sensitive_action_token,
+    verify_sensitive_action_token,
+    DEFAULT_TTL_SECONDS,
+)
+from app.services.user_deletion import (
+    DeletionActor,
+    DeletionAbortedError,
+    delete_user_completely,
+)
+from dataclasses import asdict
+
+
+class ReauthResponse(BaseModel):
+    sensitive_action_token: str
+    expires_in: int
+
+
+@router.post("/reauth", response_model=ReauthResponse)
+async def reauth(
+    current_user=Depends(get_current_user),
+):
+    """Issue a 5-minute single-use sensitive-action token. Required
+    before destructive endpoints like /auth/delete-account. The
+    returned token is bound to the calling user's id and is invalid
+    for any other user or any other purpose.
+
+    Future destructive endpoints (rotate API keys, change billing
+    email, etc.) will share this issuance path with a different
+    `expected_purpose` parameter on verification.
+    """
+    token, _exp = issue_sensitive_action_token(
+        user_id=str(current_user.id),
+        purpose=SensitiveActionPurpose.DELETE_ACCOUNT,
+    )
+    return ReauthResponse(
+        sensitive_action_token=token,
+        expires_in=DEFAULT_TTL_SECONDS,
+    )
 
 
 @router.post("/delete-account")
 async def delete_account(
-    body: DeleteAccountRequest,
+    request: Request,
     response: Response,
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete the current user's account and ALL associated data.
 
-    Requires password confirmation. Synchronous — by the time this
-    returns, the managed container is destroyed, Stripe customer is
-    deleted, OpenAI project is archived, and the user row is gone.
+    Requires a fresh sensitive-action token issued via POST /auth/
+    reauth within the last 5 minutes. Synchronous — by the time this
+    returns, Stripe customer is canceled, the managed container is
+    destroyed, OpenAI project is archived, and the user row is gone.
 
-    Last admin / cannot-delete-self guards do not apply here: this is
-    the user's own account. Apple's guideline doesn't let us refuse
-    deletion just because the user happens to be an admin.
+    Last admin / cannot-delete-self guards do not apply here: this
+    is the user's own account. Apple's guideline doesn't let us
+    refuse deletion just because the user is an admin.
+
+    Failure modes:
+      - 401: missing / invalid / replayed sensitive-action token
+      - 502: cascade aborted (Stripe or container teardown failed).
+        User's data is intact; client should surface a step-keyed
+        retry message and let the user try again.
+      - 200 with cookie cleared: deletion succeeded.
     """
-    if not verify_password(body.password, current_user.hashed_password):
-        raise HTTPException(status_code=400, detail="Password is incorrect")
+    sat = request.headers.get("X-Sensitive-Action-Token", "")
+    await verify_sensitive_action_token(
+        db,
+        sat,
+        expected_user_id=str(current_user.id),
+        expected_purpose=SensitiveActionPurpose.DELETE_ACCOUNT,
+    )
+    # Persist the redemption row before we touch destructive state, so
+    # a token that authorized this run is irreversibly burned even if
+    # the cascade aborts. Otherwise a Stripe-fail abort would let the
+    # user re-issue + re-redeem the same token.
+    await db.commit()
 
-    from app.services.user_deletion import cascade_delete_user
     try:
-        report = await cascade_delete_user(db, current_user)
-    except Exception:
-        # cascade_delete_user is engineered to never raise mid-way,
-        # but defence-in-depth: don't leak a 500 + stale session if
-        # something does throw. The user's data is already partially
-        # gone at this point, so we still clear the cookie.
-        logger.exception("[DELETE-ACCOUNT] cascade raised unexpectedly")
-        report = {"steps": {"unexpected_error": True}}
+        receipt = await delete_user_completely(
+            db,
+            current_user,
+            actor=DeletionActor.SELF,
+            request_ip=(request.client.host if request.client else None),
+            request_user_agent=request.headers.get("user-agent"),
+        )
+    except DeletionAbortedError as e:
+        # Don't clear the cookie — the user is still logged in, their
+        # data is intact, and they can retry once the underlying
+        # service recovers.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"step": e.step.value, "message": e.detail},
+        )
 
-    response.delete_cookie(key=SSO_COOKIE_NAME, domain=SSO_COOKIE_DOMAIN, path="/")
+    # Success — clear the SSO cookie so the now-deleted user's session
+    # is invalidated immediately on the client.
+    response.delete_cookie(
+        key=SSO_COOKIE_NAME, domain=SSO_COOKIE_DOMAIN, path="/",
+    )
     return {
         "success": True,
         "message": "Account and all associated data deleted.",
-        "report": report,
+        "receipt": asdict(receipt),
     }
 
 

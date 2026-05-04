@@ -45,6 +45,37 @@ from app.api.files import router as files_router
 _app_start_time = None
 
 
+def _boot_banner() -> str:
+    """Single-line boot banner for ops visibility. Masks the Stripe key —
+    only the prefix is logged, never the full value."""
+    from urllib.parse import urlparse
+    key = (settings.stripe_secret_key or "").strip()
+    if key.startswith("sk_live_"):
+        stripe_repr = "sk_live_***"
+    elif key.startswith("sk_test_"):
+        stripe_repr = "sk_test_***"
+    elif key:
+        stripe_repr = "<unrecognized-prefix>"
+    else:
+        stripe_repr = "<not configured>"
+    bridge_host = "<not configured>"
+    if settings.bridge_url:
+        try:
+            bridge_host = urlparse(settings.bridge_url).hostname or "<not configured>"
+        except Exception:
+            bridge_host = "<unparseable>"
+    try:
+        db_host = urlparse(settings.database_url).hostname or "<local>"
+    except Exception:
+        db_host = "<unparseable>"
+    return (
+        f"BOOT: ENVIRONMENT={settings.environment} "
+        f"STRIPE={stripe_repr} "
+        f"BRIDGE={bridge_host} "
+        f"DB_HOST={db_host}"
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler - runs on startup and shutdown"""
@@ -54,6 +85,7 @@ async def lifespan(app: FastAPI):
 
     # Startup
     print("🧠 Toup Agent starting up...")
+    print(_boot_banner())
     await init_db()
     print("✅ Database initialized")
     

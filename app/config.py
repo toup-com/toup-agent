@@ -8,6 +8,11 @@ class Settings(BaseSettings):
     # App
     app_name: str = "Toup Agent Platform"
     debug: bool = True
+
+    # Deployment environment. Drives the sk_live_ / sk_test_ guard below.
+    # Anything other than "production" treats the deployment as non-prod and
+    # forbids live Stripe keys. Set via ENVIRONMENT env var.
+    environment: str = "production"
     
     # Database
     database_url: str = "sqlite+aiosqlite:///./toup.db"
@@ -395,6 +400,7 @@ class Settings(BaseSettings):
         "telegram_bot_token", "discord_bot_token", "slack_bot_token",
         "slack_app_token", "brave_api_key", "elevenlabs_api_key",
         "cohere_api_key", "agent_api_key", "toup_token",
+        "stripe_secret_key", "stripe_webhook_secret",
     }
 
     @model_validator(mode="after")
@@ -405,6 +411,33 @@ class Settings(BaseSettings):
                 stripped = val.strip()
                 if stripped != val:
                     object.__setattr__(self, field, stripped)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_stripe_environment_match(self) -> "Settings":
+        # Refuse to boot when the configured Stripe key disagrees with the
+        # declared deployment environment. Guards against the two catastrophic
+        # mistakes: (a) sk_live_ in non-prod (charges real cards from a dev
+        # build), (b) sk_test_ in prod (real users get test charges that
+        # don't actually settle). Empty / unset key allows boot — Stripe is
+        # optional infrastructure, only the prefix mismatch is a fatal misconfig.
+        key = (self.stripe_secret_key or "").strip()
+        if not key:
+            return self
+        is_live = key.startswith("sk_live_")
+        if self.environment == "production" and not is_live:
+            raise ValueError(
+                "Refusing to boot: ENVIRONMENT=production requires "
+                "STRIPE_SECRET_KEY to start with 'sk_live_'. "
+                f"Got prefix '{key[:8]}...'. "
+                "Either set ENVIRONMENT to a non-prod value or use a live key."
+            )
+        if self.environment != "production" and is_live:
+            raise ValueError(
+                f"Refusing to boot: ENVIRONMENT={self.environment!r} forbids "
+                "live STRIPE_SECRET_KEY (prefix 'sk_live_'). "
+                "Use 'sk_test_...' for non-prod environments."
+            )
         return self
 
     class Config:

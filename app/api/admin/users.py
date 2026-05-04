@@ -1323,10 +1323,30 @@ async def delete_user(
         if admin_count.scalar() <= 1:
             raise HTTPException(400, "Cannot delete the last admin")
 
-    from app.services.user_deletion import cascade_delete_user
+    from app.services.user_deletion import (
+        DeletionActor, DeletionAbortedError, delete_user_completely,
+    )
     user_email = user.email
-    await cascade_delete_user(db, user)
-    return {"success": True, "message": f"User {user_email} and all data deleted"}
+    try:
+        receipt = await delete_user_completely(
+            db,
+            user,
+            actor=DeletionActor.ADMIN,
+            actor_user_id=str(admin.id),
+        )
+    except DeletionAbortedError as e:
+        # The cascade aborted at Stripe or container teardown. Audit row
+        # records the failure step. Surface a 502 with the step so the
+        # admin UI can render a retry-or-escalate message.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"step": e.step.value, "message": e.detail},
+        )
+    return {
+        "success": True,
+        "message": f"User {user_email} and all data deleted",
+        "audit_id": receipt.audit_id,
+    }
 
 
 

@@ -26,6 +26,12 @@ import time
 import uuid
 from typing import Any, AsyncIterator, Callable
 
+# Default ENVIRONMENT to "test" before any app import so the Settings
+# boot guard (config.py: _validate_stripe_environment_match) accepts
+# sk_test_* keys in dev / CI. Production deployments override this via
+# the ENVIRONMENT env var.
+os.environ.setdefault("ENVIRONMENT", "test")
+
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI

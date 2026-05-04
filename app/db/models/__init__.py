@@ -57,6 +57,12 @@ from .rollout import (
 # Streaming credentials
 from .streaming import StreamingCredential, CredentialAccessLog
 
+# Account deletion (§1.3): audit receipt + sensitive-action redemption set
+from .deletion import (
+    DeletionAuditEvent, SensitiveActionRedemption,
+    DELETION_STATUSES, DELETION_ACTORS,
+)
+
 __all__ = [
     # Base
     "Base", "Vector",
@@ -78,4 +84,6 @@ __all__ = [
     "ROLLOUT_STATUSES", "ROLLOUT_ATTEMPT_STATUSES", "ROLLOUT_TRIGGERS",
     "StreamingCredential", "CredentialAccessLog",
     "DayChat", "ContextBudgetLog", "MigrationStatus",
+    "DeletionAuditEvent", "SensitiveActionRedemption",
+    "DELETION_STATUSES", "DELETION_ACTORS",
 ]
