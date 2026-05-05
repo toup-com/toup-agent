@@ -178,8 +178,17 @@ async def _save_soul_impl(
         onboarding_was_done = agent_cfg.onboarding_completed
         agent_cfg.agent_color = req.color
         agent_cfg.agent_name = req.name
-        # Complete onboarding on first soul save (Soul page IS the onboarding)
-        if not agent_cfg.onboarding_completed:
+        # Complete onboarding on first soul save (Soul page IS the
+        # onboarding) — this matches the LEGACY flow where Soul was
+        # the very last step the user did, after Install. The Phase-2
+        # unified flow puts Soul FIRST, so it opts out of this flip
+        # via `defer_onboarding_complete=true`; in that flow, the
+        # terminal flip is owned by `/agent-setup/register` (fires
+        # when the agent container self-registers post-Install).
+        # Without the opt-out, saving Soul on /onboarding/soul would
+        # mark the whole onboarding done after step 2 of 5, letting
+        # the user skip Channel/LLM/Install entirely.
+        if not agent_cfg.onboarding_completed and not req.defer_onboarding_complete:
             agent_cfg.onboarding_completed = True
             logger.info(f"[SOUL] Onboarding completed via Soul page for user {current_user.id}")
 

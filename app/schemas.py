@@ -893,6 +893,14 @@ class SoulConfigUpdate(BaseModel):
     style: str = Field(default="casual")
     traits: List[str] = Field(default_factory=list)
     custom_instructions: str = Field(default="", max_length=500)
+    # When true, save the soul without flipping `onboarding_completed=true`.
+    # Required by the Phase-2 unified onboarding flow where Soul is the
+    # FIRST step (not the last like in the legacy modal flow). Defaults
+    # to false so legacy callers — `/agent/soul?onboarding=true` and
+    # plain `/agent/soul` edit mode — keep their existing behaviour:
+    # first save still terminates the post-install Soul prompt, just
+    # like before.
+    defer_onboarding_complete: bool = False
 
 
 class SoulConfigResponse(BaseModel):
