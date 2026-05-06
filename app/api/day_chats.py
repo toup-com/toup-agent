@@ -14,6 +14,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import select, and_, func, distinct, update
+from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -23,6 +24,17 @@ from app.api.auth import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/day-chats", tags=["Day Chats"])
+
+# When this router is mounted in `platform_main`, the platform DB
+# does NOT have the agent-only tables (`day_chats`, `conversations`,
+# `messages`) — they live in each tenant's agent DB. The endpoints
+# below proxy to the user's agent when one exists; when it doesn't,
+# the SELECT fallback would crash with `UndefinedTableError`. The
+# helper `_safe_local` swallows that specific schema-shape error and
+# yields an empty result, so a brand-new platform user (no agent
+# provisioned yet) gets a quiet 200 [] instead of a red 500 in their
+# devtools console. Caught 2026-05-06 in the post-Install live retest.
+_MISSING_TABLE_ERRORS: tuple = (ProgrammingError, OperationalError)
 
 
 _PREVIEW_MIMES = {
@@ -160,8 +172,17 @@ async def list_day_chats(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid 'before' date. Use YYYY-MM-DD.")
 
-    result = await db.execute(query)
-    day_chats = result.scalars().all()
+    try:
+        result = await db.execute(query)
+        day_chats = result.scalars().all()
+    except _MISSING_TABLE_ERRORS as exc:
+        # Platform DB has no `day_chats` (AGENT_ONLY table). User
+        # without an active proxy → no day chats yet. Return empty
+        # so the chat shell can render its empty state instead of
+        # surfacing a 500 in devtools.
+        await db.rollback()
+        logger.info("[day_chats] local SELECT skipped (table absent in this DB): %s", str(exc)[:120])
+        return JSONResponse(content=[])
 
     # ── Self-healing: fix DayChats with future local_date ──
     # This can happen when a user's timezone was NULL (defaulting to UTC) and
@@ -293,12 +314,22 @@ async def get_day_chat_messages(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    # Look up day chat by (user_id, local_date)
-    dc = (await db.execute(
-        select(DayChat).where(
-            and_(DayChat.user_id == current_user.id, DayChat.local_date == target_date)
+    # Look up day chat by (user_id, local_date). When this router is
+    # mounted in platform_main, the platform DB lacks the agent-only
+    # `day_chats` table — return empty rather than 500'ing the client.
+    try:
+        dc = (await db.execute(
+            select(DayChat).where(
+                and_(DayChat.user_id == current_user.id, DayChat.local_date == target_date)
+            )
+        )).scalar_one_or_none()
+    except _MISSING_TABLE_ERRORS as exc:
+        await db.rollback()
+        logger.info(
+            "[day_chats] messages SELECT skipped (table absent in this DB): %s",
+            str(exc)[:120],
         )
-    )).scalar_one_or_none()
+        return JSONResponse(content=[])
 
     if not dc:
         # Fall back to date-range scan (for when backfill hasn't run yet)
@@ -319,19 +350,32 @@ async def get_day_chat_messages(
 
         day_end = day_start + timedelta(days=1)
 
-        sessions_result = await db.execute(
-            select(Conversation.id, Conversation.channel)
-            .where(
-                and_(
-                    Conversation.user_id == current_user.id,
-                    Conversation.started_at >= day_start,
-                    Conversation.started_at < day_end,
+        try:
+            sessions_result = await db.execute(
+                select(Conversation.id, Conversation.channel)
+                .where(
+                    and_(
+                        Conversation.user_id == current_user.id,
+                        Conversation.started_at >= day_start,
+                        Conversation.started_at < day_end,
+                    )
                 )
             )
-        )
+        except _MISSING_TABLE_ERRORS as exc:
+            await db.rollback()
+            logger.info(
+                "[day_chats] messages fallback skipped (conversations table absent): %s",
+                str(exc)[:120],
+            )
+            return JSONResponse(content=[])
         session_rows = sessions_result.all()
         if not session_rows:
-            raise HTTPException(status_code=404, detail=f"No conversations found for {date_str}")
+            # No conversations for this day. Return empty list rather
+            # than 404 — the chat shell uses these endpoints to render
+            # past-day dividers; an empty day is a valid state, not a
+            # client error. (Pre-fix: 404 surfaced as a red devtools
+            # entry on every day-chat poll for new users.)
+            return JSONResponse(content=[])
 
         session_ids = [r[0] for r in session_rows]
         channel_map = {r[0]: r[1] for r in session_rows}
