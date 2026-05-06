@@ -258,7 +258,12 @@ class Settings(BaseSettings):
     stripe_starter_price_id: str = ""              # Stripe Price ID for Starter plan
     stripe_standard_price_id: str = ""             # Stripe Price ID for Standard plan
     stripe_pro_price_id: str = ""                  # Stripe Price ID for Pro plan
-    stripe_llm_bundle_price_id: str = ""           # Stripe Price ID for $40/mo LLM bundle
+    stripe_llm_bundle_price_id: str = ""           # Stripe Price ID for $30/mo LLM bundle (USD, default)
+    # Optional regional Price IDs. When set and the request's country
+    # matches, the corresponding Price is used for /billing/prices and
+    # subscription creation. Falls back to the USD price above when no
+    # regional override is configured.
+    stripe_llm_bundle_price_id_cad: str = ""       # Stripe Price ID for $40 CAD/mo LLM bundle (Canadian users)
     stripe_supabase_price_id: str = ""             # Stripe Price ID for $5/mo managed Supabase
 
     # ── OpenAI Admin API (per-user project + key auto-provisioning) ──
@@ -322,6 +327,19 @@ class Settings(BaseSettings):
     bridge_client_key: str = ""             # Client private key (PEM)
     bridge_request_timeout_s: int = 30      # default httpx timeout for non-upgrade calls
     bridge_upgrade_timeout_s: int = 180     # upgrade endpoint can take longer (pull + recreate + health)
+
+    # ── Audio stream proxy (Phase 1, /api/media/{id}/audio_stream) ─
+    # Per-tenant concurrent stream cap, enforced PER-REPLICA via an
+    # in-process semaphore. Effective global cap is N × replicas until
+    # Redis lands. Tune via AUDIO_STREAM_MAX_CONCURRENT_PER_TENANT.
+    # Phase 2 will allow per-tenant override via agent_configs.
+    audio_stream_max_concurrent_per_tenant: int = 5
+    # Optional base64-encoded Netscape cookies.txt for yt-dlp. When set,
+    # the cookie-boot helper decodes it to /tmp/yt-cookies.txt and points
+    # YT_DLP_COOKIES_PATH at it. Leave unset until extraction hit-rate
+    # degrades; provisioning a dedicated YouTube account is documented in
+    # docs/skills/radio-mode/proxy-handoff-design.md §3.3.
+    yt_dlp_cookies_b64: Optional[str] = None
 
     # ── Platform fixed costs (admin ROI dashboard) ───────────────
     # Recurring monthly costs that don't scale with user count: subscriptions

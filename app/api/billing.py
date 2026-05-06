@@ -12,7 +12,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -72,6 +72,67 @@ class PricesResponse(BaseModel):
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+
+
+def _country_from_request(request: Request) -> str:
+    """Resolve the request origin's ISO 3166-1 alpha-2 country code.
+
+    Source of truth (in order):
+      1. Cloudflare's ``CF-IPCountry`` header — set when toup.ai is
+         proxied through Cloudflare. Reliable, no extra dependency.
+      2. ``X-Country`` (custom override, useful for staging/test).
+      3. Empty string when nothing is set (caller treats as "default").
+
+    Returned uppercase. Returns "" rather than None so callers can use
+    cheap string comparisons.
+    """
+    cf = (request.headers.get("CF-IPCountry") or "").strip().upper()
+    if cf and cf not in ("XX", "T1"):  # XX/T1 = Tor / unknown — don't trust
+        return cf
+    override = (request.headers.get("X-Country") or "").strip().upper()
+    return override
+
+
+def _bundle_price_id_for_country(country: str) -> str:
+    """Pick the LLM bundle Price ID that matches the user's country.
+
+    Today we have a CAD price for Canadian users; everyone else gets
+    the USD default. Adding more regions is a one-line change here +
+    a new env var.
+    """
+    if country == "CA" and settings.stripe_llm_bundle_price_id_cad:
+        return settings.stripe_llm_bundle_price_id_cad
+    return settings.stripe_llm_bundle_price_id
+
+
+def _resolve_user_country(user: User, request: Optional[Request]) -> str:
+    """Two-tier country lookup for an authenticated user.
+
+    1. Stripe Customer's billing address country, when set on Stripe's
+       side. Most authoritative — the user told us where they are when
+       they entered payment details.
+    2. The request's CF-IPCountry header. Fallback for users who
+       haven't paid yet (still in onboarding LLM step).
+
+    Returns "" if neither is known. The price resolver treats "" as
+    "use the USD default."
+    """
+    if user.stripe_customer_id:
+        try:
+            from app.services.stripe_service import _get_stripe_client
+            client = _get_stripe_client()
+            cust = client.customers.retrieve(user.stripe_customer_id)
+            addr = getattr(cust, "address", None)
+            if addr and getattr(addr, "country", None):
+                return str(addr.country).upper()
+        except Exception as exc:
+            logger.warning(
+                "Stripe customer country lookup failed for %s: %s",
+                user.id, exc,
+            )
+    if request is not None:
+        return _country_from_request(request)
+    return ""
 
 
 async def _sync_active_subscription_to_db(
@@ -223,6 +284,7 @@ async def get_billing_config():
 
 @router.post("/create-subscription", response_model=CreateSubscriptionResponse)
 async def create_subscription(
+    request: Request,
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -232,20 +294,25 @@ async def create_subscription(
 
     Idempotent: if the user already has an active bundle subscription,
     returns it without creating a new one.
+
+    Country-aware pricing: looks up the user's country (Stripe billing
+    address > CF-IPCountry header) and picks the matching Price ID.
+    Canadian users charge in CAD; everyone else USD.
     """
     from app.services.stripe_service import (
         create_subscription_with_intent,
         get_active_subscription_for_customer,
     )
 
-    price_id = settings.stripe_llm_bundle_price_id
-    if not price_id:
-        raise HTTPException(400, "LLM Bundle pricing is not configured.")
-
     # Get user + ensure Stripe customer
     user_result = await db.execute(select(User).where(User.id == current_user.id))
     user = user_result.scalar_one()
     customer_id = await _ensure_stripe_customer(user, db)
+
+    country = _resolve_user_country(user, request)
+    price_id = _bundle_price_id_for_country(country)
+    if not price_id:
+        raise HTTPException(400, "LLM Bundle pricing is not configured.")
 
     # Check AgentConfig — already active? Don't create another subscription.
     cfg_result = await db.execute(
@@ -357,15 +424,25 @@ async def get_billing_status(
 
 
 @router.get("/prices", response_model=PricesResponse)
-async def get_prices(db: AsyncSession = Depends(get_db)):
-    """Return configured pricing from Stripe."""
+async def get_prices(request: Request, db: AsyncSession = Depends(get_db)):
+    """Return configured pricing from Stripe.
+
+    Picks the right LLM bundle price for the request's country —
+    Canadian users get the CAD price (~$40 CAD), everyone else gets
+    USD ($30). Country comes from Cloudflare's CF-IPCountry header
+    (toup.ai is proxied through CF). The currency in the response
+    matches the chosen Price's actual Stripe currency, so the frontend
+    renders the right symbol without guessing.
+    """
     from app.services.stripe_service import get_price
     from app.db import VPSPlan
 
     result = PricesResponse()
 
-    if settings.stripe_llm_bundle_price_id:
-        price_info = get_price(settings.stripe_llm_bundle_price_id)
+    country = _country_from_request(request)
+    bundle_price_id = _bundle_price_id_for_country(country)
+    if bundle_price_id:
+        price_info = get_price(bundle_price_id)
         if price_info:
             result.llm_bundle = PriceItem(
                 id="llm_bundle",
