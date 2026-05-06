@@ -78,19 +78,26 @@ def _country_from_request(request: Request) -> str:
     """Resolve the request origin's ISO 3166-1 alpha-2 country code.
 
     Source of truth (in order):
-      1. Cloudflare's ``CF-IPCountry`` header — set when toup.ai is
-         proxied through Cloudflare. Reliable, no extra dependency.
-      2. ``X-Country`` (custom override, useful for staging/test).
-      3. Empty string when nothing is set (caller treats as "default").
+      1. ``X-Country`` header — explicit override. Cloudflare doesn't
+         strip this so it works for staging / curl smoke tests, and
+         normal browsers don't send it so prod traffic ignores it.
+      2. Cloudflare's ``CF-IPCountry`` header — set on every request
+         when toup.ai is proxied through Cloudflare. Authoritative
+         for real users.
+      3. Empty string (caller treats as "default" → USD).
 
     Returned uppercase. Returns "" rather than None so callers can use
-    cheap string comparisons.
+    cheap string comparisons. Safety: the price difference is roughly
+    currency-equivalent (USD \$30 ≈ CAD \$40), so even if someone
+    spoofed X-Country they'd land on a comparably-priced sub.
     """
+    override = (request.headers.get("X-Country") or "").strip().upper()
+    if override:
+        return override
     cf = (request.headers.get("CF-IPCountry") or "").strip().upper()
     if cf and cf not in ("XX", "T1"):  # XX/T1 = Tor / unknown — don't trust
         return cf
-    override = (request.headers.get("X-Country") or "").strip().upper()
-    return override
+    return ""
 
 
 def _bundle_price_id_for_country(country: str) -> str:
