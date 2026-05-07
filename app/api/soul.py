@@ -24,6 +24,7 @@ from app.schemas import (
 )
 from app.services.soul_compiler import compile_soul
 from app.api.auth import get_current_user
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/soul", tags=["soul"])
@@ -237,6 +238,22 @@ async def _save_soul_impl(
 
     await db.commit()
 
+    # ── Pre-warm managed container (Phase 1, gated by feature flag) ──
+    # Fire AFTER the AgentConfig commit so prewarm_service.schedule_prewarm
+    # — which opens its own session — sees the just-saved
+    # hosting_mode/llm_mode/agent_color values. Errors are swallowed; the
+    # Install-step provision call remains the contract-bearing path.
+    # Phase 0 doc: docs/onboarding/prewarm-phase0.md.
+    if settings.prewarm_on_soul_save and agent_cfg and agent_cfg.hosting_mode == "managed":
+        try:
+            from app.services.prewarm_service import schedule_prewarm
+            await schedule_prewarm(current_user.id)
+        except Exception as e:
+            logger.warning(
+                "[SOUL] prewarm schedule failed for user %s: %s",
+                str(current_user.id)[:8], e,
+            )
+
     # ── VPS sync (invisible to user) ──
     if agent_cfg and agent_cfg.agent_url and agent_cfg.agent_api_key:
         try:
@@ -332,8 +349,6 @@ async def sync_soul(
     2. Optionally deactivate old agent_soul memories
     3. Optionally update AgentConfig fields (name, color, onboarding)
     """
-    from app.config import settings
-
     # Auth: only accept from platform via agent key
     agent_key = request.headers.get("X-Agent-Key", "")
     if not settings.agent_api_key or agent_key != settings.agent_api_key:

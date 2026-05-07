@@ -655,6 +655,17 @@ async def rollout_reconciler_loop() -> None:
         except Exception:
             # Never let a tick exception kill the loop. Log and keep going.
             logger.exception("[ROLLOUT-RECONCILER] tick failed; will retry")
+        # Piggy-back the prewarm reconciler on the same tick — it shares
+        # the "asyncio.create_task dies on Railway redeploy → DB row is
+        # the durable signal → reconciler retries stuck rows" pattern,
+        # and running it in the same loop avoids a second top-level task
+        # that would itself need warm-start handling. Wrapped in its own
+        # try/except so a prewarm-side failure doesn't taint rollouts.
+        try:
+            from app.services.prewarm_service import reconcile_stuck_provisioning
+            await reconcile_stuck_provisioning()
+        except Exception:
+            logger.exception("[PREWARM-RECONCILER] tick failed; will retry")
         await asyncio.sleep(30)
 
 

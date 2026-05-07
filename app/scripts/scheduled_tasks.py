@@ -618,6 +618,133 @@ async def run_managed_container_reaper():
     )
 
 
+async def run_abandoned_onboarding_reaper():
+    """Destroy managed-tenant containers belonging to users who created
+    an account, kicked off the prewarm-on-Soul.save trigger, and then
+    never finished onboarding.
+
+    Per docs/onboarding/prewarm-phase0.md (Phase 2). Closes the
+    abandoned-onboarding cost leak that signup-time / Soul.save-time
+    pre-warming creates: every user who fills Soul gets a container,
+    but a user who never reaches Install or Chat leaves that container
+    running indefinitely until manual cleanup.
+
+    Filter (all conditions must hold):
+      * `agent_configs.created_at < now() - abandoned_onboarding_grace_days`
+      * `agent_configs.onboarding_completed = false`
+      * `bundle_status` in ('none', null) — paying users are never reaped here
+        (the bundle_reaper above owns the post-cancellation path)
+      * `ManagedContainer` row exists AND status not in ('deleted','destroyed')
+
+    NOTE on the day_chats engagement signal:
+      The original Phase-2 spec also gated on "no day_chats rows for
+      this user." day_chats lives in the per-tenant agent DB
+      (AGENT_ONLY_TABLES at backend/app/db/models/base.py:56), not the
+      platform DB this reaper queries. Cross-DB lookup from the reaper
+      would require per-tenant connection issuance (architecturally
+      heavy, no precedent in scheduled_tasks.py). We rely instead on
+      `onboarding_completed=False` which is strictly stronger for the
+      abandoned-user case — a user who finished onboarding has by
+      definition reached past Install, regardless of message count.
+
+    Behavior on reap:
+      * Destroy the container via existing teardown path (bridge DELETE)
+      * KEEP the agent_configs row so a returning user re-onboards
+        cleanly with a fresh container provision
+      * Never touches the User row; account survives
+
+    Set `settings.abandoned_onboarding_grace_days = 0` to disable.
+    """
+    from datetime import timedelta
+    from app.config import settings as _s
+    from app.db.models import AgentConfig
+    from app.db.models.platform import ManagedContainer
+    from app.services import docker_host_service
+
+    grace_days = int(getattr(_s, "abandoned_onboarding_grace_days", 14) or 0)
+    if grace_days <= 0:
+        logger.info(
+            "[abandoned_onboarding_reaper] disabled (grace_days=%s)", grace_days,
+        )
+        return
+
+    cutoff = datetime.utcnow() - timedelta(days=grace_days)
+
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(
+                AgentConfig.user_id,
+                AgentConfig.created_at,
+                AgentConfig.bundle_status,
+            ).where(
+                AgentConfig.hosting_mode == "managed",
+                AgentConfig.onboarding_completed == False,  # noqa: E712 — sqlalchemy
+                AgentConfig.created_at < cutoff,
+                # Bundle gate: explicitly skip any paying state. The
+                # bundle_reaper owns post-cancellation cleanup; here we
+                # only touch users who never engaged.
+                AgentConfig.bundle_status.in_(("none", None)),
+            )
+        )
+        candidates = list(result.all())
+
+    if not candidates:
+        logger.info(
+            "[abandoned_onboarding_reaper] no candidates (grace=%dd, cutoff=%s)",
+            grace_days, cutoff.isoformat(),
+        )
+        return
+
+    logger.info(
+        "[abandoned_onboarding_reaper] %d candidate(s) past %dd grace",
+        len(candidates), grace_days,
+    )
+
+    reaped = 0
+    skipped = 0
+    failed = 0
+    for user_id, created_at, bundle_status in candidates:
+        try:
+            async with async_session_maker() as cdb:
+                container = (
+                    await cdb.execute(
+                        select(ManagedContainer).where(
+                            ManagedContainer.user_id == user_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if not container:
+                    skipped += 1
+                    continue
+                if container.status in ("deleted", "destroyed"):
+                    skipped += 1
+                    continue
+
+                ok = await docker_host_service.destroy_container(cdb, user_id)
+                if ok:
+                    reaped += 1
+                    logger.info(
+                        "[abandoned_onboarding_reaper] destroyed container "
+                        "user=%s created_at=%s bundle_status=%s",
+                        str(user_id)[:8],
+                        created_at.isoformat() if created_at else "?",
+                        bundle_status,
+                    )
+                else:
+                    failed += 1
+        except Exception as e:
+            failed += 1
+            logger.error(
+                "[abandoned_onboarding_reaper] destroy failed user=%s err=%s",
+                str(user_id)[:8], e, exc_info=True,
+            )
+
+    logger.info(
+        "[abandoned_onboarding_reaper] complete reaped=%d skipped=%d failed=%d",
+        reaped, skipped, failed,
+    )
+
+
 def setup_scheduler(
     decay_interval_hours: int = 6,
     consolidation_interval_hours: int = 24,
@@ -693,6 +820,21 @@ def setup_scheduler(
         trigger=CronTrigger(hour=5, minute=0),
         id="bundle_container_reaper",
         name="Managed Container Reaper (post-cancel grace)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Phase-2 abandoned-onboarding reaper — destroys containers belonging
+    # to users who created an account, fired the Soul.save prewarm, and
+    # never finished onboarding. 14d grace by default. Runs at 5:30 UTC
+    # so it doesn't collide with the bundle reaper at 5:00 UTC; both
+    # tap the bridge DELETE path so staggering minimises rate-limit
+    # risk. Self-disables when grace setting is 0.
+    scheduler.add_job(
+        run_abandoned_onboarding_reaper,
+        trigger=CronTrigger(hour=5, minute=30),
+        id="abandoned_onboarding_reaper",
+        name="Abandoned Onboarding Reaper (Phase-2 prewarm cost cap)",
         replace_existing=True,
         misfire_grace_time=3600,
     )

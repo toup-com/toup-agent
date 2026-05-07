@@ -113,6 +113,11 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)
     name: Optional[str] = None
+    # Cloudflare Turnstile token. Required in production (when
+    # TURNSTILE_SECRET_KEY is set on the backend); ignored in dev.
+    # Phase-3 of the prewarm hardening work — see
+    # docs/onboarding/prewarm-phase0.md.
+    cf_turnstile_token: Optional[str] = None
 
 
 class UserLogin(BaseModel):

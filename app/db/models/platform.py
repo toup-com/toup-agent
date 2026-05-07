@@ -87,11 +87,21 @@ class ManagedContainer(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     stopped_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Auto-updated on any row mutation. Powers the prewarm reconciler's
+    # stuck-row detection (status='provisioning' AND updated_at older
+    # than ~5min = the in-flight asyncio.create_task died, retry it).
+    # `created_at` reflects only the first-ever provision; `started_at`
+    # is only set on successful start. Migration 037 added the column
+    # with server-default and a (status, updated_at) composite index.
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=True,
+    )
 
     __table_args__ = (
         Index("ix_managed_containers_user_id", "user_id"),
         Index("ix_managed_containers_status", "status"),
         Index("ix_managed_containers_host_port", "host_port", unique=True),
+        Index("ix_managed_containers_status_updated_at", "status", "updated_at"),
     )
 
 

@@ -315,6 +315,26 @@ class Settings(BaseSettings):
     # window without burning Contabo resources indefinitely. Set to 0
     # in dev to disable the reaper entirely.
     bundle_cancel_grace_days: int = 7
+    # Phase-1 prewarm-on-Soul.save feature flag. When True, the Soul.save
+    # handler fires `provision_container` in the background after commit so
+    # the user's managed container is fully booted by the time they reach
+    # Install. When False (default during ST-3 cutover bake, dial true
+    # 2026-05-09+), the existing OnboardingShell Welcome-mount prewarm
+    # remains the only trigger. See docs/onboarding/prewarm-phase0.md.
+    prewarm_on_soul_save: bool = False
+    # Abandoned-onboarding reaper grace window. Containers tied to users
+    # who haven't completed onboarding AND have no day_chats AND aren't
+    # paying get destroyed after this many days. The agent_configs row
+    # is preserved so a returning user can re-onboard cleanly. Set to 0
+    # to disable.
+    abandoned_onboarding_grace_days: int = 14
+    # Cloudflare Turnstile secret for signup verification (Phase 3).
+    # When set, /auth/register requires a valid Turnstile token. When
+    # blank, verification is skipped (dev / test path).
+    turnstile_secret_key: str = ""
+    # Signup rate limit — IP-keyed. 5 signups per hour per IP, copied
+    # from the login rate limiter pattern. Disabled if either value is 0.
+    signup_rate_limit_per_hour: int = 5
     admin_alert_telegram_token: str = ""    # Bot token for admin alerts (shared / user-facing bot)
     admin_alert_telegram_chat_id: str = ""
 

@@ -18,7 +18,8 @@ from app.services import (
     get_user_by_id, create_access_token, decode_access_token,
     verify_password, change_user_password,
 )
-from app.services.rate_limiter import login_rate_limiter
+from app.services.rate_limiter import login_rate_limiter, signup_rate_limiter
+from app.services.turnstile import verify_turnstile_token
 from app.config import settings
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -100,12 +101,53 @@ async def get_current_user(
 # ── Register ─────────────────────────────────────────────────────
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
-    """Register a new user"""
+async def register(
+    user_data: UserCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Register a new user.
+
+    Phase-3 hardening (docs/onboarding/prewarm-phase0.md):
+      * IP-keyed rate limit (5 signups per IP per hour by default).
+        Caps the "spam signups burn pre-warmed containers" attack now
+        that Soul.save provisions a Docker container.
+      * Cloudflare Turnstile verification when TURNSTILE_SECRET_KEY is
+        set. Skipped in dev / CI to keep tests deterministic.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Rate-limit FIRST so we don't waste DB / Turnstile work on
+    # already-blocked IPs.
+    retry_after = signup_rate_limiter.check(client_ip)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many signup attempts from this network. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # Turnstile gate — skipped when no secret configured (dev / CI).
+    # Verifies BEFORE we touch the DB so a failing token never hits
+    # the User uniqueness constraint.
+    if not await verify_turnstile_token(
+        user_data.cf_turnstile_token, remote_ip=client_ip,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CAPTCHA verification failed. Please refresh and try again.",
+        )
+
     existing = await get_user_by_email(db, user_data.email)
     if existing:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+
+    # Record the attempt only after both gates pass — we don't count a
+    # bot's failed Turnstile attempts toward the rate limit (otherwise
+    # one bot can lock out a shared IP). Successful create is the
+    # signal that consumes a slot.
     user = await create_user(db, email=user_data.email, password=user_data.password, name=user_data.name)
+    signup_rate_limiter.record(client_ip)
     return user
 
 
