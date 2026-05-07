@@ -324,6 +324,16 @@ async def init_db():
         # User-selectable LLM provider for bundle mode (anthropic | openai).
         # See model_router.classify_request — overrides the bundle default.
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS preferred_provider VARCHAR(20) NOT NULL DEFAULT 'anthropic'",
+        # Phase-1 prewarm reconciler input (migration 037, see
+        # docs/onboarding/prewarm-phase0.md). updated_at auto-bumps via
+        # the ManagedContainer model's onupdate hook; the (status,
+        # updated_at) composite index keeps the reconciler query plan
+        # locked. Backfill row on add — created_at is the closest stand-in
+        # for "first known activity time" so freshly-added rows don't get
+        # immediately treated as stuck.
+        "ALTER TABLE managed_containers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "UPDATE managed_containers SET updated_at = COALESCE(started_at, created_at) WHERE updated_at IS NULL",
+        "CREATE INDEX IF NOT EXISTS ix_managed_containers_status_updated_at ON managed_containers (status, updated_at)",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)
