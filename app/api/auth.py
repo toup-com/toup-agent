@@ -1,5 +1,6 @@
 """Authentication endpoints"""
 
+import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -21,6 +22,8 @@ from app.services import (
 from app.services.rate_limiter import login_rate_limiter, signup_rate_limiter
 from app.services.turnstile import verify_turnstile_token
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 security = HTTPBearer(auto_error=False)
@@ -148,6 +151,47 @@ async def register(
     # signal that consumes a slot.
     user = await create_user(db, email=user_data.email, password=user_data.password, name=user_data.name)
     signup_rate_limiter.record(client_ip)
+
+    # Kick off the prewarm IMMEDIATELY at signup — before the user
+    # even navigates to /onboarding/welcome. Previously the prewarm
+    # fired from OnboardingShell.mount, which was 1-2s later (auto-
+    # login round-trip + React Router navigate + chunk hydrate +
+    # mount). Moving it here:
+    #   - Cuts ~1-2s off the boot budget the user-visible flow can
+    #     overlap with prewarm. By Install time, the container is
+    #     ~1-2s further along its boot.
+    #   - Provides a more deterministic start point for telemetry —
+    #     [PREWARM-START] fires synchronously with the User row insert.
+    # Fire-and-forget; failures are logged + non-blocking. The
+    # OnboardingShell-mount fallback at OnboardingShell.tsx remains in
+    # place as a defense (schedule_prewarm short-circuits on already-
+    # running/provisioning containers, so the second call is a cheap
+    # no-op rather than a duplicate provision).
+    if settings.prewarm_on_soul_save:
+        try:
+            from app.api.agent_setup import _get_or_create_config
+            from app.services.prewarm_service import schedule_prewarm
+            config = await _get_or_create_config(str(user.id), db)
+            # Default to managed for unified onboarding. The signup
+            # form has no hosting choice, and the frontend's
+            # Welcome.advance writes hosting_mode='managed' anyway —
+            # priming here lets the prewarm container boot once with
+            # the correct env so we don't recreate at Welcome→Soul.
+            dirty = False
+            if config.hosting_mode in (None, "self-hosted"):
+                config.hosting_mode = "managed"
+                dirty = True
+            if not config.whatsapp_mode:
+                config.whatsapp_mode = "qr_link"
+                dirty = True
+            if dirty:
+                await db.commit()
+            await schedule_prewarm(str(user.id))
+        except Exception as e:
+            logger.warning(
+                "[REGISTER] Prewarm schedule failed for user %s: %s",
+                str(user.id)[:8], e,
+            )
     return user
 
 
