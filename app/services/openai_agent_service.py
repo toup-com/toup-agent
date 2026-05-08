@@ -107,14 +107,17 @@ class OpenAIAgentService:
         # Build OpenAI messages list
         oai_messages = self._build_openai_messages(system, messages)
 
+        from app.services.model_resolver import supports_custom_temperature
+
         kwargs: Dict[str, Any] = dict(
             model=model,
             messages=oai_messages,
             max_completion_tokens=max_tokens,
-            temperature=temperature,
             stream=True,
             stream_options={"include_usage": True},
         )
+        if supports_custom_temperature(model):
+            kwargs["temperature"] = temperature
 
         # Convert Anthropic-format tools to OpenAI format
         if tools:

@@ -209,6 +209,22 @@ def is_openai_model(model: str | None) -> bool:
     return m.startswith(("gpt", "o1-", "o3-", "o4-")) or m in {"o1", "o3", "o4"}
 
 
+def supports_custom_temperature(model: str | None) -> bool:
+    """False for OpenAI reasoning models + gpt-5.x family — they only accept
+    temperature=1 (the default) and reject any explicit value with HTTP 400.
+    Callers should omit the `temperature` kwarg from the API request entirely
+    when this returns False.
+    """
+    if not model:
+        return True
+    m = model.lower()
+    if m.startswith(("o1", "o3", "o4")):
+        return False
+    if m.startswith("gpt-5"):
+        return False
+    return True
+
+
 # ── OAuth token detection ─────────────────────────────────────────────
 
 

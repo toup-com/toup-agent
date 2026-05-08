@@ -163,14 +163,18 @@ class LLMService:
         max_retries = 3
         retry_delay = 1.0
 
+        from app.services.model_resolver import supports_custom_temperature
+
         for attempt in range(max_retries):
             try:
+                call_kwargs = dict(kwargs)
+                if supports_custom_temperature(model):
+                    call_kwargs["temperature"] = temperature
                 response = await self._openai_client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=temperature,
                     max_tokens=max_tokens,
-                    **kwargs
+                    **call_kwargs,
                 )
                 choice = response.choices[0]
                 usage = response.usage
