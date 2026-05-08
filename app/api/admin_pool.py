@@ -200,6 +200,22 @@ async def admin_bind(
         # lazily by ws_chat.py's stub-user path on first chat. Logging
         # only so an operator can spot DB-down conditions.
 
+    # 2c. Refresh the LLM key cache. OpenAI/Anthropic clients are
+    #     constructed once at agent boot and cached on KeyProvider's
+    #     version counter; without bumping that counter the LLM
+    #     services keep using the (empty) key the lobby agent had at
+    #     startup. The agent then sends every chat completion with no
+    #     api_key header and OpenAI returns 401 'Incorrect API key
+    #     provided: missing'. Calling refresh() reads the freshly-
+    #     mutated settings and bumps version → next chat call rebuilds
+    #     the client with the user's real key.
+    try:
+        from app.services.key_provider import keys as _llm_keys
+        _llm_keys.refresh()
+        logger.info("[admin/bind] LLM key cache refreshed")
+    except Exception as e:
+        logger.warning("[admin/bind] LLM key refresh failed (non-fatal): %s", e)
+
     # 3. Wake any lazy channel adapters. Best-effort — adapter init
     #    can take seconds (Telegram getMe, WhatsApp QR pairing) and we
     #    want /admin/bind to return fast. The wake_lazy_channels module
