@@ -1406,9 +1406,63 @@ async def ws_chat(
                     try:
                         from app.db.database import async_session_maker
                         from app.db.models import Message as DbMessage, Conversation
+                        # Idempotency: derive a deterministic UUID from
+                        # (user_id, client_msg_id). If the client retries the
+                        # same message after a dropped WS, the same derived
+                        # id collides with the existing row and we recognize
+                        # the replay — skip re-persist + skip the LLM call
+                        # (we already replied; replaying would duplicate the
+                        # assistant message). Client_msg_id absent? Fall
+                        # through to the normal random-uuid path; no
+                        # idempotency, but we don't break older clients.
+                        import uuid as _uuid
+                        _client_msg_id = msg.get("client_msg_id")
+                        _derived_msg_id: Optional[str] = None
+                        if _client_msg_id:
+                            _derived_msg_id = str(_uuid.uuid5(
+                                _uuid.NAMESPACE_OID,
+                                f"toup-msg:{user_id}:{_client_msg_id}",
+                            ))
                         async with async_session_maker() as _presave_db:
+                            # Replay check.
+                            if _derived_msg_id:
+                                _existing = (await _presave_db.execute(
+                                    __import__('sqlalchemy').select(DbMessage)
+                                    .where(DbMessage.id == _derived_msg_id)
+                                )).scalar_one_or_none()
+                                if _existing is not None:
+                                    _persisted_user_msg_id = _existing.id
+                                    _persisted_day_chat_id = _existing.day_chat_id
+                                    _user_msg_presaved = True
+                                    logger.info(
+                                        "[WS] Idempotent replay detected client_msg_id=%s — skipping persist + LLM",
+                                        _client_msg_id,
+                                    )
+                                    # Echo the ack so the client swaps its
+                                    # optimistic id and clears its pending
+                                    # queue.
+                                    try:
+                                        await websocket.send_json({
+                                            "type": "user_message_persisted",
+                                            "client_msg_id": _client_msg_id,
+                                            "server_msg_id": _persisted_user_msg_id,
+                                            "day_chat_id": _persisted_day_chat_id,
+                                            "session_id": session_id,
+                                            "duplicate": True,
+                                        })
+                                    except Exception:
+                                        pass
+                                    # Skip the LLM call: a previous handler
+                                    # already responded. The client's
+                                    # `messages-since` reconnect path will
+                                    # pull the assistant reply if it exists.
+                                    continue
                             _presave_dc_id = await _resolve_day_chat_id_for_now(_presave_db, user_id, tz_override=client_tz)
                             _new_msg = DbMessage(
+                                # Pin id so a future replay collides via
+                                # primary-key uniqueness if our own check
+                                # races (concurrent retries from one tab).
+                                id=(_derived_msg_id or str(_uuid.uuid4())),
                                 conversation_id=session_id,
                                 day_chat_id=_presave_dc_id,
                                 role="user",
@@ -1434,7 +1488,6 @@ async def ws_chat(
                         # canonical id. Without this, the day-chat refetch
                         # dropped the optimistic entry until the page was
                         # refreshed (matin-era UX bug).
-                        _client_msg_id = msg.get("client_msg_id")
                         if _client_msg_id:
                             try:
                                 await websocket.send_json({
