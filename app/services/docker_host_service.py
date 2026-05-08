@@ -524,25 +524,43 @@ async def upgrade_tenant_image(
 ) -> dict:
     """Upgrade one tenant to a specific image tag.
 
-    Called by rollout_service.py. NOT called directly from the legacy
-    upgrade_container() path (deleted in Phase 3).
+    Phase B (never-sleep plan): when `settings.use_blue_green_rollouts`
+    is True, calls the bridge's `/v1/tenants/<prefix>/blue-green-upgrade`
+    endpoint — zero WS drops, in-flight streams complete on the old
+    slot. When False (default during the bake window), falls back to
+    the legacy `/v1/tenants/<prefix>/upgrade` recreate-flow.
 
-    Returns the bridge's UpgradeResp dict on success. Raises on failure;
-    caller (rollout_service) decides whether to retry / rollback.
+    Called by rollout_service.py. Raises on failure; caller decides
+    rollback strategy.
     """
     prefix = user_id[:8]
+    use_blue_green = bool(getattr(settings, "use_blue_green_rollouts", False))
+    endpoint = (
+        f"/v1/tenants/{prefix}/blue-green-upgrade"
+        if use_blue_green
+        else f"/v1/tenants/{prefix}/upgrade"
+    )
+    body = {"image_tag": image_tag, "rollout_id": rollout_id}
+    if use_blue_green:
+        body["drain_timeout_s"] = int(getattr(settings, "blue_green_drain_timeout_s", 60))
+
     async with _bridge_client(timeout_s or settings.bridge_upgrade_timeout_s) as client:
-        r = await client.post(
-            f"/v1/tenants/{prefix}/upgrade",
-            json={"image_tag": image_tag, "rollout_id": rollout_id},
-        )
+        r = await client.post(endpoint, json=body)
         if r.status_code == 503:
-            # Health-check timeout — bridge returns structured detail
             try:
                 detail = r.json().get("detail", {})
             except ValueError:
                 detail = {"error": "unhealthy", "raw": r.text[:200]}
             raise BridgeUpgradeUnhealthy(detail)
+        if r.status_code == 504 and use_blue_green:
+            # Blue-green specific: new slot didn't become healthy.
+            # Bridge already cleaned up the new slot; old slot keeps
+            # serving. Surface as BridgeUpgradeUnhealthy so the
+            # rollout reconciler treats it the same as legacy 503.
+            raise BridgeUpgradeUnhealthy({
+                "error": "blue_green_health_timeout",
+                "raw": r.text[:200],
+            })
         r.raise_for_status()
         data = r.json()
 

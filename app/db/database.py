@@ -1,62 +1,155 @@
-"""Database connection and session management"""
+"""Database connection and session management.
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+Phase A (never-sleep plan) added late-bind support: the agent now
+starts with `TOUP_POOL_GENERIC=1` pointed at a generic pool DB, and
+on `POST /admin/bind` the engine is rebound to the renamed tenant DB.
+The module-level `engine` and `async_session_maker` are wrapped in a
+proxy/holder so existing `from app.db.database import async_session_maker`
+imports continue to resolve correctly through a rebind without
+touching 141 call sites.
+"""
+
+import logging
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, AsyncEngine, async_sessionmaker
 from sqlalchemy.pool import StaticPool, NullPool
 from app.config import settings
 from app.db.models import Base
 
-# Create async engine
-if settings.database_url.startswith("sqlite"):
-    # SQLite configuration for development
-    engine = create_async_engine(
-        settings.database_url,
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-        echo=settings.debug,
-    )
-elif settings.run_mode in ("platform", "agent"):
-    # Supabase / PgBouncer (platform + remote agents)
-    # - NullPool: no local pooling — PgBouncer handles it
-    # - statement_cache_size=0: disables asyncpg's LRU statement cache
-    # - prepared_statement_name_func returns '': forces unnamed prepared
-    #   statements which PgBouncer handles correctly in transaction mode
-    #   (named ones like __asyncpg_stmt_1__ collide across connections)
-    # - pool_pre_ping: detect stale connections after cold starts
-    _db_url = settings.database_url
-    _sep = "&" if "?" in _db_url else "?"
-    _db_url += f"{_sep}prepared_statement_cache_size=0"
-    engine = create_async_engine(
-        _db_url,
-        echo=settings.debug,
-        poolclass=NullPool,
-        pool_pre_ping=True,
-        connect_args={
-            "statement_cache_size": 0,
-            "prepared_statement_name_func": lambda: "",
-            "command_timeout": 30,
-            # Override Supabase's default statement_timeout (often 8s)
-            # Agent sessions stay open during LLM calls, so we need more
-            "server_settings": {"statement_timeout": "30000"},
-        },
-    )
-else:
-    # PostgreSQL — monolith mode (long-running process, direct connection)
-    engine = create_async_engine(
-        settings.database_url,
+logger = logging.getLogger(__name__)
+
+
+def _build_engine(database_url: str) -> AsyncEngine:
+    """Construct an AsyncEngine for the given URL using the same
+    knobs as the original module-level setup. Centralized so
+    `rebind_database()` builds an identical engine to the one created
+    at import."""
+    if database_url.startswith("sqlite"):
+        return create_async_engine(
+            database_url,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+            echo=settings.debug,
+        )
+    if settings.run_mode in ("platform", "agent"):
+        _db_url = database_url
+        _sep = "&" if "?" in _db_url else "?"
+        _db_url += f"{_sep}prepared_statement_cache_size=0"
+        return create_async_engine(
+            _db_url,
+            echo=settings.debug,
+            poolclass=NullPool,
+            pool_pre_ping=True,
+            connect_args={
+                "statement_cache_size": 0,
+                "prepared_statement_name_func": lambda: "",
+                "command_timeout": 30,
+                "server_settings": {"statement_timeout": "30000"},
+            },
+        )
+    return create_async_engine(
+        database_url,
         echo=settings.debug,
         pool_size=10,
         max_overflow=20,
         pool_pre_ping=True,
     )
 
-# Session factory
-async_session_maker = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autocommit=False,
-    autoflush=False,
-)
+
+def _build_sessionmaker(eng: AsyncEngine):
+    return async_sessionmaker(
+        eng,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autocommit=False,
+        autoflush=False,
+    )
+
+
+# ── Holder + proxy ─────────────────────────────────────────────────
+# Single-element registry, mutated on rebind. Modules that imported
+# `engine` directly continue to see the OLD instance — that's why
+# `rebind_database` reassigns the module attribute below as well, and
+# why direct imports of `engine` are limited to a handful of sites
+# (refactored to use `get_engine()` in Phase A).
+_holder: dict = {"engine": None, "session_maker": None}
+
+
+class _SessionMakerProxy:
+    """Thin proxy so `from app.db.database import async_session_maker`
+    continues to work after a rebind. The proxy resolves the current
+    sessionmaker on every call.
+
+    Calls that look like `async_session_maker()` build a session via
+    the proxy's `__call__`; the resulting session uses whichever
+    engine is currently in the holder."""
+
+    def __call__(self, *args, **kwargs):
+        sm = _holder["session_maker"]
+        if sm is None:
+            raise RuntimeError(
+                "async_session_maker called before engine init. "
+                "If you're in pool-lobby mode, this likely means a route "
+                "that needs the DB ran before /admin/bind."
+            )
+        return sm(*args, **kwargs)
+
+
+# Initialize the holder at import time using the configured URL.
+engine: AsyncEngine = _build_engine(settings.database_url)
+_holder["engine"] = engine
+_holder["session_maker"] = _build_sessionmaker(engine)
+async_session_maker = _SessionMakerProxy()
+
+
+def get_engine() -> AsyncEngine:
+    """Return the current engine. Use this instead of importing
+    `engine` directly when you need a guaranteed-live reference (the
+    direct import captures the engine at module-import time, which
+    becomes stale after a pool→bound rebind)."""
+    return _holder["engine"]
+
+
+async def rebind_database(new_database_url: str) -> None:
+    """Atomically swap the engine + sessionmaker to a new database URL.
+
+    Called by `POST /admin/bind` when a pool container is claimed for a
+    user. The flow is:
+    1. Build a new engine at the new URL.
+    2. Smoke-test: open a connection (catches credential / DB-name typos
+       BEFORE we tear down the live engine). Failure here leaves the
+       old engine intact — caller treats this as bind failure.
+    3. Dispose the old engine.
+    4. Replace holder + module attribute.
+
+    This function is single-shot in practice (generic→bound happens
+    once per container lifetime). Concurrent callers are not supported;
+    `/admin/bind` is the only caller and is itself serialized by
+    `pool_member.state='ASSIGNING'` on the bridge side.
+    """
+    global engine
+    logger.info("[database] Rebinding engine to new URL")
+    new_engine = _build_engine(new_database_url)
+    # Smoke-test the new connection. asyncpg raises OperationalError on
+    # bad credentials / missing DB / unreachable host. We propagate the
+    # error so /admin/bind returns 500 and the bridge moves the pool
+    # member to TEARDOWN — no half-bound state.
+    async with new_engine.connect() as conn:
+        from sqlalchemy import text
+        await conn.execute(text("SELECT 1"))
+
+    old_engine = _holder["engine"]
+    _holder["engine"] = new_engine
+    _holder["session_maker"] = _build_sessionmaker(new_engine)
+    engine = new_engine
+    logger.info("[database] Engine rebound; disposing old engine")
+    if old_engine is not None:
+        try:
+            await old_engine.dispose()
+        except Exception as e:
+            # Old engine disposal is best-effort. A leaked connection
+            # at the OS level here is preferable to crashing the bind
+            # — pool DBs have unused connections only.
+            logger.warning("[database] Old engine dispose failed: %s", e)
 
 
 async def get_db() -> AsyncSession:

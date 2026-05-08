@@ -170,7 +170,6 @@ async def register(
     if settings.prewarm_on_soul_save:
         try:
             from app.api.agent_setup import _get_or_create_config
-            from app.services.prewarm_service import schedule_prewarm
             config = await _get_or_create_config(str(user.id), db)
             # Default to managed for unified onboarding. The signup
             # form has no hosting choice, and the frontend's
@@ -186,10 +185,16 @@ async def register(
                 dirty = True
             if dirty:
                 await db.commit()
-            await schedule_prewarm(str(user.id))
+            # Phase A.2 (never-sleep plan): prefer pool claim — sub-
+            # second bind to a pre-booted container vs ~15s cold-boot
+            # via schedule_prewarm. claim_or_prewarm internally falls
+            # back to the legacy prewarm path on pool-exhausted /
+            # feature-flag-off, so the slow-path safety net remains.
+            from app.services.pool_service import claim_or_prewarm
+            await claim_or_prewarm(db, str(user.id))
         except Exception as e:
             logger.warning(
-                "[REGISTER] Prewarm schedule failed for user %s: %s",
+                "[REGISTER] Prewarm/claim schedule failed for user %s: %s",
                 str(user.id)[:8], e,
             )
     return user

@@ -526,36 +526,45 @@ async def run_account_purge():
 
 async def run_managed_container_reaper():
     """Destroy managed-tenant containers whose bundle was cancelled
-    longer than ``settings.bundle_cancel_grace_days`` ago.
+    AND whose user account has been deactivated.
 
-    Closes the post-cancellation resource leak on Contabo: without this
-    job, a user can cancel their LLM Bundle subscription and keep their
-    tenant container running indefinitely (see May 2026 review). The
-    grace window — 7 days by default — gives users a re-subscribe path
-    that doesn't require re-provisioning.
+    Phase C of the never-sleep plan softened this from a pure
+    "X days after bundle cancellation" reaper into one that ALSO
+    requires the user to have flagged their account inactive (or had
+    it deactivated by an operator). Reasoning: a user who cancelled
+    but might come back next week deserves to skip the cold-start —
+    their container costs ~150MB of RAM, cheap insurance against the
+    "agent isn't there when I log back in" UX hit.
 
-    Filtering is conservative on purpose:
-      * `hosting_mode == 'managed'` — never touches self-hosted agents
-      * `bundle_status == 'cancelled'` — `cancelling` (period not over)
-        and `past_due` (could recover) are explicitly skipped
-      * `bundle_cancelled_at` is set AND older than grace window —
-        rows missing the timestamp are skipped (the timestamp will be
-        backfilled by the next webhook event for this user)
-      * `ManagedContainer.status` already in {`deleted`, `destroyed`}
-        is skipped — destroy_container is idempotent but we don't want
-        to log noise for already-reaped tenants
+    Filtering (all four conditions must hold):
+      * `User.is_active == False` — the new gate. Without this, any
+        cancelled-but-still-logging-in user has their container
+        reaped and faces a 15s cold start on next chat.
+      * `hosting_mode == 'managed'` — never touches self-hosted
+      * `bundle_status == 'cancelled'` — `cancelling` (period not
+        over) and `past_due` (could recover) are explicitly skipped
+      * `bundle_cancelled_at` is set AND older than the grace window
+        (30 days by default — Phase C bumped from 7d) — rows missing
+        the timestamp are skipped (will be backfilled on next webhook)
+
+    The `ManagedContainer.status` already-deleted check is preserved.
 
     Failures of `destroy_container` are logged and counted; the loop
     continues so one stuck tenant doesn't block the rest. Set
     `settings.bundle_cancel_grace_days = 0` to disable the job.
+
+    Phase C-specific telemetry: counts the `kept_alive_cancelled_users`
+    population (cancelled bundles whose user is still active) so we
+    can alert if that group exceeds 100 — at which point the cost
+    ceiling argues for revisiting the policy.
     """
     from datetime import timedelta
     from app.config import settings as _s
-    from app.db.models import AgentConfig
+    from app.db.models import AgentConfig, User
     from app.db.models.managed_container import ManagedContainer
     from app.services import docker_host_service
 
-    grace_days = int(getattr(_s, "bundle_cancel_grace_days", 7) or 0)
+    grace_days = int(getattr(_s, "bundle_cancel_grace_days", 30) or 0)
     if grace_days <= 0:
         logger.info("[bundle_reaper] disabled (bundle_cancel_grace_days=%s)", grace_days)
         return
@@ -563,12 +572,40 @@ async def run_managed_container_reaper():
     cutoff = datetime.utcnow() - timedelta(days=grace_days)
 
     async with async_session_maker() as db:
+        # Telemetry pass: count cancelled-but-still-active users.
+        # This is the population we INTENTIONALLY don't reap; alert
+        # if it grows past 100 (~15GB RAM ceiling on the host).
+        kept_alive_q = await db.execute(
+            select(AgentConfig.user_id)
+            .join(User, AgentConfig.user_id == User.id)
+            .where(
+                AgentConfig.hosting_mode == "managed",
+                AgentConfig.bundle_status == "cancelled",
+                User.is_active.is_(True),
+            )
+        )
+        kept_alive_count = len(list(kept_alive_q))
+        logger.info(
+            "[bundle_reaper] kept_alive_cancelled_users=%d (no-op gate; alert threshold=100)",
+            kept_alive_count,
+        )
+        if kept_alive_count > 100:
+            logger.warning(
+                "[bundle_reaper] kept_alive_cancelled_users=%d exceeds 100 — "
+                "revisit Phase C policy (RAM ceiling).",
+                kept_alive_count,
+            )
+
+        # Reap pass — BOTH bundle-cancelled AND user-inactive.
         result = await db.execute(
-            select(AgentConfig.user_id, AgentConfig.bundle_cancelled_at).where(
+            select(AgentConfig.user_id, AgentConfig.bundle_cancelled_at)
+            .join(User, AgentConfig.user_id == User.id)
+            .where(
                 AgentConfig.hosting_mode == "managed",
                 AgentConfig.bundle_status == "cancelled",
                 AgentConfig.bundle_cancelled_at.is_not(None),
                 AgentConfig.bundle_cancelled_at < cutoff,
+                User.is_active.is_(False),
             )
         )
         candidates = list(result.all())

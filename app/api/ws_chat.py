@@ -1076,6 +1076,14 @@ async def ws_chat(
 
         logger.info(f"[WS] Authenticated user: {user_id}")
 
+        # Phase A/B: track this WS in the drain coordinator. Decremented
+        # in the finally below. The increment happens here (post-auth)
+        # rather than at accept-time so failed auth doesn't pin the
+        # counter at >0 forever — the bind handler's drain timer waits
+        # for this counter to hit 0 before exiting.
+        from app.services import drain_state as _drain_state
+        _drain_state.increment_active()
+
         # Register broadcast queue for this connection
         broadcast_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         _register_ws_queue(user_id, broadcast_queue)
@@ -1765,6 +1773,14 @@ async def ws_chat(
             broadcast_task.cancel()
             keepalive_task.cancel()
             _unregister_ws_queue(user_id, broadcast_queue)
+            # Phase A/B: release this WS from the drain counter. Match
+            # the increment above; if drain has been engaged and this
+            # was the last in-flight WS, the drain watcher will exit
+            # the process within ~1s.
+            try:
+                _drain_state.decrement_active()
+            except Exception:
+                pass
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Disconnected: {user_id}")

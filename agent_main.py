@@ -40,6 +40,7 @@ from app.api.memories import router as memories_router
 from app.api.sessions import router as sessions_router
 from app.api.day_chats import router as day_chats_router
 from app.api.chat import router as chat_router
+from app.api.messages_recover import router as messages_recover_router
 from app.api.ws_chat import router as ws_chat_router, set_ws_refs, broadcast_to_user
 from app.api.api_v1 import router as api_v1_router
 from app.api.models import router as models_router
@@ -57,6 +58,11 @@ from app.api.files import router as files_router
 # WhatsApp QR-pairing endpoints (agent-side; platform proxies via
 # /api/agent-setup/whatsapp/qr-* using X-Agent-Key over Caddy TLS).
 from app.api.whatsapp_qr import router as whatsapp_qr_router
+# Phase A: pool admin (bind / drain / status). Auth by POOL_ADMIN_TOKEN
+# (NOT X-Agent-Key) — bridge holds the token, agent containers receive
+# it as an env var at docker run.
+from app.api.admin_pool import router as admin_pool_router
+from app.services import runtime_identity, drain_state
 
 _app_start_time = None
 _skill_loader = None
@@ -65,7 +71,25 @@ _skill_loader = None
 _boot_progress = {"percent": 0, "phase": "starting", "ready": False}
 
 # ── Paths that skip API key auth (health checks, root) ─────────────
-_PUBLIC_PATHS = frozenset({"/", "/agent/health", "/agent/system", "/docs", "/openapi.json", "/redoc"})
+# Pool admin endpoints (`/api/admin/bind` etc.) are public to the
+# X-Agent-Key middleware but enforce their own POOL_ADMIN_TOKEN check
+# inside the handler. Same posture as `/agent/health`: the middleware
+# delegates auth to the route, not the other way around.
+_PUBLIC_PATHS = frozenset({
+    "/", "/agent/health", "/agent/system", "/docs", "/openapi.json", "/redoc",
+    "/api/admin/bind", "/api/admin/drain", "/api/admin/status",
+})
+
+# Routes that remain reachable in pool-lobby mode (TOUP_POOL_GENERIC=1
+# AND not yet bound). Everything else 503s with `X-Lobby-Mode: 1`.
+# Bridge polls /agent/health to know when generic boot finishes; it
+# calls /api/admin/bind to claim. Once `runtime_identity.is_bound()`
+# returns True, the lobby gate is off and the rest of the API serves
+# normally.
+_LOBBY_ALLOWED = frozenset({
+    "/", "/agent/health", "/agent/system",
+    "/api/admin/bind", "/api/admin/drain", "/api/admin/status",
+})
 
 
 # ── Module-level refs for hot-restart of channel bots ──────────────
@@ -211,6 +235,62 @@ async def restart_whatsapp_channel():
             print("📱 WhatsApp channel restarted (Cloud API)")
     except Exception as e:
         logging.exception(f"[RESTART] Failed to start WhatsApp channel: {e}")
+
+
+class LobbyAndDrainMiddleware:
+    """Phase A/B gate: block traffic when the agent is in pool-lobby
+    mode (not yet bound) or actively draining (Phase B blue-green
+    cutover).
+
+    Lobby mode (`TOUP_POOL_GENERIC=1` + `runtime_identity.is_bound()=False`):
+        Everything except _LOBBY_ALLOWED returns 503 with
+        `X-Lobby-Mode: 1`. WebSocket upgrades get a 503 close
+        (Starlette translates http.response 503 into ws-close 1011 for
+        ASGI clients before accept). Existing tenants — `TOUP_POOL_GENERIC`
+        unset — are unaffected; they pass straight through.
+
+    Drain mode (`drain_state.is_draining()=True`):
+        New WebSocket upgrades close with code 1012 (Service Restart);
+        in-flight handlers continue. HTTP requests pass through —
+        a drain doesn't break short-lived requests, only long-lived
+        ones, and we want any final cleanup HTTP to succeed."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+
+        # Lobby gate
+        if runtime_identity.is_pool_generic() and not runtime_identity.is_bound():
+            if path not in _LOBBY_ALLOWED:
+                if scope["type"] == "websocket":
+                    # Reject before accept — code 1011 (Internal Error) /
+                    # we use 1013 (Try Again Later). Starlette accepts
+                    # only `websocket.close` after `websocket.accept`,
+                    # but for unaccepted WS we send `websocket.close`
+                    # straight off the receive queue.
+                    await send({"type": "websocket.close", "code": 1013, "reason": "pool-lobby"})
+                    return
+                response = Response(
+                    content='{"detail":"Agent in pool-lobby mode; awaiting bind"}',
+                    status_code=503,
+                    media_type="application/json",
+                    headers={"X-Lobby-Mode": "1", "Retry-After": "5"},
+                )
+                await response(scope, receive, send)
+                return
+
+        # Drain gate (only blocks NEW WS upgrades; HTTP unaffected)
+        if drain_state.is_draining() and scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1012, "reason": "draining"})
+            return
+
+        await self.app(scope, receive, send)
 
 
 class AgentAPIKeyMiddleware:
@@ -1105,6 +1185,14 @@ app.add_middleware(
 # API key auth — only when AGENT_API_KEY is configured (on user VPS)
 app.add_middleware(AgentAPIKeyMiddleware)
 
+# Lobby + drain gate. ORDER MATTERS: this needs to run BEFORE the
+# X-Agent-Key check so a generic pool container (which has no
+# X-Agent-Key configured) can serve /admin/bind without first
+# having the API-key middleware 401 it. FastAPI applies middlewares
+# in REVERSE add order, so adding LobbyAndDrain after AgentAPIKey
+# means LobbyAndDrain runs FIRST in the request chain.
+app.add_middleware(LobbyAndDrainMiddleware)
+
 # ── Register agent routers ───────────────────────────────────────────
 app.include_router(agent_router, prefix=settings.api_prefix)
 app.include_router(stats_router, prefix=settings.api_prefix)
@@ -1112,6 +1200,7 @@ app.include_router(memories_router, prefix=settings.api_prefix)
 app.include_router(sessions_router, prefix=settings.api_prefix)
 app.include_router(day_chats_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
+app.include_router(messages_recover_router, prefix=settings.api_prefix)  # GET /api/messages/since/<id>
 app.include_router(ws_chat_router, prefix=settings.api_prefix)
 app.include_router(api_v1_router, prefix=settings.api_prefix)
 app.include_router(models_router, prefix=settings.api_prefix)    # GET /api/models — model registry
@@ -1132,6 +1221,11 @@ app.include_router(llm_setup_router, prefix=settings.api_prefix)
 # Generated-file attachments — data + files live here on the agent.
 app.include_router(files_router, prefix=settings.api_prefix)
 app.include_router(whatsapp_qr_router, prefix=settings.api_prefix)
+# Pool admin endpoints (Phase A/B): /api/admin/bind, /api/admin/drain,
+# /api/admin/status. Auth enforced inside the handlers via
+# X-Pool-Admin-Token; bypassed by the X-Agent-Key middleware via
+# _PUBLIC_PATHS membership.
+app.include_router(admin_pool_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
 try:

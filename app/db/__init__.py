@@ -18,7 +18,7 @@ from app.db.models import (
     LLMUsageRecord,
     LLMProxyEvent,
 )
-from app.db.database import get_db, init_db, drop_db, async_session_maker, engine
+from app.db.database import get_db, init_db, drop_db, async_session_maker, engine, get_engine, rebind_database
 
 __all__ = [
     "Base",
@@ -68,4 +68,6 @@ __all__ = [
     "drop_db",
     "async_session_maker",
     "engine",
+    "get_engine",
+    "rebind_database",
 ]

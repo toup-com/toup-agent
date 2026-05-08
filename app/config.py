@@ -244,6 +244,25 @@ class Settings(BaseSettings):
     agent_api_key: str = ""                          # API key for authenticating requests to this Agent VPS
     user_id: str = ""                                # Owner user ID (set on Agent VPS via cloud-init)
     toup_token: str = ""                             # Connect token from toup.ai dashboard (for tunnel auth)
+    # Phase A — Pool of pre-booted agent containers. When True,
+    # `auth.register` calls `pool_service.claim_for_user` instead of the
+    # slow `schedule_prewarm` path. Pool requires the bridge's pool
+    # endpoints to be installed (see `bridge/INSTALL.md`); set this
+    # to False (the default) until that's deployed and verified.
+    use_container_pool: bool = False
+    # Phase B — Blue-green tenant rollouts. When True,
+    # `docker_host_service.upgrade_tenant_image` calls the bridge's
+    # `/v1/tenants/<prefix>/blue-green-upgrade` (zero-WS-drop) instead
+    # of the legacy `/v1/tenants/<prefix>/upgrade` (recreate). Requires
+    # the bridge's `blue_green.py` module installed (see
+    # `bridge/blue_green.py` + `INSTALL.md`).
+    use_blue_green_rollouts: bool = False
+    # Drain timeout for blue-green cutovers. After Caddy flips to the
+    # new slot, the old slot rejects new WS but lets in-flight stream
+    # for up to this many seconds before the bridge force-stops it.
+    # 60s is the plan default — enough for any reasonable LLM stream
+    # while bounding the rollout pipeline's per-tenant time.
+    blue_green_drain_timeout_s: int = 60
 
     # ── VPS Provisioning (AWS + Stripe) ──────────────────────
     aws_access_key_id: Optional[str] = None        # Set via AWS_ACCESS_KEY_ID
@@ -310,11 +329,14 @@ class Settings(BaseSettings):
     docker_port_range_end: int = 9999
     managed_hosting_enabled: bool = False   # Gate: set True once bridge is reachable
     # Container reaper grace period — how many days a managed tenant
-    # container keeps running after its bundle is cancelled before the
-    # nightly reaper destroys it. 7 days gives users a generous re-sub
-    # window without burning Contabo resources indefinitely. Set to 0
-    # in dev to disable the reaper entirely.
-    bundle_cancel_grace_days: int = 7
+    # container keeps running after its bundle is cancelled AND the
+    # user account is deactivated, before the nightly reaper destroys
+    # it. Phase C of the never-sleep plan bumped this from 7 to 30 and
+    # added the `User.is_active=False` AND-gate (see
+    # scheduled_tasks.run_managed_container_reaper). Active-but-cancelled
+    # users keep their container indefinitely so they don't hit a cold
+    # start on return. Set to 0 in dev to disable the reaper entirely.
+    bundle_cancel_grace_days: int = 30
     # Phase-1 prewarm-on-Soul.save feature flag. When True, the Soul.save
     # handler fires `provision_container` in the background after commit so
     # the user's managed container is fully booted by the time they reach
