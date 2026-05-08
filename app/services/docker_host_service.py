@@ -428,7 +428,16 @@ async def restart_container(db: AsyncSession, user_id: str) -> Optional[ManagedC
 
 
 async def destroy_container(db: AsyncSession, user_id: str) -> bool:
-    """Remove a tenant container (DB + network + Caddy route) via bridge."""
+    """Remove a tenant container (DB + network + Caddy route) via bridge.
+
+    Pool members vs ad-hoc tenants:
+    - If the container's name is `toup-agent-pool-NN`, it was bound from
+      the warm pool. Use `/v1/pool/release` so the bridge drains via
+      /admin/drain, revokes the DB role, and the reconciler reaps and
+      respawns the slot to maintain target.
+    - Otherwise it's a slow-path tenant container; use the legacy
+      `/v1/tenants/<prefix>` DELETE which drops DB, network, route.
+    """
     result = await db.execute(
         select(ManagedContainer).where(ManagedContainer.user_id == user_id)
     )
@@ -436,12 +445,20 @@ async def destroy_container(db: AsyncSession, user_id: str) -> bool:
     if not container:
         return False
     prefix = user_id[:8]
+    is_pool_member = (
+        container.container_name
+        and container.container_name.startswith("toup-agent-pool-")
+    )
     try:
-        async with _bridge_client() as client:
-            r = await client.delete(f"/v1/tenants/{prefix}")
-            # 204 is the expected response; 404 (already gone) is also OK
-            if r.status_code not in (204, 404):
-                r.raise_for_status()
+        if is_pool_member:
+            from app.services.pool_service import release_pool_member
+            await release_pool_member(prefix=prefix, user_id=user_id)
+        else:
+            async with _bridge_client() as client:
+                r = await client.delete(f"/v1/tenants/{prefix}")
+                # 204 is the expected response; 404 (already gone) is also OK
+                if r.status_code not in (204, 404):
+                    r.raise_for_status()
     except httpx.HTTPError as e:
         logger.error("bridge destroy failed for %s: %s", user_id[:8], e)
         # Continue — mark DB row regardless. Operator can reconcile if bridge

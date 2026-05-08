@@ -229,6 +229,89 @@ async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedCont
     return container
 
 
+async def notify_pool_image_refresh(image_tag: str) -> bool:
+    """Tell the bridge a new image SHA has rolled out.
+
+    Bridge persists this as `current_image_tag` and the reconciler will
+    drain stale-image GENERIC pool members on its next tick (≤30 s),
+    respawning them on the new SHA. ASSIGNED members are untouched —
+    those go through Phase B blue-green per-tenant.
+
+    Returns True on success, False on bridge unreachable / 4xx / 5xx.
+    Failure is non-fatal: the rollout itself succeeds even if the pool
+    refresh notification doesn't go through; the reconciler's
+    live-tenant fallback eventually catches up. Caller logs and moves on."""
+    if not image_tag or image_tag.endswith(":latest"):
+        # :latest is a fresh-install sentinel; rollout always provides a
+        # real SHA tag, so this guards against accidental misuse.
+        logger.info("[pool_service] skip pool refresh (no real tag): %s", image_tag)
+        return False
+    # Normalize bare 'toup-agent:<sha>' → fully-qualified GHCR ref so
+    # the bridge can `docker pull` it directly.
+    tag = image_tag.strip()
+    if tag.startswith("toup-agent:"):
+        tag = "ghcr.io/toup-com/toup-agent:" + tag.split(":", 1)[1]
+    from app.services.docker_host_service import _bridge_client
+    try:
+        async with _bridge_client() as client:
+            resp = await client.post("/v1/pool/refresh-image", json={"image_tag": tag})
+            if resp.status_code != 200:
+                logger.warning(
+                    "[pool_service] bridge refresh-image %s: %s",
+                    resp.status_code, resp.text[:200],
+                )
+                return False
+            data = resp.json()
+            logger.info(
+                "[pool_service] pool image refreshed: changed=%s stale_to_drain=%s tag=%s",
+                data.get("changed"), data.get("stale_generic_to_drain"), tag,
+            )
+            return True
+    except Exception as e:
+        logger.warning("[pool_service] bridge refresh-image unreachable: %s", e)
+        return False
+
+
+async def release_pool_member(prefix: Optional[str] = None, user_id: Optional[str] = None) -> bool:
+    """Tell the bridge a user has been deleted / churned.
+
+    Bridge marks the pool member DRAINING; the reconciler completes the
+    destroy on its next tick. The DB role is revoked so any leftover
+    connection attempts fail; the DB itself is preserved (cleanup is
+    out-of-band). Slot is reusable once the reconciler reaps it; the
+    next allocation creates a fresh DB role + password.
+
+    Returns True if the bridge accepted the release (including the
+    "no pool member matches" case — that's idempotent success).
+    """
+    if not prefix and not user_id:
+        return False
+    body: dict = {}
+    if prefix:
+        body["prefix"] = prefix
+    if user_id:
+        body["user_id"] = str(user_id)
+    from app.services.docker_host_service import _bridge_client
+    try:
+        async with _bridge_client() as client:
+            resp = await client.post("/v1/pool/release", json=body)
+            if resp.status_code != 200:
+                logger.warning(
+                    "[pool_service] bridge release %s: %s",
+                    resp.status_code, resp.text[:200],
+                )
+                return False
+            data = resp.json()
+            logger.info(
+                "[pool_service] pool release: found=%s slot=%s prefix=%s user=%s",
+                data.get("found"), data.get("slot"), prefix, str(user_id)[:8] if user_id else "",
+            )
+            return True
+    except Exception as e:
+        logger.warning("[pool_service] bridge release unreachable: %s", e)
+        return False
+
+
 async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
     """Try the pool first; fall back to schedule_prewarm.
 

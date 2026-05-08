@@ -497,6 +497,16 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
     rollout.notes = f"completed: {total_ok} ok, {total_fail} failed/rolled-back of {len(tenants)} total"
     await db.commit()
 
+    # Tell the bridge so the warm pool flips to the new image. Reconciler
+    # drains stale-image GENERIC members on its next tick (≤30s) and
+    # respawns on `rollout.image_tag`. Non-fatal: rollout success is
+    # decoupled from pool refresh notification.
+    try:
+        from app.services.pool_service import notify_pool_image_refresh
+        await notify_pool_image_refresh(rollout.image_tag)
+    except Exception as e:
+        logger.warning("[rollout] pool image refresh notify failed: %s", e)
+
     alert_level = "info" if total_fail == 0 else "warning"
     await _send_telegram(
         alert_level,
@@ -922,6 +932,11 @@ async def _resume_rollout_task(rollout_id: str) -> None:
             f"{total_fail} failed/rolled-back of {len(tenants)} total"
         )
         await db.commit()
+        try:
+            from app.services.pool_service import notify_pool_image_refresh
+            await notify_pool_image_refresh(rollout.image_tag)
+        except Exception as e:
+            logger.warning("[rollout-resume] pool image refresh notify failed: %s", e)
         await _send_telegram(
             "info" if total_fail == 0 else "warning",
             f"Rollout <code>{rollout.image_tag}</code> complete (resumed): "
