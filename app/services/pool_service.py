@@ -46,6 +46,19 @@ async def _build_bind_payload(
     user_id: str,
     agent_config: AgentConfig,
 ) -> dict:
+    # User-side identity for the agent's local DB lazy-create path.
+    # Without these, the agent stubs `name='Agent Owner'` /
+    # `email='<prefix>@agent.local'` and the chat greeting reads as
+    # generic forever. Loaded from the platform User row, with sane
+    # fallback if the row is somehow missing (won't normally happen
+    # for a managed tenant — if it does, /admin/bind degrades to the
+    # legacy stub values).
+    from app.db.models import User as _PlatformUser
+    _u_row = (await db.execute(
+        select(_PlatformUser).where(_PlatformUser.id == user_id)
+    )).scalar_one_or_none()
+    _user_name = (_u_row.name if _u_row and _u_row.name else None) or ""
+    _user_email = (_u_row.email if _u_row and _u_row.email else None) or ""
     """Compose the body for `POST /v1/pool/claim`. Mirrors the
     bridge's /admin/bind contract — see backend/app/api/admin_pool.py
     `_BIND_FIELDS`."""
@@ -73,6 +86,10 @@ async def _build_bind_payload(
         "prefix": prefix,
         "_image_tag": image_hint,
     }
+    if _user_name:
+        payload["user_name"] = _user_name
+    if _user_email:
+        payload["user_email"] = _user_email
 
     # Channel + identity fields — same set as
     # `_agent_config_to_bridge_body` in docker_host_service. Pulled

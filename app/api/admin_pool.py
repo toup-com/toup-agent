@@ -66,6 +66,12 @@ _MAX_BIND_BODY_BYTES = 64 * 1024
 _BIND_FIELDS = (
     "user_id",
     "agent_api_key",
+    # User-side identity (real human, not the agent persona). Threaded
+    # through so lazy-create paths in the agent's local DB stop stubbing
+    # `name='Agent Owner'` / `email='<prefix>@agent.local'`. Without
+    # these, the user's first-message greeting was generic forever.
+    "user_name",
+    "user_email",
     "agent_color",
     "agent_name",
     "llm_mode",
@@ -173,12 +179,20 @@ async def admin_bind(
         logger.exception("[admin/bind] runtime.json write failed")
         raise HTTPException(status_code=500, detail=f"Runtime write failed: {e}") from e
 
-    # 2b. Ensure owner user row exists in the (now-bound) DB. The
-    #     agent_main lifespan creates this row at startup gated on
-    #     `settings.user_id`, which was empty in lobby mode, so the
-    #     row was never created. Without it, the first chat WS hits
-    #     a Foreign Key violation when trying to write the user's
-    #     message into a session whose user_id references users.id.
+    # 2b. Ensure owner user row exists in the (now-bound) DB with the
+    #     real name + email. Without `user_name`/`user_email` in the
+    #     bind payload (legacy callers), falls back to the stub values
+    #     that legacy bind used. Existing rows are UPDATED on every
+    #     bind so a migration from stub → real name happens automatically
+    #     on the next config-refresh, no manual SQL needed.
+    #
+    #     The agent_main lifespan also creates this row at startup gated
+    #     on `settings.user_id`, but `user_id` is empty in lobby mode,
+    #     so the row was never created there. Without it, the first
+    #     chat WS hits a Foreign Key violation when trying to write the
+    #     user's message into a session whose user_id references users.id.
+    real_user_name = (filtered.get("user_name") or "").strip() or "Agent Owner"
+    real_user_email = (filtered.get("user_email") or "").strip() or f"{user_id[:8]}@agent.local"
     try:
         from app.db.database import async_session_maker as _sm
         from app.services.auth_service import get_user_by_id
@@ -188,12 +202,33 @@ async def admin_bind(
             if not existing:
                 _udb.add(User(
                     id=user_id,
-                    email=f"{user_id[:8]}@agent.local",
+                    email=real_user_email,
                     hashed_password="",
-                    name="Agent Owner",
+                    name=real_user_name,
                 ))
                 await _udb.commit()
-                logger.info("[admin/bind] Owner user row created for %s", user_id[:8])
+                logger.info(
+                    "[admin/bind] Owner user row created for %s (name=%r)",
+                    user_id[:8], real_user_name,
+                )
+            else:
+                # Backfill the real values if the row was previously
+                # stubbed via a lazy-create path (bind path's stub or
+                # the WS auth path's stub). Cheap UPDATE — only writes
+                # when the value actually changes.
+                changed = False
+                if existing.name != real_user_name and real_user_name != "Agent Owner":
+                    existing.name = real_user_name
+                    changed = True
+                if existing.email != real_user_email and real_user_email != f"{user_id[:8]}@agent.local":
+                    existing.email = real_user_email
+                    changed = True
+                if changed:
+                    await _udb.commit()
+                    logger.info(
+                        "[admin/bind] Owner user row backfilled for %s (name=%r)",
+                        user_id[:8], real_user_name,
+                    )
     except Exception as e:
         logger.exception("[admin/bind] Owner-user creation failed (non-fatal)")
         # Don't fail the bind on this — the user row will be created
