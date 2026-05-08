@@ -145,23 +145,13 @@ async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedCont
 
     payload = await _build_bind_payload(db, user_id, agent_config)
 
-    # Mark provisioning so concurrent UI polls show the right state.
-    if existing:
-        container = existing
-    else:
-        import uuid as _uuid
-        container = ManagedContainer(
-            id=str(_uuid.uuid4()),
-            user_id=user_id,
-            container_name=f"toup-agent-{user_id[:8]}",  # Filled in for real after claim
-            status="provisioning",
-        )
-        db.add(container)
-    container.status = "provisioning"
-    container.error_message = None
-    await db.commit()
-
-    # Call bridge.
+    # Call bridge FIRST — only persist the ManagedContainer row once
+    # we have a real host_port (the column is NOT NULL on the schema).
+    # Pre-Phase-A code did a placeholder insert+commit before bridge,
+    # which 500'd the whole register endpoint via NotNullViolation
+    # AND poisoned the session so the User row's response build also
+    # blew up. Lesson: never insert a row with required fields you
+    # don't yet have.
     from app.services.docker_host_service import _bridge_client
     try:
         async with _bridge_client() as client:
@@ -191,6 +181,18 @@ async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedCont
         logger.error("[pool_service] bridge claim returned bad shape: %s", data)
         return None
 
+    # Now we have everything required by the schema — upsert the row.
+    if existing:
+        container = existing
+    else:
+        import uuid as _uuid
+        container = ManagedContainer(
+            id=str(_uuid.uuid4()),
+            user_id=user_id,
+            container_name=container_name,
+            host_port=int(host_port),
+        )
+        db.add(container)
     container.container_name = container_name
     container.host_port = int(host_port)
     container.image_tag = settings.docker_agent_image
@@ -236,6 +238,14 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
             return True
     except Exception:
         logger.exception("[pool_service] claim_for_user raised; falling through to prewarm")
+        # Critical: roll back the session so the rest of auth.register
+        # (the User-row response build) doesn't fail on a poisoned
+        # session. SQLAlchemy raises InvalidRequestError or "current
+        # transaction is aborted" on any further use until rollback.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
     try:
         from app.services.prewarm_service import schedule_prewarm
