@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 # Settings + per-tenant overrides take precedence; these are the
 # last-resort fallback when nothing else is configured.
 _CANONICAL_AGENT_MODEL = "claude-opus-4-7"
-_CANONICAL_FALLBACK_MODEL = "gpt-5.4"
+_CANONICAL_FALLBACK_MODEL = "gpt-5.5"
 _CANONICAL_ANTHROPIC_MODEL = "claude-opus-4-7"
-_CANONICAL_OPENAI_MODEL = "gpt-5.4"
+_CANONICAL_OPENAI_MODEL = "gpt-5.5"
 
 
 # ── Default-resolution functions ──────────────────────────────────────

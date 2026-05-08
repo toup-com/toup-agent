@@ -12,7 +12,7 @@ caching enabled via Cache-Control to keep load light.
 Response shape:
     {
       "default": "claude-opus-4-7",
-      "fallback": "gpt-5.4",
+      "fallback": "gpt-5.5",
       "auto_builder": {
         "planner": "claude-opus-4-7",
         "builder": "claude-opus-4-7"
@@ -22,7 +22,7 @@ Response shape:
         ...
       ],
       "openai": [
-        {"id": "gpt-5.4",         "label": "GPT-5.4"},
+        {"id": "gpt-5.5",         "label": "GPT-5.5"},
         ...
       ]
     }
@@ -50,6 +50,7 @@ _LABEL_MAP: dict[str, str] = {
     "claude-sonnet-4-20250514": "Claude Sonnet 4",
     "claude-3-5-haiku-20241022": "Claude 3.5 Haiku",
     "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
+    "gpt-5.5": "GPT-5.5",
     "gpt-5.4": "GPT-5.4",
     "gpt-5.2": "GPT-5.2",
     "gpt-5": "GPT-5",

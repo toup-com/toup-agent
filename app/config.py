@@ -90,7 +90,7 @@ class Settings(BaseSettings):
 
     # Agent Runtime
     agent_model: str = "claude-opus-4-7"  # Primary agent model
-    agent_fallback_model: str = "gpt-5.4"  # Fallback if primary model fails (cross-provider)
+    agent_fallback_model: str = "gpt-5.5"  # Fallback if primary model fails (cross-provider)
     # Auto-builder Planner/Builder model overrides. None means "share the
     # agent's default model" — both phases use `agent_model` unless an
     # operator deliberately splits them. See model_resolver.app_builder_*_model().
@@ -420,6 +420,7 @@ class Settings(BaseSettings):
 
     # Pricing per 1K tokens (USD)
     pricing_per_1k: dict[str, dict[str, float]] = {
+        "gpt-5.5": {"input": 0.005, "output": 0.030},
         "gpt-5.4": {"input": 0.003, "output": 0.012},
         "gpt-5": {"input": 0.003, "output": 0.012},
         "gpt-4.1": {"input": 0.002, "output": 0.008},

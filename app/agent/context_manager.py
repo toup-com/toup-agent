@@ -20,6 +20,7 @@ CHARS_PER_TOKEN = 4
 
 # Model context windows (tokens)
 MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
+    "gpt-5.5": 1_050_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.2": 400_000,
     "gpt-5": 128_000,

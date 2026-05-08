@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 AVAILABLE_MODELS = {
     "claude-opus-4-6": {"provider": "anthropic", "cost_in": 15.0, "cost_out": 75.0, "context": 200000},
     "claude-sonnet-4-20250514": {"provider": "anthropic", "cost_in": 3.0, "cost_out": 15.0, "context": 200000},
+    "gpt-5.5": {"provider": "openai", "cost_in": 5.0, "cost_out": 30.0, "context": 1050000},
+    "gpt-5.4": {"provider": "openai", "cost_in": 3.0, "cost_out": 12.0, "context": 1000000},
     "gpt-4o": {"provider": "openai", "cost_in": 2.5, "cost_out": 10.0, "context": 128000},
     "gpt-4o-mini": {"provider": "openai", "cost_in": 0.15, "cost_out": 0.60, "context": 128000},
     "gpt-4.1": {"provider": "openai", "cost_in": 2.0, "cost_out": 8.0, "context": 1000000},

@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 # Cost per 1M tokens (USD)
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
+    "gpt-5.5": {"input": 5.00, "output": 30.00},
+    "gpt-5.4": {"input": 3.00, "output": 12.00},
     "gpt-4o": {"input": 2.50, "output": 10.00},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4-turbo": {"input": 10.00, "output": 30.00},
