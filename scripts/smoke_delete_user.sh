@@ -64,9 +64,17 @@ BASE="${BASE%/}"
 # destructive call. UUID prefix collision is vanishingly unlikely;
 # this is belt-and-suspenders defense.
 REAL_TENANT_PREFIXES=(
-  "c47c5b4b"
-  "3134fece"
-  "ad6060cc"
+  "871bac24"  # nariman@toup.ai
+  "3134fece"  # parmida.isazadeh@gmail.com
+  "c47c5b4b"  # mrhx@toup.ai
+  "2b58d9b2"  # alireza@toup.ai (paying)
+  "791c1335"  # matin@toup.ai (paying)
+  "43961335"  # mamad@toup.ai (paying)
+  "3e1f9185"  # mmd@toup.ai (paying)
+  "a37db19b"  # sam@toup.ai
+  "e077c3e5"  # poopak@toup.ai
+  "12333f17"  # n@toup.ai
+  "ad6060cc"  # carried over from upstream
 )
 
 # Use seconds + nanoseconds (where supported) + PID + $RANDOM so two
