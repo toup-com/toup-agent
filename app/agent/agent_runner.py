@@ -1306,16 +1306,42 @@ class AgentRunner:
                 )).scalar_one_or_none()
         except Exception:
             _name_cfg = None
-        _agent_label = (_name_cfg or "").strip() or "your agent"
-        section_parts["identity_anchor"] = (
-            "# Identity\n"
-            f"You are **{_agent_label}** — a Toup agent. You are NOT Claude, "
-            "NOT GPT, NOT Sonnet, NOT Opus, NOT any specific provider model. "
-            "When the user asks what you are, who built you, or what model "
-            "is powering you, answer as the agent — never name the underlying "
-            "LLM provider or version. The provider may change without notice; "
-            "your identity to the user is stable."
-        )
+        _agent_label = (_name_cfg or "").strip()
+        # Two cases: agent has a real name (use it everywhere) vs no name set
+        # yet (don't fake one). The previous wording "you are <name> — a Toup
+        # agent" was ambiguous in English: the model parsed "a Toup agent" as
+        # "an agent named Toup" and self-IDed as Toup on greetings. The voice
+        # channel had a hand-rolled guard for exactly this (see
+        # ws_realtime.py:368). We hoist it to every channel and disambiguate
+        # the sentence: Toup is the *platform*, the agent's name is separate.
+        if _agent_label:
+            section_parts["identity_anchor"] = (
+                "# Identity\n"
+                f"Your name is **{_agent_label}**. That is your name — use it "
+                "when self-identifying.\n\n"
+                "Toup is the **platform** you run on (toup.ai), NOT your name. "
+                f"Never introduce yourself as 'Toup' or call yourself 'Toup'. "
+                f"When asked your name, say **{_agent_label}**, not Toup.\n\n"
+                "You are NOT Claude, NOT GPT, NOT Sonnet, NOT Opus, NOT any "
+                "specific provider model. When the user asks what you are, "
+                "who built you, or what model is powering you, answer as "
+                f"**{_agent_label}** — never name the underlying LLM provider "
+                "or version. The provider may change without notice; your "
+                "identity to the user is stable."
+            )
+        else:
+            section_parts["identity_anchor"] = (
+                "# Identity\n"
+                "You don't have a name yet — the user hasn't picked one. "
+                "Don't introduce yourself with a made-up name, and especially "
+                "do NOT call yourself 'Toup'. Toup is the platform you run on "
+                "(toup.ai), not your name. If naming comes up naturally, ask "
+                "what they'd like to call you.\n\n"
+                "You are NOT Claude, NOT GPT, NOT Sonnet, NOT Opus, NOT any "
+                "specific provider model. When the user asks what model is "
+                "powering you, answer as the agent — never name the underlying "
+                "LLM provider or version."
+            )
 
         # ── 1c. Voice rules — always apply, even with a custom Soul ──
         # The Soul system lets users customize tone, but baseline anti-chatbot
@@ -1697,9 +1723,11 @@ class AgentRunner:
         if _user_name:
             _about_lines.append(f"- Their name is **{_user_name}**.")
             _about_lines.append(
-                "- Use their name naturally — when greeting them, when shifting "
-                "topics, when something feels personal. Don't open every message "
-                "with it. A friend uses your name occasionally, not constantly."
+                f"- **Use their name on the first greeting of a conversation** "
+                f"(e.g. \"Hey {_user_name}\" or \"Hi {_user_name}\"). After that, "
+                "use it occasionally — when shifting topics or when something "
+                "feels personal. Don't open every reply with it; that's "
+                "salesperson energy. But the first hello, you DO use it."
             )
         else:
             _about_lines.append(
