@@ -57,15 +57,21 @@ async def _build_bind_payload(
     # gets it).
     agent_api_key = agent_config.agent_api_key or secrets.token_urlsafe(48)
 
+    # Image tag for the bridge's refill spawn after this claim. Use the
+    # last successful rollout's SHA — same source the slow provision path
+    # uses. `settings.docker_agent_image` ("toup-agent:latest") is a
+    # fresh-install sentinel, NOT a published GHCR tag, so passing it as
+    # the hint causes refill to spawn pool members on whatever the host
+    # cached weeks ago. See May 2026 incident: stale `211f0b4beabd`
+    # pool members had no /api/admin/bind, every claim 404'd.
+    from app.services.docker_host_service import _latest_known_good_image_tag
+    image_hint = await _latest_known_good_image_tag(db) or settings.docker_agent_image
+
     payload = {
         "user_id": str(user_id),
         "agent_api_key": agent_api_key,
         "prefix": prefix,
-        # Image tag — needed by the bridge's refill spawn after this
-        # claim. Bridge stores it in BRIDGE_AGENT_IMAGE env normally;
-        # passing it explicitly here keeps platform → bridge in sync
-        # if the bridge env drifts.
-        "_image_tag": settings.docker_agent_image,
+        "_image_tag": image_hint,
     }
 
     # Channel + identity fields — same set as
