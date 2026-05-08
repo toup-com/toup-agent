@@ -219,10 +219,15 @@ class LLMService:
         temperature = temperature if temperature is not None else self.default_temperature
         max_tokens = max_tokens or self.default_max_tokens
 
+        from app.services.model_resolver import supports_custom_temperature
+
         try:
+            call_kwargs = dict(kwargs)
+            if supports_custom_temperature(model):
+                call_kwargs["temperature"] = temperature
             stream = await self._openai_client.chat.completions.create(
-                model=model, messages=messages, temperature=temperature,
-                max_tokens=max_tokens, stream=True, **kwargs
+                model=model, messages=messages,
+                max_tokens=max_tokens, stream=True, **call_kwargs,
             )
             async for chunk in stream:
                 if chunk.choices:
