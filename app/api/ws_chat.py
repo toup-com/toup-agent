@@ -985,6 +985,76 @@ async def _authenticate_ws(token: str) -> Optional[str]:
         return None
 
 
+async def _authenticate_ws_session_token(token: str) -> Optional[str]:
+    """Validate a direct-to-agent session token signed by the platform.
+
+    Used by the browser to open a WebSocket directly to the agent
+    (`agent-<prefix>.agents.toup.ai/api/ws/chat`) without going through
+    the Railway platform proxy. Why: platform redeploys would otherwise
+    drop the chat WS for ~30s; talking to the agent directly keeps the
+    chat alive across any platform deploy.
+
+    Token format: HS256 JWT, secret = `settings.agent_api_key` (the
+    same key the platform uses for X-Agent-Key proxy auth — already
+    shared between platform and this agent, so no new secret bootstrap
+    needed). Required claims:
+        sub: user_id (string)
+        exp: int unix-ts (must be in future)
+        iss: "toup-platform"
+        aud: "toup-agent-session"  (distinguishes from regular auth JWTs)
+
+    Returns the user_id on valid, None otherwise."""
+    if not token:
+        return None
+    secret = (settings.agent_api_key or "").strip()
+    if not secret:
+        return None
+    try:
+        from jose import jwt as _jose_jwt
+        payload = _jose_jwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+            audience="toup-agent-session",
+            issuer="toup-platform",
+        )
+    except Exception as e:
+        logger.info("[WS] session token rejected: %s", e)
+        return None
+    user_id = payload.get("sub")
+    if not user_id or not isinstance(user_id, str):
+        return None
+    # Cross-check against the agent's bound user. settings.user_id is
+    # set at bind-time; reject tokens for any other user even if the
+    # signature checks out (defense in depth — a token valid for some
+    # other agent must not authenticate against this one).
+    if settings.user_id and user_id != settings.user_id:
+        logger.warning(
+            "[WS] session token user mismatch: token=%s bound=%s",
+            user_id[:8], (settings.user_id or "?")[:8],
+        )
+        return None
+    # Lazy-create the user row (mirrors the X-Agent-Key path).
+    try:
+        from app.db.database import async_session_maker as _sm
+        from app.db.models import User
+        async with _sm() as _db:
+            from app.services.auth_service import get_user_by_id
+            u = await get_user_by_id(_db, user_id)
+            if not u:
+                u = User(
+                    id=user_id,
+                    email=f"{user_id[:8]}@agent.local",
+                    hashed_password="",
+                    name="Agent Owner",
+                )
+                _db.add(u)
+                await _db.commit()
+    except Exception as e:
+        logger.warning("[WS] session-token user-row create failed: %s", e)
+    return user_id
+
+
 @router.websocket("/ws/chat")
 async def ws_chat(
     websocket: WebSocket,
@@ -1037,6 +1107,14 @@ async def ws_chat(
                     u = User(id=user_id, email=f"{user_id[:8]}@agent.local", hashed_password="", name="Agent Owner")
                     _db.add(u)
                     await _db.commit()
+
+    # Try direct-to-agent session token (signed with this agent's
+    # X-Agent-Key, issued by platform's /api/auth/agent-session-token).
+    # Tried BEFORE the platform-JWT path because session tokens carry
+    # `aud=toup-agent-session` which the regular JWT path would reject —
+    # cheaper to try the right path first.
+    if not user_id and subprotocol_token:
+        user_id = await _authenticate_ws_session_token(subprotocol_token)
 
     # Try subprotocol JWT auth (ST-2 — header-based, no URL leak)
     if not user_id and subprotocol_token:

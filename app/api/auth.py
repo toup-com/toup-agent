@@ -521,3 +521,71 @@ async def demo_login(db: AsyncSession = Depends(get_db)):
         user = await create_user(db, email=demo_email, password=demo_password, name="Demo User")
     token = create_access_token(user.id)
     return Token(access_token=token)
+
+
+# ── Direct-to-agent session token ────────────────────────────────
+
+@router.post("/agent-session-token")
+async def agent_session_token(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Issue a short-lived (5min) token the browser uses to open a
+    WebSocket directly to the agent at `agent-<prefix>.agents.toup.ai`,
+    bypassing the Railway platform proxy entirely.
+
+    Why: a platform redeploy (Railway swap) would otherwise drop every
+    chat WebSocket for ~30s. Direct-to-agent connections live between
+    the browser and Contabo VPS, completely independent of Railway,
+    so chat keeps streaming through any number of platform deploys.
+
+    Token format: HS256 JWT, secret = the user's `agent_api_key`
+    (already known to both platform and agent — the same key the
+    platform uses for X-Agent-Key proxy auth, so no new bootstrap).
+    Claims:
+        sub: user_id
+        iss: "toup-platform"
+        aud: "toup-agent-session"
+        exp: now + 300s
+
+    Refresh: client calls again before expiry. The 5-min window keeps
+    the token short enough that leaks don't matter much, while long
+    enough that a refresh during a long deploy still succeeds.
+
+    Returns 200 with `{token, agent_url, expires_in}`. Returns 404 if
+    the user has no provisioned agent — caller falls back to the
+    legacy platform-proxy chat path."""
+    from sqlalchemy import select
+    from app.db.models import AgentConfig
+
+    result = await db.execute(
+        select(AgentConfig).where(AgentConfig.user_id == current_user.id)
+    )
+    cfg = result.scalar_one_or_none()
+    if not cfg or not cfg.agent_url or not cfg.agent_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No provisioned agent for this user",
+        )
+    if cfg.deploy_status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Agent is not active (status={cfg.deploy_status})",
+        )
+
+    expires_in = 300  # 5 min
+    now = int(datetime.utcnow().timestamp())
+    payload = {
+        "sub": str(current_user.id),
+        "iss": "toup-platform",
+        "aud": "toup-agent-session",
+        "iat": now,
+        "exp": now + expires_in,
+    }
+    # python-jose, already in requirements (`from jose import jwt` at top).
+    token = jwt.encode(payload, cfg.agent_api_key, algorithm="HS256")
+    return {
+        "token": token,
+        "agent_url": cfg.agent_url,
+        "expires_in": expires_in,
+    }
