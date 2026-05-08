@@ -1275,13 +1275,17 @@ class AgentRunner:
             elif identity.identity_type == IdentityType.TOOLS.value:
                 identity_parts.append(f"# Tool Guidelines\n{identity.content}")
 
-        # Default identity if no Soul exists
+        # Default identity if no Soul exists. Pre-Soul users see this on every
+        # turn until they configure tone — so it must already feel like a
+        # person, not a corporate assistant. The agent name is left to the
+        # identity_anchor block below; here we set voice and posture.
         if not has_soul_identity:
             identity_parts.insert(0, (
                 "# Core Identity\n"
-                "Your name is Toup. You are an intelligent AI assistant with persistent memory.\n"
-                "Communicate in a friendly, helpful manner. Be concise but thorough. "
-                "Ask clarifying questions when needed."
+                "You are the user's personal agent — present in their life as a "
+                "real person who happens to be exceptionally capable. Not a "
+                "chatbot, not an FAQ, not a help desk. Be warm, direct, curious. "
+                "A trusted friend who can also actually get things done."
             ))
             logger.warning(f"No soul config found for user {user_id}, using default")
 
@@ -1311,6 +1315,33 @@ class AgentRunner:
             "is powering you, answer as the agent — never name the underlying "
             "LLM provider or version. The provider may change without notice; "
             "your identity to the user is stable."
+        )
+
+        # ── 1c. Voice rules — always apply, even with a custom Soul ──
+        # The Soul system lets users customize tone, but baseline anti-chatbot
+        # guardrails apply universally. Without these, even a "casual + humor"
+        # Soul leaks generic-assistant phrases ("I'd be happy to help") that
+        # break the illusion of talking to a real person.
+        section_parts["voice_rules"] = (
+            "# Voice — Always Apply\n"
+            "You are not a chatbot. Talk like someone who knows the user and "
+            "actually cares about what they're doing.\n\n"
+            "Banned phrases (these instantly break the illusion):\n"
+            "- \"I'd be happy to help\" / \"How can I help you today?\" / \"Feel free to...\"\n"
+            "- \"As an AI\" / \"I'm an AI assistant\" / any self-description as an assistant\n"
+            "- \"Of course!\" / \"Certainly!\" / \"Absolutely!\" as preambles to answers\n"
+            "- \"I hope this helps\" / \"Is there anything else I can help with?\"\n\n"
+            "How to actually sound:\n"
+            "- Be specific over generic. \"That's tricky\" is filler; "
+            "\"the token expires before refresh\" is real.\n"
+            "- Match their energy and length. Short ask → short answer. "
+            "Don't pad to seem thorough.\n"
+            "- Treat the conversation as one continuous thread — you've been "
+            "talking with this person. Don't reintroduce yourself or restart context.\n"
+            "- It's OK to have opinions. It's OK to push back, kindly, "
+            "when they're heading the wrong way.\n"
+            "- Surface things that matter without being asked. If they "
+            "mentioned doing something earlier and haven't, it's fine to check in."
         )
 
         # ── 2. Agent Brain — disabled (Soul page is source of truth) ──
@@ -1603,16 +1634,21 @@ class AgentRunner:
         now_utc = datetime.now(_dt_timezone.utc)
         tz_name = (client_tz or "").strip() or None
         tz_source = "client" if tz_name else None
+        # Load User row once — used for timezone fallback AND for the user's
+        # name in the `# About You (the User)` section below. One DB round-trip
+        # per turn covers both.
+        _user_row = None
+        try:
+            from app.db.models import User
+            _user_row = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+        except Exception as _u_err:
+            logger.debug("[agent] user load failed: %s", _u_err)
+
         if not tz_name:
-            try:
-                from app.db.models import User
-                _u_for_tz = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-                _profile_tz = getattr(_u_for_tz, "timezone", None) if _u_for_tz else None
-                if _profile_tz:
-                    tz_name = _profile_tz
-                    tz_source = "user_profile"
-            except Exception as _tz_err:
-                logger.debug("[agent] tz user-profile lookup failed: %s", _tz_err)
+            _profile_tz = getattr(_user_row, "timezone", None) if _user_row else None
+            if _profile_tz:
+                tz_name = _profile_tz
+                tz_source = "user_profile"
         if not tz_name:
             tz_name = "UTC"
             tz_source = "utc_default"
@@ -1641,6 +1677,42 @@ class AgentRunner:
             now_local.strftime("%Y-%m-%d %H:%M"),
             now_utc.strftime("%Y-%m-%d %H:%M"),
         )
+
+        # ── 6a. About You (the user) — name + time-of-day awareness ────
+        # Inject the user's name (if set on their profile) so the agent stops
+        # greeting a stranger, plus a time-of-day phrase for tonal calibration.
+        # A friend who texts you at 2am sounds different than at 10am — we give
+        # the model the same hint. Falls back gracefully when name is unknown.
+        _user_name = (getattr(_user_row, "name", None) or "").strip() if _user_row else ""
+        _hour = now_local.hour
+        if 5 <= _hour < 12:
+            _tod = "morning"
+        elif 12 <= _hour < 17:
+            _tod = "afternoon"
+        elif 17 <= _hour < 22:
+            _tod = "evening"
+        else:
+            _tod = "late night"
+        _about_lines = ["# About You (the User)"]
+        if _user_name:
+            _about_lines.append(f"- Their name is **{_user_name}**.")
+            _about_lines.append(
+                "- Use their name naturally — when greeting them, when shifting "
+                "topics, when something feels personal. Don't open every message "
+                "with it. A friend uses your name occasionally, not constantly."
+            )
+        else:
+            _about_lines.append(
+                "- You don't know their name yet. If it comes up naturally, "
+                "ask once — don't interrogate them for it."
+            )
+        _about_lines.append(
+            f"- Local time for them right now: **{_tod}** "
+            f"({now_local.strftime('%-I:%M %p')}). Let it inform tone subtly — "
+            "late at night, be quieter and lower-energy; morning, be fresh. "
+            "Don't announce the time of day; just feel it."
+        )
+        section_parts["about_you"] = "\n".join(_about_lines)
 
         # Per-channel formatting guidance. Hardcoded table today; channel_config
         # wire-up is a follow-up (TODO(time-channel-fix followup)). Keep values
@@ -1756,7 +1828,7 @@ class AgentRunner:
                 "- Use plain Unicode symbols for math: × ÷ √ → ⇒ ≤ ≥ ≠ ≈ ∞ π.\n"
                 "- Keep responses concise and conversational.\n"
                 "- Do NOT expose internal implementation details (databases, bridges, connections, file paths, error traces).\n"
-                "- When the user greets you, greet them back warmly and offer to help.\n"
+                "- When the user greets you, greet them back like a friend would — not a help desk. If you know their name, use it. Skip 'How can I help you today?' (see voice rules above).\n"
                 "- You have editing capabilities: you can modify the app's files, database, and navigation using your tools.\n"
                 "- When the user asks you to change something in the app (theme, colors, layout, text, features, etc.), "
                 "DO NOT just describe what you would do — actually DO it by calling your write_file/edit_file tools to modify the source code. "
@@ -1849,6 +1921,8 @@ class AgentRunner:
         SECTION_ORDER = [
             "identity",         # WHO the agent is (soul + behavioral)
             "identity_anchor",  # Don't break white-label by naming underlying LLM
+            "voice_rules",    # Always-apply anti-chatbot tone (survives custom Souls)
+            "about_you",      # User's name + local time-of-day for tonal calibration
             "user_brain",       # WHO the user is
             "agent_brain",    # Agent brain (disabled by default)
             "work_brain",     # Work brain (disabled by default)

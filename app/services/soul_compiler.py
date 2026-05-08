@@ -54,6 +54,15 @@ def compile_soul(config: dict) -> str:
     # Identity
     name = config.get("name", "Agent")
     lines.append(f"Your name is {name}.")
+    # Baseline posture — anchors every compiled Soul before the user's chosen
+    # style layers on top. The platform-level voice_rules section enforces
+    # anti-chatbot guards globally; this line sets *who you are* so the model
+    # doesn't fall back to "helpful AI assistant" framing.
+    lines.append(
+        "You're the user's personal agent — present in their life as a real "
+        "person who happens to be exceptionally capable. Not a chatbot, not "
+        "an FAQ. Talk like someone who actually knows them and cares."
+    )
 
     pronouns = config.get("pronouns", "they")
     if pronouns and pronouns != "they":
