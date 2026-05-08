@@ -510,6 +510,49 @@ async def update_container_env(
     container = result.scalar_one_or_none()
     if not container:
         return None
+
+    # Phase A (never-sleep): if this user is on a pool container, route
+    # the env update through the bridge's /v1/pool/refresh-config which
+    # calls /admin/bind on the running agent — preserves the warm
+    # state. Recreate would force-destroy the pool container and the
+    # next chat would hit a cold-booting fresh tenant ("waking..."
+    # indicator), exactly the regression Phase A was built to prevent.
+    if container.container_name and container.container_name.startswith("toup-agent-pool-"):
+        prefix = user_id[:8]
+        # Build the same bind payload the platform pool_service builds
+        # at signup, then forward to the bridge.
+        from app.services.pool_service import _build_bind_payload
+        payload = await _build_bind_payload(db, user_id, agent_config)
+        try:
+            async with _bridge_client() as client:
+                resp = await client.post("/v1/pool/refresh-config", json=payload)
+                if resp.status_code == 404:
+                    # Bridge no longer tracks this prefix as pool-bound
+                    # (pool registry drift). Fall through to recreate
+                    # path — the user will eat a cold boot once, then
+                    # be on a regular tenant container.
+                    logger.warning(
+                        "[update_container_env] pool drift for %s: bridge says no pool member. Falling through.",
+                        user_id[:8],
+                    )
+                    return await provision_container(
+                        db, user_id, agent_config=agent_config, recreate=True,
+                    )
+                resp.raise_for_status()
+                logger.info(
+                    "[update_container_env] pool refresh OK for %s (no recreate)",
+                    user_id[:8],
+                )
+                return container
+        except httpx.HTTPError as e:
+            logger.warning(
+                "[update_container_env] pool refresh failed for %s: %s. Falling through to recreate.",
+                user_id[:8], e,
+            )
+            return await provision_container(
+                db, user_id, agent_config=agent_config, recreate=True,
+            )
+
     return await provision_container(
         db, user_id, agent_config=agent_config, recreate=True,
     )
