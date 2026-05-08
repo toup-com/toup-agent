@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from sqlalchemy import select
@@ -55,6 +55,22 @@ logger = logging.getLogger(__name__)
 # (typically <2 min) without piling reprovision attempts on a tenant
 # whose bridge call is still legitimately in-flight (~25-40s).
 _STUCK_PROVISIONING_MIN = 5
+
+
+# How long to poll the agent's /agent/health for boot_ready=true after
+# provision_container returns. Container start typically takes 13-20s;
+# we cap at 60s so a stuck boot still emits a "[BOOT-READY-TIMEOUT]"
+# marker the aggregator can flag rather than silently leaving prewarm
+# without a paired BOOT-READY line.
+_BOOT_READY_POLL_TIMEOUT_S = 60
+_BOOT_READY_POLL_INTERVAL_S = 1.5
+
+
+def _iso_now() -> str:
+    """ISO-8601 UTC timestamp suitable for log-line aggregation. The
+    aggregator parses ts=<...> tokens; using a single helper keeps the
+    format identical across PREWARM-START / BOOT-READY / WAKE-CLICK."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 PrewarmStatus = Literal["queued", "already_running", "skipped"]
@@ -132,7 +148,14 @@ async def schedule_prewarm(user_id: str) -> PrewarmStatus:
     # asyncio.create_task fires AFTER the session is closed and the
     # commit is durable. The task opens its own session.
     asyncio.create_task(_run_prewarm(user_id))
-    logger.info("[PREWARM] user=%s queued", str(user_id)[:8])
+    # Telemetry marker: prewarm trigger time. Pair with the matching
+    # [BOOT-READY] line (same user prefix) to compute boot duration,
+    # and with [WAKE-CLICK] to compute the user-facing gap. Format
+    # parsed by scripts/prewarm_aggregator.py — keep stable.
+    logger.info(
+        "[PREWARM-START] user=%s ts=%s",
+        str(user_id)[:8], _iso_now(),
+    )
     return "queued"
 
 
@@ -141,7 +164,12 @@ async def _run_prewarm(user_id: str) -> None:
     session and swallows errors — prewarm is a perf optimisation, not a
     contract-bearing path. The Install-step handler still calls
     provision_container synchronously and is the source of truth for any
-    user-visible failure."""
+    user-visible failure.
+
+    After provision_container returns, polls the agent's `/agent/health`
+    until `boot_progress.ready=true`, then emits `[BOOT-READY]`. The
+    aggregator pairs this with the prior `[PREWARM-START]` (boot
+    duration) and the later `[WAKE-CLICK]` (user-visible gap)."""
     try:
         async with async_session_maker() as db:
             agent_config = (
@@ -156,12 +184,67 @@ async def _run_prewarm(user_id: str) -> None:
             # import cycle that otherwise surfaces at platform-api boot.
             from app.services import docker_host_service
             await docker_host_service.provision_container(db, user_id, agent_config)
-            logger.info("[PREWARM] user=%s container provisioned", str(user_id)[:8])
+            # Refresh to pick up the agent_url the bridge wrote.
+            await db.refresh(agent_config)
+            agent_url = agent_config.agent_url
+            agent_api_key = agent_config.agent_api_key
+        # Poll /agent/health for boot_ready outside the session — keeps
+        # the DB connection idle while we wait on network I/O.
+        await _await_boot_ready(user_id, agent_url, agent_api_key)
     except Exception as e:
         logger.error(
             "[PREWARM] user=%s task failed: %s",
             str(user_id)[:8], e, exc_info=True,
         )
+
+
+async def _await_boot_ready(
+    user_id: str, agent_url: str | None, agent_api_key: str | None,
+) -> None:
+    """Poll the agent's /agent/health until boot_progress.ready=true,
+    then emit the [BOOT-READY] telemetry marker. Bounded by
+    _BOOT_READY_POLL_TIMEOUT_S; emits [BOOT-READY-TIMEOUT] on miss so
+    the aggregator can distinguish "boot took too long" from "prewarm
+    crashed before reaching boot."""
+    if not agent_url:
+        logger.warning(
+            "[BOOT-READY-SKIPPED] user=%s reason=no_agent_url",
+            str(user_id)[:8],
+        )
+        return
+    import httpx as _httpx
+    headers = {}
+    if agent_api_key:
+        headers["X-Agent-Key"] = agent_api_key
+    deadline = asyncio.get_event_loop().time() + _BOOT_READY_POLL_TIMEOUT_S
+    last_phase: str | None = None
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            async with _httpx.AsyncClient(timeout=4) as client:
+                resp = await client.get(
+                    f"{agent_url}/agent/health", headers=headers,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    boot = data.get("boot_progress", {}) or {}
+                    last_phase = boot.get("phase") or last_phase
+                    if boot.get("ready", False):
+                        logger.info(
+                            "[BOOT-READY] user=%s ts=%s phase=%s",
+                            str(user_id)[:8], _iso_now(),
+                            boot.get("phase", "ready"),
+                        )
+                        return
+        except Exception:
+            # Container still starting / Caddy route still propagating.
+            # Loop until the deadline; don't spam the log on transient
+            # connection errors.
+            pass
+        await asyncio.sleep(_BOOT_READY_POLL_INTERVAL_S)
+    logger.warning(
+        "[BOOT-READY-TIMEOUT] user=%s ts=%s last_phase=%s timeout_s=%d",
+        str(user_id)[:8], _iso_now(), last_phase, _BOOT_READY_POLL_TIMEOUT_S,
+    )
 
 
 async def reconcile_stuck_provisioning() -> int:
