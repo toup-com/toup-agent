@@ -247,6 +247,41 @@ async def _await_boot_ready(
     )
 
 
+async def _is_agent_actually_healthy(user_id: str) -> bool:
+    """Return True iff the agent's `/agent/health` reports
+    `boot_progress.ready=true`. Fail-soft on any error — caller should
+    treat False as "couldn't verify, fall through to bridge re-fire."
+    Uses the agent_url + agent_api_key already written by an earlier
+    successful provision (we only get here after status was once set
+    to 'provisioning', meaning provision_container at least started)."""
+    try:
+        async with async_session_maker() as db:
+            agent_config = (
+                await db.execute(
+                    select(AgentConfig).where(AgentConfig.user_id == user_id)
+                )
+            ).scalar_one_or_none()
+            if not agent_config or not agent_config.agent_url:
+                return False
+            agent_url = agent_config.agent_url
+            agent_api_key = agent_config.agent_api_key
+        import httpx as _httpx
+        headers = {"X-Agent-Key": agent_api_key} if agent_api_key else {}
+        async with _httpx.AsyncClient(timeout=4) as client:
+            resp = await client.get(f"{agent_url}/agent/health", headers=headers)
+            if resp.status_code != 200:
+                return False
+            data = resp.json()
+            boot = data.get("boot_progress", {}) or {}
+            return bool(boot.get("ready", False))
+    except Exception as e:
+        logger.info(
+            "[PREWARM-RECONCILER] user=%s health-check failed (will re-fire): %s",
+            str(user_id)[:8], e,
+        )
+        return False
+
+
 async def reconcile_stuck_provisioning() -> int:
     """Find managed_containers in status='provisioning' for longer than
     `_STUCK_PROVISIONING_MIN` and re-fire the bridge call. Returns the
@@ -260,6 +295,18 @@ async def reconcile_stuck_provisioning() -> int:
     finished provisioning since the query is harmless — provision_container
     short-circuits on `status in ('running', 'provisioning')` without
     `recreate=True`.
+
+    Health-check shortcut (added 2026-05-08): if the agent is reachable
+    and reports `boot_progress.ready=true`, we don't re-fire the bridge
+    at all — we just patch the DB row to status='running'. The
+    realistic-pace test uncovered a path where update_container_env's
+    recreate set status='provisioning' before the bridge call but the
+    post-call status='running' write either failed silently or didn't
+    persist (likely pgbouncer transaction-mode reassignment, similar
+    to the 2026-05-02 soul-save bug). Without the shortcut, we'd
+    needlessly destroy + recreate a healthy container 5min after every
+    legitimate env-flip recreate. The check is fail-soft: any error
+    falls through to the existing bridge re-fire path.
     """
     cutoff = datetime.utcnow() - timedelta(minutes=_STUCK_PROVISIONING_MIN)
     requeued = 0
@@ -277,6 +324,28 @@ async def reconcile_stuck_provisioning() -> int:
         return 0
 
     for user_id in stuck_user_ids:
+        # Health-check first — if the agent is actually healthy, the
+        # status='provisioning' is a stale DB write, not a real
+        # in-flight provision. Patch the row, skip the recreate.
+        healthy = await _is_agent_actually_healthy(user_id)
+        if healthy:
+            logger.info(
+                "[PREWARM-RECONCILER] user=%s stuck provisioning >%dmin BUT "
+                "/agent/health reports ready — patching status='running' "
+                "instead of re-firing bridge",
+                str(user_id)[:8], _STUCK_PROVISIONING_MIN,
+            )
+            async with async_session_maker() as db:
+                mc = (await db.execute(
+                    select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+                )).scalar_one_or_none()
+                if mc:
+                    mc.status = "running"
+                    mc.error_message = None
+                    if mc.started_at is None:
+                        mc.started_at = datetime.utcnow()
+                    await db.commit()
+            continue
         logger.warning(
             "[PREWARM-RECONCILER] user=%s stuck provisioning > %dmin, re-firing",
             str(user_id)[:8], _STUCK_PROVISIONING_MIN,
