@@ -66,6 +66,36 @@ async def debug_bridge(_=Depends(require_admin)):
     return info
 
 
+@router.get("/bridge-status")
+async def bridge_status(_=Depends(require_admin)):
+    """Live state of the platform-side bridge supervisor + the bridge's
+    own tenant healthchecker. One stop for "is the never-sleep stack
+    working right now?"
+    """
+    from app.services.bridge_supervisor import last_status as supervisor_status
+
+    info = {
+        "supervisor": supervisor_status(),
+        "tenant_healthcheck": None,
+    }
+
+    # Pull the bridge's tenant_health/state too. If the supervisor says
+    # the bridge is unreachable we skip this — saves a 5s timeout per
+    # admin pageload during an outage.
+    if info["supervisor"].get("last_status") == "healthy":
+        try:
+            from app.services.docker_host_service import _bridge_client
+            async with _bridge_client(timeout_s=5) as client:
+                r = await client.get("/v1/tenants/health/state")
+                if r.status_code == 200:
+                    info["tenant_healthcheck"] = r.json()
+                else:
+                    info["tenant_healthcheck"] = {"error": f"HTTP {r.status_code}"}
+        except Exception as e:
+            info["tenant_healthcheck"] = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+    return info
+
+
 @router.get("/overview")
 async def overview(
     _=Depends(require_admin),
