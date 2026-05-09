@@ -58,6 +58,16 @@ class DayChat(Base):
     # Summary lifecycle: up_to_date | pending | failed | stale
     summary_status: Mapped[str] = mapped_column(String(20), default="up_to_date")
 
+    # Failure bookkeeping for the bounded-retry policy. Replaces the
+    # previous fail-once-fail-forever behaviour. See FF-B.2 in
+    # docs/memory/changelog.md and the retry logic in day_summarizer.py.
+    summary_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary_last_failure_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Classified failure mode: auth_error | rate_limit | timeout | server_error
+    # | parse_error | no_keys | other. Surfaced via Day Recall and metrics so
+    # operators can tell credential issues from genuine LLM failures.
+    summary_last_failure_reason: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
     # Archival summary — permanent, fact-dense index entry produced by the
     # end-of-day job. Distinct from rolling_summary (which compresses active
     # context). Returned by recall_day in summary-only mode.

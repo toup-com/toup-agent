@@ -396,6 +396,17 @@ async def init_db():
         "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS archival_summary TEXT",
         "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS archival_summary_generated_at TIMESTAMP",
         "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS archival_summary_status VARCHAR(20) NOT NULL DEFAULT 'not_needed'",
+        # FF-B.2 — bounded-retry policy for the rolling summarizer. Replaces
+        # the previous fail-once-fail-forever behaviour. summary_failure_count
+        # starts at 0 (default for existing rows). summary_last_failure_at is
+        # nullable so retry-eligibility logic can identify never-failed days.
+        # See docs/memory/changelog.md FF-B.2.
+        "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS summary_failure_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS summary_last_failure_at TIMESTAMP",
+        "ALTER TABLE day_chats ADD COLUMN IF NOT EXISTS summary_last_failure_reason VARCHAR(50)",
+        # Partial index supports the retry-eligibility scan: tiny because most
+        # day_chats are 'up_to_date', not 'failed'.
+        "CREATE INDEX IF NOT EXISTS ix_day_chats_failed_retry_eligible ON day_chats (summary_status, summary_last_failure_at) WHERE summary_status = 'failed'",
         # Doc-delivery feature (generated-file attachments on assistant messages).
         # JSONB on Postgres, TEXT on SQLite — ORM uses Text for portability, ALTER promotes to JSONB on PG.
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachments JSONB",
