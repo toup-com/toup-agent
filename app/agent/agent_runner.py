@@ -136,10 +136,32 @@ class AgentRunner:
 
     @property
     def tool_defs(self) -> list:
-        """Dynamically combine core tools + skill tools (picks up new app skills)."""
+        """Dynamically combine core tools + skill tools (picks up new app skills).
+
+        T1g: when `use_connector_dispatch=True`, append connector tool
+        definitions stored on the executor at boot
+        (`tool_executor.mcp_tool_defs`, populated by agent_main.py from
+        the platform's per-user filtered `tools/list`). Each connector
+        tool is already user-scoped — the platform's T1f filter
+        middleware only returns tools for connectors the user has
+        actively connected. Skills win over connector tools by ordering
+        (skills first → MCP tools won't shadow them in the LLM's view
+        if a name happens to collide; the dispatcher's tool-name
+        registry lints this at platform boot).
+        """
         defs = list(self._core_tool_defs)
         if self.skill_loader:
             defs = defs + self.skill_loader.get_all_tool_definitions()
+        if settings.use_connector_dispatch:
+            mcp_tool_defs = getattr(self.tools, "mcp_tool_defs", None) or []
+            if mcp_tool_defs:
+                # Tools come from the platform as {name, description,
+                # input_schema} — already in Anthropic shape (the OpenAI
+                # adapter elsewhere normalises if needed). Skill+connector
+                # collisions: registry lints at platform boot, but if
+                # one slips through, the executor's dispatch order
+                # (skills first) means the skill wins on call.
+                defs = defs + list(mcp_tool_defs)
         # Apply per-session disabled filter (tools can be Anthropic or OpenAI format)
         if self._disabled_tool_names:
             defs = [
@@ -1501,6 +1523,42 @@ class AgentRunner:
             "The whole point of you is: the user says what they want, you make it happen."
         )
 
+        # ── 1d. Self-knowledge — how YOUR memory actually works ──────
+        # F7 (2026-05-08): pre-F7 the agent had no integrated picture of
+        # its memory system in the prompt. When a user asked "how does
+        # your memory work?", the model improvised. This block gives an
+        # accurate, in-voice description that distinguishes the layers:
+        # working memory (rolling summary), long-term (Memory + decay),
+        # day continuity (Day-as-Chat across channels), open threads
+        # (active_tasks), entity graph, Soul/Brain split.
+        #
+        # Posture rules per the founder's spec:
+        # - In voice — no docs prose. The agent talks like itself.
+        # - Lead with the confabulation guard so users can trust the answer.
+        # - No implementation leaks ("7-day TTL", model names, RRF, etc.).
+        #   Describe the BEHAVIOUR, not the wiring.
+        section_parts["self_knowledge"] = (
+            "# Your Memory (when the user asks how you remember)\n"
+            "Answer straight — including when the answer is \"I don't.\" "
+            "Never invent recall you can't actually do.\n\n"
+            "What you have:\n"
+            "- **Working memory** of this conversation. Long days get a "
+            "rolling summary so context doesn't drift; recent turns stay raw.\n"
+            "- **Long-term facts** they've shared — goals, projects, "
+            "preferences, people in their life. Things that keep coming up "
+            "stay strong; things that don't quietly fade. Visible on /brain.\n"
+            "- **Day-to-day continuity** across every channel — web, mobile, "
+            "voice, WhatsApp, Telegram all share one thread per day. Past "
+            "days are recoverable by date.\n"
+            "- **Open threads** — what they're in the middle of stays nearby "
+            "until it stops coming up. That's how you can ask \"did the X "
+            "thing sort itself out?\" days later.\n"
+            "- **Connected people and projects** — asking about one surfaces "
+            "what's tied to it.\n\n"
+            "If memory's genuinely not working (credentials, network, "
+            "hiccup), say so. \"Something's off, give me a sec\" beats faking it."
+        )
+
         # ── 1c. Voice rules — always apply, even with a custom Soul ──
         # The Soul system lets users customize tone, but baseline anti-chatbot
         # guardrails apply universally. Without these, even a "casual + humor"
@@ -1695,6 +1753,32 @@ class AgentRunner:
             skill_parts = self.skill_loader.get_all_system_prompt_sections()
             if skill_parts:
                 section_parts["skills"] = "\n\n".join(skill_parts)
+
+        # ── 4b. Connected services (T1g) ────────────────────────
+        # When connector dispatch is on AND the agent has any connector
+        # tools registered, surface a one-line block to the LLM so it
+        # knows what's available without scanning every tool def.
+        # Cheap (already on the executor); high signal (the LLM is
+        # otherwise unaware of what the user has connected vs not).
+        if settings.use_connector_dispatch:
+            mcp_tool_defs = getattr(self.tools, "mcp_tool_defs", None) or []
+            if mcp_tool_defs:
+                # Connector tool names are `<connector_id>__<tool>` —
+                # the prefix IS the connector id (T1c manifest contract).
+                connectors = sorted({
+                    (t.get("name") or "").split("__", 1)[0]
+                    for t in mcp_tool_defs
+                    if "__" in (t.get("name") or "")
+                })
+                if connectors:
+                    section_parts["skills"] = (
+                        section_parts.get("skills", "")
+                        + ("\n\n" if section_parts.get("skills") else "")
+                        + "# Connected services\n"
+                        + "User has connected: "
+                        + ", ".join(connectors)
+                        + ". Use the matching `<service>__*` tools to interact."
+                    )
         elif self.skill_loader and not intent.include_skill_prompts:
             logger.info(f"[PERF] skill_prompts: SKIPPED (intent={intent.category})")
 
@@ -2131,6 +2215,7 @@ class AgentRunner:
             "identity",         # WHO the agent is (soul + behavioral)
             "identity_anchor",  # Don't break white-label by naming underlying LLM
             "voice_rules",    # Always-apply anti-chatbot tone (survives custom Souls)
+            "self_knowledge", # HOW your memory actually works (F7) — agent can explain itself when asked
             "platform_knowledge",  # WHAT Toup is — pages, capabilities, decision rules
             "about_you",      # User's name + local time-of-day for tonal calibration
             "user_brain",       # WHO the user is
