@@ -1758,6 +1758,7 @@ class MemoryService:
         query: str,
         limit: int = 15,
         min_similarity: float = 0.3,
+        min_strength: float = 0.1,
         brain_types: Optional[List[str]] = None,
         categories: Optional[List[str]] = None,
         created_after: Optional[datetime] = None,
@@ -1766,32 +1767,58 @@ class MemoryService:
     ) -> List[dict]:
         """
         Multi-strategy memory retrieval with Reciprocal Rank Fusion.
-        
+
         Strategies:
           - "vector": pgvector cosine similarity (semantic search)
           - "keyword": tsvector full-text search (BM25-style keyword matching)
           - "graph": entity graph traversal (knowledge graph walk)
           - "temporal": recency-weighted search (auto-activated on time queries)
-        
+
         Temporal reasoning: Automatically detects time references in queries
         (e.g., "last week", "yesterday", "in January") and applies date filters
         to all strategies + adds a temporal strategy for recency-weighted results.
-        
+
         Results from all strategies are fused with RRF, then weighted
         by Brain's proprietary scoring (strength, importance, emotion, recency).
+
+        F5 (2026-05-08): adds a real min_strength floor (NEW, default 0.1).
+        Pre-F5 there was no strength filter at all — strength only weighted
+        final scoring at 20%, so faded memories could still surface if RRF
+        ranked them via keyword/graph match. With this floor, decay actually
+        means "fades out of recall."
+          - Active_task memories are unaffected: their reinforcement path
+            (active_task_service.py) resets strength to 1.0 on every match,
+            so they never approach the floor while live.
+          - High-importance memories that DO fade below the floor were
+            either created with strength=1.0 and never revisited (genuine
+            forgetting) or seeded as low-strength on purpose.
+          - Pass min_strength=0.0 to opt out (keep old behaviour for
+            specific call sites that want everything).
+
+        min_similarity is still a no-op (dead parameter from pre-F5).
+        Activating it correctly requires deciding whether the floor should
+        apply only to vector-only matches or to the merged set — that's a
+        product call pending the staging eval in
+        docs/memory/continuity-audit.md §5.
         """
         import logging
         logger = logging.getLogger(__name__)
-        
+
         if strategies is None:
             strategies = ["vector", "keyword", "graph"]
-        
+
         # Build common filter conditions
         conditions = [
             Memory.user_id == user_id,
             Memory.is_deleted == False,
             Memory.is_active == True,
         ]
+        # F5: real min_strength floor. The decay model is meaningless if
+        # forgotten memories can still be retrieved. Active_task memories
+        # with importance=0.9 are unaffected — strength resets to 1.0 on
+        # every reinforcement. Long-faded memories (strength < 0.1) drop.
+        if min_strength is not None and min_strength > 0:
+            conditions.append(Memory.strength >= min_strength)
         if brain_types:
             conditions.append(Memory.brain_type.in_(brain_types))
         if categories:
