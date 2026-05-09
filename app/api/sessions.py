@@ -15,7 +15,15 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
+from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.orm import selectinload
+
+# Mirrors day_chats.py — `conversations`/`messages` are AGENT_ONLY_TABLES,
+# so any local fall-back query on the platform DB raises UndefinedTable.
+# Without this guard, a failed agent proxy (401, timeout, agent down) cascades
+# into a 500 instead of an empty-but-valid response, breaking the chat shell's
+# multi-day load.
+_MISSING_TABLE_ERRORS: tuple = (ProgrammingError, OperationalError)
 from typing import Optional, Tuple
 import json
 import httpx
@@ -693,30 +701,40 @@ async def get_messages_by_date(
     day_start = datetime(target_date.year, target_date.month, target_date.day) + tz_delta
     day_end = day_start + timedelta(days=1)
 
-    sessions_result = await db.execute(
-        select(Conversation.id)
-        .where(
-            and_(
-                Conversation.user_id == current_user.id,
-                Conversation.started_at >= day_start,
-                Conversation.started_at < day_end,
+    try:
+        sessions_result = await db.execute(
+            select(Conversation.id)
+            .where(
+                and_(
+                    Conversation.user_id == current_user.id,
+                    Conversation.started_at >= day_start,
+                    Conversation.started_at < day_end,
+                )
             )
+            .order_by(Conversation.updated_at.desc())
+            .limit(10)
         )
-        .order_by(Conversation.updated_at.desc())
-        .limit(10)
-    )
+    except _MISSING_TABLE_ERRORS:
+        # Platform DB doesn't carry conversations/messages (AGENT_ONLY_TABLES).
+        # Roll back and return empty so the chat shell renders normally.
+        await db.rollback()
+        return JSONResponse(content=[])
     session_ids = [r[0] for r in sessions_result.fetchall()]
 
     if not session_ids:
         return JSONResponse(content=[])
 
     # Get all messages for these sessions in one query
-    messages_result = await db.execute(
-        select(Message)
-        .where(Message.conversation_id.in_(session_ids))
-        .order_by(Message.created_at.asc())
-        .limit(limit)
-    )
+    try:
+        messages_result = await db.execute(
+            select(Message)
+            .where(Message.conversation_id.in_(session_ids))
+            .order_by(Message.created_at.asc())
+            .limit(limit)
+        )
+    except _MISSING_TABLE_ERRORS:
+        await db.rollback()
+        return JSONResponse(content=[])
     messages = messages_result.scalars().all()
 
     # Enrich with build job data

@@ -402,15 +402,22 @@ async def get_day_chat_messages(
             for m in messages
         ])
 
-    # Day chat exists — load messages via day_chat_id (fast path)
-    msgs_result = await db.execute(
-        select(Message, Conversation.channel)
-        .join(Conversation, Message.conversation_id == Conversation.id)
-        .where(Message.day_chat_id == dc.id)
-        .order_by(Message.created_at.asc())
-        .limit(limit)
-    )
-    rows = msgs_result.all()
+    # Day chat exists — load messages via day_chat_id (fast path).
+    # Wrapped: if `day_chats` lives on platform DB (legacy artifact) but
+    # `messages`/`conversations` don't, this query would 500. Guard
+    # mirrors the missing-table handling above.
+    try:
+        msgs_result = await db.execute(
+            select(Message, Conversation.channel)
+            .join(Conversation, Message.conversation_id == Conversation.id)
+            .where(Message.day_chat_id == dc.id)
+            .order_by(Message.created_at.asc())
+            .limit(limit)
+        )
+        rows = msgs_result.all()
+    except _MISSING_TABLE_ERRORS:
+        await db.rollback()
+        return JSONResponse(content=[])
 
     return JSONResponse(content=[
         {
