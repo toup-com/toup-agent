@@ -1046,6 +1046,56 @@ class ToolExecutor:
         return await self._register_attachment(att)
 
     # ------------------------------------------------------------------
+    # navigate_to — transfer the user to a different platform page
+    # ------------------------------------------------------------------
+    # Mirrors the voice-mode tool in ws_realtime.py:1422–1434. Broadcasts a
+    # {"type":"navigate", "path":...} frame on the user's chat WS. The
+    # frontend (ChatPage) listens for this frame and calls React Router's
+    # navigate(path), keeping the chat session alive across the route change.
+    # For passive suggestions (where the user should choose), the agent
+    # should emit a [[navigate:/path]] chip in its message text instead —
+    # see the chip path in the system prompt and parseMessageBlocks.ts.
+    _NAV_ALLOWED_PATHS = {
+        "/", "/chat", "/brain/user", "/brain/agent",
+        "/workspace", "/dashboard", "/agent",
+        "/agent/soul", "/agent/integrations",
+        "/agent/tools", "/agent/skills",
+    }
+    _NAV_PATH_LABELS = {
+        "/": "Hub",
+        "/chat": "Chat",
+        "/brain/user": "User Brain",
+        "/brain/agent": "Agent Brain",
+        "/workspace": "Workspace",
+        "/dashboard": "Dashboard",
+        "/agent": "Agent Setup",
+        "/agent/soul": "Soul",
+        "/agent/integrations": "Integrations",
+        "/agent/tools": "Tools",
+        "/agent/skills": "Skills",
+    }
+
+    async def _tool_navigate_to(self, inp: Dict[str, Any]) -> str:
+        path = (inp.get("path") or "").strip()
+        if path not in self._NAV_ALLOWED_PATHS:
+            return (
+                f"ERROR: invalid path '{path}'. "
+                f"Allowed: {sorted(self._NAV_ALLOWED_PATHS)}"
+            )
+        user_id = self._current_user_id
+        if not user_id:
+            return "ERROR: no user context — cannot navigate."
+        from app.api.ws_chat import broadcast_to_user
+        sent = await broadcast_to_user(user_id, {"type": "navigate", "path": path})
+        if sent == 0:
+            return (
+                f"Could not navigate — no active chat session for the user. "
+                f"Tell them to open {path} themselves."
+            )
+        label = self._NAV_PATH_LABELS.get(path, path)
+        return f"Navigated to {label} ({path})."
+
+    # ------------------------------------------------------------------
     # 11. analyze_image — GPT vision on URL or workspace file
     # ------------------------------------------------------------------
     async def _tool_analyze_image(self, inp: Dict[str, Any]) -> str:

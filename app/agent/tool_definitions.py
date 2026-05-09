@@ -1505,4 +1505,49 @@ def get_doc_generation_tools() -> List[Dict[str, Any]]:
                 "required": ["html", "filename"],
             },
         },
+        # Navigate the user's browser to a different platform page. The handler
+        # broadcasts a {"type":"navigate", "path":...} frame to the user's chat
+        # WebSocket; the frontend listens for it and routes via React Router
+        # without losing chat session continuity. Use ONLY when the user
+        # explicitly asks to be taken somewhere ("take me to settings", "open
+        # my brain"). For passive suggestions (e.g. "your portrait is on the
+        # brain page — want to see?"), emit a [[navigate:/path]] chip in the
+        # message text instead — the user clicks if interested.
+        {
+            "name": "navigate_to",
+            "description": (
+                "Transfer the user to a different page in the Toup platform. "
+                "Use when the user EXPLICITLY asks to go somewhere ('take me to "
+                "X', 'open Y', 'go to Z'). For passive suggestions, prefer a "
+                "[[navigate:/path]] chip in your message instead so the user "
+                "can choose. Available paths:\n"
+                "- / — Hub (main landing)\n"
+                "- /chat — Chat (this page)\n"
+                "- /brain/user — User Brain (their stored memories)\n"
+                "- /brain/agent — Agent Brain (your stored knowledge)\n"
+                "- /workspace — Workspace (workflows and apps)\n"
+                "- /dashboard — Dashboard (metrics, tasks, inbox, logs)\n"
+                "- /agent — Agent Setup (configure agent settings)\n"
+                "- /agent/soul — Soul (configure your personality)\n"
+                "- /agent/integrations — Integrations\n"
+                "- /agent/tools — Tools catalog\n"
+                "- /agent/skills — Skills catalog"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The URL path to navigate to.",
+                        "enum": [
+                            "/", "/chat", "/brain/user", "/brain/agent",
+                            "/workspace", "/dashboard", "/agent",
+                            "/agent/soul", "/agent/integrations",
+                            "/agent/tools", "/agent/skills",
+                        ],
+                    },
+                },
+                "required": ["path"],
+            },
+        },
     ]
