@@ -44,7 +44,8 @@ async def _make_engine():
                 name VARCHAR(255), password_changed_at TIMESTAMP,
                 role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
                 updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50)
+                stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
+                is_canary BOOLEAN DEFAULT 0
             )""",
             """CREATE TABLE IF NOT EXISTS messages (
                 id VARCHAR(50) PRIMARY KEY, conversation_id VARCHAR(36),

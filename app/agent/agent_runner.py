@@ -486,6 +486,46 @@ class AgentRunner:
                 from app.agent.day_context_loader import build_today_so_far_block
                 system_prompt += build_today_so_far_block(_day_context["summary"])
 
+            # F8: Inject <recent_days> recap on day-boundary warm starts.
+            # Only fires when today's day-chat is fresh (no rolling summary
+            # yet, low message count). Once the day grows its own context,
+            # the active conversation IS the continuity — don't double up.
+            if _use_day_ctx and _day_context and _day_chat_id:
+                try:
+                    from app.services.recent_days_service import (
+                        should_inject_recent_days,
+                        get_recent_day_summaries,
+                        build_recent_days_block,
+                    )
+                    if should_inject_recent_days(_day_context):
+                        from sqlalchemy import select as _sel_dc
+                        from app.db.models.day_chat import DayChat
+                        _today_dc = (await db.execute(
+                            _sel_dc(DayChat).where(DayChat.id == _day_chat_id)
+                        )).scalar_one_or_none()
+                        if _today_dc:
+                            _recent = await get_recent_day_summaries(
+                                db, user_id, _today_dc.local_date,
+                            )
+                            if _recent:
+                                system_prompt += build_recent_days_block(
+                                    _recent, today_local_date=_today_dc.local_date,
+                                )
+                                logger.info(
+                                    "[AGENT] recent_days injected: %d day(s) "
+                                    "(fresh day-chat msg_count=%d)",
+                                    len(_recent),
+                                    _day_context.get("message_count", 0),
+                                )
+                except Exception as _rd_err:
+                    # Non-fatal: continuity recap is a quality-of-life
+                    # surface, not a correctness gate. Log loudly so a
+                    # silent regression is visible.
+                    logger.warning(
+                        "[AGENT] recent_days_block_failed user=%s err=%s: %s",
+                        user_id[:8], type(_rd_err).__name__, _rd_err,
+                    )
+
             logger.info(f"[PERF] build_system_prompt: {(time.perf_counter() - t_prompt) * 1000:.0f}ms — {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
             await db.commit()
         logger.info(f"[PERF] phase1_total: {(time.perf_counter() - t_phase1) * 1000:.0f}ms")
