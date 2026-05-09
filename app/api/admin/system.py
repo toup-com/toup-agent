@@ -59,6 +59,61 @@ class MemoryHealthStats(BaseModel):
     meta_count: int
 
 
+# F6 — per-user memory health snapshot for ops debugging.
+# Distinct from /admin/health (which scopes to current_user). This one
+# takes a user_id and returns the same per-turn signals the runtime
+# emits via the [memory_health] log line, plus a 7-day summarizer
+# rollup so operators can answer "is memory working for this user?"
+# in one HTTP call.
+
+class DaySummarizerStateRow(BaseModel):
+    local_date: str  # ISO date
+    summary_status: str
+    summary_failure_count: int
+    summary_last_failure_at: Optional[str]  # ISO datetime
+    summary_last_failure_reason: Optional[str]
+    archival_summary_status: str
+    has_rolling_summary: bool
+    has_archival_summary: bool
+    message_count: int
+
+
+class ActiveTaskRow(BaseModel):
+    id: str
+    content: str
+    strength: float
+    created_at: Optional[str]
+    last_reinforced_at: Optional[str]
+
+
+class MemoryHealthForUser(BaseModel):
+    """Snapshot of memory subsystem state for one user.
+
+    Mirrors the per-turn [memory_health] log line plus aggregates an
+    operator would otherwise have to grep across days.
+    """
+    user_id: str
+    user_email: Optional[str]
+    # Memory bank
+    total_memories: int
+    active_memory_count: int
+    avg_strength: float
+    weak_count: int
+    strong_count: int
+    by_category: dict
+    # Active tasks (open threads — F4)
+    active_tasks_live: int
+    active_tasks_archived: int
+    active_task_samples: List[ActiveTaskRow]
+    # Day summarizer state — last 7 days
+    summarizer_recent_days: List[DaySummarizerStateRow]
+    summarizer_failure_streak: int
+    summarizer_last_failure_reason: Optional[str]
+    # Day-boundary recap (F8) — would the next "fresh" turn surface anything?
+    recent_days_with_archival: int
+    recent_days_with_rolling_only: int
+
+
 # ============ Memory Endpoints ============
 
 @router.post("/decay", response_model=DecayResult)
@@ -444,3 +499,177 @@ async def reload_config(current_user=Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to reload config: {e}")
+
+
+# ============ F6 — Per-user memory health snapshot ============
+
+@router.get("/memory-health/{user_id}", response_model=MemoryHealthForUser)
+async def get_user_memory_health(
+    user_id: str,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return a memory-subsystem snapshot for one user.
+
+    Mirrors the per-turn [memory_health] log line plus a 7-day
+    summarizer rollup. Use this to answer:
+      - is memory being created? (total_memories, by_category)
+      - is decay working? (avg_strength, weak_count)
+      - are open threads being tracked? (active_tasks_live)
+      - is the summarizer healthy? (summarizer_recent_days,
+        summarizer_failure_streak, summarizer_last_failure_reason)
+      - would the next warm-start turn have continuity? (recent_days_*)
+
+    Admin-only. Doesn't expose memory CONTENT — just shape and health.
+    """
+    from datetime import date, timedelta
+    from app.db.models.user import User
+    from app.db.models.day_chat import DayChat
+
+    # Admin guard — non-admins get their own snapshot only
+    if getattr(current_user, "role", None) != "admin" and current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Admin access required for other users")
+
+    # Resolve user
+    user_row = (await db.execute(
+        select(User).where(User.id == user_id)
+    )).scalar_one_or_none()
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # ── Memory bank aggregates ──
+    bank = (await db.execute(
+        select(
+            func.count(Memory.id).label("total"),
+            func.sum(case((Memory.is_active == True, 1), else_=0)).label("active"),
+            func.avg(Memory.strength).label("avg_strength"),
+            func.sum(case((Memory.strength < 0.3, 1), else_=0)).label("weak"),
+            func.sum(case((Memory.strength >= 0.8, 1), else_=0)).label("strong"),
+        ).where(and_(Memory.user_id == user_id, Memory.is_deleted == False))
+    )).first()
+
+    cat_rows = (await db.execute(
+        select(Memory.category, func.count(Memory.id))
+        .where(and_(
+            Memory.user_id == user_id,
+            Memory.is_deleted == False,
+            Memory.is_active == True,
+        ))
+        .group_by(Memory.category)
+    )).all()
+    by_category = {(c or "uncategorized"): int(n) for (c, n) in cat_rows}
+
+    # ── Active tasks ──
+    at_live = (await db.execute(
+        select(func.count(Memory.id)).where(and_(
+            Memory.user_id == user_id,
+            Memory.category == "active_task",
+            Memory.is_active == True,
+            Memory.is_deleted == False,
+        ))
+    )).scalar() or 0
+
+    at_archived = (await db.execute(
+        select(func.count(Memory.id)).where(and_(
+            Memory.user_id == user_id,
+            Memory.category == "active_task",
+            Memory.is_active == False,
+            Memory.is_deleted == False,
+        ))
+    )).scalar() or 0
+
+    at_sample_rows = (await db.execute(
+        select(Memory).where(and_(
+            Memory.user_id == user_id,
+            Memory.category == "active_task",
+            Memory.is_active == True,
+            Memory.is_deleted == False,
+        )).order_by(Memory.updated_at.desc()).limit(5)
+    )).scalars().all()
+    at_samples = [
+        ActiveTaskRow(
+            id=t.id,
+            content=t.content[:200],
+            strength=float(t.strength or 0.0),
+            created_at=t.created_at.isoformat() if t.created_at else None,
+            last_reinforced_at=t.last_reinforced_at.isoformat() if t.last_reinforced_at else None,
+        )
+        for t in at_sample_rows
+    ]
+
+    # ── Summarizer state — last 7 calendar days ──
+    today = date.today()
+    cutoff = today - timedelta(days=7)
+    day_rows = (await db.execute(
+        select(DayChat).where(and_(
+            DayChat.user_id == user_id,
+            DayChat.local_date >= cutoff,
+        )).order_by(DayChat.local_date.desc())
+    )).scalars().all()
+
+    summarizer_rows = [
+        DaySummarizerStateRow(
+            local_date=dc.local_date.isoformat(),
+            summary_status=dc.summary_status or "unknown",
+            summary_failure_count=int(dc.summary_failure_count or 0),
+            summary_last_failure_at=(
+                dc.summary_last_failure_at.isoformat()
+                if dc.summary_last_failure_at else None
+            ),
+            summary_last_failure_reason=dc.summary_last_failure_reason,
+            archival_summary_status=dc.archival_summary_status or "not_needed",
+            has_rolling_summary=bool(dc.rolling_summary),
+            has_archival_summary=bool(dc.archival_summary),
+            message_count=int(dc.message_count or 0),
+        )
+        for dc in day_rows
+    ]
+
+    # Failure streak: count consecutive most-recent days where status='failed'.
+    streak = 0
+    for r in summarizer_rows:
+        if r.summary_status == "failed":
+            streak += 1
+        else:
+            break
+
+    last_failure_reason = next(
+        (r.summary_last_failure_reason for r in summarizer_rows if r.summary_last_failure_reason),
+        None,
+    )
+
+    # ── F8 readiness — what would a fresh-day turn see? ──
+    cutoff_2d = today - timedelta(days=2)
+    recent_arch = sum(
+        1 for dc in day_rows
+        if dc.local_date >= cutoff_2d
+        and dc.local_date < today
+        and dc.archival_summary
+        and dc.archival_summary_status == "up_to_date"
+    )
+    recent_rolling_only = sum(
+        1 for dc in day_rows
+        if dc.local_date >= cutoff_2d
+        and dc.local_date < today
+        and not (dc.archival_summary and dc.archival_summary_status == "up_to_date")
+        and dc.rolling_summary
+    )
+
+    return MemoryHealthForUser(
+        user_id=user_id,
+        user_email=user_row.email,
+        total_memories=int(bank.total or 0),
+        active_memory_count=int(bank.active or 0),
+        avg_strength=round(float(bank.avg_strength or 0.0), 3),
+        weak_count=int(bank.weak or 0),
+        strong_count=int(bank.strong or 0),
+        by_category=by_category,
+        active_tasks_live=int(at_live),
+        active_tasks_archived=int(at_archived),
+        active_task_samples=at_samples,
+        summarizer_recent_days=summarizer_rows,
+        summarizer_failure_streak=streak,
+        summarizer_last_failure_reason=last_failure_reason,
+        recent_days_with_archival=recent_arch,
+        recent_days_with_rolling_only=recent_rolling_only,
+    )

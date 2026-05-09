@@ -133,6 +133,11 @@ class AgentRunner:
         self._disabled_tool_names: set = set()  # Per-session disabled tools
         # Phase 5: Track retrieved memories for feedback loop
         self._last_retrieved_memories: List[Dict[str, Any]] = []
+        # F6: per-turn memory health state captured during system_prompt
+        # assembly. One structured log line is emitted from run() after
+        # the prompt is built so operators have a single grep target for
+        # "is memory working for user X right now?". Resets per turn.
+        self._memory_health: Dict[str, Any] = {}
 
     @property
     def tool_defs(self) -> list:
@@ -303,6 +308,17 @@ class AgentRunner:
         """
         start = time.time()
         logger.info(f"[AGENT] === New agent run for user_id={user_id} ===")
+
+        # F6: zero per-turn memory_health dict so a previous turn's counts
+        # can't leak into this turn's [memory_health] log line.
+        self._memory_health = {
+            "retrieved": 0,
+            "active_tasks": 0,
+            "recent_days": 0,
+            "summary_status": None,
+            "summary_failure_reason": None,
+            "today_summary_present": False,
+        }
 
         # Pre-generate the assistant message ID so generate_* tools can emit
         # attachment WS events with a stable message_id before the message
@@ -485,11 +501,18 @@ class AgentRunner:
             if _use_day_ctx and _day_context and _day_context.get("summary"):
                 from app.agent.day_context_loader import build_today_so_far_block
                 system_prompt += build_today_so_far_block(_day_context["summary"])
+                self._memory_health["today_summary_present"] = True
 
             # F8: Inject <recent_days> recap on day-boundary warm starts.
             # Only fires when today's day-chat is fresh (no rolling summary
             # yet, low message count). Once the day grows its own context,
             # the active conversation IS the continuity — don't double up.
+            #
+            # F6 telemetry: capture summary_status / failure_reason from
+            # today's day_chat row even when we don't inject recent_days,
+            # so the [memory_health] line below can surface summarizer
+            # health (e.g. "summary=failed reason=auth_error") at every
+            # turn, not just on warm starts.
             if _use_day_ctx and _day_context and _day_chat_id:
                 try:
                     from app.services.recent_days_service import (
@@ -497,13 +520,17 @@ class AgentRunner:
                         get_recent_day_summaries,
                         build_recent_days_block,
                     )
-                    if should_inject_recent_days(_day_context):
-                        from sqlalchemy import select as _sel_dc
-                        from app.db.models.day_chat import DayChat
-                        _today_dc = (await db.execute(
-                            _sel_dc(DayChat).where(DayChat.id == _day_chat_id)
-                        )).scalar_one_or_none()
-                        if _today_dc:
+                    from sqlalchemy import select as _sel_dc
+                    from app.db.models.day_chat import DayChat
+                    _today_dc = (await db.execute(
+                        _sel_dc(DayChat).where(DayChat.id == _day_chat_id)
+                    )).scalar_one_or_none()
+                    if _today_dc:
+                        # F6: always capture summary state for memory_health
+                        self._memory_health["summary_status"] = _today_dc.summary_status
+                        self._memory_health["summary_failure_reason"] = _today_dc.summary_last_failure_reason
+                        # F8: gated injection
+                        if should_inject_recent_days(_day_context):
                             _recent = await get_recent_day_summaries(
                                 db, user_id, _today_dc.local_date,
                             )
@@ -511,6 +538,7 @@ class AgentRunner:
                                 system_prompt += build_recent_days_block(
                                     _recent, today_local_date=_today_dc.local_date,
                                 )
+                                self._memory_health["recent_days"] = len(_recent)
                                 logger.info(
                                     "[AGENT] recent_days injected: %d day(s) "
                                     "(fresh day-chat msg_count=%d)",
@@ -527,6 +555,38 @@ class AgentRunner:
                     )
 
             logger.info(f"[PERF] build_system_prompt: {(time.perf_counter() - t_prompt) * 1000:.0f}ms — {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
+
+            # F6: Single structured per-turn memory_health line.
+            # ONE grep target for "is memory working for user X right now?".
+            # Fields are stable so an operator can pipe through awk/jq.
+            #   retrieved=N        → user memories from hybrid_search
+            #   active_tasks=N     → open threads in <active_tasks> block
+            #   recent_days=N      → days surfaced in <recent_days> block (F8)
+            #   today_summary=Y/N  → was <today_so_far> injected this turn
+            #   summary=<status>   → today's day_chat summary lifecycle
+            #   reason=<reason>    → FF-B.2 failure taxonomy if last attempt failed
+            #   intent=<cat>       → query intent classification
+            #   tokens=N           → estimated system prompt tokens
+            try:
+                _mh = self._memory_health
+                logger.info(
+                    "[memory_health] user=%s channel=%s retrieved=%d active_tasks=%d "
+                    "recent_days=%d today_summary=%s summary=%s reason=%s "
+                    "intent=%s tokens=%d",
+                    user_id[:8], channel,
+                    _mh.get("retrieved", 0),
+                    _mh.get("active_tasks", 0),
+                    _mh.get("recent_days", 0),
+                    "Y" if _mh.get("today_summary_present") else "N",
+                    _mh.get("summary_status") or "-",
+                    _mh.get("summary_failure_reason") or "-",
+                    getattr(query_intent, "category", "-"),
+                    estimate_tokens(system_prompt),
+                )
+            except Exception as _mh_err:
+                # Never let telemetry break the turn.
+                logger.debug(f"[memory_health] log build failed: {_mh_err}")
+
             await db.commit()
         logger.info(f"[PERF] phase1_total: {(time.perf_counter() - t_phase1) * 1000:.0f}ms")
         # DB session closed — no connection held during LLM calls
@@ -1708,6 +1768,7 @@ class AgentRunner:
 
             user_memories = [m for m in memories if m.get("brain_type") == "user"]
             self._last_retrieved_memories = user_memories
+            self._memory_health["retrieved"] = len(user_memories)
             logger.info(f"[AGENT] Found {len(user_memories)} relevant user memories (hybrid)")
 
             # A. User Portrait
@@ -1782,10 +1843,12 @@ class AgentRunner:
         try:
             from app.services.active_task_service import get_active_tasks, build_active_tasks_block
             active_tasks = await get_active_tasks(db, user_id)
+            self._memory_health["active_tasks"] = len(active_tasks) if active_tasks else 0
             if active_tasks:
                 section_parts["active_tasks"] = build_active_tasks_block(active_tasks)
                 logger.info(f"[AGENT] active_tasks built: {len(active_tasks)} task(s)")
         except Exception as _at_err:
+            self._memory_health["active_tasks"] = 0
             logger.debug(f"[AGENT] Active tasks build skipped: {_at_err}")
 
         # ── 4. Skills (only if intent requires them) ─────────────
