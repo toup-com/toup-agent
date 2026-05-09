@@ -1057,11 +1057,12 @@ class ToolExecutor:
     # see the chip path in the system prompt and parseMessageBlocks.ts.
     # Paths verified against frontend/src/App.tsx route definitions. Anything
     # not registered there falls into the catch-all `*` redirect to `/`, which
-    # would feel like a broken transfer to the user. /brain/user is intentionally
-    # omitted in favour of canonical /brain (the former is a redirect alias).
+    # would feel like a broken transfer to the user. /brain/user is a real
+    # registered route that redirects to canonical /brain — accepted here as
+    # a friendly alias so the model isn't punished for guessing it.
     _NAV_ALLOWED_PATHS = {
         "/", "/chat",
-        "/brain",
+        "/brain", "/brain/user",
         "/browser",
         "/workspace", "/jobs", "/dashboard",
         "/agent", "/agent/soul", "/agent/settings",
@@ -1072,6 +1073,7 @@ class ToolExecutor:
         "/": "Hub",
         "/chat": "Chat",
         "/brain": "Brain",
+        "/brain/user": "Brain",
         "/browser": "Live Browser",
         "/workspace": "Workspace",
         "/jobs": "Jobs",

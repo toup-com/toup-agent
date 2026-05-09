@@ -1543,7 +1543,7 @@ def get_doc_generation_tools() -> List[Dict[str, Any]]:
                         "type": "string",
                         "description": "The URL path to navigate to.",
                         "enum": [
-                            "/", "/chat", "/brain", "/browser",
+                            "/", "/chat", "/brain", "/brain/user", "/browser",
                             "/workspace", "/jobs", "/dashboard",
                             "/agent", "/agent/soul", "/agent/settings",
                             "/agent/tools", "/agent/skills",

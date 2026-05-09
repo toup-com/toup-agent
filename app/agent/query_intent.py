@@ -485,6 +485,21 @@ def classify_query_intent(message: str) -> QueryIntent:
     return INTENT_FULL
 
 
+# Transversal UX-affordance tools — ALWAYS included regardless of intent.
+# These don't fit a single category because the user can ask for them in
+# greetings, questions, anywhere. Without this, the LLM sees the tool
+# described in the system prompt but can't actually invoke it on a
+# greeting/question turn — and then hallucinates fake XML/JSX syntax in
+# its text output (caught 2026-05-08 when "transfer me to user brain"
+# came back as `<navigate_to path="/brain/user" />` plain text instead
+# of an actual tool call).
+_ALWAYS_INCLUDED_TOOLS = frozenset({
+    "navigate_to",  # Page transfers — needed in any intent
+    "recall_day",   # Past-day questions can fall under any category
+    "memory_search",  # "what do you remember about X" can hit any intent
+})
+
+
 def filter_tools_by_intent(
     all_tools: list,
     intent: QueryIntent,
@@ -498,22 +513,25 @@ def filter_tools_by_intent(
 
     Returns:
         Filtered list of tool definitions. If intent.tool_names is empty,
-        returns all_tools for "full" intent, or empty list for "greeting"/"question".
+        returns all_tools for "full" intent, or only the always-included
+        UX-affordance tools for "greeting"/"question".
     """
     if intent.category == "full":
         return all_tools
 
     if not intent.tool_names:
-        # greeting, question — no tools
-        return []
+        # greeting, question — no work tools, but still surface the
+        # always-included UX affordances so the LLM can navigate / recall
+        # / search memory without an intent escalation round-trip.
+        return [t for t in all_tools if t.get("name", "") in _ALWAYS_INCLUDED_TOOLS]
 
-    # Filter to only matching tool names
+    # Filter to only matching tool names + always-included UX affordances.
     # Skill tools have prefixed names (e.g., "app_builder__build_app")
-    # Include them if the intent says include_skills
+    # Include them if the intent says include_skills.
     filtered = []
     for tool in all_tools:
         name = tool.get("name", "")
-        if name in intent.tool_names:
+        if name in intent.tool_names or name in _ALWAYS_INCLUDED_TOOLS:
             filtered.append(tool)
         elif intent.include_skills and "__" in name:
             # Skill tool — include it
