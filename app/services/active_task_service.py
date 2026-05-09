@@ -205,14 +205,47 @@ def build_active_tasks_block(tasks: List[Dict]) -> str:
     """Build the <active_tasks> system prompt section.
 
     Always injected when tasks exist — regardless of intent classification.
+
+    F4 (2026-05-08): the previous instruction ("Reference them when relevant")
+    was too passive. The model deferred to "is it relevant?" and almost
+    never surfaced an open thread on its own. The new instruction primes
+    the proactive-recall behaviour the founder explicitly asked for: a
+    friend who picks up a thread without being asked to.
+
+    Important constraint: the model MUST NOT make this feel scripted.
+    Ask, don't list. At most one mention per session. Pair with the
+    voice_rules anti-chatbot guards higher in the prompt — same posture.
     """
     if not tasks:
         return ""
 
     lines = [
         "\n<active_tasks>",
-        "The user is currently working on these tasks/problems. "
-        "Reference them when relevant — the user expects continuity.",
+        "Open threads with this user — things they were working on, "
+        "stuck on, or said they'd come back to. These persist across "
+        "days and channels. Don't list them; that's not what a friend "
+        "does. Instead:",
+        "",
+        "- **First message of the day** (or a long gap since last turn): "
+        "if one of these threads still feels unresolved, ask about it "
+        "naturally as part of your reply. \"Did the Stripe webhook thing "
+        "ever sort itself out?\" — that kind of beat. ONE thread max, the "
+        "most recently reinforced. Don't bring it up if their opener is "
+        "clearly about something else important.",
+        "",
+        "- **Mid-conversation:** if their current message connects to one "
+        "of these threads (even loosely), reference it directly. \"Right, "
+        "that ties back to the migration you were stuck on earlier.\"",
+        "",
+        "- **Never say** \"I see you're working on...\" or \"I remember "
+        "that you...\" — those are robot phrases. Just ask, or just say "
+        "the thing, the way a friend would.",
+        "",
+        "- **If a thread is done**, drop it: don't keep asking about a "
+        "task they've moved past. When in doubt, the recently-reinforced "
+        "ones are the live ones.",
+        "",
+        "Open threads (most-recently-reinforced first):",
     ]
     for t in tasks[:10]:  # Max 10 active tasks
         age = ""
