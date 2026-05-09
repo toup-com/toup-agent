@@ -1676,15 +1676,19 @@ class AgentRunner:
             section_parts["user_brain"] = "# User Brain\n" + "\n".join(memory_sections)
         logger.info(f"[PERF] memory_retrieval: {(time.perf_counter() - t_memory) * 1000:.0f}ms")
 
-        # ── 3b. Active tasks — always injected, regardless of intent ──
+        # ── 3b. Active tasks — always built; injected if "active_tasks" is in SECTION_ORDER ──
+        # The block is registered into section_parts here. Whether it actually
+        # reaches the assembled prompt is decided by SECTION_ORDER below — that
+        # filter is the canonical "is this section in the prompt?" check.
+        # See the assembly-time log for the post-filter truth.
         try:
             from app.services.active_task_service import get_active_tasks, build_active_tasks_block
             active_tasks = await get_active_tasks(db, user_id)
             if active_tasks:
                 section_parts["active_tasks"] = build_active_tasks_block(active_tasks)
-                logger.info(f"[AGENT] Injected {len(active_tasks)} active task(s)")
+                logger.info(f"[AGENT] active_tasks built: {len(active_tasks)} task(s)")
         except Exception as _at_err:
-            logger.debug(f"[AGENT] Active tasks injection skipped: {_at_err}")
+            logger.debug(f"[AGENT] Active tasks build skipped: {_at_err}")
 
         # ── 4. Skills (only if intent requires them) ─────────────
         if self.skill_loader and intent.include_skill_prompts:
@@ -2130,6 +2134,7 @@ class AgentRunner:
             "platform_knowledge",  # WHAT Toup is — pages, capabilities, decision rules
             "about_you",      # User's name + local time-of-day for tonal calibration
             "user_brain",       # WHO the user is
+            "active_tasks",   # CONTINUITY — what user is working on right now (7-day TTL)
             "agent_brain",    # Agent brain (disabled by default)
             "work_brain",     # Work brain (disabled by default)
             "skills",         # WHAT the agent can do
@@ -2144,14 +2149,33 @@ class AgentRunner:
             "verbose",        # Optional verbose mode
         ]
 
-        sections = [section_parts[k] for k in SECTION_ORDER if k in section_parts]
+        # Apply SECTION_ORDER filter. This IS the canonical "in the prompt"
+        # check — anything in section_parts but not in SECTION_ORDER is
+        # silently dropped here (this is exactly how F1 / active_tasks went
+        # missing for months). The "dropped" warning below is the safety rail.
+        injected_keys = [k for k in SECTION_ORDER if k in section_parts]
+        sections = [section_parts[k] for k in injected_keys]
 
-        # Log section sizes for debugging
+        # Per-section token estimates (debug only)
         for name, text in section_parts.items():
             tokens_est = len(text) // 4
             logger.debug(f"Prompt [{name}]: ~{tokens_est} tokens")
-        total = sum(len(v) for v in section_parts.values()) // 4
-        logger.info(f"[AGENT] System prompt: {len(section_parts)} sections, ~{total} tokens est.")
+
+        # Assembly-time truth: which sections actually made it into the prompt,
+        # and which were built but dropped. Built-but-dropped is almost always
+        # a bug (key forgotten in SECTION_ORDER); louder than a debug line.
+        dropped_keys = sorted(set(section_parts.keys()) - set(SECTION_ORDER))
+        if dropped_keys:
+            logger.warning(
+                "[AGENT] system_prompt DROPPED sections (built but not in "
+                "SECTION_ORDER — likely a bug): %s",
+                dropped_keys,
+            )
+        total = sum(len(section_parts[k]) for k in injected_keys) // 4
+        logger.info(
+            "[AGENT] system_prompt sections=%s ~%d tokens",
+            injected_keys, total,
+        )
 
         return "\n\n".join(sections)
     
