@@ -116,6 +116,15 @@ async def _build_bind_payload(
         "whatsapp_verify_token",
         "whatsapp_app_secret",
         "whatsapp_mode",
+        # WhatsApp Baileys ACL fields. The pool path used to OMIT both,
+        # so pool-bound users had every inbound WhatsApp message silently
+        # dropped by `lid.allowlist_empty` even when their settings page
+        # showed numbers in "Who can talk to your agent". The legacy slow
+        # path's `_agent_config_to_bridge_body` always passed them
+        # through; pool drift was an unintentional regression.
+        "whatsapp_baileys_allowlist",
+        "whatsapp_self_e164",
+        "whatsapp_session_status",
         "connect_token",
         "supabase_url",
         "supabase_anon_key",

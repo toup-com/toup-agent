@@ -229,6 +229,13 @@ _PAYLOAD_TO_SETTING = {
     "whatsapp_verify_token": "whatsapp_verify_token",
     "whatsapp_app_secret": "whatsapp_app_secret",
     "whatsapp_mode": "whatsapp_mode",
+    # Baileys ACL — restart_whatsapp_channel reads these from settings
+    # to filter inbound messages. Missing here meant pool-bound users'
+    # inbound WhatsApp messages were silently dropped by the empty
+    # allowlist even when /admin/bind successfully forwarded them.
+    "whatsapp_baileys_allowlist": "whatsapp_baileys_allowlist",
+    "whatsapp_self_e164": "whatsapp_self_e164",
+    "whatsapp_session_status": "whatsapp_session_status",
     "connect_token": "toup_token",
     "supabase_url": "supabase_url",
     "supabase_anon_key": "supabase_anon_key",

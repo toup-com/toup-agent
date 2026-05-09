@@ -92,6 +92,16 @@ _BIND_FIELDS = (
     "whatsapp_verify_token",
     "whatsapp_app_secret",
     "whatsapp_mode",
+    # WhatsApp Baileys (QR-link) ACL — without these in the whitelist,
+    # the platform's bind payload was silently dropped here and the
+    # agent restarted its WhatsApp channel with allowlist_size=0.
+    # Result: every inbound WhatsApp message hit lid.allowlist_empty
+    # and was ignored, so users saw "linked" in settings but their
+    # agent never replied. Pool path only — slow path went through
+    # `_build_env` which propagated these fields via env vars.
+    "whatsapp_baileys_allowlist",
+    "whatsapp_self_e164",
+    "whatsapp_session_status",
     "connect_token",
     "supabase_url",
     "supabase_anon_key",

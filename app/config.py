@@ -179,6 +179,10 @@ class Settings(BaseSettings):
     # Anything else is silently dropped at the ACL gate. Empty = block all
     # (the secure default — pairs scan-then-allowlist into one explicit step).
     whatsapp_baileys_allowlist: str = ""
+    # Pairing snapshot mirrored from the Baileys sidecar. Tracks
+    # not_linked / linking / linked / logged_out so /admin/bind can apply
+    # the value via runtime_identity.apply_to_settings without warning.
+    whatsapp_session_status: Optional[str] = None
 
     # ── Thinking / Extended Thinking ─────────────────────────
     thinking_budget_default: int = 0  # 0 = disabled, >0 = max thinking tokens
