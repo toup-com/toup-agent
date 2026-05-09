@@ -470,7 +470,19 @@ async def destroy_container(db: AsyncSession, user_id: str) -> bool:
 
 
 async def get_container_status(db: AsyncSession, user_id: str) -> Optional[dict]:
-    """Get runtime status via bridge + DB row."""
+    """Get runtime status via bridge + DB row.
+
+    Pool-bound containers keep their `toup-agent-pool-NN` name even
+    after claim — the bridge's `/v1/tenants/{prefix}/status` endpoint
+    looks up `toup-agent-{prefix}` and 404s on every pool-bound user.
+    Without the fallback below, frontend's `docker_status === 'running'`
+    check stayed false forever after a successful pool claim, producing
+    "Agent took too long to start" on the WhatsApp QR onboarding step
+    despite the container being healthy. The DB row's status field is
+    set authoritatively by `claim_for_user` AFTER a successful bridge
+    bind, so it's the right fallback when the bridge can't resolve the
+    tenant prefix.
+    """
     result = await db.execute(
         select(ManagedContainer).where(ManagedContainer.user_id == user_id)
     )
@@ -488,10 +500,18 @@ async def get_container_status(db: AsyncSession, user_id: str) -> Optional[dict]
     except httpx.HTTPError as e:
         logger.warning("bridge status unreachable for %s: %s", user_id[:8], e)
 
+    # Pool-bound fallback: bridge can't resolve `toup-agent-pool-NN` by
+    # tenant prefix, so docker_status comes back missing. The DB row is
+    # authoritative for pool-bound containers — use it.
+    docker_status = bridge_status.get("status")
+    if docker_status is None and container.container_name and \
+            container.container_name.startswith("toup-agent-pool-"):
+        docker_status = container.status
+
     return {
         "id": container.id,
         "status": container.status,
-        "docker_status": bridge_status.get("status"),
+        "docker_status": docker_status,
         "docker_health": bridge_status.get("health"),
         "port": container.host_port,
         "image_tag": container.image_tag,

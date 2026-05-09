@@ -245,11 +245,19 @@ class Settings(BaseSettings):
     user_id: str = ""                                # Owner user ID (set on Agent VPS via cloud-init)
     toup_token: str = ""                             # Connect token from toup.ai dashboard (for tunnel auth)
     # Phase A — Pool of pre-booted agent containers. When True,
-    # `auth.register` calls `pool_service.claim_for_user` instead of the
-    # slow `schedule_prewarm` path. Pool requires the bridge's pool
-    # endpoints to be installed (see `bridge/INSTALL.md`); set this
-    # to False (the default) until that's deployed and verified.
-    use_container_pool: bool = False
+    # `auth.register` calls `pool_service.claim_for_user` instead of
+    # the slow `schedule_prewarm` path (~1-2s pool bind vs ~30-90s
+    # cold container build). Pool requires the bridge's pool endpoints
+    # to be installed (verified live on Contabo since 2026-04-30).
+    #
+    # Default flipped to True 2026-05-08 after the WhatsApp QR onboarding
+    # incident: USE_CONTAINER_POOL was unset in Railway env, so every
+    # signup fell through to schedule_prewarm. Users reached the Channel
+    # step before the slow path finished and saw "Agent took too long to
+    # start." Setting the default to True makes the fast path the
+    # production-correct behavior; self-hosters without pool endpoints
+    # can still set USE_CONTAINER_POOL=false explicitly to opt out.
+    use_container_pool: bool = True
     # Phase B — Blue-green tenant rollouts. When True,
     # `docker_host_service.upgrade_tenant_image` calls the bridge's
     # `/v1/tenants/<prefix>/blue-green-upgrade` (zero-WS-drop) instead
