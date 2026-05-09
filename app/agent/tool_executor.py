@@ -1055,24 +1055,34 @@ class ToolExecutor:
     # For passive suggestions (where the user should choose), the agent
     # should emit a [[navigate:/path]] chip in its message text instead —
     # see the chip path in the system prompt and parseMessageBlocks.ts.
+    # Paths verified against frontend/src/App.tsx route definitions. Anything
+    # not registered there falls into the catch-all `*` redirect to `/`, which
+    # would feel like a broken transfer to the user. /brain/user is intentionally
+    # omitted in favour of canonical /brain (the former is a redirect alias).
     _NAV_ALLOWED_PATHS = {
-        "/", "/chat", "/brain/user", "/brain/agent",
-        "/workspace", "/dashboard", "/agent",
-        "/agent/soul", "/agent/integrations",
+        "/", "/chat",
+        "/brain",
+        "/browser",
+        "/workspace", "/jobs", "/dashboard",
+        "/agent", "/agent/soul", "/agent/settings",
         "/agent/tools", "/agent/skills",
+        "/account", "/movies",
     }
     _NAV_PATH_LABELS = {
         "/": "Hub",
         "/chat": "Chat",
-        "/brain/user": "User Brain",
-        "/brain/agent": "Agent Brain",
+        "/brain": "Brain",
+        "/browser": "Live Browser",
         "/workspace": "Workspace",
+        "/jobs": "Jobs",
         "/dashboard": "Dashboard",
         "/agent": "Agent Setup",
         "/agent/soul": "Soul",
-        "/agent/integrations": "Integrations",
+        "/agent/settings": "Channels & Settings",
         "/agent/tools": "Tools",
         "/agent/skills": "Skills",
+        "/account": "Account",
+        "/movies": "Movies",
     }
 
     async def _tool_navigate_to(self, inp: Dict[str, Any]) -> str:

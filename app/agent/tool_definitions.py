@@ -1521,17 +1521,20 @@ def get_doc_generation_tools() -> List[Dict[str, Any]]:
                 "X', 'open Y', 'go to Z'). For passive suggestions, prefer a "
                 "[[navigate:/path]] chip in your message instead so the user "
                 "can choose. Available paths:\n"
-                "- / — Hub (main landing)\n"
+                "- / — Hub (home)\n"
                 "- /chat — Chat (this page)\n"
-                "- /brain/user — User Brain (their stored memories)\n"
-                "- /brain/agent — Agent Brain (your stored knowledge)\n"
-                "- /workspace — Workspace (workflows and apps)\n"
-                "- /dashboard — Dashboard (metrics, tasks, inbox, logs)\n"
-                "- /agent — Agent Setup (configure agent settings)\n"
-                "- /agent/soul — Soul (configure your personality)\n"
-                "- /agent/integrations — Integrations\n"
+                "- /brain — Brain (their stored memories about themselves)\n"
+                "- /browser — Live Browser (watch your headless browser in real time)\n"
+                "- /workspace — Workspace (apps you've built for them)\n"
+                "- /jobs — Jobs (long-running tasks, status + logs)\n"
+                "- /dashboard — Dashboard (metrics, inbox, daily summary)\n"
+                "- /agent — Agent home (soul, channels, LLM keys)\n"
+                "- /agent/soul — Soul (your personality config)\n"
+                "- /agent/settings — Channels & Settings (WhatsApp, Telegram, voice wiring)\n"
                 "- /agent/tools — Tools catalog\n"
-                "- /agent/skills — Skills catalog"
+                "- /agent/skills — Skills catalog\n"
+                "- /account — Account (profile, password, billing)\n"
+                "- /movies — Movies (Netflix integration)"
             ),
             "input_schema": {
                 "type": "object",
@@ -1540,10 +1543,11 @@ def get_doc_generation_tools() -> List[Dict[str, Any]]:
                         "type": "string",
                         "description": "The URL path to navigate to.",
                         "enum": [
-                            "/", "/chat", "/brain/user", "/brain/agent",
-                            "/workspace", "/dashboard", "/agent",
-                            "/agent/soul", "/agent/integrations",
+                            "/", "/chat", "/brain", "/browser",
+                            "/workspace", "/jobs", "/dashboard",
+                            "/agent", "/agent/soul", "/agent/settings",
                             "/agent/tools", "/agent/skills",
+                            "/account", "/movies",
                         ],
                     },
                 },
