@@ -157,7 +157,13 @@ class AgentRunner:
         defs = list(self._core_tool_defs)
         if self.skill_loader:
             defs = defs + self.skill_loader.get_all_tool_definitions()
-        if settings.use_connector_dispatch:
+        # Defensive read — `use_connector_dispatch` is a newer setting and
+        # this code can run on agent images deployed before the Settings
+        # class added the attribute. Without getattr, any incoming
+        # message (Telegram/WhatsApp/web) crashes with AttributeError on
+        # such an agent. Default False keeps connector dispatch off until
+        # the field is genuinely present.
+        if getattr(settings, "use_connector_dispatch", False):
             mcp_tool_defs = getattr(self.tools, "mcp_tool_defs", None) or []
             if mcp_tool_defs:
                 # Tools come from the platform as {name, description,
@@ -1863,7 +1869,8 @@ class AgentRunner:
         # knows what's available without scanning every tool def.
         # Cheap (already on the executor); high signal (the LLM is
         # otherwise unaware of what the user has connected vs not).
-        if settings.use_connector_dispatch:
+        # Defensive getattr — see tool_defs property for why.
+        if getattr(settings, "use_connector_dispatch", False):
             mcp_tool_defs = getattr(self.tools, "mcp_tool_defs", None) or []
             if mcp_tool_defs:
                 # Connector tool names are `<connector_id>__<tool>` —
