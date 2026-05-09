@@ -43,6 +43,9 @@ class ManagedApp:
     web_process: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
     log_buffer: deque = field(default_factory=lambda: deque(maxlen=MAX_LOG_LINES))
     started_at: float = 0.0
+    # Watchdog cooldown — avoid thrashing on crash-loop apps. Updated by
+    # ensure_web_alive() each time it triggers a revive.
+    last_revive_at: float = 0.0
 
 
 class AppManager:
@@ -378,13 +381,22 @@ class AppManager:
         # Start log reader
         asyncio.create_task(self._read_output(managed, proc, "web"))
 
-        # Wait for server to actually be ready (up to 30s)
+        # Wait for server to actually be ready (up to 30s).
+        # If the process dies before the socket binds, fail loudly — silently
+        # returning a port for a dead process used to mark the app "running"
+        # in DB while the preview proxy got connection-refused for hours.
         import socket
         for _ in range(30):
             await asyncio.sleep(1)
             if proc.returncode is not None:
-                logger.error(f"[APP] Web server for {app_id} exited early (code {proc.returncode})")
-                break
+                # Free the claimed port so the next start can reuse it.
+                self._used_web_ports.discard(port)
+                managed.web_port = None
+                managed.web_process = None
+                raise RuntimeError(
+                    f"Expo web server for {app_id} exited early (code {proc.returncode}) — "
+                    f"check log_buffer for crash details"
+                )
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=1):
                     logger.info(f"[APP] Web server ready for {app_id} on port {port}")
@@ -392,7 +404,9 @@ class AppManager:
             except (OSError, ConnectionRefusedError):
                 continue
 
-        logger.warning(f"[APP] Web server for {app_id} on port {port} may not be ready yet")
+        # Process is alive but socket never bound — leave it tracked so the
+        # watchdog can monitor and respawn if needed, but warn loudly.
+        logger.warning(f"[APP] Web server for {app_id} on port {port} did not bind in 30s")
         return port
 
     async def stop_app(self, app_id: str) -> bool:
@@ -535,6 +549,96 @@ class AppManager:
             app_id[:8], duration_ms, not os.path.exists(nm_dir),
         )
         return {"metro_port": metro_port, "web_port": web_port, "duration_ms": duration_ms}
+
+    # ── Liveness + watchdog ────────────────────────────────────────
+    #
+    # Apps die. Expo crashes, Metro hangs, parent SIGKILL leaves zombies.
+    # The original code returned a port from start_web/restart_processes
+    # and never checked again — so a dead `web_process` left AppManager
+    # confidently advertising a port that nothing was listening on, and
+    # the preview proxy 503'd forever.
+    #
+    # `_probe_web_port` is a 1s TCP probe (cheaper than HTTP). It's the
+    # single source of truth for "is this app's web server up." Both the
+    # background watchdog and the preview proxy's lazy-revive path call
+    # it before deciding whether to respawn.
+    #
+    # Cooldown: a crashing app could otherwise be respawned every 30s
+    # by the watchdog. last_revive_at gates re-entry to once per 60s.
+
+    REVIVE_COOLDOWN_S = 60
+    WATCHDOG_INTERVAL_S = 30
+
+    async def _probe_web_port(self, port: int, timeout: float = 1.0) -> bool:
+        """TCP-probe 127.0.0.1:port — return True if accept()s a connection."""
+        import socket
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: socket.create_connection(("127.0.0.1", port), timeout=timeout).close(),
+            )
+            return True
+        except (OSError, ConnectionRefusedError, socket.timeout):
+            return False
+
+    async def ensure_web_alive(self, app_id: str) -> bool:
+        """Probe app's web port; if dead, trigger a restart (with cooldown).
+
+        Returns True if web was already alive OR became alive after revive.
+        Returns False if app is unknown, on cooldown, or revive failed.
+        Idempotent — safe to call from preview proxy on every miss.
+        """
+        managed = self._running.get(app_id)
+        if not managed or not managed.web_port:
+            return False
+
+        if await self._probe_web_port(managed.web_port):
+            return True
+
+        now = time.time()
+        if now - managed.last_revive_at < self.REVIVE_COOLDOWN_S:
+            logger.debug(
+                "[APP] revive skipped for %s (cooldown %ds remaining)",
+                app_id[:8], int(self.REVIVE_COOLDOWN_S - (now - managed.last_revive_at)),
+            )
+            return False
+
+        managed.last_revive_at = now
+        logger.warning(
+            "[APP] auto-revive triggered for %s — web port %d not responding",
+            app_id[:8], managed.web_port,
+        )
+        try:
+            await self.restart_processes(app_id)
+        except Exception as e:
+            logger.error("[APP] auto-revive failed for %s: %s", app_id[:8], e)
+            return False
+        return await self._probe_web_port(managed.web_port)
+
+    async def watchdog_loop(self) -> None:
+        """Background task: probe every running app and revive on failure.
+
+        Runs forever once started. Started from agent_main.py lifespan.
+        Skips silently when AppManager has no apps (warm-pool members).
+        """
+        logger.info("[APP] watchdog started (interval=%ds)", self.WATCHDOG_INTERVAL_S)
+        while True:
+            try:
+                await asyncio.sleep(self.WATCHDOG_INTERVAL_S)
+                # Snapshot keys — _running can mutate while we iterate.
+                for app_id in list(self._running.keys()):
+                    try:
+                        await self.ensure_web_alive(app_id)
+                    except Exception as e:
+                        logger.warning("[APP] watchdog probe failed for %s: %s", app_id[:8], e)
+            except asyncio.CancelledError:
+                logger.info("[APP] watchdog stopped")
+                raise
+            except Exception as e:
+                logger.error("[APP] watchdog loop error: %s", e, exc_info=True)
+                # Don't die — sleep and continue.
+                await asyncio.sleep(5)
 
     async def get_logs(self, app_id: str, lines: int = 50) -> List[str]:
         """Get recent logs from app's Metro + web processes."""

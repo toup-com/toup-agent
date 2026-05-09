@@ -780,6 +780,16 @@ async def agent_preview_proxy(app_id: str, request: Request, path: str = ""):
     if not managed or not managed.web_port:
         raise HTTPException(503, "App web server not running")
 
+    # Lazy-revive: TCP-probe the upstream before entering the retry loop.
+    # If the Expo dev server died (process crashed, SIGKILL'd by oom-killer,
+    # whatever), this triggers an immediate respawn rather than waiting up
+    # to 30s for the background watchdog. Cheaper than 15× failed httpx
+    # connects, and the user's own request becomes the recovery event.
+    try:
+        await _app_manager.ensure_web_alive(app_id)
+    except Exception as e:
+        logger.warning("[PREVIEW] ensure_web_alive errored for %s: %s", app_id[:8], e)
+
     target = f"http://127.0.0.1:{managed.web_port}/{path}"
     params = dict(request.query_params)
     if params:

@@ -594,6 +594,20 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.warning(f"[INIT] restore_on_startup failed (non-fatal, App Builder still available): {e}", exc_info=True)
 
+        # Step 2b: Start app watchdog — TCP-probes each running app every
+        # 30s and auto-revives any whose web server died. Without this, a
+        # crashed Expo dev server stays dead until the user explicitly
+        # restarts the app, which surfaces as a 503 preview loop and a
+        # "Reconnecting…" banner that never resolves on its own.
+        if app_manager:
+            try:
+                app.state.app_watchdog_task = asyncio.create_task(
+                    app_manager.watchdog_loop()
+                )
+                print("🐕 App watchdog started")
+            except Exception as e:
+                logger.warning(f"[INIT] watchdog start failed (non-fatal): {e}", exc_info=True)
+
         # Step 3: Register AppBuilderSkill
         if app_manager:
             try:
@@ -1128,6 +1142,16 @@ async def lifespan(app: FastAPI):
             if active:
                 print(f"🧵 Cancelled {len(active)} sub-agent tasks")
         except Exception:
+            pass
+
+    # Stop watchdog before cleanup so it doesn't try to revive apps we're
+    # tearing down.
+    wd_task = getattr(app.state, "app_watchdog_task", None)
+    if wd_task and not wd_task.done():
+        wd_task.cancel()
+        try:
+            await wd_task
+        except (asyncio.CancelledError, Exception):
             pass
 
     if app_manager:
