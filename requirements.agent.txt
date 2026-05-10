@@ -74,10 +74,13 @@ patchright>=1.0.0
 # MCP Server — must match requirements.platform.txt (the agent calls
 # the platform's MCP endpoint; both ends use the same fastmcp). 2.9.2
 # is broken under Pydantic 2.13+ (TypeError: cannot specify both
-# default and default_factory at fastmcp/settings.py:57); 2.14.7 fixes
-# the offending field declaration. Verified Client API (`transport`,
-# `auth`, `list_tools`, `call_tool`) is unchanged 2.9 → 2.14.
-fastmcp==2.14.7
+# default and default_factory at fastmcp/settings.py:57); 2.11.3 fixes
+# that field declaration. 2.14+ requires uvicorn>=0.35 which conflicts
+# with `uvicorn[standard]==0.27.0` above — 2.11.3 is the highest
+# version still compatible with uvicorn 0.27. Verified Client API
+# (`transport`, `auth`, `list_tools`, `call_tool`) is unchanged 2.9 →
+# 2.11.
+fastmcp==2.11.3
 
 # Smart Fetch
 trafilatura>=2.0.0

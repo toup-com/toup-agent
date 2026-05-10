@@ -97,10 +97,13 @@ patchright>=1.0.0  # Drop-in Playwright replacement that bypasses CDP detection
 # refuses to import, so the agent's MCP client never starts, no
 # connector tools (Gmail / Calendar / Drive) ever reach the agent's
 # tool registry, and chat hard-stops at "no email tool available"
-# regardless of OAuth state. 2.14.7 fixes the field declaration.
-# Client API surface (`Client(url, auth=...)`, `list_tools`,
-# `call_tool`) is unchanged across 2.9 → 2.14.
-fastmcp==2.14.7
+# regardless of OAuth state. 2.11.3 fixes the field declaration.
+# 2.14+ requires uvicorn>=0.35 which conflicts with our pinned
+# uvicorn[standard]==0.27.0 — 2.11.3 is the highest version still
+# compatible with uvicorn 0.27. Client API surface (`Client(url,
+# auth=...)`, `list_tools`, `call_tool`) is unchanged across 2.9 →
+# 2.11.
+fastmcp==2.11.3
 
 # Connector manifests (T1c+) — declarative YAML config for third-party
 # integrations under app/connectors/<id>/manifest.yaml. Already pulled
