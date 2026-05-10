@@ -70,8 +70,12 @@ yt-dlp>=2025.1.0
 
 # MCP server (mounted at /api/mcp by platform_main). Required by the
 # T0c-T1h connector arc — without this the MCP transport import fails
-# and connector_mcp registration is skipped silently.
-fastmcp==2.9.2
+# and connector_mcp registration is skipped silently. Must match the
+# pin in requirements.agent.txt — agent's MCP client and platform's
+# MCP server speak the same wire format. 2.9.2 → 2.14.7 because 2.9.2
+# raises TypeError under Pydantic 2.13+ (`cannot specify both default
+# and default_factory` at fastmcp/settings.py:57).
+fastmcp==2.14.7
 
 # Connector manifests (T1c+) — declarative YAML config at
 # app/connectors/<id>/manifest.yaml. connector_registry hard-imports
