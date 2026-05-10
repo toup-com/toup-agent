@@ -203,12 +203,19 @@ async def oauth_connect(
     # 2. Provider-app config lookup.
     app_cfg = get_provider_app(entry.manifest.oauth.provider_app)
     if app_cfg is None:
+        provider = entry.manifest.oauth.provider_app
+        # Map provider name → the exact env vars the operator must set.
+        # Keeps the 503 actionable instead of generic "config missing".
+        env_hints = {
+            "google": "GOOGLE_OAUTH_CLIENT_ID + GOOGLE_OAUTH_CLIENT_SECRET",
+            "github": "GITHUB_OAUTH_CLIENT_ID + GITHUB_OAUTH_CLIENT_SECRET",
+        }
+        hint = env_hints.get(provider, f"{provider.upper()}_OAUTH_CLIENT_ID + ..._SECRET")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                f"Provider app {entry.manifest.oauth.provider_app!r} for "
-                f"connector {connector_id!r} is not registered. "
-                f"Set the corresponding env vars and restart."
+                f"{entry.manifest.name} OAuth credentials not configured "
+                f"on the platform. Set {hint} and redeploy."
             ),
         )
 

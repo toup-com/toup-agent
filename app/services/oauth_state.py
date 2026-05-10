@@ -64,21 +64,51 @@ class StatePayload:
 # ─── Configuration guards ────────────────────────────────────────────
 
 
+# Static label keeps this derived key crypto-isolated from any other
+# HMAC use of `jwt_secret` — flipping the label would invalidate every
+# in-flight state token but not log out a single user.
+_STATE_KEY_DERIVATION_LABEL = b"toup-oauth-state-secret-v1"
+
+
+def _derive_state_secret() -> str:
+    """Derive a stable HMAC key for OAuth state from `jwt_secret`.
+    Used as a fall-back when `OAUTH_STATE_SECRET` is unset on the
+    platform — keeps connector OAuth working out-of-the-box without
+    requiring operators to provision a separate env var.
+
+    The derived key is stable across deploys (same `jwt_secret` →
+    same key) so in-flight states survive restarts. Rotating
+    `jwt_secret` invalidates state tokens but only for the 10-minute
+    TTL window — acceptable given how rarely the JWT secret rotates.
+    """
+    base = (settings.jwt_secret or "").encode("utf-8")
+    if not base:
+        return ""
+    return hmac.new(base, _STATE_KEY_DERIVATION_LABEL, hashlib.sha256).hexdigest()
+
+
 def assert_configured() -> None:
     """Call from platform lifespan when enable_connector_oauth=True.
-    Fails fast if oauth_state_secret is missing in the env — matches
-    the credential_crypto.py contract."""
-    secret = (settings.oauth_state_secret or "").strip()
-    if not secret:
-        raise RuntimeError(
-            "oauth_state_secret is not set — connector OAuth cannot "
-            "initialise. Set OAUTH_STATE_SECRET (e.g. "
-            "`secrets.token_urlsafe(32)`)."
-        )
+    Resolves a usable HMAC key — explicit `OAUTH_STATE_SECRET` first,
+    derived-from-`jwt_secret` fall-back second. Only raises if both
+    paths fail (e.g. dev defaults stripped and no JWT secret set)."""
+    if (settings.oauth_state_secret or "").strip():
+        return
+    if _derive_state_secret():
+        return
+    raise RuntimeError(
+        "oauth_state_secret cannot be resolved — neither "
+        "OAUTH_STATE_SECRET nor JWT_SECRET is set."
+    )
 
 
 def _secret_bytes() -> bytes:
+    """Resolve the HMAC key for sign/verify. Explicit secret wins;
+    derived-from-jwt fall-back keeps the connect path working in
+    deploys that haven't provisioned the dedicated env var."""
     secret = (settings.oauth_state_secret or "").strip()
+    if not secret:
+        secret = _derive_state_secret()
     if not secret:
         raise StateVerificationError(
             "oauth_state_secret not configured — refusing to sign or verify"
