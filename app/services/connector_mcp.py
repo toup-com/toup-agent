@@ -284,7 +284,24 @@ def register_connector_tools(
 # ─── tools/list filter middleware ────────────────────────────────────
 
 
-class ConnectorToolFilterMiddleware:
+try:
+    # fastmcp 2.11+ requires middleware classes to inherit from this
+    # base — its `__call__` orchestrates per-method dispatch
+    # (`on_list_tools`, `on_call_tool`, …). Without it,
+    # `FastMCP._build_chain` does `partial(middleware, call_next=...)`
+    # which raises `TypeError: the first argument must be callable`
+    # because plain instances aren't callable. The error propagates
+    # back to the agent client as `McpError("the first argument must
+    # be callable")` and every tools/list dies — taking the entire
+    # connector tool surface (Gmail etc.) offline.
+    from fastmcp.server.middleware import Middleware as _FastMCPMiddleware
+except ImportError:
+    # Pre-2.11 fastmcp had no formal middleware base. Defensive
+    # fallback only; the production pin is 2.11+.
+    _FastMCPMiddleware = object  # type: ignore[assignment,misc]
+
+
+class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
     """FastMCP middleware that filters connector tools per requesting
     user.
 
