@@ -298,23 +298,19 @@ class Settings(BaseSettings):
     agent_key_rotation_verify_retry_interval_s: float = 2.0
 
     # ── Connector OAuth (T1d) ────────────────────────────────
-    # When False (default), POST /api/oauth/connect/<id> and
-    # /api/oauth/disconnect/<id> return 503. /api/oauth/callback always
-    # responds (provider hits it asynchronously). Flip to True per
-    # docs/integrations/02-rollout.md T1d once stub round-trip is green.
-    enable_connector_oauth: bool = False
+    # Default ON since the T1d staging soak passed and the connector
+    # arc shipped. Set ENABLE_CONNECTOR_OAUTH=false to disable as a
+    # kill switch (returns 503 on /api/oauth/connect/<id> and
+    # /api/oauth/disconnect/<id>; /api/oauth/callback always responds).
+    enable_connector_oauth: bool = True
 
     # ── Connector dispatch (T1g — closes the agent→platform loop) ──
-    # When False (default), the agent does NOT advertise connector tools
-    # to the LLM and the tool_executor's MCP branch is unreachable. The
-    # X-Agent-Key + X-Toup-Channel headers are still injected on every
-    # MCP request — harmless overhead, makes flip-on instantaneous. When
-    # True, connector tool names are merged into the agent's current
-    # tool list, the LLM can emit tool_use for them, the executor
-    # dispatches via FastMCP to the platform, and the platform's T1f
-    # registration runs the dispatcher. Flip per `docs/integrations/
-    # 02-rollout.md` T5d (staging dogfood allowlist first).
-    use_connector_dispatch: bool = False
+    # Default ON: connector tool names merge into the agent's tool
+    # list, the LLM can emit tool_use for them, and the platform
+    # dispatcher routes the call. Set USE_CONNECTOR_DISPATCH=false
+    # to mute connectors from the agent without breaking the OAuth
+    # connect flow.
+    use_connector_dispatch: bool = True
 
     # T3a — Google OAuth client. One client backs Gmail + Calendar +
     # Drive (architecture §6.1). Without both set the provider app

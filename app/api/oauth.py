@@ -95,8 +95,11 @@ def _flag_or_503() -> None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Connector OAuth is not enabled in this environment. "
-                "Set ENABLE_CONNECTOR_OAUTH=true after T1d staging soak."
+                "Connector OAuth is unavailable. Most often this is a "
+                "missing OAUTH_STATE_SECRET env var on the platform — "
+                "set it (e.g. `python -c \"import secrets; "
+                "print(secrets.token_urlsafe(32))\"`) and redeploy. "
+                "ENABLE_CONNECTOR_OAUTH must also be true."
             ),
         )
 
