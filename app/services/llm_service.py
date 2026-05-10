@@ -112,12 +112,41 @@ class LLMService:
         max_tokens: Optional[int] = None,
         **kwargs
     ) -> LLMResponse:
-        """Generate a chat completion (Anthropic or OpenAI)."""
+        """Generate a chat completion (Anthropic or OpenAI).
+
+        Hotfix (2026-05-10): route on MODEL, not just on `_use_anthropic`.
+        Pre-fix, the path was decided by which key happened to be set —
+        but `default_model` is `settings.agent_model` (e.g. `gpt-5.5`),
+        which is an OpenAI model. With `_use_anthropic=True`, calls
+        were sent in Anthropic shape and the bundle proxy silently
+        translated them to OpenAI, which then rejected `max_tokens`
+        with a 400 (gpt-5.x requires `max_completion_tokens`).
+        Routing on the model name avoids that whole translation hop:
+        OpenAI models go through `_complete_openai` (which already
+        knows the param swap), Anthropic models stay on Anthropic.
+        """
         model = model or self.default_model
         temperature = temperature if temperature is not None else self.default_temperature
         max_tokens = max_tokens or self.default_max_tokens
 
-        if self._use_anthropic:
+        # Decide route on model family, not just on which key is set.
+        m = (model or "").lower()
+        is_openai_model = m.startswith(("gpt-", "o1", "o3", "o4", "chatgpt-", "text-"))
+        is_anthropic_model = m.startswith(("claude-", "claude_"))
+
+        if is_openai_model:
+            # Lazy-init OpenAI client when we picked Anthropic at __init__
+            # but ended up needing OpenAI for this specific model.
+            if self._openai_client is None:
+                from app.services.bundle_client import make_openai_client
+                from app.services.key_provider import keys as _k
+                from openai import AsyncOpenAI
+                self._openai_client = (
+                    make_openai_client(byok_key=_k.openai or None)
+                    or AsyncOpenAI(api_key="missing")
+                )
+            return await self._complete_openai(messages, model, temperature, max_tokens, **kwargs)
+        if is_anthropic_model or self._use_anthropic:
             return await self._complete_anthropic(messages, model, temperature, max_tokens)
         return await self._complete_openai(messages, model, temperature, max_tokens, **kwargs)
 
