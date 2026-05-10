@@ -356,6 +356,35 @@ async def lifespan(app: FastAPI):
     import time as _time
     _app_start_time = _time.time()
 
+    # ── Blue-green passive-boot gate ──────────────────────────
+    # When the bridge does a blue-green upgrade, it spawns this
+    # container as `toup-agent-<prefix>-bg` alongside the still-running
+    # canonical container. Both share `/app/workspace`. If we restore
+    # apps + start Baileys WhatsApp at boot, our spawn fights the old
+    # container's still-locked workspace files (Expo `.expo/state.json`,
+    # `node_modules/.bin/expo` lockfiles, Baileys auth state) — green's
+    # /agent/health never goes ready and the bridge's _wait_for_health
+    # times out at 120 s. Caught for tenant 871bac24 running Nokia-Snake.
+    #
+    # When TOUP_BG_PASSIVE=1 and the marker file is absent (first boot
+    # of a fresh green), we skip workspace-touching initialisation and
+    # schedule it for ~90 s later — by which point bridge has cut Caddy
+    # over to us, drained the old container, and removed it. Workspace
+    # files are released; our delayed init succeeds cleanly.
+    #
+    # The marker file in workspace ensures that an in-place container
+    # restart (OOM, crash) after promotion boots normally instead of
+    # re-entering passive mode. Bridge clears the marker before creating
+    # each new green so the next upgrade gets a fresh passive cycle.
+    from pathlib import Path as _Path
+    _BG_PASSIVE_ENV = os.environ.get("TOUP_BG_PASSIVE") == "1"
+    _BG_MARKER = _Path("/app/workspace/.toup_bg_promoted")
+    _bg_passive_active = _BG_PASSIVE_ENV and not _BG_MARKER.exists()
+    if _bg_passive_active:
+        print("🟢 [BG_PASSIVE] Boot in passive mode — apps + Baileys WhatsApp deferred")
+    elif _BG_PASSIVE_ENV:
+        print("🟢 [BG_PASSIVE] Marker present, booting normally (post-promote restart)")
+
     # ── Startup ───────────────────────────────────────────────
     print("🤖 Toup Agent starting up...")
     _boot_progress.update(percent=5, phase="database")
@@ -585,14 +614,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"[INIT] AppManager construction failed: {e}", exc_info=True)
 
-        # Step 2: Restore previously-running apps (non-fatal)
-        if app_manager:
+        # Step 2: Restore previously-running apps (non-fatal).
+        # Skipped during blue-green passive boot — see _bg_passive_active
+        # comment at top of lifespan. Delayed-promote task below will
+        # restore apps after the old container has been removed and
+        # workspace lockfiles are released.
+        if app_manager and not _bg_passive_active:
             try:
                 restored = await app_manager.restore_on_startup(async_session_maker)
                 if restored:
                     print(f"📱 App Manager: restored {restored} running app(s)")
             except Exception as e:
                 logger.warning(f"[INIT] restore_on_startup failed (non-fatal, App Builder still available): {e}", exc_info=True)
+        elif app_manager and _bg_passive_active:
+            print("📱 [BG_PASSIVE] App restore deferred to post-promote phase")
 
         # Step 2b: Start app watchdog — TCP-probes each running app every
         # 30s and auto-revives any whose web server died. Without this, a
@@ -917,7 +952,7 @@ async def lifespan(app: FastAPI):
         else:
             _wa_mode = "qr_link"
 
-    if _wa_mode == "qr_link":
+    if _wa_mode == "qr_link" and not _bg_passive_active:
         try:
             from app.agent.channels.whatsapp_baileys import BaileysWhatsAppChannel
             from app.agent.channels.registry import ChannelRegistry
@@ -939,6 +974,10 @@ async def lifespan(app: FastAPI):
             print("📱 WhatsApp channel started (QR-link / Baileys sidecar)")
         except Exception as e:
             print(f"⚠️ WhatsApp QR-link error: {e}")
+    elif _wa_mode == "qr_link" and _bg_passive_active:
+        # Baileys' /app/workspace/.whatsapp_auth/ would contend with the
+        # still-running old container's auth state. Defer to post-promote.
+        print("📱 [BG_PASSIVE] WhatsApp Baileys deferred to post-promote phase")
     elif _wa_mode == "cloud_api" and settings.whatsapp_phone_number_id and settings.whatsapp_access_token:
         try:
             from app.agent.channels.whatsapp_channel import WhatsAppChannel
@@ -1122,6 +1161,70 @@ async def lifespan(app: FastAPI):
     print(f"   Health:  http://localhost:8001/agent/health")
     print(f"   Web UI:  https://toup.ai")
     print(f"   Press Ctrl+C to stop.\n")
+
+    # ── Blue-green delayed promote ────────────────────────────
+    # When this container booted in passive mode, schedule the
+    # workspace-touching initialisation we deferred. By the time this
+    # runs (~90 s), the bridge has cut Caddy over to us, drained, and
+    # removed the old container — workspace lockfiles are released so
+    # AppManager.restore_on_startup and Baileys' .whatsapp_auth/ open
+    # both succeed. Marker file ensures in-place restarts of THIS
+    # container after promotion boot normally.
+    if _bg_passive_active:
+        async def _bg_delayed_promote():
+            # 90 s = bridge's drain (10 s) + old kill + buffer.
+            # Tune via TOUP_BG_PROMOTE_DELAY_SEC if rollout timing changes.
+            delay = int(os.environ.get("TOUP_BG_PROMOTE_DELAY_SEC", "90"))
+            try:
+                await asyncio.sleep(delay)
+                print(f"🟢 [BG_PROMOTE] starting deferred init after {delay}s")
+
+                # Restore previously-running apps (the actual reason we
+                # gated boot — old container's Expo lockfiles are gone now).
+                if app_manager:
+                    try:
+                        restored = await app_manager.restore_on_startup(async_session_maker)
+                        print(f"🟢 [BG_PROMOTE] restored {restored} app(s)")
+                    except Exception as e:
+                        logger.warning(
+                            "[BG_PROMOTE] restore_on_startup failed (non-fatal): %s", e,
+                            exc_info=True,
+                        )
+
+                # Start WhatsApp Baileys if configured. Reuses the same
+                # restart helper used by tunnel_client config-sync, so
+                # the channel boots with the current settings snapshot.
+                try:
+                    if (settings.whatsapp_mode or "").strip().lower() == "qr_link":
+                        await restart_whatsapp_channel()
+                        print("🟢 [BG_PROMOTE] WhatsApp Baileys started")
+                except Exception as e:
+                    logger.warning(
+                        "[BG_PROMOTE] WhatsApp restart failed (non-fatal): %s", e,
+                        exc_info=True,
+                    )
+
+                # Write marker: future restarts of this container boot
+                # normally, NOT passive. Bridge clears the marker before
+                # creating the next green so it gets a fresh passive cycle.
+                try:
+                    _BG_MARKER.parent.mkdir(parents=True, exist_ok=True)
+                    _BG_MARKER.write_text(str(int(_time.time())))
+                    print(f"🟢 [BG_PROMOTE] marker written at {_BG_MARKER}")
+                except Exception as e:
+                    logger.warning("[BG_PROMOTE] marker write failed: %s", e)
+            except asyncio.CancelledError:
+                # Container shutting down before we finished — fine.
+                raise
+            except Exception as e:
+                logger.error("[BG_PROMOTE] unexpected error: %s", e, exc_info=True)
+
+        try:
+            app.state.bg_promote_task = asyncio.create_task(_bg_delayed_promote())
+            print("🟢 [BG_PASSIVE] Promote scheduled")
+        except Exception as e:
+            logger.warning("[BG_PASSIVE] could not schedule promote task: %s", e)
+
     yield
 
     # ── Shutdown (reverse order) ──────────────────────────────

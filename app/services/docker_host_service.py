@@ -626,6 +626,14 @@ async def upgrade_tenant_image(
 
     async with _bridge_client(timeout_s or settings.bridge_upgrade_timeout_s) as client:
         r = await client.post(endpoint, json=body)
+        if r.status_code == 404:
+            # Tenant has no container on the bridge — orphan. The bridge
+            # legitimately can't upgrade what doesn't exist; the rollout
+            # service should record the attempt as failed and SKIP the
+            # rollback (a rollback would just hit 422 since we have no
+            # valid prior_tag for an orphan). Surfaced as
+            # BridgeContainerNotFound so callers can branch cleanly.
+            raise BridgeContainerNotFound(prefix=prefix, raw=r.text[:200])
         if r.status_code == 503:
             try:
                 detail = r.json().get("detail", {})
@@ -664,6 +672,25 @@ class BridgeUpgradeUnhealthy(RuntimeError):
     def __init__(self, detail: dict):
         self.detail = detail
         super().__init__(f"bridge upgrade unhealthy: {detail}")
+
+
+class BridgeContainerNotFound(RuntimeError):
+    """Raised when bridge /upgrade returns 404 — no container exists for
+    this prefix. The tenant is orphaned (was deprovisioned without our
+    record being updated, or never provisioned). Rollback is impossible
+    because there's nothing to roll back to. Caller should mark the
+    attempt failed and skip the rollback path.
+
+    Caught 2026-05-10: tenant 9ef741e3 produced 422 on every rollback
+    because the rollout service was sending image_tag="unknown" (the
+    sentinel for missing prior_tag) which fails Pydantic validation
+    on the bridge.
+    """
+
+    def __init__(self, prefix: str, raw: str = ""):
+        self.prefix = prefix
+        self.raw = raw
+        super().__init__(f"bridge container not found for prefix={prefix}: {raw}")
 
 
 # ─── Post-provision soul sync (unchanged from Phase 2) ────────────

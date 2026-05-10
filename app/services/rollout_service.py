@@ -42,7 +42,7 @@ from app.db.models import (
     Rollout, RolloutAttempt,
 )
 from app.services.docker_host_service import (
-    upgrade_tenant_image, BridgeUpgradeUnhealthy,
+    upgrade_tenant_image, BridgeUpgradeUnhealthy, BridgeContainerNotFound,
 )
 
 logger = logging.getLogger(__name__)
@@ -303,6 +303,27 @@ async def _upgrade_one(
             attempt.completed_at = datetime.utcnow()
             await db.commit()
             return attempt
+        except BridgeContainerNotFound:
+            # Orphan tenant — bridge has no container for this prefix.
+            # Rollback would just hit 422 (we have no valid prior_tag for
+            # an orphan), so don't try it. Mark the attempt failed and
+            # send a single warning instead of a critical
+            # "AND rollback failed" alarm. Caught 2026-05-10 for
+            # tenant 9ef741e3 — it was producing critical alerts on
+            # every rollout because of the dual upgrade-then-rollback
+            # 422 path.
+            attempt.status = "failed"
+            attempt.error = "bridge: container not found (orphan tenant)"
+            attempt.duration_ms = int((time.time() - t0) * 1000)
+            attempt.completed_at = datetime.utcnow()
+            await db.commit()
+            await _send_telegram(
+                "warning",
+                f"Tenant <code>{container.user_id[:8]}</code> skipped — no container "
+                f"on bridge (orphan). Manual cleanup may be needed but no "
+                f"in-flight users are affected.",
+            )
+            return attempt
         except BridgeUpgradeUnhealthy as e:
             attempt.status = "failed"
             attempt.error = f"unhealthy after upgrade: {e.detail}"[:1000]
@@ -314,6 +335,28 @@ async def _upgrade_one(
             attempt.error = f"{type(e).__name__}: {str(e)[:1000]}"
             attempt.duration_ms = int((time.time() - t0) * 1000)
             await db.commit()
+
+        # Refuse to roll back without a real prior tag. `prior_tag` is
+        # set to the literal "unknown" sentinel when ManagedContainer
+        # has no recorded image_tag — sending that to the bridge fails
+        # the Pydantic image_tag validator (422) AND wastes a slot in
+        # the alert spam. Same fix family as BridgeContainerNotFound
+        # above; this catches the case where the container DOES exist
+        # but our DB never recorded what it's running.
+        if prior_tag == "unknown" or not prior_tag.startswith("ghcr.io/toup-com/toup-agent:"):
+            attempt.status = "failed"
+            attempt.error = (attempt.error or "") + (
+                f" | rollback skipped: prior_tag={prior_tag!r} not a valid"
+                f" GHCR tag — DB record missing or malformed"
+            )
+            attempt.completed_at = datetime.utcnow()
+            await db.commit()
+            await _send_telegram(
+                "warning",
+                f"Tenant <code>{container.user_id[:8]}</code> failed upgrade to "
+                f"<code>{new_tag}</code> — rollback skipped (no valid prior tag).",
+            )
+            return attempt
 
         # Failed — attempt rollback
         try:
