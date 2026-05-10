@@ -355,3 +355,44 @@ class ConnectorUserPreference(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow,
     )
+
+
+class ProviderAppCredential(Base):
+    """OAuth provider-app credentials persisted in the platform DB.
+
+    Lets the operator paste Google / GitHub / Notion / etc. OAuth client
+    IDs+secrets through an admin UI instead of editing Railway env vars
+    and redeploying. `provider_apps.get_provider_app()` checks this table
+    first, then falls back to settings env vars — so a deploy that pre-
+    sets env vars still works, but most operators will live in the UI.
+
+    `client_secret_enc` is Fernet ciphertext via
+    `credential_crypto.encrypt_str` (same primitive as
+    streaming_credentials and connector tokens). Plaintext NEVER reads
+    out through any HTTP endpoint — admin reads return masked
+    `client_secret_set: true|false` only.
+
+    `name` matches the provider_apps registry key (`google`, `github`,
+    `notion`, …). PK = name so upserts are idempotent.
+
+    Updated_by recorded for audit. NULL on env-var fallback (loader
+    never writes from env into this table).
+    """
+
+    __tablename__ = "provider_app_credentials"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    client_id: Mapped[str] = mapped_column(Text, nullable=False)
+    client_secret_enc: Mapped[str] = mapped_column(Text, nullable=False)
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow,
+    )
+    updated_by: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow,
+    )

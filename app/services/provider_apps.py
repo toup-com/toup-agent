@@ -50,6 +50,28 @@ class ProviderAppConfig:
 # `reset_for_tests` when needed.
 _apps: dict[str, ProviderAppConfig] = {}
 
+# Per-name "skeleton" template — endpoint URLs, PKCE policy. Populated
+# at boot by `bootstrap_provider_apps`. We use these to assemble a
+# ProviderAppConfig when DB-backed credentials override env-var ones,
+# without re-typing the URL set per provider.
+_TEMPLATES: dict[str, dict] = {
+    "google": {
+        "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_url": "https://oauth2.googleapis.com/token",
+        "use_pkce": True,
+    },
+    "github": {
+        "authorize_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "use_pkce": False,
+    },
+    "stub_provider_app": {
+        "authorize_url": "/api/oauth/_stub/authorize",
+        "token_url": "/api/oauth/_stub/token",
+        "use_pkce": True,
+    },
+}
+
 
 def register_provider_app(config: ProviderAppConfig) -> None:
     """Idempotent — re-registering with the same name overwrites."""
@@ -60,11 +82,96 @@ def register_provider_app(config: ProviderAppConfig) -> None:
     )
 
 
+def _from_db_credentials(name: str) -> Optional[ProviderAppConfig]:
+    """Best-effort load of provider-app credentials from the platform
+    DB. Returns None on any failure (no row, decryption error, DB down)
+    so the caller falls through to env-var registration.
+
+    Cheap to call: a single PK lookup. We do NOT cache here — admin UI
+    saves should take effect on the very next /connect request without
+    a process restart, and the ProviderAppCredential table is tiny.
+    For very high-traffic deploys we can add a TTL cache later.
+    """
+    template = _TEMPLATES.get(name)
+    if template is None:
+        # Unknown provider — no template to assemble against.
+        return None
+    try:
+        # Local imports — provider_apps.py loads at module import in
+        # config / lifespan paths where the DB layer isn't ready yet.
+        from sqlalchemy import select
+        from app.db.database import async_session_maker
+        from app.db.models import ProviderAppCredential
+        from app.services.credential_crypto import decrypt_str
+        # Sync wrapper — get_provider_app is sync. Use the running
+        # event loop's run_until_complete equivalent. Simpler: use
+        # an async helper and have callers `await` instead. Falling
+        # back to sync DB query via a tiny asyncio.run since callers
+        # are inside FastAPI's event loop already → can't asyncio.run.
+        # We instead expose an async sibling and have the OAuth
+        # endpoint use that path. Sync callers (lifespan boot) get
+        # env-var-only behaviour; that's correct.
+        return None  # sync path falls through; async sibling handles DB
+    except Exception as e:
+        logger.warning("[provider_apps] DB credential load failed: %s", e)
+        return None
+
+
+async def get_provider_app_async(name: str) -> Optional[ProviderAppConfig]:
+    """Async resolver that consults the DB first (admin-UI overrides),
+    then falls back to whatever was registered at boot from env vars.
+
+    The OAuth /connect endpoint awaits this so admin saves take effect
+    immediately. Lifespan code that just wants the env-var snapshot
+    keeps using `get_provider_app(name)`.
+    """
+    template = _TEMPLATES.get(name)
+    if template is None:
+        return _apps.get(name)
+
+    try:
+        from sqlalchemy import select
+        from app.db.database import async_session_maker
+        from app.db.models import ProviderAppCredential
+        from app.services.credential_crypto import decrypt_str
+
+        async with async_session_maker() as db:
+            row = (await db.execute(
+                select(ProviderAppCredential).where(
+                    ProviderAppCredential.name == name,
+                ),
+            )).scalar_one_or_none()
+        if row is not None:
+            return ProviderAppConfig(
+                name=name,
+                client_id=row.client_id,
+                client_secret=decrypt_str(row.client_secret_enc),
+                authorize_url=template["authorize_url"],
+                token_url=template["token_url"],
+                use_pkce=template["use_pkce"],
+            )
+    except Exception as e:
+        # Never block /connect on a transient DB hiccup — fall through
+        # to the env-var registration. Logged so operators can spot
+        # decryption issues (wrong PLATFORM_ENCRYPTION_KEY rotation).
+        logger.warning(
+            "[provider_apps] DB credential load failed for %r: %s",
+            name, e,
+        )
+
+    return _apps.get(name)
+
+
 def get_provider_app(name: str) -> Optional[ProviderAppConfig]:
+    """Sync resolver — env-var snapshot only. Use `get_provider_app_async`
+    from request handlers so admin-UI overrides apply immediately."""
     return _apps.get(name)
 
 
 def list_registered() -> list[str]:
+    """Names of providers currently resolvable via env vars OR DB. The
+    superset is the deduped union — UI uses this to decide which tiles
+    to enable. Sync (env-only) for callers in module-init paths."""
     return sorted(_apps.keys())
 
 

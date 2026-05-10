@@ -127,6 +127,10 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "connector_oauth_sessions",
     "connector_events",
     "connector_user_preferences",
+    # OAuth provider-app credentials (Google/GitHub/etc client_id+secret).
+    # Persisted in DB so the operator can paste them through the admin
+    # UI instead of editing env vars + redeploying.
+    "provider_app_credentials",
 }
 
 SHARED_TABLES: set[str] = {

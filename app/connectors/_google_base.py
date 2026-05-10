@@ -39,7 +39,7 @@ from app.connectors.base import (
     RefreshFailed,
     RefreshResult,
 )
-from app.services.provider_apps import get_provider_app
+from app.services.provider_apps import get_provider_app_async
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +70,11 @@ async def google_refresh(refresh_token: str) -> RefreshResult:
     underlying exception so the dispatcher's "unexpected refresh
     exception" branch fires.
     """
-    app_cfg = get_provider_app("google")
+    app_cfg = await get_provider_app_async("google")
     if app_cfg is None:
         raise RefreshFailed(
-            "google provider not registered — set GOOGLE_OAUTH_CLIENT_ID"
+            "google provider not registered — set credentials via "
+            "/admin/oauth-apps or GOOGLE_OAUTH_CLIENT_ID env var"
         )
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
         resp = await client.post(

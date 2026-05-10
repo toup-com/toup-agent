@@ -251,8 +251,8 @@ class GitHubProvider(BaseConnectorProvider):
         # basic-auth credentials, not the user's bearer. Best-effort:
         # if we can't reach it, the vault.disconnect will still zero
         # ciphertext and the user can revoke from github.com/settings.
-        from app.services.provider_apps import get_provider_app
-        cfg = get_provider_app("github")
+        from app.services.provider_apps import get_provider_app_async
+        cfg = await get_provider_app_async("github")
         if cfg is None or not access_token:
             return
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:

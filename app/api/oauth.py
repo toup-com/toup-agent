@@ -200,23 +200,28 @@ async def oauth_connect(
             detail=f"Unknown connector {connector_id!r}",
         )
 
-    # 2. Provider-app config lookup.
-    app_cfg = get_provider_app(entry.manifest.oauth.provider_app)
+    # 2. Provider-app config lookup. Async path checks the
+    #    provider_app_credentials DB table first (admin-UI saves take
+    #    effect immediately), then falls back to env-var registration.
+    from app.services.provider_apps import get_provider_app_async
+    app_cfg = await get_provider_app_async(entry.manifest.oauth.provider_app)
     if app_cfg is None:
-        provider = entry.manifest.oauth.provider_app
-        # Map provider name → the exact env vars the operator must set.
-        # Keeps the 503 actionable instead of generic "config missing".
-        env_hints = {
-            "google": "GOOGLE_OAUTH_CLIENT_ID + GOOGLE_OAUTH_CLIENT_SECRET",
-            "github": "GITHUB_OAUTH_CLIENT_ID + GITHUB_OAUTH_CLIENT_SECRET",
-        }
-        hint = env_hints.get(provider, f"{provider.upper()}_OAUTH_CLIENT_ID + ..._SECRET")
+        # Structured 503 — `provider` lets the frontend render the
+        # inline setup form for the right OAuth client without parsing
+        # the human message. `reason: "credentials_missing"` lets the
+        # client distinguish this case from a generic 503.
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                f"{entry.manifest.name} OAuth credentials not configured "
-                f"on the platform. Set {hint} and redeploy."
-            ),
+            detail={
+                "reason": "credentials_missing",
+                "provider": entry.manifest.oauth.provider_app,
+                "provider_label": entry.manifest.name,
+                "message": (
+                    f"{entry.manifest.name} OAuth credentials are not "
+                    f"configured yet. The platform owner can paste them "
+                    f"in the admin panel and you can connect immediately."
+                ),
+            },
         )
 
     # 3. PKCE + state.
@@ -347,7 +352,11 @@ async def oauth_callback(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="connector unknown",
         )
-    app_cfg = get_provider_app(entry.manifest.oauth.provider_app)
+    # Same DB-first lookup as /connect — admin saves between connect
+    # and callback take effect (they shouldn't, the OAuth state is
+    # 10-minute TTL, but consistency wins).
+    from app.services.provider_apps import get_provider_app_async
+    app_cfg = await get_provider_app_async(entry.manifest.oauth.provider_app)
     if app_cfg is None:
         await db.rollback()
         raise HTTPException(

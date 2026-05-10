@@ -13,6 +13,7 @@ from app.api.admin.system import router as system_router, set_bot_refs
 from app.api.admin.users import router as users_router, invite_router
 from app.api.admin.infrastructure import router as infra_router
 from app.api.admin.rollouts import router as rollouts_router
+from app.api.admin.provider_apps import router as provider_apps_router
 from app.api.admin.deps import require_admin
 
 # media_router (admin media-proxy metrics) is in-flight work for the
@@ -26,6 +27,7 @@ __all__ = [
     "invite_router",
     "infra_router",
     "rollouts_router",
+    "provider_apps_router",
     "set_bot_refs",
     "require_admin",
 ]
