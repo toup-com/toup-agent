@@ -163,17 +163,28 @@ class LLMService:
         max_retries = 3
         retry_delay = 1.0
 
-        from app.services.model_resolver import supports_custom_temperature
+        from app.services.model_resolver import (
+            supports_custom_temperature, uses_max_completion_tokens,
+        )
 
         for attempt in range(max_retries):
             try:
                 call_kwargs = dict(kwargs)
                 if supports_custom_temperature(model):
                     call_kwargs["temperature"] = temperature
+                # gpt-5.x + reasoning models reject `max_tokens` with HTTP 400
+                # and require `max_completion_tokens`. Older models (gpt-4o etc)
+                # only know `max_tokens`. Branch on model family — was breaking
+                # every LLM-backed memory extraction with a 400 since the
+                # gpt-5 default landed.
+                if max_tokens is not None:
+                    if uses_max_completion_tokens(model):
+                        call_kwargs["max_completion_tokens"] = max_tokens
+                    else:
+                        call_kwargs["max_tokens"] = max_tokens
                 response = await self._openai_client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    max_tokens=max_tokens,
                     **call_kwargs,
                 )
                 choice = response.choices[0]

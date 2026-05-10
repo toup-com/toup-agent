@@ -155,15 +155,31 @@ async def call_anthropic_system(
     output_tokens = 0
     text: Optional[str] = None
 
+    # Anthropic accepts two auth shapes:
+    #   - API keys (sk-ant-api03-…) → `x-api-key`
+    #   - OAuth tokens (sk-ant-oat01-…) → `Authorization: Bearer …` + beta
+    # Mismatch → 401 invalid x-api-key, which silently broke every internal
+    # Anthropic call (memory extraction, portrait, intent) for OAuth-mode
+    # tenants. Detection now matches the rest of the codebase.
+    is_oauth = isinstance(api_key, str) and api_key.startswith("sk-ant-oat")
+    if is_oauth:
+        ant_headers = {
+            "Authorization": f"Bearer {api_key}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+            "content-type": "application/json",
+        }
+    else:
+        ant_headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 _ANTHROPIC_URL,
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
+                headers=ant_headers,
                 json={
                     "model": model,
                     "max_tokens": max_tokens,

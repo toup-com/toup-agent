@@ -225,6 +225,26 @@ def supports_custom_temperature(model: str | None) -> bool:
     return True
 
 
+def uses_max_completion_tokens(model: str | None) -> bool:
+    """True for OpenAI reasoning models + gpt-5.x family — they reject the
+    classic `max_tokens` parameter with HTTP 400 ("Unsupported parameter:
+    'max_tokens' is not supported with this model. Use 'max_completion_tokens'
+    instead.") and require `max_completion_tokens` instead.
+
+    Callers should pass the OpenAI client kwarg conditionally:
+        kwarg = "max_completion_tokens" if uses_max_completion_tokens(model)
+                else "max_tokens"
+    """
+    if not model:
+        return False
+    m = model.lower()
+    if m.startswith(("o1", "o3", "o4")):
+        return True
+    if m.startswith("gpt-5"):
+        return True
+    return False
+
+
 # ── OAuth token detection ─────────────────────────────────────────────
 
 

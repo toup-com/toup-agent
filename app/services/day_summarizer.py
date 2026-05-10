@@ -333,15 +333,34 @@ async def _try_summarize(user_prompt: str) -> Tuple[Optional[str], str]:
 
     # Try Anthropic first (cheaper for this workload)
     if anthropic_key:
+        # Anthropic accepts two auth shapes:
+        #   - API keys (sk-ant-api03-…) → `x-api-key` header
+        #   - OAuth tokens (sk-ant-oat01-…) → `Authorization: Bearer …`
+        #     plus the claude-code/oauth beta header
+        # The summarizer was hardcoded to `x-api-key`, so OAuth tokens
+        # got rejected with 401 invalid x-api-key — silently routing
+        # everything through the OpenAI fallback (which masked the bug
+        # for weeks). Other call sites already detect the prefix
+        # (browser.py, ws_browser.py); the summarizer now matches.
+        is_oauth = anthropic_key.startswith("sk-ant-oat")
+        if is_oauth:
+            anthropic_headers = {
+                "Authorization": f"Bearer {anthropic_key}",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                "content-type": "application/json",
+            }
+        else:
+            anthropic_headers = {
+                "x-api-key": anthropic_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
                     "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": anthropic_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
+                    headers=anthropic_headers,
                     json={
                         "model": "claude-haiku-4-5-20251001",
                         "max_tokens": 1200,
