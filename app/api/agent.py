@@ -1,12 +1,14 @@
 """Agent API endpoints - for Toup agent to store and retrieve memories"""
 
 import json
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import List, Optional
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import desc, select, and_
 
 from app.db import get_db, Memory, Entity, EntityLink
+from app.db.models import AgentSecurityEvent, EVENT_AGENT_KEY_ROTATED
 from app.schemas import (
     AgentStoreRequest, AgentRecallRequest, AgentRecallResponse,
     AgentGraphRequest, AgentGraphResponse,
@@ -15,6 +17,7 @@ from app.schemas import (
 )
 from app.api.auth import get_current_user
 from app.api.memories import memory_to_response
+from app.config import settings
 from app.services.memory_service import MemoryService
 
 router = APIRouter(prefix="/agent", tags=["Agent API"])
@@ -260,5 +263,208 @@ async def get_memories_by_entity(
         .limit(limit)
     )
     memories = result.scalars().all()
-    
+
     return [memory_to_response(m) for m in memories]
+
+
+# ─── T0b: agent_api_key rotation ──────────────────────────────────────
+
+
+class RotateAgentKeyResponse(BaseModel):
+    new_agent_api_key: str
+    rotated_at: str  # ISO 8601 UTC
+    key_prefix: str  # First 8 chars for display
+
+
+class LastRotationResponse(BaseModel):
+    last_rotated_at: Optional[str] = None  # ISO 8601 UTC, or None if never
+
+
+@router.post("/rotate-key", response_model=RotateAgentKeyResponse)
+async def rotate_agent_key(
+    x_sensitive_action_token: Optional[str] = Header(default=None),
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rotate this user's `agent_api_key`.
+
+    Authentication chain:
+      1. The standard JWT/session auth identifies the user (`current_user`).
+      2. `X-Sensitive-Action-Token` carries a fresh `ROTATE_AGENT_KEY`-purpose
+         token issued by `POST /auth/reauth` with body
+         `{"purpose": "rotate_agent_key"}`. Single-use; replay-protected.
+
+    Effect:
+      * New `agent_api_key` is generated, persisted to `agent_configs`,
+        and pushed into the tenant container's env (via bridge recreate).
+      * The new container is verified by polling `/agent/health` with
+        the new key before this endpoint returns success.
+      * Active WS chat sessions disconnect when the old container is
+        killed by recreate. This is the desired behavior for a security
+        action — the user is told this on the confirm modal.
+      * On any failure (bridge recreate fails, verify times out), the
+        DB is rolled back to the old key and the bridge is restored to
+        the old env. The old key remains valid.
+
+    Response:
+      * The new key is returned EXACTLY ONCE in this response. The
+        client must display it for the user to copy and never request
+        it again. The DB does not persist any plaintext copy beyond
+        this row.
+    """
+    # Routing guard: agent_router is mounted on both platform and agent
+    # containers. Rotation only makes sense from the platform side
+    # (it pushes new env to the bridge, which the platform owns the
+    # mTLS cert for). On the agent process, surface a 404 so this
+    # endpoint is invisible to anyone probing the tenant URL.
+    if settings.run_mode == "agent":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not Found",
+        )
+    if not settings.enable_agent_key_rotation:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Agent key rotation is not enabled in this environment. "
+                "Contact the operator to flip ENABLE_AGENT_KEY_ROTATION."
+            ),
+        )
+
+    # Verify the sensitive-action token (replay-protected, purpose-bound).
+    from app.services.sensitive_action_token import (
+        SensitiveActionPurpose,
+        verify_sensitive_action_token,
+    )
+    await verify_sensitive_action_token(
+        db,
+        x_sensitive_action_token or "",
+        expected_user_id=str(current_user.id),
+        expected_purpose=SensitiveActionPurpose.ROTATE_AGENT_KEY,
+    )
+
+    # Atomic rotation. Raises AgentKeyRotationError on any failure;
+    # rollback (DB + bridge restore) is handled inside.
+    from app.services.agent_key_rotation import (
+        AgentKeyRotationError,
+        rotate_agent_api_key,
+    )
+    try:
+        result = await rotate_agent_api_key(db, str(current_user.id))
+    except AgentKeyRotationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(e),
+        )
+
+    return RotateAgentKeyResponse(
+        new_agent_api_key=result.new_agent_api_key,
+        rotated_at=result.rotated_at.isoformat() + "Z",
+        key_prefix=result.key_prefix,
+    )
+
+
+@router.get("/key-last-rotated", response_model=LastRotationResponse)
+async def get_last_key_rotation(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return when this user last rotated their agent_api_key, or None
+    if never. Drives the "Last rotated: X ago" line on /agent/settings."""
+    if settings.run_mode == "agent":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not Found",
+        )
+    row = (
+        await db.execute(
+            select(AgentSecurityEvent.occurred_at)
+            .where(AgentSecurityEvent.user_id == str(current_user.id))
+            .where(AgentSecurityEvent.event_type == EVENT_AGENT_KEY_ROTATED)
+            .order_by(desc(AgentSecurityEvent.occurred_at))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return LastRotationResponse(
+        last_rotated_at=(row.isoformat() + "Z") if row else None,
+    )
+
+
+# ─── T1h: connector tools cache invalidation ───────────────────────────
+
+
+class RefreshToolsResponse(BaseModel):
+    status: str
+    tool_count: int
+
+
+@router.put("/refresh-tools", response_model=RefreshToolsResponse)
+async def refresh_connector_tools(request: Request):
+    """T1h — Drop the agent's MCP tools cache and refetch immediately.
+
+    Called by the platform after an OAuth connect / disconnect so the
+    agent's tool list reflects the change without waiting for the 60s
+    TTL. Best-effort from the platform's side: if this 500s or times
+    out, the TTL is the safety net.
+
+    Auth model:
+      * Tenant agents have a unique `agent_api_key`. The platform
+        knows it (it minted it at provision time and pushes it into
+        the tenant container's env). The endpoint accepts the same
+        `X-Agent-Key` header the soul-sync path uses
+        (`app/api/soul.py:353`). Any other caller — JWT user, CSRF —
+        is rejected.
+      * Run-mode guard: only meaningful on agent containers
+        (`run_mode == "agent"`). On the platform process itself,
+        return 404 so the endpoint is invisible to anyone probing
+        `<platform>/api/agent/refresh-tools`.
+
+    Idempotent: multiple PUTs in quick succession are coalesced by
+    the cache's per-instance asyncio.Lock — only one MCP round-trip
+    fires regardless of how many platform callers race.
+    """
+    if settings.run_mode != "agent":
+        # On the platform, this endpoint is meaningless — there's no
+        # MCP tools cache here. Surface 404 so probers don't learn
+        # the endpoint exists.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not Found",
+        )
+
+    # X-Agent-Key auth — same primitive as soul.py:353. Reject if
+    # missing, malformed, or doesn't match the tenant's key.
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid agent key",
+        )
+
+    # Reach the cache via app.state. The agent's lifespan wires it
+    # there at boot if MCP discovery succeeded. If it's missing,
+    # the agent is in a degraded mode (no MCP client) — return 200
+    # with tool_count=0 so the platform's call site doesn't treat
+    # missing-cache as a failure (the platform already logs WARN on
+    # any non-200; a 200 with zero tools accurately reflects the
+    # agent's state).
+    cache = getattr(request.app.state, "mcp_tools_cache", None)
+    if cache is None:
+        return RefreshToolsResponse(status="no_cache", tool_count=0)
+
+    # Force an immediate refetch (bypasses TTL). Lock inside the cache
+    # coalesces concurrent platform notifications.
+    try:
+        await cache.refresh()
+    except Exception as e:
+        # Refetch failed — DB / network blip on the platform side.
+        # Cache.invalidate() ensures the next list_tools() retries.
+        cache.invalidate()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Refresh failed: {type(e).__name__}: {str(e)[:200]}",
+        )
+    return RefreshToolsResponse(
+        status="invalidated",
+        tool_count=len(cache.tools),
+    )

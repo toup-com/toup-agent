@@ -55,6 +55,7 @@ class SensitiveActionPurpose(StrEnum):
     """
 
     DELETE_ACCOUNT = "delete_account"
+    ROTATE_AGENT_KEY = "rotate_agent_key"
 
 
 # Default TTL — 5 minutes. The product reasoning: long enough for a

@@ -31,6 +31,16 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+# Bumped whenever the platform↔bridge contract changes shape — i.e. when
+# either `_agent_config_to_bridge_body` or `AgentEnvContract` adds/removes
+# a field. The bridge's own Pydantic AgentConfig model on the VPS must be
+# updated in lockstep, plus `bridge_schema_v<N>.json` regenerated.
+#
+# `tests/test_bridge_contract.py` enforces this — bumping the constant
+# without updating the snapshot (or vice versa) fails CI.
+BRIDGE_SCHEMA_VERSION = 1
+
+
 class AgentEnvContract(BaseModel):
     """Canonical env-var payload for a tenant agent container.
 

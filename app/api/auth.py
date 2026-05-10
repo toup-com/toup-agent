@@ -414,31 +414,47 @@ from app.services.user_deletion import (
 from dataclasses import asdict
 
 
+class ReauthRequest(BaseModel):
+    # Optional — defaults to delete_account so the existing mobile flow,
+    # which calls /reauth with no body, keeps working unchanged. New
+    # destructive endpoints pass the matching purpose explicitly.
+    purpose: Optional[str] = "delete_account"
+
+
 class ReauthResponse(BaseModel):
     sensitive_action_token: str
     expires_in: int
+    purpose: str
 
 
 @router.post("/reauth", response_model=ReauthResponse)
 async def reauth(
+    body: Optional[ReauthRequest] = None,
     current_user=Depends(get_current_user),
 ):
-    """Issue a 5-minute single-use sensitive-action token. Required
-    before destructive endpoints like /auth/delete-account. The
-    returned token is bound to the calling user's id and is invalid
-    for any other user or any other purpose.
+    """Issue a 5-minute single-use sensitive-action token, bound to the
+    calling user and to one specific destructive purpose.
 
-    Future destructive endpoints (rotate API keys, change billing
-    email, etc.) will share this issuance path with a different
-    `expected_purpose` parameter on verification.
+    Defaults to `delete_account` for backward compatibility with the
+    mobile delete-account flow that POSTs an empty body. New endpoints
+    pass `{"purpose": "<value>"}` explicitly.
     """
+    purpose_str = (body.purpose if body else None) or SensitiveActionPurpose.DELETE_ACCOUNT.value
+    try:
+        purpose = SensitiveActionPurpose(purpose_str)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown sensitive-action purpose: {purpose_str!r}",
+        )
     token, _exp = issue_sensitive_action_token(
         user_id=str(current_user.id),
-        purpose=SensitiveActionPurpose.DELETE_ACCOUNT,
+        purpose=purpose,
     )
     return ReauthResponse(
         sensitive_action_token=token,
         expires_in=DEFAULT_TTL_SECONDS,
+        purpose=purpose.value,
     )
 
 

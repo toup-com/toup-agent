@@ -1,0 +1,42 @@
+# Stub connector — test harness for T1c registry tests and T1d OAuth
+# flow tests. Excluded from production by `status: experimental`
+# (default load filters it out).
+#
+# NOTE on the name: the operator's T1c spec said `_stub` (underscore-
+# prefix) for the directory. The tool-name regex
+# `^[a-z][a-z0-9]*__[a-z0-9_]+$` requires letter-start, so an
+# underscore-prefixed manifest id wouldn't validate. Renamed to `stub`;
+# the experimental status filter is the actual production gate.
+manifest_version: 1
+id: stub
+name: Stub
+short_description: Test-only connector for the OAuth flow harness (T1d).
+status: experimental
+category: test
+
+oauth:
+  provider_app: stub_provider_app
+  scopes: []
+  scopes_optional: []
+  pkce: true
+  refresh: true
+
+health:
+  probe: stub__echo
+
+tools:
+  - name: stub__echo
+    description: Echo the input back. Used by tests to verify dispatch.
+    input_schema:
+      type: object
+      properties:
+        message:
+          type: string
+      required:
+        - message
+    mutates: false
+    elevation: false
+    output_redaction: []
+    channel_policy:
+      default: allow
+      deny: []

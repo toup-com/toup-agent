@@ -30,13 +30,35 @@ mcp = FastMCP(
 # ── Helper: resolve user_id from context ──────────────────────────────
 
 def _get_user_id() -> str:
-    """Get user_id from settings (set via AGENT_API_KEY → user binding).
+    """Resolve the MCP request's user_id.
 
-    In MCP mode, the Agent's USER_ID env var identifies the owner.
+    Primary path (post-T0c): the MCPAuthMiddleware (`app/mcp_auth.py`)
+    validated the request's X-Agent-Key against `agent_configs` and bound
+    the user_id to a contextvar. We read it here.
+
+    Fallback path: `settings.user_id` is set on agent-side processes that
+    happen to import this module (currently no such caller exists, but
+    the constant is retained so this resolver doesn't break if one
+    appears). On the platform process `settings.user_id` is always
+    empty — so without middleware binding, this raises ValueError, which
+    FastMCP serialises as a clean tool-call error.
+
+    The failure mode during warn-only soak: an unauthenticated MCP call
+    reaches a tool handler, `get_mcp_user_id()` raises, the client sees
+    a structured error. That's the correct behavior — we want
+    unauthenticated callers to fail loudly with a clear reason, not
+    silently return wrong-tenant data (the pre-T0c bug).
     """
-    if settings.user_id:
-        return settings.user_id
-    raise ValueError("USER_ID not configured — cannot identify user for MCP operations")
+    from app.mcp_auth import get_mcp_user_id
+
+    try:
+        return get_mcp_user_id()
+    except ValueError:
+        # No middleware-bound user. Fall back to the legacy single-tenant
+        # path only if settings.user_id is set (agent-side processes).
+        if settings.user_id:
+            return settings.user_id
+        raise
 
 
 # ── Memory Tools ──────────────────────────────────────────────────────

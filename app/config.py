@@ -276,6 +276,74 @@ class Settings(BaseSettings):
     # while bounding the rollout pipeline's per-tenant time.
     blue_green_drain_timeout_s: int = 60
 
+    # ── MCP transport auth (T0c) ─────────────────────────────
+    # When False (default), the platform MCP server logs unauthenticated
+    # requests as warnings but lets them through. When True, missing or
+    # invalid X-Agent-Key returns 401 from the transport before any tool
+    # dispatch. Flip to True only after a clean staging soak shows zero
+    # warn-only rejections (per docs/integrations/02-rollout.md T0c).
+    mcp_require_x_agent_key: bool = False
+
+    # ── Agent-key rotation primitive (T0b) ──────────────────
+    # When False (default), POST /api/agent/rotate-key returns 503. Flip
+    # to True after the smoke matrix in docs/integrations/02-rollout.md
+    # T0b passes (rotate while WS active → clean disconnect; bridge fail
+    # → DB rollback; replay token rejected; etc.).
+    enable_agent_key_rotation: bool = False
+    # Total time we'll spend polling the new container's /agent/health
+    # with the new X-Agent-Key after rotation, before declaring failure
+    # and rolling back. 12s is empirically enough for a bridge recreate
+    # (~2-5s) plus FastAPI lifespan boot (~3-5s) on Contabo.
+    agent_key_rotation_verify_timeout_s: int = 12
+    agent_key_rotation_verify_retry_interval_s: float = 2.0
+
+    # ── Connector OAuth (T1d) ────────────────────────────────
+    # When False (default), POST /api/oauth/connect/<id> and
+    # /api/oauth/disconnect/<id> return 503. /api/oauth/callback always
+    # responds (provider hits it asynchronously). Flip to True per
+    # docs/integrations/02-rollout.md T1d once stub round-trip is green.
+    enable_connector_oauth: bool = False
+
+    # ── Connector dispatch (T1g — closes the agent→platform loop) ──
+    # When False (default), the agent does NOT advertise connector tools
+    # to the LLM and the tool_executor's MCP branch is unreachable. The
+    # X-Agent-Key + X-Toup-Channel headers are still injected on every
+    # MCP request — harmless overhead, makes flip-on instantaneous. When
+    # True, connector tool names are merged into the agent's current
+    # tool list, the LLM can emit tool_use for them, the executor
+    # dispatches via FastMCP to the platform, and the platform's T1f
+    # registration runs the dispatcher. Flip per `docs/integrations/
+    # 02-rollout.md` T5d (staging dogfood allowlist first).
+    use_connector_dispatch: bool = False
+
+    # T3a — Google OAuth client. One client backs Gmail + Calendar +
+    # Drive (architecture §6.1). Without both set the provider app
+    # silently doesn't register and Google connectors are skipped at
+    # registry-load time. Required for the Google verification path
+    # in `docs/integrations/google-verification.md`.
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+
+    # T4a — GitHub OAuth client. PKCE off (provider doesn't support
+    # it on the standard OAuth app type — see provider_apps.py).
+    github_oauth_client_id: str = ""
+    github_oauth_client_secret: str = ""
+
+    # HMAC-SHA256 signing key for the OAuth state token (architecture D2).
+    # Independent from jwt_secret so rotating it doesn't log out users.
+    # Generate via `secrets.token_urlsafe(32)`. Required when
+    # enable_connector_oauth=True; assert at platform lifespan.
+    oauth_state_secret: str = ""
+    # State token TTL — 10 minutes per architecture §3.1. Long enough to
+    # walk through Google's consent screen unhurried, short enough that
+    # a captured state is rapidly unredeemable.
+    oauth_state_ttl_seconds: int = 600
+    # Where Google/GitHub/etc. redirect the browser after consent.
+    # MUST exact-match the redirect_uri registered in each provider's
+    # OAuth-app config (per docs/integrations/google-verification.md §3.2).
+    # Override in tests via env.
+    oauth_callback_url: str = "https://app.toup.ai/api/oauth/callback"
+
     # ── VPS Provisioning (AWS + Stripe) ──────────────────────
     aws_access_key_id: Optional[str] = None        # Set via AWS_ACCESS_KEY_ID
     aws_secret_access_key: Optional[str] = None    # Set via AWS_SECRET_ACCESS_KEY

@@ -792,31 +792,67 @@ async def lifespan(app: FastAPI):
     print("🔌 Hook bus started")
 
     # ── MCP Client (connect to Platform MCP server) ──────────
+    # T1g: re-add X-Agent-Key + X-Toup-Channel auth via httpx.Auth so
+    # the platform's T0c middleware can resolve the user_id and T1f's
+    # connector_mcp filter can scope the per-user tool list. Channel
+    # is injected per-call from a ContextVar set by the tool_executor;
+    # boot-time list_tools calls default to "web".
+    #
+    # T1h: wrap the client in MCPToolsCache so list_tools() round-trips
+    # are bounded by a 60s TTL. The tool_executor reads the sync attrs
+    # the cache maintains; the periodic refresh task keeps them warm;
+    # PUT /api/agent/refresh-tools (this module's app) forces an
+    # immediate refetch when the platform pushes a connect/disconnect.
     mcp_client = None
+    mcp_tools_cache = None
     if settings.platform_api_url and settings.agent_api_key:
         try:
             from fastmcp import Client as MCPClient
+            from app.agent.mcp_client_auth import AgentMCPAuth
+            from app.agent.mcp_tools_cache import (
+                MCPToolsCache,
+                periodic_refresh_loop,
+            )
 
             mcp_url = f"{settings.platform_api_url}/mcp"
-            mcp_client = MCPClient(mcp_url)
+            mcp_client = MCPClient(
+                mcp_url,
+                auth=AgentMCPAuth(settings.agent_api_key),
+            )
+            mcp_tools_cache = MCPToolsCache(mcp_client)
 
-            # List available MCP tools (non-blocking discovery)
+            # Boot-time discovery — primes the cache so the first turn
+            # doesn't pay a TTL miss. Errors are swallowed; the
+            # periodic refresh task will retry every 60s.
             try:
-                async with mcp_client:
-                    tools = await mcp_client.list_tools()
-                    tool_names = [t.name for t in tools]
-                    print(f"🔗 MCP connected ({len(tool_names)} tools): {tool_names}")
-
-                    # Register MCP tools with the agent's tool executor
-                    if tool_executor:
-                        tool_executor.mcp_client = mcp_client
-                        tool_executor.mcp_tools = tool_names
+                await mcp_tools_cache.refresh()
+                print(
+                    f"🔗 MCP connected ({len(mcp_tools_cache.tools)} tools): "
+                    f"{mcp_tools_cache.tools}"
+                )
             except Exception as e:
                 print(f"⚠️ MCP tool discovery failed (will retry on use): {e}")
-                # Store client anyway — tools can be discovered lazily
-                if tool_executor:
-                    tool_executor.mcp_client = mcp_client
-                    tool_executor.mcp_tools = []
+
+            # Wire the cache into the executor BEFORE starting the
+            # periodic loop — the loop refreshes the cache, which the
+            # executor reads via the same attributes T1g already
+            # consumes.
+            if tool_executor:
+                tool_executor.mcp_client = mcp_client
+                tool_executor.mcp_tools_cache = mcp_tools_cache
+                tool_executor.mcp_tools = mcp_tools_cache.tools
+                tool_executor.mcp_tool_defs = mcp_tools_cache.tool_defs
+
+            # Periodic refresh task — keeps the sync snapshot fresh
+            # without every turn paying the cache-miss cost. Stored on
+            # app.state so a graceful shutdown can cancel it.
+            app.state.mcp_refresh_task = asyncio.create_task(
+                periodic_refresh_loop(mcp_tools_cache),
+                name="mcp_tools_periodic_refresh",
+            )
+            # Expose the cache on app.state so the refresh-tools
+            # endpoint can reach it without re-importing globals.
+            app.state.mcp_tools_cache = mcp_tools_cache
         except ImportError:
             print("⚠️ fastmcp not installed — MCP client disabled")
         except Exception as e:

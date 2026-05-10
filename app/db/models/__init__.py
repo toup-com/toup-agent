@@ -63,6 +63,39 @@ from .deletion import (
     DELETION_STATUSES, DELETION_ACTORS,
 )
 
+# Per-tenant security audit (T0b) — agent_api_key rotation, future
+# connector quarantine, future security primitives. Append-only.
+from .security import (
+    AgentSecurityEvent,
+    EVENT_AGENT_KEY_ROTATED,
+    EVENT_AGENT_KEY_ROTATION_FAILED,
+)
+
+# Third-party connector vault (T1a). Platform-only.
+from .connectors import (
+    ConnectorIdentity,
+    ConnectorOAuthSession,
+    ConnectorEvent,
+    ConnectorUserPreference,
+    CONNECTOR_IDENTITY_STATUSES,
+    EVENT_CONNECTED,
+    EVENT_DISCONNECTED,
+    EVENT_REAUTH_STARTED,
+    EVENT_REAUTH_COMPLETED,
+    EVENT_REFRESH_SUCCEEDED,
+    EVENT_REFRESH_FAILED,
+    EVENT_TOOL_CALLED,
+    EVENT_TOOL_SUCCEEDED,
+    EVENT_TOOL_FAILED,
+    EVENT_TOOL_ELEVATION_REQUIRED,
+    EVENT_REVOCATION_PROVIDER_SUCCEEDED,
+    EVENT_REVOCATION_PROVIDER_FAILED,
+    EVENT_HEALTH_PROBE_SUCCEEDED,
+    EVENT_HEALTH_PROBE_FAILED,
+    EVENT_FORCE_QUARANTINED,
+    EVENT_FORCE_RELEASED,
+)
+
 __all__ = [
     # Base
     "Base", "Vector",
@@ -86,4 +119,16 @@ __all__ = [
     "DayChat", "ContextBudgetLog", "MigrationStatus",
     "DeletionAuditEvent", "SensitiveActionRedemption",
     "DELETION_STATUSES", "DELETION_ACTORS",
+    "AgentSecurityEvent",
+    "EVENT_AGENT_KEY_ROTATED", "EVENT_AGENT_KEY_ROTATION_FAILED",
+    "ConnectorIdentity", "ConnectorOAuthSession", "ConnectorEvent",
+    "ConnectorUserPreference", "CONNECTOR_IDENTITY_STATUSES",
+    "EVENT_CONNECTED", "EVENT_DISCONNECTED",
+    "EVENT_REAUTH_STARTED", "EVENT_REAUTH_COMPLETED",
+    "EVENT_REFRESH_SUCCEEDED", "EVENT_REFRESH_FAILED",
+    "EVENT_TOOL_CALLED", "EVENT_TOOL_SUCCEEDED", "EVENT_TOOL_FAILED",
+    "EVENT_TOOL_ELEVATION_REQUIRED",
+    "EVENT_REVOCATION_PROVIDER_SUCCEEDED", "EVENT_REVOCATION_PROVIDER_FAILED",
+    "EVENT_HEALTH_PROBE_SUCCEEDED", "EVENT_HEALTH_PROBE_FAILED",
+    "EVENT_FORCE_QUARANTINED", "EVENT_FORCE_RELEASED",
 ]

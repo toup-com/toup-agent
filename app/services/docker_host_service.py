@@ -669,6 +669,73 @@ class BridgeUpgradeUnhealthy(RuntimeError):
 # ─── Post-provision soul sync (unchanged from Phase 2) ────────────
 
 
+async def refresh_tenant_tools(db: AsyncSession, user_id: str) -> bool:
+    """T1h — Notify a user's tenant agent that its connector tools
+    cache must be invalidated immediately.
+
+    Called by the OAuth callback (after `vault.put` + audit) and the
+    OAuth disconnect handler (after `vault.disconnect` + audit). The
+    agent's `PUT /api/agent/refresh-tools` drops its 60s TTL cache
+    and refetches via the platform's per-user filtered tools/list.
+
+    Best-effort:
+      * 3-second timeout — the user is waiting for the OAuth flow to
+        complete. If a tenant container is slow or down, we bail and
+        the cache's 60s TTL becomes the safety net.
+      * Failure logs WARN, returns False. NEVER raises — the OAuth
+        flow must succeed regardless of whether this notification
+        lands. The cache will self-heal on the next TTL tick.
+      * Returns True on 2xx, False on anything else (including no
+        AgentConfig row, missing agent_url, missing key).
+    """
+    import httpx as _httpx
+    from app.db.models import AgentConfig
+
+    cfg = (
+        await db.execute(
+            select(AgentConfig).where(AgentConfig.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+    if cfg is None or not cfg.agent_url or not cfg.agent_api_key:
+        # Self-hosted agents (no managed AgentConfig) and
+        # mid-provisioning users (no agent_url yet) both land here.
+        # Not an error — just nothing to notify.
+        logger.info(
+            "[refresh_tools] no agent_url/key for user=%s — skipping notify",
+            user_id[:8],
+        )
+        return False
+
+    url = f"{cfg.agent_url.rstrip('/')}/api/agent/refresh-tools"
+    try:
+        async with _httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.put(
+                url,
+                headers={"X-Agent-Key": cfg.agent_api_key},
+            )
+        if 200 <= resp.status_code < 300:
+            logger.info(
+                "[refresh_tools] notified user=%s (status=%d)",
+                user_id[:8], resp.status_code,
+            )
+            return True
+        logger.warning(
+            "[refresh_tools] tenant returned %d for user=%s — "
+            "TTL is the safety net (body=%s)",
+            resp.status_code, user_id[:8], resp.text[:200],
+        )
+        return False
+    except Exception as e:
+        # Timeout, DNS fail, container down — log + move on. The
+        # cache's 60s TTL will pick up the change on its own.
+        logger.warning(
+            "[refresh_tools] notify failed for user=%s: %s — "
+            "TTL is the safety net",
+            user_id[:8], e,
+        )
+        return False
+
+
 async def _sync_soul_after_start(
     user_id: str, agent_url: str, agent_api_key: str, db_session_maker=None,
 ):

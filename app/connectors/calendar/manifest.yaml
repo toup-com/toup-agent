@@ -1,0 +1,125 @@
+# T3c — Google Calendar connector manifest.
+manifest_version: 1
+id: calendar
+name: Google Calendar
+short_description: List events, check availability, and create meetings on your primary calendar.
+icon: calendar
+docs_url: https://developers.google.com/calendar/api/v3/reference
+status: stable
+category: productivity
+
+oauth:
+  provider_app: google
+  scopes:
+    - https://www.googleapis.com/auth/calendar.events
+  scopes_optional:
+    - https://www.googleapis.com/auth/calendar.readonly
+  pkce: true
+  refresh: true
+
+scope_descriptions:
+  https://www.googleapis.com/auth/calendar.events: Create, edit, and delete events on your calendars.
+  https://www.googleapis.com/auth/calendar.readonly: Read events without creating or modifying any.
+
+health:
+  probe: calendar__list_events
+
+tools:
+  - name: calendar__list_events
+    description: List upcoming events on the primary calendar within a time window.
+    input_schema:
+      type: object
+      properties:
+        time_min:
+          type: string
+          description: ISO timestamp (lower bound, inclusive).
+        time_max:
+          type: string
+          description: ISO timestamp (upper bound, exclusive).
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+        query:
+          type: string
+          description: Free-text search across event fields.
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["description", "attendees"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: calendar__create_event
+    description: Create a new event on the primary calendar. Times accept ISO timestamps with timezone.
+    input_schema:
+      type: object
+      properties:
+        summary:
+          type: string
+        start:
+          type: string
+          description: ISO 8601 start (e.g. "2026-05-15T14:00:00-07:00").
+        end:
+          type: string
+          description: ISO 8601 end. Must be after start.
+        description:
+          type: string
+        attendees:
+          type: array
+          items:
+            type: string
+            description: Email address.
+        location:
+          type: string
+      required: [summary, start, end]
+    mutates: true
+    elevation: true
+    output_redaction: ["description", "attendees"]
+    pii: high
+    rate_limit: "20/min"
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: calendar__check_availability
+    description: Return free/busy intervals for a list of calendars across a time window.
+    input_schema:
+      type: object
+      properties:
+        time_min:
+          type: string
+        time_max:
+          type: string
+        calendars:
+          type: array
+          items: { type: string }
+          description: Calendar ids; defaults to primary.
+      required: [time_min, time_max]
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: calendar__delete_event
+    description: Delete an event by id from the primary calendar.
+    input_schema:
+      type: object
+      properties:
+        event_id:
+          type: string
+      required: [event_id]
+    mutates: true
+    elevation: true
+    output_redaction: []
+    pii: medium
+    rate_limit: "20/min"
+    channel_policy:
+      default: allow
+      deny: []

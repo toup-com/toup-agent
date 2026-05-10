@@ -1,0 +1,119 @@
+# T3b — Gmail connector manifest.
+#
+# Tool surface kept tight: list, get, send, search. No labels/drafts
+# in v1 — the agent can express those as natural-language asks and
+# we'll add them when we see real demand.
+#
+# Channel policy: send_message is mutating (default-deny on voice and
+# Telegram via the dispatcher's _MUTATES_DEFAULT_DENY_CHANNELS).
+# Reads (list, get, search) allowed everywhere.
+manifest_version: 1
+id: gmail
+name: Gmail
+short_description: Read your inbox, search threads, and send messages from your Gmail account.
+icon: mail
+docs_url: https://developers.google.com/gmail/api
+status: stable
+category: productivity
+
+oauth:
+  provider_app: google
+  scopes:
+    - https://www.googleapis.com/auth/gmail.readonly
+    - https://www.googleapis.com/auth/gmail.send
+  scopes_optional: []
+  pkce: true
+  refresh: true
+
+scope_descriptions:
+  https://www.googleapis.com/auth/gmail.readonly: Read your Gmail messages, threads, and labels.
+  https://www.googleapis.com/auth/gmail.send: Send mail on your behalf. We never store the body of messages you send beyond your audit log.
+
+health:
+  probe: gmail__list_messages
+
+tools:
+  - name: gmail__list_messages
+    description: List recent Gmail messages, optionally filtered by Gmail's search query syntax (e.g. "from:alice newer_than:7d").
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Gmail search query syntax. Empty string = inbox.
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["snippet", "body"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: gmail__get_message
+    description: Fetch the full body, headers, and metadata of one Gmail message by id.
+    input_schema:
+      type: object
+      properties:
+        message_id:
+          type: string
+      required: [message_id]
+    mutates: false
+    elevation: false
+    output_redaction: ["body"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: gmail__send_message
+    description: Compose and send a Gmail message. Subject and body are required.
+    input_schema:
+      type: object
+      properties:
+        to:
+          type: string
+          description: Recipient email address.
+        subject:
+          type: string
+        body:
+          type: string
+        cc:
+          type: string
+        bcc:
+          type: string
+      required: [to, subject, body]
+    mutates: true
+    elevation: true
+    output_redaction: ["body", "cc", "bcc"]
+    pii: high
+    rate_limit: "10/min"
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: gmail__search_threads
+    description: Search Gmail threads matching a query, returning thread metadata + first-message snippets.
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 25
+          default: 10
+      required: [query]
+    mutates: false
+    elevation: false
+    output_redaction: ["snippet"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []

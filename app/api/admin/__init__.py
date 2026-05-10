@@ -13,6 +13,7 @@ from app.api.admin.system import router as system_router, set_bot_refs
 from app.api.admin.users import router as users_router, invite_router
 from app.api.admin.infrastructure import router as infra_router
 from app.api.admin.rollouts import router as rollouts_router
+from app.api.admin.media import router as media_router
 from app.api.admin.deps import require_admin
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "invite_router",
     "infra_router",
     "rollouts_router",
+    "media_router",
     "set_bot_refs",
     "require_admin",
 ]

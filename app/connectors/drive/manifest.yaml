@@ -1,0 +1,83 @@
+# T3d — Google Drive connector manifest.
+manifest_version: 1
+id: drive
+name: Google Drive
+short_description: Find files, read text content, and create new docs in your Drive.
+icon: cloud
+docs_url: https://developers.google.com/drive/api/v3/reference
+status: stable
+category: productivity
+
+oauth:
+  provider_app: google
+  scopes:
+    - https://www.googleapis.com/auth/drive.file
+  scopes_optional:
+    - https://www.googleapis.com/auth/drive.readonly
+  pkce: true
+  refresh: true
+
+scope_descriptions:
+  https://www.googleapis.com/auth/drive.file: Read and write files the agent creates or that you explicitly share with it.
+  https://www.googleapis.com/auth/drive.readonly: Read every file in your Drive (broad read access; only enable if you want full search).
+
+health:
+  probe: drive__list_files
+
+tools:
+  - name: drive__list_files
+    description: List Drive files matching an optional query string (Drive search syntax).
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: 'Drive search query (e.g. "mimeType=''application/pdf''").'
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: drive__get_file_text
+    description: Fetch the text content of a Drive file by id. Works for plain text, Google Docs (exported as plain text), and PDFs (Drive returns indexed text).
+    input_schema:
+      type: object
+      properties:
+        file_id:
+          type: string
+      required: [file_id]
+    mutates: false
+    elevation: false
+    output_redaction: ["text"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: drive__create_doc
+    description: Create a Google Doc with the given title and body text, in the user's Drive root.
+    input_schema:
+      type: object
+      properties:
+        title:
+          type: string
+        body:
+          type: string
+      required: [title, body]
+    mutates: true
+    elevation: true
+    output_redaction: ["body"]
+    pii: high
+    rate_limit: "10/min"
+    channel_policy:
+      default: allow
+      deny: []

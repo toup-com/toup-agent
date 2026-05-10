@@ -92,6 +92,12 @@ patchright>=1.0.0  # Drop-in Playwright replacement that bypasses CDP detection
 # MCP Server
 fastmcp==2.9.2
 
+# Connector manifests (T1c+) — declarative YAML config for third-party
+# integrations under app/connectors/<id>/manifest.yaml. Already pulled
+# in transitively by other deps; pinning explicitly because the
+# connector_registry hard-imports it.
+PyYAML>=6.0
+
 # Smart Fetch (API-first search, page reading, video search)
 trafilatura>=2.0.0
 yt-dlp>=2025.1.0

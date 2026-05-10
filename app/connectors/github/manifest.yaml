@@ -1,0 +1,138 @@
+# T4a — GitHub connector manifest.
+manifest_version: 1
+id: github
+name: GitHub
+short_description: Browse repositories, read issues and PRs, and leave comments.
+icon: github
+docs_url: https://docs.github.com/en/rest
+status: stable
+category: developer
+
+oauth:
+  provider_app: github
+  scopes:
+    - read:user
+    - repo
+  scopes_optional:
+    - read:org
+  pkce: false  # provider doesn't support PKCE on standard OAuth apps
+  refresh: false  # GitHub access tokens don't expire (until revoked)
+
+scope_descriptions:
+  repo: Read and write to your repositories (public + private).
+  read:user: Read your basic profile + email.
+  read:org: Read your organization memberships.
+
+health:
+  probe: github__list_repos
+
+tools:
+  - name: github__list_repos
+    description: List repositories you have access to.
+    input_schema:
+      type: object
+      properties:
+        visibility:
+          type: string
+          enum: [all, public, private]
+          default: all
+        sort:
+          type: string
+          enum: [created, updated, pushed, full_name]
+          default: pushed
+        per_page:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 30
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: github__get_issue
+    description: Fetch one issue (or pull request) by owner/repo/number.
+    input_schema:
+      type: object
+      properties:
+        owner: { type: string }
+        repo: { type: string }
+        number: { type: integer }
+      required: [owner, repo, number]
+    mutates: false
+    elevation: false
+    output_redaction: ["body"]
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: github__list_issues
+    description: List open issues for a repo (excludes pull requests).
+    input_schema:
+      type: object
+      properties:
+        owner: { type: string }
+        repo: { type: string }
+        state:
+          type: string
+          enum: [open, closed, all]
+          default: open
+        per_page:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 30
+      required: [owner, repo]
+    mutates: false
+    elevation: false
+    output_redaction: ["body"]
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: github__create_comment
+    description: Post a comment on an issue or pull request.
+    input_schema:
+      type: object
+      properties:
+        owner: { type: string }
+        repo: { type: string }
+        number: { type: integer }
+        body: { type: string }
+      required: [owner, repo, number, body]
+    mutates: true
+    elevation: true
+    output_redaction: ["body"]
+    pii: low
+    rate_limit: "20/min"
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: github__search_code
+    description: Search code across all accessible repos using GitHub's code search.
+    input_schema:
+      type: object
+      properties:
+        q:
+          type: string
+          description: Code search query (e.g. 'org:acme path:**/api/auth').
+        per_page:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 20
+      required: [q]
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []

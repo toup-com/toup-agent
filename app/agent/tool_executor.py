@@ -287,7 +287,11 @@ class ToolExecutor:
           0. Check tool policy (deny list blocks, elevated list logs warning)
           1. Built-in tool handler (_tool_<name>)
           2. Skill tool (if skill_loader recognises the name)
-          3. ERROR: Unknown tool
+          3. MCP connector tool (T1g — only when use_connector_dispatch=True
+             AND the agent has an mcp_client AND the tool is in mcp_tools).
+             Skills WIN over MCP intentionally — a skill that ships in-tree
+             must never be shadowed by a connector.
+          4. ERROR: Unknown tool
         """
         # ── Tool Policy Enforcement ──────────────────────────
         if tool_name in settings.tool_deny_list:
@@ -317,6 +321,23 @@ class ToolExecutor:
                     chat_id=self._chat_id,
                 )
                 result = await self.skill_loader.execute_tool(tool_name, tool_input, ctx)
+            elif (
+                settings.use_connector_dispatch
+                and getattr(self, "mcp_client", None) is not None
+                and tool_name in getattr(self, "mcp_tools", set())
+            ):
+                # T1g — connector tool dispatch via FastMCP. Auth headers
+                # (X-Agent-Key, X-Toup-Channel) are injected by the
+                # AgentMCPAuth class wired in agent_main.py; we set the
+                # channel ContextVar around the call so the Auth picks
+                # up THIS turn's channel.
+                try:
+                    result = await asyncio.wait_for(
+                        self._dispatch_mcp_tool(tool_name, tool_input),
+                        timeout=tool_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    return f"ERROR: Tool '{tool_name}' timed out after {tool_timeout}s"
             else:
                 return f"ERROR: Unknown tool '{tool_name}'"
 
@@ -330,6 +351,93 @@ class ToolExecutor:
         except Exception as exc:
             logger.exception(f"Tool {tool_name} raised")
             return f"ERROR: {type(exc).__name__}: {exc}"
+
+    async def _dispatch_mcp_tool(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+    ) -> str:
+        """T1g — Run one connector tool via the MCP client.
+
+        Returns the canonicalized string the agent's tool_result loop
+        expects. ConnectorResult variants (T1f's `_serialize_result`)
+        come back as `{kind, message, ...}` dicts — we pass `content`
+        through unchanged for `ok`, and lift the `message` field for
+        every error variant so the LLM gets a clean line to react to.
+
+        Connection lifecycle: each call opens an `async with` block on
+        the persistent MCP client. FastMCP handles re-use across
+        contiguous calls; the cost of repeated context entry is
+        negligible compared to the network round-trip.
+        """
+        from app.agent.mcp_client_auth import (
+            reset_pending_channel,
+            set_pending_channel,
+        )
+
+        channel = self._current_channel or "web"
+        token = set_pending_channel(channel)
+        try:
+            async with self.mcp_client:
+                call_result = await self.mcp_client.call_tool(tool_name, tool_input)
+        finally:
+            reset_pending_channel(token)
+
+        return self._canonicalize_mcp_result(tool_name, call_result)
+
+    @staticmethod
+    def _canonicalize_mcp_result(tool_name: str, call_result: Any) -> str:
+        """Convert FastMCP's CallToolResult to the agent's string shape.
+
+        FastMCP returns a `CallToolResult` with a `content` list (text
+        blocks) and optionally a `structured_content` dict (the dict
+        our T1f handler returned: `{kind, message, ...}` or
+        `{kind: 'ok', content: '...'}`).
+
+        Strategy:
+          - If we can get the structured dict and it looks like a T1f
+            envelope, lift `kind=ok → content`, otherwise lift
+            `message` (LLM-friendly).
+          - Fallback: concatenate text blocks. Worst case: empty
+            string (the LLM sees a blank result, which is at least
+            well-shaped).
+        """
+        envelope: Optional[Dict[str, Any]] = None
+        structured = getattr(call_result, "structured_content", None) or getattr(
+            call_result, "structuredContent", None
+        )
+        if isinstance(structured, dict):
+            envelope = structured
+            # FastMCP wraps return-dict in {"result": <dict>} on some
+            # versions — unwrap if that shape comes back.
+            if (
+                set(envelope.keys()) == {"result"}
+                and isinstance(envelope["result"], dict)
+            ):
+                envelope = envelope["result"]
+
+        if envelope is not None and "kind" in envelope:
+            kind = envelope.get("kind")
+            if kind == "ok":
+                content = envelope.get("content")
+                # ok envelope sometimes carries content as JSON string;
+                # passing it through is correct (LLM parses).
+                if isinstance(content, str):
+                    return content
+                if content is None:
+                    return ""
+                return json.dumps(content)
+            # Error variants — surface the LLM-friendly message.
+            msg = envelope.get("message") or f"[{kind}] connector returned {kind}"
+            return str(msg)
+
+        # No structured envelope — concatenate text blocks.
+        parts: list[str] = []
+        for block in getattr(call_result, "content", []) or []:
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(text)
+        return "".join(parts)
     
     # ------------------------------------------------------------------
     # 1. exec — shell command execution

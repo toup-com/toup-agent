@@ -116,6 +116,17 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # Account deletion audit + sensitive-action replay defense (§1.3).
     "deletion_audit_events",
     "sensitive_action_redemptions",
+    # Per-tenant security audit (T0b — agent_api_key rotation, future
+    # connector quarantine, future security primitives). Append-only.
+    "agent_security_events",
+    # Third-party connector vault (T1a). Tokens stay platform-side
+    # only — the bridge never sees them, tenant containers never see
+    # them. Reaches providers via the platform's MCP server (T0c-gated
+    # auth) → connector dispatcher (T1e).
+    "connector_identities",
+    "connector_oauth_sessions",
+    "connector_events",
+    "connector_user_preferences",
 }
 
 SHARED_TABLES: set[str] = {
