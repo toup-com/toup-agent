@@ -673,3 +673,174 @@ async def get_user_memory_health(
         recent_days_with_archival=recent_arch,
         recent_days_with_rolling_only=recent_rolling_only,
     )
+
+
+# ============ Data audit — sidebar gap diagnostic ============
+
+class DataAuditDateBucket(BaseModel):
+    date: str                  # YYYY-MM-DD
+    conversation_count: int
+    has_day_chat: bool
+    day_chat_message_count: int
+
+
+class DataAuditReport(BaseModel):
+    user_id: str
+    user_email: str
+    agent_url: Optional[str]
+    hosting_mode: Optional[str]
+    deploy_status: Optional[str]
+    total_conversations: int
+    total_day_chats: int
+    conversation_oldest: Optional[str]
+    conversation_newest: Optional[str]
+    day_chat_oldest: Optional[str]
+    day_chat_newest: Optional[str]
+    orphan_dates: List[str]    # dates with conversations but no day-chat
+    buckets: List[DataAuditDateBucket]
+
+
+@router.get("/data-audit/{user_id}", response_model=DataAuditReport)
+async def data_audit_for_user(
+    user_id: str,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Per-user audit: how many conversations vs day-chats, and which
+    dates are missing day-chat rows.
+
+    Built specifically to answer "why is the sidebar showing only
+    N entries?" — proxies to the user's agent, paginates through
+    sessions, fetches day-chats, and returns a date-bucketed gap
+    report. Orphan dates are the conversations that exist but the
+    backfill hasn't covered, so the sidebar's day-chat-mode
+    rendering would silently drop them.
+
+    Admin-only by default. A non-admin caller can audit only their
+    own user_id (same scoping as memory-health).
+    """
+    import httpx
+    from datetime import date as _date
+    from app.db.models.user import User
+    from app.db.models.agent import AgentConfig
+
+    if getattr(current_user, "role", None) != "admin" and current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Admin access required for other users")
+
+    user_row = (await db.execute(
+        select(User).where(User.id == user_id)
+    )).scalar_one_or_none()
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    cfg = (await db.execute(
+        select(AgentConfig).where(AgentConfig.user_id == user_id)
+    )).scalar_one_or_none()
+
+    if not cfg or not cfg.agent_url or not cfg.agent_api_key:
+        return DataAuditReport(
+            user_id=user_id,
+            user_email=user_row.email,
+            agent_url=cfg.agent_url if cfg else None,
+            hosting_mode=cfg.hosting_mode if cfg else None,
+            deploy_status=cfg.deploy_status if cfg else None,
+            total_conversations=0,
+            total_day_chats=0,
+            conversation_oldest=None,
+            conversation_newest=None,
+            day_chat_oldest=None,
+            day_chat_newest=None,
+            orphan_dates=[],
+            buckets=[],
+        )
+
+    headers = {"X-Agent-Key": cfg.agent_api_key}
+    sessions: list = []
+    day_chats: list = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Walk sessions across pages — agent caps at limit=100, so loop
+        # offsets until we get a short page or hit a safety cap of 1000.
+        for offset in range(0, 1000, 100):
+            try:
+                resp = await client.get(
+                    f"{cfg.agent_url}/api/sessions",
+                    params={"limit": 100, "offset": offset},
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    break
+                payload = resp.json()
+                page = payload.get("sessions", payload) if isinstance(payload, dict) else payload
+                if not isinstance(page, list) or not page:
+                    break
+                sessions.extend(page)
+                if len(page) < 100:
+                    break
+            except Exception:
+                break
+
+        # Day-chats — agent caps at limit=90, single page is enough.
+        try:
+            resp = await client.get(
+                f"{cfg.agent_url}/api/day-chats",
+                params={"limit": 90},
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                payload = resp.json()
+                if isinstance(payload, list):
+                    day_chats = payload
+        except Exception:
+            pass
+
+    # Bucket conversations by their started_at date (UTC). The agent
+    # stores started_at in UTC; comparing UTC-derived bucket vs
+    # day_chat.local_date gives a reasonable signal even when the
+    # user's tz differs by a few hours — for the gap-detection use
+    # case here, off-by-one near midnight is acceptable.
+    def _to_iso_date(s: Optional[str]) -> Optional[str]:
+        if not s or not isinstance(s, str):
+            return None
+        # Accept "2026-05-09T..." → "2026-05-09".
+        return s[:10] if len(s) >= 10 else None
+
+    conv_dates: dict = {}
+    for s in sessions:
+        iso = _to_iso_date(s.get("started_at") or s.get("created_at"))
+        if iso:
+            conv_dates[iso] = conv_dates.get(iso, 0) + 1
+
+    dc_by_date: dict = {}
+    for dc in day_chats:
+        iso = dc.get("local_date")
+        if iso:
+            dc_by_date[iso] = int(dc.get("message_count") or 0)
+
+    all_dates = sorted(set(conv_dates.keys()) | set(dc_by_date.keys()), reverse=True)
+    orphan_dates = [d for d in all_dates if d in conv_dates and d not in dc_by_date]
+
+    buckets = [
+        DataAuditDateBucket(
+            date=d,
+            conversation_count=conv_dates.get(d, 0),
+            has_day_chat=d in dc_by_date,
+            day_chat_message_count=dc_by_date.get(d, 0),
+        )
+        for d in all_dates
+    ]
+
+    return DataAuditReport(
+        user_id=user_id,
+        user_email=user_row.email,
+        agent_url=cfg.agent_url,
+        hosting_mode=cfg.hosting_mode,
+        deploy_status=cfg.deploy_status,
+        total_conversations=len(sessions),
+        total_day_chats=len(day_chats),
+        conversation_oldest=min(conv_dates.keys()) if conv_dates else None,
+        conversation_newest=max(conv_dates.keys()) if conv_dates else None,
+        day_chat_oldest=min(dc_by_date.keys()) if dc_by_date else None,
+        day_chat_newest=max(dc_by_date.keys()) if dc_by_date else None,
+        orphan_dates=orphan_dates,
+        buckets=buckets,
+    )
