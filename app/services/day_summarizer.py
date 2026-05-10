@@ -596,7 +596,16 @@ async def run_summarizer_if_needed(session_maker, day_chat_id: str):
 
                 dc.rolling_summary = new_summary
                 dc.summary_up_to_message_id = last_msg
-                dc.summary_updated_at = datetime.now(timezone.utc)
+                # FF-B.2 hotfix (2026-05-10): use tz-naive utcnow() to match
+                # the column type (TIMESTAMP WITHOUT TIME ZONE) and the
+                # rest of this file. The previous tz-aware datetime.now(
+                # timezone.utc) silently broke EVERY summarizer success on
+                # asyncpg + tz-naive column — the summary text was generated
+                # via the M1 OpenAI fallback, but the UPDATE failed and the
+                # day flipped right back to status='failed' with reason='other'.
+                # That's exactly why the founder's stuck days never recovered
+                # despite FF-B.2 retry eligibility being True.
+                dc.summary_updated_at = datetime.utcnow()
                 dc.summary_status = "up_to_date"
                 # Recovery clears failure bookkeeping — a previously-stuck day
                 # that just succeeded should not look "failed" forever after.
