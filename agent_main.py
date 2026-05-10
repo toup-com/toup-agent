@@ -849,14 +849,19 @@ async def lifespan(app: FastAPI):
                 periodic_refresh_loop,
             )
 
-            # Platform mounts FastMCP at /api/mcp with inner path=/mcp/,
-            # so the streamable-HTTP endpoint is /api/mcp/mcp/. Tests at
-            # backend/tests/test_mcp_auth.py:370+ confirm this. Hitting
-            # /api/mcp directly 404s before MCPAuthMiddleware ever runs,
-            # which previously caused boot-time tool discovery to fail
-            # silently and the agent to insist no connector tools exist
-            # (regardless of OAuth state on the platform side).
-            mcp_url = f"{settings.platform_api_url.rstrip('/')}/mcp/mcp/"
+            # Platform mounts FastMCP at /api/mcp with inner path=/mcp,
+            # so the streamable-HTTP endpoint is /api/mcp/mcp. Tests at
+            # backend/tests/test_mcp_auth.py:370+ use the trailing-slash
+            # form because their httpx test transport short-circuits the
+            # 307 in-process. In production the trailing slash triggers
+            # FastAPI's redirect_slashes → 307 to `http://` (the
+            # redirect URL is built without honoring X-Forwarded-Proto)
+            # → Cloudflare/Caddy 301 back to https → method downgrades
+            # POST → GET → MCP rejects the GET with 400. Dropping the
+            # trailing slash hits the canonical route directly and
+            # avoids the entire redirect chain. /api/mcp on its own
+            # still 404s before MCPAuthMiddleware ever runs.
+            mcp_url = f"{settings.platform_api_url.rstrip('/')}/mcp/mcp"
             mcp_client = MCPClient(
                 mcp_url,
                 auth=AgentMCPAuth(settings.agent_api_key),
