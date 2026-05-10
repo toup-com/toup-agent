@@ -468,3 +468,72 @@ async def refresh_connector_tools(request: Request):
         status="invalidated",
         tool_count=len(cache.tools),
     )
+
+
+class MCPCacheStatusResponse(BaseModel):
+    """Snapshot of the agent's MCP tools cache for ops diagnostics.
+
+    Returned by /api/agent/mcp-cache-status. The whole point is that
+    when a user reports "the agent says no Gmail tool but the platform
+    shows it Connected", an operator can hit this endpoint and see at
+    a glance whether the cache is healthy, never-fetched, or
+    persistently failing — without having to docker-exec into the
+    tenant container to grep stdout.
+    """
+
+    has_cache: bool
+    tool_count: int
+    tools: list[str]
+    cached_at_monotonic: float
+    last_attempt_at_monotonic: float
+    consecutive_failures: int
+    last_error: Optional[str]
+    is_fresh: bool
+
+
+@router.get("/mcp-cache-status", response_model=MCPCacheStatusResponse)
+async def mcp_cache_status(request: Request):
+    """Read-only view of the MCP tools cache state.
+
+    Same X-Agent-Key gate as /refresh-tools. The platform's admin
+    dashboard polls this when an operator clicks "Diagnose connectors"
+    on a tenant; if `consecutive_failures > 0` we surface the
+    `last_error` next to the tile so the failure mode is visible
+    instead of hidden behind a generic "no tools available".
+    """
+    if settings.run_mode != "agent":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not Found",
+        )
+
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid agent key",
+        )
+
+    cache = getattr(request.app.state, "mcp_tools_cache", None)
+    if cache is None:
+        return MCPCacheStatusResponse(
+            has_cache=False,
+            tool_count=0,
+            tools=[],
+            cached_at_monotonic=0.0,
+            last_attempt_at_monotonic=0.0,
+            consecutive_failures=0,
+            last_error=None,
+            is_fresh=False,
+        )
+
+    return MCPCacheStatusResponse(
+        has_cache=True,
+        tool_count=len(cache.tools),
+        tools=list(cache.tools),
+        cached_at_monotonic=cache.cached_at,
+        last_attempt_at_monotonic=getattr(cache, "last_attempt_at", 0.0),
+        consecutive_failures=getattr(cache, "consecutive_failures", 0),
+        last_error=getattr(cache, "last_error", None),
+        is_fresh=cache.is_fresh(),
+    )

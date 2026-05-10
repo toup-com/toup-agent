@@ -849,7 +849,14 @@ async def lifespan(app: FastAPI):
                 periodic_refresh_loop,
             )
 
-            mcp_url = f"{settings.platform_api_url}/mcp"
+            # Platform mounts FastMCP at /api/mcp with inner path=/mcp/,
+            # so the streamable-HTTP endpoint is /api/mcp/mcp/. Tests at
+            # backend/tests/test_mcp_auth.py:370+ confirm this. Hitting
+            # /api/mcp directly 404s before MCPAuthMiddleware ever runs,
+            # which previously caused boot-time tool discovery to fail
+            # silently and the agent to insist no connector tools exist
+            # (regardless of OAuth state on the platform side).
+            mcp_url = f"{settings.platform_api_url.rstrip('/')}/mcp/mcp/"
             mcp_client = MCPClient(
                 mcp_url,
                 auth=AgentMCPAuth(settings.agent_api_key),
@@ -858,15 +865,26 @@ async def lifespan(app: FastAPI):
 
             # Boot-time discovery — primes the cache so the first turn
             # doesn't pay a TTL miss. Errors are swallowed; the
-            # periodic refresh task will retry every 60s.
+            # periodic refresh task will retry every 60s. We log the
+            # full traceback because a persistent failure here (URL
+            # drift, auth-key mismatch, platform unreachable) silently
+            # strips every connector tool from the agent — and we lost
+            # a day of "no Gmail tool" once because the print() above
+            # only showed the exception's str(), not its type or stack.
             try:
                 await mcp_tools_cache.refresh()
                 print(
-                    f"🔗 MCP connected ({len(mcp_tools_cache.tools)} tools): "
-                    f"{mcp_tools_cache.tools}"
+                    f"🔗 MCP connected ({len(mcp_tools_cache.tools)} tools) "
+                    f"at {mcp_url}: {mcp_tools_cache.tools}"
                 )
             except Exception as e:
-                print(f"⚠️ MCP tool discovery failed (will retry on use): {e}")
+                import traceback
+                print(
+                    f"⚠️ MCP tool discovery failed at {mcp_url} "
+                    f"({type(e).__name__}: {e}) — connector tools will be "
+                    f"unavailable until next refresh succeeds:\n"
+                    f"{traceback.format_exc()}"
+                )
 
             # Wire the cache into the executor BEFORE starting the
             # periodic loop — the loop refreshes the cache, which the

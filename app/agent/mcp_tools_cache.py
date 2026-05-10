@@ -68,6 +68,14 @@ class MCPToolsCache:
         # means "never fetched" or "explicitly invalidated".
         self._cached_at: float = 0.0
         self._lock = asyncio.Lock()
+        # Diagnostics surface read by /api/agent/mcp-cache-status and
+        # by the periodic loop's escalation. We track the last error
+        # message (with type) and a consecutive-failure counter so
+        # operators can tell at a glance whether the cache is healthy,
+        # transiently flaking, or persistently broken.
+        self.last_error: Optional[str] = None
+        self.last_attempt_at: float = 0.0
+        self.consecutive_failures: int = 0
 
     # ── State predicates ──────────────────────────────────────
 
@@ -106,10 +114,26 @@ class MCPToolsCache:
             try:
                 await self._refetch_locked()
             except Exception as e:
-                logger.warning(
-                    "[mcp_tools_cache] refetch failed (returning stale): %s",
-                    e,
-                )
+                # Promote to ERROR + traceback once we've failed
+                # repeatedly — a single transient blip stays at WARN,
+                # but a steady-state misconfig (URL drift, auth-key
+                # mismatch) becomes loudly visible in container logs.
+                self.consecutive_failures += 1
+                self.last_error = f"{type(e).__name__}: {e}"
+                self.last_attempt_at = time.monotonic()
+                if self.consecutive_failures >= 3:
+                    logger.exception(
+                        "[mcp_tools_cache] refetch failing persistently "
+                        "(%d consecutive); connector tools will be "
+                        "unavailable until recovered",
+                        self.consecutive_failures,
+                    )
+                else:
+                    logger.warning(
+                        "[mcp_tools_cache] refetch failed (returning stale): "
+                        "%s",
+                        self.last_error,
+                    )
                 # Don't update _cached_at — next call retries.
                 # Don't bubble — caller gets stale list (well-shaped).
             return self.tools
@@ -123,8 +147,13 @@ class MCPToolsCache:
             try:
                 await self._refetch_locked()
             except Exception as e:
-                logger.warning(
-                    "[mcp_tools_cache] forced refresh failed: %s", e,
+                self.consecutive_failures += 1
+                self.last_error = f"{type(e).__name__}: {e}"
+                self.last_attempt_at = time.monotonic()
+                logger.exception(
+                    "[mcp_tools_cache] forced refresh failed (caller "
+                    "will see exception): %s",
+                    self.last_error,
                 )
                 raise
             return self.tools
@@ -167,7 +196,13 @@ class MCPToolsCache:
         self.tools.extend(new_names)
         self.tool_defs.clear()
         self.tool_defs.extend(new_defs)
-        self._cached_at = time.monotonic()
+        now = time.monotonic()
+        self._cached_at = now
+        self.last_attempt_at = now
+        # Recovery — clear failure state so the next failure starts
+        # the consecutive count fresh, and operators see "healthy".
+        self.last_error = None
+        self.consecutive_failures = 0
         logger.info(
             "[mcp_tools_cache] refetched: %d tool(s)", len(self.tools),
         )
