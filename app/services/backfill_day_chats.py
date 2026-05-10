@@ -65,9 +65,22 @@ async def run_backfill(session_maker) -> str:
 
     Returns:
         "completed", "already_completed", or "failed".
+
+    Auto-retry policy on failure (added 2026-05-09):
+      The original "failed → never auto-retry" policy left users
+      stranded — Nariman's account hit a transient failure mid-backfill
+      and the sidebar lost half its history because no later run ever
+      re-attempted it. We now retry up to MAX_AUTO_RETRY_ATTEMPTS times
+      with at least RETRY_GRACE_SEC between attempts. Resume state
+      (last_conversation_id) is preserved across attempts so we don't
+      reprocess work, and we still bail out and alert after the cap so
+      a genuinely broken backfill (schema bug, etc.) doesn't loop.
     """
     from app.db.models import User, Conversation, Message
     from app.db.models.day_chat import DayChat, MigrationStatus
+
+    MAX_AUTO_RETRY_ATTEMPTS = 3
+    RETRY_GRACE_SEC = 300  # 5 minutes
 
     t0 = time.monotonic()
 
@@ -99,17 +112,62 @@ async def run_backfill(session_maker) -> str:
             return "already_completed"
 
         if status_row.status == "failed":
-            logger.error(
-                "day_chat_backfill.previously_failed error=%s — not auto-retrying. "
-                "Set FORCE_DAY_CHAT_BACKFILL=true to re-run.",
-                status_row.error_message,
+            # Read attempts counter + last-attempt time from progress_json.
+            # We piggyback on this field rather than schema-migrating
+            # MigrationStatus — keeps the change reversible and avoids a
+            # column add for every existing tenant.
+            _prev_progress = (
+                json.loads(status_row.progress_json) if status_row.progress_json else {}
             )
-            return "failed"
+            _attempts = int(_prev_progress.get("attempts", 1))
+            _last_failed_at_iso = _prev_progress.get("last_failed_at")
+            _grace_elapsed = True
+            if _last_failed_at_iso:
+                try:
+                    _last_failed_at = datetime.fromisoformat(_last_failed_at_iso)
+                    _grace_elapsed = (
+                        (datetime.utcnow() - _last_failed_at).total_seconds()
+                        >= RETRY_GRACE_SEC
+                    )
+                except Exception:
+                    _grace_elapsed = True
+
+            if _attempts >= MAX_AUTO_RETRY_ATTEMPTS:
+                logger.error(
+                    "day_chat_backfill.giveup attempts=%d error=%s — not auto-retrying. "
+                    "Set FORCE_DAY_CHAT_BACKFILL=true to re-run.",
+                    _attempts, status_row.error_message,
+                )
+                return "failed"
+            if not _grace_elapsed:
+                logger.info(
+                    "day_chat_backfill.retry_deferred attempts=%d grace=%ds — will retry next boot",
+                    _attempts, RETRY_GRACE_SEC,
+                )
+                return "failed"
+            # Reset to not_started but preserve last_conversation_id +
+            # processed counter so we resume rather than restart. attempts
+            # is bumped so the next failure narrows toward the cap.
+            logger.info(
+                "day_chat_backfill.auto_retry attempt=%d/%d resume_from=%s",
+                _attempts + 1, MAX_AUTO_RETRY_ATTEMPTS,
+                _prev_progress.get("last_conversation_id"),
+            )
+            status_row.status = "not_started"
+            status_row.error_message = None
+            status_row.progress_json = json.dumps({
+                "last_conversation_id": _prev_progress.get("last_conversation_id"),
+                "processed": _prev_progress.get("processed", 0),
+                "attempts": _attempts + 1,
+            })
+            await db.commit()
+            status_row = await get_migration_status(db)
 
         # Resume point
         progress = json.loads(status_row.progress_json) if status_row.progress_json else {}
         last_processed_id = progress.get("last_conversation_id")
         processed_count = progress.get("processed", 0)
+        _attempts_running = int(progress.get("attempts", 1))
 
     # ── Get user and total conversation count ──
     async with session_maker() as db:
@@ -301,13 +359,18 @@ async def run_backfill(session_maker) -> str:
                     )
                     raise
 
-            # Update progress after each successful conversation
+            # Update progress after each successful conversation. Track
+            # the last-processed id locally too so the exception handler
+            # can persist it; without that, a crash would reset our
+            # resume cursor to the pre-run value and reprocess everything.
+            last_processed_id = conv.id
             async with session_maker() as db:
                 ms = await get_migration_status(db)
                 ms.progress_json = json.dumps({
                     "last_conversation_id": conv.id,
                     "processed": processed_count,
                     "total": total_convos,
+                    "attempts": _attempts_running,
                 })
                 await db.commit()
 
@@ -362,20 +425,28 @@ async def run_backfill(session_maker) -> str:
         return "completed"
 
     except Exception as e:
-        # Mark failed
+        # Mark failed. Persist attempts counter + last_failed_at so the
+        # auto-retry path on the next boot can decide whether to retry
+        # (attempts < cap AND grace elapsed) or give up.
+        # last_conversation_id reflects the last successfully-processed
+        # conversation, so a future resume picks up after that row
+        # rather than restarting from scratch.
         async with session_maker() as db:
             ms = await get_migration_status(db)
             ms.status = "failed"
             ms.error_message = str(e)[:2000]
+            _last_processed_id = locals().get("last_processed_id")
             ms.progress_json = json.dumps({
-                "last_conversation_id": None,
+                "last_conversation_id": _last_processed_id,
                 "processed": processed_count,
                 "total": total_convos,
+                "attempts": _attempts_running,
+                "last_failed_at": datetime.utcnow().isoformat(),
             })
             await db.commit()
 
         logger.error(
-            "day_chat_backfill.failed user_id=%s error=%s",
-            user_id, e,
+            "day_chat_backfill.failed user_id=%s attempts=%d error=%s",
+            user_id, _attempts_running, e,
         )
         return "failed"
