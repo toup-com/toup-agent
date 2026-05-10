@@ -337,8 +337,10 @@ class Settings(BaseSettings):
     # Where Google/GitHub/etc. redirect the browser after consent.
     # MUST exact-match the redirect_uri registered in each provider's
     # OAuth-app config (per docs/integrations/google-verification.md §3.2).
-    # Override in tests via env.
-    oauth_callback_url: str = "https://app.toup.ai/api/oauth/callback"
+    # Override in tests / non-default deploys via OAUTH_CALLBACK_URL env.
+    # Default uses the canonical platform host `toup.ai` (no `app.`
+    # prefix) — matches how the frontend is currently served.
+    oauth_callback_url: str = "https://toup.ai/api/oauth/callback"
 
     # ── VPS Provisioning (AWS + Stripe) ──────────────────────
     aws_access_key_id: Optional[str] = None        # Set via AWS_ACCESS_KEY_ID
