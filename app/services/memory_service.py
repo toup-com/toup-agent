@@ -1795,11 +1795,19 @@ class MemoryService:
           - Pass min_strength=0.0 to opt out (keep old behaviour for
             specific call sites that want everything).
 
-        min_similarity is still a no-op (dead parameter from pre-F5).
-        Activating it correctly requires deciding whether the floor should
-        apply only to vector-only matches or to the merged set — that's a
-        product call pending the staging eval in
-        docs/memory/continuity-audit.md §5.
+        F-final (2026-05-10): min_similarity is now LIVE — applied to
+        the _vector_search path only (NOT to the merged RRF set).
+        Rationale (the conservative product call):
+          - A memory matched by KEYWORD or GRAPH still surfaces at any
+            vector similarity. Lexical/graph evidence is independent of
+            embedding proximity; floor-gating the merged set would drop
+            valid matches that happen to have low cosine distance.
+          - A memory matched ONLY by the vector path with low similarity
+            is the noise case (semantic-but-tangential). That's what we
+            want filtered.
+        Default 0.3 from the function signature; callers can override
+        per-query (chat path passes 0.1 for max recall, prompt assembly
+        leans on the default).
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -1850,8 +1858,14 @@ class MemoryService:
         fetch_limit = limit * 4  # Over-fetch per strategy for re-ranker input
         
         if "vector" in strategies:
+            # F-final (2026-05-10): pass min_similarity down so the
+            # vector-only path applies the floor BEFORE results enter
+            # RRF. Memories matched by keyword/graph still surface
+            # without a similarity check — that's the conservative
+            # product call documented in the hybrid_search docstring.
             tasks["vector"] = self._vector_search(
-                user_id, query_embedding, fetch_limit, conditions
+                user_id, query_embedding, fetch_limit, conditions,
+                min_similarity=min_similarity,
             )
         if "keyword" in strategies:
             tasks["keyword"] = self._keyword_search(
@@ -2023,19 +2037,26 @@ class MemoryService:
         query_embedding: List[float],
         limit: int,
         conditions: list,
+        min_similarity: float = 0.05,
     ) -> List[Tuple[str, float]]:
         """
         pgvector cosine similarity search.
         Returns [(memory_id, similarity_score)] sorted by similarity desc.
+
+        F-final (2026-05-10): min_similarity is now a real parameter
+        (was previously a hard-coded 0.05 noise floor). hybrid_search
+        passes its own min_similarity through (default 0.3) — that's
+        the active, vector-only floor. Direct callers can still pass
+        0.05 to keep the lenient behaviour.
         """
         if not (hasattr(Memory, 'embedding') and Memory.embedding is not None):
             return []
-        
+
         try:
             extra_conditions = list(conditions) + [Memory.embedding.isnot(None)]
             # pgvector accepts Python list directly (no string conversion needed)
             embedding_vec = query_embedding  # raw list for pgvector
-            
+
             query = (
                 select(
                     Memory.id,
@@ -2045,9 +2066,11 @@ class MemoryService:
                 .order_by(Memory.embedding.cosine_distance(embedding_vec))
                 .limit(limit)
             )
-            
+
             result = await self.db.execute(query)
-            return [(row.id, row.similarity) for row in result.all() if row.similarity > 0.05]
+            # Apply the floor as an explicit filter so callers can tune it.
+            floor = max(min_similarity, 0.0)
+            return [(row.id, row.similarity) for row in result.all() if row.similarity > floor]
         except Exception:
             return []
 

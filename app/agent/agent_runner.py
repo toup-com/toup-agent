@@ -589,6 +589,41 @@ class AgentRunner:
                     getattr(query_intent, "category", "-"),
                     estimate_tokens(system_prompt),
                 )
+
+                # F-final: WARN-level alert on degraded memory state.
+                # Two signals chosen because they're high-precision and
+                # actionable: a credentialed-failure streak means the
+                # summarizer hasn't worked in 3+ days (key/network ops
+                # issue), and an empty retrieval on a non-greeting turn
+                # means hybrid_search returned nothing for a real query
+                # (corpus gap or retrieval bug). Greeting/social intent
+                # legitimately retrieves nothing — those are excluded.
+                _alerts: List[str] = []
+                _intent_cat = getattr(query_intent, "category", "")
+                _summary_status = _mh.get("summary_status")
+                _failure_reason = _mh.get("summary_failure_reason")
+                # Heuristic: persistent failure → recent failures + a
+                # diagnostic reason. The summarizer service writes the
+                # reason every time it fails, so presence + status='failed'
+                # is the operator-actionable signal.
+                if _summary_status == "failed" and _failure_reason:
+                    _alerts.append(f"summarizer_persistent_fail:{_failure_reason}")
+                if (
+                    _mh.get("retrieved", 0) == 0
+                    and _intent_cat not in ("", "-", "greeting", "social", "casual")
+                    and len(user_message.strip()) > 12  # skip yes/no/hi
+                ):
+                    _alerts.append("retrieval_empty_on_substantive_turn")
+
+                if _alerts:
+                    logger.warning(
+                        "[memory_health_alert] user=%s channel=%s reasons=%s "
+                        "summary=%s retrieved=%d intent=%s",
+                        user_id[:8], channel, ",".join(_alerts),
+                        _summary_status or "-",
+                        _mh.get("retrieved", 0),
+                        _intent_cat or "-",
+                    )
             except Exception as _mh_err:
                 # Never let telemetry break the turn.
                 logger.debug(f"[memory_health] log build failed: {_mh_err}")
