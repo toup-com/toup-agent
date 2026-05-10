@@ -703,10 +703,23 @@ If the conversation is just casual chat, commands, or questions with nothing wor
             return memories
 
         except Exception as e:
-            # Log error and fall back to rule-based extraction
+            # 2026-05-10 hardening: do NOT silently fall back to regex.
+            # Regex extraction produces low-quality "Schedule: <fragment>"
+            # output that pollutes the brain. The previous silent fallback
+            # masked an LLM-call bug for weeks (max_tokens param mismatch
+            # against gpt-5.x; see commit e0d004d). If LLM extraction
+            # genuinely fails, we'd rather extract NOTHING this turn and
+            # log loudly than store garbage.
+            #
+            # Operators can re-extract from past turns by calling the
+            # backfill script once the underlying LLM issue is resolved.
             import logging
-            logging.warning(f"LLM extraction failed, falling back to rules: {e}")
-            return self.extract_memories(user_message, assistant_response, max_memories)
+            logging.error(
+                "[memory_extractor] LLM extraction failed (skipping turn — "
+                "regex fallback disabled to keep brain clean): %s: %s",
+                type(e).__name__, str(e)[:200],
+            )
+            return []
     
     async def extract_relationships_with_llm(
         self,
