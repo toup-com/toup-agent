@@ -67,3 +67,14 @@ patchright>=1.0.0
 
 # Media extraction (YouTube stream/audio_url endpoints in app/api/media_proxy.py)
 yt-dlp>=2025.1.0
+
+# MCP server (mounted at /api/mcp by platform_main). Required by the
+# T0c-T1h connector arc — without this the MCP transport import fails
+# and connector_mcp registration is skipped silently.
+fastmcp==2.9.2
+
+# Connector manifests (T1c+) — declarative YAML config at
+# app/connectors/<id>/manifest.yaml. connector_registry hard-imports
+# yaml at module load; missing this brings down anything that
+# downstream-imports the registry (oauth router, dispatcher, mcp wiring).
+PyYAML>=6.0
