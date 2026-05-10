@@ -331,7 +331,12 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
     async def on_list_tools(self, context, call_next):
         # Run the chain first — let FastMCP build the unfiltered list,
         # then trim it based on this request's user.
-        result = await call_next(context)
+        # fastmcp 2.11+ contract: call_next returns `list[Tool]`
+        # directly. Pre-2.11 wrapped it in a `ListToolsResult` with a
+        # `.tools` attribute — accessing `.tools` on the bare list now
+        # raises AttributeError (surfaced to the client as McpError
+        # "'list' object has no attribute 'tools'").
+        tools = await call_next(context)
 
         user_id = try_get_mcp_user_id()
         if user_id is None:
@@ -339,7 +344,7 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
             # either invoke and hit the dispatcher's auth error, or
             # not invoke. Either way we're not silently hiding the
             # connector surface.
-            return result
+            return tools
 
         # Per-request DB read. Cheap (single indexed query); see
         # T1h for the agent-side cache that elides repeat traffic.
@@ -350,7 +355,7 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
         # Filter: keep all non-connector tools (memory_*, entity_*,
         # etc) + connector tools whose owner is in the active set.
         filtered = []
-        for tool in result.tools:
+        for tool in tools:
             owner = self._registry.get_owner(tool.name)
             if owner is None:
                 # Not a connector tool — keep.
@@ -360,8 +365,7 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
                 filtered.append(tool)
             # else drop (user hasn't connected this connector).
 
-        result.tools = filtered
-        return result
+        return filtered
 
 
 # ─── Module-level test reset ─────────────────────────────────────────
