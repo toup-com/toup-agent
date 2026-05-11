@@ -20,6 +20,7 @@ naturally, same shape as Microsoft.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
@@ -50,6 +51,37 @@ logger = logging.getLogger(__name__)
 
 LINKEDIN_API = "https://api.linkedin.com/v2"
 _HTTP_TIMEOUT_S = 15.0
+
+
+# Pooled AsyncClient — same rationale as `_google_base._get_google_client`.
+# LinkedIn doesn't support HTTP/2 yet (last we tested) so we leave that
+# off; the TLS-session reuse is still the big win.
+_LI_CLIENT: Optional[httpx.AsyncClient] = None
+_LI_CLIENT_LOCK = asyncio.Lock()
+
+
+async def _get_li_client() -> httpx.AsyncClient:
+    global _LI_CLIENT
+    if _LI_CLIENT is not None:
+        return _LI_CLIENT
+    async with _LI_CLIENT_LOCK:
+        if _LI_CLIENT is None:
+            _LI_CLIENT = httpx.AsyncClient(
+                timeout=_HTTP_TIMEOUT_S,
+                limits=httpx.Limits(
+                    max_connections=50,
+                    max_keepalive_connections=50,
+                    keepalive_expiry=300.0,
+                ),
+            )
+    return _LI_CLIENT
+
+
+async def shutdown_li_client() -> None:
+    global _LI_CLIENT
+    if _LI_CLIENT is not None:
+        await _LI_CLIENT.aclose()
+        _LI_CLIENT = None
 
 
 class _LinkedInError(Exception):
@@ -127,14 +159,14 @@ async def _linkedin_request(
     }
     if extra_headers:
         headers.update(extra_headers)
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-        resp = await client.request(
-            method,
-            url,
-            headers=headers,
-            json=json_body,
-            params=params,
-        )
+    client = await _get_li_client()
+    resp = await client.request(
+        method,
+        url,
+        headers=headers,
+        json=json_body,
+        params=params,
+    )
     _handle_linkedin_error(resp, scope_hint=scope_hint)
     if not resp.content:
         return {"raw": "", "x_linkedin_id": resp.headers.get("x-restli-id", "")}
@@ -151,17 +183,17 @@ async def linkedin_refresh(refresh_token: str) -> RefreshResult:
             "linkedin provider not registered — set credentials via "
             "/admin/oauth-apps or LINKEDIN_OAUTH_CLIENT_ID env var"
         )
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-        resp = await client.post(
-            app_cfg.token_url,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": app_cfg.client_id,
-                "client_secret": app_cfg.client_secret,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+    client = await _get_li_client()
+    resp = await client.post(
+        app_cfg.token_url,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": app_cfg.client_id,
+            "client_secret": app_cfg.client_secret,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
     if resp.status_code in (400, 401):
         raise RefreshFailed(
             f"linkedin refresh returned {resp.status_code}: {resp.text[:200]}"

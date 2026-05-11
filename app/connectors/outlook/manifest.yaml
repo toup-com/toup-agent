@@ -40,7 +40,8 @@ health:
 
 tools:
   - name: outlook__list_messages
-    description: List recent Outlook messages, optionally filtered by Graph's $search syntax (e.g. "from:alice@contoso.com"). Defaults to the 10 most recent.
+    description: |
+      List recent Outlook messages, optionally filtered by Graph's $search syntax (e.g. "from:alice@contoso.com"). Defaults to the 10 most recent. Pass `include_body: true` to inline each message's full body in the SAME response — Graph supports body in the list call directly, so this saves an entire round-trip per message. Use whenever the user asks to "read" / "summarize" / "show" their emails.
     input_schema:
       type: object
       properties:
@@ -52,6 +53,10 @@ tools:
           minimum: 1
           maximum: 50
           default: 10
+        include_body:
+          type: boolean
+          description: When true, ask Graph to include the full body in the list response. Avoids a per-message outlook__get_message round-trip.
+          default: false
       required: []
     mutates: false
     elevation: false

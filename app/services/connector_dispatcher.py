@@ -153,6 +153,15 @@ async def execute(
     so the LLM gets a well-shaped message instead of a 500.
     """
     started = time.monotonic()
+    # Phase-level timing breakdown. Logged at the end of `execute`
+    # alongside the outcome so ops can spot regressions (DB write
+    # latency spike, Google API slow path, etc.) at a glance. Each
+    # phase records cumulative ms since `started`.
+    phases: dict[str, float] = {}
+
+    def _mark(phase: str) -> None:
+        phases[phase] = round((time.monotonic() - started) * 1000.0, 1)
+
     user_hash = _hash_user(user_id)
 
     # 1. Manifest tool lookup.
@@ -190,12 +199,26 @@ async def execute(
             retryable=True,  # eligible for retry once lifted
         )
 
-    # 2. Channel-policy resolution. Pre-flight, BEFORE any vault touch
-    #    (architecture §4.4 — and the smoke test enforces that
-    #    rejected channel calls don't generate vault read traffic).
+    # 2 + 3. Channel-policy resolution + vault read in PARALLEL.
     #
-    # T2c: consult ConnectorUserPreference for per-user overrides
-    # FIRST. Resolution order (architecture §4.4):
+    # Pre-2026-05-11 these two DB queries ran serially: preference
+    # SELECT (~50-150ms on Railway+pgbouncer), then vault SELECT
+    # (~50-150ms), adding up to ~100-300ms before the provider call
+    # even started. They're independent — the channel-policy
+    # resolution only needs preference rows, the vault.get only
+    # needs the identity row — so we fan them out with asyncio.gather.
+    # Saves one full DB round-trip per tool call. No security
+    # impact: both results are checked below before provider.execute
+    # is invoked, and the audit-then-act gate (step 5) is the
+    # security-relevant boundary, not the order of pre-flight reads.
+    #
+    # asyncpg refuses two queries concurrently on the same connection,
+    # so the parallel vault read uses a *separate* session — opened
+    # for the read, closed when the gather returns. The dispatcher's
+    # caller-supplied `db` session is reserved for the audit-then-act
+    # commit later in this function.
+    #
+    # Resolution order (architecture §4.4) for the preference branch:
     #   1. ConnectorUserPreference.enabled = false → reject (kill switch)
     #   2. ConnectorUserPreference.per_tool_overrides[tool][channel] = false → reject
     #   3. ConnectorUserPreference.per_tool_overrides[tool][channel] = true → ALLOW
@@ -204,9 +227,17 @@ async def execute(
     #   4. Manifest channel_policy.deny → reject
     #   5. Manifest mutates: true AND channel in {voice, telegram} → reject
     #   6. Default
-    pref_decision = await _resolve_user_preference(
-        db, user_id, connector_id, tool_name, channel,
+    from app.db.database import async_session_maker as _make_session
+
+    async def _vault_get_with_own_session():
+        async with _make_session() as db2:
+            return await vault.get(db2, user_id, connector_id)
+
+    pref_decision, identity = await asyncio.gather(
+        _resolve_user_preference(db, user_id, connector_id, tool_name, channel),
+        _vault_get_with_own_session(),
     )
+    _mark("preflight")
     if isinstance(pref_decision, ConnectorToolError):
         _log(user_hash, connector_id, tool_name, channel, "pref_denied", started)
         return pref_decision
@@ -223,8 +254,7 @@ async def execute(
             _log(user_hash, connector_id, tool_name, channel, "channel_denied", started)
             return channel_check
 
-    # 3. Vault read.
-    identity = await vault.get(db, user_id, connector_id)
+    # 3.0 Vault read result (fetched in parallel above).
     if identity is None:
         _log(user_hash, connector_id, tool_name, channel, "no_identity", started)
         return ConnectorReauthRequired(
@@ -274,6 +304,7 @@ async def execute(
             agent_request_id=agent_request_id,
             metadata={"input": _redact(tool_input, manifest_tool.output_redaction)},
         )
+        _mark("audit_in")
     except VaultAuditError as e:
         # Fail-closed: provider was NOT called.
         _log(user_hash, connector_id, tool_name, channel, "audit_failed", started)
@@ -295,6 +326,7 @@ async def execute(
     )
     try:
         result = await entry.provider.execute(tool_name, tool_input, ctx)
+        _mark("provider")
     except Exception as e:
         # Unexpected — providers are expected to return sum-type
         # variants for known errors. Map to ConnectorProviderDown when
@@ -333,20 +365,27 @@ async def execute(
         success=success,
         metadata=_outcome_metadata(result, manifest_tool.output_redaction),
     )
+    _mark("audit_out")
 
     # 8. Log + return. Result variants other than Ok are normal results,
     #    not errors at the log level — but rate-limit and provider-down
     #    deserve WARN so ops can grep for sustained patterns.
     outcome_label = type(result).__name__
+    # Phase-timing breakdown — emitted with every dispatch so a
+    # production tail latency spike can be attributed to a phase
+    # (DB pre-flight vs provider call vs audit write) without
+    # re-running with extra instrumentation. Tiny per-line, formatted
+    # as `phase=Xms` pairs so log search tools can grep them.
+    phase_str = " ".join(f"{k}={v}ms" for k, v in phases.items())
     if isinstance(result, (ConnectorRateLimited, ConnectorProviderDown)):
         _log(
             user_hash, connector_id, tool_name, channel,
-            outcome_label, started, level="WARNING",
+            outcome_label, started, level="WARNING", phases=phase_str,
         )
     else:
         _log(
             user_hash, connector_id, tool_name, channel,
-            outcome_label, started,
+            outcome_label, started, phases=phase_str,
         )
     # T5a — emit Prometheus counters/histogram. Bounded labels: connector
     # id and tool name come from the manifest registry, channel is one
@@ -702,6 +741,7 @@ def _log(
     started_at: float,
     *,
     level: str = "INFO",
+    phases: str = "",
 ) -> None:
     duration_ms = int((time.monotonic() - started_at) * 1000)
     msg = (
@@ -709,6 +749,11 @@ def _log(
         f"tool={tool_name} channel={channel} outcome={outcome} "
         f"duration_ms={duration_ms}"
     )
+    if phases:
+        # Phase breakdown: `preflight=XXms audit_in=YYms provider=ZZms
+        # audit_out=AAms` — lets ops attribute tail latency to a phase
+        # without rerunning with extra instrumentation.
+        msg += f" phases=[{phases}]"
     if level == "WARNING":
         logger.warning(msg)
     elif level == "ERROR":

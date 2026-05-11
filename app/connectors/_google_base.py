@@ -22,6 +22,7 @@ sensible for 95% of API endpoints.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -50,6 +51,61 @@ logger = logging.getLogger(__name__)
 _HTTP_TIMEOUT_S = 15.0
 
 
+# ─── Pooled HTTP client (perf-critical) ────────────────────────────
+#
+# Pre-2026-05-11 we did `async with httpx.AsyncClient(...)` inside
+# every Google call. That meant a fresh TCP socket + TLS handshake
+# (~200-400 ms) + connection teardown PER tool call. Stacked twice
+# for the common list-then-get pattern, that's 400-800 ms of pure
+# setup overhead before any Google API work begins.
+#
+# A module-singleton AsyncClient keeps the underlying HTTP/2
+# connection pool warm across the process lifetime — repeat calls
+# to googleapis.com reuse the same TLS session, dropping per-call
+# overhead to ~5 ms. The client is process-wide; FastAPI workers
+# share it within a worker (no cross-worker sharing, which is
+# the right contract — connections are per-event-loop).
+#
+# Built lazily on first use so module import stays cheap and so
+# tests that don't touch Google never spin up a client.
+_GOOGLE_CLIENT: Optional[httpx.AsyncClient] = None
+_GOOGLE_CLIENT_LOCK = asyncio.Lock()
+
+
+async def _get_google_client() -> httpx.AsyncClient:
+    """Return the process-singleton AsyncClient for googleapis.com.
+    Created on first use under a lock so 50 concurrent callers don't
+    each construct their own client."""
+    global _GOOGLE_CLIENT
+    if _GOOGLE_CLIENT is not None:
+        return _GOOGLE_CLIENT
+    async with _GOOGLE_CLIENT_LOCK:
+        if _GOOGLE_CLIENT is None:
+            _GOOGLE_CLIENT = httpx.AsyncClient(
+                timeout=_HTTP_TIMEOUT_S,
+                # 100 keepalive connections per worker is generous —
+                # we only talk to a handful of *.googleapis.com hosts
+                # and httpx auto-shares within the pool.
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=100,
+                    keepalive_expiry=300.0,
+                ),
+                http2=True,
+            )
+    return _GOOGLE_CLIENT
+
+
+async def shutdown_google_client() -> None:
+    """Close the pooled client. Called from platform lifespan on
+    shutdown so the process exits cleanly. Test code can also call
+    this between assertions to start from a clean pool."""
+    global _GOOGLE_CLIENT
+    if _GOOGLE_CLIENT is not None:
+        await _GOOGLE_CLIENT.aclose()
+        _GOOGLE_CLIENT = None
+
+
 class _GoogleConnectorError(Exception):
     """Wraps a `ConnectorResult` so we can exit a provider method via
     `raise` from anywhere in a call chain. The dispatcher's exception
@@ -76,16 +132,16 @@ async def google_refresh(refresh_token: str) -> RefreshResult:
             "google provider not registered — set credentials via "
             "/admin/oauth-apps or GOOGLE_OAUTH_CLIENT_ID env var"
         )
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-        resp = await client.post(
-            app_cfg.token_url,
-            data={
-                "client_id": app_cfg.client_id,
-                "client_secret": app_cfg.client_secret,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-            },
-        )
+    client = await _get_google_client()
+    resp = await client.post(
+        app_cfg.token_url,
+        data={
+            "client_id": app_cfg.client_id,
+            "client_secret": app_cfg.client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+    )
     if resp.status_code == 400 or resp.status_code == 401:
         # Google returns 400 invalid_grant when the refresh token has
         # been revoked or expired. Treat as permanent.
@@ -119,14 +175,14 @@ async def google_revoke(access_token: str) -> None:
     docstring contract."""
     if not access_token:
         return
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-        try:
-            await client.post(
-                "https://oauth2.googleapis.com/revoke",
-                params={"token": access_token},
-            )
-        except Exception as e:
-            logger.warning("[google_revoke] best-effort failure: %s", e)
+    try:
+        client = await _get_google_client()
+        await client.post(
+            "https://oauth2.googleapis.com/revoke",
+            params={"token": access_token},
+        )
+    except Exception as e:
+        logger.warning("[google_revoke] best-effort failure: %s", e)
 
 
 def _handle_google_error(resp: httpx.Response, *, scope_hint: str = "") -> None:
@@ -186,14 +242,14 @@ async def google_request(
     """Authenticated request → JSON dict. Raises `_GoogleConnectorError`
     on any non-2xx with the right variant attached."""
     headers = {"Authorization": f"Bearer {access_token}"}
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-        resp = await client.request(
-            method,
-            url,
-            headers=headers,
-            json=json_body,
-            params=params,
-        )
+    client = await _get_google_client()
+    resp = await client.request(
+        method,
+        url,
+        headers=headers,
+        json=json_body,
+        params=params,
+    )
     _handle_google_error(resp, scope_hint=scope_hint)
     if resp.headers.get("content-type", "").startswith("application/json"):
         return resp.json()

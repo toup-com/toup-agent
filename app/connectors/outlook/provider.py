@@ -16,8 +16,9 @@ Send-mail endpoint quirks:
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import ClassVar, Optional
+from typing import Any, ClassVar, Optional
 
 from app.connectors._microsoft_base import (
     _MicrosoftConnectorError,
@@ -87,11 +88,19 @@ class OutlookProvider(BaseConnectorProvider):
 
         try:
             if tool_name == "outlook__list_messages":
+                include_body = bool(tool_input.get("include_body"))
                 params: dict = {
                     "$top": int(tool_input.get("max_results", 10)),
+                    # When include_body=true we ask Graph for the full
+                    # body in the same list call — saves the
+                    # per-message GET round-trip entirely (Graph's
+                    # /messages endpoint supports body inline, unlike
+                    # Gmail). When false, only headers + preview to
+                    # keep the LLM's token budget low.
                     "$select": (
                         "id,subject,from,toRecipients,receivedDateTime,"
                         "bodyPreview,isRead,hasAttachments"
+                        + (",body" if include_body else "")
                     ),
                     "$orderby": "receivedDateTime desc",
                 }
@@ -108,8 +117,9 @@ class OutlookProvider(BaseConnectorProvider):
                 )
                 # Trim to the fields the agent actually needs so we
                 # don't blow the LLM's token budget on Graph metadata.
-                msgs = [
-                    {
+                msgs = []
+                for m in (result.get("value") or []):
+                    row: dict[str, Any] = {
                         "id": m.get("id"),
                         "subject": m.get("subject", ""),
                         "from": (
@@ -119,8 +129,11 @@ class OutlookProvider(BaseConnectorProvider):
                         "received_at": m.get("receivedDateTime"),
                         "is_read": m.get("isRead"),
                     }
-                    for m in (result.get("value") or [])
-                ]
+                    if include_body:
+                        body_obj = m.get("body") or {}
+                        row["body_content_type"] = body_obj.get("contentType")
+                        row["body"] = (body_obj.get("content") or "")[:50_000]
+                    msgs.append(row)
                 return ConnectorOk(content=json.dumps({"messages": msgs}))
 
             if tool_name == "outlook__get_message":

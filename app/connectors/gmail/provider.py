@@ -10,9 +10,10 @@ runs. We never decrypt directly.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from app.connectors._google_base import (
     _GoogleConnectorError,
@@ -100,7 +101,8 @@ class GmailProvider(BaseConnectorProvider):
 
         try:
             if tool_name == "gmail__list_messages":
-                params = {"maxResults": int(tool_input.get("max_results", 10))}
+                max_results = int(tool_input.get("max_results", 10))
+                params = {"maxResults": max_results}
                 q = tool_input.get("query")
                 if q:
                     params["q"] = q
@@ -111,12 +113,35 @@ class GmailProvider(BaseConnectorProvider):
                     params=params,
                     scope_hint="gmail.readonly",
                 )
-                # Reduce to summary list — full bodies via gmail__get_message
-                summaries = []
-                for m in (result.get("messages") or [])[:int(tool_input.get("max_results", 10))]:
-                    summaries.append({"id": m.get("id"), "threadId": m.get("threadId")})
+                raw_ids = [
+                    {"id": m.get("id"), "threadId": m.get("threadId")}
+                    for m in (result.get("messages") or [])[:max_results]
+                    if m.get("id")
+                ]
+
+                # FAST PATH: include_body inlines each message's
+                # headers + body in this same response. Pre-2026-05-11
+                # the only way to read a mail was: list → pick id →
+                # get_message — two LLM round-trips and two MCP
+                # roundtrips PER message. With include_body=true the
+                # LLM gets everything in one call and the per-message
+                # fetches fan out in parallel (Gmail's /messages/{id}
+                # endpoint comfortably handles 10 concurrent reads
+                # against the same user; we cap the gather at 25 just
+                # in case). Matches the "summarise my latest 5 emails"
+                # ask without the LLM ever leaving the dispatcher.
+                if tool_input.get("include_body") and raw_ids:
+                    full_messages = await _fetch_messages_parallel(
+                        access_token=access_token,
+                        message_ids=[r["id"] for r in raw_ids],
+                    )
+                    return ConnectorOk(content=json.dumps({
+                        "messages": full_messages,
+                        "result_size": result.get("resultSizeEstimate"),
+                    }))
+
                 return ConnectorOk(content=json.dumps({
-                    "messages": summaries,
+                    "messages": raw_ids,
                     "result_size": result.get("resultSizeEstimate"),
                 }))
 
@@ -254,3 +279,62 @@ def _extract_text_body(payload: dict) -> str:
             if d:
                 return _b64url_decode(d)
     return ""
+
+
+# Cap on the include_body fan-out. Higher = more parallelism = faster
+# wall time, but more pressure on the per-user Gmail quota.
+# 25 is well under Google's per-user quota for read endpoints
+# (~250 req/s on a fresh project) and is enough to cover the common
+# "summarise my latest 5/10/20 emails" patterns.
+_INCLUDE_BODY_CONCURRENCY = 25
+
+
+async def _fetch_messages_parallel(
+    *,
+    access_token: str,
+    message_ids: list[str],
+) -> list[dict]:
+    """Fan out a batch of GET /messages/{id}?format=full calls and
+    return them in input order with parsed body + headers — the same
+    shape `gmail__get_message` returns for a single id.
+
+    Used by `gmail__list_messages` when `include_body=true`. Bounded
+    by `_INCLUDE_BODY_CONCURRENCY` so a 100-email list doesn't open
+    100 simultaneous httpx requests; the pooled AsyncClient in
+    `_google_base` already keeps the TLS session warm so the bound
+    is for politeness toward Google's per-user quota, not for our
+    side."""
+    sem = asyncio.Semaphore(_INCLUDE_BODY_CONCURRENCY)
+
+    async def _one(mid: str) -> dict:
+        async with sem:
+            try:
+                raw = await google_request(
+                    "GET",
+                    f"{GMAIL_API_BASE}/messages/{mid}",
+                    access_token=access_token,
+                    params={"format": "full"},
+                    scope_hint="gmail.readonly",
+                )
+            except _GoogleConnectorError as e:
+                # Surface the per-message error inline rather than
+                # tanking the whole gather — the agent can still
+                # work with the other emails it got back.
+                return {
+                    "id": mid,
+                    "error": repr(e.result),
+                }
+            headers = {
+                h["name"]: h["value"]
+                for h in (raw.get("payload", {}).get("headers") or [])
+                if h["name"] in ("From", "To", "Cc", "Subject", "Date")
+            }
+            return {
+                "id": raw.get("id"),
+                "threadId": raw.get("threadId"),
+                "headers": headers,
+                "snippet": raw.get("snippet"),
+                "body": _extract_text_body(raw.get("payload") or {}),
+            }
+
+    return await asyncio.gather(*(_one(mid) for mid in message_ids))

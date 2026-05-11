@@ -19,6 +19,7 @@ the same shape they call for Google.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -45,6 +46,39 @@ logger = logging.getLogger(__name__)
 _HTTP_TIMEOUT_S = 15.0
 
 
+# Pooled AsyncClient — see `_get_google_client` in `_google_base.py`
+# for the full rationale. Without pooling, every Graph call eats a
+# fresh TLS handshake (~200-400 ms). With pooling, repeat calls reuse
+# the same TCP+TLS session and drop to ~5 ms of setup overhead.
+_MS_CLIENT: Optional[httpx.AsyncClient] = None
+_MS_CLIENT_LOCK = asyncio.Lock()
+
+
+async def _get_ms_client() -> httpx.AsyncClient:
+    global _MS_CLIENT
+    if _MS_CLIENT is not None:
+        return _MS_CLIENT
+    async with _MS_CLIENT_LOCK:
+        if _MS_CLIENT is None:
+            _MS_CLIENT = httpx.AsyncClient(
+                timeout=_HTTP_TIMEOUT_S,
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=100,
+                    keepalive_expiry=300.0,
+                ),
+                http2=True,
+            )
+    return _MS_CLIENT
+
+
+async def shutdown_ms_client() -> None:
+    global _MS_CLIENT
+    if _MS_CLIENT is not None:
+        await _MS_CLIENT.aclose()
+        _MS_CLIENT = None
+
+
 class _MicrosoftConnectorError(Exception):
     """Same role as `_GoogleConnectorError`. Wraps a `ConnectorResult`
     so providers can exit any call chain via `raise` and translate at
@@ -69,24 +103,24 @@ async def microsoft_refresh(refresh_token: str) -> RefreshResult:
             "microsoft provider not registered — set credentials via "
             "/admin/oauth-apps or MICROSOFT_OAUTH_CLIENT_ID env var"
         )
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-        resp = await client.post(
-            app_cfg.token_url,
-            data={
-                "client_id": app_cfg.client_id,
-                "client_secret": app_cfg.client_secret,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-                # Microsoft requires the scope set to be re-asserted
-                # on refresh, otherwise the new access_token loses
-                # scopes that were on the original. We pass the
-                # special "offline_access" sentinel so Graph keeps
-                # the rotating refresh_token without the caller
-                # needing to know the original scope set. Graph
-                # actually echoes back the union of granted scopes.
-                "scope": "offline_access",
-            },
-        )
+    client = await _get_ms_client()
+    resp = await client.post(
+        app_cfg.token_url,
+        data={
+            "client_id": app_cfg.client_id,
+            "client_secret": app_cfg.client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+            # Microsoft requires the scope set to be re-asserted
+            # on refresh, otherwise the new access_token loses
+            # scopes that were on the original. We pass the
+            # special "offline_access" sentinel so Graph keeps
+            # the rotating refresh_token without the caller
+            # needing to know the original scope set. Graph
+            # actually echoes back the union of granted scopes.
+            "scope": "offline_access",
+        },
+    )
     if resp.status_code in (400, 401):
         # Microsoft returns 400 invalid_grant when the refresh token
         # is revoked / expired / consent withdrawn — permanent fail.
@@ -186,14 +220,14 @@ async def microsoft_graph_request(
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     }
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:
-        resp = await client.request(
-            method,
-            url,
-            headers=headers,
-            json=json_body,
-            params=params,
-        )
+    client = await _get_ms_client()
+    resp = await client.request(
+        method,
+        url,
+        headers=headers,
+        json=json_body,
+        params=params,
+    )
     _handle_microsoft_error(resp, connector_id=connector_id, scope_hint=scope_hint)
     if not resp.content:
         return {"raw": ""}
