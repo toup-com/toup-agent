@@ -355,15 +355,29 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
         # Filter: keep all non-connector tools (memory_*, entity_*,
         # etc) + connector tools whose owner is in the active set.
         filtered = []
+        connector_tools_seen: list[tuple[str, str]] = []
+        connector_tools_kept: list[str] = []
         for tool in tools:
             owner = self._registry.get_owner(tool.name)
             if owner is None:
                 # Not a connector tool — keep.
                 filtered.append(tool)
                 continue
+            connector_tools_seen.append((tool.name, owner))
             if owner in active_connector_ids:
                 filtered.append(tool)
+                connector_tools_kept.append(tool.name)
             # else drop (user hasn't connected this connector).
+
+        logger.info(
+            "[connector_filter] user_id=%s active=%s "
+            "connector_tools_seen=%d kept=%d kept_names=%s",
+            user_id,
+            sorted(active_connector_ids),
+            len(connector_tools_seen),
+            len(connector_tools_kept),
+            connector_tools_kept,
+        )
 
         return filtered
 
