@@ -42,6 +42,9 @@ from .app import App, BuildJob, BuildUsage, ReconciliationLog
 # Agent runtime
 from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig
 
+# Routines (system-managed scheduled actions — email briefing, etc.)
+from .routine import Routine, RoutineRun
+
 # Soul config
 from .soul_config import SoulConfig
 
@@ -112,6 +115,7 @@ __all__ = [
     "Document", "DocumentChunk", "Media",
     "App", "BuildJob", "BuildUsage", "ReconciliationLog",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
+    "Routine", "RoutineRun",
     "SoulConfig",
     "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord", "LLMProxyEvent", "PlatformSetting",
     "Rollout", "RolloutAttempt",

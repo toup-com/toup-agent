@@ -85,6 +85,11 @@ AGENT_ONLY_TABLES: set[str] = {
     "telegram_user_mappings",
     "agent_errors",
     "api_keys",
+    # System-managed routines (email briefing, calendar briefing, …).
+    # User-facing config in /agent/settings/routines; operator monitoring
+    # in Mission Control reads via authenticated API, not direct DB query.
+    "routines",
+    "routine_runs",
     # WhatsApp Cloud API webhook dedupe (agent-side; survives container
     # restarts so Meta retries within a 7-day window cannot re-run the LLM)
     "whatsapp_inbound_dedupe",

@@ -444,6 +444,13 @@ async def init_db():
         "ALTER TABLE managed_containers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         "UPDATE managed_containers SET updated_at = COALESCE(started_at, created_at) WHERE updated_at IS NULL",
         "CREATE INDEX IF NOT EXISTS ix_managed_containers_status_updated_at ON managed_containers (status, updated_at)",
+        # Routines (system-managed scheduled actions). Tables themselves are
+        # created via Base.metadata.create_all on fresh containers; this ALTER
+        # adds the per-message discriminator that lets the frontend tell a
+        # routine-generated assistant message apart from a normal reply.
+        # `messages.channel` already exists (added by the time-channel-fix PR
+        # above) and routine writes will set it to "routine".
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS source VARCHAR(50)",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

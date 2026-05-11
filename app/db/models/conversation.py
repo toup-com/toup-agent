@@ -76,6 +76,14 @@ class Message(Base):
     # conversation.channel then "unknown". See channel_util.resolve_channel.
     channel: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
 
+    # Sub-channel discriminator for non-user-originated messages. NULL for
+    # normal user/assistant turns. Set to a routine kind id (e.g.
+    # "email_briefing") on routine-generated messages so the frontend can
+    # render them as a distinct card and operators can filter the audit
+    # trail. DB column added by `init_db()` ALTER; the ORM declaration
+    # here lets SQLAlchemy actually read/write it.
+    source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
     role: Mapped[str] = mapped_column(String(20))  # "user", "assistant", "system", "job"
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

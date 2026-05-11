@@ -62,6 +62,7 @@ from app.api.whatsapp_qr import router as whatsapp_qr_router
 # (NOT X-Agent-Key) — bridge holds the token, agent containers receive
 # it as an env var at docker run.
 from app.api.admin_pool import router as admin_pool_router
+from app.api.routines import router as routines_router, set_runner_ref as set_routines_runner_ref
 from app.services import runtime_identity, drain_state
 
 _app_start_time = None
@@ -481,6 +482,7 @@ async def lifespan(app: FastAPI):
     # ── Agent stack initialization ────────────────────────────
     telegram_bot = None
     cron_service = None
+    routine_runner = None  # Sibling scheduler for system-managed routines (email briefing, …)
     subagent_manager = None
     skill_loader = None
     agent_runner = None
@@ -741,6 +743,25 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ Could not start cron service: {e}")
             cron_service = None
 
+        # Routine scheduler — sibling of CronService. Starts AFTER CronService
+        # so its DB session pool / async_session_maker proxy is already warm,
+        # and after the WS server scaffolding (still pre-listen at this point;
+        # the runner just registers triggers, doesn't fire until tick time).
+        # The MCP client doesn't exist yet at this point (constructed later
+        # in the lifespan around the MCP block), so the runner is constructed
+        # without one; `set_mcp_client()` is called once the client is built.
+        # Failure here is non-fatal: routines silently don't run, the rest of
+        # the agent boots normally.
+        try:
+            from app.agent.routines import RoutineRunner
+            routine_runner = RoutineRunner()
+            await routine_runner.start()
+            set_routines_runner_ref(routine_runner)
+            print("📅 Routine runner started")
+        except Exception as e:
+            print(f"⚠️ Could not start routine runner: {e}")
+            routine_runner = None
+
         # Heartbeat service
         if settings.heartbeat_enabled and cron_service:
             try:
@@ -900,6 +921,16 @@ async def lifespan(app: FastAPI):
                 tool_executor.mcp_tools_cache = mcp_tools_cache
                 tool_executor.mcp_tools = mcp_tools_cache.tools
                 tool_executor.mcp_tool_defs = mcp_tools_cache.tool_defs
+
+            # Same client, late-bound into the routine runner. The runner
+            # was constructed earlier in lifespan (before MCP existed) so
+            # handlers got `_mcp_client=None` at first; this gives them
+            # the real client just before any cron trigger can fire (the
+            # earliest a routine could fire is the user's tz-local wake
+            # time, which is far in the future for a freshly-booted
+            # container).
+            if routine_runner is not None:
+                routine_runner.set_mcp_client(mcp_client)
 
             # Periodic refresh task — keeps the sync snapshot fresh
             # without every turn paying the cache-miss cost. Stored on
@@ -1288,6 +1319,16 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
+    # RoutineRunner must stop BEFORE CronService: handlers may use the DB
+    # session pool that CronService also holds — clean shutdown order avoids
+    # "session already closed" noise during the drain window.
+    if routine_runner:
+        try:
+            await routine_runner.stop()
+            print("📅 Routine runner stopped")
+        except Exception:
+            pass
+
     if cron_service:
         try:
             await cron_service.stop()
@@ -1412,6 +1453,10 @@ app.include_router(whatsapp_qr_router, prefix=settings.api_prefix)
 # X-Pool-Admin-Token; bypassed by the X-Agent-Key middleware via
 # _PUBLIC_PATHS membership.
 app.include_router(admin_pool_router, prefix=settings.api_prefix)
+
+# Routines (system-managed scheduled actions — email briefing, etc.).
+# Gate 1 ships /api/routines/_runner_status only; full CRUD lands in Gate 3.
+app.include_router(routines_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
 try:
