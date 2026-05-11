@@ -118,6 +118,21 @@ def _lock_for(identity_id: str) -> asyncio.Lock:
     return lock
 
 
+# ─── Public refresh helpers (shared with the health-probe scheduler) ─
+#
+# The health probe needs the SAME refresh-on-expiring logic the
+# dispatcher runs on tool calls — otherwise active identities flip
+# to provider_down 1 h after the user's last action (Google access
+# tokens expire). Re-using the dispatcher's helpers (rather than
+# duplicating) keeps the per-identity coalescing lock global so a
+# tool call and a probe can't both call provider.refresh() at the
+# same instant.
+#
+# Definitions live below at `_needs_refresh` / `_refresh_with_coalescing`;
+# these aliases are bound at the bottom of the module so callers can
+# import them by their public names.
+
+
 # ─── Public entry point ──────────────────────────────────────────────
 
 
@@ -698,3 +713,10 @@ def reset_locks_for_tests() -> None:
     """Drop the per-identity lock dict. Tests only — production never
     needs to reset (locks are bounded by active identities)."""
     _refresh_locks.clear()
+
+
+# Public aliases for the refresh helpers — see the rationale block at
+# the top of this module. Bound here (not at definition site) so the
+# `_needs_refresh` / `_refresh_with_coalescing` symbols exist first.
+needs_refresh = _needs_refresh
+refresh_with_coalescing = _refresh_with_coalescing

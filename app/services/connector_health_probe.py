@@ -32,10 +32,15 @@ from typing import Optional
 
 from sqlalchemy import select, update as sa_update
 
-from app.connectors.base import ConnectorContext
+from app.connectors.base import ConnectorContext, ConnectorReauthRequired
 from app.db.database import async_session_maker
 from app.db.models import ConnectorIdentity
 from app.services import connector_metrics as _m
+from app.services import connector_vault as vault
+from app.services.connector_dispatcher import (
+    needs_refresh,
+    refresh_with_coalescing,
+)
 from app.services.connector_registry import get_registry
 
 logger = logging.getLogger(__name__)
@@ -97,7 +102,7 @@ class HealthProbeScheduler:
                 continue
             sem = asyncio.Semaphore(self._concurrency)
             tasks = [
-                self._probe_one(connector_id, ident, entry.provider, sem)
+                self._probe_one(connector_id, ident, entry, sem)
                 for ident in identities
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -115,7 +120,7 @@ class HealthProbeScheduler:
         self,
         connector_id: str,
         ident: ConnectorIdentity,
-        provider,
+        entry,
         sem: asyncio.Semaphore,
     ) -> bool:
         async with sem:
@@ -124,6 +129,40 @@ class HealthProbeScheduler:
                 channel="health_probe",
                 request_id=f"health_{int(time.time())}",
             )
+            # Refresh-on-expiring BEFORE the probe, using the same
+            # helper the dispatcher uses on tool calls. Google access
+            # tokens are 1 h-lived; without this step every overnight
+            # gap (no user activity → no refresh-on-call) hands an
+            # expired token to the provider, the probe 401s, and three
+            # consecutive sweeps flip the identity to provider_down.
+            # The per-identity lock is module-global in the dispatcher
+            # so a concurrent tool call + probe can't double-refresh.
+            async with async_session_maker() as db:
+                fresh = await vault.get(db, ident.user_id, connector_id)
+                if fresh is None:
+                    # Identity vanished mid-sweep (user disconnected).
+                    # Nothing to probe; don't count against the fail
+                    # threshold either.
+                    self._fail_counts.get(connector_id, {}).pop(ident.id, None)
+                    return True
+                if needs_refresh(fresh):
+                    fresh, refresh_outcome = await refresh_with_coalescing(
+                        db, entry, fresh,
+                    )
+                    if isinstance(refresh_outcome, ConnectorReauthRequired):
+                        # Refresh failed — the helper already moved the
+                        # identity to reauth_required (the correct
+                        # terminal state). Don't count this as a
+                        # transient probe failure or we'd race ourselves
+                        # toward provider_down on top of reauth_required.
+                        _m.inc(_m.M_HEALTH_PROBES, labels={
+                            "connector": connector_id,
+                            "outcome": "refresh_failed",
+                        })
+                        self._fail_counts.get(connector_id, {}).pop(ident.id, None)
+                        return False
+
+            provider = entry.provider
             try:
                 result = await provider.health_probe(ctx)
             except Exception as e:
