@@ -1,13 +1,30 @@
 """User model."""
 
 from datetime import datetime
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 import uuid
 
 from sqlalchemy import String, DateTime, Boolean, Index
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
 from .base import Base
+
+
+# Default notification preferences. Source of truth for "what's a
+# brand-new user's email opt-in state" — referenced by the account
+# preferences endpoint when a User row has notification_preferences=NULL.
+# - morning_briefing: bridges to the user's email_briefing Routine.
+#   Off by default; user has to actively turn it on (routines are a
+#   flag-gated feature anyway).
+# - security_alerts: critical-only (new device, password change). True
+#   so users always get the safety net unless they explicitly opt out.
+# - product_updates: marketing/changelog. False — opt-in only, CASL/CAN-SPAM friendly.
+DEFAULT_NOTIFICATION_PREFERENCES: Dict[str, bool] = {
+    "morning_briefing": False,
+    "security_alerts": True,
+    "product_updates": False,
+}
 
 
 class User(Base):
@@ -29,6 +46,16 @@ class User(Base):
 
     # Timezone (IANA format, e.g. "America/Toronto") — used for day boundaries
     timezone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Account-level notification opt-in toggles. JSONB lets us add new
+    # toggles (eg. weekly_digest, mention_emails) without an ALTER per
+    # toggle. Shape: {"morning_briefing": bool, "security_alerts":
+    # bool, "product_updates": bool, ...}. NULL is treated as
+    # DEFAULT_NOTIFICATION_PREFERENCES on read so existing rows don't
+    # need a backfill.
+    notification_preferences: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        JSONB, nullable=True
+    )
 
     # is_canary: designates this user as the rollout canary. Rollouts upgrade
     # this tenant FIRST, wait out the canary window watching /agent/health,

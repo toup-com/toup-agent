@@ -4,12 +4,14 @@ import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from typing import Optional
 from jose import jwt, JWTError
 
 from app.db import get_db
+from app.db.models import UserSession
 from app.schemas import (
     UserCreate, UserLogin, UserResponse, Token,
     ChangePasswordRequest, UpdateProfileRequest,
@@ -21,6 +23,9 @@ from app.services import (
 )
 from app.services.rate_limiter import login_rate_limiter, signup_rate_limiter
 from app.services.turnstile import verify_turnstile_token
+from app.services.session_tracker import (
+    parse_device_label, record_login_session, JTI_REVOCATION_GRACE_SECONDS,
+)
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -85,7 +90,11 @@ async def get_current_user(
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled")
 
-    # Token revocation: reject tokens issued before last password change
+    # Token revocation: reject tokens issued before last password change.
+    # Also: per-session revocation via the UserSession table (account
+    # page "sign out this device"). The two checks are complementary —
+    # password change scorches everything via password_changed_at; the
+    # per-session table lets users sign out one device at a time.
     if token and getattr(user, 'password_changed_at', None):
         try:
             payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
@@ -97,6 +106,48 @@ async def get_current_user(
                 )
         except JWTError:
             pass  # Token already validated by decode_access_token
+
+    # Per-session revocation. Skip for agent-mode (no token, no jti).
+    # The grace window swallows the race where login returns the JWT
+    # before the session-row commit lands in the read connection.
+    if token:
+        try:
+            payload = jwt.decode(
+                token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+            )
+            jti = payload.get("jti")
+            token_iat = datetime.utcfromtimestamp(payload.get("iat", 0))
+            if jti:
+                from app.services.session_tracker import (
+                    get_session_by_jti, maybe_bump_last_seen,
+                )
+                session_row = await get_session_by_jti(db, jti)
+                if session_row is None:
+                    # No matching session row. Could be: legacy token
+                    # issued before the table existed (let through —
+                    # grace), or a freshly-issued token whose commit
+                    # hasn't been observed yet (grace window), or a
+                    # forged/tampered jti (reject after grace).
+                    age = (datetime.utcnow() - token_iat).total_seconds()
+                    if age > JTI_REVOCATION_GRACE_SECONDS:
+                        # Treat as legacy/missing. Don't reject —
+                        # we'd nuke every pre-rollout session. The
+                        # password_changed_at gate above is still the
+                        # blunt-but-reliable revocation lever.
+                        pass
+                elif session_row.is_revoked:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="This session was signed out. Please log in again.",
+                    )
+                else:
+                    # Live session — keep last_seen_at fresh.
+                    request.state.user_session_jti = jti  # for endpoints that need it
+                    await maybe_bump_last_seen(db, session_row)
+        except HTTPException:
+            raise
+        except JWTError:
+            pass
 
     return user
 
@@ -243,6 +294,13 @@ async def login(credentials: UserLogin, request: Request, response: Response, db
     login_rate_limiter.clear(client_ip, login_id)
     token = create_access_token(user.id)
 
+    # Record the session BEFORE returning the token. This guarantees
+    # the row is committed before the client uses the JWT to call
+    # protected endpoints — avoids the otherwise-tiny race window where
+    # get_current_user sees a jti with no matching row. The grace
+    # window in session_tracker is a belt-and-suspenders safeguard.
+    await record_login_session(db, user.id, token, request)
+
     response.set_cookie(
         key=SSO_COOKIE_NAME, value=token, domain=SSO_COOKIE_DOMAIN,
         max_age=SSO_COOKIE_MAX_AGE, httponly=True, secure=True,
@@ -289,6 +347,15 @@ async def change_password(
 
     await change_user_password(db, current_user, body.new_password)
     new_token = create_access_token(current_user.id)
+
+    # Revoke every existing session — including this one — then record
+    # the freshly-minted token. password_changed_at already invalidates
+    # old JWTs via iat comparison; this also clears the
+    # account-page sessions list so the user sees a clean "just one
+    # active device" state after changing their password.
+    from app.services.session_tracker import revoke_all_user_sessions_except
+    await revoke_all_user_sessions_except(db, current_user.id, except_jti=None)
+    await record_login_session(db, current_user.id, new_token, request=None)
 
     response.set_cookie(
         key=SSO_COOKIE_NAME, value=new_token, domain=SSO_COOKIE_DOMAIN,
@@ -352,7 +419,7 @@ class SSOExchangeRequest(BaseModel):
     token: str
 
 @router.post("/sso", response_model=Token)
-async def sso_exchange(body: SSOExchangeRequest, response: Response, db: AsyncSession = Depends(get_db)):
+async def sso_exchange(body: SSOExchangeRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     """Exchange an SSO token for a fresh JWT."""
     user_id = decode_access_token(body.token)
     if not user_id:
@@ -361,6 +428,8 @@ async def sso_exchange(body: SSOExchangeRequest, response: Response, db: AsyncSe
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
     new_token = create_access_token(user.id)
+    # New token = new session row, same way as /login does it.
+    await record_login_session(db, user.id, new_token, request)
     response.set_cookie(
         key=SSO_COOKIE_NAME, value=new_token, domain=SSO_COOKIE_DOMAIN,
         max_age=SSO_COOKIE_MAX_AGE, httponly=True, secure=True, samesite="none", path="/",
@@ -371,8 +440,32 @@ async def sso_exchange(body: SSOExchangeRequest, response: Response, db: AsyncSe
 # ── Logout ───────────────────────────────────────────────────────
 
 @router.post("/logout")
-async def logout_user(response: Response):
-    """Logout — clear SSO cookie"""
+async def logout_user(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    """Logout — clear SSO cookie + revoke current session."""
+    # Revoke the current session row so the JWT can't be reused (e.g.
+    # if the user is on a shared device and the cookie is still
+    # readable elsewhere). Best-effort — if we can't decode the token
+    # we still clear the cookie.
+    token = (
+        request.cookies.get(SSO_COOKIE_NAME)
+        or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    )
+    if token:
+        try:
+            payload = jwt.decode(
+                token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+            )
+            jti = payload.get("jti")
+            if jti:
+                result = await db.execute(
+                    select(UserSession).where(UserSession.jti == jti)
+                )
+                row = result.scalar_one_or_none()
+                if row and not row.is_revoked:
+                    row.is_revoked = True
+                    await db.commit()
+        except (JWTError, Exception) as e:  # noqa: BLE001
+            logger.debug("logout session revoke swallowed: %s", e)
     response.delete_cookie(key=SSO_COOKIE_NAME, domain=SSO_COOKIE_DOMAIN, path="/")
     return {"success": True}
 

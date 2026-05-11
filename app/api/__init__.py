@@ -3,6 +3,7 @@ from app.api.memories import router as memories_router
 from app.api.ingest import router as ingest_router
 from app.api.agent import router as agent_router
 from app.api.stats import router as stats_router
+from app.api.account import router as account_router
 
 __all__ = [
     "auth_router",
@@ -10,5 +11,6 @@ __all__ = [
     "ingest_router",
     "agent_router",
     "stats_router",
+    "account_router",
     "get_current_user",
 ]

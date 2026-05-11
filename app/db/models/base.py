@@ -136,6 +136,10 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # Persisted in DB so the operator can paste them through the admin
     # UI instead of editing env vars + redeploying.
     "provider_app_credentials",
+    # Active user JWT sessions. Auth router is platform-only (users
+    # don't log into agent containers — agent_api_key auth is used
+    # there instead), so the table only exists on the platform side.
+    "user_sessions",
 }
 
 SHARED_TABLES: set[str] = {

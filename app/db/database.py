@@ -270,6 +270,11 @@ async def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone VARCHAR(50)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255) UNIQUE",
+        # Email/notification toggles. JSONB so we can add new keys
+        # without an ALTER per toggle. NULL on existing rows is
+        # interpreted as DEFAULT_NOTIFICATION_PREFERENCES by the
+        # account preferences endpoint.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_preferences JSONB",
         # ── Agent configs ──
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_mode VARCHAR(20) DEFAULT 'manual'",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS google_api_key TEXT",

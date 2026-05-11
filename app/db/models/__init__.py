@@ -17,6 +17,7 @@ from .enums import (
 
 # User
 from .user import User
+from .user_session import UserSession
 
 # Identity
 from .identity import Identity
@@ -108,7 +109,7 @@ __all__ = [
     "MemoryType", "EntityType", "MemoryLevel", "MemoryEventType",
     "UserRole", "IdentityType", "DocumentType", "MediaType",
     # Models
-    "User", "Identity",
+    "User", "UserSession", "Identity",
     "Conversation", "Message",
     "Memory", "memory_relationships", "BrainStats", "MemoryEvent", "RetrievalEvent",
     "Entity", "EntityLink", "EntityRelationship",
