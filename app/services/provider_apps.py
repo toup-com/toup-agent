@@ -61,7 +61,14 @@ _TEMPLATES: dict[str, dict] = {
         "use_pkce": True,
     },
     "github": {
-        "authorize_url": "https://github.com/login/oauth/authorize",
+        # `/select_account` (not `/authorize`) so multi-account users see
+        # GitHub's account chooser before consenting — matches the
+        # Base44 / Vercel / "Sign in with GitHub" UX. GitHub's plain
+        # `/authorize` silently authorizes the currently-signed-in
+        # account, which is confusing for anyone who keeps a personal
+        # + work GitHub logged in at the same time. Same query params,
+        # same token-exchange URL — only the front-door page differs.
+        "authorize_url": "https://github.com/login/oauth/select_account",
         "token_url": "https://github.com/login/oauth/access_token",
         "use_pkce": False,
     },
@@ -269,7 +276,11 @@ def register_github_provider_app() -> None:
         name="github",
         client_id=cid,
         client_secret=csec,
-        authorize_url="https://github.com/login/oauth/authorize",
+        # See the rationale in `_TEMPLATES["github"]` above — we ALWAYS
+        # route through GitHub's `/select_account` so multi-account
+        # users see the chooser instead of being silently authorized
+        # as whichever GitHub user happens to be logged in.
+        authorize_url="https://github.com/login/oauth/select_account",
         token_url="https://github.com/login/oauth/access_token",
         use_pkce=False,
     ))

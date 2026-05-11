@@ -89,6 +89,49 @@ def test_dispatcher_blocks_mutating_tools_on_read_only_identity():
     )
 
 
+def test_github_authorize_routes_through_select_account():
+    """GitHub's plain `/login/oauth/authorize` silently authorizes the
+    currently-signed-in account (no chooser, no confirmation), which is
+    confusing for anyone with personal + work GitHub accounts. We
+    route through `/login/oauth/select_account` so first-time connect
+    always shows a chooser — same UX as Base44 / Vercel / "Sign in
+    with GitHub" buttons across the web.
+
+    Pinning this in both the template and the env-var registration
+    path so a future copy-paste from GitHub's docs doesn't quietly
+    drop us back to the silent-authorize URL."""
+    from app.services.provider_apps import _TEMPLATES, register_github_provider_app
+    from app.services import provider_apps as _pa
+
+    assert _TEMPLATES["github"]["authorize_url"].endswith("/select_account"), (
+        "GitHub template authorize_url must route through "
+        "/login/oauth/select_account so multi-account users see the "
+        "chooser. The plain /authorize endpoint silently uses the "
+        "currently-signed-in account."
+    )
+
+    # Stub the settings so the env-var path actually registers.
+    from app.config import settings
+    prev_cid = getattr(settings, "github_oauth_client_id", "")
+    prev_sec = getattr(settings, "github_oauth_client_secret", "")
+    settings.github_oauth_client_id = "test_cid"
+    settings.github_oauth_client_secret = "test_secret"
+    try:
+        _pa.reset_for_tests()
+        register_github_provider_app()
+        cfg = _pa.get_provider_app("github")
+        assert cfg is not None
+        assert cfg.authorize_url.endswith("/select_account"), (
+            "register_github_provider_app must also use /select_account — "
+            "otherwise the prod path (env-var registration) drifts from "
+            "the template path (DB-credential registration)."
+        )
+    finally:
+        settings.github_oauth_client_id = prev_cid
+        settings.github_oauth_client_secret = prev_sec
+        _pa.reset_for_tests()
+
+
 def test_health_probe_unaffected_by_read_only():
     """A read-only identity is still a healthy identity — the probe
     should keep refreshing tokens and reporting health. Locking the
