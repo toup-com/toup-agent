@@ -35,7 +35,7 @@ class IdentityRow(BaseModel):
 class EventRow(BaseModel):
     connector_id: str
     event_type: str
-    created_at: str
+    occurred_at: str
 
 
 class FilterDebugResp(BaseModel):
@@ -94,7 +94,7 @@ async def _mcp_filter_debug_impl(
             await db.execute(
                 select(ConnectorEvent)
                 .where(ConnectorEvent.user_id == user_id)
-                .order_by(ConnectorEvent.created_at.desc())
+                .order_by(ConnectorEvent.occurred_at.desc())
                 .limit(20)
             )
         ).scalars().all()
@@ -117,7 +117,7 @@ async def _mcp_filter_debug_impl(
             EventRow(
                 connector_id=e.connector_id,
                 event_type=e.event_type,
-                created_at=e.created_at.isoformat() + "Z",
+                occurred_at=e.occurred_at.isoformat() + "Z",
             )
             for e in recent_events
         ],
