@@ -54,6 +54,7 @@ from app.api.auth import get_current_user
 from app.config import settings
 from app.db import get_db
 from app.db.models import (
+    AgentConfig,
     ConnectorOAuthSession,
     EVENT_CONNECTED,
     EVENT_REVOCATION_PROVIDER_FAILED,

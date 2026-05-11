@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from app.db.database import async_session_maker
-from app.db.models import ConnectorIdentity, User
+from app.db.models import AgentConfig, ConnectorIdentity, User
 from app.db.models.connectors import ConnectorEvent
 from app.mcp_auth import _resolve_agent_key_to_user_id
 from app.services import connector_vault as vault
@@ -47,21 +47,27 @@ class GlobalRow(BaseModel):
     user_email: str | None
 
 
+class UserDetail(BaseModel):
+    user_id: str
+    email: str | None
+    name: str | None
+    role: str | None
+    created_at: str | None
+    has_agent_config: bool
+
+
 class FilterDebugResp(BaseModel):
     resolved_user_id: str | None
     active_connector_ids: list[str]
     all_identities: list[IdentityRow]
     recent_events: list[EventRow]
     total_identities_all_users: int
-    # Every row in connector_identities, anonymised. Only safe to expose
-    # because v0 has at most a handful of rows during this debugging
-    # window — rip this field out before re-publishing the diagnostic.
     all_rows_global: list[GlobalRow]
-    # Email of the user the X-Agent-Key resolves to. If this differs
-    # from the all_rows_global[*].user_email, we're in a
-    # two-different-account scenario; if they match, two accounts
-    # share an email which is the platform's bug.
     resolved_user_email: str | None
+    # Full metadata for every user_id touched in this response so we
+    # can identify mystery accounts (when did sam@toup.ai get created,
+    # who created it, does it have an agent_config of its own).
+    users_detail: list[UserDetail]
 
 
 @router.get("/_mcp_filter_debug")
@@ -110,15 +116,21 @@ async def _impl(x_agent_key: str | None) -> FilterDebugResp:
         global_rows = (
             await db.execute(select(ConnectorIdentity))
         ).scalars().all()
-        # Bulk email lookup for every user_id we touch in this response.
+        # Bulk lookup for every user_id we touch in this response —
+        # email + name + role + created_at + whether they have an
+        # agent_config (== are they a real "Toup user with an agent").
         wanted_ids = {r.user_id for r in global_rows} | {user_id}
-        users_by_id = {
-            u.id: u.email
-            for u in (
+        users_full = (
+            await db.execute(select(User).where(User.id.in_(wanted_ids)))
+        ).scalars().all()
+        users_by_id = {u.id: u.email for u in users_full}
+        agent_owner_ids = {
+            row[0]
+            for row in (
                 await db.execute(
-                    select(User).where(User.id.in_(wanted_ids))
+                    select(AgentConfig.user_id).where(AgentConfig.user_id.in_(wanted_ids))
                 )
-            ).scalars()
+            ).all()
         }
     return FilterDebugResp(
         resolved_user_id=user_id,
@@ -152,4 +164,15 @@ async def _impl(x_agent_key: str | None) -> FilterDebugResp:
             for r in global_rows
         ],
         resolved_user_email=users_by_id.get(user_id),
+        users_detail=[
+            UserDetail(
+                user_id=u.id,
+                email=u.email,
+                name=u.name,
+                role=u.role,
+                created_at=u.created_at.isoformat() + "Z" if u.created_at else None,
+                has_agent_config=u.id in agent_owner_ids,
+            )
+            for u in users_full
+        ],
     )
