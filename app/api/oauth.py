@@ -193,6 +193,31 @@ async def oauth_connect(
     redirects back to /api/oauth/callback (handled below)."""
     _flag_or_503()
 
+    # 0. Pre-flight: the user MUST have an agent_config row, otherwise
+    #    the OAuth completes successfully and writes a connector_identity
+    #    row that no agent will ever see — silent orphan that surfaces
+    #    in chat as the agent insisting the tool isn't available.
+    #    Burned by exactly this on 2026-05-10 — adding the guard so
+    #    other users don't lose hours to the same trap.
+    _agent_check = (
+        await db.execute(
+            select(AgentConfig.user_id).where(AgentConfig.user_id == str(current_user.id))
+        )
+    ).scalar_one_or_none()
+    if _agent_check is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "reason": "no_agent_config",
+                "message": (
+                    "Your Toup agent isn't set up yet. Finish onboarding "
+                    "and provision your agent before connecting external "
+                    "tools — otherwise the OAuth row would be stored for "
+                    "an account that has no agent to read it."
+                ),
+            },
+        )
+
     # 1. Manifest lookup.
     entry = get_registry().get(connector_id)
     if entry is None:
@@ -340,6 +365,31 @@ async def oauth_callback(
     await db.execute(
         delete(ConnectorOAuthSession).where(ConnectorOAuthSession.state_hash == sh)
     )
+
+    # Defense in depth: the /connect entry already refused if no
+    # agent_config existed, but a stale state token from a user whose
+    # agent was deleted mid-flow could still land here. Refusing the
+    # vault.put avoids the orphan-row class entirely. Mirror error
+    # shape on /connect so the frontend bridge page can render the
+    # same actionable message.
+    _agent_check = (
+        await db.execute(
+            select(AgentConfig.user_id).where(AgentConfig.user_id == payload.user_id)
+        )
+    ).scalar_one_or_none()
+    if _agent_check is None:
+        await db.commit()  # commit the session-delete before bailing
+        logger.warning(
+            "[oauth.callback] user_id %s has no agent_config — refusing vault.put",
+            payload.user_id[:8],
+        )
+        return RedirectResponse(
+            url=(
+                "/oauth/callback-bridge?error="
+                + urllib.parse.quote("no_agent_config")
+            ),
+            status_code=status.HTTP_302_FOUND,
+        )
 
     # 3. Look up connector + provider-app config.
     entry = get_registry().get(payload.connector_id)
