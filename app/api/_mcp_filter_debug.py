@@ -38,12 +38,26 @@ class EventRow(BaseModel):
     occurred_at: str
 
 
+class GlobalRow(BaseModel):
+    # Truncated to first 8 chars + connector_id so we can pin down
+    # whether the orphaned identity belongs to a user with a similar
+    # prefix (=> it's our caller, ID got stored differently) or a
+    # totally different one (=> two-account scenario).
+    user_id_prefix: str
+    connector_id: str
+    status: str
+
+
 class FilterDebugResp(BaseModel):
     resolved_user_id: str | None
     active_connector_ids: list[str]
     all_identities: list[IdentityRow]
     recent_events: list[EventRow]
     total_identities_all_users: int
+    # Every row in connector_identities, anonymised. Only safe to expose
+    # because v0 has at most a handful of rows during this debugging
+    # window — rip this field out before re-publishing the diagnostic.
+    all_rows_global: list[GlobalRow]
 
 
 @router.get("/_mcp_filter_debug")
@@ -89,6 +103,9 @@ async def _impl(x_agent_key: str | None) -> FilterDebugResp:
         total_count = (
             await db.execute(select(func.count(ConnectorIdentity.user_id)))
         ).scalar_one()
+        global_rows = (
+            await db.execute(select(ConnectorIdentity))
+        ).scalars().all()
     return FilterDebugResp(
         resolved_user_id=user_id,
         active_connector_ids=sorted({r.connector_id for r in active_rows}),
@@ -111,4 +128,12 @@ async def _impl(x_agent_key: str | None) -> FilterDebugResp:
             for e in recent_events
         ],
         total_identities_all_users=int(total_count),
+        all_rows_global=[
+            GlobalRow(
+                user_id_prefix=(r.user_id or "")[:8],
+                connector_id=r.connector_id,
+                status=r.status,
+            )
+            for r in global_rows
+        ],
     )
