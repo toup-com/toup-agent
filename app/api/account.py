@@ -14,6 +14,7 @@ Mounted under /api/account/* by platform_main.
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -21,12 +22,15 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, select
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
 from app.db import get_db
 from app.db.models import ApiKey, Routine, UserSession
 from app.db.models.user import DEFAULT_NOTIFICATION_PREFERENCES
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/account", tags=["Account"])
 
@@ -64,23 +68,41 @@ def _merged_prefs(row_value: Optional[Dict[str, Any]]) -> Dict[str, bool]:
     return merged
 
 
-async def _user_has_enabled_email_briefing(
-    db: AsyncSession, user_id: str
-) -> bool:
-    """The morning_briefing toggle is a view over the user's
-    email_briefing Routine row, not just a flag on the user. So GET
-    needs to consult the routines table — if the user has an enabled
-    email_briefing routine, the toggle reads on."""
-    result = await db.execute(
-        select(Routine).where(
-            and_(
-                Routine.user_id == user_id,
-                Routine.kind == "email_briefing",
-                Routine.enabled == True,  # noqa: E712
+async def _try_sync_briefing_routine(
+    db: AsyncSession, user_id: str, enabled: bool
+) -> None:
+    """Best-effort sync of the user's email_briefing Routine row to
+    match the morning_briefing toggle. The routines table is
+    AGENT-ONLY (see base.py: routines, routine_runs ∈ AGENT_ONLY_TABLES)
+    — it doesn't exist on the platform DB where this endpoint runs.
+    On platform: the query raises UndefinedTableError and we swallow
+    it; the toggle's source of truth is User.notification_preferences,
+    and the agent-side Routines UI is the place where the routine row
+    actually gets created. On agent: the query lands a real update.
+
+    Logged as debug — this is expected on platform, not an error."""
+    try:
+        result = await db.execute(
+            select(Routine).where(
+                and_(
+                    Routine.user_id == user_id,
+                    Routine.kind == "email_briefing",
+                )
             )
         )
-    )
-    return result.scalar_one_or_none() is not None
+        rows = list(result.scalars().all())
+        for r in rows:
+            r.enabled = enabled
+            r.updated_at = datetime.utcnow()
+        if rows:
+            await db.commit()
+    except ProgrammingError as e:
+        # Most common: relation "routines" does not exist (platform DB).
+        await db.rollback()
+        logger.debug("briefing routine sync skipped (routines table unreachable): %s", e)
+    except Exception as e:  # noqa: BLE001
+        await db.rollback()
+        logger.warning("briefing routine sync failed: %s", e)
 
 
 @router.get("/preferences", response_model=NotificationPreferences)
@@ -88,10 +110,14 @@ async def get_preferences(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> NotificationPreferences:
+    # All three toggles persist on the User.notification_preferences
+    # JSONB column — single source of truth on the platform side.
+    # The morning_briefing toggle ALSO mirrors to the user's
+    # email_briefing Routine when that table is reachable (agent DB
+    # only), but the toggle's value is read from the JSON column so
+    # the account page works identically regardless of which DB it's
+    # being served from.
     prefs = _merged_prefs(getattr(current_user, "notification_preferences", None))
-    # morning_briefing is sourced from the routines table, not the
-    # JSON column — the column stores the OTHER toggles. Overlay it.
-    prefs["morning_briefing"] = await _user_has_enabled_email_briefing(db, current_user.id)
     return NotificationPreferences(**prefs)
 
 
@@ -101,39 +127,22 @@ async def update_preferences(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> NotificationPreferences:
-    # security_alerts + product_updates persist on the user row.
     current = _merged_prefs(getattr(current_user, "notification_preferences", None))
+    if body.morning_briefing is not None:
+        current["morning_briefing"] = body.morning_briefing
     if body.security_alerts is not None:
         current["security_alerts"] = body.security_alerts
     if body.product_updates is not None:
         current["product_updates"] = body.product_updates
-    # morning_briefing lives on the routines table — not on the JSON
-    # column — so we strip it before persisting to avoid drift between
-    # the two storage locations.
-    current.pop("morning_briefing", None)
     current_user.notification_preferences = current
     current_user.updated_at = datetime.utcnow()
     await db.commit()
 
-    # morning_briefing toggle bridges to the email_briefing routine.
-    # On: enable an existing routine (or no-op if none exists — UI
-    # nudges the user to create one via the Routines surface).
-    # Off: disable the user's enabled email_briefing routine(s).
+    # Best-effort sync to the routine row (no-op on platform DB).
     if body.morning_briefing is not None:
-        result = await db.execute(
-            select(Routine).where(
-                and_(
-                    Routine.user_id == current_user.id,
-                    Routine.kind == "email_briefing",
-                )
-            )
-        )
-        for r in result.scalars().all():
-            r.enabled = bool(body.morning_briefing)
-            r.updated_at = datetime.utcnow()
-        await db.commit()
+        await _try_sync_briefing_routine(db, current_user.id, bool(body.morning_briefing))
 
-    return await get_preferences(current_user=current_user, db=db)
+    return NotificationPreferences(**current)
 
 
 # =====================================================================
