@@ -118,6 +118,12 @@ class Settings(BaseSettings):
     # Day recall (recall_day tool + end-of-day archival summaries)
     enable_day_recall: bool = False  # When true, exposes recall_day tool + runs hourly archival job
 
+    # Agent Routines — system-managed scheduled actions (email briefing, etc.).
+    # Gates RoutineRunner scheduler registration, API visibility, and Mission
+    # Control UI surface. Per-tenant; default off until the canary cohort runs
+    # for 48h with <2% failure rate.
+    routines_email_briefing_enabled: bool = False
+
     # Workspace Bootstrap
     workspace_per_user: bool = True  # Create per-user workspace subdirectories
     workspace_create_readme: bool = True  # Create README.md in new workspaces
@@ -324,6 +330,28 @@ class Settings(BaseSettings):
     # it on the standard OAuth app type — see provider_apps.py).
     github_oauth_client_id: str = ""
     github_oauth_client_secret: str = ""
+
+    # Microsoft Identity Platform v2 — backs the Outlook connector
+    # (and future Microsoft 365 surfaces: Teams, OneDrive, Calendar).
+    # Register an "App registration" in https://portal.azure.com →
+    # Azure Active Directory → App registrations. PKCE supported.
+    # Without both set the Microsoft provider app silently doesn't
+    # register and Microsoft connectors are skipped at registry-load
+    # time — same gate pattern as Google + GitHub above.
+    microsoft_oauth_client_id: str = ""
+    microsoft_oauth_client_secret: str = ""
+    # `common` works for both personal Microsoft accounts and Azure AD
+    # (work/school) tenants. Set to a specific tenant id to lock
+    # consent to a single org. See
+    # https://learn.microsoft.com/en-us/azure/active-directory/develop/v2-protocols-oidc.
+    microsoft_oauth_tenant: str = "common"
+
+    # LinkedIn OAuth 2.0 — backs the LinkedIn connector. Register an
+    # app at https://www.linkedin.com/developers/apps and enable the
+    # "Sign In with LinkedIn using OpenID Connect" + "Share on
+    # LinkedIn" products. PKCE NOT supported by LinkedIn (yet).
+    linkedin_oauth_client_id: str = ""
+    linkedin_oauth_client_secret: str = ""
 
     # HMAC-SHA256 signing key for the OAuth state token (architecture D2).
     # Independent from jwt_secret so rotating it doesn't log out users.

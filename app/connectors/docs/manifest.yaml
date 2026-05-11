@@ -1,0 +1,100 @@
+# Google Docs connector — manifest.
+#
+# Scope set is deliberately tight: `documents` only. We don't request
+# `drive.metadata.readonly` (which would be needed to list docs) because
+# it lives in the RESTRICTED scope tier and triggers Google's CASA
+# security assessment ($15k+). Same CASA-dodge rationale as the Sheets
+# manifest (2026-05-10).
+#
+# In v1 the user (or the agent's prior context) supplies the document
+# id or url. Discovery via Drive listing is a follow-up that pairs with
+# the Drive connector once CASA is in scope.
+manifest_version: 1
+id: docs
+name: Google Docs
+short_description: Create new docs, read existing ones, and append text — by document id or url.
+icon: file-text
+docs_url: https://developers.google.com/docs/api
+status: stable
+category: productivity
+
+oauth:
+  provider_app: google
+  scopes:
+    # SENSITIVE (not restricted) — verification step but no CASA gate.
+    - https://www.googleapis.com/auth/documents
+  scopes_optional: []
+  pkce: true
+  refresh: true
+
+scope_descriptions:
+  https://www.googleapis.com/auth/documents: Read and write your Google Docs documents (by URL/id). We never store the full document body beyond your audit log.
+
+health:
+  # Registry requires `probe` to reference one of this manifest's tools.
+  # The actual probe runs `provider.health_probe()` — see provider.py —
+  # which just verifies token resolution. `docs__get` is named here
+  # purely to satisfy the schema check.
+  probe: docs__get
+
+tools:
+  - name: docs__get
+    description: Fetch a Google Doc by id or URL and return its plain-text body plus title. Pass either `document_id` (`1AbC...`) or `document_url` (the full `docs.google.com/document/d/<id>/edit` link).
+    input_schema:
+      type: object
+      properties:
+        document_id:
+          type: string
+          description: Bare document id from the URL.
+        document_url:
+          type: string
+          description: Full docs.google.com URL — the agent extracts the id.
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["text"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: docs__create
+    description: Create a new Google Doc with a title and initial body text. Returns the new document id and shareable URL.
+    input_schema:
+      type: object
+      properties:
+        title:
+          type: string
+          description: Doc title shown in Drive + the doc itself.
+        body:
+          type: string
+          description: Initial body text. Plain text only; line breaks preserved.
+      required: [title, body]
+    mutates: true
+    elevation: false
+    output_redaction: ["body"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: docs__append_text
+    description: Append text to the end of an existing Google Doc (by id or URL). Returns success status and the doc's URL.
+    input_schema:
+      type: object
+      properties:
+        document_id:
+          type: string
+        document_url:
+          type: string
+        text:
+          type: string
+          description: Text to append. A leading newline is added so it doesn't run into the previous paragraph.
+      required: [text]
+    mutates: true
+    elevation: false
+    output_redaction: ["text"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []

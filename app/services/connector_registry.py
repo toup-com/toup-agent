@@ -74,6 +74,10 @@ TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9]*__[a-z0-9_]+$")
 KNOWN_PROVIDER_APPS: frozenset[str] = frozenset({
     "google",
     "github",
+    # 2026-05-11 — Outlook + LinkedIn connectors. Templates +
+    # env-var registration live in `provider_apps.py`.
+    "microsoft",
+    "linkedin",
     "stub_provider_app",
 })
 

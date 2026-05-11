@@ -1,0 +1,104 @@
+# Outlook (Microsoft 365) mail connector — manifest.
+#
+# Scopes lifted from Microsoft Graph's permission catalogue:
+#   - Mail.Read     — list + read messages
+#   - Mail.Send     — send mail
+#   - User.Read     — needed for /me/messages to identify the mailbox
+#   - offline_access — issue a refresh_token
+#
+# All four are "delegated" permissions (user-consent only, no admin
+# consent needed for personal Microsoft accounts and most Azure AD
+# tenants).
+manifest_version: 1
+id: outlook
+name: Outlook
+short_description: Read your inbox, search threads, and send messages from your Outlook / Microsoft 365 mailbox.
+icon: mail
+docs_url: https://learn.microsoft.com/en-us/graph/api/resources/mail-api-overview
+status: stable
+category: productivity
+
+oauth:
+  provider_app: microsoft
+  scopes:
+    - https://graph.microsoft.com/Mail.Read
+    - https://graph.microsoft.com/Mail.Send
+    - https://graph.microsoft.com/User.Read
+    - offline_access
+  scopes_optional: []
+  pkce: true
+  refresh: true
+
+scope_descriptions:
+  https://graph.microsoft.com/Mail.Read: Read your Outlook mail.
+  https://graph.microsoft.com/Mail.Send: Send mail on your behalf.
+  https://graph.microsoft.com/User.Read: Read your basic profile (mailbox address, display name).
+  offline_access: Refresh tokens so we don't ask you to sign in every hour.
+
+health:
+  probe: outlook__list_messages
+
+tools:
+  - name: outlook__list_messages
+    description: List recent Outlook messages, optionally filtered by Graph's $search syntax (e.g. "from:alice@contoso.com"). Defaults to the 10 most recent.
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Microsoft Graph $search filter. Empty string = inbox.
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["bodyPreview", "body"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: outlook__get_message
+    description: Fetch the full body, headers, and metadata of one Outlook message by id.
+    input_schema:
+      type: object
+      properties:
+        message_id:
+          type: string
+      required: [message_id]
+    mutates: false
+    elevation: false
+    output_redaction: ["body"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: outlook__send_message
+    description: Compose and send an Outlook message. Subject and body are required.
+    input_schema:
+      type: object
+      properties:
+        to:
+          type: string
+          description: Recipient email address (single).
+        subject:
+          type: string
+        body:
+          type: string
+        cc:
+          type: string
+        bcc:
+          type: string
+      required: [to, subject, body]
+    mutates: true
+    elevation: true
+    output_redaction: ["body", "cc", "bcc"]
+    pii: high
+    rate_limit: "10/min"
+    channel_policy:
+      default: allow
+      deny: []

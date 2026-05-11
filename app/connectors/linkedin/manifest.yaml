@@ -1,0 +1,81 @@
+# LinkedIn connector — manifest.
+#
+# Uses LinkedIn's modern OpenID Connect + Sharing-on-LinkedIn scope set
+# (the legacy r_liteprofile / r_emailaddress scopes are retired). The
+# combined consent screen shows: profile info, email, and post-on-
+# behalf-of.
+#
+# We don't request `r_organization_social` (page admin reads) or
+# `w_organization_social` (post as company page) in v1 — they require
+# additional partnership review from LinkedIn. Personal-account
+# posting is the wide-market feature.
+manifest_version: 1
+id: linkedin
+name: LinkedIn
+short_description: Read your LinkedIn profile and post updates to your feed.
+icon: linkedin
+docs_url: https://learn.microsoft.com/en-us/linkedin/marketing/integrations/community-management/shares/posts-api
+status: stable
+category: social
+
+oauth:
+  provider_app: linkedin
+  scopes:
+    # Sign In with LinkedIn (OpenID Connect) — profile + email.
+    - openid
+    - profile
+    - email
+    # Share on LinkedIn — post to personal feed.
+    - w_member_social
+  scopes_optional: []
+  pkce: false
+  refresh: true
+
+scope_descriptions:
+  openid: Identify your LinkedIn account.
+  profile: Read your public profile (name, headline, profile picture).
+  email: Read your primary LinkedIn email address.
+  w_member_social: Post text and links to your personal LinkedIn feed.
+
+health:
+  probe: linkedin__get_profile
+
+tools:
+  - name: linkedin__get_profile
+    description: Fetch your LinkedIn profile (name, headline, profile picture URL) and primary email.
+    input_schema:
+      type: object
+      properties: {}
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: linkedin__share_post
+    description: Post a text update (with an optional link) to your personal LinkedIn feed. The post is visible to your network by default — pass `visibility="CONNECTIONS"` to limit, or `"PUBLIC"` to make it world-visible.
+    input_schema:
+      type: object
+      properties:
+        text:
+          type: string
+          description: Post body. Plain text; LinkedIn linkifies URLs automatically.
+        link_url:
+          type: string
+          description: Optional URL to attach — LinkedIn fetches the preview card (title, image) server-side.
+        visibility:
+          type: string
+          enum: ["PUBLIC", "CONNECTIONS"]
+          default: "PUBLIC"
+      required: [text]
+    mutates: true
+    elevation: true
+    output_redaction: ["text"]
+    pii: medium
+    rate_limit: "5/min"
+    channel_policy:
+      default: allow
+      deny: []

@@ -72,6 +72,32 @@ _TEMPLATES: dict[str, dict] = {
         "token_url": "https://github.com/login/oauth/access_token",
         "use_pkce": False,
     },
+    "microsoft": {
+        # Microsoft Identity Platform v2. `common` tenant accepts both
+        # personal Microsoft accounts (Outlook.com, Live, Xbox) and
+        # work/school Azure AD accounts. Endpoint is templated with
+        # the tenant id at registration time (see
+        # `register_microsoft_provider_app` below). Microsoft always
+        # shows an account chooser when `prompt=select_account` is
+        # set or when the user has multiple signed-in accounts — but
+        # by default it can short-circuit to the active account. We
+        # add `prompt=select_account` at the connect call site for
+        # both first-time + "Switch account" flows so the experience
+        # matches the GitHub `/select_account` choice (see above).
+        "authorize_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        "use_pkce": True,
+    },
+    "linkedin": {
+        # LinkedIn OAuth 2.0. No PKCE support today. Authorize URL
+        # supports `client_id`, `redirect_uri`, `response_type=code`,
+        # `state`, and `scope` (space-separated; we URL-encode at
+        # send time). Token endpoint returns access_token +
+        # refresh_token + expires_in.
+        "authorize_url": "https://www.linkedin.com/oauth/v2/authorization",
+        "token_url": "https://www.linkedin.com/oauth/v2/accessToken",
+        "use_pkce": False,
+    },
     "stub_provider_app": {
         "authorize_url": "/api/oauth/_stub/authorize",
         "token_url": "/api/oauth/_stub/token",
@@ -286,9 +312,74 @@ def register_github_provider_app() -> None:
     ))
 
 
+def register_microsoft_provider_app() -> None:
+    """Register the Microsoft Identity Platform v2 OAuth client.
+
+    Backs the Outlook connector. Tenant id is templated into the
+    authorize + token URLs at registration time so an operator can
+    lock OAuth to a specific Azure AD organisation by setting
+    `MICROSOFT_OAUTH_TENANT` to that org's GUID (default `common`
+    accepts both personal + work accounts).
+
+    Required env vars:
+      - MICROSOFT_OAUTH_CLIENT_ID
+      - MICROSOFT_OAUTH_CLIENT_SECRET
+    Optional:
+      - MICROSOFT_OAUTH_TENANT (default: `common`)
+    """
+    cid = getattr(settings, "microsoft_oauth_client_id", "") or ""
+    csec = getattr(settings, "microsoft_oauth_client_secret", "") or ""
+    tenant = getattr(settings, "microsoft_oauth_tenant", "") or "common"
+    if not cid or not csec:
+        logger.info(
+            "[provider_apps] microsoft not registered — "
+            "MICROSOFT_OAUTH_CLIENT_ID/SECRET not set",
+        )
+        return
+    register_provider_app(ProviderAppConfig(
+        name="microsoft",
+        client_id=cid,
+        client_secret=csec,
+        authorize_url=f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+        token_url=f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+        use_pkce=True,
+    ))
+
+
+def register_linkedin_provider_app() -> None:
+    """Register the LinkedIn OAuth 2.0 client.
+
+    Backs the LinkedIn connector (profile read + post share). LinkedIn
+    doesn't support PKCE yet, so this provider opts out — same
+    treatment as the GitHub OAuth app.
+
+    Required env vars:
+      - LINKEDIN_OAUTH_CLIENT_ID
+      - LINKEDIN_OAUTH_CLIENT_SECRET
+    """
+    cid = getattr(settings, "linkedin_oauth_client_id", "") or ""
+    csec = getattr(settings, "linkedin_oauth_client_secret", "") or ""
+    if not cid or not csec:
+        logger.info(
+            "[provider_apps] linkedin not registered — "
+            "LINKEDIN_OAUTH_CLIENT_ID/SECRET not set",
+        )
+        return
+    register_provider_app(ProviderAppConfig(
+        name="linkedin",
+        client_id=cid,
+        client_secret=csec,
+        authorize_url="https://www.linkedin.com/oauth/v2/authorization",
+        token_url="https://www.linkedin.com/oauth/v2/accessToken",
+        use_pkce=False,
+    ))
+
+
 def bootstrap_provider_apps() -> None:
     """Called from platform_main lifespan. Always registers stub;
     registers real providers only when their env vars are present."""
     register_stub_provider_app()
     register_google_provider_app()
     register_github_provider_app()
+    register_microsoft_provider_app()
+    register_linkedin_provider_app()
