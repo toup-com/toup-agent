@@ -1174,7 +1174,7 @@ class ToolExecutor:
         "/browser",
         "/workspace", "/jobs", "/dashboard",
         "/agent", "/agent/soul", "/agent/settings",
-        "/agent/tools", "/agent/skills",
+        "/agent/tools", "/agent/skills", "/agent/integrations",
         "/account", "/movies",
     }
     _NAV_PATH_LABELS = {
@@ -1191,16 +1191,28 @@ class ToolExecutor:
         "/agent/settings": "Channels & Settings",
         "/agent/tools": "Tools",
         "/agent/skills": "Skills",
+        "/agent/integrations": "Integrations",
         "/account": "Account",
         "/movies": "Movies",
     }
 
+    # /agent/integrations/<connector_id> — the connector dispatcher
+    # generates these reauth URLs. The React Router route is the bare
+    # `/agent/integrations` page; the suffix is informational. Accept
+    # the subpath here AND in the frontend allowlist (ChatPage's
+    # `_isAllowedPlatformPath`) so the chip is clickable for every
+    # connector without listing each one. Lowercase a-z only to refuse
+    # any path-traversal / query-string / fragment trickery.
+    import re as _re
+    _NAV_INTEGRATIONS_RECONNECT_RE = _re.compile(r"^/agent/integrations/[a-z]+$")
+
     async def _tool_navigate_to(self, inp: Dict[str, Any]) -> str:
         path = (inp.get("path") or "").strip()
-        if path not in self._NAV_ALLOWED_PATHS:
+        if path not in self._NAV_ALLOWED_PATHS and not self._NAV_INTEGRATIONS_RECONNECT_RE.match(path):
             return (
                 f"ERROR: invalid path '{path}'. "
-                f"Allowed: {sorted(self._NAV_ALLOWED_PATHS)}"
+                f"Allowed: {sorted(self._NAV_ALLOWED_PATHS)} "
+                f"(or /agent/integrations/<connector_id>)"
             )
         user_id = self._current_user_id
         if not user_id:
