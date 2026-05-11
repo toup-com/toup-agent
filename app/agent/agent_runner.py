@@ -679,6 +679,14 @@ class AgentRunner:
         total_input = 0
         total_output = 0
         all_tool_calls: List[Dict[str, Any]] = []
+        # Per-call records persisted alongside the assistant message so the
+        # ToolPillRow chrome (frontend) can re-render days later when the
+        # user scrolls back. Each entry: {tool, started_at_ms,
+        # completed_at_ms, summary}. Kept thin (summary capped at 2KB
+        # per record) — the message column is Text-backed JSON, no point
+        # paying a few hundred KB just so a click-to-expand pill can
+        # show a giant raw blob.
+        tool_event_records: List[Dict[str, Any]] = []
         final_text = ""
         model_used = ""
 
@@ -974,6 +982,7 @@ class AgentRunner:
                 await _hb.emit(HookEvent.BEFORE_TOOL_CALL, {"tool": tc["name"], "input": tc["input"]})
 
                 _t_tool = time.perf_counter()
+                _t_tool_started_ms = int(time.time() * 1000)
                 try:
                     result = await self.tools.execute(tc["name"], tc["input"])
                 except Exception as e:
@@ -983,6 +992,18 @@ class AgentRunner:
                 logger.info(f"[PERF] tool_exec({tc['name']}): {(time.perf_counter() - _t_tool) * 1000:.0f}ms — {len(result)} chars")
                 logger.info(f"[AGENT] Tool result: {result[:200]}")
                 await _hb.emit(HookEvent.AFTER_TOOL_CALL, {"tool": tc["name"], "result_len": len(result)})
+                # Capture for the persisted ToolPillRow re-render. We
+                # cap summary at 2KB per record — the click-to-expand
+                # pill UI shows a popover, not a code editor; if you
+                # need the full payload for debugging, pull it from
+                # logs instead of bloating every message row.
+                _record_summary = result if len(result) <= 2048 else (result[:2048] + "…")
+                tool_event_records.append({
+                    "tool": tc["name"],
+                    "started_at_ms": _t_tool_started_ms,
+                    "completed_at_ms": int(time.time() * 1000),
+                    "summary": _record_summary,
+                })
                 if on_tool_end:
                     summary = result[:200] + "..." if len(result) > 200 else result
                     await on_tool_end(tc["name"], summary, tc.get("input"))
@@ -2515,6 +2536,16 @@ class AgentRunner:
 
         # Build kwargs so we only set id when provided (new code path); older
         # save paths that don't pass asst_message_id fall back to the UUID default.
+        # Compose metadata_json. Two payloads share this column today:
+        #   - "media":       legacy media-card metadata (may be None)
+        #   - "tool_events": ToolPillRow records (may be empty list)
+        # Only emit a non-NULL JSON when there's at least one payload to
+        # avoid bloating an otherwise-empty assistant turn.
+        _meta: Dict[str, Any] = {}
+        if media_meta:
+            _meta["media"] = media_meta
+        if tool_event_records:
+            _meta["tool_events"] = tool_event_records
         _asst_kwargs = dict(
             conversation_id=session_id,
             day_chat_id=_day_chat_id,
@@ -2525,7 +2556,7 @@ class AgentRunner:
             tokens_completion=tokens_output,
             model_used=model,
             processing_time_ms=processing_time_ms,
-            metadata_json=json.dumps({"media": media_meta}) if media_meta else None,
+            metadata_json=json.dumps(_meta) if _meta else None,
         )
         if asst_message_id:
             _asst_kwargs["id"] = asst_message_id

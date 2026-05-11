@@ -101,6 +101,36 @@ def _serialize_media(msg: Message) -> Optional[dict]:
     return media if isinstance(media, dict) else None
 
 
+def _serialize_tool_events(msg: Message) -> Optional[List[dict]]:
+    """Extract the ToolPillRow records persisted in metadata_json by
+    agent_runner. Shape per record: {tool, started_at_ms,
+    completed_at_ms, summary}. Returns None when absent or malformed
+    so the frontend ToolPillRow component skips rendering entirely
+    for legacy (pre-feature) messages instead of showing an empty
+    pill row."""
+    import json as _json
+    raw = getattr(msg, "metadata_json", None)
+    if not raw:
+        return None
+    try:
+        parsed = _json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    events = parsed.get("tool_events")
+    if not isinstance(events, list) or not events:
+        return None
+    # Defensive: drop any record missing the required keys instead of
+    # poisoning the whole list. The agent always writes well-formed
+    # records but a hand-edited row in production should degrade
+    # gracefully, not 500 every history load.
+    return [
+        e for e in events
+        if isinstance(e, dict) and "tool" in e and "started_at_ms" in e
+    ] or None
+
+
 # ── Agent proxy (platform mode proxies to user's VPS agent) ──────────
 
 async def _get_agent_proxy_info(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]]:
@@ -398,6 +428,7 @@ async def get_day_chat_messages(
                 "conversation_id": m.conversation_id,
                 "attachments": _serialize_attachments(m),
                 "media": _serialize_media(m),
+                "tool_events": _serialize_tool_events(m),
             }
             for m in messages
         ])
@@ -429,6 +460,7 @@ async def get_day_chat_messages(
             "conversation_id": msg.conversation_id,
             "attachments": _serialize_attachments(msg),
             "media": _serialize_media(msg),
+            "tool_events": _serialize_tool_events(msg),
         }
         for msg, channel in rows
     ])
