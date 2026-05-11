@@ -15,10 +15,11 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.db.database import async_session_maker
 from app.db.models import ConnectorIdentity
+from app.db.models.connectors import ConnectorEvent
 from app.mcp_auth import _resolve_agent_key_to_user_id
 from app.services import connector_vault as vault
 
@@ -31,10 +32,26 @@ class IdentityRow(BaseModel):
     has_token: bool
 
 
+class EventRow(BaseModel):
+    connector_id: str
+    event_type: str
+    created_at: str
+
+
 class FilterDebugResp(BaseModel):
     resolved_user_id: str | None
     active_connector_ids: list[str]
     all_identities: list[IdentityRow]
+    # Were any oauth events EVER recorded for this user_id? Tells us
+    # whether the OAuth callback even ran. EVENT_CONNECTED rows would
+    # show "the OAuth completed but vault.put failed silently"; EVENT
+    # rows of any other type narrow it further.
+    recent_events: list[EventRow]
+    # Sanity check: total identities across all users in the platform
+    # DB. If this is 0, no OAuth has ever persisted anywhere — points
+    # to a global connector_identities write bug rather than a per-
+    # user mismatch.
+    total_identities_all_users: int
 
 
 @router.get("/_mcp_filter_debug", response_model=FilterDebugResp)
@@ -54,9 +71,6 @@ async def mcp_filter_debug(
 
     async with async_session_maker() as db:
         active_rows = await vault.list_active(db, user_id)
-        # Pull every row for the user too — including non-active — so
-        # we can tell "no row at all" from "row exists but status !=
-        # active".
         all_rows = (
             await db.execute(
                 select(ConnectorIdentity).where(
@@ -64,6 +78,17 @@ async def mcp_filter_debug(
                 )
             )
         ).scalars().all()
+        recent_events = (
+            await db.execute(
+                select(ConnectorEvent)
+                .where(ConnectorEvent.user_id == user_id)
+                .order_by(ConnectorEvent.created_at.desc())
+                .limit(20)
+            )
+        ).scalars().all()
+        total_count = (
+            await db.execute(select(func.count(ConnectorIdentity.user_id)))
+        ).scalar_one()
 
     return FilterDebugResp(
         resolved_user_id=user_id,
@@ -76,4 +101,13 @@ async def mcp_filter_debug(
             )
             for r in all_rows
         ],
+        recent_events=[
+            EventRow(
+                connector_id=e.connector_id,
+                event_type=e.event_type,
+                created_at=e.created_at.isoformat() + "Z",
+            )
+            for e in recent_events
+        ],
+        total_identities_all_users=int(total_count),
     )
