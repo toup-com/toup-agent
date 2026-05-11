@@ -11,19 +11,22 @@ sharing CronService's scheduler). Three concerns, two schedulers feels
 right — Routines stand alone.
 """
 
+from .agent_task_handler import AgentTaskHandler
 from .base_handler import RoutineHandler, RoutineResult, RoutineStatus
 from .email_briefing_handler import EmailBriefingHandler
 from .registry import KIND_HANDLERS, register_handler
 from .runner import RoutineRunner
 
 
-# Register the email briefing handler so any routine with
-# kind="email_briefing" gets a real dispatch (not the no-op fallback).
-# Gating happens at `RoutineRunner._load_enabled_routines` via the
-# `routines_email_briefing_enabled` per-tenant feature flag.
+# Default handler registrations. Both kinds gate on the per-tenant
+# feature flag (see `RoutineRunner._kind_enabled`).
+#   - `email_briefing` — Gmail-specialised preset
+#   - `agent_task` — generic prompt-driven, runs through the agent
 register_handler(EmailBriefingHandler())
+register_handler(AgentTaskHandler())
 
 __all__ = [
+    "AgentTaskHandler",
     "EmailBriefingHandler",
     "RoutineHandler",
     "RoutineResult",

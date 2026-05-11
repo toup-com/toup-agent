@@ -451,6 +451,11 @@ async def init_db():
         # `messages.channel` already exists (added by the time-channel-fix PR
         # above) and routine writes will set it to "routine".
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS source VARCHAR(50)",
+        # Routines generalised from email-only → arbitrary scheduled agent
+        # tasks (2026-05-12). `name` is user-visible; `prompt_text` is the
+        # NL prompt for `kind='agent_task'`. Nullable for existing rows.
+        "ALTER TABLE routines ADD COLUMN IF NOT EXISTS name VARCHAR(100)",
+        "ALTER TABLE routines ADD COLUMN IF NOT EXISTS prompt_text TEXT",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

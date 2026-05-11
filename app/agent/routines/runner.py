@@ -107,6 +107,11 @@ class RoutineRunner:
         # None is acceptable; handlers that need MCP will return a
         # `failed` result with error_class="no_mcp_client".
         self._mcp_client = mcp_client
+        # Agent runner — wired post-construction (lifespan order). The
+        # generic `agent_task` handler uses it for tool-using prompts;
+        # if absent, that handler falls back to a no-tools internal_llm
+        # call so pure-text routines still work.
+        self._agent_runner: Any = None
         self._retry_delays = retry_delays or self.DEFAULT_RETRY_DELAYS
         self.scheduler = AsyncIOScheduler()
         # routine_id → APScheduler job_id (1:1; the job_id IS the routine_id
@@ -118,6 +123,12 @@ class RoutineRunner:
         BEFORE the MCP client (lifespan order), so wire-up uses this
         rather than the constructor."""
         self._mcp_client = mcp_client
+
+    def set_agent_runner(self, agent_runner: Any) -> None:
+        """Late-bind the AgentRunner so `agent_task` handlers can call
+        `agent_runner.run(prompt, ...)` with full tool access. agent_main
+        wires this after the runner is constructed."""
+        self._agent_runner = agent_runner
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -225,13 +236,21 @@ class RoutineRunner:
     @staticmethod
     def _kind_enabled(kind: str, settings) -> bool:
         """Map a routine kind to its feature flag. Unknown kinds default
-        off so a typo or future-kind row doesn't surprise-activate."""
-        if kind == "email_briefing":
-            return bool(getattr(settings, "routines_email_briefing_enabled", False))
+        off so a typo or future-kind row doesn't surprise-activate.
+
+        v2 generalisation: a single master flag
+        (`routines_email_briefing_enabled`, retained for backward compat
+        with the env var the canary tenant already has set) enables
+        BOTH `email_briefing` (preset) AND `agent_task` (generic). One
+        knob, two real kinds available. Add a per-kind flag later if a
+        future kind needs separate gating."""
+        master = bool(getattr(settings, "routines_email_briefing_enabled", False))
         # Test-only kinds bypass the flag so the smoke test doesn't need
         # to flip a real production setting on.
         if kind.startswith("_test_") or kind == "_smoke":
             return True
+        if kind in ("email_briefing", "agent_task"):
+            return master
         return False
 
     async def _register_trigger_for(self, routine) -> str:
@@ -378,12 +397,17 @@ class RoutineRunner:
             await self._finalize_run(run_id, status="success")
             return
 
-        # Wire the MCP client into the handler if the handler accepts one
-        # via attribute. Stateless: handlers may share an instance across
-        # tenants — the per-call X-Agent-Key already scopes the client.
+        # Wire the MCP client + agent runner into the handler if the
+        # handler declares either dep via attribute. Stateless: handlers
+        # may share an instance across tenants — per-call X-Agent-Key
+        # already scopes the MCP client; agent_runner is per-tenant by
+        # virtue of being constructed in this tenant's lifespan.
         if self._mcp_client is not None and hasattr(handler, "_mcp_client"):
             if handler._mcp_client is None:
                 handler._mcp_client = self._mcp_client
+        if getattr(self, "_agent_runner", None) is not None and hasattr(handler, "_agent_runner"):
+            if handler._agent_runner is None:
+                handler._agent_runner = self._agent_runner
 
         result = await self._run_with_retry(handler, routine, run_id)
         await self._post_terminal(routine, run_id, result)

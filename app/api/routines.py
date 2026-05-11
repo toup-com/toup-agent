@@ -95,12 +95,17 @@ def _kind_enabled_or_404(kind: str) -> None:
 
 
 class RoutineCreate(BaseModel):
-    kind: str = Field(..., description="Routine handler kind, e.g. 'email_briefing'")
+    kind: str = Field(..., description="Routine handler kind: 'email_briefing' or 'agent_task'")
     schedule_cron_local: str = Field(
         ...,
         description="5-part cron expression evaluated in the user's tz",
         examples=["30 6 * * *"],
     )
+    name: Optional[str] = Field(default=None, max_length=100,
+        description="User-visible name. Defaults to a kind-based label.")
+    prompt_text: Optional[str] = Field(default=None,
+        description="Required when kind='agent_task'. The natural-language "
+                    "task the agent runs at fire time.")
     enabled: bool = True
     config: Optional[dict] = None
 
@@ -109,6 +114,8 @@ class RoutineUpdate(BaseModel):
     schedule_cron_local: Optional[str] = None
     enabled: Optional[bool] = None
     config: Optional[dict] = None
+    name: Optional[str] = Field(default=None, max_length=100)
+    prompt_text: Optional[str] = None
 
 
 class RoutineRunResponse(BaseModel):
@@ -127,6 +134,8 @@ class RoutineRunResponse(BaseModel):
 class RoutineResponse(BaseModel):
     id: str
     kind: str
+    name: Optional[str] = None
+    prompt_text: Optional[str] = None
     enabled: bool
     schedule_cron_local: str
     config: Optional[dict]
@@ -144,6 +153,8 @@ def _row_to_response(routine, recent_runs=()) -> RoutineResponse:
     return RoutineResponse(
         id=routine.id,
         kind=routine.kind,
+        name=getattr(routine, "name", None),
+        prompt_text=getattr(routine, "prompt_text", None),
         enabled=bool(routine.enabled),
         schedule_cron_local=routine.schedule_cron_local,
         config=routine.config_json or None,
@@ -231,29 +242,46 @@ async def create_routine(req: RoutineCreate):
     _kind_enabled_or_404(req.kind)
     _validate_cron(req.schedule_cron_local)
 
+    # Generic agent_task routines NEED a prompt — that's the whole point.
+    # Preset kinds (email_briefing) don't use prompt_text; the handler
+    # has its own hard-coded prompt template.
+    if req.kind == "agent_task" and not (req.prompt_text or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="agent_task routines require `prompt_text` (what should "
+                   "the agent do?).",
+        )
+
     from app.db.database import async_session_maker
     from app.db.models import Routine
 
     user_id = _user_id()
     async with async_session_maker() as db:
-        # One-active-per-kind enforcement
-        existing = await db.execute(
-            select(Routine).where(
-                Routine.user_id == user_id,
-                Routine.kind == req.kind,
-                Routine.enabled == True,  # noqa: E712
+        # One-active-per-kind enforcement is preserved for preset kinds
+        # (email_briefing → one Gmail briefing per user). For the generic
+        # `agent_task` kind we allow MANY active routines — each one is a
+        # distinct task ("morning briefing", "noon GitHub check", etc.)
+        # and per-task uniqueness on (kind=agent_task) would be useless.
+        if req.kind != "agent_task":
+            existing = await db.execute(
+                select(Routine).where(
+                    Routine.user_id == user_id,
+                    Routine.kind == req.kind,
+                    Routine.enabled == True,  # noqa: E712
+                )
             )
-        )
-        if existing.scalar_one_or_none() is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"An enabled {req.kind!r} routine already exists. "
-                       f"Disable or delete it first.",
-            )
+            if existing.scalar_one_or_none() is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"An enabled {req.kind!r} routine already exists. "
+                           f"Disable or delete it first.",
+                )
 
         routine = Routine(
             user_id=user_id,
             kind=req.kind,
+            name=(req.name or "").strip() or None,
+            prompt_text=(req.prompt_text or "").strip() or None,
             schedule_cron_local=req.schedule_cron_local,
             enabled=bool(req.enabled),
             config_json=req.config or None,
@@ -302,6 +330,10 @@ async def update_routine(routine_id: str, req: RoutineUpdate):
             routine.enabled = bool(req.enabled)
         if req.config is not None:
             routine.config_json = req.config
+        if req.name is not None:
+            routine.name = (req.name or "").strip() or None
+        if req.prompt_text is not None:
+            routine.prompt_text = (req.prompt_text or "").strip() or None
         routine.updated_at = datetime.utcnow()
         await db.commit()
         await db.refresh(routine)

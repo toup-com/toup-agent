@@ -931,6 +931,12 @@ async def lifespan(app: FastAPI):
             # container).
             if routine_runner is not None:
                 routine_runner.set_mcp_client(mcp_client)
+                # Also wire the AgentRunner so generic `agent_task`
+                # routines can use the agent's tool-using turn pipeline.
+                # `agent_runner` exists at this point in lifespan (it was
+                # constructed alongside cron_service in the earlier block).
+                if agent_runner is not None:
+                    routine_runner.set_agent_runner(agent_runner)
 
             # Periodic refresh task — keeps the sync snapshot fresh
             # without every turn paying the cache-miss cost. Stored on

@@ -38,9 +38,24 @@ class Routine(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
 
-    # Routine kind discriminator. v1: "email_briefing". Future: "calendar_briefing", "slack_digest".
+    # Routine kind discriminator.
+    #   "agent_task"     — generic. Runs `prompt_text` against the agent at
+    #                      the scheduled time. Output posted to day-chat.
+    #   "email_briefing" — Gmail-specialised preset (MCP fetch + summary).
+    # Adding a new kind = add a handler + register; no migrations.
     kind: Mapped[str] = mapped_column(String(50), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+
+    # User-visible name, e.g. "Morning briefing" / "Check deploys". Used
+    # as the Conversation title for posted messages + Mission Control
+    # card title. NULL for legacy rows (pre-2026-05-12); the UI falls
+    # back to the kind discriminator when empty.
+    name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    # Natural-language prompt the agent runs at fire time. Only used by
+    # `kind="agent_task"`. NULL for handler-specific kinds like
+    # `email_briefing` whose flow is hard-coded in the handler.
+    prompt_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # 5-part cron expression evaluated in User.timezone. Stored as the user's
     # original choice so a later tz change can re-resolve without losing intent.
