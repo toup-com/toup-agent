@@ -1,0 +1,156 @@
+# Google Sheets connector manifest.
+#
+# Reuses the same `google` provider_app as Gmail/Calendar/Drive — one
+# OAuth client, separate scopes per surface. The user re-consents once
+# per surface; refresh tokens stay scoped per identity row.
+manifest_version: 1
+id: sheets
+name: Google Sheets
+short_description: Read and write rows on your spreadsheets.
+icon: sheets
+docs_url: https://developers.google.com/sheets/api/reference/rest
+status: stable
+category: productivity
+
+oauth:
+  provider_app: google
+  scopes:
+    - https://www.googleapis.com/auth/spreadsheets
+  # drive.readonly is RESTRICTED in Google's verification policy and
+  # would force the entire app through CASA security assessment
+  # ($15k–$75k, months of work). It's only needed for
+  # sheets__list_spreadsheets; everything that operates on a known
+  # spreadsheet ID works with `spreadsheets` alone. Kept optional so
+  # power users can grant it explicitly to enable listing.
+  scopes_optional:
+    - https://www.googleapis.com/auth/drive.readonly
+    - https://www.googleapis.com/auth/spreadsheets.readonly
+  pkce: true
+  refresh: true
+
+scope_descriptions:
+  https://www.googleapis.com/auth/spreadsheets: Read and edit values, formatting, and structure of your spreadsheets.
+  https://www.googleapis.com/auth/drive.readonly: (Optional, broad) List every spreadsheet in your Drive. Without this the agent can still read and write any sheet you give it the URL or ID of.
+  https://www.googleapis.com/auth/spreadsheets.readonly: Read-only access if you don't want the agent writing.
+
+health:
+  probe: sheets__list_spreadsheets
+
+tools:
+  - name: sheets__list_spreadsheets
+    description: List Google Sheets the user owns or has access to. Requires the optional `drive.readonly` scope; if the user hasn't granted it, this tool returns a `ConnectorScopeMissing` result and the agent should ask them to reconnect Sheets with the broader permission, or work with a spreadsheet ID/URL the user provides directly.
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Free-text filter on the spreadsheet name.
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 20
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: sheets__read_range
+    description: Read a range of cells from a sheet. Returns a 2D array of values.
+    input_schema:
+      type: object
+      properties:
+        spreadsheet_id:
+          type: string
+        range:
+          type: string
+          description: A1 notation, e.g. "Sheet1!A1:D20".
+      required: [spreadsheet_id, range]
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: sheets__append_rows
+    description: Append rows to the end of a sheet. Each row is a list of cell values.
+    input_schema:
+      type: object
+      properties:
+        spreadsheet_id:
+          type: string
+        range:
+          type: string
+          description: A1 notation pointing at the sheet, e.g. "Sheet1!A:D".
+        values:
+          type: array
+          items:
+            type: array
+            items: {}
+        value_input_option:
+          type: string
+          enum: [RAW, USER_ENTERED]
+          default: USER_ENTERED
+      required: [spreadsheet_id, range, values]
+    mutates: true
+    elevation: true
+    output_redaction: []
+    pii: medium
+    rate_limit: "60/min"
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: sheets__update_range
+    description: Overwrite a range of cells. Replaces any existing values in the target range.
+    input_schema:
+      type: object
+      properties:
+        spreadsheet_id:
+          type: string
+        range:
+          type: string
+        values:
+          type: array
+          items:
+            type: array
+            items: {}
+        value_input_option:
+          type: string
+          enum: [RAW, USER_ENTERED]
+          default: USER_ENTERED
+      required: [spreadsheet_id, range, values]
+    mutates: true
+    elevation: true
+    output_redaction: []
+    pii: medium
+    rate_limit: "60/min"
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: sheets__create_spreadsheet
+    description: Create a new spreadsheet with the given title and optional initial sheet name.
+    input_schema:
+      type: object
+      properties:
+        title:
+          type: string
+        sheet_title:
+          type: string
+          default: Sheet1
+      required: [title]
+    mutates: true
+    elevation: true
+    output_redaction: []
+    pii: low
+    rate_limit: "10/min"
+    channel_policy:
+      default: allow
+      deny: []
