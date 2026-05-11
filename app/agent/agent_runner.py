@@ -1097,6 +1097,7 @@ class AgentRunner:
                 client_tz=client_tz,
                 asst_message_id=asst_message_id,
                 channel=channel,
+                tool_event_records=tool_event_records,
             )
             await db.commit()
         logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
@@ -2476,7 +2477,15 @@ class AgentRunner:
         client_tz: Optional[str] = None,
         asst_message_id: Optional[str] = None,
         channel: Optional[str] = None,
+        # Per-call tool records for the persisted ToolPillRow chrome.
+        # Default empty list keeps every other caller (cron jobs, etc.)
+        # working without code changes — no tools used → no tool_events
+        # key in metadata_json → frontend renders the saved message
+        # exactly like before.
+        tool_event_records: Optional[List[Dict[str, Any]]] = None,
     ):
+        if tool_event_records is None:
+            tool_event_records = []
         from sqlalchemy import select
         from app.db.models import Message, Conversation
 
