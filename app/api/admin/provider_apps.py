@@ -52,16 +52,24 @@ router = APIRouter(prefix="/admin/provider-apps", tags=["Admin — Provider apps
 # Friendly per-provider metadata that drives the admin UI walkthrough.
 # Keep this aligned with `_TEMPLATES` in provider_apps.py — both indexed
 # by the same provider name.
+#
+# `client_id_placeholder` is the example format the frontend shows
+# inside the Client ID input. Each provider's ID has a distinct shape
+# (Google: dashed reverse-domain; GitHub: short alnum; Microsoft: GUID;
+# LinkedIn: short hex) — a generic placeholder leads to users pasting
+# the wrong value (e.g. an entire console URL) and a 400 from the
+# upsert endpoint. Specific placeholders = fewer setup mistakes.
 _PROVIDER_META: dict[str, dict] = {
     "google": {
         "label": "Google",
         "description": (
-            "Google OAuth client. One client backs Gmail, Calendar, and "
-            "Drive — distinct manifests, distinct scopes, one credential "
-            "pair."
+            "Google OAuth client. One client backs Gmail, Calendar, "
+            "Drive, and Docs — distinct manifests, distinct scopes, "
+            "one credential pair."
         ),
         "console_url": "https://console.cloud.google.com/apis/credentials",
         "redirect_uri_hint": "Add this exact redirect URI to your Google OAuth client.",
+        "client_id_placeholder": "123456789-xxxxxxx.apps.googleusercontent.com",
     },
     "github": {
         "label": "GitHub",
@@ -71,6 +79,28 @@ _PROVIDER_META: dict[str, dict] = {
         ),
         "console_url": "https://github.com/settings/developers",
         "redirect_uri_hint": "Add this as the Authorization callback URL on the OAuth App.",
+        "client_id_placeholder": "Ov23liXXXXXXXXXXXXXX",
+    },
+    "microsoft": {
+        "label": "Microsoft",
+        "description": (
+            "Microsoft Identity Platform app registration. Used by the "
+            "Outlook connector — and any future Microsoft 365 connectors "
+            "(Teams, OneDrive, Calendar) that ship later."
+        ),
+        "console_url": "https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps",
+        "redirect_uri_hint": "Add this exact URL as a Web redirect URI on your App registration.",
+        "client_id_placeholder": "00000000-0000-0000-0000-000000000000",
+    },
+    "linkedin": {
+        "label": "LinkedIn",
+        "description": (
+            "LinkedIn OAuth 2.0 app. Used by the LinkedIn connector for "
+            "profile read and personal-feed posts."
+        ),
+        "console_url": "https://www.linkedin.com/developers/apps",
+        "redirect_uri_hint": "Add this exact URL under Authorized redirect URLs in the Auth tab.",
+        "client_id_placeholder": "86xxxxxxxxxx",
     },
 }
 
@@ -86,6 +116,9 @@ class ProviderAppOut(BaseModel):
     status: str  # "configured_db" | "configured_env" | "missing"
     client_id: Optional[str] = None  # full id (not a secret)
     client_secret_set: bool = False
+    # Example shape of this provider's client_id — drives the frontend
+    # input placeholder so users don't paste a whole URL by mistake.
+    client_id_placeholder: str = ""
     updated_at: Optional[datetime] = None
     updated_by: Optional[str] = None
 
@@ -144,6 +177,7 @@ def _build_out(name: str, *, status_: str, client_id: Optional[str],
         "description": f"OAuth provider — {name}",
         "console_url": "",
         "redirect_uri_hint": "",
+        "client_id_placeholder": "",
     })
     return ProviderAppOut(
         name=name,
@@ -155,6 +189,7 @@ def _build_out(name: str, *, status_: str, client_id: Optional[str],
         status=status_,
         client_id=client_id,
         client_secret_set=secret_set,
+        client_id_placeholder=meta.get("client_id_placeholder", ""),
         updated_at=updated_at,
         updated_by=updated_by,
     )
