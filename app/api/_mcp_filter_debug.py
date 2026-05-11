@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from app.db.database import async_session_maker
-from app.db.models import ConnectorIdentity
+from app.db.models import ConnectorIdentity, User
 from app.db.models.connectors import ConnectorEvent
 from app.mcp_auth import _resolve_agent_key_to_user_id
 from app.services import connector_vault as vault
@@ -39,13 +39,12 @@ class EventRow(BaseModel):
 
 
 class GlobalRow(BaseModel):
-    # Truncated to first 8 chars + connector_id so we can pin down
-    # whether the orphaned identity belongs to a user with a similar
-    # prefix (=> it's our caller, ID got stored differently) or a
-    # totally different one (=> two-account scenario).
     user_id_prefix: str
     connector_id: str
     status: str
+    # Email of the user that owns this row — needed to disambiguate
+    # the two-account-same-email case from two-different-accounts.
+    user_email: str | None
 
 
 class FilterDebugResp(BaseModel):
@@ -58,6 +57,11 @@ class FilterDebugResp(BaseModel):
     # because v0 has at most a handful of rows during this debugging
     # window — rip this field out before re-publishing the diagnostic.
     all_rows_global: list[GlobalRow]
+    # Email of the user the X-Agent-Key resolves to. If this differs
+    # from the all_rows_global[*].user_email, we're in a
+    # two-different-account scenario; if they match, two accounts
+    # share an email which is the platform's bug.
+    resolved_user_email: str | None
 
 
 @router.get("/_mcp_filter_debug")
@@ -106,6 +110,16 @@ async def _impl(x_agent_key: str | None) -> FilterDebugResp:
         global_rows = (
             await db.execute(select(ConnectorIdentity))
         ).scalars().all()
+        # Bulk email lookup for every user_id we touch in this response.
+        wanted_ids = {r.user_id for r in global_rows} | {user_id}
+        users_by_id = {
+            u.id: u.email
+            for u in (
+                await db.execute(
+                    select(User).where(User.id.in_(wanted_ids))
+                )
+            ).scalars()
+        }
     return FilterDebugResp(
         resolved_user_id=user_id,
         active_connector_ids=sorted({r.connector_id for r in active_rows}),
@@ -133,7 +147,9 @@ async def _impl(x_agent_key: str | None) -> FilterDebugResp:
                 user_id_prefix=(r.user_id or "")[:8],
                 connector_id=r.connector_id,
                 status=r.status,
+                user_email=users_by_id.get(r.user_id),
             )
             for r in global_rows
         ],
+        resolved_user_email=users_by_id.get(user_id),
     )
