@@ -55,11 +55,13 @@ from app.config import settings
 from app.db import get_db
 from app.db.models import (
     AgentConfig,
+    ConnectorIdentity,
     ConnectorOAuthSession,
     EVENT_CONNECTED,
     EVENT_REVOCATION_PROVIDER_FAILED,
     EVENT_REVOCATION_PROVIDER_SUCCEEDED,
 )
+from sqlalchemy import update as sa_update
 from app.services import connector_vault as vault
 from app.services.connector_registry import get_registry
 from app.services.connector_vault import _audit_then_commit
@@ -86,6 +88,15 @@ class ConnectStartResponse(BaseModel):
 class DisconnectResponse(BaseModel):
     status: str
     revoke_outcome: str  # "succeeded" | "failed" | "no_identity"
+
+
+class ReadOnlyRequest(BaseModel):
+    read_only: bool
+
+
+class ReadOnlyResponse(BaseModel):
+    connector_id: str
+    read_only: bool
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────
@@ -123,8 +134,15 @@ def _build_authorize_url(
     state: str,
     code_challenge: str,
     use_pkce: bool,
+    force_account_selection: bool = False,
 ) -> str:
-    """Compose the standard OAuth 2.0 authorize URL."""
+    """Compose the standard OAuth 2.0 authorize URL.
+
+    `force_account_selection=True` adds `prompt=select_account` so the
+    provider re-shows its account chooser even when the user is already
+    signed in. Drives the connected-card "Switch account" action;
+    Google/Microsoft/GitHub all honour the standard OAuth 2.0 `prompt`
+    parameter."""
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -135,6 +153,8 @@ def _build_authorize_url(
     if use_pkce:
         params["code_challenge"] = code_challenge
         params["code_challenge_method"] = "S256"
+    if force_account_selection:
+        params["prompt"] = "select_account"
     sep = "&" if "?" in base_url else "?"
     return f"{base_url}{sep}{urllib.parse.urlencode(params)}"
 
@@ -183,6 +203,15 @@ async def _exchange_code_for_tokens(
 @router.post("/connect/{connector_id}", response_model=ConnectStartResponse)
 async def oauth_connect(
     connector_id: str,
+    switch_account: bool = Query(
+        default=False,
+        description=(
+            "When true, ask the provider to re-show its account chooser "
+            "(OAuth `prompt=select_account`). Used by the connected-card "
+            "'Switch account' action so the user can swap to a different "
+            "Google/GitHub/etc. account without first disconnecting."
+        ),
+    ),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -278,6 +307,7 @@ async def oauth_connect(
         state=state,
         code_challenge=code_challenge,
         use_pkce=app_cfg.use_pkce,
+        force_account_selection=switch_account,
     )
 
     # T1d Q2: absolutise stub authorize URLs so the frontend's
@@ -567,6 +597,75 @@ async def oauth_disconnect(
     )
 
     return DisconnectResponse(status="disconnected", revoke_outcome=revoke_outcome)
+
+
+# ─── /read-only ──────────────────────────────────────────────────────
+
+
+@router.post("/{connector_id}/read-only", response_model=ReadOnlyResponse)
+async def oauth_read_only(
+    connector_id: str,
+    req: ReadOnlyRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Toggle the per-identity read-only flag.
+
+    `read_only=true`  → every mutating tool (`mutates: true` in the
+                        manifest) disappears from the agent's tool list
+                        and the dispatcher refuses any call to one as
+                        defense-in-depth.
+    `read_only=false` → tools come back the next time the agent
+                        refreshes its tool cache (T1h push below).
+
+    Drives the connected-card "Switch to read-only" action. Idempotent:
+    repeated calls with the same value succeed and return the current
+    state.
+    """
+    _flag_or_503()
+
+    entry = get_registry().get(connector_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown connector {connector_id!r}",
+        )
+
+    user_id = str(current_user.id)
+
+    # Identity must exist + be in a usable state. We allow toggling on
+    # active and reauth_required identities (the user might be locking
+    # down a connection they're about to re-auth) but reject revoked /
+    # provider_down where the flag is meaningless.
+    ident_row = (
+        await db.execute(
+            select(ConnectorIdentity)
+            .where(ConnectorIdentity.user_id == user_id)
+            .where(ConnectorIdentity.connector_id == connector_id)
+        )
+    ).scalar_one_or_none()
+    if ident_row is None or ident_row.status not in ("active", "reauth_required"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active {connector_id!r} identity to toggle",
+        )
+
+    await db.execute(
+        sa_update(ConnectorIdentity)
+        .where(ConnectorIdentity.id == ident_row.id)
+        .values(read_only=bool(req.read_only))
+    )
+    await db.commit()
+
+    # Push the tool list to the tenant so write-tools disappear (or
+    # reappear) without a page reload.
+    from app.services.docker_host_service import refresh_tenant_tools
+    await refresh_tenant_tools(db, user_id)
+    logger.info(
+        "[oauth.read_only] user=%s connector=%s → read_only=%s",
+        user_id[:8], connector_id, bool(req.read_only),
+    )
+    return ReadOnlyResponse(connector_id=connector_id, read_only=bool(req.read_only))
 
 
 # ─── Stub-only endpoints (test harness) ──────────────────────────────

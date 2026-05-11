@@ -236,6 +236,22 @@ async def execute(
             reauth_url=f"/agent/integrations/{connector_id}",
         )
 
+    # 3.5 Per-identity read-only gate. The MCP tool filter already
+    #     drops mutating tools from the agent's tool list when the
+    #     identity is read-only — this is defense-in-depth for any
+    #     code path that bypassed the filter (cached tool spec, raw
+    #     dispatcher call from a test, etc).
+    if getattr(identity, "read_only", False) and manifest_tool.mutates:
+        _log(user_hash, connector_id, tool_name, channel, "read_only_blocked", started)
+        return ConnectorToolError(
+            message=(
+                f"{connector_id} is currently set to read-only — "
+                f"tool {tool_name!r} would modify data and is blocked. "
+                f"Toggle off read-only on the integrations page to enable."
+            ),
+            retryable=False,
+        )
+
     # 4. Refresh-on-expiring (lazy, coalesced via per-identity lock).
     if _needs_refresh(identity):
         identity, refresh_outcome = await _refresh_with_coalescing(

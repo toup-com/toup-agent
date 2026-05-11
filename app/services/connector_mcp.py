@@ -350,10 +350,19 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
         # T1h for the agent-side cache that elides repeat traffic.
         async with async_session_maker() as db:
             active_rows = await vault.list_active(db, user_id)
-        active_connector_ids = {row.connector_id for row in active_rows}
+        # connector_id → read_only flag for this user. The filter below
+        # drops every mutating tool of any connector whose identity
+        # the user has flipped to read-only via the connected-card
+        # "Switch to read-only" action.
+        read_only_by_connector = {
+            row.connector_id: bool(getattr(row, "read_only", False))
+            for row in active_rows
+        }
 
         # Filter: keep all non-connector tools (memory_*, entity_*,
         # etc) + connector tools whose owner is in the active set.
+        # Drop mutating connector tools when the user's identity for
+        # that connector is read-only.
         filtered = []
         for tool in tools:
             owner = self._registry.get_owner(tool.name)
@@ -361,9 +370,16 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
                 # Not a connector tool — keep.
                 filtered.append(tool)
                 continue
-            if owner in active_connector_ids:
-                filtered.append(tool)
-            # else drop (user hasn't connected this connector).
+            if owner not in read_only_by_connector:
+                # User hasn't connected this connector — drop.
+                continue
+            if read_only_by_connector[owner]:
+                # Identity is read-only: drop the tool if its manifest
+                # marks it as mutating. Read tools pass through.
+                spec = self._registry.get_tool_spec(tool.name)
+                if spec is not None and spec.mutates:
+                    continue
+            filtered.append(tool)
 
         return filtered
 

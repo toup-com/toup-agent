@@ -112,6 +112,10 @@ class DecryptedIdentity:
     connected_at: Optional[datetime] = None
     last_used_at: Optional[datetime] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # True when the user has flipped this connection to read-only.
+    # The MCP tool filter and the dispatcher both gate mutating tool
+    # calls on this flag.
+    read_only: bool = False
 
 
 class VaultAuditError(RuntimeError):
@@ -181,6 +185,7 @@ def _to_struct(row: ConnectorIdentity) -> DecryptedIdentity:
         connected_at=row.connected_at,
         last_used_at=row.last_used_at,
         metadata=(json.loads(row.metadata_json) if row.metadata_json else {}),
+        read_only=bool(getattr(row, "read_only", False)),
     )
 
 

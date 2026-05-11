@@ -172,6 +172,16 @@ class ConnectorIdentity(Base):
         DateTime, nullable=True,
     )
 
+    # Per-identity read-only switch. When True, the MCP tool filter
+    # drops every manifest tool with `mutates: true` and the
+    # dispatcher refuses any mutating tool call as defense-in-depth.
+    # Toggled from the connected-card "Switch to read-only" action.
+    # Default False so existing identities are unaffected by the
+    # migration.
+    read_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+
     # Free-form per-provider metadata — Slack team_id, Gmail
     # email_address, GitHub installation_id (when we add GitHub Apps),
     # etc. Text not JSONB so SQLite tests can seed without driver gymnastics.

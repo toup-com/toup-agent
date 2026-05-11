@@ -322,6 +322,12 @@ async def init_db():
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_self_e164 VARCHAR(20)",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_baileys_allowlist TEXT",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_session_status VARCHAR(20)",
+        # ── Connector identities ──
+        # Per-identity read-only switch (2026-05-11). True means the
+        # MCP tool filter drops every manifest tool with mutates=true
+        # and the dispatcher refuses any mutating tool call. Toggled
+        # from the connected-card "Switch to read-only" action.
+        "ALTER TABLE connector_identities ADD COLUMN IF NOT EXISTS read_only BOOLEAN NOT NULL DEFAULT FALSE",
         # ── VPS ──
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT 'aws'",
         "ALTER TABLE vps_plans ADD COLUMN IF NOT EXISTS hostinger_plan_id VARCHAR(50)",

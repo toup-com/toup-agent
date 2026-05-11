@@ -62,6 +62,9 @@ class CatalogConnectorEntry(BaseModel):
     scopes: list[CatalogScopeEntry]
     tools: list[CatalogToolEntry]
     coming_soon: bool = False
+    # Per-identity read-only flag. Defaults to False; only meaningful
+    # when status is 'active' or 'reauth_required'.
+    read_only: bool = False
 
 
 class CatalogResponse(BaseModel):
@@ -159,6 +162,7 @@ async def get_connector_catalog(
                     if ident and ident.last_used_at
                     else None
                 ),
+                read_only=bool(getattr(ident, "read_only", False)) if ident else False,
                 scopes=catalog_scopes,
                 tools=[
                     CatalogToolEntry(

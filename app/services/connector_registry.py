@@ -202,6 +202,24 @@ class ConnectorRegistry:
         """connector_id of the manifest that registered this tool."""
         return self._tool_index.get(tool_name)
 
+    def get_tool_spec(self, tool_name: str) -> Optional["ConnectorTool"]:
+        """Return the manifest tool entry for `tool_name`, or None.
+
+        Lets callers ask things like "is this a mutating tool?" without
+        re-walking the manifest list. Used by the MCP tool filter to
+        drop write-tools when the identity is in read-only mode.
+        """
+        owner = self._tool_index.get(tool_name)
+        if owner is None:
+            return None
+        entry = self._entries.get(owner)
+        if entry is None:
+            return None
+        for t in entry.manifest.tools:
+            if t.name == tool_name:
+                return t
+        return None
+
     def alarms(self) -> list[_ManifestRejection]:
         """List of manifests rejected during the last `load_all()`.
         Empty on a clean boot."""
