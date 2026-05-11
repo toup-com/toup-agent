@@ -233,10 +233,29 @@ async def execute(
         async with _make_session() as db2:
             return await vault.get(db2, user_id, connector_id)
 
-    pref_decision, identity = await asyncio.gather(
-        _resolve_user_preference(db, user_id, connector_id, tool_name, channel),
-        _vault_get_with_own_session(),
-    )
+    # Defensive fallback: if the parallel-gather path raises for any
+    # reason (asyncpg connection acquisition under contention, session
+    # construction error, whatever), fall back to the serial path
+    # using the caller's `db`. Slower (~50-150ms extra on pgbouncer)
+    # but keeps every connector tool working. NEVER swallow without
+    # logging — the alert tells us a known-good fast path stopped
+    # working.
+    try:
+        pref_decision, identity = await asyncio.gather(
+            _resolve_user_preference(db, user_id, connector_id, tool_name, channel),
+            _vault_get_with_own_session(),
+        )
+    except Exception as e:
+        logger.warning(
+            "[dispatcher] parallel pre-flight raised (%s: %s) — "
+            "falling back to serial for this call. Investigate "
+            "before this pattern goes wide.",
+            type(e).__name__, e,
+        )
+        pref_decision = await _resolve_user_preference(
+            db, user_id, connector_id, tool_name, channel,
+        )
+        identity = await vault.get(db, user_id, connector_id)
     _mark("preflight")
     if isinstance(pref_decision, ConnectorToolError):
         _log(user_hash, connector_id, tool_name, channel, "pref_denied", started)

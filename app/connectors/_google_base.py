@@ -75,24 +75,47 @@ _GOOGLE_CLIENT_LOCK = asyncio.Lock()
 async def _get_google_client() -> httpx.AsyncClient:
     """Return the process-singleton AsyncClient for googleapis.com.
     Created on first use under a lock so 50 concurrent callers don't
-    each construct their own client."""
+    each construct their own client.
+
+    If the pooled construction fails for any reason (missing optional
+    httpx extra, broken event loop, etc.) we fall back to a per-call
+    client and log loudly. The fallback path is slower (TLS handshake
+    per call) but keeps Gmail/Drive/Docs/Calendar working. NEVER
+    silently swallow these errors — every fallback is a SEV signal."""
     global _GOOGLE_CLIENT
     if _GOOGLE_CLIENT is not None:
         return _GOOGLE_CLIENT
     async with _GOOGLE_CLIENT_LOCK:
         if _GOOGLE_CLIENT is None:
-            _GOOGLE_CLIENT = httpx.AsyncClient(
-                timeout=_HTTP_TIMEOUT_S,
-                # 100 keepalive connections per worker is generous —
-                # we only talk to a handful of *.googleapis.com hosts
-                # and httpx auto-shares within the pool.
-                limits=httpx.Limits(
-                    max_connections=100,
-                    max_keepalive_connections=100,
-                    keepalive_expiry=300.0,
-                ),
-                http2=True,
-            )
+            try:
+                # HTTP/1.1 keepalive (not HTTP/2). HTTP/2 requires the
+                # `h2` extra (`pip install httpx[http2]`) which isn't
+                # in requirements.platform.txt — setting `http2=True`
+                # here raised `ImportError` on the first call and
+                # killed every Gmail / Microsoft Graph dispatch. The
+                # TLS-session reuse we actually need comes from
+                # `max_keepalive_connections`, not from HTTP/2
+                # multiplexing.
+                _GOOGLE_CLIENT = httpx.AsyncClient(
+                    timeout=_HTTP_TIMEOUT_S,
+                    limits=httpx.Limits(
+                        max_connections=100,
+                        max_keepalive_connections=100,
+                        keepalive_expiry=300.0,
+                    ),
+                )
+            except Exception as e:
+                # Defensive fallback: a per-call client costs ~200-400
+                # ms of TLS handshake but keeps the connector working
+                # while we investigate. Logged at ERROR so the alert
+                # fires even though dispatch keeps succeeding.
+                logger.error(
+                    "[google_base] pooled AsyncClient construction "
+                    "failed (%s: %s) — falling back to per-call "
+                    "clients. Investigate immediately.",
+                    type(e).__name__, e,
+                )
+                _GOOGLE_CLIENT = httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S)
     return _GOOGLE_CLIENT
 
 

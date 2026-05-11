@@ -55,20 +55,33 @@ _MS_CLIENT_LOCK = asyncio.Lock()
 
 
 async def _get_ms_client() -> httpx.AsyncClient:
+    """Process-singleton AsyncClient — see `_google_base._get_google_client`
+    for the full rationale + the defensive-fallback contract."""
     global _MS_CLIENT
     if _MS_CLIENT is not None:
         return _MS_CLIENT
     async with _MS_CLIENT_LOCK:
         if _MS_CLIENT is None:
-            _MS_CLIENT = httpx.AsyncClient(
-                timeout=_HTTP_TIMEOUT_S,
-                limits=httpx.Limits(
-                    max_connections=100,
-                    max_keepalive_connections=100,
-                    keepalive_expiry=300.0,
-                ),
-                http2=True,
-            )
+            try:
+                # HTTP/1.1 keepalive — see `_google_base`. http2=True
+                # needs the `h2` extra; setting it without that extra
+                # hard-crashes every Graph call on first use.
+                _MS_CLIENT = httpx.AsyncClient(
+                    timeout=_HTTP_TIMEOUT_S,
+                    limits=httpx.Limits(
+                        max_connections=100,
+                        max_keepalive_connections=100,
+                        keepalive_expiry=300.0,
+                    ),
+                )
+            except Exception as e:
+                logger.error(
+                    "[microsoft_base] pooled AsyncClient construction "
+                    "failed (%s: %s) — falling back to per-call "
+                    "clients. Investigate immediately.",
+                    type(e).__name__, e,
+                )
+                _MS_CLIENT = httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S)
     return _MS_CLIENT
 
 

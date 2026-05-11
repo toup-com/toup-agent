@@ -37,55 +37,72 @@ _OUTLOOK_PROVIDER = (BACKEND / "app/connectors/outlook/provider.py").read_text()
 # ── Pooled HTTP clients ──────────────────────────────────────────────
 
 
+def _request_path_callsites(source: str) -> list[str]:
+    """Lines in `source` that construct `httpx.AsyncClient(...)`
+    OUTSIDE the pooled-getter / shutdown helpers. The pool's own
+    fast-path + defensive-fallback both live inside `_get_*_client`;
+    only constructions OUTSIDE those helpers are the bad pattern
+    that re-introduces per-call TLS overhead."""
+    # Walk the source line by line; track whether we're inside the
+    # `_get_*_client` function body (between its def and the next
+    # top-level def at column 0). Anything outside that scope is a
+    # request-path callsite — which we want to be empty.
+    in_pool_helper = False
+    out: list[str] = []
+    for line in source.splitlines():
+        stripped = line.lstrip()
+        # Top-level def or async def ends the previous scope.
+        if line.startswith(("def ", "async def ")):
+            in_pool_helper = bool(
+                "_get_google_client" in line
+                or "_get_ms_client" in line
+                or "_get_li_client" in line
+                or "shutdown_" in line
+            )
+            continue
+        if "httpx.AsyncClient(" in line and not stripped.startswith("#") and not in_pool_helper:
+            out.append(line)
+    return out
+
+
 def test_google_base_uses_pooled_client_not_per_request():
     """Per-request `async with httpx.AsyncClient(...)` was the
     biggest single source of tool-call latency (200-400ms of TLS
-    handshake per call). The pooled-client refactor must stick."""
+    handshake per call). The pooled-client refactor must stick.
+
+    The pooled getter (`_get_google_client`) can have multiple
+    AsyncClient constructions internally (fast path + defensive
+    fallback) — but no request-path helper should construct one.
+    """
     assert "async def _get_google_client" in _GOOGLE_BASE, (
         "_google_base must expose _get_google_client — without it "
         "each Google call eats a fresh TLS handshake."
     )
-    # The old anti-pattern: `async with httpx.AsyncClient(...)` —
-    # must not reappear in the request-path helpers. Comments
-    # mentioning the old pattern are fine.
-    google_callsites = [
-        line for line in _GOOGLE_BASE.splitlines()
-        if "httpx.AsyncClient(" in line and not line.lstrip().startswith("#")
-    ]
-    # The ONLY remaining `httpx.AsyncClient(` line should be the
-    # one inside `_get_google_client` that constructs the pool.
-    assert len(google_callsites) == 1, (
-        f"Expected exactly 1 httpx.AsyncClient construction in "
-        f"_google_base.py (inside _get_google_client). Got "
-        f"{len(google_callsites)} — a request-path helper is "
-        f"creating per-call clients again, killing the TLS reuse.\n"
-        f"Lines:\n" + "\n".join(google_callsites)
+    leaked = _request_path_callsites(_GOOGLE_BASE)
+    assert leaked == [], (
+        f"Found {len(leaked)} httpx.AsyncClient construction(s) "
+        f"OUTSIDE the pooled getter — these re-introduce per-call "
+        f"TLS handshake.\nOffending lines:\n" + "\n".join(leaked)
     )
 
 
 def test_microsoft_base_uses_pooled_client():
     assert "async def _get_ms_client" in _MS_BASE
-    ms_callsites = [
-        line for line in _MS_BASE.splitlines()
-        if "httpx.AsyncClient(" in line and not line.lstrip().startswith("#")
-    ]
-    assert len(ms_callsites) == 1, (
-        "Microsoft Graph helper should construct exactly one pooled "
-        "AsyncClient (in _get_ms_client). Per-call constructions kill "
-        "the TLS-session reuse."
+    leaked = _request_path_callsites(_MS_BASE)
+    assert leaked == [], (
+        f"Found {len(leaked)} httpx.AsyncClient construction(s) "
+        f"OUTSIDE the pooled getter in _microsoft_base.py:\n"
+        + "\n".join(leaked)
     )
 
 
 def test_linkedin_provider_uses_pooled_client():
     assert "async def _get_li_client" in _LI_PROVIDER
-    li_callsites = [
-        line for line in _LI_PROVIDER.splitlines()
-        if "httpx.AsyncClient(" in line and not line.lstrip().startswith("#")
-    ]
-    assert len(li_callsites) == 1, (
-        "LinkedIn provider must use the pooled client — see "
-        "_get_li_client. Per-call AsyncClient construction reverts "
-        "the latency fix."
+    leaked = _request_path_callsites(_LI_PROVIDER)
+    assert leaked == [], (
+        f"Found {len(leaked)} httpx.AsyncClient construction(s) "
+        f"OUTSIDE the pooled getter in linkedin/provider.py:\n"
+        + "\n".join(leaked)
     )
 
 

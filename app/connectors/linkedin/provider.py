@@ -61,19 +61,31 @@ _LI_CLIENT_LOCK = asyncio.Lock()
 
 
 async def _get_li_client() -> httpx.AsyncClient:
+    """Process-singleton AsyncClient. Same defensive-fallback shape
+    as `_google_base._get_google_client` — if construction fails for
+    any reason we fall back to a per-call client and log loudly."""
     global _LI_CLIENT
     if _LI_CLIENT is not None:
         return _LI_CLIENT
     async with _LI_CLIENT_LOCK:
         if _LI_CLIENT is None:
-            _LI_CLIENT = httpx.AsyncClient(
-                timeout=_HTTP_TIMEOUT_S,
-                limits=httpx.Limits(
-                    max_connections=50,
-                    max_keepalive_connections=50,
-                    keepalive_expiry=300.0,
-                ),
-            )
+            try:
+                _LI_CLIENT = httpx.AsyncClient(
+                    timeout=_HTTP_TIMEOUT_S,
+                    limits=httpx.Limits(
+                        max_connections=50,
+                        max_keepalive_connections=50,
+                        keepalive_expiry=300.0,
+                    ),
+                )
+            except Exception as e:
+                logger.error(
+                    "[linkedin] pooled AsyncClient construction "
+                    "failed (%s: %s) — falling back to per-call. "
+                    "Investigate immediately.",
+                    type(e).__name__, e,
+                )
+                _LI_CLIENT = httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S)
     return _LI_CLIENT
 
 
