@@ -92,6 +92,13 @@ class AgentResponse:
     model: str = ""
     processing_time_ms: int = 0
     memories_extracted: int = 0
+    # Server-side UUID of the saved assistant Message row. Threaded
+    # through the WS `done` payload so the frontend can stamp it on
+    # the live-rendered bubble — without it, the bubble carries a
+    # client-generated `msg-<timestamp>` id that doesn't match the
+    # DB id, and the day-chat reload renders the same content twice
+    # (once from the live append, once from the history fetch).
+    asst_message_id: str = ""
 
 
 OnTextChunk = Callable[[str], Coroutine[Any, Any, None]]
@@ -1229,6 +1236,7 @@ class AgentRunner:
             model=model_used,
             processing_time_ms=elapsed,
             memories_extracted=0,  # extracted in background
+            asst_message_id=asst_message_id,
         )
     
     # ------------------------------------------------------------------

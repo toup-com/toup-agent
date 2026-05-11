@@ -1832,6 +1832,13 @@ async def ws_chat(
                         "model": response.model,
                         "tool_calls": len(response.tool_calls),
                         "processing_time_ms": response.processing_time_ms,
+                        # Server-side UUID of the saved Message row.
+                        # Frontend stamps it on the live bubble so a
+                        # later day-chat reload finds the same id and
+                        # dedupes — without this, the live render and
+                        # the DB-backed render appear as two separate
+                        # messages with identical content.
+                        "asst_message_id": response.asst_message_id,
                     }
                     # Day-as-Chat: include day_chat_id so frontend can group by day
                     if getattr(response, 'day_chat_id', None):
