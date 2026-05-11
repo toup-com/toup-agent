@@ -26,8 +26,9 @@ What this module deliberately does NOT do:
     binding ContextVars (`get_mcp_user_id`, `get_mcp_channel`,
     `get_mcp_request_id`).
   - Caching of per-user tool lists — every `tools/list` reads
-    `vault.list_active(user_id)`. Single indexed query; cheap. The
-    agent-side cache (T1h) is the right place for the hot path.
+    `vault.list_visible_to_agent(user_id)`. Single indexed query;
+    cheap. The agent-side cache (T1h) is the right place for the
+    hot path.
   - The dispatcher's audit/refresh/policy logic — all owned by T1e.
     This module is a thin transport adapter.
 
@@ -348,21 +349,38 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
 
         # Per-request DB read. Cheap (single indexed query); see
         # T1h for the agent-side cache that elides repeat traffic.
+        #
+        # `list_visible_to_agent` returns identities in `active`,
+        # `reauth_required`, AND `provider_down` statuses — wider than
+        # the pre-2026-05-12 `list_active` call. The motivation: an
+        # identity with an EXPIRED token but no terminal disconnect is
+        # still a connector the user knows about. Hiding the tool sent
+        # the agent to the `browser` fallback (which fails because
+        # Chromium isn't installed in tenant containers); KEEPING the
+        # tool lets the dispatcher return ConnectorReauthRequired,
+        # which the LLM surfaces as "Please reconnect your Gmail".
+        # See `vault.list_visible_to_agent` docstring for the contract.
         async with async_session_maker() as db:
-            active_rows = await vault.list_active(db, user_id)
-        # connector_id → read_only flag for this user. The filter below
-        # drops every mutating tool of any connector whose identity
-        # the user has flipped to read-only via the connected-card
-        # "Switch to read-only" action.
-        read_only_by_connector = {
-            row.connector_id: bool(getattr(row, "read_only", False))
-            for row in active_rows
+            visible_rows = await vault.list_visible_to_agent(db, user_id)
+        # connector_id → (status, read_only). The status drives the
+        # mutating-tool gate below: read-only only applies to identities
+        # that are actually active (a reauth_required identity isn't
+        # "read-only", it's broken — drop *no* tools for it so the
+        # dispatcher's reauth error reaches the LLM).
+        visible_by_connector = {
+            row.connector_id: (
+                row.status,
+                bool(getattr(row, "read_only", False)),
+            )
+            for row in visible_rows
         }
 
         # Filter: keep all non-connector tools (memory_*, entity_*,
-        # etc) + connector tools whose owner is in the active set.
-        # Drop mutating connector tools when the user's identity for
-        # that connector is read-only.
+        # etc) + connector tools whose owner has a visible identity.
+        # Drop mutating connector tools when the user's ACTIVE identity
+        # for that connector is read-only. reauth_required / provider_down
+        # identities pass through unfiltered — the dispatcher returns
+        # the structured error, which the LLM surfaces to the user.
         filtered = []
         for tool in tools:
             owner = self._registry.get_owner(tool.name)
@@ -370,12 +388,16 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
                 # Not a connector tool — keep.
                 filtered.append(tool)
                 continue
-            if owner not in read_only_by_connector:
-                # User hasn't connected this connector — drop.
+            if owner not in visible_by_connector:
+                # User hasn't connected this connector (or it's
+                # `revoked`) — drop. Agent's system prompt covers
+                # "tell the user to connect if they ask for an
+                # un-connected service".
                 continue
-            if read_only_by_connector[owner]:
-                # Identity is read-only: drop the tool if its manifest
-                # marks it as mutating. Read tools pass through.
+            status, read_only = visible_by_connector[owner]
+            if status == "active" and read_only:
+                # Active read-only identity: drop mutating tools so
+                # the LLM doesn't even see them. Read tools pass.
                 spec = self._registry.get_tool_spec(tool.name)
                 if spec is not None and spec.mutates:
                     continue

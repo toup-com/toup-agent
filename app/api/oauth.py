@@ -134,6 +134,7 @@ def _build_authorize_url(
     state: str,
     code_challenge: str,
     use_pkce: bool,
+    provider_name: str = "",
     force_account_selection: bool = False,
 ) -> str:
     """Compose the standard OAuth 2.0 authorize URL.
@@ -142,7 +143,17 @@ def _build_authorize_url(
     provider re-shows its account chooser even when the user is already
     signed in. Drives the connected-card "Switch account" action;
     Google/Microsoft/GitHub all honour the standard OAuth 2.0 `prompt`
-    parameter."""
+    parameter.
+
+    `provider_name` is the registered provider-app key (`google`,
+    `microsoft`, `github`, `linkedin`). Used to apply provider-specific
+    quirks below — most importantly Google's `access_type=offline` +
+    `prompt=consent` pair, WITHOUT which Google does not return a
+    refresh_token and every connected Gmail/Calendar/Drive identity
+    flips to `reauth_required` exactly one hour after the user
+    connects. Pin this rigorously; the symptom is "the connector
+    disconnected itself overnight" reported every hour, on the hour.
+    """
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -153,8 +164,34 @@ def _build_authorize_url(
     if use_pkce:
         params["code_challenge"] = code_challenge
         params["code_challenge_method"] = "S256"
+
+    # Provider-specific quirks that MUST be applied to issue refresh
+    # tokens. Without these, the access token expires in ~1 h with
+    # no recovery path → identity flips to reauth_required and the
+    # MCP layer drops the tool, which sends the agent to its browser
+    # fallback. Same root cause hit every Google connector at the
+    # 1-h mark since the initial connectors commit (126bb77, never
+    # patched). See `provider_apps.py:272` for the original
+    # aspirational comment that promised these would be added here.
+    if provider_name == "google":
+        # `access_type=offline` is REQUIRED — Google omits the
+        # refresh_token in the token response otherwise.
+        params["access_type"] = "offline"
+        # `prompt=consent` ensures Google re-issues a refresh_token on
+        # re-auth too (Google's default is to skip the consent screen
+        # AND skip the refresh_token if the user has previously
+        # consented — same hourly-disconnect symptom on re-connect).
+        # Overridden by `force_account_selection=True` below since the
+        # caller's intent is "show the account chooser, not consent".
+        if not force_account_selection:
+            params["prompt"] = "consent"
+
     if force_account_selection:
+        # Overrides Google's `prompt=consent` — `select_account` is
+        # the right thing for "Switch account", and Google still
+        # honours `access_type=offline` so refresh_token is preserved.
         params["prompt"] = "select_account"
+
     sep = "&" if "?" in base_url else "?"
     return f"{base_url}{sep}{urllib.parse.urlencode(params)}"
 
@@ -307,6 +344,7 @@ async def oauth_connect(
         state=state,
         code_challenge=code_challenge,
         use_pkce=app_cfg.use_pkce,
+        provider_name=app_cfg.name,
         force_account_selection=switch_account,
     )
 

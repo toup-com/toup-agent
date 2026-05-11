@@ -1946,13 +1946,71 @@ class AgentRunner:
                     if "__" in (t.get("name") or "")
                 })
                 if connectors:
+                    # Per-connector fast-path hints (the LLM is
+                    # technically capable of inferring these from the
+                    # tool descriptions but in practice picks the slow
+                    # list→get→get path. Pin the hints here so a single
+                    # 12-email summary is one tool call, not four).
+                    fast_path_hints = []
+                    if "gmail" in connectors:
+                        fast_path_hints.append(
+                            "- Reading/summarizing Gmail: ALWAYS call "
+                            "`gmail__list_messages` with "
+                            "`include_body: true` (and max_results = "
+                            "number of emails the user asked about). "
+                            "It returns full headers + bodies inline, "
+                            "in ONE call. NEVER do `list_messages` then "
+                            "loop `get_message` per id — that's 4× slower "
+                            "and the wrong shape."
+                        )
+                    if "outlook" in connectors:
+                        fast_path_hints.append(
+                            "- Reading/summarizing Outlook: ALWAYS call "
+                            "`outlook__list_messages` with "
+                            "`include_body: true`. Microsoft Graph "
+                            "returns bodies inline via $select — one "
+                            "call, not a list+loop."
+                        )
+
+                    hints_block = (
+                        "\n\n## Fast paths\n" + "\n".join(fast_path_hints)
+                        if fast_path_hints else ""
+                    )
+
                     section_parts["skills"] = (
                         section_parts.get("skills", "")
                         + ("\n\n" if section_parts.get("skills") else "")
                         + "# Connected services\n"
                         + "User has connected: "
                         + ", ".join(connectors)
-                        + ". Use the matching `<service>__*` tools to interact."
+                        + ". Use the matching `<service>__*` tools to "
+                        "interact — these are the RIGHT tools for those "
+                        "services. Do NOT use the `browser` tool to "
+                        "access Gmail / Outlook / Calendar / Drive / "
+                        "Docs / LinkedIn / GitHub when a connector tool "
+                        "exists; the browser tool is for general web "
+                        "navigation, not for services the user has "
+                        "already authenticated.\n\n"
+                        "## Handling connector errors\n"
+                        "Connector tools return STRUCTURED error variants. "
+                        "When you see one, surface it cleanly to the user "
+                        "— do NOT try the `browser` tool as a fallback "
+                        "(it will fail; Chromium is not installed in your "
+                        "runtime):\n"
+                        "- `[reauth_required] Reconnect at <URL>` — tell "
+                        "the user EXACTLY: \"Your <service> connection "
+                        "expired. Please reconnect it from the "
+                        "integrations page and try again.\" Include the "
+                        "URL as a link if your channel supports markdown.\n"
+                        "- `[provider_down] ...` — tell the user the "
+                        "service is having an outage and to try again "
+                        "shortly.\n"
+                        "- `[rate_limited] ...` — wait the suggested "
+                        "seconds before retrying, or tell the user to "
+                        "try again in N seconds.\n"
+                        "- `[scope_missing] ...` — tell the user to "
+                        "reconnect and approve the missing permission."
+                        + hints_block
                     )
         elif self.skill_loader and not intent.include_skill_prompts:
             logger.info(f"[PERF] skill_prompts: SKIPPED (intent={intent.category})")

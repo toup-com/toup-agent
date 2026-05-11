@@ -459,3 +459,48 @@ async def list_active(
         )
     ).scalars().all()
     return list(rows)
+
+
+# Statuses the MCP filter treats as "visible to the agent" — the user
+# has set up this connector at least once, so the agent should be aware
+# of the tools EVEN IF the identity is currently in trouble (expired
+# tokens, transient provider outage). Surfacing the tool lets the
+# dispatcher return `ConnectorReauthRequired` / `ConnectorProviderDown`
+# to the LLM, which then tells the user "Please reconnect your Gmail"
+# instead of silently falling back to the browser tool (which fails
+# because Chromium isn't installed in the runtime container).
+#
+# Excludes `revoked` because that one is terminal — the user
+# explicitly disconnected. Agent shouldn't pretend the tool exists.
+_VISIBLE_STATUSES = ("active", "reauth_required", "provider_down")
+
+
+async def list_visible_to_agent(
+    db: AsyncSession,
+    user_id: str,
+) -> list[ConnectorIdentity]:
+    """Return all identities the agent should be able to *see* — the
+    set used by the MCP filter when deciding which connector tools to
+    expose in `tools/list`.
+
+    Wider than `list_active`: also includes `reauth_required` and
+    `provider_down`. The dispatcher gates *invocation* on
+    `status == "active"`; this method gates *discoverability*. The two
+    being different is intentional — a hidden tool means the agent
+    chooses a worse fallback (browser → fails); a visible-but-failing
+    tool means the agent surfaces the structured error to the user,
+    which is the production-grade UX.
+    """
+    rows = (
+        await db.execute(
+            select(ConnectorIdentity)
+            .where(
+                and_(
+                    ConnectorIdentity.user_id == user_id,
+                    ConnectorIdentity.status.in_(_VISIBLE_STATUSES),
+                )
+            )
+            .order_by(ConnectorIdentity.connector_id)
+        )
+    ).scalars().all()
+    return list(rows)
