@@ -54,9 +54,21 @@ class FilterDebugResp(BaseModel):
     total_identities_all_users: int
 
 
-@router.get("/_mcp_filter_debug", response_model=FilterDebugResp)
+@router.get("/_mcp_filter_debug")
 async def mcp_filter_debug(
     x_agent_key: str | None = Header(default=None, alias="X-Agent-Key"),
+):
+    # Wrap everything in try/except and return the traceback so we can
+    # see what's happening without Railway log access. Diagnostic-only.
+    import traceback as _tb
+    try:
+        return await _mcp_filter_debug_impl(x_agent_key)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "traceback": _tb.format_exc()}
+
+
+async def _mcp_filter_debug_impl(
+    x_agent_key: str | None,
 ) -> FilterDebugResp:
     if not x_agent_key:
         raise HTTPException(status_code=401, detail="X-Agent-Key required")
