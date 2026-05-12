@@ -437,10 +437,30 @@ async def ws_extension(websocket: WebSocket, token: Optional[str] = Query(None))
     """
     The Chrome extension connects here to receive task envelopes from
     the agent runtime and return results. One connection per user.
-    """
-    await websocket.accept()
 
-    # 1. Authenticate
+    Auth precedence: WS subprotocol `bearer.<jwt>` (preferred — no URL
+    leak, no server-log exposure) → `?token=` query → first-frame
+    `{type:"auth",token}` (legacy).
+    """
+    # Read subprotocol token BEFORE accept so we can echo it back.
+    sub_token: Optional[str] = None
+    selected_sub: Optional[str] = None
+    subprotocols = list(websocket.scope.get("subprotocols") or [])
+    if "toup.auth.v1" in subprotocols:
+        for sp in subprotocols:
+            if isinstance(sp, str) and sp.startswith("bearer."):
+                sub_token = sp[len("bearer."):]
+                selected_sub = "toup.auth.v1"
+                break
+    if selected_sub:
+        await websocket.accept(subprotocol=selected_sub)
+    else:
+        await websocket.accept()
+
+    if sub_token and not token:
+        token = sub_token
+
+    # Legacy fallbacks: ?token= already populated by Query(None); first-frame as last resort.
     if not token:
         try:
             raw = await asyncio.wait_for(websocket.receive_text(), timeout=3.0)
