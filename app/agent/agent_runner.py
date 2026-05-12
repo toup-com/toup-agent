@@ -1954,22 +1954,35 @@ class AgentRunner:
                     fast_path_hints = []
                     if "gmail" in connectors:
                         fast_path_hints.append(
-                            "- Reading/summarizing Gmail: ALWAYS call "
-                            "`gmail__list_messages` with "
-                            "`include_body: true` (and max_results = "
-                            "number of emails the user asked about). "
-                            "It returns full headers + bodies inline, "
-                            "in ONE call. NEVER do `list_messages` then "
-                            "loop `get_message` per id — that's 4× slower "
-                            "and the wrong shape."
+                            "- **Reading email is ONE call.** "
+                            "`gmail__list_messages` returns full "
+                            "headers + body for every message by "
+                            "default (`include_body: true` is the "
+                            "default — do NOT pass `false`). For "
+                            "\"my Nth email\" or \"my last N emails\", "
+                            "set `max_results: N` and pick from the "
+                            "response. Examples:\n"
+                            "    • \"summarize my 14th email\" → "
+                            "`gmail__list_messages({max_results: 14})` "
+                            "→ summarise the 14th item. ONE call.\n"
+                            "    • \"read my last 5 emails\" → "
+                            "`gmail__list_messages({max_results: 5})` "
+                            "→ summarise all 5. ONE call.\n"
+                            "  Calling `gmail__list_messages` then "
+                            "`gmail__get_message` is the WRONG pattern "
+                            "— it adds 10+ seconds per extra call for "
+                            "no benefit. The bodies are already in the "
+                            "list response."
                         )
                     if "outlook" in connectors:
                         fast_path_hints.append(
-                            "- Reading/summarizing Outlook: ALWAYS call "
-                            "`outlook__list_messages` with "
-                            "`include_body: true`. Microsoft Graph "
-                            "returns bodies inline via $select — one "
-                            "call, not a list+loop."
+                            "- **Reading Outlook is ONE call.** "
+                            "`outlook__list_messages` returns body "
+                            "inline by default. For \"my Nth email\" "
+                            "set `max_results: N`. Same rule as Gmail: "
+                            "do NOT follow up with "
+                            "`outlook__get_message` unless you need "
+                            "something the list call didn't return."
                         )
 
                     hints_block = (

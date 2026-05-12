@@ -58,7 +58,7 @@ class CalendarProvider(BaseConnectorProvider):
         ctx: ConnectorContext,
     ) -> ConnectorResult:
         try:
-            access_token = await _resolve_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
         except _GoogleConnectorError as e:
             return _retarget_reauth(e.result)
 
@@ -187,7 +187,7 @@ class CalendarProvider(BaseConnectorProvider):
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:
         try:
-            access_token = await _resolve_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
             await google_request(
                 "GET",
                 f"{CAL_API_BASE}/users/me/calendarList",

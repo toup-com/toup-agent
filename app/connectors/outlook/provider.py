@@ -81,16 +81,21 @@ class OutlookProvider(BaseConnectorProvider):
         tool_input: dict,
         ctx: ConnectorContext,
     ) -> ConnectorResult:
+        # Prefer the dispatcher's pre-decrypted token — skips a
+        # duplicate vault.get + Fernet decrypt in the provider.
         try:
-            access_token = await _resolve_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
         except _MicrosoftConnectorError as e:
             return _retarget_reauth(e.result)
 
         try:
             if tool_name == "outlook__list_messages":
-                include_body = bool(tool_input.get("include_body"))
+                # Default to true to match the manifest. Dispatcher
+                # also auto-injects when the LLM omits the field; this
+                # default covers tests + non-dispatcher call paths.
+                include_body = bool(tool_input.get("include_body", True))
                 params: dict = {
-                    "$top": int(tool_input.get("max_results", 10)),
+                    "$top": int(tool_input.get("max_results", 25)),
                     # When include_body=true we ask Graph for the full
                     # body in the same list call — saves the
                     # per-message GET round-trip entirely (Graph's

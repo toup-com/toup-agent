@@ -124,7 +124,7 @@ class GitHubProvider(BaseConnectorProvider):
         ctx: ConnectorContext,
     ) -> ConnectorResult:
         try:
-            access_token = await _resolve_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
         except _GHError as e:
             return e.result
 
@@ -276,7 +276,7 @@ class GitHubProvider(BaseConnectorProvider):
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:
         try:
-            access_token = await _resolve_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
             await _gh_request(
                 "GET", "/user",
                 access_token=access_token, scope_hint="read:user",

@@ -35,7 +35,7 @@ health:
 tools:
   - name: gmail__list_messages
     description: |
-      List recent Gmail messages, optionally filtered by Gmail's search query syntax (e.g. "from:alice newer_than:7d"). Pass `include_body: true` to inline the full headers + decoded body for every message in the SAME response — use this whenever you'd otherwise loop list → get_message, it's a 4-10× speedup. Default `false` returns ids only.
+      List recent Gmail messages, optionally filtered by Gmail's search query syntax (e.g. "from:alice newer_than:7d"). Returns full headers + decoded body for every message in ONE call by default — this is what you almost always want. Only set `include_body: false` for the rare bulk-enumeration use case (e.g. counting messages, exporting just ids). For "Nth email" requests (e.g. "summarize my 14th email") set `max_results` to N and pick the Nth from the response — ONE tool call, not list-then-get.
     input_schema:
       type: object
       properties:
@@ -46,11 +46,12 @@ tools:
           type: integer
           minimum: 1
           maximum: 50
-          default: 10
+          description: Number of messages to return. For "show me my last N emails" or "summarize my Nth email", set this to N (or N+1 for safety). Default 25 covers most "recent emails" asks in one call.
+          default: 25
         include_body:
           type: boolean
-          description: When true, fetch each message's full headers + plain-text body in parallel and inline them in the response. Avoids a per-message gmail__get_message round-trip. Recommended whenever the user asks to "read" / "summarize" / "show" emails.
-          default: false
+          description: Defaults to true — returns full headers + plain-text body for every listed message inline (parallel-fetched). Set to false ONLY for bulk-enumeration tasks where bodies aren't needed; in 95% of real asks ("read", "summarize", "show", "what's my Nth email") you want the default.
+          default: true
       required: []
     mutates: false
     elevation: false

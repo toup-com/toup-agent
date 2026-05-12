@@ -68,7 +68,7 @@ class DriveProvider(BaseConnectorProvider):
         ctx: ConnectorContext,
     ) -> ConnectorResult:
         try:
-            access_token = await _resolve_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
         except _GoogleConnectorError as e:
             return _retarget_reauth(e.result)
 
@@ -192,7 +192,7 @@ class DriveProvider(BaseConnectorProvider):
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:
         try:
-            access_token = await _resolve_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
             await google_request(
                 "GET",
                 f"{DRIVE_API}/about",

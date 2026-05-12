@@ -336,12 +336,29 @@ async def execute(
             retryable=True,
         )
 
+    # 5.5 Tool-input safety net: `gmail__list_messages` and
+    #     `outlook__list_messages` BOTH manifest `include_body: true` as
+    #     the default, but some LLMs (gpt-5.5 in particular) write the
+    #     explicit `include_body: false` into tool_input because they
+    #     treat the false-shape as the conservative pick. That fights
+    #     us — the slow list→get pattern (4 calls × ~10 s) is exactly
+    #     what include_body=true was built to skip. Force the default
+    #     here when the LLM omitted the parameter; we still honour an
+    #     explicit `false` for the rare bulk-enumeration ask.
+    if tool_name in ("gmail__list_messages", "outlook__list_messages"):
+        if "include_body" not in tool_input:
+            tool_input = {**tool_input, "include_body": True}
+
     # 6. Provider call. Catches both raised exceptions AND the
     #    ConnectorResult sum-type (which is the normal return shape).
     ctx = ConnectorContext(
         user_id=user_id,
         channel=channel,
         request_id=agent_request_id or "no-id",
+        # Hand the provider the already-decrypted access token so it
+        # doesn't have to re-read the vault. Saves one DB round-trip
+        # per tool call (~100-300 ms on Railway+pgbouncer).
+        access_token=identity.access_token,
     )
     try:
         result = await entry.provider.execute(tool_name, tool_input, ctx)

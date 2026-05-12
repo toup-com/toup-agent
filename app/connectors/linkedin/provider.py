@@ -237,7 +237,7 @@ class LinkedInProvider(BaseConnectorProvider):
         ctx: ConnectorContext,
     ) -> ConnectorResult:
         try:
-            access_token = await _resolve_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
         except _LinkedInError as e:
             return _retarget_reauth(e.result)
 
@@ -355,7 +355,7 @@ class LinkedInProvider(BaseConnectorProvider):
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:
         try:
-            access_token = await _resolve_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
             await _linkedin_request(
                 "GET",
                 f"{LINKEDIN_API}/userinfo",

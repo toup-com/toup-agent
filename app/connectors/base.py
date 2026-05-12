@@ -29,12 +29,22 @@ class ConnectorContext:
     `vault` is intentionally typed as Any to avoid a circular import
     (the vault module imports models, the dispatcher imports both).
     Real type at runtime is `app.services.connector_vault` module.
+
+    `access_token` is the dispatcher's pre-fetched, already-decrypted
+    access token for this (user, connector). Providers SHOULD use it
+    directly instead of re-fetching from the vault — the dispatcher
+    already paid the SELECT + Fernet-decrypt cost during pre-flight,
+    and that second DB round-trip was a measurable per-call latency
+    contributor (~100-300 ms on Railway+pgbouncer). Falls back to a
+    fresh vault read only when None (defensive — old providers, tests
+    that build ctx by hand).
     """
 
     user_id: str
     channel: str = "web"        # "web" | "telegram" | "voice" | "whatsapp" | "mobile"
     request_id: str = "no-id"   # AgentRunner request id for trace correlation
     vault: Any = None           # Injected by dispatcher; provider uses to read tokens
+    access_token: Optional[str] = None  # Pre-decrypted by the dispatcher; see docstring
     metadata: dict = field(default_factory=dict)
 
 

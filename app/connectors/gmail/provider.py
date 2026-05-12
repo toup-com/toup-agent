@@ -37,11 +37,18 @@ GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 
 
 async def _resolve_access_token(user_id: str) -> str:
-    """Pull the decrypted access_token for this (user, gmail). The
-    dispatcher already ran refresh-on-expiring before calling us, so
-    the returned token is good for the duration of THIS call. We
-    re-fetch per call (not per provider instance) because providers
-    are shared across requests."""
+    """Fallback path: pull the decrypted access_token for this
+    (user, gmail) when the dispatcher didn't hand one through
+    `ctx.access_token`. Production callers (the dispatcher) always
+    pass the pre-decrypted token; this path exists for tests that
+    build ctx by hand and for any historical code path that bypasses
+    the dispatcher.
+
+    Was the hot path pre-2026-05-12 — every Gmail tool call did a
+    second vault.get() here (~100-300 ms on Railway+pgbouncer) right
+    after the dispatcher had ALREADY decrypted the identity in
+    pre-flight. Threading the token through ConnectorContext
+    eliminates that duplicate read."""
     async with async_session_maker() as db:
         ident = await _vault.get(db, user_id, "gmail")
     if ident is None or not ident.access_token:
@@ -94,14 +101,23 @@ class GmailProvider(BaseConnectorProvider):
         tool_input: dict,
         ctx: ConnectorContext,
     ) -> ConnectorResult:
+        # Prefer the dispatcher's pre-decrypted token — skips a
+        # duplicate vault.get + Fernet decrypt that used to add
+        # ~100-300 ms to every Gmail call. The fallback covers tests
+        # that build ctx by hand without an access_token.
         try:
-            access_token = await _resolve_access_token(ctx.user_id)
+            access_token = ctx.access_token or await _resolve_access_token(ctx.user_id)
         except _GoogleConnectorError as e:
             return e.result
 
         try:
             if tool_name == "gmail__list_messages":
-                max_results = int(tool_input.get("max_results", 10))
+                # Defaults match the manifest: max_results=25,
+                # include_body=true. The dispatcher's safety net also
+                # auto-injects include_body=true when the LLM omits it,
+                # but mirror the default here so direct calls (tests,
+                # any non-dispatcher path) get the same behaviour.
+                max_results = int(tool_input.get("max_results", 25))
                 params = {"maxResults": max_results}
                 q = tool_input.get("query")
                 if q:
@@ -119,18 +135,16 @@ class GmailProvider(BaseConnectorProvider):
                     if m.get("id")
                 ]
 
-                # FAST PATH: include_body inlines each message's
-                # headers + body in this same response. Pre-2026-05-11
-                # the only way to read a mail was: list → pick id →
-                # get_message — two LLM round-trips and two MCP
-                # roundtrips PER message. With include_body=true the
-                # LLM gets everything in one call and the per-message
-                # fetches fan out in parallel (Gmail's /messages/{id}
-                # endpoint comfortably handles 10 concurrent reads
-                # against the same user; we cap the gather at 25 just
-                # in case). Matches the "summarise my latest 5 emails"
-                # ask without the LLM ever leaving the dispatcher.
-                if tool_input.get("include_body") and raw_ids:
+                # FAST PATH (now the default): include_body inlines each
+                # message's headers + body in this same response, fanned
+                # out in parallel. Pre-2026-05-12 the LLM had to
+                # explicitly opt in (default was false) and frequently
+                # missed the hint, doing list → list → get_message at
+                # ~10 s per call. Default is now `true` in the manifest
+                # AND auto-injected by the dispatcher when omitted, so
+                # this branch is the hot path. Reading: ONE call.
+                include_body = tool_input.get("include_body", True)
+                if include_body and raw_ids:
                     full_messages = await _fetch_messages_parallel(
                         access_token=access_token,
                         message_ids=[r["id"] for r in raw_ids],
