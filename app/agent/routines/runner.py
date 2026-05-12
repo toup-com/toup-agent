@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -282,7 +282,52 @@ class RoutineRunner:
             misfire_grace_time=300,  # if container was down ≤5min, still fire
         )
         self._jobs[routine.id] = routine.id
+        # APScheduler computes next_run_time at register-time. Sync to
+        # the DB so the dashboard + `/api/routines/{id}` response know
+        # when the next fire is — pre-2026-05-12 the `next_run_at`
+        # column was added to the schema but never written, surfacing
+        # in the UI as a permanently "null" next-run badge even for
+        # healthy daily routines.
+        await self._sync_next_run(routine.id)
         return "utc_fallback" if fellback else "ok"
+
+    async def _sync_next_run(self, routine_id: str) -> None:
+        """Query APScheduler for the job's next fire time and persist
+        it to `Routine.next_run_at`. Idempotent — safe to call from
+        any code path that mutates the schedule (register, reload,
+        post-terminal).
+
+        Stored as naive UTC because the column is a tz-less DateTime.
+        APScheduler hands back a tz-aware datetime, so we convert
+        before stripping tzinfo (otherwise we'd land a 8-hours-off
+        timestamp for Toronto users)."""
+        from app.db.models import Routine
+
+        try:
+            if not self.scheduler.running:
+                return
+            job = self.scheduler.get_job(routine_id)
+            next_run = getattr(job, "next_run_time", None) if job else None
+            if next_run is None:
+                next_run_utc: Optional[datetime] = None
+            else:
+                next_run_utc = next_run.astimezone(timezone.utc).replace(tzinfo=None)
+            async with self._session_maker() as db:
+                await db.execute(
+                    update(Routine)
+                    .where(Routine.id == routine_id)
+                    .values(next_run_at=next_run_utc)
+                )
+                await db.commit()
+        except Exception as e:
+            # Never let next_run_at sync take down the scheduler. The
+            # dashboard's "next fire" badge being null is a visual
+            # bug; APScheduler still fires on schedule from its
+            # in-memory state regardless of the DB column.
+            logger.warning(
+                "[routine_runner] next_run_at sync failed routine_id=%s err=%s",
+                routine_id, e,
+            )
 
     def _unregister(self, routine_id: str) -> None:
         try:
@@ -553,6 +598,13 @@ class RoutineRunner:
                     await db.commit()
             except Exception:
                 pass
+
+        # After EVERY terminal outcome, refresh next_run_at from
+        # APScheduler. The job's next_run_time has already advanced
+        # past today's fire — without this sync, the dashboard shows
+        # yesterday's planned fire time (or null for first-run-since-
+        # boot) until the next scheduler restart.
+        await self._sync_next_run(routine.id)
 
         await self._finalize_run(
             run_id,

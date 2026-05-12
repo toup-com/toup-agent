@@ -734,33 +734,48 @@ async def refresh_tenant_tools(db: AsyncSession, user_id: str) -> bool:
         return False
 
     url = f"{cfg.agent_url.rstrip('/')}/api/agent/refresh-tools"
-    try:
-        async with _httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.put(
-                url,
-                headers={"X-Agent-Key": cfg.agent_api_key},
+    # Two-pass notify: a fast 3 s attempt right after OAuth so the user
+    # gets immediate access to the connector tools, and a 10 s fallback
+    # if the agent container was just warming up (image pull, app
+    # startup, etc.). Without the retry, a single slow agent boot meant
+    # the cache only updated via the 60 s TTL — the user saw "Gmail
+    # tool isn't exposed" responses for up to a minute.
+    headers = {"X-Agent-Key": cfg.agent_api_key}
+    for attempt, timeout_s in enumerate((3.0, 10.0), start=1):
+        try:
+            async with _httpx.AsyncClient(timeout=timeout_s) as client:
+                resp = await client.put(url, headers=headers)
+            if 200 <= resp.status_code < 300:
+                logger.info(
+                    "[refresh_tools] notified user=%s (status=%d, attempt=%d)",
+                    user_id[:8], resp.status_code, attempt,
+                )
+                return True
+            # Non-2xx — agent reachable but rejected the call. Retrying
+            # won't fix a 401 / 404; bail to the TTL safety net.
+            logger.warning(
+                "[refresh_tools] tenant returned %d for user=%s — "
+                "TTL is the safety net (attempt=%d, body=%s)",
+                resp.status_code, user_id[:8], attempt, resp.text[:200],
             )
-        if 200 <= resp.status_code < 300:
-            logger.info(
-                "[refresh_tools] notified user=%s (status=%d)",
-                user_id[:8], resp.status_code,
+            return False
+        except Exception as e:
+            # Transport-level failure (timeout, DNS, container booting).
+            # Loop once with the longer timeout before bailing.
+            if attempt == 1:
+                logger.info(
+                    "[refresh_tools] first attempt timed out for user=%s "
+                    "(%s) — retrying with longer timeout",
+                    user_id[:8], type(e).__name__,
+                )
+                continue
+            logger.warning(
+                "[refresh_tools] notify failed for user=%s after %d "
+                "attempts: %s — TTL is the safety net",
+                user_id[:8], attempt, e,
             )
-            return True
-        logger.warning(
-            "[refresh_tools] tenant returned %d for user=%s — "
-            "TTL is the safety net (body=%s)",
-            resp.status_code, user_id[:8], resp.text[:200],
-        )
-        return False
-    except Exception as e:
-        # Timeout, DNS fail, container down — log + move on. The
-        # cache's 60s TTL will pick up the change on its own.
-        logger.warning(
-            "[refresh_tools] notify failed for user=%s: %s — "
-            "TTL is the safety net",
-            user_id[:8], e,
-        )
-        return False
+            return False
+    return False
 
 
 async def _sync_soul_after_start(
