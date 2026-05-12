@@ -196,6 +196,7 @@ class AgentTaskHandler:
             model_used=model_used,
         )
         if broadcaster is not None:
+            from .channel_dispatcher import parse_delivery_channels
             await broadcaster(
                 routine.user_id,
                 message_id=msg_id,
@@ -203,6 +204,8 @@ class AgentTaskHandler:
                 source=self.kind,
                 content=content,
                 model_used=model_used,
+                delivery_channels=parse_delivery_channels(routine.config_json),
+                routine_name=routine.name or routine.kind,
             )
         return RoutineResult(
             status="success",

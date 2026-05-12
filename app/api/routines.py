@@ -94,6 +94,9 @@ def _kind_enabled_or_404(kind: str) -> None:
 # ── Pydantic models ────────────────────────────────────────────────────
 
 
+_VALID_DELIVERY_CHANNELS = {"website", "telegram", "whatsapp"}
+
+
 class RoutineCreate(BaseModel):
     kind: str = Field(..., description="Routine handler kind: 'email_briefing' or 'agent_task'")
     schedule_cron_local: str = Field(
@@ -107,7 +110,31 @@ class RoutineCreate(BaseModel):
         description="Required when kind='agent_task'. The natural-language "
                     "task the agent runs at fire time.")
     enabled: bool = True
+    # Where to send the routine's output. Website (Day-as-Chat) is always
+    # written; this list controls EXTRA outbound channels — Telegram and
+    # WhatsApp. Default ["website"] preserves legacy behaviour. Stored
+    # into `config_json.delivery_channels` server-side so the handler can
+    # read it at fire time without a join.
+    delivery_channels: Optional[list[str]] = Field(
+        default=None,
+        description="Subset of ['website','telegram','whatsapp']. Website is "
+                    "always included; listing telegram/whatsapp fans the "
+                    "summary out to those channels too.",
+    )
     config: Optional[dict] = None
+
+    @field_validator("delivery_channels")
+    @classmethod
+    def _validate_delivery_channels(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        if v is None:
+            return v
+        bad = [c for c in v if c not in _VALID_DELIVERY_CHANNELS]
+        if bad:
+            raise ValueError(
+                f"Unknown delivery channels: {bad}. "
+                f"Allowed: {sorted(_VALID_DELIVERY_CHANNELS)}"
+            )
+        return v
 
 
 class RoutineUpdate(BaseModel):
@@ -116,6 +143,20 @@ class RoutineUpdate(BaseModel):
     config: Optional[dict] = None
     name: Optional[str] = Field(default=None, max_length=100)
     prompt_text: Optional[str] = None
+    delivery_channels: Optional[list[str]] = None
+
+    @field_validator("delivery_channels")
+    @classmethod
+    def _validate_delivery_channels(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        if v is None:
+            return v
+        bad = [c for c in v if c not in _VALID_DELIVERY_CHANNELS]
+        if bad:
+            raise ValueError(
+                f"Unknown delivery channels: {bad}. "
+                f"Allowed: {sorted(_VALID_DELIVERY_CHANNELS)}"
+            )
+        return v
 
 
 class RoutineRunResponse(BaseModel):
@@ -277,6 +318,16 @@ async def create_routine(req: RoutineCreate):
                            f"Disable or delete it first.",
                 )
 
+        # Merge delivery_channels into config_json. We keep them on the
+        # SAME blob so the handler can read everything at fire time
+        # without a separate query — config_json is the per-kind state +
+        # routing dict. If the client passed an explicit `config` too,
+        # delivery_channels wins on key collision (it's the typed field).
+        merged_config: Optional[dict] = dict(req.config) if req.config else None
+        if req.delivery_channels is not None:
+            merged_config = merged_config or {}
+            merged_config["delivery_channels"] = list(req.delivery_channels)
+
         routine = Routine(
             user_id=user_id,
             kind=req.kind,
@@ -284,7 +335,7 @@ async def create_routine(req: RoutineCreate):
             prompt_text=(req.prompt_text or "").strip() or None,
             schedule_cron_local=req.schedule_cron_local,
             enabled=bool(req.enabled),
-            config_json=req.config or None,
+            config_json=merged_config,
             last_status="never_run",
         )
         db.add(routine)
@@ -330,6 +381,13 @@ async def update_routine(routine_id: str, req: RoutineUpdate):
             routine.enabled = bool(req.enabled)
         if req.config is not None:
             routine.config_json = req.config
+        if req.delivery_channels is not None:
+            # Merge into the live config blob — don't clobber other keys
+            # like `connector_identity_id` that the email_briefing handler
+            # uses.
+            cfg = dict(routine.config_json or {})
+            cfg["delivery_channels"] = list(req.delivery_channels)
+            routine.config_json = cfg
         if req.name is not None:
             routine.name = (req.name or "").strip() or None
         if req.prompt_text is not None:

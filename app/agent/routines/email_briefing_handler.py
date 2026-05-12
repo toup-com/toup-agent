@@ -280,6 +280,7 @@ class EmailBriefingHandler:
             tokens_completion=None,
         )
         if broadcaster is not None:
+            from .channel_dispatcher import parse_delivery_channels
             await broadcaster(
                 routine.user_id,
                 message_id=msg_id,
@@ -287,6 +288,8 @@ class EmailBriefingHandler:
                 source=self.kind,
                 content=summary_text,
                 model_used=_HAIKU_MODEL,
+                delivery_channels=parse_delivery_channels(routine.config_json),
+                routine_name=routine.name or "Morning email briefing",
             )
 
         new_watermark = self._advance_watermark(routine.last_state_json, emails)
@@ -394,6 +397,7 @@ class EmailBriefingHandler:
             model_used=None,
         )
         if broadcaster is not None:
+            from .channel_dispatcher import parse_delivery_channels
             await broadcaster(
                 routine.user_id,
                 message_id=msg_id,
@@ -401,6 +405,8 @@ class EmailBriefingHandler:
                 source=self.kind,
                 content=text,
                 model_used=None,
+                delivery_channels=parse_delivery_channels(routine.config_json),
+                routine_name=routine.name or "Morning email briefing",
             )
         return RoutineResult(
             status="success",

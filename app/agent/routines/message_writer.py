@@ -113,9 +113,18 @@ async def broadcast_routine_message(
     source: str,
     content: str,
     model_used: Optional[str] = None,
+    delivery_channels: Optional[list[str]] = None,
+    routine_name: Optional[str] = None,
 ) -> int:
-    """Push a routine Message to any live WS clients. Returns the number
-    of queues that accepted the event.
+    """Push a routine Message to any live WS clients AND (optionally) to
+    extra outbound channels the routine asked for (Telegram / WhatsApp).
+    Returns the number of WS queues that accepted the event.
+
+    `delivery_channels` is the list the user picked when they created
+    the routine — typically `["website"]` (no-op here), or with extra
+    channel slugs like `["website", "telegram"]`. The 'website' slug is
+    served by this broadcast (the chat UI subscribes to the WS event);
+    other slugs route through `channel_dispatcher.deliver_to_extra_channels`.
 
     Lazy-imports `broadcast_to_user` so this module is importable in test
     environments where the full `app.api` package can't load (the
@@ -125,21 +134,49 @@ async def broadcast_routine_message(
         from app.api.ws_chat import broadcast_to_user
     except Exception as e:
         logger.debug("[routine_writer] broadcast skipped — ws_chat unavailable: %s", e)
-        return 0
+        ws_count = 0
+    else:
+        event = {
+            "type": "message",
+            "id": message_id,
+            "day_chat_id": day_chat_id,
+            "role": "assistant",
+            "channel": "routine",
+            "source": source,
+            "content": content,
+            "model_used": model_used,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        try:
+            ws_count = await broadcast_to_user(user_id, event)
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning("[routine_writer] broadcast failed: %s", e)
+            ws_count = 0
 
-    event = {
-        "type": "message",
-        "id": message_id,
-        "day_chat_id": day_chat_id,
-        "role": "assistant",
-        "channel": "routine",
-        "source": source,
-        "content": content,
-        "model_used": model_used,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    try:
-        return await broadcast_to_user(user_id, event)
-    except Exception as e:  # pragma: no cover — defensive
-        logger.warning("[routine_writer] broadcast failed: %s", e)
-        return 0
+    # Optional fan-out to extra channels. Best-effort by design — the
+    # canonical Day-as-Chat record already landed via write_routine_message,
+    # so a Telegram outage must not block or fail the routine.
+    extras = [c for c in (delivery_channels or []) if c and c != "website"]
+    if extras:
+        try:
+            from .channel_dispatcher import deliver_to_extra_channels
+            from app.db.database import async_session_maker
+            results = await deliver_to_extra_channels(
+                user_id=user_id,
+                delivery_channels=extras,
+                routine_name=routine_name or source,
+                content=content,
+                db_session_maker=async_session_maker,
+            )
+            if results:
+                logger.info(
+                    "[routine_writer] extra channel fan-out user=%s results=%s",
+                    user_id, results,
+                )
+        except Exception as e:  # pragma: no cover — top-level guard
+            logger.warning(
+                "[routine_writer] extra channel dispatch failed: %s: %s",
+                type(e).__name__, e,
+            )
+
+    return ws_count

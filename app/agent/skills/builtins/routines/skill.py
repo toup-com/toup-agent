@@ -100,7 +100,15 @@ class RoutinesSkill(Skill):
                     "Cron format: 5-part `m h dom mon dow` in the user's local "
                     "timezone. Examples: `30 6 * * *` = 06:30 every day; "
                     "`0 7 * * 1-5` = 07:00 weekdays; `0 9 * * 0` = 09:00 Sundays. "
-                    "Confirm the time with the user BEFORE calling this tool."
+                    "Confirm the time with the user BEFORE calling this tool.\n\n"
+                    "**Delivery channels:** ALWAYS ask the user where they want "
+                    "to see the result before creating the routine. Options:\n"
+                    "  • `website` — the chat thread on toup.ai (default)\n"
+                    "  • `telegram` — the user's Telegram bot DM\n"
+                    "  • `whatsapp` — the user's WhatsApp self-chat\n"
+                    "Pass the chosen subset as `delivery_channels`. The website "
+                    "is always included (it's the canonical record); listing "
+                    "telegram/whatsapp fans the summary OUT to those channels too."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -142,6 +150,20 @@ class RoutinesSkill(Skill):
                             "type": "boolean",
                             "description": "Default true. Set false to create dormant.",
                         },
+                        "delivery_channels": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["website", "telegram", "whatsapp"],
+                            },
+                            "description": (
+                                "Where to deliver the routine's output. Ask the "
+                                "user before picking. `website` is always "
+                                "included server-side. Examples: "
+                                "[\"website\",\"telegram\"], [\"telegram\",\"whatsapp\"] "
+                                "(both channels), [\"website\"] (chat only — the default)."
+                            ),
+                        },
                     },
                     "required": ["kind", "schedule_cron_local"],
                 },
@@ -164,10 +186,11 @@ class RoutinesSkill(Skill):
             {
                 "name": "routines__update",
                 "description": (
-                    "Update an existing routine's schedule, name, prompt, or "
-                    "enabled flag. Use the `id` from `routines__list`. Any "
-                    "field left unset is preserved. Triggers an immediate "
-                    "scheduler reload — the next fire honours the new schedule."
+                    "Update an existing routine's schedule, name, prompt, "
+                    "delivery channels, or enabled flag. Use the `id` from "
+                    "`routines__list`. Any field left unset is preserved. "
+                    "Triggers an immediate scheduler reload — the next fire "
+                    "honours the new schedule."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -188,6 +211,17 @@ class RoutinesSkill(Skill):
                         "prompt_text": {
                             "type": "string",
                             "description": "Only meaningful for kind=`agent_task`.",
+                        },
+                        "delivery_channels": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["website", "telegram", "whatsapp"],
+                            },
+                            "description": (
+                                "New delivery-channel list. Replaces the "
+                                "current setting entirely."
+                            ),
                         },
                     },
                     "required": ["routine_id"],
@@ -250,16 +284,30 @@ class RoutinesSkill(Skill):
             "  1. Confirm the schedule with the user in plain English (\"so "
             "you want this at 6:30am every day, right?\"). The user thinks in "
             "their local time — never echo UTC.\n"
-            "  2. Pick the kind:\n"
+            "  2. **ASK WHERE to deliver it.** Before creating the routine, "
+            "ask the user which channel(s) they want to receive it on. "
+            "Phrase the question naturally: \"Where do you want to see this "
+            "— here in the chat, on Telegram, on WhatsApp, or all of them?\" "
+            "Default is `website` (the chat thread). Map the answer to a "
+            "`delivery_channels` list:\n"
+            "     - \"here\" / \"the chat\" / \"website\" → `[\"website\"]`\n"
+            "     - \"Telegram\" → `[\"website\", \"telegram\"]`\n"
+            "     - \"WhatsApp\" → `[\"website\", \"whatsapp\"]`\n"
+            "     - \"all channels\" / \"everywhere\" → `[\"website\", \"telegram\", \"whatsapp\"]`\n"
+            "     (The website is always kept so the user has a permanent "
+            "record on their dashboard even when the buzz goes to phone.)\n"
+            "  3. Pick the kind:\n"
             "     - `email_briefing` for \"summarize my unread emails\" "
             "(preset Gmail flow — no prompt needed).\n"
             "     - `agent_task` for everything else. Write a self-contained "
             "`prompt_text` — the fire runs in a fresh context with no memory "
             "of this conversation, so spell out exactly what to do.\n"
-            "  3. Convert the spoken schedule to a 5-part cron in the user's "
+            "  4. Convert the spoken schedule to a 5-part cron in the user's "
             "tz: `30 6 * * *` = 06:30 daily; `0 7 * * 1-5` = 07:00 weekdays.\n"
-            "  4. Call `routines__create`. Confirm success to the user and "
-            "tell them where to find / edit it (Mission Control on the dashboard).\n"
+            "  5. Call `routines__create` with kind + schedule + name + "
+            "delivery_channels (+ prompt_text for agent_task). Confirm "
+            "success to the user, mention which channel(s) they'll see it on, "
+            "and tell them they can adjust later from Mission Control on the dashboard.\n"
             "\n"
             "**Before creating, always call `routines__list` first** to check "
             "if a similar routine already exists — if so, offer to update it "
@@ -320,6 +368,7 @@ class RoutinesSkill(Skill):
                 name=args.get("name"),
                 prompt_text=args.get("prompt_text"),
                 enabled=bool(args.get("enabled", True)),
+                delivery_channels=args.get("delivery_channels"),
                 config=args.get("config"),
             )
         except Exception as e:
@@ -330,6 +379,7 @@ class RoutinesSkill(Skill):
         except HTTPException as e:
             return f"ERROR: {e.detail}"
 
+        delivery = (resp.config or {}).get("delivery_channels") if resp.config else None
         return _as_json({
             "status": "created",
             "routine": {
@@ -338,6 +388,7 @@ class RoutinesSkill(Skill):
                 "name": resp.name,
                 "schedule_cron_local": resp.schedule_cron_local,
                 "enabled": resp.enabled,
+                "delivery_channels": delivery or ["website"],
                 "next_run_at": str(resp.next_run_at) if resp.next_run_at else None,
             },
             "hint": (
@@ -359,6 +410,10 @@ class RoutinesSkill(Skill):
                 "prompt_text": r.prompt_text,
                 "schedule_cron_local": r.schedule_cron_local,
                 "enabled": r.enabled,
+                "delivery_channels": (
+                    (r.config or {}).get("delivery_channels")
+                    if r.config else None
+                ) or ["website"],
                 "last_status": r.last_status,
                 "last_run_at": str(r.last_run_at) if r.last_run_at else None,
                 "next_run_at": str(r.next_run_at) if r.next_run_at else None,
@@ -379,7 +434,7 @@ class RoutinesSkill(Skill):
         # Only pass fields the agent actually set — RoutineUpdate's None
         # default means "leave unchanged".
         update_fields: Dict[str, Any] = {}
-        for key in ("schedule_cron_local", "enabled", "name", "prompt_text", "config"):
+        for key in ("schedule_cron_local", "enabled", "name", "prompt_text", "config", "delivery_channels"):
             if key in args and args[key] is not None:
                 update_fields[key] = args[key]
 
