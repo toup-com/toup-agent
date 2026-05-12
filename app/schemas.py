@@ -132,6 +132,11 @@ class UserResponse(BaseModel):
     role: str = "beta_user"
     created_at: datetime
     is_active: bool
+    # IANA tz name. Captured silently on every login via /auth/profile
+    # (Intl-resolved) and overridable from the account page's "Share
+    # precise location" flow. Exposed here so the account UI can render
+    # the current value without a second round trip.
+    timezone: Optional[str] = None
 
     class Config:
         from_attributes = True

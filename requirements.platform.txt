@@ -35,6 +35,12 @@ python-dateutil==2.8.2
 httpx>=0.28.1
 tenacity==8.2.3
 apscheduler==3.10.4
+# Coordinates → IANA timezone lookup. Used by /auth/timezone-from-coords
+# so the account-page "Share precise location" flow can resolve a
+# user's exact tz from lat/lng without an external API. Pure-Python,
+# bundled shapefile (~17MB), zero network. Pinned because newer
+# versions change the API shape (e.g. timezone_at vs certain_timezone_at).
+timezonefinder==6.2.0
 
 # Document Processing
 pypdf==4.0.1

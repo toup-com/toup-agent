@@ -356,6 +356,82 @@ async def update_profile(
     }
 
 
+# ── Timezone-from-coordinates ────────────────────────────────────
+#
+# Account-page "Share precise location" flow. The browser asks the
+# user for navigator.geolocation permission, then POSTs the resolved
+# (lat, lng) here. We derive the IANA timezone via the bundled
+# timezonefinder shapefile (no external API, no per-request network).
+# This is the explicit-consent counterpart to the silent Intl capture
+# wired into /auth/profile.
+
+# Module-level instance — TimezoneFinder() loads the shapefile on
+# construction, so reusing one instance across requests avoids paying
+# that cost (~50-200ms) per call.
+_tz_finder = None
+
+
+def _get_tz_finder():
+    global _tz_finder
+    if _tz_finder is None:
+        from timezonefinder import TimezoneFinder
+        _tz_finder = TimezoneFinder()
+    return _tz_finder
+
+
+class TimezoneFromCoordsRequest(BaseModel):
+    # Latitude bounds match the WGS84 valid range. Anything outside
+    # this is either a typo or hostile — reject early so timezonefinder
+    # never sees garbage.
+    lat: float
+    lng: float
+
+
+@router.post("/timezone-from-coords")
+async def timezone_from_coords(
+    body: TimezoneFromCoordsRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve precise IANA timezone from (lat, lng) and persist on
+    User.timezone. Called by the account page after the user grants
+    browser geolocation permission. Returns the resolved zone so the
+    frontend can show "Now using America/Toronto" in the share card.
+    """
+    if not (-90.0 <= body.lat <= 90.0) or not (-180.0 <= body.lng <= 180.0):
+        raise HTTPException(status_code=400, detail="Coordinates out of range")
+
+    tf = _get_tz_finder()
+    tz_name = tf.timezone_at(lat=body.lat, lng=body.lng)
+    if not tz_name:
+        # timezonefinder returns None only for a handful of unmapped
+        # polar / disputed-water polygons. Unlikely for real user
+        # devices but the frontend has a fallback to keep the silently
+        # captured Intl value, so we surface the failure honestly.
+        raise HTTPException(
+            status_code=404, detail="Could not determine timezone for these coordinates"
+        )
+
+    # Defense in depth: zoneinfo confirms the string timezonefinder
+    # returned is one Python (and the rest of our scheduling stack)
+    # accepts. If a bundled shapefile ever drifts ahead of stdlib
+    # tzdata this catches it before we corrupt User.timezone.
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        raise HTTPException(
+            status_code=500, detail="Resolved zone is not a known IANA name"
+        )
+
+    if current_user.timezone != tz_name:
+        current_user.timezone = tz_name
+        current_user.updated_at = datetime.utcnow()
+        await db.commit()
+
+    return {"timezone": tz_name}
+
+
 # ── Change Password ──────────────────────────────────────────────
 
 @router.post("/change-password")
