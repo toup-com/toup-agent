@@ -1120,7 +1120,14 @@ async def ws_chat(
     if not user_id and subprotocol_token:
         user_id = await _authenticate_ws(subprotocol_token)
 
-    # Try ?token= JWT (deprecated bake-window fallback)
+    # Try ?token= session token (signed with agent_api_key, aud=toup-agent-session).
+    # The Chrome extension's sidepanel chat-ws connects via query string with
+    # such a token — the path needs to recognize it BEFORE falling through to
+    # the platform-JWT decoder which uses a different secret.
+    if not user_id and token:
+        user_id = await _authenticate_ws_session_token(token)
+
+    # Try ?token= platform JWT (deprecated bake-window fallback)
     if not user_id and token:
         log_deprecated_query_token("/api/ws/chat (agent)")
         user_id = await _authenticate_ws(token)
