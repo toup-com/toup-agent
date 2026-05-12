@@ -1381,6 +1381,33 @@ async def ws_chat(
                 # Uses the consolidated build_layer2_context (Checkpoint 5 Part 2, Risk 5)
                 app_id_from_msg = msg.get("app_id")
                 _original_user_text = text  # Preserve before context injection
+
+                # Phase 4: Chrome sidepanel ambient page-context.
+                # The sidepanel attaches `page_context` to every outgoing
+                # message so the agent knows what the user is currently
+                # looking at. Inject as a hidden context block — agent sees
+                # it, user sees only their original text (via display_text).
+                _page_ctx = msg.get("page_context")
+                if _page_ctx and isinstance(_page_ctx, dict):
+                    try:
+                        from app.services.page_context_render import render_page_context
+                        # Honor any privacy flags the sidepanel surfaces with
+                        # the context (set per-message based on Options page
+                        # toggles). Defaults remain permissive.
+                        _flags = _page_ctx.get("_flags") or {}
+                        _filtered = dict(_page_ctx)
+                        if _flags.get("hide_readable", False):
+                            _filtered["readable_content"] = ""
+                        if _flags.get("hide_selection", False):
+                            _filtered["selected_text"] = ""
+                        if _flags.get("hide_dom", False):
+                            _filtered["dom_summary"] = ""
+                        _ctx_block = render_page_context(_filtered)
+                        if _ctx_block:
+                            text = f"{_ctx_block}\n\n{text}"
+                    except Exception as _pc_err:
+                        logger.debug("[WS] page_context render skipped: %s", _pc_err)
+
                 if channel == "app" and app_id_from_msg:
                     try:
                         from app.db.database import async_session_maker

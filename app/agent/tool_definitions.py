@@ -277,6 +277,175 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
+        # 8b. Extension-routed web search (runs in the user's real Chrome)
+        # ------------------------------------------------------------------
+        {
+            "name": "extension_search",
+            "description": (
+                "Run a web search inside the user's real Chrome via the Toup Chrome "
+                "extension. Uses the user's residential IP and session — far more "
+                "resilient to bot detection than server-side scraping. Opens a "
+                "visible tab. Falls back to web_search transparently if the user "
+                "hasn't installed/paired the extension; agents can call this "
+                "freely without checking first."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query":  {"type": "string", "description": "The search query."},
+                    "engine": {"type": "string", "enum": ["google", "bing", "duckduckgo"], "description": "Search engine (default google)."},
+                    "top_n":  {"type": "integer", "description": "Number of ranked results (1-20, default 10)."},
+                    "locale": {"type": "string", "description": "Optional locale hint, e.g. 'en-US'."},
+                },
+                "required": ["query"],
+            },
+        },
+        # ------------------------------------------------------------------
+        # 8c. Extension-routed page read (Readability-clean text)
+        # ------------------------------------------------------------------
+        {
+            "name": "extension_read",
+            "description": (
+                "Fetch a URL in the user's real Chrome and return cleaned readable "
+                "text (nav/ads/boilerplate stripped). Use this for sites that block "
+                "server-side fetch (LinkedIn, Twitter/X, Substack, Medium paywalls), "
+                "or when you specifically need pages behind the user's login. "
+                "Falls back to web_fetch if the extension isn't connected."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url":       {"type": "string", "description": "The URL to read."},
+                    "max_chars": {"type": "integer", "description": "Max characters to return (default 12000)."},
+                    "use_existing_tab": {"type": "boolean", "description": "Reuse an open tab on the same hostname if available (default true)."},
+                },
+                "required": ["url"],
+            },
+        },
+        # ------------------------------------------------------------------
+        # 8d. Extension-routed research (search + read top N)
+        # ------------------------------------------------------------------
+        {
+            "name": "extension_research",
+            "description": (
+                "Multi-step research: run a search, open the top results in the "
+                "user's Chrome, extract clean text from each, and return a "
+                "structured bundle. Far faster than chaining extension_search + "
+                "extension_read manually. Falls back to web_search + web_fetch "
+                "if the extension is unavailable."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query":  {"type": "string", "description": "The research question."},
+                    "depth":  {"type": "integer", "description": "How many top results to open (1-10, default 5)."},
+                    "engine": {"type": "string", "enum": ["google", "bing", "duckduckgo"], "description": "Search engine (default google)."},
+                    "per_page_chars": {"type": "integer", "description": "Max chars to extract per page (default 4000)."},
+                },
+                "required": ["query"],
+            },
+        },
+        # ------------------------------------------------------------------
+        # 8e. browser_session_start — open a controlled tab in user's Chrome
+        # ------------------------------------------------------------------
+        {
+            "name": "browser_session_start",
+            "description": (
+                "Start a stateful browser-control session inside the user's real "
+                "Chrome (via the Toup extension). Returns a session_id you MUST "
+                "pass to every subsequent browser_action / browser_screenshot / "
+                "browser_session_end call. Sessions persist across turns and "
+                "auto-end after 10 min of inactivity. Requires the extension to "
+                "be paired; without it, every browser_* call returns an error "
+                "(use web_search / extension_search for stateless lookups)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name":             {"type": "string", "description": "Human-readable label for the session (shown in the UI)."},
+                    "hint_url":         {"type": "string", "description": "Optional starting URL; extension opens a fresh tab here."},
+                    "share_active_tab": {"type": "boolean", "description": "If true and hint_url is omitted, take over the user's currently-focused tab."},
+                },
+                "required": [],
+            },
+        },
+        # ------------------------------------------------------------------
+        # 8f. browser_session_end
+        # ------------------------------------------------------------------
+        {
+            "name": "browser_session_end",
+            "description": "End a browser session. Optionally closes the underlying tab.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "From browser_session_start."},
+                    "close_tab":  {"type": "boolean", "description": "If true, also close the tab in Chrome (default false)."},
+                },
+                "required": ["session_id"],
+            },
+        },
+        # ------------------------------------------------------------------
+        # 8g. browser_action — the fat tool (navigate/click/type/etc.)
+        # ------------------------------------------------------------------
+        {
+            "name": "browser_action",
+            "description": (
+                "Execute a single browser action inside a session. The `kind` "
+                "field selects: navigate, click, type, scroll, select, "
+                "wait_for, evaluate, extract, dom_snapshot, read_logs. "
+                "`args` is kind-specific. Set `capture.screenshot=true` to get "
+                "a JPEG of the post-action viewport in the result. Element "
+                "targeting prefers `ref` (from a prior dom_snapshot) over CSS "
+                "`selector` over `(x,y)`. "
+                "For dynamic apps where selectors are unreliable (Gmail, "
+                "LinkedIn, Notion, canvas/PDF, shadow DOM), set "
+                "`args.use_vision=true` and provide `args.target_description` "
+                "in plain English — a Claude Vision call grounds the action "
+                "to pixel coordinates from the current screenshot."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["navigate", "click", "type", "scroll", "select",
+                                  "wait_for", "evaluate", "extract", "dom_snapshot", "read_logs"],
+                    },
+                    "args":    {"type": "object", "description": "Kind-specific arguments. See PROTOCOL.md §3."},
+                    "capture": {
+                        "type": "object",
+                        "properties": {
+                            "screenshot": {"type": "boolean", "description": "Include a JPEG of the post-action viewport."},
+                            "snapshot":   {"type": "boolean", "description": "Include a fresh dom_snapshot in the result."},
+                            "quality":    {"type": "integer", "description": "JPEG quality 1-100 (default 80)."},
+                        },
+                    },
+                    "timeout_s": {"type": "integer", "description": "Per-action timeout (default 30)."},
+                },
+                "required": ["session_id", "kind"],
+            },
+        },
+        # ------------------------------------------------------------------
+        # 8h. browser_screenshot — JPEG of the session's viewport
+        # ------------------------------------------------------------------
+        {
+            "name": "browser_screenshot",
+            "description": (
+                "Capture a JPEG screenshot of the session's current viewport. "
+                "Cheaper than browser_action(kind=dom_snapshot) when you just "
+                "want vision. Returns base64-encoded JPEG."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "quality":    {"type": "integer", "description": "JPEG quality 1-100 (default 80)."},
+                },
+                "required": ["session_id"],
+            },
+        },
+        # ------------------------------------------------------------------
         # 9. Send file to user
         # ------------------------------------------------------------------
         {

@@ -67,6 +67,8 @@ from app.api.routines import router as routines_router, set_runner_ref as set_ro
 # No runner yet (Gate T2). Same X-Agent-Key contract as other authed
 # agent endpoints; defence-in-depth user_id check inside the handler.
 from app.api.triggers_inbound import router as triggers_inbound_router
+# Triggers user-facing CRUD (Gate T2) — list/create/update/delete/events/test.
+from app.api.triggers import router as triggers_router, set_runner_ref as set_triggers_crud_runner_ref
 from app.services import runtime_identity, drain_state
 
 _app_start_time = None
@@ -487,6 +489,7 @@ async def lifespan(app: FastAPI):
     telegram_bot = None
     cron_service = None
     routine_runner = None  # Sibling scheduler for system-managed routines (email briefing, …)
+    trigger_runner = None  # Event-driven dispatcher for trigger_events (email_received, …)
     subagent_manager = None
     skill_loader = None
     agent_runner = None
@@ -766,6 +769,28 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ Could not start routine runner: {e}")
             routine_runner = None
 
+        # TriggerRunner — event-driven sibling. Started after RoutineRunner
+        # so its restart sweep + rate-bucket warmup run before any inbound
+        # webhook can dispatch. Auto-imports the email_received handler
+        # which self-registers via the registry. MCP client wires later
+        # (same lifespan ordering as routines).
+        try:
+            from app.agent.triggers import TriggerRunner
+            # Importing email_received_handler triggers the auto-register
+            # call at module load.
+            from app.agent.triggers import email_received_handler  # noqa: F401
+            trigger_runner = TriggerRunner()
+            await trigger_runner.start()
+            from app.api.triggers_inbound import set_runner_ref as set_triggers_runner_ref
+            set_triggers_runner_ref(trigger_runner)
+            # Also hand the runner to the CRUD module so the test-fire
+            # endpoint can dispatch synthesised events directly.
+            set_triggers_crud_runner_ref(trigger_runner)
+            print("⚡ Trigger runner started")
+        except Exception as e:
+            print(f"⚠️ Could not start trigger runner: {e}")
+            trigger_runner = None
+
         # Heartbeat service
         if settings.heartbeat_enabled and cron_service:
             try:
@@ -941,6 +966,11 @@ async def lifespan(app: FastAPI):
                 # constructed alongside cron_service in the earlier block).
                 if agent_runner is not None:
                     routine_runner.set_agent_runner(agent_runner)
+            # Same hand-off for the trigger runner — handlers fetch
+            # Gmail messages via MCP, so they need the client wired
+            # before any inbound event can be dispatched in earnest.
+            if trigger_runner is not None:
+                trigger_runner.set_mcp_client(mcp_client)
 
             # Periodic refresh task — keeps the sync snapshot fresh
             # without every turn paying the cache-miss cost. Stored on
@@ -1339,6 +1369,15 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
+    # TriggerRunner shutdown order mirrors RoutineRunner — must drain
+    # in-flight handlers before the DB pool tears down.
+    if trigger_runner:
+        try:
+            await trigger_runner.stop()
+            print("⚡ Trigger runner stopped")
+        except Exception:
+            pass
+
     if cron_service:
         try:
             await cron_service.stop()
@@ -1469,8 +1508,10 @@ app.include_router(admin_pool_router, prefix=settings.api_prefix)
 app.include_router(routines_router, prefix=settings.api_prefix)
 
 # Triggers — event-driven automations (Gmail Pub/Sub, etc.).
-# Gate T1 ships /api/triggers/inbound only; runner + CRUD land in T2/T3.
+# Gate T1: /api/triggers/inbound (platform dispatches here).
+# Gate T2: /api/triggers/* (CRUD + event history + test-fire).
 app.include_router(triggers_inbound_router, prefix=settings.api_prefix)
+app.include_router(triggers_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
 try:

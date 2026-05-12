@@ -39,6 +39,13 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "memory_store": 1_000,
     "web_search": 10_000,
     "web_fetch": 15_000,
+    "extension_search": 12_000,
+    "extension_read": 20_000,
+    "extension_research": 60_000,
+    "browser_session_start": 2_000,
+    "browser_session_end":   500,
+    "browser_action":        2_500_000,   # may include base64 JPEG + DOM snapshot
+    "browser_screenshot":    2_000_000,   # base64 JPEG ~1-1.5MB
     "send_file": 1_000,
     "send_photo": 1_000,
     "analyze_image": 10_000,
@@ -940,7 +947,361 @@ class ToolExecutor:
             logger.warning("[web_fetch] Browser read_page also failed: %s", exc)
 
         return f"ERROR: Could not read {url}"
-    
+
+    # ------------------------------------------------------------------
+    # 8b/c/d. extension_* — route through the user's Chrome extension.
+    # All three fall back to the equivalent server-side tool when the
+    # extension isn't connected, so they're safe to call unconditionally.
+    # ------------------------------------------------------------------
+    async def _tool_extension_search(self, inp: Dict[str, Any]) -> str:
+        from app.agent import extension_bridge
+
+        query = (inp.get("query") or "").strip()
+        if not query:
+            return "ERROR: query is required"
+        if not self._current_user_id or not extension_bridge.is_connected(self._current_user_id):
+            logger.info("[extension_search] extension not connected; falling back to web_search")
+            return await self._tool_web_search({"query": query, "count": inp.get("top_n", 10)})
+
+        params = {
+            "query":  query,
+            "engine": inp.get("engine", "google"),
+            "top_n":  min(int(inp.get("top_n", 10)), 20),
+        }
+        if inp.get("locale"):
+            params["locale"] = inp["locale"]
+        try:
+            data = await extension_bridge.dispatch(
+                self._current_user_id, "search", params, timeout_s=30,
+            )
+        except extension_bridge.ExtensionUnavailable:
+            return await self._tool_web_search({"query": query, "count": params["top_n"]})
+        except extension_bridge.ExtensionError as exc:
+            logger.warning("[extension_search] extension returned %s; falling back", exc.code)
+            return await self._tool_web_search({"query": query, "count": params["top_n"]})
+        except asyncio.TimeoutError:
+            logger.warning("[extension_search] timeout; falling back")
+            return await self._tool_web_search({"query": query, "count": params["top_n"]})
+        return self._format_extension_search(data)
+
+    async def _tool_extension_read(self, inp: Dict[str, Any]) -> str:
+        from app.agent import extension_bridge
+
+        url = (inp.get("url") or "").strip()
+        max_chars = int(inp.get("max_chars", 12000))
+        if not url:
+            return "ERROR: url is required"
+        if not self._current_user_id or not extension_bridge.is_connected(self._current_user_id):
+            logger.info("[extension_read] extension not connected; falling back to web_fetch")
+            return await self._tool_web_fetch({"url": url, "max_chars": max_chars})
+
+        params = {
+            "url": url,
+            "max_chars": max_chars,
+            "use_existing_tab": bool(inp.get("use_existing_tab", True)),
+        }
+        try:
+            data = await extension_bridge.dispatch(
+                self._current_user_id, "read", params, timeout_s=30,
+            )
+        except extension_bridge.ExtensionUnavailable:
+            return await self._tool_web_fetch({"url": url, "max_chars": max_chars})
+        except extension_bridge.ExtensionError as exc:
+            logger.warning("[extension_read] extension returned %s; falling back", exc.code)
+            return await self._tool_web_fetch({"url": url, "max_chars": max_chars})
+        except asyncio.TimeoutError:
+            return await self._tool_web_fetch({"url": url, "max_chars": max_chars})
+        return self._format_extension_read(data)
+
+    async def _tool_extension_research(self, inp: Dict[str, Any]) -> str:
+        from app.agent import extension_bridge
+
+        query = (inp.get("query") or "").strip()
+        if not query:
+            return "ERROR: query is required"
+        if not self._current_user_id or not extension_bridge.is_connected(self._current_user_id):
+            return await self._fallback_research(inp)
+
+        params = {
+            "query":          query,
+            "depth":          min(max(int(inp.get("depth", 5)), 1), 10),
+            "engine":         inp.get("engine", "google"),
+            "per_page_chars": min(max(int(inp.get("per_page_chars", 4000)), 500), 20000),
+        }
+        try:
+            data = await extension_bridge.dispatch(
+                self._current_user_id, "research", params, timeout_s=120,
+            )
+        except extension_bridge.ExtensionUnavailable:
+            return await self._fallback_research(inp)
+        except extension_bridge.ExtensionError as exc:
+            logger.warning("[extension_research] extension returned %s; falling back", exc.code)
+            return await self._fallback_research(inp)
+        except asyncio.TimeoutError:
+            return await self._fallback_research(inp)
+        return self._format_extension_research(data)
+
+    # ─── formatters & fallbacks ───
+    @staticmethod
+    def _format_extension_search(data: Dict[str, Any]) -> str:
+        results = data.get("results") or []
+        if not results:
+            return "No results found."
+        engine = data.get("engine") or "google"
+        query = data.get("query") or ""
+        lines = [f"Search via Chrome extension ({engine}) for: {query}", ""]
+        for r in results:
+            lines.append(f"{r.get('rank', '?')}. {r.get('title', '').strip()}")
+            lines.append(f"   {r.get('url', '')}")
+            snip = (r.get("snippet") or "").strip()
+            if snip:
+                lines.append(f"   {snip}")
+            score = r.get("score")
+            if score is not None:
+                lines.append(f"   relevance: {score:.2f}")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    @staticmethod
+    def _format_extension_read(data: Dict[str, Any]) -> str:
+        title = data.get("title") or ""
+        url = data.get("final_url") or data.get("url") or ""
+        byline = data.get("byline")
+        site = data.get("site_name")
+        head_bits = [f"# {title}".strip(), url]
+        if site:   head_bits.append(f"site: {site}")
+        if byline: head_bits.append(f"by: {byline}")
+        head = "\n".join(b for b in head_bits if b)
+        body = (data.get("text") or "").strip()
+        if not body:
+            return f"{head}\n\n(no readable text extracted)"
+        return f"{head}\n\n{body}"
+
+    def _format_extension_research(self, data: Dict[str, Any]) -> str:
+        query = data.get("query", "")
+        pages = data.get("pages") or []
+        if not pages:
+            return f"Research for '{query}': no pages extracted."
+        out = [f"# Research: {query}", ""]
+        for p in pages:
+            out.append(f"## [{p.get('rank', '?')}] {p.get('title', '').strip()}")
+            out.append(p.get("url", ""))
+            if p.get("snippet"):
+                out.append(f"_{p['snippet'].strip()}_")
+            out.append("")
+            text = p.get("extracted_text")
+            if text:
+                out.append(text.strip())
+            else:
+                out.append(f"(failed to extract: {p.get('error', 'unknown')})")
+            out.append("")
+            out.append("---")
+            out.append("")
+        return "\n".join(out).rstrip()
+
+    async def _fallback_research(self, inp: Dict[str, Any]) -> str:
+        """Server-side research path when the extension isn't available."""
+        from app.agent.smart_fetch.search import toup_search
+        from app.agent.smart_fetch.reader import toup_read_page
+
+        query = (inp.get("query") or "").strip()
+        depth = min(max(int(inp.get("depth", 5)), 1), 10)
+        per_page = min(max(int(inp.get("per_page_chars", 4000)), 500), 20000)
+
+        try:
+            serp = await toup_search(query, depth)
+        except Exception as exc:
+            logger.warning("[fallback_research] search failed: %s", exc)
+            return f"Research for '{query}' failed: {exc}"
+
+        # toup_search returns formatted text; we don't have structured
+        # URLs here, so fall back to a search-only summary if we can't
+        # parse URLs out cleanly.
+        urls = []
+        for line in (serp or "").splitlines():
+            line = line.strip()
+            if line.startswith("http://") or line.startswith("https://"):
+                urls.append(line.split()[0])
+        urls = urls[:depth]
+        if not urls:
+            return serp or f"No results for '{query}'."
+
+        out = [f"# Research: {query}", "", "_(extension unavailable; using server-side fetch)_", ""]
+        for i, u in enumerate(urls, 1):
+            out.append(f"## [{i}] {u}")
+            try:
+                txt = await toup_read_page(u, per_page)
+                out.append(txt or "(empty)")
+            except Exception as exc:
+                out.append(f"(read failed: {exc})")
+            out.append("")
+            out.append("---")
+            out.append("")
+        return "\n".join(out).rstrip()
+
+    # ════════════════════════════════════════════════════════════════════
+    # 8e-h. browser_session_start / _end / browser_action / browser_screenshot
+    # ════════════════════════════════════════════════════════════════════
+    # These four tools route through the Chrome extension. Unlike the
+    # search/read/research tools above, they do NOT fall back to
+    # server-side execution — the whole point is operating in the user's
+    # real browser. If no extension is paired/connected we return a
+    # clear error so the agent surfaces a "please install the extension"
+    # message to the user instead of silently doing the wrong thing.
+
+    @staticmethod
+    def _require_extension_or_error() -> Optional[str]:
+        """Return an error string if no extension is wired; else None."""
+        # Local import to avoid loading extension_bridge for agents that
+        # never use it.
+        return None  # actual check happens inline with user_id
+
+    async def _tool_browser_session_start(self, inp: Dict[str, Any]) -> str:
+        from app.agent import extension_bridge
+
+        if not self._current_user_id:
+            return "ERROR: browser tools require a user context"
+        if not extension_bridge.is_connected(self._current_user_id):
+            return (
+                "ERROR: Chrome extension is not connected. Ask the user to install "
+                "the Toup Agent Browser extension from https://toup.ai/settings/extensions "
+                "and pair it. For pure-search queries use web_search or extension_search "
+                "instead (those don't need the extension)."
+            )
+
+        params: Dict[str, Any] = {}
+        if inp.get("name"):             params["name"] = str(inp["name"])[:120]
+        if inp.get("hint_url"):         params["hint_url"] = str(inp["hint_url"])
+        if inp.get("share_active_tab"): params["share_active_tab"] = bool(inp["share_active_tab"])
+
+        try:
+            data = await extension_bridge.dispatch(
+                self._current_user_id, "session_start", params, timeout_s=30,
+            )
+        except extension_bridge.ExtensionUnavailable:
+            return "ERROR: extension disconnected"
+        except extension_bridge.ExtensionError as exc:
+            return f"ERROR: {exc.code}: {exc.message}"
+        except asyncio.TimeoutError:
+            return "ERROR: TIMEOUT starting session"
+
+        sid = data.get("session_id", "")
+        url = data.get("url", "")
+        title = data.get("title", "")
+        return (
+            f"session_id: {sid}\n"
+            f"tab: {title or '(untitled)'}\n"
+            f"url: {url}\n"
+            f"\nUse this session_id for browser_action / browser_screenshot / browser_session_end."
+        )
+
+    async def _tool_browser_session_end(self, inp: Dict[str, Any]) -> str:
+        from app.agent import extension_bridge
+
+        sid = (inp.get("session_id") or "").strip()
+        if not sid:
+            return "ERROR: session_id is required"
+        if not self._current_user_id or not extension_bridge.is_connected(self._current_user_id):
+            return "ERROR: extension not connected"
+        try:
+            data = await extension_bridge.dispatch(
+                self._current_user_id, "session_end",
+                {"session_id": sid, "close_tab": bool(inp.get("close_tab"))},
+                timeout_s=10,
+            )
+        except extension_bridge.ExtensionUnavailable:
+            return "ERROR: extension disconnected"
+        except extension_bridge.ExtensionError as exc:
+            return f"ERROR: {exc.code}: {exc.message}"
+        return f"session ended: {sid} (ended={data.get('ended', False)})"
+
+    async def _tool_browser_action(self, inp: Dict[str, Any]) -> str:
+        from app.agent import extension_bridge
+
+        sid = (inp.get("session_id") or "").strip()
+        kind = (inp.get("kind") or "").strip()
+        if not sid or not kind:
+            return "ERROR: session_id and kind are required"
+        if not self._current_user_id or not extension_bridge.is_connected(self._current_user_id):
+            return "ERROR: extension not connected"
+
+        params = {
+            "session_id": sid,
+            "kind":       kind,
+            "args":       inp.get("args") or {},
+            "capture":    inp.get("capture") or {},
+        }
+        timeout = int(inp.get("timeout_s") or 30)
+        try:
+            data = await extension_bridge.dispatch(
+                self._current_user_id, "action", params, timeout_s=timeout,
+            )
+        except extension_bridge.ExtensionUnavailable:
+            return "ERROR: extension disconnected"
+        except extension_bridge.ExtensionError as exc:
+            return f"ERROR: {exc.code}: {exc.message}"
+        except asyncio.TimeoutError:
+            return f"ERROR: TIMEOUT after {timeout}s"
+
+        return self._format_browser_action(data)
+
+    async def _tool_browser_screenshot(self, inp: Dict[str, Any]) -> str:
+        from app.agent import extension_bridge
+
+        sid = (inp.get("session_id") or "").strip()
+        if not sid:
+            return "ERROR: session_id is required"
+        if not self._current_user_id or not extension_bridge.is_connected(self._current_user_id):
+            return "ERROR: extension not connected"
+        params = {"session_id": sid, "quality": int(inp.get("quality") or 80)}
+        try:
+            data = await extension_bridge.dispatch(
+                self._current_user_id, "screenshot", params, timeout_s=15,
+            )
+        except extension_bridge.ExtensionUnavailable:
+            return "ERROR: extension disconnected"
+        except extension_bridge.ExtensionError as exc:
+            return f"ERROR: {exc.code}: {exc.message}"
+        except asyncio.TimeoutError:
+            return "ERROR: TIMEOUT"
+
+        w = data.get("width"); h = data.get("height")
+        q = data.get("quality")
+        b64 = data.get("image_b64") or ""
+        # Keep the textual envelope short and put the base64 on a fenced
+        # line so the agent can detect / forward it without ambiguity.
+        return (
+            f"screenshot ({w}x{h}, jpeg q={q}, {len(b64)} chars b64)\n"
+            f"```jpeg-b64\n{b64}\n```"
+        )
+
+    @staticmethod
+    def _format_browser_action(data: Dict[str, Any]) -> str:
+        kind = data.get("kind") or "action"
+        outcome = data.get("outcome") or {}
+        ts = data.get("tab_state") or {}
+        lines = [
+            f"[{kind}] url={ts.get('url', '')}  title={ts.get('title', '')}",
+            f"outcome: {json.dumps(outcome, ensure_ascii=False)[:1200]}",
+        ]
+        snap = data.get("snapshot")
+        if snap:
+            ref_count = snap.get("ref_count")
+            lines.append(f"snapshot: {ref_count} interactive refs at {snap.get('url', '')}")
+            lines.append("```snapshot-json")
+            try:
+                lines.append(json.dumps(snap, ensure_ascii=False)[:8000])
+            except Exception:
+                lines.append("(snapshot serialization failed)")
+            lines.append("```")
+        if data.get("screenshot"):
+            meta = data.get("screenshot_meta") or {}
+            lines.append(f"screenshot: {meta.get('w')}x{meta.get('h')} jpeg q={meta.get('quality')}")
+            lines.append("```jpeg-b64")
+            lines.append(data["screenshot"])
+            lines.append("```")
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # 9. send_file — send a document to the user via Telegram
     # ------------------------------------------------------------------

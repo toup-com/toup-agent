@@ -65,6 +65,19 @@ router = APIRouter(prefix="/triggers", tags=["triggers (inbound)"])
 logger = logging.getLogger(__name__)
 
 
+# Late-bound runner reference. agent_main injects this after the
+# TriggerRunner is built so the inbound endpoint can fire-and-forget
+# dispatch each newly-inserted row to the handler. None is fine — the
+# drain loop picks up un-handed events on its next tick.
+_runner_ref: Any = None
+
+
+def set_runner_ref(runner: Any) -> None:
+    """Called by agent_main lifespan after TriggerRunner is started."""
+    global _runner_ref
+    _runner_ref = runner
+
+
 # ── Envelope ─────────────────────────────────────────────────────────
 
 
@@ -294,6 +307,10 @@ async def _idempotent_insert(
     (the real prod path) and SQLite gets OR IGNORE (the test path).
     Other dialects would need an explicit branch — failing loudly here
     is preferable to silently double-inserting.
+
+    Fires the runner hand-off when (and only when) a new row was
+    actually created — dedupe hits must NOT re-dispatch, that's the
+    whole point of the UNIQUE gate.
     """
     new_id = str(uuid.uuid4())
     values = {
@@ -327,7 +344,23 @@ async def _idempotent_insert(
     inserted_id = result.scalar_one_or_none()
     await db.commit()
 
-    return "inserted" if inserted_id is not None else "dedupe_hit"
+    if inserted_id is None:
+        return "dedupe_hit"
+
+    # Fire-and-forget runner hand-off. The event is in 'queued' state
+    # in the DB; the runner picks it up, applies rate/coalesce/filter,
+    # and dispatches to the handler. If the runner isn't wired yet
+    # (boot race), its drain_loop picks the row up on its next tick.
+    if _runner_ref is not None:
+        try:
+            _runner_ref.handle_event_background(str(inserted_id))
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning(
+                "[trigger_inbound] runner hand-off raised: %s (drain_loop will recover)",
+                e,
+            )
+
+    return "inserted"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────

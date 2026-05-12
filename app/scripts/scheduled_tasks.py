@@ -782,6 +782,94 @@ async def run_abandoned_onboarding_reaper():
     )
 
 
+async def run_gmail_watch_refresh():
+    """Re-arm every active Gmail watch ahead of the 7-day expiration.
+
+    Gmail's `users.watch` expires ~7 days after the last call. We
+    refresh DAILY because:
+      - Refreshing 6× more often than needed is harmless: re-arming
+        a live watch is idempotent + resets the expiration clock.
+      - Daily cadence gives 6 days of forgiveness for transient
+        Google outages — one missed refresh window doesn't leave a
+        user without notifications.
+      - The cost is trivial: one Google API call per Gmail-connected
+        user per day, well under any sane quota.
+
+    Gated on `settings.triggers_email_enabled` — when the feature is
+    off, the refresh job is a no-op (so a flagged-off deployment
+    doesn't generate spurious Google API traffic).
+
+    Failure model: per-user try/except. One user's token rot, scope
+    miss, or temporary outage doesn't sink the batch. Failures are
+    structured-logged for ops triage.
+
+    This task is the auto-side of what `docs/runbooks/gmail-pubsub.md`
+    §4.1 documents as the manual procedure. The manual path stays
+    operative as a recovery lever — operators can run
+    `refresh_watch(user_id)` directly to repair a specific user.
+    """
+    from app.config import settings
+    if not getattr(settings, "triggers_email_enabled", False):
+        logger.debug(
+            "[gmail_watch_refresh] feature flag off — skipping daily refresh"
+        )
+        return
+    if not settings.gcp_project or not settings.pubsub_topic:
+        logger.warning(
+            "[gmail_watch_refresh] GCP project/topic unset — refusing to refresh"
+        )
+        return
+
+    from app.db.database import async_session_maker
+    from app.db.models import ConnectorIdentity
+    from app.services.gmail_pubsub import refresh_watch, GmailWatchError
+    from sqlalchemy import select
+
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(ConnectorIdentity.user_id, ConnectorIdentity.provider_account_id)
+            .where(
+                ConnectorIdentity.connector_id == "gmail",
+                ConnectorIdentity.status == "active",
+            )
+        )).all()
+
+    refreshed = 0
+    failed = 0
+    skipped_no_token = 0
+    for user_id, email in rows:
+        try:
+            handle = await refresh_watch(user_id)
+        except GmailWatchError as e:
+            msg = str(e)
+            if "no active gmail identity" in msg:
+                skipped_no_token += 1
+                continue
+            failed += 1
+            logger.warning(
+                "[gmail_watch_refresh] user=%s email=%s err=%s",
+                str(user_id)[:8], email or "", msg[:200],
+            )
+            continue
+        except Exception as e:
+            failed += 1
+            logger.exception(
+                "[gmail_watch_refresh] crash user=%s err=%s",
+                str(user_id)[:8], e,
+            )
+            continue
+        refreshed += 1
+        logger.info(
+            "[gmail_watch_refresh] ok user=%s history_id=%s expires_ms=%d",
+            str(user_id)[:8], handle.history_id, handle.expiration_unix_ms,
+        )
+
+    logger.info(
+        "[gmail_watch_refresh] complete refreshed=%d failed=%d skipped=%d total=%d",
+        refreshed, failed, skipped_no_token, len(rows),
+    )
+
+
 def setup_scheduler(
     decay_interval_hours: int = 6,
     consolidation_interval_hours: int = 24,
@@ -872,6 +960,20 @@ def setup_scheduler(
         trigger=CronTrigger(hour=5, minute=30),
         id="abandoned_onboarding_reaper",
         name="Abandoned Onboarding Reaper (Phase-2 prewarm cost cap)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Gmail watch refresh — daily at 4:45 UTC, before the reapers.
+    # Re-arms every active Gmail connector_identity's `users.watch`
+    # so the 7-day expiration never causes a notification gap. No-op
+    # when the triggers feature flag is off. See
+    # docs/runbooks/gmail-pubsub.md §4.1 for the manual recovery path.
+    scheduler.add_job(
+        run_gmail_watch_refresh,
+        trigger=CronTrigger(hour=4, minute=45),
+        id="gmail_watch_refresh",
+        name="Gmail Watch Refresh (pre-7d-expiration re-arm)",
         replace_existing=True,
         misfire_grace_time=3600,
     )
