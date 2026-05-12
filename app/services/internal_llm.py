@@ -230,6 +230,7 @@ async def _system_call_openai(
     prepended to messages — OpenAI uses an in-band 'system' role, not a
     separate field like Anthropic."""
     from app.services.model_resolver import (
+        is_reasoning_model,
         supports_custom_temperature,
         uses_max_completion_tokens,
     )
@@ -242,6 +243,7 @@ async def _system_call_openai(
 
     chat_messages = [{"role": "system", "content": system}] + list(messages)
     token_kwarg = "max_completion_tokens" if uses_max_completion_tokens(model) else "max_tokens"
+    is_reasoning = is_reasoning_model(model)
 
     if _bundle_active():
         try:
@@ -259,23 +261,55 @@ async def _system_call_openai(
                 token_kwarg: max_tokens,
                 "timeout": timeout,
             }
+            # Reasoning models (gpt-5.x, o-series) silently spend output
+            # budget on hidden chain-of-thought BEFORE the visible answer.
+            # For a summarisation job there's nothing to think hard about
+            # — pin `reasoning_effort="low"` so the budget is reserved
+            # for the actual summary. Without this, a 13k-token email
+            # input on gpt-5.5 with max_completion_tokens=1200 spent the
+            # entire 1200 on reasoning and returned empty content — caller
+            # saw `llm_returned_none` even though the HTTP call succeeded.
+            # ("low" not "minimal" — gpt-5.5 only accepts
+            # {none, low, medium, high, xhigh}; "low" is the smallest
+            # universally-supported value.)
+            if is_reasoning:
+                kwargs["reasoning_effort"] = "low"
             # gpt-5.x / reasoning models reject explicit temperature.
-            # We never need a non-default temperature for system ops.
-            if supports_custom_temperature(model):
-                # Default is 1.0 anyway — omit unless we actually want to
-                # tune it. Keeps the request minimal and avoids "Unsupported
-                # parameter" 400s on the reasoning family.
-                pass
+            # We never need a non-default temperature for system ops, so
+            # we just omit it entirely (default is 1.0) — safer than
+            # branching per-model.
             resp = await client.chat.completions.create(**kwargs)
             usage = getattr(resp, "usage", None)
+            reasoning_tokens = 0
             if usage is not None:
                 input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
                 output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                # Surface reasoning portion if the SDK exposed it — lets
+                # ops spot future truncation early.
+                details = getattr(usage, "completion_tokens_details", None)
+                if details is not None:
+                    reasoning_tokens = int(getattr(details, "reasoning_tokens", 0) or 0)
             choices = getattr(resp, "choices", None) or []
+            finish_reason = None
             if choices:
+                finish_reason = getattr(choices[0], "finish_reason", None)
                 msg = getattr(choices[0], "message", None)
                 if msg is not None:
                     text = (getattr(msg, "content", None) or "").strip() or None
+            # Empty content + non-zero output_tokens almost always means
+            # the reasoning budget ate everything. Surface that loudly so
+            # we don't return a misleading None up to the caller without
+            # an obvious log signature for triage.
+            if text is None and output_tokens > 0:
+                logger.warning(
+                    "[internal_llm] OpenAI returned empty text op=%s model=%s "
+                    "finish=%s out_tokens=%d reasoning_tokens=%d — likely "
+                    "reasoning consumed the budget; raise max_tokens or set "
+                    "reasoning_effort='minimal'",
+                    operation_type, model, finish_reason,
+                    output_tokens, reasoning_tokens,
+                )
+                status = "empty_output"
         except Exception as e:
             status = "error"
             logger.warning(

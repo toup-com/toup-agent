@@ -245,6 +245,24 @@ def uses_max_completion_tokens(model: str | None) -> bool:
     return False
 
 
+def is_reasoning_model(model: str | None) -> bool:
+    """True for OpenAI models that do internal chain-of-thought reasoning
+    (o-series + gpt-5 family).
+
+    These models silently spend output-token budget on hidden reasoning
+    tokens BEFORE emitting any visible text. Burned the routine path: a
+    13k-token email summary with `max_completion_tokens=1200` exhausted
+    its entire budget on reasoning and returned an empty `message.content`
+    — the call logged status=ok with 1200 output tokens but zero visible
+    output. Callers running cheap summarisation jobs should pass
+    `reasoning_effort="minimal"` to keep the reasoning portion tiny and
+    leave the budget for the actual summary."""
+    if not model:
+        return False
+    m = model.lower()
+    return m.startswith(("o1", "o3", "o4", "gpt-5"))
+
+
 # ── OAuth token detection ─────────────────────────────────────────────
 
 

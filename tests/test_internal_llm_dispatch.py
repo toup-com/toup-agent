@@ -290,6 +290,95 @@ async def test_openai_system_prompt_goes_into_messages(bundle_settings):
 
 
 @pytest.mark.asyncio
+async def test_gpt5_passes_reasoning_effort_low(bundle_settings):
+    """Reasoning models silently spend output-token budget on hidden
+    chain-of-thought. For a system-op summarisation there's nothing to
+    reason hard about — we must pin `reasoning_effort="low"` so the
+    visible-output budget isn't eaten. Real production failure: a 13k-
+    token email summary on gpt-5.5 hit the 1200-token cap entirely
+    inside the reasoning step and returned empty content."""
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = AsyncMock(return_value=_openai_response("ok"))
+
+    with patch("app.services.bundle_client.make_openai_client", return_value=fake_client):
+        from app.services.internal_llm import call_system_llm
+        await call_system_llm(
+            user_id="u",
+            operation_type="system.test",
+            max_tokens=1200,
+            system="x",
+            messages=[{"role": "user", "content": "y"}],
+            model="gpt-5.5",
+        )
+
+    kwargs = fake_client.chat.completions.create.call_args.kwargs
+    assert kwargs["reasoning_effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_non_reasoning_openai_omits_reasoning_effort(bundle_settings):
+    """gpt-4o doesn't accept reasoning_effort — passing it would 400.
+    Only reasoning models (gpt-5.x, o-series) get the flag."""
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = AsyncMock(return_value=_openai_response("ok"))
+
+    with patch("app.services.bundle_client.make_openai_client", return_value=fake_client):
+        from app.services.internal_llm import call_system_llm
+        await call_system_llm(
+            user_id="u",
+            operation_type="system.test",
+            max_tokens=1200,
+            system="x",
+            messages=[{"role": "user", "content": "y"}],
+            model="gpt-4o-mini",
+        )
+
+    kwargs = fake_client.chat.completions.create.call_args.kwargs
+    assert "reasoning_effort" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_empty_content_with_nonzero_output_logs_warning(bundle_settings, caplog):
+    """When a reasoning model burns through its budget without emitting
+    visible text, we must log a clear warning so triage isn't blind."""
+    import logging
+
+    # Build a response where content is empty but output_tokens > 0
+    block = MagicMock()
+    block.message = MagicMock(content="")
+    block.finish_reason = "length"
+    resp = MagicMock()
+    resp.choices = [block]
+    resp.usage = MagicMock(
+        prompt_tokens=10,
+        completion_tokens=1200,
+        completion_tokens_details=MagicMock(reasoning_tokens=1200),
+    )
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = AsyncMock(return_value=resp)
+    caplog.set_level(logging.WARNING, logger="app.services.internal_llm")
+
+    with patch("app.services.bundle_client.make_openai_client", return_value=fake_client):
+        from app.services.internal_llm import call_system_llm
+        text = await call_system_llm(
+            user_id="u",
+            operation_type="system.test",
+            max_tokens=1200,
+            system="x",
+            messages=[{"role": "user", "content": "y"}],
+            model="gpt-5.5",
+        )
+
+    assert text is None  # contract: empty content surfaces as None
+    truncation_logs = [
+        r for r in caplog.records
+        if "reasoning consumed the budget" in r.getMessage()
+    ]
+    assert truncation_logs, "expected an operator-visible warning when reasoning ate the budget"
+
+
+@pytest.mark.asyncio
 async def test_anthropic_system_prompt_is_separate_kwarg(bundle_settings):
     """Mirror of the above — Anthropic takes `system` as a top-level
     parameter, not in messages."""
