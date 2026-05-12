@@ -255,13 +255,30 @@ class RoutineRunner:
 
     async def _register_trigger_for(self, routine) -> str:
         """Register one routine's trigger. Returns a tag string for
-        observability: 'ok' | 'utc_fallback' | 'invalid_cron' | 'invalid_kind'.
+        observability: 'ok' | 'utc_fallback' | 'invalid_cron' |
+        'invalid_kind' | 'missing_tz'.
 
         Async because we must resolve the user's IANA timezone from the
         DB before building the CronTrigger — a `0 7 * * *` schedule for a
         Toronto user has to fire at 07:00 local, not 07:00 UTC.
+
+        When the user has no stored timezone we log loudly and SKIP
+        registration. Falling back to UTC silently was the 2026-05-12
+        production bug: a Toronto user's "fire at 1:21 PM" landed as
+        1:21 PM UTC = 9:21 AM Toronto. A missed registration is a
+        better failure mode than a misfire at the wrong hour — the
+        operator sees the log, the routine reactivates the moment the
+        user's tz is captured + the runner reloads.
         """
         tz_str = await self._user_tz_async(routine.user_id)
+        if not tz_str:
+            logger.error(
+                "[routine_runner] missing_tz routine_id=%s user=%s — "
+                "skipping registration. User must set timezone before "
+                "routines can fire at the right local time.",
+                routine.id, routine.user_id,
+            )
+            return "missing_tz"
         tz, fellback = _resolve_tz(tz_str, routine.user_id)
         trigger = _parse_cron(routine.schedule_cron_local, tz)
         if trigger is None:

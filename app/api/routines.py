@@ -22,7 +22,7 @@ from typing import Any, Optional
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 
 
 router = APIRouter(prefix="/routines", tags=["routines"])
@@ -294,9 +294,34 @@ async def create_routine(req: RoutineCreate):
         )
 
     from app.db.database import async_session_maker
-    from app.db.models import Routine
+    from app.db.models import Routine, User
 
     user_id = _user_id()
+
+    # Fail loudly when User.timezone is missing — routines without a tz
+    # silently fall back to UTC inside `_resolve_tz`, so a user who said
+    # "fire at 1:21 PM" would get a fire at 1:21 PM UTC (= 9:21 AM
+    # Toronto during EDT). Recent auth commits (`f62ae3a` silent
+    # browser-Intl capture, `2d1e14c` location-share refinement) cover
+    # new sign-ins, but legacy users without a captured tz must set
+    # one before scheduling work — a UTC misfire is a worse UX than a
+    # clear "set your timezone" prompt.
+    async with async_session_maker() as db:
+        user = await db.get(User, user_id)
+    if user is None or not getattr(user, "timezone", None):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "missing_timezone",
+                "message": (
+                    "Your timezone isn't set, so we can't schedule "
+                    "this routine to fire at the right local time. "
+                    "Open the chat once more (we'll capture it from "
+                    "your browser) or set it manually in account "
+                    "settings, then try again."
+                ),
+            },
+        )
     async with async_session_maker() as db:
         # One-active-per-kind enforcement is preserved for preset kinds
         # (email_briefing → one Gmail briefing per user). For the generic
@@ -375,6 +400,11 @@ async def update_routine(routine_id: str, req: RoutineUpdate):
 
         _kind_enabled_or_404(routine.kind)
 
+        schedule_changed = (
+            req.schedule_cron_local is not None
+            and req.schedule_cron_local != routine.schedule_cron_local
+        )
+
         if req.schedule_cron_local is not None:
             routine.schedule_cron_local = req.schedule_cron_local
         if req.enabled is not None:
@@ -393,6 +423,29 @@ async def update_routine(routine_id: str, req: RoutineUpdate):
         if req.prompt_text is not None:
             routine.prompt_text = (req.prompt_text or "").strip() or None
         routine.updated_at = datetime.utcnow()
+
+        # When the user moves the schedule mid-day (the 2026-05-12 case:
+        # 8 AM briefing failed → user moved it to 1:21 PM, then the new
+        # fire would have been blocked by the idempotency UNIQUE on
+        # (routine_id, scheduled_for_local_date)), clear any
+        # FAILED/SKIPPED run rows for today's local date so the new
+        # cron tick can claim a fresh row. We do NOT touch successful
+        # runs — those represent real work the user already received.
+        # Running rows are also left alone (race-safe).
+        if schedule_changed:
+            from app.agent.routines.runner import _resolve_tz
+            from app.db.models import RoutineRun, User as _User
+            user = await db.get(_User, user_id)
+            tz, _ = _resolve_tz(getattr(user, "timezone", None), user_id)
+            local_today = datetime.now(tz).date()
+            await db.execute(
+                delete(RoutineRun).where(
+                    RoutineRun.routine_id == routine.id,
+                    RoutineRun.scheduled_for_local_date == local_today,
+                    RoutineRun.status.in_(("failed", "skipped_reauth")),
+                )
+            )
+
         await db.commit()
         await db.refresh(routine)
 
@@ -462,14 +515,27 @@ async def force_run(routine_id: str):
         )
         prior = existing.scalar_one_or_none()
         if prior is not None:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": "Today's run already exists for this routine.",
-                    "run_id": prior.id,
-                    "status": prior.status,
-                },
-            )
+            # Re-run policy: if today's prior run ended in a recoverable
+            # terminal state (failed, skipped_reauth), the user explicitly
+            # asking to re-run is a retry — drop the prior row so the
+            # idempotency claim in `_fire` succeeds with a fresh row. We
+            # KEEP success rows (don't double-deliver to Telegram /
+            # WhatsApp) and KEEP running rows (race-safe — another
+            # request is already mid-fire).
+            if prior.status in ("failed", "skipped_reauth"):
+                await db.execute(
+                    delete(RoutineRun).where(RoutineRun.id == prior.id)
+                )
+                await db.commit()
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Today's run already exists for this routine.",
+                        "run_id": prior.id,
+                        "status": prior.status,
+                    },
+                )
 
     if _runner is None:
         raise HTTPException(status_code=503, detail="Routine runner not started")

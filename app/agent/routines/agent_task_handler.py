@@ -94,6 +94,18 @@ class AgentTaskHandler:
                 # Don't propagate to other channels — this is a scheduled
                 # background turn, not an inbound user message.
                 telegram_chat_id=None,
+                # CRITICAL — do NOT persist the routine's prompt_text as
+                # a user Message in the day-chat. Pre-2026-05-12 the
+                # runner saved every `user_message=` with role="user"
+                # by default, which made the SYSTEM-generated routine
+                # prompt ("Every day at 1:21 PM Toronto time, fetch the
+                # user's latest 5 Gmail messages…") appear in chat as
+                # if the user had typed it. The user never wrote that
+                # text — it's the routine's internal instruction, not
+                # conversational content. The assistant's reply still
+                # saves (channel=routine), which is what the user
+                # actually wants to see.
+                save_user_message=False,
             )
         except Exception as e:
             logger.exception(
