@@ -66,16 +66,8 @@ RUN useradd -m -u 1000 toup && \
     chown -R toup:toup /app
 
 # ─── Stage 2b: prod_deps ───────────────────────────────────────────
-# Full pip install for prod. Adds Node.js + @anthropic-ai/claude-code
-# globally for the experimental Toup Code feature (/code/*). Pinned
-# Node 20 LTS via NodeSource; install adds ~110 MB to the prod image.
-# If the experiment is killed, drop this RUN block to reclaim space.
+# Full pip install for prod. Unchanged behavior from pre-split.
 FROM base AS prod_deps
-
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y nodejs && \
-    rm -rf /var/lib/apt/lists/* && \
-    npm install -g --no-audit --no-fund @anthropic-ai/claude-code
 
 COPY backend/requirements.docker.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
