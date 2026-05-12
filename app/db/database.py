@@ -466,6 +466,13 @@ async def init_db():
         # NL prompt for `kind='agent_task'`. Nullable for existing rows.
         "ALTER TABLE routines ADD COLUMN IF NOT EXISTS name VARCHAR(100)",
         "ALTER TABLE routines ADD COLUMN IF NOT EXISTS prompt_text TEXT",
+        # Triggers (event-driven automations — Gate T1). `triggers` and
+        # `trigger_events` tables are created by Base.metadata.create_all
+        # on fresh containers; these ALTERs ensure idempotent re-runs on
+        # containers that were spun up before any later schema additions
+        # land. Empty for v1 — listed here so the migration path is
+        # obvious when we add columns later.
+        # (Reserved space; no v1 ALTERs needed beyond create_all.)
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

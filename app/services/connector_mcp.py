@@ -382,6 +382,7 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
         # identities pass through unfiltered — the dispatcher returns
         # the structured error, which the LLM surfaces to the user.
         filtered = []
+        dropped_owners: set[str] = set()
         for tool in tools:
             owner = self._registry.get_owner(tool.name)
             if owner is None:
@@ -393,6 +394,7 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
                 # `revoked`) — drop. Agent's system prompt covers
                 # "tell the user to connect if they ask for an
                 # un-connected service".
+                dropped_owners.add(owner)
                 continue
             status, read_only = visible_by_connector[owner]
             if status == "active" and read_only:
@@ -402,6 +404,50 @@ class ConnectorToolFilterMiddleware(_FastMCPMiddleware):
                 if spec is not None and spec.mutates:
                     continue
             filtered.append(tool)
+
+        # Observability: when a user has an ACTIVE identity for a
+        # connector but ALSO sees zero filtered tools for that
+        # connector, that's a smell — the most common cause was the
+        # pre-2026-05-12 `list_active` bug where reauth_required
+        # identities were dropped. The bug is fixed but the SAME
+        # symptom can recur from a future regression (registry stale
+        # cache, manifest tool-spec drift, etc.). Loud structured log
+        # so a future production incident is one grep away from a
+        # root cause, instead of an "I don't know why Gmail is gone"
+        # session like the 2026-05-12 one.
+        active_connectors = {
+            cid for cid, (status, _) in visible_by_connector.items()
+            if status == "active"
+        }
+        filtered_owners = {
+            self._registry.get_owner(t.name)
+            for t in filtered
+            if self._registry.get_owner(t.name)
+        }
+        missing_for_active = active_connectors - filtered_owners
+        if missing_for_active:
+            # User-id hashed to first 8 chars in the log; raw is PII.
+            import hashlib
+            uh = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:8]
+            logger.warning(
+                "[connector_mcp] tools/list filtered to ZERO tools for "
+                "%d active connector(s) — user=%s connectors=%s. "
+                "Agent will fall back to 'tool not exposed' for these. "
+                "Likely registry stale or manifest drift.",
+                len(missing_for_active), uh, sorted(missing_for_active),
+            )
+            try:
+                from app.services import connector_metrics as _m
+                # Bounded labels: connector id from the registry, no
+                # user_id (hashed only in logs).
+                for cid in missing_for_active:
+                    _m.inc(
+                        getattr(_m, "M_MCP_FILTER_EMPTY", "mcp_filter_empty_total"),
+                        labels={"connector": cid},
+                    )
+            except Exception:
+                # Metrics MUST NEVER affect tool dispatch.
+                pass
 
         return filtered
 

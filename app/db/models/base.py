@@ -90,6 +90,13 @@ AGENT_ONLY_TABLES: set[str] = {
     # in Mission Control reads via authenticated API, not direct DB query.
     "routines",
     "routine_runs",
+    # Event-driven automations (Gmail Pub/Sub etc.). Platform-side
+    # webhook authenticates the Pub/Sub push and dispatches an envelope
+    # to the user's per-tenant agent container via the bridge; the
+    # agent owns the trigger config + event audit trail. Tokens never
+    # leave the platform — same isolation guarantee as Routines.
+    "triggers",
+    "trigger_events",
     # WhatsApp Cloud API webhook dedupe (agent-side; survives container
     # restarts so Meta retries within a 7-day window cannot re-run the LLM)
     "whatsapp_inbound_dedupe",

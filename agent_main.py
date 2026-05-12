@@ -63,6 +63,10 @@ from app.api.whatsapp_qr import router as whatsapp_qr_router
 # it as an env var at docker run.
 from app.api.admin_pool import router as admin_pool_router
 from app.api.routines import router as routines_router, set_runner_ref as set_routines_runner_ref
+# Triggers inbound (Gate T1) — platform-side webhook dispatches here.
+# No runner yet (Gate T2). Same X-Agent-Key contract as other authed
+# agent endpoints; defence-in-depth user_id check inside the handler.
+from app.api.triggers_inbound import router as triggers_inbound_router
 from app.services import runtime_identity, drain_state
 
 _app_start_time = None
@@ -1463,6 +1467,10 @@ app.include_router(admin_pool_router, prefix=settings.api_prefix)
 # Routines (system-managed scheduled actions — email briefing, etc.).
 # Gate 1 ships /api/routines/_runner_status only; full CRUD lands in Gate 3.
 app.include_router(routines_router, prefix=settings.api_prefix)
+
+# Triggers — event-driven automations (Gmail Pub/Sub, etc.).
+# Gate T1 ships /api/triggers/inbound only; runner + CRUD land in T2/T3.
+app.include_router(triggers_inbound_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients
 try:

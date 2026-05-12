@@ -40,6 +40,8 @@ from app.api.checkout import router as checkout_router
 from app.api.llm_setup import router as llm_setup_router
 # Generated-file attachments (Phase 2 of doc-delivery)
 from app.api.files import router as files_router
+# Chrome extension pairing + WS bridge
+from app.api.extension import router as extension_router
 
 # Global start time for uptime tracking
 _app_start_time = None
@@ -434,6 +436,12 @@ app.include_router(graph_router, prefix=settings.api_prefix)  # Entity graph API
 app.include_router(feedback_router, prefix=settings.api_prefix)  # Phase 5: Retrieval feedback
 app.include_router(models_router, prefix=settings.api_prefix)    # GET /api/models — model registry
 app.include_router(webhooks_router, prefix=settings.api_prefix)  # Webhook triggers
+# Gmail Pub/Sub push receiver — POST /api/v1/webhooks/gmail. Verifies
+# Google-signed JWT, fetches history delta with platform-side token,
+# dispatches new message-ids to the user's tenant agent container.
+# Production endpoint for Gate T1 (Triggers).
+from app.api.webhooks_gmail_pubsub import router as gmail_pubsub_router
+app.include_router(gmail_pubsub_router, prefix=settings.api_prefix)
 # Chat
 app.include_router(sessions_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
@@ -450,6 +458,8 @@ app.include_router(checkout_router, prefix=settings.api_prefix)
 app.include_router(llm_setup_router, prefix=settings.api_prefix)
 # Generated-file attachments
 app.include_router(files_router, prefix=settings.api_prefix)
+# Chrome extension — pairing routes (platform) + /ws/extension (agent)
+app.include_router(extension_router, prefix=settings.api_prefix)
 
 
 

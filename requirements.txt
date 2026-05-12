@@ -52,6 +52,12 @@ pillow>=11.1.0
 
 # Auth & Security
 python-jose[cryptography]==3.3.0
+# PyJWT — used by the Gmail Pub/Sub webhook verifier (PyJWKClient
+# pulls Google's signing certs and validates RS256 push tokens).
+# Already transitively present via fastapi-mcp; we pin explicitly so
+# dependency drift can't silently downgrade it below the PyJWKClient
+# feature set (added in 2.5.0).
+pyjwt[crypto]>=2.8.0
 passlib[bcrypt]==1.7.4
 pydantic[email]>=2.7.2,<3.0.0
 pydantic-settings>=2.5.2

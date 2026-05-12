@@ -46,6 +46,12 @@ from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig
 # Routines (system-managed scheduled actions — email briefing, etc.)
 from .routine import Routine, RoutineRun
 
+# Triggers (event-driven automations — Gmail Pub/Sub, etc.)
+from .trigger import (
+    Trigger, TriggerEvent,
+    TRIGGER_KINDS, TRIGGER_ACTIONS, TRIGGER_STATUSES, TRIGGER_EVENT_STATUSES,
+)
+
 # Soul config
 from .soul_config import SoulConfig
 
@@ -117,6 +123,8 @@ __all__ = [
     "App", "BuildJob", "BuildUsage", "ReconciliationLog",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig",
     "Routine", "RoutineRun",
+    "Trigger", "TriggerEvent",
+    "TRIGGER_KINDS", "TRIGGER_ACTIONS", "TRIGGER_STATUSES", "TRIGGER_EVENT_STATUSES",
     "SoulConfig",
     "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord", "LLMProxyEvent", "PlatformSetting",
     "Rollout", "RolloutAttempt",

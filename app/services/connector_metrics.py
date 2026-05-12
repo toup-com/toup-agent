@@ -154,3 +154,8 @@ M_OAUTH_CALLBACKS = "connector_oauth_callbacks_total"
 M_REFRESH = "connector_refresh_total"
 M_HEALTH_PROBES = "connector_health_probes_total"
 M_DISPATCH_LATENCY = "connector_dispatch_latency_ms"
+# Incremented when the MCP filter hides all tools for a connector the
+# user has an ACTIVE identity for. Production smell — same shape as
+# the 2026-05-12 "Gmail tool isn't exposed" incident. Operator alert
+# on any non-zero rate (this should be 0 in steady state).
+M_MCP_FILTER_EMPTY = "connector_mcp_filter_empty_total"

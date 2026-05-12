@@ -326,6 +326,34 @@ class Settings(BaseSettings):
     google_oauth_client_id: str = ""
     google_oauth_client_secret: str = ""
 
+    # ── Gmail Pub/Sub triggers (Gate T1) ─────────────────────
+    # GCP project that owns the Pub/Sub topic. The fully-qualified
+    # topic name is `projects/{gcp_project}/topics/{pubsub_topic}` —
+    # we assemble it from these two so the operator can rotate either
+    # piece without surgery on the config.
+    # Empty when the trigger system isn't provisioned yet; the
+    # platform webhook returns 503 in that state (fail-closed —
+    # never silently accepts an unsigned push).
+    gcp_project: str = ""
+    pubsub_topic: str = ""
+    # The `aud` claim Google embeds in the push-subscription JWT.
+    # In the standard setup this is the full webhook URL
+    # (https://toup.ai/api/v1/webhooks/gmail). The webhook rejects
+    # any push whose `aud` doesn't match — without this, anyone who
+    # can forge a JWT signed by Google's keys for any audience could
+    # reach our endpoint.
+    pubsub_push_audience: str = ""
+    # Service-account email Google signs the push JWT as. Match
+    # against the `email` claim. Leave empty during dev to skip the
+    # signer check (relies on JWT signature alone) — flip on for
+    # prod.
+    pubsub_push_signer: str = ""
+    # Per-tenant kill switch for the email_received trigger kind.
+    # Set false to silently drop incoming Pub/Sub pushes (the
+    # webhook still 200s — Pub/Sub stops retrying — but no agent
+    # dispatch happens). Mirrors the routine flag pattern.
+    triggers_email_enabled: bool = True
+
     # T4a — GitHub OAuth client. PKCE off (provider doesn't support
     # it on the standard OAuth app type — see provider_apps.py).
     github_oauth_client_id: str = ""
