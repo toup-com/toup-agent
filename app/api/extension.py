@@ -152,27 +152,66 @@ def _public_base_url() -> str:
 EXT_TOKEN_TTL_S = 90 * 24 * 3600  # 90 days
 
 
-def _mint_extension_token(user_id: str) -> Dict[str, Any]:
-    """Mint a JWT carrying scope=extension, signed with the platform secret."""
+def _mint_extension_token(user_id: str, agent_api_key: str) -> Dict[str, Any]:
+    """Mint a long-lived JWT carrying scope=extension, signed with the
+    *user's agent_api_key* (same secret the chat session token uses).
+
+    Why agent_api_key, not settings.jwt_secret: the extension's chat-ws
+    connects to `/api/ws/chat` on the agent, which validates with
+    `settings.agent_api_key` + audience "toup-agent-session" + issuer
+    "toup-platform". Minting with the same scheme means one token works
+    on both `/ws/extension` and `/ws/chat` — and matches the existing
+    per-user agent-key topology (each tenant already has its key set
+    at bind time, so no new secret distribution is needed).
+    """
+    if not agent_api_key:
+        raise HTTPException(409, "user has no provisioned agent yet")
     now = int(time.time())
     payload = {
         "sub":   user_id,
+        "iss":   "toup-platform",
+        "aud":   "toup-agent-session",
         "scope": "extension",
         "jti":   secrets.token_hex(16),
         "iat":   now,
         "exp":   now + EXT_TOKEN_TTL_S,
     }
-    token = jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    token = jwt.encode(payload, agent_api_key, algorithm="HS256")
     return {"token": token, "issued_at": now, "expires_in": EXT_TOKEN_TTL_S}
 
 
 def _decode_extension_token(token: str) -> Optional[Dict[str, Any]]:
+    """Validate the extension token on the agent side. Uses the agent's
+    own `settings.agent_api_key` (which equals the platform's
+    `cfg.agent_api_key` for this user — bound at deploy time).
+    """
+    if not token:
+        return None
+    secret = (settings.agent_api_key or "").strip()
+    if not secret:
+        logger.warning("[extension] agent_api_key not configured — cannot validate token")
+        return None
     try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        payload = jwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+            audience="toup-agent-session",
+            issuer="toup-platform",
+        )
     except JWTError as exc:
-        logger.debug("[extension] token decode failed: %s", exc)
+        logger.warning("[extension] token decode failed: %s", exc)
         return None
     if payload.get("scope") != "extension":
+        logger.warning("[extension] token has wrong scope: %r", payload.get("scope"))
+        return None
+    # Defense in depth: token must be for the bound user.
+    sub = payload.get("sub")
+    if settings.user_id and sub != settings.user_id:
+        logger.warning(
+            "[extension] token user mismatch: token=%s bound=%s",
+            (sub or "?")[:8], (settings.user_id or "?")[:8],
+        )
         return None
     return payload
 
@@ -180,6 +219,21 @@ def _decode_extension_token(token: str) -> Optional[Dict[str, Any]]:
 # ─────────────────────────────────────────────────────────────────────
 # Pairing endpoints
 # ─────────────────────────────────────────────────────────────────────
+async def _agent_config_for(user_id: str) -> Optional[AgentConfig]:
+    """Look up the user's active agent config (URL + api_key)."""
+    try:
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(AgentConfig).where(
+                    AgentConfig.user_id == user_id,
+                    AgentConfig.deploy_status == "active",
+                )
+            )
+            return result.scalar_one_or_none()
+    except Exception:
+        return None
+
+
 async def _agent_ws_url_for(user_id: str) -> Optional[str]:
     """Return the wss:// URL of the user's agent /api/ws/extension."""
     try:
@@ -289,8 +343,16 @@ async def pair_approve(req: PairApproveReq, current_user=Depends(get_current_use
         raise HTTPException(409, f"code already {rec['status']}")
 
     user_id = current_user.id if hasattr(current_user, "id") else current_user["id"]
-    token_bundle = _mint_extension_token(user_id)
-    agent_ws_url = await _agent_ws_url_for(user_id) or ""
+    cfg = await _agent_config_for(user_id)
+    if not cfg or not cfg.agent_api_key:
+        raise HTTPException(409, "user has no provisioned agent yet")
+    token_bundle = _mint_extension_token(user_id, cfg.agent_api_key)
+    agent_ws_url = ""
+    if cfg.agent_url:
+        agent_ws_url = (
+            cfg.agent_url.replace("https://", "wss://").replace("http://", "ws://")
+            .rstrip("/") + "/api/ws/extension"
+        )
 
     async with _pair_lock:
         rec["status"] = "approved"
@@ -318,8 +380,16 @@ async def pair_issue(req: PairInitReq, current_user=Depends(get_current_user)) -
     chrome.runtime.sendMessage(extensionId, ...).
     """
     user_id = current_user.id if hasattr(current_user, "id") else current_user["id"]
-    bundle = _mint_extension_token(user_id)
-    agent_ws_url = await _agent_ws_url_for(user_id) or ""
+    cfg = await _agent_config_for(user_id)
+    if not cfg or not cfg.agent_api_key:
+        raise HTTPException(409, "user has no provisioned agent yet")
+    bundle = _mint_extension_token(user_id, cfg.agent_api_key)
+    agent_ws_url = ""
+    if cfg.agent_url:
+        agent_ws_url = (
+            cfg.agent_url.replace("https://", "wss://").replace("http://", "ws://")
+            .rstrip("/") + "/api/ws/extension"
+        )
     logger.info("[extension] direct-issue token for %s device=%r", user_id, req.device_name)
     return {
         "access_token": bundle["token"],
