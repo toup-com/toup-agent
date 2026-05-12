@@ -323,13 +323,37 @@ async def update_profile(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update user profile (name)."""
-    if body.name is not None:
+    """Update user profile (name, timezone).
+
+    Timezone updates are silent: frontend captures the OS-resolved IANA
+    name via `Intl` on app boot and PATCHes here. We validate against
+    zoneinfo and no-op the write if the value already matches — so the
+    boot-time call is cheap and idempotent.
+    """
+    changed = False
+    if body.name is not None and body.name != current_user.name:
         current_user.name = body.name
+        changed = True
+    if body.timezone is not None and body.timezone != current_user.timezone:
+        # Validate IANA name. zoneinfo is stdlib (3.9+); raises
+        # ZoneInfoNotFoundError for typos / spoofed values.
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(body.timezone)
+        except ZoneInfoNotFoundError:
+            raise HTTPException(status_code=400, detail="Invalid timezone")
+        current_user.timezone = body.timezone
+        changed = True
+    if changed:
         current_user.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(current_user)
-    return {"id": current_user.id, "email": current_user.email, "name": current_user.name}
+        await db.commit()
+        await db.refresh(current_user)
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "name": current_user.name,
+        "timezone": current_user.timezone,
+    }
 
 
 # ── Change Password ──────────────────────────────────────────────

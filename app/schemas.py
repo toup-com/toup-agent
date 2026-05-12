@@ -154,6 +154,11 @@ class ChangePasswordRequest(BaseModel):
 
 class UpdateProfileRequest(BaseModel):
     name: Optional[str] = Field(None, max_length=255)
+    # IANA tz name (e.g. "America/Toronto"). Frontend captures this via
+    # `Intl.DateTimeFormat().resolvedOptions().timeZone` on app boot and
+    # PATCHes it silently — no UI, no permission popup. Server validates
+    # via zoneinfo.ZoneInfo and rejects unknown values.
+    timezone: Optional[str] = Field(None, max_length=50)
 
 
 class AdminResetPasswordRequest(BaseModel):
