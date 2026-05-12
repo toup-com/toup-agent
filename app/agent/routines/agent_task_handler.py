@@ -135,19 +135,26 @@ class AgentTaskHandler:
         """Fallback path — no tools, just a single LLM call. Works for
         pure text tasks ("daily haiku", "translate today's date to 5
         languages") and is always available even if the agent runner
-        couldn't be wired."""
+        couldn't be wired.
+
+        Routes through `call_system_llm` so the call honours the user's
+        active model (settings.agent_model) + bundle proxy when applicable.
+        Pre-refactor we hard-pinned `default_anthropic_model()` here,
+        which sent every GPT-5.5 user's fallback to Anthropic. Now the
+        provider follows the user's actual preference."""
         llm = self._llm_fn
         if llm is None:
-            from app.services.internal_llm import call_anthropic_system
-            llm = call_anthropic_system
+            from app.services.internal_llm import call_system_llm
+            llm = call_system_llm
 
-        from app.services.model_resolver import default_anthropic_model
-        model = default_anthropic_model()
+        # Per-routine model override (same contract as email_briefing).
+        cfg = routine.config_json or {}
+        model_override = (cfg.get("model") or "").strip() or None
 
         text = await llm(
             user_id=routine.user_id,
-            operation_type=f"system.routine.agent_task",
-            model=model,
+            operation_type="system.routine.agent_task",
+            model=model_override,
             max_tokens=2000,
             system=_DEFAULT_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
@@ -157,13 +164,14 @@ class AgentTaskHandler:
             return RoutineResult(
                 status="failed",
                 error_class="llm_returned_none",
-                error_detail="internal_llm returned None (timeout / auth / parse)",
+                error_detail="call_system_llm returned None (timeout / auth / parse)",
             )
 
+        from app.services.model_resolver import default_model
         return await self._persist_and_return(
             routine, db,
             content=text,
-            model_used=model,
+            model_used=model_override or default_model(),
             emails_fetched=0,
             metrics={"path": "internal_llm", "summary_chars": len(text)},
         )

@@ -41,11 +41,19 @@ from .base_handler import RoutineResult
 logger = logging.getLogger(__name__)
 
 
-# Conservative Haiku cap. 300-word target ≈ 400 tokens; ceiling at 1200
+# Conservative summary cap. 300-word target ≈ 400 tokens; ceiling at 1200
 # gives margin without inviting LLM ramble. Day-archival uses 1800 for a
 # longer summary; we're tighter.
-_HAIKU_MAX_TOKENS = 1200
-_HAIKU_MODEL = "claude-haiku-4-5-20251001"
+_SUMMARY_MAX_TOKENS = 1200
+
+# Pre-refactor we hard-pinned `claude-haiku-4-5-20251001` here. That was a
+# bug: bundle-mode tenants whose chat uses GPT-5.5 would suddenly find
+# their morning brief being written by an Anthropic model on credentials
+# the rest of the stack stopped renewing. The model now comes from the
+# `call_system_llm` resolver — same path the chat uses — with an optional
+# per-routine override via `routine.config_json.model` for power users
+# who genuinely want to pin "always Haiku, my brief is text-heavy" or
+# similar.
 
 # Gmail-side caps.
 _MAX_EMAILS_PER_BRIEFING = 50
@@ -230,11 +238,21 @@ class EmailBriefingHandler:
         if not emails:
             return await self._post_empty(routine, db)
 
-        # Summarize via Haiku.
+        # Summarize via the agent's active LLM. `call_system_llm` resolves
+        # provider + auth via `model_resolver` + `bundle_client` — same
+        # path the user's chat uses. Tests inject `self._llm_fn` to skip
+        # network; in prod we route through bundle when active.
         llm = self._llm_fn
         if llm is None:
-            from app.services.internal_llm import call_anthropic_system
-            llm = call_anthropic_system
+            from app.services.internal_llm import call_system_llm
+            llm = call_system_llm
+
+        # Per-routine model override — power users can pin a cheap model
+        # ("always Haiku for cost") or upgrade ("Sonnet for nuance") via
+        # `config_json.model`. Falls through to resolver default when
+        # unset (the common case).
+        cfg = routine.config_json or {}
+        model_override = (cfg.get("model") or "").strip() or None
 
         prompt_body = _format_emails_for_llm(emails)
         if fetched_count > len(emails):
@@ -243,8 +261,8 @@ class EmailBriefingHandler:
         summary_text = await llm(
             user_id=routine.user_id,
             operation_type=_OPERATION_TYPE,
-            model=_HAIKU_MODEL,
-            max_tokens=_HAIKU_MAX_TOKENS,
+            model=model_override,
+            max_tokens=_SUMMARY_MAX_TOKENS,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt_body}],
             timeout=60,
@@ -253,7 +271,7 @@ class EmailBriefingHandler:
             return RoutineResult(
                 status="failed",
                 error_class="llm_returned_none",
-                error_detail="internal_llm.call_anthropic_system returned None (timeout / auth / parse)",
+                error_detail="call_system_llm returned None (timeout / auth / parse)",
             )
 
         # Post the briefing.
@@ -265,6 +283,13 @@ class EmailBriefingHandler:
         else:
             broadcaster = None  # tests inject writer + skip broadcast
 
+        # `model_used` is best-effort metadata for the Message row — we
+        # echo the override when set, else the resolver default. The
+        # llm_proxy_events log captures the actually-used model and is
+        # the source of truth for billing.
+        from app.services.model_resolver import default_model
+        model_used_for_record = model_override or default_model()
+
         msg_id, day_chat_id = await writer(
             db,
             user_id=routine.user_id,
@@ -272,10 +297,10 @@ class EmailBriefingHandler:
             source=self.kind,
             routine_id=routine.id,
             title=f"Morning briefing — {datetime.utcnow().date().isoformat()}",
-            model_used=_HAIKU_MODEL,
-            # Token counts aren't returned by call_anthropic_system as a struct;
-            # the LLM-proxy log captures them. Leaving null on the Message row
-            # is consistent with day_archival.
+            model_used=model_used_for_record,
+            # Token counts aren't returned by call_system_llm as a struct;
+            # the LLM-proxy log captures them. Leaving null on the Message
+            # row is consistent with day_archival.
             tokens_prompt=None,
             tokens_completion=None,
         )
@@ -287,7 +312,7 @@ class EmailBriefingHandler:
                 day_chat_id=day_chat_id,
                 source=self.kind,
                 content=summary_text,
-                model_used=_HAIKU_MODEL,
+                model_used=model_used_for_record,
                 delivery_channels=parse_delivery_channels(routine.config_json),
                 routine_name=routine.name or "Morning email briefing",
             )

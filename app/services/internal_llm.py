@@ -1,20 +1,35 @@
 """
 Internal LLM helper — platform-side system operations (archival summaries,
-background jobs, etc.) that need to call Claude/GPT but can't route through
-the HTTP LLM proxy (no agent auth token available).
+background jobs, etc.) that need to call an LLM directly (no agent auth
+token available in this call site).
 
-Logs usage into llm_proxy_events with operation_type="system.*" so costs show
-up in operational dashboards but do NOT count toward the user's monthly/daily
-caps. See _get_spend() in app/api/llm_proxy.py for the exemption logic.
+Two-layer API:
 
-Usage:
-    text = await call_anthropic_system(
+  • call_system_llm()  — UNIFIED entry point. Resolves the active model
+    via model_resolver, picks the SDK + auth path automatically: bundle
+    proxy when the tenant is in bundle mode, direct API otherwise.
+    This is what new code should call.
+
+  • call_anthropic_system() / call_openai_system() — legacy direct-API
+    callers. Kept for backwards compatibility with day_summarizer and
+    any pre-existing caller that needed to pin a provider. New code
+    should NOT use these — they bypass bundle mode and silently break
+    on tenants whose chat works through the platform proxy.
+
+Logs usage into llm_proxy_events with operation_type="system.*" so costs
+show up in operational dashboards but do NOT count toward the user's
+monthly/daily caps. See _get_spend() in app/api/llm_proxy.py for the
+exemption logic.
+
+Usage (preferred):
+    text = await call_system_llm(
         user_id=user_id,
-        operation_type="system.day_archival",
-        model="claude-haiku-4-5-20251001",
+        operation_type="system.routine.email_briefing",
         max_tokens=1500,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
+        # model: optional — defaults to model_resolver.default_model()
+        # (i.e. settings.agent_model / AGENT_MODEL env var)
     )
 """
 
@@ -33,6 +48,388 @@ logger = logging.getLogger(__name__)
 
 _ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 _OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+
+# ── Unified entry point ──────────────────────────────────────────────
+
+
+async def call_system_llm(
+    *,
+    user_id: str,
+    operation_type: str,
+    max_tokens: int,
+    system: str,
+    messages: List[Dict[str, Any]],
+    model: Optional[str] = None,
+    timeout: int = 45,
+) -> Optional[str]:
+    """Call the active LLM for a system operation.
+
+    Resolves provider + auth automatically:
+      1. `model` argument wins (caller pin — e.g. per-routine override).
+      2. Else `model_resolver.default_model()` (settings.agent_model /
+         AGENT_MODEL env). This is what the user's main chat uses, so a
+         GPT-5.5 user gets GPT-5.5 in their routine too — no surprise
+         provider switch.
+      3. Provider is detected from the model id
+         (`is_claude_model` / `is_openai_model`).
+      4. If bundle mode is active (LLM_MODE=bundle + TOUP_TOKEN), the
+         call routes through `bundle_client.make_*_client()` →
+         {platform_api_url}/llm — same path the chat uses. Otherwise
+         falls back to the legacy direct-API helper.
+
+    Returns the text completion on success, None on failure. Failures
+    are logged but never raised — caller decides how to react.
+    """
+    if not operation_type.startswith("system."):
+        raise ValueError(
+            f"operation_type must start with 'system.' for internal calls (got {operation_type!r})"
+        )
+
+    from app.services.model_resolver import (
+        default_model,
+        is_claude_model,
+        is_openai_model,
+    )
+
+    resolved_model = (model or "").strip() or default_model()
+
+    # Classify provider. Unknown model id → treat as Claude (back-compat
+    # with legacy callers that passed dated Anthropic model strings).
+    is_openai = is_openai_model(resolved_model)
+    is_claude = is_claude_model(resolved_model) or not is_openai
+
+    if is_openai:
+        return await _system_call_openai(
+            user_id=user_id,
+            operation_type=operation_type,
+            model=resolved_model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+            timeout=timeout,
+        )
+    return await _system_call_anthropic(
+        user_id=user_id,
+        operation_type=operation_type,
+        model=resolved_model,
+        max_tokens=max_tokens,
+        system=system,
+        messages=messages,
+        timeout=timeout,
+    )
+
+
+def _bundle_active() -> bool:
+    """Re-evaluated each call (settings may flip at runtime when the
+    platform pushes new env via the bridge bind path)."""
+    return (
+        getattr(settings, "llm_mode", None) == "bundle"
+        and bool(getattr(settings, "toup_token", None))
+    )
+
+
+async def _system_call_anthropic(
+    *,
+    user_id: str,
+    operation_type: str,
+    model: str,
+    max_tokens: int,
+    system: str,
+    messages: List[Dict[str, Any]],
+    timeout: int,
+) -> Optional[str]:
+    """Anthropic dispatch — bundle SDK when active, else direct API.
+
+    Bundle path uses the same `make_anthropic_client()` the chat does,
+    so credentials + WAF-bypass headers stay in lockstep with the rest
+    of the agent. Single source of truth for "how does this agent reach
+    Anthropic" — we don't reimplement auth here."""
+    start = time.time()
+    status = "ok"
+    input_tokens = 0
+    output_tokens = 0
+    text: Optional[str] = None
+
+    if _bundle_active():
+        # SDK path — let bundle_client handle proxy URL, TOUP_TOKEN auth,
+        # WAF header rewriting. We just call .messages.create().
+        try:
+            from app.services.bundle_client import make_anthropic_client
+            client = make_anthropic_client()
+            if client is None:
+                logger.warning(
+                    "[internal_llm] bundle mode but make_anthropic_client returned None for op=%s",
+                    operation_type,
+                )
+                return None
+            resp = await client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+                timeout=timeout,
+            )
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+                output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            blocks = getattr(resp, "content", None) or []
+            if blocks:
+                first = blocks[0]
+                # SDK returns TextBlock objects; .text is the attr
+                text = getattr(first, "text", None) or None
+        except Exception as e:
+            status = "error"
+            logger.warning(
+                "[internal_llm] bundle Anthropic call failed for op=%s: %s: %s",
+                operation_type, type(e).__name__, str(e)[:300],
+            )
+    else:
+        # Legacy direct-API path. Same code as `call_anthropic_system`
+        # below — inlined here to keep one logging call per dispatch.
+        text, input_tokens, output_tokens, status = await _direct_anthropic(
+            operation_type=operation_type,
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+            timeout=timeout,
+        )
+
+    latency_ms = int((time.time() - start) * 1000)
+    cost_cents = _calc_cost_cents(model, input_tokens, output_tokens)
+    await _log_system_event(
+        user_id=user_id,
+        provider="anthropic",
+        model=model,
+        operation_type=operation_type,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_cents=cost_cents,
+        latency_ms=latency_ms,
+        status=status,
+    )
+    return text
+
+
+async def _system_call_openai(
+    *,
+    user_id: str,
+    operation_type: str,
+    model: str,
+    max_tokens: int,
+    system: str,
+    messages: List[Dict[str, Any]],
+    timeout: int,
+) -> Optional[str]:
+    """OpenAI dispatch — bundle SDK when active, else direct API.
+
+    Handles the gpt-5.x / o-series quirks centrally (max_completion_tokens
+    instead of max_tokens, no custom temperature). System prompt is
+    prepended to messages — OpenAI uses an in-band 'system' role, not a
+    separate field like Anthropic."""
+    from app.services.model_resolver import (
+        supports_custom_temperature,
+        uses_max_completion_tokens,
+    )
+
+    start = time.time()
+    status = "ok"
+    input_tokens = 0
+    output_tokens = 0
+    text: Optional[str] = None
+
+    chat_messages = [{"role": "system", "content": system}] + list(messages)
+    token_kwarg = "max_completion_tokens" if uses_max_completion_tokens(model) else "max_tokens"
+
+    if _bundle_active():
+        try:
+            from app.services.bundle_client import make_openai_client
+            client = make_openai_client()
+            if client is None:
+                logger.warning(
+                    "[internal_llm] bundle mode but make_openai_client returned None for op=%s",
+                    operation_type,
+                )
+                return None
+            kwargs: Dict[str, Any] = {
+                "model": model,
+                "messages": chat_messages,
+                token_kwarg: max_tokens,
+                "timeout": timeout,
+            }
+            # gpt-5.x / reasoning models reject explicit temperature.
+            # We never need a non-default temperature for system ops.
+            if supports_custom_temperature(model):
+                # Default is 1.0 anyway — omit unless we actually want to
+                # tune it. Keeps the request minimal and avoids "Unsupported
+                # parameter" 400s on the reasoning family.
+                pass
+            resp = await client.chat.completions.create(**kwargs)
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+                output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            choices = getattr(resp, "choices", None) or []
+            if choices:
+                msg = getattr(choices[0], "message", None)
+                if msg is not None:
+                    text = (getattr(msg, "content", None) or "").strip() or None
+        except Exception as e:
+            status = "error"
+            logger.warning(
+                "[internal_llm] bundle OpenAI call failed for op=%s: %s: %s",
+                operation_type, type(e).__name__, str(e)[:300],
+            )
+    else:
+        text, input_tokens, output_tokens, status = await _direct_openai(
+            operation_type=operation_type,
+            model=model,
+            max_tokens=max_tokens,
+            chat_messages=chat_messages,
+            token_kwarg=token_kwarg,
+            timeout=timeout,
+        )
+
+    latency_ms = int((time.time() - start) * 1000)
+    cost_cents = _calc_cost_cents(model, input_tokens, output_tokens)
+    await _log_system_event(
+        user_id=user_id,
+        provider="openai",
+        model=model,
+        operation_type=operation_type,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_cents=cost_cents,
+        latency_ms=latency_ms,
+        status=status,
+    )
+    return text
+
+
+async def _direct_anthropic(
+    *,
+    operation_type: str,
+    model: str,
+    max_tokens: int,
+    system: str,
+    messages: List[Dict[str, Any]],
+    timeout: int,
+) -> tuple[Optional[str], int, int, str]:
+    """BYOK direct-API Anthropic call. Returns (text, in_tokens, out_tokens, status).
+
+    Same auth + OAuth detection as the legacy `call_anthropic_system`,
+    factored out so the unified dispatcher can share it."""
+    api_key = (
+        getattr(settings, "platform_anthropic_api_key", None)
+        or settings.anthropic_api_key
+    )
+    if not api_key:
+        logger.warning("[internal_llm] No Anthropic key for op=%s", operation_type)
+        return None, 0, 0, "error"
+
+    is_oauth = isinstance(api_key, str) and api_key.startswith("sk-ant-oat")
+    if is_oauth:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+            "content-type": "application/json",
+        }
+    else:
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                _ANTHROPIC_URL,
+                headers=headers,
+                json={
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "system": system,
+                    "messages": messages,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                usage = data.get("usage", {})
+                blocks = data.get("content", [])
+                text = blocks[0].get("text") if blocks else None
+                return (
+                    text or None,
+                    int(usage.get("input_tokens", 0) or 0),
+                    int(usage.get("output_tokens", 0) or 0),
+                    "ok",
+                )
+            logger.warning(
+                "[internal_llm] Anthropic %d for op=%s: %s",
+                resp.status_code, operation_type, resp.text[:300],
+            )
+            return None, 0, 0, "error"
+    except Exception as e:
+        logger.warning("[internal_llm] Anthropic call failed for op=%s: %s", operation_type, e)
+        return None, 0, 0, "error"
+
+
+async def _direct_openai(
+    *,
+    operation_type: str,
+    model: str,
+    max_tokens: int,
+    chat_messages: List[Dict[str, Any]],
+    token_kwarg: str,
+    timeout: int,
+) -> tuple[Optional[str], int, int, str]:
+    """BYOK direct-API OpenAI call. Returns (text, in_tokens, out_tokens, status)."""
+    api_key = (
+        getattr(settings, "platform_openai_api_key", None)
+        or settings.openai_api_key
+    )
+    if not api_key:
+        logger.warning("[internal_llm] No OpenAI key for op=%s", operation_type)
+        return None, 0, 0, "error"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                _OPENAI_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": chat_messages,
+                    token_kwarg: max_tokens,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                usage = data.get("usage", {})
+                choices = data.get("choices", [])
+                text = (
+                    choices[0].get("message", {}).get("content")
+                    if choices else None
+                )
+                return (
+                    text or None,
+                    int(usage.get("prompt_tokens", 0) or 0),
+                    int(usage.get("completion_tokens", 0) or 0),
+                    "ok",
+                )
+            logger.warning(
+                "[internal_llm] OpenAI %d for op=%s: %s",
+                resp.status_code, operation_type, resp.text[:300],
+            )
+            return None, 0, 0, "error"
+    except Exception as e:
+        logger.warning("[internal_llm] OpenAI call failed for op=%s: %s", operation_type, e)
+        return None, 0, 0, "error"
 
 
 def _calc_cost_cents(model: str, input_tokens: int, output_tokens: int) -> int:
