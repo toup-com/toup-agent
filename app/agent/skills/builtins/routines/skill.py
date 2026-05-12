@@ -452,6 +452,13 @@ class RoutinesSkill(Skill):
             "status": "updated",
             "routine": {
                 "id": resp.id,
+                # `kind` is echoed so the frontend tool-call row can
+                # render the connector subject badge (Gmail icon for an
+                # email_briefing routine etc.). Drop this field and an
+                # "update my morning briefing schedule" turn renders
+                # the update row with the bare action glyph, losing the
+                # "this is about Gmail" signal at the row level.
+                "kind": resp.kind,
                 "schedule_cron_local": resp.schedule_cron_local,
                 "enabled": resp.enabled,
                 "name": resp.name,
