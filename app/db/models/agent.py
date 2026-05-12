@@ -247,6 +247,16 @@ class AgentConfig(Base):
     #   "logged_out"  — Meta forced a 401; user must re-pair
     whatsapp_session_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
+    # ── Toup Code (experimental Claude Code IDE, 2026-05-12) ──
+    # Long-lived OAuth token from `claude setup-token` on the user's
+    # local machine. When set, the Toup Code page can spawn Claude
+    # Code sessions authenticated against the user's Claude
+    # Pro/Max subscription quota — Toup never bills for these calls.
+    # Stored plaintext (same trust model as the other channel tokens
+    # above); rotate to column-level encryption before opening this
+    # to public if the experiment graduates.
+    claude_code_oauth_token: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
+
     # Step 4: Services
     brave_api_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     elevenlabs_api_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

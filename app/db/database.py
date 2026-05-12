@@ -327,6 +327,11 @@ async def init_db():
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_self_e164 VARCHAR(20)",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_baileys_allowlist TEXT",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS whatsapp_session_status VARCHAR(20)",
+        # Toup Code (experimental Claude Code IDE, 2026-05-12). Long-lived
+        # OAuth token from `claude setup-token`; nullable so existing
+        # rows stay valid. 2000 chars to fit refresh-token-embedded
+        # payloads without truncation.
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS claude_code_oauth_token VARCHAR(2000)",
         # ── Connector identities ──
         # Per-identity read-only switch (2026-05-11). True means the
         # MCP tool filter drops every manifest tool with mutates=true
