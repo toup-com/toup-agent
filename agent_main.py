@@ -1513,6 +1513,13 @@ app.include_router(routines_router, prefix=settings.api_prefix)
 app.include_router(triggers_inbound_router, prefix=settings.api_prefix)
 app.include_router(triggers_router, prefix=settings.api_prefix)
 
+# Chrome extension — /ws/extension lives here (per-tenant agent VPS).
+# Pairing/suggest/ground routes are platform-only; mounting the whole
+# router on the agent is a no-op for those (the extension never calls
+# the agent for pairing — it calls the platform).
+from app.api.extension import router as extension_router
+app.include_router(extension_router, prefix=settings.api_prefix)
+
 # Mount App MCP server for external MCP clients
 try:
     from app.agent.app_mcp_server import app_mcp, set_mcp_skill_loader

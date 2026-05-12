@@ -75,6 +75,47 @@ async def _gc_pairings() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Tiny per-IP / per-user sliding-window limiter for the expensive
+# endpoints (LLM-backed /suggest, Vision-backed /ground, pairing init).
+# In-memory; per-replica. Good enough for MVP — DoS targeting would
+# need to overwhelm every replica simultaneously.
+# ─────────────────────────────────────────────────────────────────────
+_RATE_BUCKETS: Dict[str, list] = {}
+_rate_lock = asyncio.Lock()
+
+
+async def _rate_check(key: str, limit: int, window_s: int) -> bool:
+    """Returns True if allowed, False if over the limit."""
+    now = time.time()
+    async with _rate_lock:
+        bucket = _RATE_BUCKETS.setdefault(key, [])
+        # Drop entries outside the window
+        cutoff = now - window_s
+        i = 0
+        while i < len(bucket) and bucket[i] < cutoff:
+            i += 1
+        if i:
+            del bucket[:i]
+        if len(bucket) >= limit:
+            return False
+        bucket.append(now)
+        return True
+
+
+def _client_ip(req: Request) -> str:
+    fwd = req.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",", 1)[0].strip()
+    return req.client.host if req.client else "unknown"
+
+
+async def _enforce_rate(req: Request, name: str, *, limit: int, window_s: int) -> None:
+    ip = _client_ip(req)
+    if not await _rate_check(f"{name}:{ip}", limit, window_s):
+        raise HTTPException(429, f"rate limited ({name}); retry shortly")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Request/response schemas
 # ─────────────────────────────────────────────────────────────────────
 class PairInitReq(BaseModel):
@@ -161,11 +202,13 @@ async def _agent_ws_url_for(user_id: str) -> Optional[str]:
 
 
 @router.post("/extension/pair/init")
-async def pair_init(req: PairInitReq) -> Dict[str, Any]:
+async def pair_init(req: PairInitReq, request: Request) -> Dict[str, Any]:
     """
     Step 1. Extension calls this to start pairing.
     Returns the user_code the user will type into toup.ai.
     """
+    # Cap pairing churn from a single IP at 10/min to deter spam.
+    await _enforce_rate(request, "pair_init", limit=10, window_s=60)
     async with _pair_lock:
         await _gc_pairings()
         # Generate a fresh, unused user_code.
@@ -330,7 +373,7 @@ async def ws_extension(websocket: WebSocket, token: Optional[str] = Query(None))
     # 1. Authenticate
     if not token:
         try:
-            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=3.0)
             first = json.loads(raw)
             if first.get("type") == "auth":
                 token = first.get("token")
@@ -403,8 +446,13 @@ async def extension_status(current_user=Depends(get_current_user)) -> Dict[str, 
 
 
 @router.get("/admin/extension/stats")
-async def extension_stats(_request: Request) -> Dict[str, Any]:
-    """Operational counters — protected by the same gate as other /admin routes."""
+async def extension_stats(current_user=Depends(get_current_user)) -> Dict[str, Any]:
+    """Operational counters — admin-only."""
+    is_admin = getattr(current_user, "is_admin", False) or (
+        isinstance(current_user, dict) and current_user.get("is_admin")
+    )
+    if not is_admin:
+        raise HTTPException(403, "admin only")
     return extension_bridge.stats()
 
 
@@ -487,6 +535,7 @@ class GroundReq(BaseModel):
 @router.post("/extension/ground")
 async def extension_ground(
     req: GroundReq,
+    request: Request,
     current_user=Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
@@ -497,6 +546,8 @@ async def extension_ground(
     from app.services.vision_grounding import ground
 
     user_id = current_user.id
+    # Vision calls are expensive ($/call). Cap at 30/min per user.
+    await _enforce_rate(request, f"ground:{user_id}", limit=30, window_s=60)
     out = await ground(
         user_id=user_id,
         screenshot_b64=req.screenshot_b64,
@@ -668,12 +719,15 @@ class SuggestReq(BaseModel):
 @router.post("/extension/suggest")
 async def extension_suggest(
     req: SuggestReq,
+    request: Request,
     current_user=Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Return 2–3 chips the sidepanel can render before the user types."""
     from app.services.page_suggest import suggest_for_page
 
     user_id = current_user.id
+    # Haiku-backed; cap at 60/min per user to keep $$ predictable.
+    await _enforce_rate(request, f"suggest:{user_id}", limit=60, window_s=60)
     out = await suggest_for_page(user_id=user_id, page_context=req.page_context or {})
     if not out:
         return {"ok": True, "suggestion": None}

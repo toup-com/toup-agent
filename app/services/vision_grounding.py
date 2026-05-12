@@ -86,10 +86,10 @@ async def ground(
 
     if not screenshot_b64 or not isinstance(screenshot_b64, str):
         return {"ok": False, "reason": "missing screenshot", "confidence": 0.0}
-    if len(screenshot_b64) > 6_000_000:
-        # Defensive cap — Anthropic accepts up to a few MB per image. A
-        # 6MB base64 string is ~4.5MB raw, well over what JPEG@80 of any
-        # viewport would emit.
+    if len(screenshot_b64) > 2_000_000:
+        # Defensive cap — a JPEG@70 of a 1920x1080 viewport encodes well
+        # under 1.5 MB base64. Anything larger is wasteful for grounding
+        # and risks memory pressure under concurrent requests.
         return {"ok": False, "reason": "screenshot too large", "confidence": 0.0}
 
     user_content = [

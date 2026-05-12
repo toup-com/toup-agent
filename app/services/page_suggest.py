@@ -93,9 +93,21 @@ async def suggest_for_page(
         logger.debug("[suggest] skip — privacy block (%s)", url)
         return None
 
+    # Honor sidepanel privacy toggles the same way ws_chat does. Without
+    # this, /suggest would see readable/selection/dom even when the user
+    # disabled them in Options.
+    _flags = page_context.get("_flags") or {}
+    _filtered = dict(page_context)
+    if _flags.get("hide_readable", False):
+        _filtered["readable_content"] = ""
+    if _flags.get("hide_selection", False):
+        _filtered["selected_text"] = ""
+    if _flags.get("hide_dom", False):
+        _filtered["dom_summary"] = ""
+
     # Render the same hidden block we send into the chat — same view of
     # the page the agent would have.
-    ctx_block = render_page_context(page_context)
+    ctx_block = render_page_context(_filtered)
     if not ctx_block:
         return None
 
