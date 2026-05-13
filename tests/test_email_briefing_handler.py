@@ -243,6 +243,58 @@ async def test_handler_bootstrap_window_uses_newer_than_1d():
 
 
 @pytest.mark.asyncio
+async def test_handler_latest_n_mode_ignores_watermark():
+    """Ticket 7 (2026-05-13) regression: `mode=latest_n` MUST NOT use
+    the `newer_than:Nh` watermark window. The user's complaint:
+    "every day at 10:58 give me my latest 5 emails" landed on
+    `since_last_run` semantics by default, so once the watermark
+    advanced after the first fire, every subsequent run saw 0 new
+    emails and posted "No new emails since the last briefing."
+
+    With `mode=latest_n` the query MUST be empty (`q=""`) and
+    `max_results` MUST equal the configured `max_emails` so Gmail
+    returns the most-recent N regardless of when they arrived."""
+    from app.agent.routines.email_briefing_handler import EmailBriefingHandler
+    from app.db import async_session_maker
+    from app.db.models import Routine
+
+    user_id = await _make_user("America/Toronto")
+    # Watermark set to "yesterday" — exactly the post-first-run state
+    # where the legacy bug would have kicked in.
+    yesterday_ms = 1715300000000
+    rid = await _make_routine(
+        user_id,
+        last_state={"last_processed_internal_date": yesterday_ms},
+        config={"mode": "latest_n", "max_emails": 5},
+    )
+    async with async_session_maker() as db:
+        routine = await db.get(Routine, rid)
+
+    # The expected_args_subset asserts BOTH: empty q + max_results=5.
+    mcp = _FakeMCP([
+        ("gmail__list_messages",
+         {"q": "", "max_results": 5},
+         _list_messages_ok(["m1", "m2"])),
+        ("gmail__get_message", None, _get_message_ok("m1")),
+        ("gmail__get_message", None, _get_message_ok("m2")),
+    ])
+    writer = _RecordingWriter()
+    handler = EmailBriefingHandler(mcp_client=mcp, llm_fn=_fake_llm, writer=writer)
+
+    async with async_session_maker() as db:
+        result = await handler.execute(routine, None, db)
+
+    assert result.status == "success"
+    assert result.emails_fetched == 2
+    # The first call was list_messages with q="" — proving the
+    # watermark-driven window was bypassed.
+    assert mcp.calls[0][1]["q"] == ""
+    assert mcp.calls[0][1]["max_results"] == 5
+    # A briefing Message was actually posted (not "no new emails").
+    assert len(writer.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_handler_steady_state_window_uses_hours_since_watermark():
     """Watermark set 6h ago → query is roughly `newer_than:7h` (6h + 1h buffer)."""
     from app.agent.routines.email_briefing_handler import EmailBriefingHandler

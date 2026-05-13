@@ -77,6 +77,30 @@ If there are no new emails, output exactly: "No new emails since the last briefi
 """
 
 
+# Alternate prompt for `mode=latest_n` routines (Ticket 7, 2026-05-13).
+# The default SYSTEM_PROMPT is hard-wired to "new since last briefing"
+# semantics and will say "No new emails since the last briefing" on a
+# quiet day even when latest-N emails were fetched successfully. A
+# user who set up "daily latest 5 Gmail" wants the most recent five
+# every day, not "nothing new since yesterday's run."
+SYSTEM_PROMPT_LATEST_N = """You're showing the user their latest emails on a scheduled morning briefing. Rules:
+
+- Open with one line stating how many emails you're showing ("Here are your latest 5 emails:").
+- Then list them in reverse-chronological order — one block per email:
+    • **Sender — Subject**
+    • Date (use the user's local format).
+    • 1-2 line gist of the body. Surface action items, deadlines,
+      security alerts, payments, calendar invites.
+- Flag priority with ⚑ for boss/family/financial/security; nothing for routine.
+- Skip newsletter/promotional noise only if you have MORE than the
+  requested count — never pad with noise to hit a number.
+- ≤300 words total. Markdown supported — use **bold** and bullets, no
+  headings.
+- DO NOT say "no new emails since the last briefing" — these are the
+  latest, not the new. If the inbox is genuinely empty, say so plainly.
+"""
+
+
 @dataclass
 class _Email:
     id: str
@@ -214,8 +238,42 @@ class EmailBriefingHandler:
                 error_detail="RoutineRunner did not provide an MCP client",
             )
 
+        # Ticket 7 (2026-05-13): two semantic modes.
+        #
+        #   - "since_last_run" (default, legacy): emails that arrived
+        #     after the last successful briefing's watermark. Posts
+        #     "No new emails since the last briefing" when the inbox
+        #     was quiet. This is what the original "morning unread
+        #     briefing" target wanted.
+        #
+        #   - "latest_n": always the most recent N emails regardless
+        #     of the watermark. This is what users mean by "give me
+        #     the latest 5 every day at 10:58." The bug we're fixing:
+        #     before this knob existed, the user's routine landed on
+        #     `since_last_run` and after the first run advanced the
+        #     watermark, every subsequent run fetched 0 emails (their
+        #     inbox was quiet on the inter-run interval). Per-day
+        #     repetition of the same 5 emails IS the desired UX here.
+        mode = (cfg.get("mode") or "since_last_run").strip()
+        if mode not in ("since_last_run", "latest_n"):
+            mode = "since_last_run"
+        # Mode-aware default: legacy `since_last_run` keeps the 50-email
+        # window cap (a real morning briefing can have that many);
+        # `latest_n` defaults to 5 (matches the "give me the latest N"
+        # ask the bug-sweep surfaced). User can override with
+        # `config.max_emails`.
+        default_max = 5 if mode == "latest_n" else _MAX_EMAILS_PER_BRIEFING
         try:
-            emails, fetched_count = await self._fetch(mcp, routine.last_state_json)
+            max_emails = int(cfg.get("max_emails") or default_max)
+        except (TypeError, ValueError):
+            max_emails = default_max
+        max_emails = max(1, min(max_emails, _MAX_EMAILS_PER_BRIEFING))
+
+        try:
+            emails, fetched_count = await self._fetch(
+                mcp, routine.last_state_json,
+                mode=mode, max_emails=max_emails,
+            )
         except _ReauthRequired as e:
             return RoutineResult(
                 status="skipped_reauth",
@@ -263,12 +321,17 @@ class EmailBriefingHandler:
         if fetched_count > len(emails):
             prompt_body += f"\n(+{fetched_count - len(emails)} more new emails not shown)"
 
+        # Mode-aware system prompt. latest_n must NOT say "no new
+        # emails since the last briefing" — by definition the listed
+        # emails ARE the latest, not the "new."
+        system_prompt = SYSTEM_PROMPT_LATEST_N if mode == "latest_n" else SYSTEM_PROMPT
+
         summary_text = await llm(
             user_id=routine.user_id,
             operation_type=_OPERATION_TYPE,
             model=model_choice,
             max_tokens=_SUMMARY_MAX_TOKENS,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": prompt_body}],
             timeout=60,
         )
@@ -334,11 +397,22 @@ class EmailBriefingHandler:
         )
 
     # ------------------------------------------------------------------ fetch
-    async def _fetch(self, mcp_client: Any, last_state: Optional[dict]) -> tuple[List[_Email], int]:
+    async def _fetch(
+        self,
+        mcp_client: Any,
+        last_state: Optional[dict],
+        *,
+        mode: str = "since_last_run",
+        max_emails: int = _MAX_EMAILS_PER_BRIEFING,
+    ) -> tuple[List[_Email], int]:
         """Return (emails_to_summarize, total_emails_in_window). The
-        first list is capped at _MAX_EMAILS_PER_BRIEFING; the count tells
-        us if there were more we didn't hydrate so the summary can say
-        "+N more".
+        first list is capped at max_emails; the count tells us if there
+        were more we didn't hydrate so the summary can say "+N more".
+
+        `mode="since_last_run"` (default) uses the watermark-driven
+        query window. `mode="latest_n"` ignores the watermark — empty
+        query + `max_results=max_emails` returns the freshest N
+        regardless of when they arrived.
 
         Each MCP call goes through `async with mcp_client` + the
         `pending_channel="routine"` shim — same contract `tool_executor`
@@ -358,18 +432,27 @@ class EmailBriefingHandler:
             reset_pending_channel = None  # type: ignore
 
         try:
-            query = _compute_query_window(last_state)
+            if mode == "latest_n":
+                # No `newer_than` filter — Gmail returns the most-recent
+                # N by default-sort. We pass an empty q so Gmail doesn't
+                # apply a time gate.
+                list_args = {"q": "", "max_results": max_emails}
+            else:
+                list_args = {
+                    "q": _compute_query_window(last_state),
+                    "max_results": max_emails,
+                }
             async with mcp_client:
                 list_result = await mcp_client.call_tool(
                     "gmail__list_messages",
-                    {"q": query, "max_results": _MAX_EMAILS_PER_BRIEFING},
+                    list_args,
                 )
             list_data = _unpack_ok(list_result, "gmail__list_messages")
             ids = [m["id"] for m in (list_data.get("messages") or []) if m.get("id")]
             total = list_data.get("result_size") or len(ids)
 
             emails: List[_Email] = []
-            for mid in ids[:_MAX_EMAILS_PER_BRIEFING]:
+            for mid in ids[:max_emails]:
                 try:
                     async with mcp_client:
                         msg_result = await mcp_client.call_tool(
