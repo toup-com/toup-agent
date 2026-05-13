@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional, List
 import uuid
 
-from sqlalchemy import String, DateTime, Boolean, Index
+from sqlalchemy import String, DateTime, Boolean, Index, JSON
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
@@ -53,8 +53,15 @@ class User(Base):
     # bool, "product_updates": bool, ...}. NULL is treated as
     # DEFAULT_NOTIFICATION_PREFERENCES on read so existing rows don't
     # need a backfill.
+    #
+    # `with_variant(JSONB(), "postgresql")` keeps the prod schema as
+    # JSONB (binary, indexable) while letting SQLite-based test runs
+    # (billing CI uses sqlite+aiosqlite) actually compile the column.
+    # Without this variant, every push has hit
+    # `SQLiteTypeCompiler … can't render element of type JSONB` and
+    # the CI Backend Tests workflow fails before the first assertion.
     notification_preferences: Mapped[Optional[Dict[str, Any]]] = mapped_column(
-        JSONB, nullable=True
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
     )
 
     # is_canary: designates this user as the rollout canary. Rollouts upgrade

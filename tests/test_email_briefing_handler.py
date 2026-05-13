@@ -562,6 +562,28 @@ async def test_runner_retry_succeeds_on_second_attempt_advances_watermark():
     user_id = await _make_user("UTC")
     rid = await _make_routine(user_id, last_state=None)
 
+    # F3 fix: pre-create the Message row that `summary_message_id`
+    # references — RoutineRun.summary_message_id is a FK to messages.id
+    # (ON DELETE SET NULL). The test was authored before the FK
+    # constraint landed; passing the bare sentinel "fake-msg-id"
+    # would trigger a ForeignKeyViolationError when the runner
+    # UPDATEs the run row. Pre-inserting a stub Message keeps the
+    # test isolated from the message-writer's behavior.
+    from app.db.models import Conversation as _Conv, Message as _Msg
+    async with async_session_maker() as _db:
+        _conv = _Conv(
+            id=str(uuid.uuid4()), user_id=user_id, channel="routine",
+            is_active=True,
+        )
+        _db.add(_conv)
+        await _db.flush()
+        _db.add(_Msg(
+            id="fake-msg-id", conversation_id=_conv.id,
+            role="assistant", content="(test stub)",
+            channel="routine", source="email_briefing",
+        ))
+        await _db.commit()
+
     new_watermark = {"last_processed_internal_date": 9999999999000}
     scripted = _ScriptedHandler("email_briefing", [
         RoutineResult(status="failed", error_class="transient", error_detail="x"),
