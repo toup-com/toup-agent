@@ -595,6 +595,12 @@ async def spawn_session(
             proc = await asyncio.create_subprocess_exec(
                 claude_bin,
                 "-p", prompt_text,
+                "--model", "claude-opus-4-7",
+                # Sonnet 4.6 covers turns when Opus 4.7 is rate-limited or
+                # overloaded so the session degrades instead of failing
+                # outright. --fallback-model only works with --print, which
+                # is exactly the mode we're in.
+                "--fallback-model", "claude-sonnet-4-6",
                 "--output-format", "stream-json",
                 "--verbose",
                 "--permission-mode", "acceptEdits",
