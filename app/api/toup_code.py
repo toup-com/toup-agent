@@ -100,6 +100,32 @@ async def _get_or_create_config(user_id: str, db: AsyncSession) -> AgentConfig:
 _OAUTH_PREFIX = "sk-ant-oat"
 _API_KEY_PREFIX = "sk-ant-api"
 
+# OAuth tokens are URL-safe base64 (alphanumeric + dash + underscore)
+# plus the `sk-ant-oat01-` prefix. Used to verify the cleaned token
+# didn't pick up odd characters from clipboard / smart quotes / etc.
+_TOKEN_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+
+def _clean_pasted_token(raw: str) -> str:
+    """Strip ALL whitespace from a pasted token, not just the ends.
+
+    The /code/spawn 401 cascade traced to this: `claude setup-token`
+    prints a ~120-char OAuth token, terminals wrap it across two
+    visual lines, and copy-from-terminal embeds a literal `\\n` in
+    the middle of the string. `.strip()` only touches the ends so the
+    newline survived all the way to Anthropic's bearer auth → 401.
+
+    `\\s+` in Python's re module catches \\n, \\r, \\t, \\f, \\v, and
+    Unicode whitespace (non-breaking space, etc.) — anything a paste
+    might smuggle in. Tokens themselves are URL-safe base64 + the
+    `sk-ant-oat01-` prefix; no legitimate whitespace can ever appear
+    inside one. Also strips wrapping quotes for the common shell-paste
+    case where someone copied `"sk-ant-oat01-..."` from a docs block."""
+    s = re.sub(r"\s+", "", raw or "")
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("\"", "'"):
+        s = s[1:-1]
+    return s
+
 
 async def _validate_token(
     token: str,
@@ -351,7 +377,17 @@ async def save_token(
     window), we skip validation and accept the token optimistically —
     /code/spawn will surface the auth error later with the same
     actionable message."""
-    token = body.token.strip()
+    token = _clean_pasted_token(body.token)
+
+    if len(token) < 20:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "That doesn't look like a Claude Code token after whitespace "
+                "was removed. Make sure you pasted the entire long token from "
+                "`claude setup-token`."
+            ),
+        )
 
     # Hard-reject obvious mismatches before we burn 5 s on a subprocess.
     if token.startswith(_API_KEY_PREFIX):
@@ -362,6 +398,17 @@ async def save_token(
                 "`sk-ant-api…`). This feature uses your Pro/Max subscription "
                 "via an OAuth token. Run `claude setup-token` on your machine "
                 "and paste its output (starts with `sk-ant-oat01-…`)."
+            ),
+        )
+
+    if not _TOKEN_ALLOWED_RE.match(token):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Token contains characters that don't belong to an OAuth "
+                "token (allowed: letters, digits, `-`, `_`). Re-copy directly "
+                "from your terminal output — avoid editors that auto-correct "
+                "quotes or dashes."
             ),
         )
 
@@ -421,11 +468,25 @@ async def spawn_session(
     `claude` chewing through subscription quota after the tab closes.
     """
     config = await _get_or_create_config(str(current_user.id), db)
-    token = config.claude_code_oauth_token
-    if not token:
+    raw_token = config.claude_code_oauth_token
+    if not raw_token:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Connect your Claude Code subscription first.",
+        )
+    # Defense-in-depth: tokens saved before the whitespace fix landed
+    # may still have embedded newlines from terminal copy/paste. Clean
+    # on read so the existing connector starts working without forcing
+    # a re-paste, AND write the cleaned value back so /status etc.
+    # don't keep showing a stale masked tail.
+    token = _clean_pasted_token(raw_token)
+    if token != raw_token:
+        config.claude_code_oauth_token = token
+        config.updated_at = datetime.utcnow()
+        await db.commit()
+        logger.info(
+            "toup_code: sanitized stored token for user=%s (stripped %d whitespace chars)",
+            current_user.id, len(raw_token) - len(token),
         )
 
     user_id = _safe_segment(str(current_user.id), "user")
