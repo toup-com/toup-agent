@@ -16,6 +16,7 @@ multiple per kind so weekday/weekend variants stay possible later.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import Any, Optional
 
@@ -26,6 +27,7 @@ from sqlalchemy import delete, desc, select
 
 
 router = APIRouter(prefix="/routines", tags=["routines"])
+logger = logging.getLogger(__name__)
 
 _runner = None  # set by agent_main.py via set_runner_ref()
 
@@ -452,8 +454,36 @@ async def update_routine(routine_id: str, req: RoutineUpdate):
     if _runner is not None:
         try:
             await _runner.reload_routine(routine.id)
-        except Exception:
-            pass
+        except Exception as e:
+            # Ticket 3 / Bug B: do NOT swallow silently. A failed reload
+            # leaves the OLD job registered with the OLD cron — the API
+            # response would lie about the update having taken effect.
+            # Count it (status_snapshot surfaces this) and re-raise so
+            # the client sees a 500 and the operator sees a stack trace.
+            try:
+                _runner._reload_failures_total += 1  # type: ignore[attr-defined]
+            except Exception:  # pragma: no cover — counter is best-effort
+                pass
+            logger.exception(
+                "[routines.update] reload_routine failed routine_id=%s err=%s",
+                routine.id, e,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Schedule saved to DB but scheduler reload failed. "
+                       "Retry the update or contact support.",
+            )
+
+    # Re-read the routine after reload so the response carries the
+    # freshly-synced `next_run_at` (runner._sync_next_run writes it
+    # from APScheduler's in-memory next_run_time during reload). Without
+    # this re-read, the response shows the pre-update next_run_at and
+    # users / the agent's routines__list see "stale scheduler" — the
+    # original Ticket 3 / Bug A symptom.
+    async with async_session_maker() as db:
+        routine = await db.get(Routine, routine_id)
+        if routine is None:
+            raise HTTPException(status_code=404, detail="Routine not found")
 
     return _row_to_response(routine)
 

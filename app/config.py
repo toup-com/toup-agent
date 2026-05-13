@@ -274,7 +274,15 @@ class Settings(BaseSettings):
     # of the legacy `/v1/tenants/<prefix>/upgrade` (recreate). Requires
     # the bridge's `blue_green.py` module installed (see
     # `bridge/blue_green.py` + `INSTALL.md`).
-    use_blue_green_rollouts: bool = False
+    #
+    # Default flipped to True 2026-05-13: the legacy recreate flow was
+    # closing every active sidepanel/web WS with code 1001 on every CI
+    # push, and was the actual source of the "Reconnecting…" cycles the
+    # user kept seeing during deploy bursts. Blue-green has been live
+    # on the bridge since 2026-05-10 and validated at 81/81 health
+    # probes during a 62-s image swap on tenant `871bac24` — production-
+    # ready, just gated behind a flag that was never flipped.
+    use_blue_green_rollouts: bool = True
     # Drain timeout for blue-green cutovers. After Caddy flips to the
     # new slot, the old slot rejects new WS but lets in-flight stream
     # for up to this many seconds before the bridge force-stops it.

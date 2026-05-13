@@ -118,6 +118,20 @@ class RoutineRunner:
         # so reload is just `add_job(..., id=routine_id, replace_existing=True)`)
         self._jobs: dict[str, str] = {}
 
+        # Observability counters (Ticket 3 / invariant #4). Exposed via
+        # status_snapshot() → /_runner_status. Don't reset across reloads;
+        # they are process-lifetime totals so operators can spot drift
+        # between successive observations.
+        self._missed_fires_total = 0
+        self._reload_failures_total = 0
+        self._reconcile_runs_total = 0
+        # In-memory background task for the periodic reconciler. Started
+        # alongside the scheduler in `start()`, cancelled in `stop()`.
+        self._reconcile_task: Optional[asyncio.Task] = None
+        # Reconciler cadence — every 10 minutes is enough to catch drift
+        # within one user-visible window without thrashing the DB.
+        self.RECONCILE_INTERVAL_SECONDS = 10 * 60
+
     def set_mcp_client(self, mcp_client: Any) -> None:
         """Late-bind the MCP client. agent_main constructs the runner
         BEFORE the MCP client (lifespan order), so wire-up uses this
@@ -145,15 +159,31 @@ class RoutineRunner:
                 tz_fallbacks += 1
         if not self.scheduler.running:
             self.scheduler.start()
+        # Periodic reconciler — backstop for any in-memory↔DB drift
+        # (silent reload failures, dropped APScheduler jobs, etc.). Idem-
+        # potent: if state is already clean, each cycle is a no-op.
+        if self._reconcile_task is None or self._reconcile_task.done():
+            self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         logger.info(
-            "[routine_runner] started routines_loaded=%d tz_fallbacks=%d restart_sweep_marked=%d",
+            "[routine_runner] started routines_loaded=%d tz_fallbacks=%d "
+            "restart_sweep_marked=%d reconcile_interval=%ds",
             len(routines), tz_fallbacks, swept,
+            self.RECONCILE_INTERVAL_SECONDS,
         )
 
     async def stop(self) -> None:
         """Graceful shutdown. Blocks up to SHUTDOWN_TIMEOUT_SECONDS for
         in-flight jobs to drain. Beyond that, abandon and log so a hung
         handler can't keep the container alive."""
+        # Cancel the reconciler first so it can't trigger a reload mid-
+        # shutdown. Await briefly so the cancellation completes cleanly.
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            self._reconcile_task.cancel()
+            try:
+                await asyncio.wait_for(self._reconcile_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._reconcile_task = None
         if not self.scheduler.running:
             return
         # APScheduler.shutdown(wait=True) blocks the calling thread, so
@@ -199,6 +229,40 @@ class RoutineRunner:
 
         if routine and routine.enabled:
             await self._register_trigger_for(routine)
+
+    async def _reconcile_loop(self) -> None:
+        """Periodic reconciler — every RECONCILE_INTERVAL_SECONDS, re-read
+        every enabled routine from DB and re-register it. Catches the
+        failure mode where `update_routine` swallows a reload exception
+        (Ticket 3 / Bug B) or APScheduler internal state diverges from
+        DB silently.
+
+        Idempotent: `_register_trigger_for` uses `replace_existing=True`
+        so a no-op cycle just refreshes `next_run_at` to whatever the
+        in-memory scheduler thinks.
+
+        Self-cancelling on `asyncio.CancelledError` (the normal
+        shutdown path). Other exceptions are logged and the loop
+        continues — never let a transient DB blip stop the backstop.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.RECONCILE_INTERVAL_SECONDS)
+                try:
+                    await self.reload_all()
+                    self._reconcile_runs_total += 1
+                    logger.info(
+                        "[routine_runner] reconcile_ok runs_total=%d routines=%d",
+                        self._reconcile_runs_total, len(self._jobs),
+                    )
+                except Exception as e:  # pragma: no cover — defensive
+                    logger.warning(
+                        "[routine_runner] reconcile_failed err=%s — will retry next cycle",
+                        e,
+                    )
+        except asyncio.CancelledError:
+            logger.debug("[routine_runner] reconcile_loop cancelled")
+            raise
 
     async def reload_all(self) -> None:
         """Drop every registered trigger and rebuild from DB. Exposed for
@@ -423,6 +487,29 @@ class RoutineRunner:
         tz_str = await self._user_tz_async(routine.user_id)
         tz, _ = _resolve_tz(tz_str, routine.user_id)
         local_date = datetime.now(tz).date()
+
+        # Missed-fire detection (Ticket 3 / Bug D). APScheduler invokes
+        # _fire whenever it decides the trigger is due — including a
+        # "catch up" fire when misfire_grace_time is satisfied. If the
+        # job's recorded next_run_time is more than grace_time behind
+        # now-wall-clock, something went wrong (scheduler was paused, OS
+        # clock jumped, in-process delay). Count it so operators have a
+        # signal that "the routine fired but late."
+        try:
+            _job = self.scheduler.get_job(routine_id)
+            _scheduled_for = getattr(_job, "next_run_time", None) if _job else None
+            if _scheduled_for is not None:
+                _now = datetime.now(_scheduled_for.tzinfo)
+                _drift = (_now - _scheduled_for).total_seconds()
+                if _drift > 300:  # misfire_grace_time
+                    self._missed_fires_total += 1
+                    logger.warning(
+                        "[routine_runner] missed_fire routine_id=%s "
+                        "drift_seconds=%.0f counter_total=%d",
+                        routine_id, _drift, self._missed_fires_total,
+                    )
+        except Exception:  # pragma: no cover — counter must never block
+            pass
 
         # Idempotency claim. SQLAlchemy raises IntegrityError on the UNIQUE
         # violation under both Postgres and SQLite — that's our gate. A
@@ -711,4 +798,14 @@ class RoutineRunner:
             "running": bool(self.scheduler.running),
             "routines_registered": len(self._jobs),
             "next_fire_at": next_fire.isoformat() if next_fire else None,
+            # Ticket 3 observability — process-lifetime counters for the
+            # invariants the missed-fire bug surfaced. Operators read these
+            # off the /_runner_status probe to spot drift.
+            "missed_fires_total": self._missed_fires_total,
+            "reload_failures_total": self._reload_failures_total,
+            "reconcile_runs_total": self._reconcile_runs_total,
+            "reconcile_active": (
+                self._reconcile_task is not None
+                and not self._reconcile_task.done()
+            ),
         }
