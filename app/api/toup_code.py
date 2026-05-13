@@ -93,6 +93,92 @@ async def _get_or_create_config(user_id: str, db: AsyncSession) -> AgentConfig:
     return config
 
 
+# Tokens from `claude setup-token` look like "sk-ant-oat01-..." per
+# Anthropic's docs. We DO NOT hard-reject other prefixes (Anthropic
+# may rotate the format) — instead, we hint at save time and let the
+# subprocess validation be the source of truth.
+_OAUTH_PREFIX = "sk-ant-oat"
+_API_KEY_PREFIX = "sk-ant-api"
+
+
+async def _validate_token(
+    token: str,
+    claude_bin: str,
+) -> tuple[bool, str]:
+    """Run a no-op `claude -p` invocation to confirm Anthropic accepts
+    the OAuth token. Returns (valid, reason_or_message).
+
+    Cost: a few cents of subscription quota per call. Latency: 2-6 s.
+    Acceptable for a one-time Connect action; we don't validate on
+    every /code/status check.
+    """
+    env = {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token}
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+
+    # Use a throwaway tmpdir as cwd so this validation can never touch
+    # the user's workspace (even though `claude -p "ok"` shouldn't write
+    # anything, belt + braces).
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="toup-code-validate-") as tmpdir:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                claude_bin,
+                "-p", "Reply with the single word: ok",
+                "--output-format", "stream-json",
+                "--verbose",
+                "--permission-mode", "acceptEdits",
+                cwd=tmpdir,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                return False, "Validation timed out after 30s — Anthropic may be slow, please retry."
+        except Exception as e:  # pragma: no cover
+            return False, f"Failed to invoke claude: {e!r}"
+
+    text = stdout.decode("utf-8", "replace")
+    err_text = stderr.decode("utf-8", "replace")
+
+    # Walk the JSONL output looking for the final `result` event. The
+    # is_error flag + result message tell us definitively whether
+    # Anthropic accepted the token.
+    last_result: dict[str, Any] | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("type") == "result":
+            last_result = msg
+
+    if last_result is None:
+        snippet = (err_text or text)[:400].strip()
+        return False, f"claude produced no result. stderr: {snippet}" if snippet else "claude produced no result."
+
+    if last_result.get("is_error"):
+        result_text = str(last_result.get("result") or "")
+        lower = result_text.lower()
+        if "401" in result_text or "invalid bearer token" in lower or "authentication" in lower:
+            return False, (
+                "Anthropic rejected this token (401). Make sure you're pasting "
+                "the output of `claude setup-token` (starts with `sk-ant-oat01-`), "
+                "not an API key (`sk-ant-api…`). Re-run `claude setup-token` if "
+                "the token may have expired."
+            )
+        return False, f"claude returned an error: {result_text[:400]}"
+
+    return True, "ok"
+
+
 def _safe_segment(value: str, fallback: str = "default") -> str:
     """Strip a path segment to characters that can't escape a workspace
     dir. Conservative — alphanumeric, dash, underscore only."""
@@ -200,10 +286,30 @@ def _translate_message(msg: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any
         return
 
     if mtype == "result":
+        result_text = str(msg.get("result") or "")
+        is_error = bool(msg.get("is_error"))
+        # Detect Anthropic auth failure surfacing as a result. Emit a
+        # dedicated event so the UI can show a "reconnect your token"
+        # banner instead of treating the 401 string as a normal reply.
+        if is_error:
+            lower = result_text.lower()
+            if "401" in result_text or "invalid bearer token" in lower or (
+                "authentication" in lower and "fail" in lower
+            ):
+                yield "auth_failed", {
+                    "message": (
+                        "Anthropic rejected your Claude Code token. Click "
+                        "Disconnect, then re-run `claude setup-token` on your "
+                        "machine and paste the fresh output (starts with "
+                        "`sk-ant-oat01-…`)."
+                    ),
+                    "raw": result_text[:500],
+                }
+                return
         yield "result", {
             "subtype": msg.get("subtype"),
-            "is_error": bool(msg.get("is_error")),
-            "result": msg.get("result", ""),
+            "is_error": is_error,
+            "result": result_text,
             "duration_ms": msg.get("duration_ms"),
             "num_turns": msg.get("num_turns"),
             "total_cost_usd": msg.get("total_cost_usd"),
@@ -235,12 +341,43 @@ async def save_token(
 ):
     """Store an OAuth token from `claude setup-token`.
 
-    We don't validate against Anthropic here — there's no public
-    introspection endpoint for these tokens, and the only honest
-    failure mode is at session-spawn time (subprocess will exit
-    non-zero with an auth error). Pydantic enforces a 20-char floor
-    so accidental empty pastes fail fast."""
+    Runs a tiny `claude -p "ok"` subprocess with the pasted token to
+    verify Anthropic accepts it. Rejects the save with HTTP 400 +
+    actionable detail if Anthropic returns 401 (most common cause:
+    user pasted an `sk-ant-api…` API key instead of the
+    `sk-ant-oat01-…` OAuth token that setup-token emits).
+
+    If the `claude` CLI isn't installed in this environment (pre-deploy
+    window), we skip validation and accept the token optimistically —
+    /code/spawn will surface the auth error later with the same
+    actionable message."""
     token = body.token.strip()
+
+    # Hard-reject obvious mismatches before we burn 5 s on a subprocess.
+    if token.startswith(_API_KEY_PREFIX):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "That looks like an Anthropic API key (starts with "
+                "`sk-ant-api…`). This feature uses your Pro/Max subscription "
+                "via an OAuth token. Run `claude setup-token` on your machine "
+                "and paste its output (starts with `sk-ant-oat01-…`)."
+            ),
+        )
+
+    claude_bin = shutil.which("claude")
+    if claude_bin:
+        valid, reason = await _validate_token(token, claude_bin)
+        if not valid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=reason,
+            )
+    else:
+        logger.warning(
+            "toup_code: claude CLI not installed; skipping save-time token validation"
+        )
+
     config = await _get_or_create_config(str(current_user.id), db)
     config.claude_code_oauth_token = token
     config.updated_at = datetime.utcnow()
