@@ -272,6 +272,252 @@ async def list_jobs() -> List[JobResponse]:
         return [_job_to_response(job) for job in jobs]
 
 
+class ImportFromToupCodeFile(BaseModel):
+    """One file in an import-from-toup-code payload."""
+    path: str                 # repo-relative; no leading slash
+    content: str              # utf-8 text; binaries rejected up-stream
+
+
+class ImportFromToupCodeRequest(BaseModel):
+    """Materialize a Toup Code session as a real App in this user's
+    container.
+
+    The platform-side Toup Code surface (`POST /api/code/save-to-
+    workspace` on toup.ai) reads the project's files from its own
+    workspace at `/app/workspace/toup-code/<user_id>/<project>/` and
+    forwards them here with X-Agent-Key auth. We then:
+
+      1. Slugify the name + dedupe against existing apps.
+      2. mkdir the target at `/opt/toup-agent/apps/<slug>/`.
+      3. Write every file via `app_manager.write_app_files` so the
+         path normalisation + sanity assert lives in one place.
+      4. INSERT App row with `source='toup-code'`, `status='ready'`,
+         a populated `files_json` backup, and the resolved `app_dir`.
+
+    Returns `{app_id, slug, app_dir, file_count}` so the platform can
+    forward to the frontend and the UI can deep-link to the new app.
+    """
+    name: str                                    # human-readable; → App.name
+    description: Optional[str] = None
+    files: List[ImportFromToupCodeFile]
+    source_metadata: Optional[Dict[str, Any]] = None  # opaque (conv_id, project, etc.)
+
+
+class ImportFromToupCodeResponse(BaseModel):
+    app_id: str
+    slug: str
+    app_dir: str
+    file_count: int
+    web_url: Optional[str] = None
+
+
+# Caps mirror what the platform side enforces — the agent fails closed
+# on anything bigger so a misbehaving platform can't fill the disk.
+_IMPORT_MAX_FILES = 500
+_IMPORT_MAX_BYTES_PER_FILE = 5 * 1024 * 1024     # 5 MB per file
+_IMPORT_MAX_TOTAL_BYTES = 50 * 1024 * 1024       # 50 MB total
+_IMPORT_FORBIDDEN_PATH_SEGMENTS = {"..", ".git", "node_modules"}
+
+
+def _slugify_app_name(name: str) -> str:
+    """Match the slug shape `app_builder` uses so Toup-Code-imported
+    apps live alongside hand-built ones with the same naming pattern."""
+    import re
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-")[:40]
+    return slug or "toup-code-app"
+
+
+def _validate_import_path(rel_path: str) -> str:
+    """Reject path traversal + dangerous segments. Returns the
+    sanitised relative path (no leading slash, no empty segments)."""
+    if not rel_path or not isinstance(rel_path, str):
+        raise HTTPException(status_code=400, detail="empty file path")
+    s = rel_path.strip().lstrip("/").lstrip("\\")
+    if not s:
+        raise HTTPException(status_code=400, detail="empty file path after strip")
+    parts = s.replace("\\", "/").split("/")
+    for seg in parts:
+        if not seg:
+            raise HTTPException(status_code=400, detail=f"empty path segment in {rel_path!r}")
+        if seg in _IMPORT_FORBIDDEN_PATH_SEGMENTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"forbidden path segment {seg!r} in {rel_path!r}",
+            )
+    return "/".join(parts)
+
+
+@router.post("/import-from-toup-code", response_model=ImportFromToupCodeResponse)
+async def import_from_toup_code(req: ImportFromToupCodeRequest) -> ImportFromToupCodeResponse:
+    """Materialise a Toup Code session as a tenant-owned App.
+
+    Auth: relies on the upstream X-Agent-Key middleware (same gate
+    every authed endpoint on the agent uses). The endpoint itself
+    pulls user_id from `settings.user_id` — single-user-per-container.
+
+    Idempotency: the slug is unique. A second call with the same name
+    gets a `-2`, `-3`, … suffix so re-saving the same Toup Code
+    session never overwrites a previous import. Re-saving is a user
+    choice — they may want to compare versions.
+    """
+    if _app_manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="app manager not initialised; agent boot incomplete",
+        )
+
+    # ── Validate payload ──
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="`name` is required")
+    if len(name) > 200:
+        raise HTTPException(status_code=400, detail="`name` too long (200 max)")
+
+    if not req.files:
+        raise HTTPException(status_code=400, detail="`files` is empty — nothing to import")
+    if len(req.files) > _IMPORT_MAX_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"too many files ({len(req.files)} > {_IMPORT_MAX_FILES})",
+        )
+
+    sanitised_files: Dict[str, str] = {}
+    total_bytes = 0
+    for f in req.files:
+        rel = _validate_import_path(f.path)
+        if rel in sanitised_files:
+            raise HTTPException(status_code=400, detail=f"duplicate path: {rel}")
+        content = f.content or ""
+        size = len(content.encode("utf-8"))
+        if size > _IMPORT_MAX_BYTES_PER_FILE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"file too large: {rel} ({size} > {_IMPORT_MAX_BYTES_PER_FILE})",
+            )
+        total_bytes += size
+        if total_bytes > _IMPORT_MAX_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"import payload exceeds {_IMPORT_MAX_TOTAL_BYTES} bytes",
+            )
+        sanitised_files[rel] = content
+
+    # ── Slug + dir reservation ──
+    import uuid
+    from app.agent.app_manager import APPS_DIR
+    base_slug = _slugify_app_name(name)
+    app_id = str(uuid.uuid4())
+    user_id = _get_user_id()
+
+    async with async_session_maker() as db:
+        # Dedupe loop — DB UNIQUE on App.slug is the source of truth.
+        slug = base_slug
+        for attempt in range(1, 200):
+            existing = await db.execute(
+                select(App.id).where(App.slug == slug).limit(1)
+            )
+            if not existing.scalar():
+                break
+            slug = f"{base_slug}-{attempt}"
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=f"could not find a free slug under {base_slug!r}",
+            )
+
+        app_dir = os.path.join(APPS_DIR, slug)
+        try:
+            os.makedirs(app_dir, exist_ok=True)
+        except OSError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"could not create {app_dir}: {e}",
+            )
+
+        # ── Write files ──
+        try:
+            for rel_path, content in sanitised_files.items():
+                full_path = os.path.join(app_dir, rel_path)
+                # Defense-in-depth: assert resolved path stays under app_dir.
+                real_full = os.path.realpath(full_path)
+                real_root = os.path.realpath(app_dir)
+                if os.path.commonpath([real_full, real_root]) != real_root:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"resolved path escapes app_dir: {rel_path}",
+                    )
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                with open(full_path, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Best-effort cleanup so a half-imported app doesn't poison
+            # the filesystem on partial failure.
+            try:
+                import shutil
+                shutil.rmtree(app_dir, ignore_errors=True)
+            except Exception:
+                pass
+            logger.exception(
+                "[apps] import-from-toup-code write failed slug=%s: %s", slug, e,
+            )
+            raise HTTPException(status_code=500, detail=f"write failed: {e}")
+
+        # Pre-create a `storage/` dir to mirror `scaffold_app`'s contract
+        # — apps that later add SQLite persistence rely on it existing.
+        try:
+            os.makedirs(os.path.join(app_dir, "storage"), exist_ok=True)
+        except OSError:
+            pass
+
+        # ── INSERT App row ──
+        files_backup = json.dumps(sanitised_files)
+        plan_json = None
+        if req.source_metadata is not None:
+            plan_json = json.dumps({"source": "toup-code", **req.source_metadata})
+
+        app = App(
+            id=app_id,
+            user_id=user_id,
+            name=name,
+            description=(req.description or "").strip() or None,
+            slug=slug,
+            status="ready",            # Files are on disk; no build step needed
+            source="toup-code",        # Distinct from app_builder / vibecoding
+            app_dir=app_dir,
+            files_json=files_backup,
+            deps_json="{}",
+            db_type="none",
+            plan_json=plan_json,
+            platforms="web",           # Static HTML drops are web-only
+        )
+        db.add(app)
+        await db.commit()
+        await db.refresh(app)
+
+    logger.info(
+        "[apps] imported from toup-code app_id=%s slug=%s files=%d bytes=%d",
+        app_id, slug, len(sanitised_files), total_bytes,
+    )
+
+    # Best-effort public URL — same path the `start_app` flow returns.
+    web_url: Optional[str] = None
+    try:
+        if _app_manager:
+            web_url = await _app_manager.get_web_url(app_id)  # type: ignore[arg-type]
+    except Exception:
+        web_url = None
+
+    return ImportFromToupCodeResponse(
+        app_id=app_id,
+        slug=slug,
+        app_dir=app_dir,
+        file_count=len(sanitised_files),
+        web_url=web_url,
+    )
+
+
 class CreateJobRequest(BaseModel):
     title: str
     description: str = ""

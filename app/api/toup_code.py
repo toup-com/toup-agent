@@ -1119,6 +1119,247 @@ async def read_file(
         }
 
 
+# ── Save to user's container workspace ───────────────────────────────
+
+
+class SaveToWorkspaceRequest(BaseModel):
+    """User clicked "Save to Workspace" in Toup Code — bridge the
+    platform-side project files into the user's per-tenant agent
+    container as a real App.
+
+    `project` defaults to the most recent supervisor session's conv_id
+    when omitted (matching the SSE stream's `project_seg` fallback).
+    `name` becomes `App.name`; the agent slugifies + dedupes.
+    """
+    project: Optional[str] = None
+    name: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = Field(default=None, max_length=1000)
+
+
+class SaveToWorkspaceResponse(BaseModel):
+    app_id: str
+    slug: str
+    file_count: int
+    web_url: Optional[str] = None
+
+
+# Mirror agent-side caps so platform side fails fast.
+_SAVE_MAX_FILES = 500
+_SAVE_MAX_BYTES_PER_FILE = 5 * 1024 * 1024
+_SAVE_MAX_TOTAL_BYTES = 50 * 1024 * 1024
+_SAVE_SKIP_DIRS = {".git", "node_modules", ".next", "dist", "build", "__pycache__", ".venv"}
+_SAVE_SKIP_FILE_EXTS = {".pyc", ".lock", ".log", ".DS_Store"}
+
+
+def _collect_project_files(project_dir: Path) -> tuple[list[dict[str, str]], int]:
+    """Walk `project_dir` and return (files, total_bytes).
+
+    Files structure: `[{"path": rel, "content": utf-8 str}, …]`.
+
+    Binaries (non-UTF-8 decodable) and obvious noise (`.git`,
+    `node_modules`, lock files, build outputs) are skipped — Toup Code
+    sessions are typically a handful of source files; we don't want to
+    pollute the user's container with `node_modules` if a stray
+    install happened mid-session.
+
+    Raises HTTPException on:
+      - >`_SAVE_MAX_FILES`: 413
+      - any file >`_SAVE_MAX_BYTES_PER_FILE`: 413 with the offending path
+      - cumulative >`_SAVE_MAX_TOTAL_BYTES`: 413
+    """
+    out: list[dict[str, str]] = []
+    total = 0
+    for root, dirs, files in os.walk(project_dir):
+        # Prune skip dirs in-place so os.walk doesn't descend into them
+        dirs[:] = [d for d in dirs if d not in _SAVE_SKIP_DIRS]
+        for fname in files:
+            if any(fname.endswith(ext) for ext in _SAVE_SKIP_FILE_EXTS):
+                continue
+            full = Path(root) / fname
+            rel = str(full.relative_to(project_dir)).replace(os.sep, "/")
+            try:
+                size = full.stat().st_size
+            except OSError:
+                continue
+            if size > _SAVE_MAX_BYTES_PER_FILE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"file too large: {rel} ({size} bytes); cap is {_SAVE_MAX_BYTES_PER_FILE}",
+                )
+            total += size
+            if total > _SAVE_MAX_TOTAL_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"project exceeds {_SAVE_MAX_TOTAL_BYTES} bytes — split or trim before saving",
+                )
+            try:
+                text = full.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                # Binary — silently skip. The IDE preview pane similarly
+                # treats non-text as opaque blobs; we don't ship them.
+                continue
+            out.append({"path": rel, "content": text})
+            if len(out) > _SAVE_MAX_FILES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"too many files (>{_SAVE_MAX_FILES})",
+                )
+    return out, total
+
+
+async def _resolve_agent_target(user_id: str, db: AsyncSession) -> tuple[str, str]:
+    """Look up `(agent_url, agent_api_key)` for this user. 404 when no
+    active agent exists — same shape `routines_proxy` uses so the
+    frontend's empty-state handling stays uniform across surfaces."""
+    from app.db.models import AgentConfig
+    from sqlalchemy import select as sa_select
+    row = (await db.execute(
+        sa_select(AgentConfig.agent_url, AgentConfig.agent_api_key).where(
+            AgentConfig.user_id == user_id,
+            AgentConfig.deploy_status == "active",
+        )
+    )).first()
+    if row is None or not row.agent_url or not row.agent_api_key:
+        raise HTTPException(
+            status_code=404,
+            detail="No active agent container — deploy one before saving to your workspace.",
+        )
+    return row.agent_url, row.agent_api_key
+
+
+@router.post("/save-to-workspace", response_model=SaveToWorkspaceResponse)
+async def save_to_workspace(
+    body: SaveToWorkspaceRequest,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SaveToWorkspaceResponse:
+    """Materialise the user's current Toup Code project as an App in
+    their per-tenant agent container.
+
+    Why this exists: Toup Code's subprocess (Claude Code / Codex) runs
+    on the platform host with its workspace at
+    `<workspace_root>/toup-code/<user_id>/<project>/`. Those files are
+    a *scratchpad* — they survive the SSE session but never make it
+    to the user's actual deployable workspace. This endpoint copies
+    them across the bridge so the user can edit, deploy, and ship
+    them through the normal Toup Build flow.
+
+    Flow:
+      1. Resolve the project dir on the platform (defaults to the
+         user's last conv_id when omitted).
+      2. Walk + read files (skipping `.git`, `node_modules`, build
+         output, binaries). Enforce per-file + total caps.
+      3. Look up the user's `(agent_url, agent_api_key)`.
+      4. POST the files to the agent's
+         `/api/apps/import-from-toup-code` with `X-Agent-Key` auth.
+      5. Forward the agent's response (`app_id`, `slug`, `app_dir`)
+         to the frontend.
+
+    Failure model:
+      - 404 when no active agent: user needs to deploy first.
+      - 404 when project dir empty / missing: typo or stale conv_id.
+      - 413 on size caps.
+      - 502 when the agent rejects or times out: surface the agent's
+        status code + body so the operator can see the root cause.
+    """
+    user_id = _safe_segment(str(current_user.id), "user")
+    project_seg = _safe_segment(
+        body.project or _last_project_for_user(user_id), "default",
+    )
+    project_dir = (_workspace_root() / user_id / project_seg).resolve()
+
+    try:
+        project_dir.relative_to(_workspace_root().resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="project escapes workspace root")
+
+    if not project_dir.exists() or not project_dir.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"no Toup Code project at {project_seg!r} — start a session before saving",
+        )
+
+    files_payload, total_bytes = _collect_project_files(project_dir)
+    if not files_payload:
+        raise HTTPException(
+            status_code=400,
+            detail="project directory has no text files to save",
+        )
+
+    agent_url, agent_key = await _resolve_agent_target(str(current_user.id), db)
+
+    import httpx  # local — matches the pattern other endpoints in this
+                  # module use; avoids paying the import cost at boot.
+
+    # Forward to agent. 30 s ceiling — should comfortably cover even
+    # the worst-case 50 MB transfer over the bridge.
+    body_payload = {
+        "name": body.name.strip(),
+        "description": (body.description or "").strip() or None,
+        "files": files_payload,
+        "source_metadata": {
+            "project": project_seg,
+            "conv_id": body.project or project_seg,
+            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "file_count": len(files_payload),
+            "total_bytes": total_bytes,
+        },
+    }
+    url = f"{agent_url.rstrip('/')}/api/apps/import-from-toup-code"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                url,
+                json=body_payload,
+                headers={
+                    "X-Agent-Key": agent_key,
+                    "Content-Type": "application/json",
+                },
+            )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"agent unreachable: {type(e).__name__}: {e}",
+        ) from e
+
+    if resp.status_code >= 300:
+        # Surface the agent's actual error so the operator can fix it —
+        # not a generic 5xx that buries the real failure.
+        raise HTTPException(
+            status_code=502,
+            detail=f"agent rejected import (status={resp.status_code}): {resp.text[:400]}",
+        )
+
+    data = resp.json()
+    return SaveToWorkspaceResponse(
+        app_id=data["app_id"],
+        slug=data["slug"],
+        file_count=int(data.get("file_count") or len(files_payload)),
+        web_url=data.get("web_url"),
+    )
+
+
+def _last_project_for_user(user_id_seg: str) -> str:
+    """Find the most recently modified project dir under the user's
+    workspace root. Used as the fallback when the request omits
+    `project` — covers the common "I want to save what I just made"
+    case without forcing the frontend to track conv_ids manually.
+
+    Returns an empty string if no project dir exists; the caller then
+    404s with a clean error."""
+    root = (_workspace_root() / user_id_seg)
+    if not root.exists() or not root.is_dir():
+        return ""
+    try:
+        candidates = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return ""
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0].name
+
+
 @router.post("/spawn")
 async def spawn_session(
     body: SpawnRequest,
