@@ -79,6 +79,14 @@ class Memory(Base):
     source_message_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("messages.id"), nullable=True)
     source_type: Mapped[str] = mapped_column(String(50), default="conversation")
 
+    # Explicit linkage to platform entities (Ticket 2, 2026-05-13). When
+    # a memory is "about" a specific routine/trigger/connector, set
+    # ref_kind + ref_id so subsequent calls about the same entity
+    # UPSERT instead of duplicating. Backed by a partial unique index
+    # on (user_id, ref_kind, ref_id) installed by init_db.
+    ref_kind: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    ref_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+
     # Metadata (flexible JSON for additional attributes)
     metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tags_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

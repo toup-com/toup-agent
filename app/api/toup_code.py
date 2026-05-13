@@ -1,28 +1,28 @@
-"""Toup Code — experimental Claude Code IDE integration (2026-05-12).
+"""Toup Code — experimental dual-provider IDE integration.
 
-Deliberately isolated from the existing app_builder / Toup build
-pipeline so the feature can be tested end-to-end and either promoted
-or ripped out without disturbing the rest of the product.
+2026-05-12: Claude Code (Anthropic) shipped.
+2026-05-13: GPT Codex (OpenAI) added — first-time screen now shows two
+cards with real provider logos and accepts either token. /code/spawn
+routes to whichever CLI the user picked.
 
-Endpoints under /code/* (registered with the platform's api_prefix):
-  - GET    /code/status   — has a Claude Code OAuth token configured?
-  - POST   /code/token    — paste a `claude setup-token` value
-  - DELETE /code/token    — clear it
-  - POST   /code/spawn    — start a coding session (SSE stream)
+Endpoints under /code/*:
+  - GET    /code/status                 — both providers' connection state
+  - POST   /code/token                  — save a token { token, provider }
+  - DELETE /code/token?provider=...     — clear a provider's token
+  - POST   /code/spawn                  — start a session (SSE), provider-routed
+  - GET    /code/file                   — read a file from the workspace
 
-The OAuth token authenticates against the user's Claude Pro/Max
-subscription quota; Toup never bills for these calls. Stored on
-agent_configs.claude_code_oauth_token alongside the other channel
-tokens.
+Tokens authenticate against the user's own subscription / API key;
+Toup never bills for these calls. Stored on agent_configs.
+{claude_code_oauth_token, openai_codex_token} (plaintext, same trust
+model as the other channel tokens).
 
-`spawn` shells out to the official `claude` CLI inside a per-user,
-per-project workspace under WORKSPACE_ROOT/toup-code/<user>/<project>,
-streams its stream-json output line-by-line, translates each message
-into our compact event shape, and emits the result as Server-Sent
-Events. The frontend consumes the stream via fetch() + ReadableStream
-(EventSource can't POST). When `claude` isn't installed in the image
-yet (local dev / pre-deploy state), we emit one `error` event and
-close the stream cleanly so the UI doesn't hang.
+`spawn` shells out to either the official `claude` CLI or the official
+`codex` CLI inside a per-user, per-project workspace under
+WORKSPACE_ROOT/toup-code/<user>/<project>, streams stream-json output
+line-by-line, translates each message into our compact event shape,
+and emits SSE frames. When the requested CLI isn't installed in the
+image (pre-deploy state) we emit one `error` event and close cleanly.
 """
 from __future__ import annotations
 
@@ -36,9 +36,9 @@ import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Iterator, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -52,26 +52,37 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/code", tags=["toup-code"])
 
 
+Provider = Literal["claude", "codex"]
+_PROVIDERS: tuple[Provider, ...] = ("claude", "codex")
+
+
 # ── Schemas ────────────────────────────────────────────────────
 
 
-class TokenStatus(BaseModel):
+class ProviderStatus(BaseModel):
     configured: bool
     # Last 6 chars only — enough for the user to recognize "yes that's
     # the token I pasted" without ever surfacing the secret.
     masked: str | None = None
 
 
+class ProvidersStatus(BaseModel):
+    claude: ProviderStatus
+    codex: ProviderStatus
+
+
 class TokenIn(BaseModel):
     token: str = Field(..., min_length=20)
+    provider: Provider = "claude"
 
 
 class SpawnRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=4000)
-    # Subdirectory under <workspace_root>/toup-code/<user_id> where
-    # Claude Code will operate. Defaults to "default" so a brand-new
-    # user gets a working session without picking a project name first.
+    # Subdirectory under <workspace_root>/toup-code/<user_id> where the
+    # session runs. Defaults to "default" so a brand-new user gets a
+    # working session without picking a project name first.
     project: str | None = None
+    provider: Provider = "claude"
 
 
 # ── Helpers ────────────────────────────────────────────────────
@@ -105,6 +116,39 @@ _API_KEY_PREFIX = "sk-ant-api"
 # didn't pick up odd characters from clipboard / smart quotes / etc.
 _TOKEN_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
+# OpenAI API keys (the modern format used by the `codex` CLI's
+# OPENAI_API_KEY env var) are URL-safe base64 plus `sk-` or `sk-proj-`
+# prefixes. Looser than the Anthropic regex above because the leading
+# segment can contain dots in service-account keys.
+_OPENAI_TOKEN_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_\-\.]+$")
+
+
+def _provider_column(provider: Provider) -> str:
+    return {
+        "claude": "claude_code_oauth_token",
+        "codex": "openai_codex_token",
+    }[provider]
+
+
+def _provider_binary_name(provider: Provider) -> str:
+    return {"claude": "claude", "codex": "codex"}[provider]
+
+
+def _provider_env_var(provider: Provider) -> str:
+    """Env var the CLI uses to pick up the user's credential."""
+    return {
+        "claude": "CLAUDE_CODE_OAUTH_TOKEN",
+        "codex": "OPENAI_API_KEY",
+    }[provider]
+
+
+def _read_provider_token(config: AgentConfig, provider: Provider) -> str | None:
+    return getattr(config, _provider_column(provider), None)
+
+
+def _write_provider_token(config: AgentConfig, provider: Provider, token: str | None) -> None:
+    setattr(config, _provider_column(provider), token)
+
 
 def _clean_pasted_token(raw: str) -> str:
     """Strip ALL whitespace from a pasted token, not just the ends.
@@ -127,10 +171,7 @@ def _clean_pasted_token(raw: str) -> str:
     return s
 
 
-async def _validate_token(
-    token: str,
-    claude_bin: str,
-) -> tuple[bool, str]:
+async def _validate_claude_token(token: str, claude_bin: str) -> tuple[bool, str]:
     """Run a no-op `claude -p` invocation to confirm Anthropic accepts
     the OAuth token. Returns (valid, reason_or_message).
 
@@ -205,6 +246,50 @@ async def _validate_token(
     return True, "ok"
 
 
+async def _validate_codex_token(token: str) -> tuple[bool, str]:
+    """Ping OpenAI's /v1/models with the pasted API key. Cheaper + faster
+    than spawning the codex CLI to validate, and avoids burning a real
+    model call on each save. A 200 means OpenAI accepts the key for at
+    least one model; the codex CLI uses the same auth path.
+
+    We deliberately don't shell out to `codex exec` for validation —
+    the codex CLI on first run interactively offers ChatGPT-login and
+    can hang waiting for stdin. /v1/models with the user's key is a
+    direct test of the credential and nothing else.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except httpx.TimeoutException:
+        return False, "Validation timed out after 12s — OpenAI may be slow, please retry."
+    except Exception as e:  # pragma: no cover — network jitter
+        return False, f"Failed to reach OpenAI: {e!r}"
+
+    if resp.status_code == 200:
+        return True, "ok"
+    if resp.status_code == 401:
+        return False, (
+            "OpenAI rejected this key (401). Paste the secret key from "
+            "platform.openai.com/api-keys (starts with `sk-` or `sk-proj-…`). "
+            "Project keys must have access to at least one model."
+        )
+    if resp.status_code == 403:
+        return False, (
+            "OpenAI rejected this key (403). Your project may not have "
+            "model access enabled — visit platform.openai.com/api-keys and "
+            "confirm the key is active for at least one model."
+        )
+    if resp.status_code == 429:
+        return False, "OpenAI rate-limited the validation request. Retry in a moment."
+    detail = resp.text[:300].strip() or f"HTTP {resp.status_code}"
+    return False, f"OpenAI returned an unexpected error: {detail}"
+
+
 def _safe_segment(value: str, fallback: str = "default") -> str:
     """Strip a path segment to characters that can't escape a workspace
     dir. Conservative — alphanumeric, dash, underscore only."""
@@ -245,6 +330,118 @@ def _sse(event_type: str, payload: dict[str, Any]) -> str:
         "at": datetime.utcnow().isoformat() + "Z",
     }
     return f"data: {json.dumps(data, default=str)}\n\n"
+
+
+def _translate_codex_message(msg: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Map one `codex exec --json` event to our wire shape.
+
+    The OpenAI Codex CLI emits Submission/Event envelopes shaped like
+        {"id": "...", "msg": {"type": "<event>", ...}}
+
+    Known event types we handle (others are silently dropped):
+      - task_started:           {"model","provider"}   → system_init
+      - agent_message:          {"message": "..."}      → thinking
+      - agent_reasoning:        {"text": "..."}         → thinking
+      - exec_command_begin:     {"command":[...]}       → tool_use Bash
+      - exec_command_end:       {"exit_code": int,...}  → tool_error (if !=0)
+      - patch_apply_begin:      {"changes": {path: {add|update|delete}}}
+                                                        → file_created / file_edited
+      - error:                  {"message": "..."}      → error / auth_failed
+      - task_complete:          {"last_agent_message"}  → result
+
+    Lossy by design — we keep what the IDE renders and drop the rest.
+    """
+    payload_root = msg.get("msg") if isinstance(msg.get("msg"), dict) else msg
+    mtype = payload_root.get("type") if isinstance(payload_root, dict) else None
+    if not mtype or not isinstance(payload_root, dict):
+        return
+
+    if mtype == "task_started":
+        yield "system_init", {
+            "session_id": msg.get("id") or payload_root.get("session_id"),
+            "model": payload_root.get("model"),
+            "tools": [],
+        }
+        return
+
+    if mtype in ("agent_message", "agent_reasoning"):
+        text = str(payload_root.get("message") or payload_root.get("text") or "").strip()
+        if text:
+            yield "thinking", {"text": text}
+        return
+
+    if mtype == "exec_command_begin":
+        cmd = payload_root.get("command")
+        if isinstance(cmd, list):
+            cmd_str = " ".join(str(c) for c in cmd)
+        else:
+            cmd_str = str(cmd or "")
+        yield "tool_use", {
+            "name": "Bash",
+            "command": cmd_str[:500],
+            "tool_use_id": payload_root.get("call_id") or msg.get("id"),
+        }
+        return
+
+    if mtype == "exec_command_end":
+        # Only surface failures — successes already showed as tool_use.
+        exit_code = payload_root.get("exit_code")
+        if exit_code not in (0, None):
+            err = (payload_root.get("stderr") or payload_root.get("stdout") or "")
+            yield "tool_error", {
+                "tool_use_id": payload_root.get("call_id") or msg.get("id"),
+                "content": f"exit {exit_code}: {str(err)[:600]}",
+            }
+        return
+
+    if mtype == "patch_apply_begin":
+        changes = payload_root.get("changes") or {}
+        if isinstance(changes, dict):
+            for path, kind_obj in changes.items():
+                kind: str | None = None
+                if isinstance(kind_obj, dict):
+                    if "add" in kind_obj:
+                        kind = "add"
+                    elif "delete" in kind_obj:
+                        kind = "delete"
+                    elif "update" in kind_obj or "rename" in kind_obj:
+                        kind = "update"
+                elif isinstance(kind_obj, str):
+                    kind = kind_obj
+                if kind == "add":
+                    yield "file_created", {"path": str(path), "tool_use_id": msg.get("id")}
+                elif kind in ("update", "rename"):
+                    yield "file_edited", {"path": str(path), "tool_use_id": msg.get("id")}
+                # `delete` has no UI event today — skip silently
+        return
+
+    if mtype == "error":
+        emsg = str(payload_root.get("message") or "")
+        lower = emsg.lower()
+        if "401" in emsg or "invalid api key" in lower or ("auth" in lower and "fail" in lower):
+            yield "auth_failed", {
+                "message": (
+                    "OpenAI rejected your Codex API key. Click Disconnect, "
+                    "then paste a fresh key from platform.openai.com/api-keys."
+                ),
+                "raw": emsg[:500],
+            }
+        else:
+            yield "error", {"message": emsg[:1500] or "codex reported an error"}
+        return
+
+    if mtype == "task_complete":
+        result_text = str(payload_root.get("last_agent_message") or "")
+        yield "result", {
+            "subtype": "success",
+            "is_error": False,
+            "result": result_text,
+            "duration_ms": payload_root.get("duration_ms"),
+            "num_turns": payload_root.get("num_turns"),
+            "total_cost_usd": payload_root.get("total_cost_usd"),
+            "session_id": msg.get("id"),
+        }
+        return
 
 
 def _translate_message(msg: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]]]:
@@ -347,49 +544,33 @@ def _translate_message(msg: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any
 # ── Endpoints ──────────────────────────────────────────────────
 
 
-@router.get("/status", response_model=TokenStatus)
-async def get_token_status(
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    config = await _get_or_create_config(str(current_user.id), db)
-    token = config.claude_code_oauth_token
+def _provider_status_from_token(token: str | None) -> ProviderStatus:
     if not token:
-        return TokenStatus(configured=False)
-    return TokenStatus(configured=True, masked=f"…{token[-6:]}")
+        return ProviderStatus(configured=False)
+    return ProviderStatus(configured=True, masked=f"…{token[-6:]}")
 
 
-@router.post("/token", response_model=TokenStatus)
-async def save_token(
-    body: TokenIn,
+@router.get("/status", response_model=ProvidersStatus)
+async def get_status(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Store an OAuth token from `claude setup-token`.
+    """Return connection state for every supported provider in one call.
 
-    Runs a tiny `claude -p "ok"` subprocess with the pasted token to
-    verify Anthropic accepts it. Rejects the save with HTTP 400 +
-    actionable detail if Anthropic returns 401 (most common cause:
-    user pasted an `sk-ant-api…` API key instead of the
-    `sk-ant-oat01-…` OAuth token that setup-token emits).
+    The frontend's first-time screen renders both cards regardless of
+    state, so collapsing this to a single round-trip keeps the page
+    snappy and avoids racing two status fetches against each other."""
+    config = await _get_or_create_config(str(current_user.id), db)
+    return ProvidersStatus(
+        claude=_provider_status_from_token(config.claude_code_oauth_token),
+        codex=_provider_status_from_token(config.openai_codex_token),
+    )
 
-    If the `claude` CLI isn't installed in this environment (pre-deploy
-    window), we skip validation and accept the token optimistically —
-    /code/spawn will surface the auth error later with the same
-    actionable message."""
-    token = _clean_pasted_token(body.token)
 
-    if len(token) < 20:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "That doesn't look like a Claude Code token after whitespace "
-                "was removed. Make sure you pasted the entire long token from "
-                "`claude setup-token`."
-            ),
-        )
-
-    # Hard-reject obvious mismatches before we burn 5 s on a subprocess.
+def _validate_claude_token_shape(token: str) -> None:
+    """Raise HTTPException(400) on obvious shape mismatches for Claude
+    Code tokens — runs BEFORE the slow subprocess validation so the user
+    gets immediate feedback when they pasted the wrong kind of secret."""
     if token.startswith(_API_KEY_PREFIX):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -400,7 +581,6 @@ async def save_token(
                 "and paste its output (starts with `sk-ant-oat01-…`)."
             ),
         )
-
     if not _TOKEN_ALLOWED_RE.match(token):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -412,36 +592,103 @@ async def save_token(
             ),
         )
 
-    claude_bin = shutil.which("claude")
-    if claude_bin:
-        valid, reason = await _validate_token(token, claude_bin)
-        if not valid:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=reason,
-            )
-    else:
-        logger.warning(
-            "toup_code: claude CLI not installed; skipping save-time token validation"
+
+def _validate_codex_token_shape(token: str) -> None:
+    """OpenAI keys are `sk-…` (legacy) or `sk-proj-…` (project keys).
+    Reject anything that doesn't match the cipherset (URL-safe base64
+    + dot for service-account keys) early."""
+    if token.startswith("sk-ant-"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "That looks like an Anthropic secret. The Codex card "
+                "needs an OpenAI API key — generate one at "
+                "platform.openai.com/api-keys (starts with `sk-` or `sk-proj-`)."
+            ),
+        )
+    if not _OPENAI_TOKEN_ALLOWED_RE.match(token):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Token contains characters that don't belong to an OpenAI "
+                "API key (allowed: letters, digits, `-`, `_`, `.`). Re-copy "
+                "directly from the OpenAI dashboard."
+            ),
+        )
+    if not (token.startswith("sk-") or token.startswith("rk_")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "OpenAI API keys start with `sk-` or `sk-proj-`. Generate one "
+                "at platform.openai.com/api-keys and paste it here."
+            ),
         )
 
+
+@router.post("/token", response_model=ProviderStatus)
+async def save_token(
+    body: TokenIn,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store a credential for the named provider.
+
+    For `claude` we run a no-op `claude -p` subprocess against
+    Anthropic's API to confirm the token is accepted. For `codex` we
+    ping `GET https://api.openai.com/v1/models` — cheaper than spawning
+    the CLI and avoids the interactive-login dance the codex CLI does
+    on its first run.
+
+    Both validations are best-effort: when the CLI is missing (pre-deploy
+    window) we still save and let /code/spawn surface the auth error
+    with the same actionable copy."""
+    token = _clean_pasted_token(body.token)
+    if len(token) < 20:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "That doesn't look like a token after whitespace was removed. "
+                "Make sure you pasted the entire value."
+            ),
+        )
+
+    if body.provider == "claude":
+        _validate_claude_token_shape(token)
+        claude_bin = shutil.which("claude")
+        if claude_bin:
+            valid, reason = await _validate_claude_token(token, claude_bin)
+            if not valid:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
+        else:
+            logger.warning(
+                "toup_code: claude CLI not installed; skipping save-time validation"
+            )
+    elif body.provider == "codex":
+        _validate_codex_token_shape(token)
+        valid, reason = await _validate_codex_token(token)
+        if not valid:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
+    else:  # pragma: no cover — Literal type guards this
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {body.provider!r}")
+
     config = await _get_or_create_config(str(current_user.id), db)
-    config.claude_code_oauth_token = token
+    _write_provider_token(config, body.provider, token)
     config.updated_at = datetime.utcnow()
     await db.commit()
-    return TokenStatus(configured=True, masked=f"…{token[-6:]}")
+    return ProviderStatus(configured=True, masked=f"…{token[-6:]}")
 
 
-@router.delete("/token", response_model=TokenStatus)
+@router.delete("/token", response_model=ProviderStatus)
 async def clear_token(
+    provider: Provider = Query("claude"),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     config = await _get_or_create_config(str(current_user.id), db)
-    config.claude_code_oauth_token = None
+    _write_provider_token(config, provider, None)
     config.updated_at = datetime.utcnow()
     await db.commit()
-    return TokenStatus(configured=False)
+    return ProviderStatus(configured=False)
 
 
 @router.get("/file")
@@ -525,13 +772,16 @@ async def spawn_session(
     finally block to kill the subprocess — we don't want an orphaned
     `claude` chewing through subscription quota after the tab closes.
     """
+    provider = body.provider
     config = await _get_or_create_config(str(current_user.id), db)
-    raw_token = config.claude_code_oauth_token
+    raw_token = _read_provider_token(config, provider)
     if not raw_token:
+        pretty = {"claude": "Claude Code", "codex": "GPT Codex"}[provider]
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Connect your Claude Code subscription first.",
+            detail=f"Connect your {pretty} credential first.",
         )
+
     # Defense-in-depth: tokens saved before the whitespace fix landed
     # may still have embedded newlines from terminal copy/paste. Clean
     # on read so the existing connector starts working without forcing
@@ -539,12 +789,12 @@ async def spawn_session(
     # don't keep showing a stale masked tail.
     token = _clean_pasted_token(raw_token)
     if token != raw_token:
-        config.claude_code_oauth_token = token
+        _write_provider_token(config, provider, token)
         config.updated_at = datetime.utcnow()
         await db.commit()
         logger.info(
-            "toup_code: sanitized stored token for user=%s (stripped %d whitespace chars)",
-            current_user.id, len(raw_token) - len(token),
+            "toup_code: sanitized stored %s token for user=%s (stripped %d whitespace chars)",
+            provider, current_user.id, len(raw_token) - len(token),
         )
 
     user_id = _safe_segment(str(current_user.id), "user")
@@ -554,7 +804,9 @@ async def spawn_session(
     workspace.mkdir(parents=True, exist_ok=True)
     session_id = uuid.uuid4().hex[:12]
     prompt_text = body.prompt
-    claude_bin = shutil.which("claude")
+
+    bin_name = _provider_binary_name(provider)
+    bin_path = shutil.which(bin_name)
 
     async def stream() -> AsyncIterator[str]:
         # Open with a synthetic session_started so the UI has something
@@ -563,25 +815,61 @@ async def spawn_session(
             "session_id": session_id,
             "project": project,
             "prompt": prompt_text,
+            "provider": provider,
         })
 
-        if claude_bin is None:
+        if bin_path is None:
+            install_hint = {
+                "claude": "npm install -g @anthropic-ai/claude-code",
+                "codex": "npm install -g @openai/codex",
+            }[provider]
             yield _sse("error", {
                 "message": (
-                    "The `claude` CLI is not installed in this environment yet. "
-                    "Deploy with the updated Dockerfile (Node.js + "
-                    "@anthropic-ai/claude-code) to enable real execution."
+                    f"The `{bin_name}` CLI is not installed in this environment yet. "
+                    f"Deploy with the updated Dockerfile or run `{install_hint}`."
                 ),
             })
             yield "data: [DONE]\n\n"
             return
 
-        # Build env — token IN, ANTHROPIC_API_KEY OUT (an API key would
-        # otherwise take precedence over the OAuth token and bill the
-        # *platform* account instead of the user's subscription).
-        env = {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token}
-        env.pop("ANTHROPIC_API_KEY", None)
-        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        # Build env — provider token IN, the *other* provider's vars OUT
+        # so a stray platform-side credential can't take precedence and
+        # bill the wrong account.
+        env = {**os.environ, _provider_env_var(provider): token}
+        if provider == "claude":
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        else:  # codex
+            env.pop("OPENAI_API_KEY", None)  # we just set it; ensure no shadowing from os.environ leftovers
+            env[_provider_env_var(provider)] = token
+
+        # Per-provider argv.
+        if provider == "claude":
+            argv = [
+                bin_path,
+                "-p", prompt_text,
+                "--model", "claude-opus-4-7",
+                # Sonnet 4.6 covers turns when Opus 4.7 is rate-limited or
+                # overloaded so the session degrades instead of failing
+                # outright. --fallback-model only works with --print.
+                "--fallback-model", "claude-sonnet-4-6",
+                "--output-format", "stream-json",
+                "--verbose",
+                "--permission-mode", "acceptEdits",
+            ]
+        else:  # codex
+            argv = [
+                bin_path,
+                "exec",
+                # `--json` makes the codex CLI emit one JSON event per
+                # line on stdout, mirroring the shape we already parse
+                # for Claude Code.
+                "--json",
+                # `--full-auto` skips the per-tool approval prompts that
+                # would otherwise block a non-interactive session.
+                "--full-auto",
+                prompt_text,
+            ]
 
         proc: asyncio.subprocess.Process | None = None
         stderr_buf: list[str] = []
@@ -593,38 +881,32 @@ async def spawn_session(
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                claude_bin,
-                "-p", prompt_text,
-                "--model", "claude-opus-4-7",
-                # Sonnet 4.6 covers turns when Opus 4.7 is rate-limited or
-                # overloaded so the session degrades instead of failing
-                # outright. --fallback-model only works with --print, which
-                # is exactly the mode we're in.
-                "--fallback-model", "claude-sonnet-4-6",
-                "--output-format", "stream-json",
-                "--verbose",
-                "--permission-mode", "acceptEdits",
+                *argv,
                 cwd=str(workspace),
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
         except Exception as e:  # pragma: no cover — defensive
-            logger.exception("claude spawn failed: user=%s", user_id)
-            yield _sse("error", {"message": f"Failed to start claude: {e!r}"})
+            logger.exception("toup_code spawn failed: provider=%s user=%s", provider, user_id)
+            yield _sse("error", {"message": f"Failed to start {bin_name}: {e!r}"})
             yield "data: [DONE]\n\n"
             return
 
         stderr_task = asyncio.create_task(drain_stderr())
         last_result_seen = False
+        translator = _translate_message if provider == "claude" else _translate_codex_message
 
         try:
             assert proc.stdout is not None
             async for raw in proc.stdout:
                 # Client-gone short-circuit — checked each line so we
-                # don't keep paying claude tokens after the tab closes.
+                # don't keep paying for tokens after the tab closes.
                 if await request.is_disconnected():
-                    logger.info("toup_code: client disconnected, killing claude pid=%s", proc.pid)
+                    logger.info(
+                        "toup_code: client disconnected, killing %s pid=%s",
+                        bin_name, proc.pid,
+                    )
                     break
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
@@ -634,7 +916,7 @@ async def spawn_session(
                 except json.JSONDecodeError:
                     logger.debug("toup_code: non-JSON line: %r", line[:200])
                     continue
-                for evt_type, payload in _translate_message(msg):
+                for evt_type, payload in translator(msg):
                     if evt_type == "result":
                         last_result_seen = True
                     # Rewrite absolute file paths to <project>/<rel>
@@ -648,9 +930,8 @@ async def spawn_session(
                         raw_path = payload.get("path")
                         if isinstance(raw_path, str) and raw_path:
                             try:
-                                payload["path"] = str(
-                                    Path(raw_path).resolve().relative_to(user_workspace_root)
-                                )
+                                resolved = (workspace / raw_path).resolve() if not Path(raw_path).is_absolute() else Path(raw_path).resolve()
+                                payload["path"] = str(resolved.relative_to(user_workspace_root))
                             except (ValueError, OSError):
                                 pass
                     yield _sse(evt_type, payload)
@@ -659,7 +940,7 @@ async def spawn_session(
             await stderr_task
 
             if rc != 0 and not last_result_seen:
-                err = "".join(stderr_buf).strip() or f"claude exited with code {rc}"
+                err = "".join(stderr_buf).strip() or f"{bin_name} exited with code {rc}"
                 yield _sse("error", {"message": err[:1500]})
         finally:
             if proc and proc.returncode is None:
@@ -675,6 +956,7 @@ async def spawn_session(
         yield _sse("session_completed", {
             "session_id": session_id,
             "exit_code": proc.returncode if proc else None,
+            "provider": provider,
         })
         yield "data: [DONE]\n\n"
 
@@ -685,7 +967,7 @@ async def spawn_session(
             "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             # Tells nginx/Caddy not to buffer the response — without this
-            # the user only sees events arrive once claude exits.
+            # the user only sees events arrive once the CLI exits.
             "X-Accel-Buffering": "no",
         },
     )

@@ -473,6 +473,17 @@ async def init_db():
         # land. Empty for v1 — listed here so the migration path is
         # obvious when we add columns later.
         # (Reserved space; no v1 ALTERs needed beyond create_all.)
+        # Bug sweep 2026-05-13 / Ticket 2: explicit memory↔entity linkage
+        # (ref_kind, ref_id) so memories ABOUT a specific routine/trigger
+        # upsert instead of duplicating. Columns are nullable — legacy
+        # memories don't need them. Partial unique index enforces "one
+        # active memory per (user, ref_kind, ref_id)" when set.
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS ref_kind VARCHAR(50)",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS ref_id VARCHAR(100)",
+        "CREATE INDEX IF NOT EXISTS ix_memories_ref ON memories (user_id, ref_kind, ref_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_memories_ref_unique "
+        "ON memories (user_id, ref_kind, ref_id) "
+        "WHERE ref_id IS NOT NULL AND is_deleted = FALSE",
         # Bug sweep 2026-05-13 / Ticket 1: enforce Reading-A invariant —
         # one Conversation per (user, day, channel) for system channels.
         # Predicate matches SYSTEM_CHANNELS in

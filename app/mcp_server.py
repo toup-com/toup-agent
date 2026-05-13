@@ -117,24 +117,104 @@ async def memory_create(
     content: str,
     category: str,
     brain_type: str = "user",
-    memory_type: str = "episodic",
+    memory_type: str = "note",
+    memory_level: str = "episodic",
     importance: float = 0.5,
     tags: Optional[list[str]] = None,
     metadata: Optional[dict] = None,
+    ref_kind: Optional[str] = None,
+    ref_id: Optional[str] = None,
 ) -> dict:
-    """Store a new memory in the user's brain.
+    """Store a memory in the user's brain.
 
-    Automatically generates embeddings and deduplicates against existing
-    memories. Returns the created (or reinforced) memory.
+    Type vs Level (Ticket 2.1 — these are different things, don't conflate):
+      `memory_type`  — WHAT KIND of fact this is. One of:
+                       fact, preference, task, event, person, place,
+                       project, decision, skill, file, note, conversation.
+                       Default: "note".
+      `memory_level` — WHICH COGNITIVE LAYER it lives in. One of:
+                       episodic, semantic, procedural, meta.
+                       Default: "episodic".
+
+    Upsert by entity (Ticket 2): if this memory is about a specific
+    routine, trigger, or connector, set BOTH `ref_kind` (e.g.
+    "routine", "trigger", "connector") AND `ref_id` (the entity's
+    id/uuid). When a memory with the same (user, ref_kind, ref_id)
+    already exists, the new content REPLACES it instead of creating
+    a duplicate. Without ref_kind+ref_id, semantic-similarity dedup
+    is used (less reliable).
+
+    Returns the created or updated memory.
     """
-    from app.api.memories import MemoryCreate
+    # Fast-fail validation BEFORE any heavier imports so the LLM gets a
+    # parseable error in <100ms instead of a 3 s Pydantic round-trip.
+    # Ticket 2.1 — the "semantic" mistake the agent made was passing a
+    # MemoryLevel value into a MemoryType slot. Schema imports are
+    # lightweight (no FastAPI / DB side-effects).
+    from app.schemas import MemoryType as _MT, MemoryLevel as _ML
+
+    _valid_types = [t.value for t in _MT]
+    if memory_type not in _valid_types:
+        return {
+            "error": f"Invalid memory_type {memory_type!r}. Must be one of: "
+                     f"{', '.join(_valid_types)}. Note: cognitive layers "
+                     f"like 'episodic' / 'semantic' go in `memory_level`, "
+                     f"not `memory_type`.",
+        }
+    _valid_levels = [l.value for l in _ML]
+    if memory_level not in _valid_levels:
+        return {
+            "error": f"Invalid memory_level {memory_level!r}. Must be one of: "
+                     f"{', '.join(_valid_levels)}.",
+        }
+
+    # Heavier imports only after the cheap validation passes.
+    from app.api.memories import MemoryCreate, MemoryUpdate
+    from app.db.models import Memory as _Memory
+    from sqlalchemy import select as _select
 
     user_id = _get_user_id()
+
+    # Upsert path: when ref_kind+ref_id are set, look up the existing
+    # memory and UPDATE it. This is the Ticket 2 fix: routines + triggers
+    # that change schedule update their canonical memory instead of
+    # producing N stale rows.
+    if ref_kind and ref_id:
+        async with async_session_maker() as db:
+            existing = (await db.execute(
+                _select(_Memory).where(
+                    _Memory.user_id == user_id,
+                    _Memory.ref_kind == ref_kind,
+                    _Memory.ref_id == ref_id,
+                    _Memory.is_deleted.is_(False),
+                ).limit(1)
+            )).scalar_one_or_none()
+            if existing is not None:
+                svc = MemoryService(db)
+                update_data = MemoryUpdate()
+                update_data.content = content
+                update_data.category = category
+                update_data.importance = importance
+                if tags is not None:
+                    update_data.tags = tags
+                updated = await svc.update_memory(existing.id, user_id, update_data)
+                if updated is not None:
+                    return {
+                        "id": str(updated.id),
+                        "content": updated.content,
+                        "category": updated.category,
+                        "importance": float(updated.importance),
+                        "ref_kind": ref_kind,
+                        "ref_id": ref_id,
+                        "action": "updated",
+                    }
+
     memory_data = MemoryCreate(
         content=content,
         category=category,
         brain_type=brain_type,
         memory_type=memory_type,
+        memory_level=memory_level,
         importance=importance,
         tags=tags or [],
         metadata=metadata or {},
@@ -143,12 +223,22 @@ async def memory_create(
     async with async_session_maker() as db:
         svc = MemoryService(db)
         memory = await svc.create_memory(user_id, memory_data)
+        # Stamp ref linkage if provided. Service-level path doesn't know
+        # about it; we apply it post-create so the partial unique index
+        # catches future collisions.
+        if ref_kind and ref_id:
+            memory.ref_kind = ref_kind
+            memory.ref_id = ref_id
+            await db.commit()
         return {
             "id": str(memory.id),
             "content": memory.content,
             "category": memory.category,
             "importance": float(memory.importance),
+            "ref_kind": ref_kind,
+            "ref_id": ref_id,
             "created_at": memory.created_at.isoformat() if memory.created_at else None,
+            "action": "created",
         }
 
 

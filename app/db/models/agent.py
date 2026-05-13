@@ -297,6 +297,12 @@ class AgentConfig(Base):
     # to public if the experiment graduates.
     claude_code_oauth_token: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
 
+    # OpenAI API key for the `codex` CLI (the OpenAI Codex companion to
+    # Claude Code, npm i -g @openai/codex). Same trust + storage model
+    # as the Anthropic side; Toup Code routes /code/spawn to whichever
+    # CLI the user picked. Migration 039 added the column.
+    openai_codex_token: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
+
     # Step 4: Services
     brave_api_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     elevenlabs_api_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
