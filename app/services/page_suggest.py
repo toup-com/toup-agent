@@ -56,10 +56,13 @@ from app.services.page_context_render import render_page_context
 
 logger = logging.getLogger(__name__)
 
-# Pinned model for /suggest. Cheapest Anthropic model that gives
-# acceptable JSON quality for this task. Hardcoded here rather than
-# pulling from settings so it survives an env-var nudge.
-_SUGGEST_MODEL = "claude-haiku-4-5-20251001"
+# Pinned model for /suggest. gpt-4o-mini ($0.15/1M input,
+# $0.60/1M output) — the cheapest production-grade option on the
+# platform's OpenAI key, ~6× cheaper than Haiku 4.5 and ~30× cheaper
+# than GPT-5.5. Hardcoded here rather than pulled from settings so it
+# survives an env-var nudge. Supports vision (not used here, but the
+# vision_grounding sibling uses the same model for consistency).
+_SUGGEST_MODEL = "gpt-4o-mini"
 
 # Trim readable_content to this many chars before rendering the context
 # block. The renderer's own cap is 8000 (good for the chat path); for
@@ -253,10 +256,11 @@ async def suggest_for_page(
             call_system_llm(
                 user_id=user_id,
                 operation_type="system.extension.suggest",
-                # Cost lever #4: PIN to Haiku. `model=None` honored the
+                # Cost lever #4: PIN to gpt-4o-mini (see _SUGGEST_MODEL
+                # comment above). `model=None` previously honored the
                 # user's chat model — for GPT-5.5 users this turned the
-                # "Haiku call" into a $5/1M-input pipe. Hardcoded here
-                # so cost is predictable regardless of who's using it.
+                # "Haiku call" into a $5/1M-input pipe. Now hardcoded so
+                # cost is predictable regardless of who's using it.
                 model=_SUGGEST_MODEL,
                 max_tokens=200,
                 system=_SYSTEM,

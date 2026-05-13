@@ -146,6 +146,14 @@ def _bundle_active() -> bool:
     )
 
 
+# Production fallback model when an Anthropic dispatch can't complete.
+# Cheapest production-grade option ($0.15/1M input, $0.60/1M output) on
+# the platform's OpenAI key, vision-capable. Background callers that
+# pin a `claude-…` model don't have to know about this — the fallback
+# is transparent below.
+_ANTHROPIC_FALLBACK_OPENAI_MODEL = "gpt-4o-mini"
+
+
 async def _system_call_anthropic(
     *,
     user_id: str,
@@ -161,12 +169,21 @@ async def _system_call_anthropic(
     Bundle path uses the same `make_anthropic_client()` the chat does,
     so credentials + WAF-bypass headers stay in lockstep with the rest
     of the agent. Single source of truth for "how does this agent reach
-    Anthropic" — we don't reimplement auth here."""
+    Anthropic" — we don't reimplement auth here.
+
+    Production fallback (2026-05-13): if the Anthropic path can't
+    succeed (no key, bundle client returns None, SDK raises, direct
+    call 4xx/5xx), we fall through to gpt-4o-mini on the platform's
+    OpenAI key instead of silently returning None. Background features
+    that pin a Claude model are decoupled from "is Anthropic reachable
+    right now" — the call always either returns text or raises a
+    transport-level error, never a "succeeded with None" zombie."""
     start = time.time()
     status = "ok"
     input_tokens = 0
     output_tokens = 0
     text: Optional[str] = None
+    fallback_reason: Optional[str] = None  # set if we should fall through to OpenAI
 
     if _bundle_active():
         # SDK path — let bundle_client handle proxy URL, TOUP_TOKEN auth,
@@ -176,32 +193,35 @@ async def _system_call_anthropic(
             client = make_anthropic_client()
             if client is None:
                 logger.warning(
-                    "[internal_llm] bundle mode but make_anthropic_client returned None for op=%s",
-                    operation_type,
+                    "[internal_llm] bundle mode but make_anthropic_client returned None for op=%s — falling back to %s",
+                    operation_type, _ANTHROPIC_FALLBACK_OPENAI_MODEL,
                 )
-                return None
-            resp = await client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=messages,
-                timeout=timeout,
-            )
-            usage = getattr(resp, "usage", None)
-            if usage is not None:
-                input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-                output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-            blocks = getattr(resp, "content", None) or []
-            if blocks:
-                first = blocks[0]
-                # SDK returns TextBlock objects; .text is the attr
-                text = getattr(first, "text", None) or None
+                fallback_reason = "bundle_client_none"
+            else:
+                resp = await client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=messages,
+                    timeout=timeout,
+                )
+                usage = getattr(resp, "usage", None)
+                if usage is not None:
+                    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+                    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+                blocks = getattr(resp, "content", None) or []
+                if blocks:
+                    first = blocks[0]
+                    # SDK returns TextBlock objects; .text is the attr
+                    text = getattr(first, "text", None) or None
         except Exception as e:
             status = "error"
             logger.warning(
-                "[internal_llm] bundle Anthropic call failed for op=%s: %s: %s",
+                "[internal_llm] bundle Anthropic call failed for op=%s: %s: %s — falling back to %s",
                 operation_type, type(e).__name__, str(e)[:300],
+                _ANTHROPIC_FALLBACK_OPENAI_MODEL,
             )
+            fallback_reason = f"bundle_exc_{type(e).__name__}"
     else:
         # Legacy direct-API path. Same code as `call_anthropic_system`
         # below — inlined here to keep one logging call per dispatch.
@@ -213,6 +233,13 @@ async def _system_call_anthropic(
             messages=messages,
             timeout=timeout,
         )
+        if status == "error" or text is None:
+            fallback_reason = "direct_failed_or_empty"
+            logger.warning(
+                "[internal_llm] direct Anthropic returned status=%s text=%s for op=%s — falling back to %s",
+                status, "None" if text is None else "<text>",
+                operation_type, _ANTHROPIC_FALLBACK_OPENAI_MODEL,
+            )
 
     latency_ms = int((time.time() - start) * 1000)
     cost_cents = _calc_cost_cents(model, input_tokens, output_tokens)
@@ -227,6 +254,25 @@ async def _system_call_anthropic(
         latency_ms=latency_ms,
         status=status,
     )
+
+    # Production fallback: Anthropic dispatch couldn't complete cleanly
+    # — call gpt-4o-mini through the OpenAI path and return its result.
+    # Both calls get logged separately to llm_proxy_events so the dashboard
+    # shows the failed attempt + the recovery in chronological order.
+    if fallback_reason is not None:
+        logger.info(
+            "[internal_llm] Anthropic fallback engaged for op=%s reason=%s → %s",
+            operation_type, fallback_reason, _ANTHROPIC_FALLBACK_OPENAI_MODEL,
+        )
+        return await _system_call_openai(
+            user_id=user_id,
+            operation_type=operation_type + ".anthropic_fallback",
+            model=_ANTHROPIC_FALLBACK_OPENAI_MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+            timeout=timeout,
+        )
     return text
 
 

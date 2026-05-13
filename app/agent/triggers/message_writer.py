@@ -9,7 +9,6 @@ for the Day-as-Chat filter "show me trigger fires only."
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from datetime import datetime
@@ -42,8 +41,9 @@ async def write_trigger_message(
     "trigger". Broadcasting is the caller's responsibility (so the
     broadcast event can include the just-returned id).
     """
+    from app.agent.conversation_resolver import resolve_or_create_day_conversation
     from app.db.message_helpers import resolve_day_chat_id_for_now
-    from app.db.models import Conversation, DayChat, Message
+    from app.db.models import DayChat, Message
 
     day_chat_id = await resolve_day_chat_id_for_now(
         db, user_id, tz_override=tz_override,
@@ -55,17 +55,16 @@ async def write_trigger_message(
     if extra_metadata:
         convo_meta.update(extra_metadata)
 
-    conv = Conversation(
-        id=str(uuid.uuid4()),
+    # Reading A (Day-as-Chat): one trigger Conversation per
+    # (user, day_chat, channel). See app/agent/conversation_resolver.py.
+    conv = await resolve_or_create_day_conversation(
+        db,
         user_id=user_id,
-        channel="trigger",
-        is_active=True,
         day_chat_id=day_chat_id,
+        channel="trigger",
         title=title or f"Trigger: {source}",
-        metadata_json=json.dumps(convo_meta),
+        metadata=convo_meta,
     )
-    db.add(conv)
-    await db.flush()
 
     msg_id = str(uuid.uuid4())
     msg = Message(

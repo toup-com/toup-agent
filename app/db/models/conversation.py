@@ -17,6 +17,19 @@ class Conversation(Base):
     A session is a sub-stream inside a DayChat. It tracks one continuous UI
     thread on one channel. The agent's context scope is the parent DayChat
     (all sessions for the day), not individual sessions.
+
+    Reading-A invariant (decided 2026-05-13, see
+    docs/bug-sweep-2026-05-13.md): for SYSTEM-DRIVEN channels —
+    `routine`, `trigger`, `api`, `digest` — there is exactly ONE active
+    Conversation per `(user_id, day_chat_id, channel)`. Every fire on
+    the same day appends to the same row instead of spawning a new one.
+    Enforced by partial unique index
+    `ix_conversations_system_channel_per_day` and the canonical resolver
+    `app.agent.conversation_resolver.resolve_or_create_day_conversation`.
+
+    USER-DRIVEN channels (`web`, `telegram`, `whatsapp`, `voice`,
+    `extension`, `app`) keep the per-day-with-`New Thread`-override
+    behavior and do NOT go through that resolver.
     """
     __tablename__ = "conversations"
 

@@ -473,6 +473,15 @@ async def init_db():
         # land. Empty for v1 — listed here so the migration path is
         # obvious when we add columns later.
         # (Reserved space; no v1 ALTERs needed beyond create_all.)
+        # Bug sweep 2026-05-13 / Ticket 1: enforce Reading-A invariant —
+        # one Conversation per (user, day, channel) for system channels.
+        # Predicate matches SYSTEM_CHANNELS in
+        # app.agent.conversation_resolver. Partial-on-is_active so soft-
+        # deleted (post-merge) rows from the cleanup script don't block
+        # future inserts.
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_conversations_system_channel_per_day "
+        "ON conversations (user_id, day_chat_id, channel) "
+        "WHERE channel IN ('routine', 'trigger', 'api', 'digest') AND is_active = TRUE",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

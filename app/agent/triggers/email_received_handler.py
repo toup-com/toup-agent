@@ -338,14 +338,14 @@ class EmailReceivedHandler:
 
         cfg = trigger.config_json or {}
         # Default-cheap policy (2026-05-13 cost audit): when no explicit
-        # `model` is configured, route per-email summarization to Haiku
-        # instead of falling through to the user's chat-model default.
-        # A busy inbox can fire this 50-100×/day; on GPT-5.5 that's
-        # $1-2/day per active user just for triage. Haiku 4.5 is more
-        # than capable for "summarize this email + extract action items".
-        # Power users wanting Sonnet/Opus set `config_json.model` on
-        # the trigger explicitly.
-        model_choice = (cfg.get("model") or "").strip() or "claude-haiku-4-5-20251001"
+        # `model` is configured, route per-email summarization to
+        # gpt-4o-mini ($0.15/1M input) instead of falling through to
+        # the user's chat-model default. A busy inbox can fire this
+        # 50-100×/day; on GPT-5.5 that's $1-2/day per active user just
+        # for triage. gpt-4o-mini is plenty for "summarize this email +
+        # extract action items". Power users wanting Sonnet/Opus set
+        # `config_json.model` on the trigger explicitly.
+        model_choice = (cfg.get("model") or "").strip() or "gpt-4o-mini"
 
         text = await llm(
             user_id=trigger.user_id,

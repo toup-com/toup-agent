@@ -248,14 +248,16 @@ class EmailBriefingHandler:
             llm = call_system_llm
 
         # Per-routine model with default-cheap policy (2026-05-13 cost
-        # audit): when `config_json.model` is unset we default to Haiku
-        # instead of falling through to the user's chat-model default.
-        # Email briefings are inherently summarization — Haiku 4.5 is
-        # excellent at this and predictable on cost. Power users
-        # wanting "Sonnet for nuance" / "Opus for the morning digest"
-        # can still set `config_json.model` explicitly per routine.
+        # audit): when `config_json.model` is unset we default to
+        # gpt-4o-mini ($0.15/1M input) instead of falling through to
+        # the user's chat-model default. Email briefings are inherently
+        # summarization — gpt-4o-mini is excellent at this and the
+        # cheapest production-grade option on the platform OpenAI key.
+        # Power users wanting "Sonnet for nuance" / "Opus for the
+        # morning digest" can still set `config_json.model` explicitly
+        # per routine.
         cfg = routine.config_json or {}
-        model_choice = (cfg.get("model") or "").strip() or "claude-haiku-4-5-20251001"
+        model_choice = (cfg.get("model") or "").strip() or "gpt-4o-mini"
 
         prompt_body = _format_emails_for_llm(emails)
         if fetched_count > len(emails):

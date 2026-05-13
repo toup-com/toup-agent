@@ -160,13 +160,13 @@ class AgentTaskHandler:
             llm = call_system_llm
 
         # Per-routine model with default-cheap policy (2026-05-13 cost
-        # audit, same contract as email_briefing). Default to Haiku
-        # when no override; power users set `config_json.model` to
-        # upgrade. Routines are user-scheduled; defaulting to Haiku
-        # makes a "10 routines firing per day" footprint predictable
-        # instead of "10× your chat-model rate".
+        # audit, same contract as email_briefing). Default to
+        # gpt-4o-mini when no override; power users set
+        # `config_json.model` to upgrade. Routines are user-scheduled;
+        # defaulting to gpt-4o-mini makes a "10 routines firing per day"
+        # footprint predictable instead of "10× your chat-model rate".
         cfg = routine.config_json or {}
-        model_choice = (cfg.get("model") or "").strip() or "claude-haiku-4-5-20251001"
+        model_choice = (cfg.get("model") or "").strip() or "gpt-4o-mini"
 
         text = await llm(
             user_id=routine.user_id,

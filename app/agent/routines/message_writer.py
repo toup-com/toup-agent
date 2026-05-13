@@ -12,7 +12,6 @@ which is a loose hint for long-lived sessions.
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from datetime import datetime
@@ -45,8 +44,9 @@ async def write_routine_message(
     the broadcast event can carry it. Broadcast is also explicitly
     isolated so a test environment without ws_chat doesn't error here.
     """
+    from app.agent.conversation_resolver import resolve_or_create_day_conversation
     from app.db.message_helpers import resolve_day_chat_id_for_now
-    from app.db.models import Conversation, DayChat, Message
+    from app.db.models import DayChat, Message
 
     day_chat_id = await resolve_day_chat_id_for_now(db, user_id, tz_override=tz_override)
 
@@ -56,17 +56,17 @@ async def write_routine_message(
     if extra_metadata:
         convo_meta.update(extra_metadata)
 
-    conv = Conversation(
-        id=str(uuid.uuid4()),
+    # Reading A (Day-as-Chat): one routine Conversation per
+    # (user, day_chat, channel). All routine fires on the same day
+    # append to the same row. See app/agent/conversation_resolver.py.
+    conv = await resolve_or_create_day_conversation(
+        db,
         user_id=user_id,
-        channel="routine",
-        is_active=True,
         day_chat_id=day_chat_id,
+        channel="routine",
         title=title or f"Routine: {source}",
-        metadata_json=json.dumps(convo_meta),
+        metadata=convo_meta,
     )
-    db.add(conv)
-    await db.flush()
 
     msg_id = str(uuid.uuid4())
     msg = Message(
