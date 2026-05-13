@@ -1070,6 +1070,14 @@ async def conversation_today(
         "local_date": local_date,
         "day_chat":   None,
         "messages":   [],
+        # Agent profile (color + name) so the sidepanel can paint its
+        # chrome in the user's chosen accent. Same source the web app's
+        # /agent-setup/config endpoint reads from. Null fields are fine —
+        # the frontend falls back to the default purple.
+        "agent": {
+            "color": None,
+            "name":  None,
+        },
     }
 
     try:
@@ -1085,6 +1093,23 @@ async def conversation_today(
                 if row:
                     day_chat_id = row[0]
                     out["day_chat"] = {"id": day_chat_id, "local_date": local_date}
+
+            # Best-effort agent profile lookup. agent_configs is
+            # PLATFORM_ONLY (see base.py PLATFORM_ONLY_TABLES) — this
+            # router runs on the platform side so the read is safe.
+            try:
+                from app.db.models import AgentConfig
+                cfg_row = (await db.execute(
+                    select(AgentConfig.agent_color, AgentConfig.agent_name)
+                    .where(AgentConfig.user_id == user_id)
+                )).first()
+                if cfg_row:
+                    out["agent"]["color"] = cfg_row[0]
+                    out["agent"]["name"]  = cfg_row[1]
+            except Exception as e:  # noqa: BLE001
+                # Don't fail the hydrate just because the profile lookup
+                # blew up — sidepanel keeps working with default color.
+                logger.debug("[extension] agent profile lookup skipped: %s", e)
 
             if day_chat_id:
                 msg_rows = (await db.execute(
