@@ -444,6 +444,64 @@ async def clear_token(
     return TokenStatus(configured=False)
 
 
+@router.get("/file")
+async def read_file(
+    path: str,
+    current_user=Depends(get_current_user),
+):
+    """Read a file from the calling user's Toup Code workspace.
+
+    `path` is interpreted relative to <workspace_root>/<user_id>, the
+    same shape that file_created/file_edited events stream over SSE.
+    Path traversal is defeated by resolving + asserting the target
+    remains under the user's workspace root (handles `..`, symlinks,
+    and absolute paths uniformly).
+
+    Returns the content as UTF-8 text when decodable; otherwise base64
+    so the UI can show "binary file (N bytes)" without crashing the
+    JSON pipeline. Hard size cap at 5 MB — the IDE preview pane isn't
+    a place for serving large blobs."""
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    if path.startswith("/") or any(seg == ".." for seg in path.split("/")):
+        # Cheap pre-check; the resolve+relative_to below is the real
+        # guard, but failing fast here returns a friendlier message.
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    user_id = _safe_segment(str(current_user.id), "user")
+    user_root = (_workspace_root() / user_id).resolve()
+    try:
+        target = (user_root / path).resolve()
+        target.relative_to(user_root)  # raises ValueError if it escapes
+    except (ValueError, OSError):
+        raise HTTPException(status_code=403, detail="Path escapes workspace")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Not a regular file")
+
+    size = target.stat().st_size
+    if size > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (5 MB limit)")
+
+    try:
+        return {
+            "path": path,
+            "content": target.read_text(encoding="utf-8"),
+            "size": size,
+            "binary": False,
+        }
+    except UnicodeDecodeError:
+        import base64
+        return {
+            "path": path,
+            "content": base64.b64encode(target.read_bytes()).decode("ascii"),
+            "size": size,
+            "binary": True,
+        }
+
+
 @router.post("/spawn")
 async def spawn_session(
     body: SpawnRequest,
@@ -491,7 +549,8 @@ async def spawn_session(
 
     user_id = _safe_segment(str(current_user.id), "user")
     project = _safe_segment(body.project or "default", "default")
-    workspace = _workspace_root() / user_id / project
+    user_workspace_root = (_workspace_root() / user_id).resolve()
+    workspace = (user_workspace_root / project).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     session_id = uuid.uuid4().hex[:12]
     prompt_text = body.prompt
@@ -572,6 +631,22 @@ async def spawn_session(
                 for evt_type, payload in _translate_message(msg):
                     if evt_type == "result":
                         last_result_seen = True
+                    # Rewrite absolute file paths to <project>/<rel>
+                    # form so the UI can render readable names AND so
+                    # the same string round-trips through GET /code/file
+                    # without exposing the platform-internal workspace
+                    # root. Paths outside the user's workspace are left
+                    # alone — they may surface in tool errors etc. and
+                    # the UI handles them as opaque.
+                    if evt_type in ("file_created", "file_edited"):
+                        raw_path = payload.get("path")
+                        if isinstance(raw_path, str) and raw_path:
+                            try:
+                                payload["path"] = str(
+                                    Path(raw_path).resolve().relative_to(user_workspace_root)
+                                )
+                            except (ValueError, OSError):
+                                pass
                     yield _sse(evt_type, payload)
 
             rc = await proc.wait()
