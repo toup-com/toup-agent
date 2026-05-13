@@ -332,6 +332,16 @@ async def init_db():
         # rows stay valid. 2000 chars to fit refresh-token-embedded
         # payloads without truncation.
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS claude_code_oauth_token VARCHAR(2000)",
+        # Toup Code dual-provider — OpenAI Codex CLI sibling (2026-05-13,
+        # commit af73c47). Migration 039 is the canonical add path; this
+        # init_db ALTER is the safety net because the Dockerfile CMD was
+        # recently changed (commit 06f550a) to NOT block uvicorn on
+        # alembic failures — so if alembic crashes for any reason, the
+        # column never appears via migrations and every SELECT from
+        # agent_configs 500s with "column does not exist". This safety
+        # net mirrors the claude_code_oauth_token entry above and
+        # guarantees schema-completeness regardless of alembic state.
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS openai_codex_token VARCHAR(2000)",
         # ── Connector identities ──
         # Per-identity read-only switch (2026-05-11). True means the
         # MCP tool filter drops every manifest tool with mutates=true
