@@ -83,6 +83,46 @@ class ApiKey(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class ExtensionDevice(Base):
+    """A Chrome browser paired to a Toup user's tenant agent.
+
+    One row per paired device — same user can install the Toup extension on
+    their laptop + desktop and we keep both. `paired_at` is the canonical
+    "this is paired" signal that the settings page reads from, replacing the
+    in-memory `extension_bridge.is_connected` check which lied because the
+    bridge runs on the tenant agent process and the settings endpoint runs
+    on the platform process — different processes, different memory.
+
+    `last_seen_at` is bumped by the tenant agent every time the extension's
+    /api/ws/extension socket connects, sends a heartbeat, or closes; the
+    settings page renders "online" / "offline since X" from the delta.
+
+    `revoked_at` is set when the user explicitly clicks Unpair on the
+    settings page. Soft-delete so we keep audit history of which device
+    was used when.
+    """
+    __tablename__ = "extension_devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    # Short user-supplied name from pair flow, e.g. "MacBook · Chrome".
+    device_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Free-form version string the extension self-reports on pair.
+    extension_version: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    # Truncated JWT jti so we can revoke a specific issued token without
+    # storing the full bearer. ON revoke, future WS auths with this jti
+    # are rejected via a denylist (added when we wire revocation; today
+    # the token TTL is short enough that simple soft-delete is enough).
+    token_jti: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    paired_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (
+        Index("ix_extension_devices_user_revoked", "user_id", "revoked_at"),
+    )
+
+
 class WhatsAppInboundDedupe(Base):
     """Persistent dedupe of WhatsApp Cloud API inbound webhook messages.
 

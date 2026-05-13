@@ -36,6 +36,7 @@ KNOWN_CHANNELS = frozenset({
     "slack",
     "whatsapp",
     "vibecoding",
+    "extension",  # Chrome side-panel chat — first-class Day-as-Chat channel
     "agent",  # internal / legacy
 })
 

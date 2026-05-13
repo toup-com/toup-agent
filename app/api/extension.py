@@ -26,18 +26,21 @@ import json
 import logging
 import secrets
 import time
-from typing import Any, Dict, Optional
+import uuid
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
-from sqlalchemy import select, text
+from sqlalchemy import and_, select, text, update
+from sqlalchemy.exc import ProgrammingError
 
 from app.agent import extension_bridge
 from app.api.auth import get_current_user
 from app.config import settings
 from app.db.database import async_session_maker
-from app.db.models import AgentConfig
+from app.db.models import AgentConfig, ExtensionDevice
 from app.services.auth_service import get_user_by_id
 
 logger = logging.getLogger(__name__)
@@ -167,17 +170,162 @@ def _mint_extension_token(user_id: str, agent_api_key: str) -> Dict[str, Any]:
     if not agent_api_key:
         raise HTTPException(409, "user has no provisioned agent yet")
     now = int(time.time())
+    jti = secrets.token_hex(16)
     payload = {
         "sub":   user_id,
         "iss":   "toup-platform",
         "aud":   "toup-agent-session",
         "scope": "extension",
-        "jti":   secrets.token_hex(16),
+        "jti":   jti,
         "iat":   now,
         "exp":   now + EXT_TOKEN_TTL_S,
     }
     token = jwt.encode(payload, agent_api_key, algorithm="HS256")
-    return {"token": token, "issued_at": now, "expires_in": EXT_TOKEN_TTL_S}
+    return {"token": token, "issued_at": now, "expires_in": EXT_TOKEN_TTL_S, "jti": jti}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Persistent pairing — ExtensionDevice rows + heartbeat (T0c, 2026-05-12)
+# ─────────────────────────────────────────────────────────────────────
+# The previous "is paired?" check was extension_bridge.is_connected(user_id)
+# — pure in-memory WS presence on whatever process serves the endpoint.
+# That broke for two reasons:
+#   1. The platform process and the tenant agent process each have their
+#      own extension_bridge module instance with their own dict, so
+#      platform never saw tenant-side sockets.
+#   2. Even when the user *was* paired, a brief WS disconnect would flip
+#      the settings page to "No extension paired" until reconnect.
+# ExtensionDevice rows persist on the platform DB; the tenant agent's
+# /ws/extension handler heartbeats over HTTP so the settings page can
+# render "Paired (online, last seen 12s ago)" without polling.
+
+# "Online" window — extension heartbeats every 25s (sidepanel chat-ws +
+# /ws/extension both ping that often), and the WS-register / WS-close
+# events also fire immediate heartbeats. 90s tolerates two missed
+# heartbeats before flipping to offline.
+DEVICE_ONLINE_WINDOW_S = 90
+
+
+async def _record_pairing(
+    user_id: str,
+    device_name: str,
+    extension_version: Optional[str],
+    token_jti: Optional[str],
+) -> Optional[str]:
+    """Insert an ExtensionDevice row on pair-approve / pair-issue.
+
+    Best-effort: if the migration hasn't run on this replica yet
+    (ProgrammingError on the table) we log + swallow so pairing still
+    succeeds. The settings page will fall back to legacy presence-only
+    until the migration ships.
+
+    Returns the new device id on success, None on failure (caller can
+    surface the id to the extension for later revoke calls).
+    """
+    try:
+        async with async_session_maker() as db:
+            device = ExtensionDevice(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                device_name=(device_name or "Chrome")[:200],
+                extension_version=(extension_version or None) and extension_version[:40],
+                token_jti=(token_jti or None) and token_jti[:64],
+                paired_at=datetime.utcnow(),
+            )
+            db.add(device)
+            await db.commit()
+            return device.id
+    except ProgrammingError as exc:
+        # extension_devices table not yet migrated on this replica —
+        # don't break pairing while the rollout completes.
+        logger.warning("[extension] _record_pairing skipped (no table): %s", exc)
+        return None
+    except Exception as exc:
+        logger.warning("[extension] _record_pairing failed for %s: %s", user_id[:8], exc)
+        return None
+
+
+async def _list_devices(user_id: str) -> List[Dict[str, Any]]:
+    """Return non-revoked ExtensionDevice rows shaped for the UI."""
+    try:
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(ExtensionDevice)
+                .where(
+                    ExtensionDevice.user_id == user_id,
+                    ExtensionDevice.revoked_at.is_(None),
+                )
+                .order_by(ExtensionDevice.paired_at.desc())
+            )
+            rows = result.scalars().all()
+    except ProgrammingError:
+        return []
+    except Exception as exc:
+        logger.debug("[extension] _list_devices read failed: %s", exc)
+        return []
+
+    cutoff = datetime.utcnow() - timedelta(seconds=DEVICE_ONLINE_WINDOW_S)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        is_online = bool(r.last_seen_at and r.last_seen_at >= cutoff)
+        out.append({
+            "id":                r.id,
+            "device_name":       r.device_name,
+            "extension_version": r.extension_version,
+            "paired_at":         r.paired_at.isoformat() + "Z" if r.paired_at else None,
+            "last_seen_at":      r.last_seen_at.isoformat() + "Z" if r.last_seen_at else None,
+            "online":            is_online,
+        })
+    return out
+
+
+async def _touch_last_seen(user_id: str, token_jti: Optional[str], online: bool) -> None:
+    """Update last_seen_at on the user's device row(s).
+
+    Called from /extension/heartbeat (tenant agent → platform) when the
+    extension's WS connects, periodically pings, or disconnects. If we
+    can identify the specific row via token_jti we touch only that row;
+    otherwise we touch the user's most-recent non-revoked row so legacy
+    devices that paired before jti tracking still flip green.
+    """
+    now = datetime.utcnow() if online else (datetime.utcnow() - timedelta(seconds=DEVICE_ONLINE_WINDOW_S + 5))
+    try:
+        async with async_session_maker() as db:
+            updated = False
+            if token_jti:
+                r = await db.execute(
+                    update(ExtensionDevice)
+                    .where(
+                        ExtensionDevice.user_id == user_id,
+                        ExtensionDevice.token_jti == token_jti,
+                        ExtensionDevice.revoked_at.is_(None),
+                    )
+                    .values(last_seen_at=now)
+                )
+                updated = (r.rowcount or 0) > 0
+            if not updated:
+                # Fallback: touch the most-recent non-revoked row.
+                latest = await db.execute(
+                    select(ExtensionDevice.id)
+                    .where(
+                        ExtensionDevice.user_id == user_id,
+                        ExtensionDevice.revoked_at.is_(None),
+                    )
+                    .order_by(ExtensionDevice.paired_at.desc())
+                    .limit(1)
+                )
+                row_id = latest.scalar_one_or_none()
+                if row_id:
+                    await db.execute(
+                        update(ExtensionDevice)
+                        .where(ExtensionDevice.id == row_id)
+                        .values(last_seen_at=now)
+                    )
+            await db.commit()
+    except ProgrammingError:
+        return
+    except Exception as exc:
+        logger.debug("[extension] _touch_last_seen failed: %s", exc)
 
 
 def _decode_extension_token(token: str) -> Optional[Dict[str, Any]]:
@@ -354,6 +502,16 @@ async def pair_approve(req: PairApproveReq, current_user=Depends(get_current_use
             .rstrip("/") + "/api/ws/extension"
         )
 
+    # Durable pairing record — survives the in-memory pair-lock eviction
+    # below so /extension/status can answer "is this user paired?" forever
+    # without needing the WS to be live right now.
+    await _record_pairing(
+        user_id=user_id,
+        device_name=rec["device_name"],
+        extension_version=rec.get("extension_version"),
+        token_jti=token_bundle.get("jti"),
+    )
+
     async with _pair_lock:
         rec["status"] = "approved"
         rec["user_id"] = user_id
@@ -390,6 +548,12 @@ async def pair_issue(req: PairInitReq, current_user=Depends(get_current_user)) -
             cfg.agent_url.replace("https://", "wss://").replace("http://", "ws://")
             .rstrip("/") + "/api/ws/extension"
         )
+    await _record_pairing(
+        user_id=user_id,
+        device_name=req.device_name,
+        extension_version=req.extension_version,
+        token_jti=bundle.get("jti"),
+    )
     logger.info("[extension] direct-issue token for %s device=%r", user_id, req.device_name)
     return {
         "access_token": bundle["token"],
@@ -476,6 +640,7 @@ async def ws_extension(websocket: WebSocket, token: Optional[str] = Query(None))
         return
 
     user_id = payload["sub"]
+    token_jti = payload.get("jti")
 
     # 2. Verify user still exists and is active.
     try:
@@ -492,6 +657,24 @@ async def ws_extension(websocket: WebSocket, token: Optional[str] = Query(None))
 
     # 3. Register and start the read loop.
     ep = await extension_bridge.register(user_id, websocket)
+
+    # Fire a heartbeat to the platform so the settings page on
+    # toup.ai/settings/extensions flips to "online" without polling.
+    # Fire-and-forget — heartbeat failure should never break the WS.
+    asyncio.create_task(_post_heartbeat_to_platform(user_id, token_jti, online=True))
+
+    # Periodic re-heartbeat keeps last_seen_at fresh during long sessions.
+    async def _heartbeat_loop():
+        try:
+            while True:
+                await asyncio.sleep(45)
+                await _post_heartbeat_to_platform(user_id, token_jti, online=True)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.debug("[extension] heartbeat loop exited: %s", exc)
+    heartbeat_task = asyncio.create_task(_heartbeat_loop())
+
     try:
         await websocket.send_json({
             "type": "hello",
@@ -519,20 +702,195 @@ async def ws_extension(websocket: WebSocket, token: Optional[str] = Query(None))
     except Exception as exc:
         logger.info("[extension] ws closed for %s: %s", user_id, exc)
     finally:
+        heartbeat_task.cancel()
         await extension_bridge.unregister(user_id, ep)
+        # Flip the settings page to "offline since" immediately on close.
+        asyncio.create_task(_post_heartbeat_to_platform(user_id, token_jti, online=False))
+
+
+async def _post_heartbeat_to_platform(
+    user_id: str,
+    token_jti: Optional[str],
+    *,
+    online: bool,
+) -> None:
+    """Fire-and-forget heartbeat from the TENANT AGENT to the platform.
+
+    No-op when:
+      - This code path is running ON the platform (same process — the
+        DB write happens via the local /heartbeat handler if you call
+        the endpoint, but skipping the loopback HTTP roundtrip is
+        cleaner).
+      - X-Agent-Key isn't configured.
+      - platform_api_url isn't a real https://toup.ai/api target.
+
+    Auth: X-Agent-Key header. The platform's /heartbeat verifies the
+    key matches AgentConfig.agent_api_key for the user_id we claim.
+    """
+    agent_key = (getattr(settings, "agent_api_key", "") or "").strip()
+    if not agent_key:
+        return
+    platform_url = (getattr(settings, "platform_api_url", "") or "").strip()
+    if not platform_url or not platform_url.startswith("http"):
+        return
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            await client.post(
+                f"{platform_url.rstrip('/')}/extension/heartbeat",
+                json={
+                    "user_id":   user_id,
+                    "online":    online,
+                    "token_jti": token_jti,
+                },
+                headers={"X-Agent-Key": agent_key},
+            )
+    except Exception as exc:
+        # Heartbeat is best-effort — platform unreachable, DNS hiccup, etc.
+        # The settings page will keep its stale state until the next
+        # successful heartbeat; nothing user-facing breaks.
+        logger.debug("[extension] heartbeat post failed: %s", exc)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Diagnostics
+# Diagnostics — paired devices + presence
 # ─────────────────────────────────────────────────────────────────────
 @router.get("/extension/status")
 async def extension_status(current_user=Depends(get_current_user)) -> Dict[str, Any]:
-    """Tell the UI whether the user's extension is currently connected."""
+    """Pairing + live presence for the settings page.
+
+    Three fields the UI cares about:
+      `paired`     — has the user ever paired a device (durable, DB-backed)
+      `connected`  — is any device online RIGHT NOW (heartbeat within
+                     DEVICE_ONLINE_WINDOW_S, OR — fallback for legacy
+                     paired-but-no-heartbeat devices — local presence on
+                     this process's extension_bridge dict)
+      `devices`    — full list with per-device online/last-seen for the
+                     UI to render "Paired with Chrome on MacBook · last
+                     seen 12s ago"
+
+    The legacy boolean `connected` is kept for backwards compatibility
+    with any caller that still treats it as the sole truth source.
+    """
     user_id = current_user.id if hasattr(current_user, "id") else current_user["id"]
+    devices = await _list_devices(user_id)
+    any_online = any(d["online"] for d in devices)
+    # Belt-and-braces: in-process bridge presence covers the case where
+    # this endpoint happens to be served by the same process the WS is
+    # registered on (the tenant agent). The heartbeat path covers the
+    # cross-process case (platform answering the question).
+    in_process_live = extension_bridge.is_connected(user_id)
     return {
         "user_id":   user_id,
-        "connected": extension_bridge.is_connected(user_id),
+        "paired":    len(devices) > 0,
+        "connected": any_online or in_process_live,
+        "devices":   devices,
     }
+
+
+@router.get("/extension/devices")
+async def list_extension_devices(current_user=Depends(get_current_user)) -> Dict[str, Any]:
+    """Same data the status endpoint returns under `devices` — exposed
+    on its own route so admin UIs and future device-management screens
+    can poll it without re-running the presence check."""
+    user_id = current_user.id if hasattr(current_user, "id") else current_user["id"]
+    return {"devices": await _list_devices(user_id)}
+
+
+class RevokeDeviceReq(BaseModel):
+    device_id: Optional[str] = None  # None = revoke ALL paired devices for this user
+
+
+@router.post("/extension/revoke")
+async def revoke_extension_device(
+    req: RevokeDeviceReq,
+    current_user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Soft-delete one (or all) of the user's paired devices.
+
+    User-facing "Unpair" button. We don't revoke the JWT itself (token TTL
+    handles that within 90 days); we just mark the row revoked so the
+    settings page stops showing it AND the tenant agent's WS auth path
+    can deny reconnects that present the matching jti (jti denylist —
+    follow-up; today the row removal alone is enough since the next
+    settings-page render reflects the change, and the user can also re-
+    pair to mint a fresh token if they want immediate cutoff).
+    """
+    user_id = current_user.id if hasattr(current_user, "id") else current_user["id"]
+    now = datetime.utcnow()
+    try:
+        async with async_session_maker() as db:
+            if req.device_id:
+                r = await db.execute(
+                    update(ExtensionDevice)
+                    .where(
+                        ExtensionDevice.id == req.device_id,
+                        ExtensionDevice.user_id == user_id,
+                        ExtensionDevice.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=now)
+                )
+            else:
+                r = await db.execute(
+                    update(ExtensionDevice)
+                    .where(
+                        ExtensionDevice.user_id == user_id,
+                        ExtensionDevice.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=now)
+                )
+            await db.commit()
+            revoked = r.rowcount or 0
+    except ProgrammingError:
+        revoked = 0
+    except Exception as exc:
+        logger.warning("[extension] revoke failed for %s: %s", user_id[:8], exc)
+        raise HTTPException(500, "revoke failed")
+    return {"ok": True, "revoked": revoked}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Heartbeat — called by the TENANT AGENT (not the browser) when the
+# extension's /ws/extension socket connects, keeps pinging, or
+# disconnects. The agent has the user's agent_api_key in its env;
+# verifying it against AgentConfig for the claimed user is what
+# authenticates this endpoint.
+# ─────────────────────────────────────────────────────────────────────
+class HeartbeatReq(BaseModel):
+    user_id: str
+    online: bool = True
+    token_jti: Optional[str] = None
+    extension_version: Optional[str] = None
+
+
+@router.post("/extension/heartbeat")
+async def extension_heartbeat(
+    req: HeartbeatReq,
+    x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
+) -> Dict[str, Any]:
+    if not x_agent_key:
+        raise HTTPException(401, "X-Agent-Key required")
+    # Verify the tenant key matches the user it claims to heartbeat for.
+    try:
+        async with async_session_maker() as db:
+            row = await db.execute(
+                select(AgentConfig.user_id).where(
+                    and_(
+                        AgentConfig.user_id == req.user_id,
+                        AgentConfig.agent_api_key == x_agent_key,
+                    )
+                )
+            )
+            if not row.scalar_one_or_none():
+                raise HTTPException(403, "agent key mismatch")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("[extension] heartbeat auth check failed: %s", exc)
+        raise HTTPException(503, "heartbeat unavailable")
+
+    await _touch_last_seen(req.user_id, req.token_jti, online=req.online)
+    return {"ok": True}
 
 
 @router.get("/admin/extension/stats")

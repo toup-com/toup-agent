@@ -2268,6 +2268,7 @@ class AgentRunner:
             "telegram":  "User is on Telegram messenger (talking to the Toup bot there). Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
             "discord":   "User is on Discord (Toup bot). Full markdown and code blocks OK. Keep message length under ~2000 chars.",
             "slack":     "User is on Slack (Toup integration). Slack-flavored markdown (limited). Short messages preferred.",
+            "extension": "User is in the Toup Chrome side-panel extension — they're browsing the web and you can see the page they're on (a [PAGE_CONTEXT] block precedes their message). You can also drive their browser: open tabs, click, type, scroll, and capture screenshots via the `browser_*` tools. Full markdown OK but keep responses compact — the side-panel is narrow. When the user asks you to navigate or act on a page, USE the browser tools rather than explaining how; they want to SEE you do it.",
             "vibecoding":"User is inside the Vibecoding IDE workspace watching you code live. See the Vibecoding rules later in the prompt.",
         }.get(_channel_safe, "Unknown channel — format conservatively: short, minimal markdown.")
 
