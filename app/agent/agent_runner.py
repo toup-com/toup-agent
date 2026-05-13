@@ -2268,7 +2268,33 @@ class AgentRunner:
             "telegram":  "User is on Telegram messenger (talking to the Toup bot there). Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
             "discord":   "User is on Discord (Toup bot). Full markdown and code blocks OK. Keep message length under ~2000 chars.",
             "slack":     "User is on Slack (Toup integration). Slack-flavored markdown (limited). Short messages preferred.",
-            "extension": "User is in the Toup Chrome side-panel extension — they're browsing the web and you can see the page they're on (a [PAGE_CONTEXT] block precedes their message). You can also drive their browser: open tabs, click, type, scroll, and capture screenshots via the `browser_*` tools. Full markdown OK but keep responses compact — the side-panel is narrow. When the user asks you to navigate or act on a page, USE the browser tools rather than explaining how; they want to SEE you do it.",
+            "extension": (
+                "User is in the Toup Chrome side-panel extension — they're browsing the web and you can see the page "
+                "they're on (a [PAGE_CONTEXT] block precedes their message). You can also DRIVE their browser via the "
+                "`browser_*` tools: open tabs, click, type, scroll, capture screenshots, take DOM snapshots. "
+                "Format: full markdown OK but keep responses compact — the side-panel is narrow.\n\n"
+                "BEHAVIOR — this is critical. The user is watching you act in real time. They want a Claude-Computer-"
+                "Use / ChatGPT-Agent / Atlas-Browser experience, not a chatbot that asks permission for every step.\n"
+                "  1. ALWAYS attempt the next obvious action before asking the user for input. If you don't have an "
+                "address, try clicking sign-in (the user is signed into their browser, sites usually know their "
+                "address). If a search box is visible, type into it. If a button looks right, click it. "
+                "Read the page → try the most likely action → check the result. Only ask the user when you've "
+                "genuinely run out of plausible moves OR when the next step legally requires THEIR data (payment, "
+                "personal info, password).\n"
+                "  2. After each browser_action, take a `browser_screenshot` so YOU have visual grounding for the "
+                "next click and the USER sees what you see. Skipping this is the #1 reason agentic browsing feels "
+                "broken — without the screenshot you're flying blind on the next coordinate.\n"
+                "  3. If `browser_action` returns `ERROR: TIMEOUT`, the element you targeted probably wasn't there "
+                "yet (slow page or wrong selector). Take a fresh `browser_action` with `kind: \"dom_snapshot\"` to "
+                "re-orient, then try a different selector — do NOT give up and ask the user.\n"
+                "  4. If `browser_action` returns `ERROR: BLOCKED`, the user is on a chrome:// or extension page "
+                "Chrome won't let any extension touch. Ask them to switch to a normal site.\n"
+                "  5. Cookie banners, sign-in nags, and 'allow notifications' popups are agent kryptonite. Dismiss "
+                "them (look for ✕, 'Reject all', 'Got it', 'Not now') before trying the main task.\n"
+                "  6. Narrate sparingly. The user is watching the tool-pill row update live; you don't need to "
+                "say 'now I'm clicking the search button' — just click it. Save text replies for: confirming what "
+                "you accomplished, surfacing data you extracted, or asking when you genuinely need user input."
+            ),
             "vibecoding":"User is inside the Vibecoding IDE workspace watching you code live. See the Vibecoding rules later in the prompt.",
         }.get(_channel_safe, "Unknown channel — format conservatively: short, minimal markdown.")
 
