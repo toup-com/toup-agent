@@ -86,55 +86,89 @@ class _Session:
     recent_traces: deque = field(default_factory=lambda: deque(maxlen=TASK_TRACE_RETAIN))
 
 
-_endpoints: Dict[str, _Endpoint] = {}                  # user_id → endpoint
+# Multi-connection registry (2026-05-13). Originally keyed connections
+# strictly by user_id, which meant a NEW WS from any Chrome (e.g. the
+# dev unpacked extension + the prod Web Store extension on the same
+# account, or a second Chrome profile) would forcibly close the prior
+# WS with code 4002 "replaced by newer pairing". Each replaced client
+# would immediately reconnect — kicking the other one out — and the
+# loop would never break, so the agent never got a stable WS to
+# dispatch browser tools through. Symptom: agent answers with a typing
+# cursor and never streams a single token.
+#
+# Now we keep a LIST of endpoints per user. Dispatch picks the most-
+# recent one (newest WS is most likely to be the one the user is
+# actively looking at). Result delivery finds the right endpoint by
+# task_id (each in-flight task lives in exactly one endpoint's pending
+# map). Multiple Chrome instances coexist; the agent only fails when
+# ALL of them disconnect.
+_endpoints_by_user: Dict[str, List[_Endpoint]] = defaultdict(list)
 _sessions:  Dict[str, _Session]  = {}                  # session_id → session
 _sessions_by_user: Dict[str, set] = defaultdict(set)   # user_id → {session_id}
 _subscribers: Dict[str, List[asyncio.Queue]] = defaultdict(list)  # session_id → [queue, ...]
 _lock = asyncio.Lock()
 
 
+def _active_eps(user_id: str) -> List[_Endpoint]:
+    """Return all currently-registered endpoints for the user, newest last."""
+    return list(_endpoints_by_user.get(user_id) or [])
+
+
 # ─── Endpoint lifecycle ─────────────────────────────────────────────
 async def register(user_id: str, ws: WebSocket) -> _Endpoint:
     async with _lock:
-        prior = _endpoints.pop(user_id, None)
-        if prior:
-            logger.info("[ext-bridge] replacing prior connection for %s", user_id)
-            for fut in prior.pending.values():
-                if not fut.done():
-                    fut.set_exception(ExtensionUnavailable("connection replaced"))
-            try: await prior.ws.close(code=4002, reason="replaced by newer pairing")
-            except Exception: pass
         ep = _Endpoint(user_id=user_id, ws=ws)
-        _endpoints[user_id] = ep
-        logger.info("[ext-bridge] registered %s (total=%d)", user_id, len(_endpoints))
+        _endpoints_by_user[user_id].append(ep)
+        total = len(_endpoints_by_user[user_id])
+        logger.info(
+            "[ext-bridge] registered %s (user_conns=%d, total_users=%d)",
+            user_id, total, len(_endpoints_by_user),
+        )
         return ep
 
 
 async def unregister(user_id: str, ep: Optional[_Endpoint] = None) -> None:
     async with _lock:
-        existing = _endpoints.get(user_id)
-        if existing and (ep is None or existing is ep):
-            del _endpoints[user_id]
-            for fut in existing.pending.values():
+        bucket = _endpoints_by_user.get(user_id)
+        if not bucket:
+            return
+        if ep is None:
+            removed = bucket
+            _endpoints_by_user.pop(user_id, None)
+        else:
+            removed = [e for e in bucket if e is ep]
+            remaining = [e for e in bucket if e is not ep]
+            if remaining:
+                _endpoints_by_user[user_id] = remaining
+            else:
+                _endpoints_by_user.pop(user_id, None)
+        for e in removed:
+            for fut in e.pending.values():
                 if not fut.done():
                     fut.set_exception(ExtensionUnavailable("extension disconnected"))
-            # Mark all of user's sessions as "ended" but keep them visible to
-            # subscribers briefly so they see the closed event.
+        # Only mark the user's sessions ended when there are NO more
+        # WS endpoints for them. With multiple Chromes connected, one
+        # closing shouldn't kill the agent's view of live sessions
+        # that the other Chrome may still be driving.
+        if user_id not in _endpoints_by_user:
             for sid in list(_sessions_by_user.get(user_id, [])):
                 sess = _sessions.get(sid)
                 if sess:
                     sess.status = "ended"
                     _push_event_locked(sess, {"kind": "closed", "data": {"reason": "extension_disconnected"}})
-            logger.info("[ext-bridge] unregistered %s", user_id)
+        logger.info("[ext-bridge] unregistered %s (remaining_conns=%d)",
+                    user_id, len(_endpoints_by_user.get(user_id) or []))
 
 
 def is_connected(user_id: str) -> bool:
-    return user_id in _endpoints
+    return bool(_endpoints_by_user.get(user_id))
 
 
 def stats() -> Dict[str, Any]:
+    flat = [ep for eps in _endpoints_by_user.values() for ep in eps]
     return {
-        "active_users": len(_endpoints),
+        "active_users": len(_endpoints_by_user),
+        "active_connections": len(flat),
         "active_sessions": len(_sessions),
         "users": [
             {
@@ -143,7 +177,7 @@ def stats() -> Dict[str, Any]:
                 "pending_tasks": len(ep.pending),
                 "sessions": list(_sessions_by_user.get(ep.user_id, [])),
             }
-            for ep in _endpoints.values()
+            for ep in flat
         ],
     }
 
@@ -164,11 +198,19 @@ def deliver_inbound(user_id: str, msg: Dict[str, Any]) -> None:
 
 
 def _deliver_result(user_id: str, msg: Dict[str, Any]) -> None:
-    ep = _endpoints.get(user_id)
-    if not ep: return
+    # task_id is unique across all endpoints for this user. Find the
+    # endpoint that originally dispatched this task by checking each
+    # endpoint's pending map.
     task_id = msg.get("id")
-    fut = ep.pending.pop(task_id, None) if task_id else None
-    if not fut or fut.done(): return
+    if not task_id:
+        return
+    fut = None
+    for ep in _active_eps(user_id):
+        fut = ep.pending.pop(task_id, None)
+        if fut:
+            break
+    if not fut or fut.done():
+        return
     if msg.get("ok"):
         data = msg.get("data") or {}
         _maybe_update_session_from_result(user_id, data)
@@ -417,9 +459,13 @@ async def dispatch(
     params: Dict[str, Any],
     timeout_s: int = 30,
 ) -> Dict[str, Any]:
-    ep = _endpoints.get(user_id)
-    if not ep:
+    eps = _active_eps(user_id)
+    if not eps:
         raise ExtensionUnavailable("no connected extension for user")
+    # Multi-conn: prefer the newest (last-registered) endpoint — most
+    # likely the Chrome the user is actively looking at. If it errors
+    # on send below, fall through to other endpoints before giving up.
+    ep = eps[-1]
     _check_rate_limit(ep)
 
     task_id = uuid.uuid4().hex
@@ -446,14 +492,20 @@ async def dispatch(
 
 # ─── Outbound: fire-and-forget control frames ───────────────────────
 async def send_control(user_id: str, session_id: str, control: str) -> None:
-    ep = _endpoints.get(user_id)
-    if not ep:
+    eps = _active_eps(user_id)
+    if not eps:
         raise ExtensionUnavailable("extension not connected")
     payload = {"type": "control", "session_id": session_id, "control": control}
-    try:
-        await ep.ws.send_text(json.dumps(payload))
-    except Exception as exc:
-        raise ExtensionUnavailable(f"send_control failed: {exc}")
+    # Send to the newest endpoint; falls through if its socket is dead.
+    last_exc: Optional[Exception] = None
+    for ep in reversed(eps):
+        try:
+            await ep.ws.send_text(json.dumps(payload))
+            return
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise ExtensionUnavailable(f"send_control failed: {last_exc}")
 
 
 def _check_rate_limit(ep: _Endpoint) -> None:
