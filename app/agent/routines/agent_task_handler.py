@@ -159,14 +159,19 @@ class AgentTaskHandler:
             from app.services.internal_llm import call_system_llm
             llm = call_system_llm
 
-        # Per-routine model override (same contract as email_briefing).
+        # Per-routine model with default-cheap policy (2026-05-13 cost
+        # audit, same contract as email_briefing). Default to Haiku
+        # when no override; power users set `config_json.model` to
+        # upgrade. Routines are user-scheduled; defaulting to Haiku
+        # makes a "10 routines firing per day" footprint predictable
+        # instead of "10× your chat-model rate".
         cfg = routine.config_json or {}
-        model_override = (cfg.get("model") or "").strip() or None
+        model_choice = (cfg.get("model") or "").strip() or "claude-haiku-4-5-20251001"
 
         text = await llm(
             user_id=routine.user_id,
             operation_type="system.routine.agent_task",
-            model=model_override,
+            model=model_choice,
             max_tokens=2000,
             system=_DEFAULT_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
@@ -179,11 +184,10 @@ class AgentTaskHandler:
                 error_detail="call_system_llm returned None (timeout / auth / parse)",
             )
 
-        from app.services.model_resolver import default_model
         return await self._persist_and_return(
             routine, db,
             content=text,
-            model_used=model_override or default_model(),
+            model_used=model_choice,
             emails_fetched=0,
             metrics={"path": "internal_llm", "summary_chars": len(text)},
         )

@@ -337,12 +337,20 @@ class EmailReceivedHandler:
             user_msg = _format_batch_for_llm(emails)
 
         cfg = trigger.config_json or {}
-        model_override = (cfg.get("model") or "").strip() or None
+        # Default-cheap policy (2026-05-13 cost audit): when no explicit
+        # `model` is configured, route per-email summarization to Haiku
+        # instead of falling through to the user's chat-model default.
+        # A busy inbox can fire this 50-100×/day; on GPT-5.5 that's
+        # $1-2/day per active user just for triage. Haiku 4.5 is more
+        # than capable for "summarize this email + extract action items".
+        # Power users wanting Sonnet/Opus set `config_json.model` on
+        # the trigger explicitly.
+        model_choice = (cfg.get("model") or "").strip() or "claude-haiku-4-5-20251001"
 
         text = await llm(
             user_id=trigger.user_id,
             operation_type=_OPERATION_TYPE,
-            model=model_override,
+            model=model_choice,
             max_tokens=_SUMMARY_MAX_TOKENS,
             system=_SUMMARIZE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
@@ -353,8 +361,7 @@ class EmailReceivedHandler:
                 "internal_llm returned None (timeout / auth / parse failure)"
             )
 
-        from app.services.model_resolver import default_model
-        model_used = model_override or default_model()
+        model_used = model_choice
 
         return await self._persist_message(
             trigger=trigger, db=db,

@@ -116,7 +116,15 @@ async def ground(
             call_system_llm(
                 user_id=user_id,
                 operation_type="system.extension.ground",
-                model=None,                 # honor user's default chat model
+                # Pinned to Haiku (vision-capable since Claude 3.5 Haiku).
+                # The previous `model=None` honored the user's chat model
+                # — for GPT-5.5/Opus tenants every click on a Notion/Gmail
+                # surface billed at $5-15 per 1M input + a ~1k-token
+                # screenshot per call. Haiku 4.5 vision is plenty for
+                # "where is this UI element on this screenshot". Pinning
+                # here so the agentic-browse loop has a predictable
+                # per-step cost regardless of who's driving.
+                model="claude-haiku-4-5-20251001",
                 max_tokens=200,
                 system=_SYSTEM,
                 messages=[{"role": "user", "content": user_content}],

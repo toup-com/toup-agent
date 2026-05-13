@@ -247,12 +247,15 @@ class EmailBriefingHandler:
             from app.services.internal_llm import call_system_llm
             llm = call_system_llm
 
-        # Per-routine model override — power users can pin a cheap model
-        # ("always Haiku for cost") or upgrade ("Sonnet for nuance") via
-        # `config_json.model`. Falls through to resolver default when
-        # unset (the common case).
+        # Per-routine model with default-cheap policy (2026-05-13 cost
+        # audit): when `config_json.model` is unset we default to Haiku
+        # instead of falling through to the user's chat-model default.
+        # Email briefings are inherently summarization — Haiku 4.5 is
+        # excellent at this and predictable on cost. Power users
+        # wanting "Sonnet for nuance" / "Opus for the morning digest"
+        # can still set `config_json.model` explicitly per routine.
         cfg = routine.config_json or {}
-        model_override = (cfg.get("model") or "").strip() or None
+        model_choice = (cfg.get("model") or "").strip() or "claude-haiku-4-5-20251001"
 
         prompt_body = _format_emails_for_llm(emails)
         if fetched_count > len(emails):
@@ -261,7 +264,7 @@ class EmailBriefingHandler:
         summary_text = await llm(
             user_id=routine.user_id,
             operation_type=_OPERATION_TYPE,
-            model=model_override,
+            model=model_choice,
             max_tokens=_SUMMARY_MAX_TOKENS,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt_body}],
@@ -283,12 +286,10 @@ class EmailBriefingHandler:
         else:
             broadcaster = None  # tests inject writer + skip broadcast
 
-        # `model_used` is best-effort metadata for the Message row — we
-        # echo the override when set, else the resolver default. The
-        # llm_proxy_events log captures the actually-used model and is
-        # the source of truth for billing.
-        from app.services.model_resolver import default_model
-        model_used_for_record = model_override or default_model()
+        # `model_used` is best-effort metadata for the Message row.
+        # The llm_proxy_events log captures the actually-used model
+        # and is the source of truth for billing.
+        model_used_for_record = model_choice
 
         msg_id, day_chat_id = await writer(
             db,

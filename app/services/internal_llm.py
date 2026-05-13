@@ -92,6 +92,23 @@ async def call_system_llm(
         is_openai_model,
     )
 
+    # Guardrail (2026-05-13 cost audit): `model=None` here resolves
+    # to the user's chat model (`settings.agent_model`). That's
+    # appropriate for one-shot user-initiated operations but a known
+    # leak for any high-frequency / background call site. Log a WARN
+    # with the operation_type so a regression shows up in the
+    # dashboard within the first burst of calls — operator can grep
+    # `[internal_llm] model=None` and see exactly which op is
+    # falling through. Does NOT block the call; this is detection,
+    # not enforcement.
+    if not (model or "").strip():
+        logger.warning(
+            "[internal_llm] model=None for operation_type=%s — resolving to user agent_model. "
+            "If this is a high-frequency or background call site, pin an explicit model "
+            "(e.g. 'claude-haiku-4-5-20251001') to keep cost predictable.",
+            operation_type,
+        )
+
     resolved_model = (model or "").strip() or default_model()
 
     # Classify provider. Unknown model id → treat as Claude (back-compat
