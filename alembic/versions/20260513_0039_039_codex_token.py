@@ -24,11 +24,37 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "agent_configs",
-        sa.Column("openai_codex_token", sa.String(length=2000), nullable=True),
-    )
+    # Idempotent: skip the add when the column already exists. Without
+    # this guard, a half-succeeded prior deploy (column added but
+    # alembic_version row not bumped) crashes every subsequent boot
+    # with "column already exists" — the container exits before
+    # uvicorn binds, Railway's /health never responds, healthcheck
+    # times out at 5 min. Was the actual cause of the
+    # 2026-05-13 platform-api deploy loop.
+    conn = op.get_bind()
+    exists = conn.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='agent_configs' "
+            "AND column_name='openai_codex_token'"
+        )
+    ).scalar()
+    if not exists:
+        op.add_column(
+            "agent_configs",
+            sa.Column("openai_codex_token", sa.String(length=2000), nullable=True),
+        )
 
 
 def downgrade() -> None:
-    op.drop_column("agent_configs", "openai_codex_token")
+    # Tolerate "column already gone" — same idempotency logic, inverted.
+    conn = op.get_bind()
+    exists = conn.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='agent_configs' "
+            "AND column_name='openai_codex_token'"
+        )
+    ).scalar()
+    if exists:
+        op.drop_column("agent_configs", "openai_codex_token")
