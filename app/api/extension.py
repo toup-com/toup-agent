@@ -280,13 +280,23 @@ async def _list_devices(user_id: str) -> List[Dict[str, Any]]:
 
 
 async def _touch_last_seen(user_id: str, token_jti: Optional[str], online: bool) -> None:
-    """Update last_seen_at on the user's device row(s).
+    """Upsert last_seen_at on the user's device row(s).
 
     Called from /extension/heartbeat (tenant agent → platform) when the
-    extension's WS connects, periodically pings, or disconnects. If we
-    can identify the specific row via token_jti we touch only that row;
-    otherwise we touch the user's most-recent non-revoked row so legacy
-    devices that paired before jti tracking still flip green.
+    extension's WS connects, periodically pings, or disconnects.
+
+    Three cases, in priority order:
+      1. token_jti matches a non-revoked row — touch that row.
+      2. No jti match, but the user has at least one non-revoked row —
+         touch the most-recent one (covers legacy pairings minted
+         before jti tracking).
+      3. The user has NO row at all but the tenant agent is reporting
+         a live WS — they paired before this migration shipped. We
+         materialize a row right here so the settings page stops
+         lying. JWT signature on the WS already proves the user is
+         authentic; the heartbeat's `X-Agent-Key` proves the tenant
+         agent is the genuine reporter. Both verifications happen
+         upstream of this function.
     """
     now = datetime.utcnow() if online else (datetime.utcnow() - timedelta(seconds=DEVICE_ONLINE_WINDOW_S + 5))
     try:
@@ -304,7 +314,7 @@ async def _touch_last_seen(user_id: str, token_jti: Optional[str], online: bool)
                 )
                 updated = (r.rowcount or 0) > 0
             if not updated:
-                # Fallback: touch the most-recent non-revoked row.
+                # Try most-recent non-revoked row first.
                 latest = await db.execute(
                     select(ExtensionDevice.id)
                     .where(
@@ -321,6 +331,23 @@ async def _touch_last_seen(user_id: str, token_jti: Optional[str], online: bool)
                         .where(ExtensionDevice.id == row_id)
                         .values(last_seen_at=now)
                     )
+                    updated = True
+            if not updated and online:
+                # No row exists for this user — they paired before this
+                # table existed. Materialize a row now (heartbeat upsert)
+                # so the settings page stops saying "No extension paired"
+                # for users who in fact have a live extension WS.
+                device = ExtensionDevice(
+                    id=str(uuid.uuid4()),
+                    user_id=user_id,
+                    device_name="Chrome",
+                    extension_version=None,
+                    token_jti=(token_jti or None) and token_jti[:64],
+                    paired_at=now,
+                    last_seen_at=now,
+                )
+                db.add(device)
+                logger.info("[extension] materialized device row for legacy paired user %s", user_id[:8])
             await db.commit()
     except ProgrammingError:
         return
