@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -83,6 +84,22 @@ class SpawnRequest(BaseModel):
     # working session without picking a project name first.
     project: str | None = None
     provider: Provider = "claude"
+
+
+class SuperviseRequest(BaseModel):
+    user_message: str = Field(..., min_length=1, max_length=8000)
+    conv_id: str | None = None
+    provider: Provider = "claude"
+    project: str | None = None
+
+
+class InterjectRequest(BaseModel):
+    conv_id: str
+    message: str = Field(..., min_length=1, max_length=4000)
+
+
+class ConvIdRequest(BaseModel):
+    conv_id: str
 
 
 # ── Helpers ────────────────────────────────────────────────────
@@ -317,18 +334,22 @@ def _workspace_root() -> Path:
     return root
 
 
-def _sse(event_type: str, payload: dict[str, Any]) -> str:
+def _sse(event_type: str, payload: dict[str, Any], role: str | None = None) -> str:
     """Format a single Server-Sent Event frame.
 
-    Our wire shape: every frame's data is a JSON object with a `type`
-    discriminator + `payload` + ISO8601 `at` timestamp. The frontend's
-    streamSpawn() parses this directly into the same shape it stored
-    in stubbed `events` arrays so existing renderers don't change."""
-    data = {
+    Wire shape: every frame's data is a JSON object with a `type`
+    discriminator + `payload` + ISO8601 `at` timestamp. The supervisor
+    flow adds a `role` field ("user" | "agent" | "cli") so the
+    frontend can render the same event stream as three distinct chat
+    entities. Direct /code/spawn (no supervision) omits role, which
+    the existing renderers handle as a default "cli" surface."""
+    data: dict[str, Any] = {
         "type": event_type,
         "payload": payload,
         "at": datetime.utcnow().isoformat() + "Z",
     }
+    if role is not None:
+        data["role"] = role
     return f"data: {json.dumps(data, default=str)}\n\n"
 
 
@@ -539,6 +560,355 @@ def _translate_message(msg: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any
             "session_id": msg.get("session_id"),
         }
         return
+
+
+# ── Supervisor flow ─────────────────────────────────────────────
+#
+# The supervisor wraps the executor CLI (Claude Code / Codex) in a
+# chat-shaped orchestration loop driven by the USER'S own model
+# (settings.agent_model). Wire shape: every event carries a `role`
+# ("user" | "agent" | "cli") so the frontend can render three
+# distinct entities in the same conversation.
+#
+# Architecture:
+#   - SupervisorSession state is in-memory, keyed by conv_id.
+#   - /code/supervise opens an SSE stream. The first call creates the
+#     session; subsequent calls with the same conv_id continue it.
+#   - /code/supervise/interject lets a connected client push a new
+#     user message into the running loop's queue. The loop drains
+#     this queue between turns.
+#   - /code/supervise/stop cancels the session cleanly.
+#
+# Termination: the supervisor decides "done" on its own (no hard cap).
+# Runaway protection comes from (a) the system prompt encouraging
+# concise turns, (b) the user's Stop button, (c) the underlying
+# CLI's own subscription quota.
+
+SUPERVISOR_SYSTEM_PROMPT = (
+    "You are this user's coding supervisor. The user has connected a coding "
+    "executor CLI (Claude Code or GPT Codex) and you orchestrate it on their "
+    "behalf. You DO NOT write code yourself — you craft precise prompts for "
+    "the executor, observe what it built, and decide what to do next.\n"
+    "\n"
+    "On every turn you MUST respond with EXACTLY ONE JSON object on a single "
+    "line and NOTHING else. No markdown fences, no prose before or after.\n"
+    "\n"
+    "Actions:\n"
+    '  {"action": "send_to_cli", "prompt": "<≤200 word prompt for the executor>", "thinking": "<≤2 sentence rationale you want the user to see>"}\n'
+    '  {"action": "done", "summary": "<1-2 sentence wrap-up for the user>"}\n'
+    '  {"action": "ask_user", "question": "<a focused clarifying question>"}\n'
+    "\n"
+    "Rules:\n"
+    " - Prefer `send_to_cli` until the user's request is satisfied. Keep "
+    "prompts focused: one concrete goal per turn (create file X with hero, "
+    "or fix the broken Y) — not multi-step plans.\n"
+    " - After each executor turn you'll see a synthetic 'CLI completed' "
+    "message with the files touched and the executor's reply. Use that to "
+    "decide the next action.\n"
+    " - `done` only when the user's request is genuinely complete. Don't "
+    "ask the executor to 'verify' or 'check' as a final step — declare done.\n"
+    " - `ask_user` only when you truly cannot proceed without clarification. "
+    "Prefer making a sensible choice and noting it in `thinking`.\n"
+    " - Output is parsed as JSON. ANY deviation from one JSON object on one "
+    "line breaks the orchestration."
+)
+
+
+@dataclasses.dataclass
+class SupervisorSession:
+    conv_id: str
+    user_id: str
+    provider: Provider
+    workspace: Path
+    workspace_root: Path
+    token: str
+    messages: list[dict[str, Any]]
+    pending_interjects: list[str] = dataclasses.field(default_factory=list)
+    canceled: bool = False
+    last_seen_at: datetime = dataclasses.field(default_factory=datetime.utcnow)
+
+
+_SESSIONS: dict[str, SupervisorSession] = {}
+_SESSION_MAX_IDLE_S = 60 * 60  # 1 hour — GC handle below
+
+
+def _gc_supervisor_sessions() -> None:
+    """Drop sessions idle longer than _SESSION_MAX_IDLE_S. Called
+    opportunistically on each /supervise entry; not a scheduled task."""
+    now = datetime.utcnow()
+    stale = [
+        cid for cid, s in _SESSIONS.items()
+        if (now - s.last_seen_at).total_seconds() > _SESSION_MAX_IDLE_S
+    ]
+    for cid in stale:
+        _SESSIONS.pop(cid, None)
+
+
+def _parse_supervisor_action(raw: str) -> dict[str, Any] | None:
+    """Extract the single JSON action from a supervisor reply.
+
+    Tolerant of: leading/trailing whitespace, ```json fences, a stray
+    sentence before the JSON. Returns None on irrecoverable malformed
+    output so the caller can surface the raw text as agent_message."""
+    s = (raw or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict) and "action" in obj:
+            return obj
+    except json.JSONDecodeError:
+        pass
+    # Try to extract the first JSON-shaped substring.
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict) and "action" in obj:
+                return obj
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+async def _run_cli_for_supervisor(
+    session: SupervisorSession,
+    cli_prompt: str,
+    queue: asyncio.Queue,
+) -> tuple[list[str], list[str], str | None, bool]:
+    """Spawn the provider's CLI with `cli_prompt`, stream its events
+    through `queue` (tagged role="cli"), and return a summary tuple of
+    (files_created, files_edited, result_text, auth_failed).
+
+    Reuses the same per-provider CLI invocation as POST /code/spawn
+    but pipes events into the supervisor's queue instead of writing
+    SSE frames itself."""
+    provider = session.provider
+    bin_name = _provider_binary_name(provider)
+    bin_path = shutil.which(bin_name)
+    files_created: list[str] = []
+    files_edited: list[str] = []
+    result_text: str | None = None
+    auth_failed = False
+
+    if bin_path is None:
+        install_hint = {
+            "claude": "npm install -g @anthropic-ai/claude-code",
+            "codex": "npm install -g @openai/codex",
+        }[provider]
+        await queue.put(_sse("error", {
+            "message": (
+                f"The `{bin_name}` CLI isn't installed in this environment. "
+                f"Deploy with the updated Dockerfile or `{install_hint}`."
+            ),
+        }, role="cli"))
+        return files_created, files_edited, None, False
+
+    env = {**os.environ, _provider_env_var(provider): session.token}
+    if provider == "claude":
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    else:
+        env[_provider_env_var(provider)] = session.token
+
+    if provider == "claude":
+        argv = [
+            bin_path,
+            "-p", cli_prompt,
+            "--model", "claude-opus-4-7",
+            "--fallback-model", "claude-sonnet-4-6",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--permission-mode", "acceptEdits",
+        ]
+    else:
+        argv = [bin_path, "exec", "--json", "--full-auto", cli_prompt]
+
+    proc: asyncio.subprocess.Process | None = None
+    stderr_buf: list[str] = []
+
+    async def drain_stderr() -> None:
+        assert proc and proc.stderr
+        async for raw in proc.stderr:
+            stderr_buf.append(raw.decode("utf-8", "replace"))
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(session.workspace),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as e:  # pragma: no cover
+        await queue.put(_sse("error", {"message": f"Failed to start {bin_name}: {e!r}"}, role="cli"))
+        return files_created, files_edited, None, False
+
+    stderr_task = asyncio.create_task(drain_stderr())
+    translator = _translate_message if provider == "claude" else _translate_codex_message
+
+    try:
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            if session.canceled:
+                break
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for evt_type, payload in translator(msg):
+                if evt_type in ("file_created", "file_edited"):
+                    raw_path = payload.get("path")
+                    if isinstance(raw_path, str) and raw_path:
+                        try:
+                            resolved = (session.workspace / raw_path).resolve() if not Path(raw_path).is_absolute() else Path(raw_path).resolve()
+                            payload["path"] = str(resolved.relative_to(session.workspace_root))
+                        except (ValueError, OSError):
+                            pass
+                    (files_created if evt_type == "file_created" else files_edited).append(str(payload.get("path") or ""))
+                if evt_type == "result":
+                    result_text = str(payload.get("result") or "")
+                if evt_type == "auth_failed":
+                    auth_failed = True
+                await queue.put(_sse(evt_type, payload, role="cli"))
+        await proc.wait()
+        await stderr_task
+    finally:
+        if proc and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
+            with contextlib.suppress(Exception):
+                await stderr_task
+
+    if proc.returncode not in (0, None) and result_text is None:
+        err = "".join(stderr_buf).strip() or f"{bin_name} exited with code {proc.returncode}"
+        await queue.put(_sse("error", {"message": err[:1500]}, role="cli"))
+
+    return files_created, files_edited, result_text, auth_failed
+
+
+async def _run_supervisor_loop(
+    session: SupervisorSession,
+    queue: asyncio.Queue,
+) -> None:
+    """Drive the supervisor LLM ↔ CLI dance. Posts events into `queue`.
+
+    The loop continues until: (a) the supervisor declares `done`,
+    (b) the supervisor asks the user a question, (c) the session is
+    canceled (Stop), or (d) a hard error makes recovery impossible.
+
+    Mid-loop user messages arrive via /supervise/interject which
+    appends to `session.pending_interjects`. We drain that queue at
+    the top of each iteration before consulting the supervisor."""
+    from app.services.internal_llm import call_system_llm
+
+    try:
+        while True:
+            if session.canceled:
+                await queue.put(_sse("agent_message", {"text": "Stopped by user."}, role="agent"))
+                break
+
+            # Drain any interjects accumulated since the last turn.
+            if session.pending_interjects:
+                extra = "\n\n".join(session.pending_interjects)
+                session.pending_interjects.clear()
+                session.messages.append({
+                    "role": "user",
+                    "content": f"[NEW USER MESSAGE — incorporate into the next decision]\n{extra}",
+                })
+
+            await queue.put(_sse("agent_status", {"text": "thinking…"}, role="agent"))
+
+            try:
+                raw = await call_system_llm(
+                    user_id=session.user_id,
+                    operation_type="system.toup_code.supervisor",
+                    model=None,  # use the user's agent_model — they OWN this orchestration
+                    max_tokens=800,
+                    system=SUPERVISOR_SYSTEM_PROMPT,
+                    messages=session.messages,
+                    timeout=120,
+                )
+            except Exception as e:  # pragma: no cover
+                await queue.put(_sse("error", {"message": f"Supervisor LLM error: {e!r}"}, role="agent"))
+                break
+
+            if not raw:
+                await queue.put(_sse("error", {"message": "Supervisor returned empty response."}, role="agent"))
+                break
+
+            action = _parse_supervisor_action(raw)
+            session.messages.append({"role": "assistant", "content": raw})
+
+            if action is None:
+                # The supervisor returned prose. Surface as a plain
+                # message so the user can see what it said, then exit
+                # the loop — repeated malformed output would burn
+                # tokens with no progress.
+                await queue.put(_sse("agent_message", {"text": raw[:2000]}, role="agent"))
+                break
+
+            kind = str(action.get("action") or "")
+            thinking = str(action.get("thinking") or "").strip()
+            if thinking:
+                await queue.put(_sse("agent_thinking", {"text": thinking}, role="agent"))
+
+            if kind == "done":
+                summary = str(action.get("summary") or "Done.").strip() or "Done."
+                await queue.put(_sse("agent_done", {"summary": summary}, role="agent"))
+                break
+
+            if kind == "ask_user":
+                question = str(action.get("question") or "").strip() or "Could you clarify?"
+                await queue.put(_sse("agent_question", {"question": question}, role="agent"))
+                # The loop ends here — the next /supervise call with the
+                # same conv_id (carrying the user's reply) resumes it.
+                break
+
+            if kind == "send_to_cli":
+                cli_prompt = str(action.get("prompt") or "").strip()
+                if not cli_prompt:
+                    await queue.put(_sse("error", {"message": "Supervisor produced an empty CLI prompt."}, role="agent"))
+                    break
+                await queue.put(_sse("agent_dispatch", {"prompt": cli_prompt}, role="agent"))
+                created, edited, cli_result, auth_failed = await _run_cli_for_supervisor(
+                    session, cli_prompt, queue,
+                )
+                if auth_failed:
+                    # The CLI rejected the user's token — no point in
+                    # asking the supervisor to keep going.
+                    break
+                # Synthesize a feedback turn so the supervisor knows
+                # what the CLI did. Keep it terse — full transcripts
+                # blow up context fast on multi-iteration runs.
+                feedback_parts: list[str] = ["CLI completed."]
+                if created:
+                    feedback_parts.append(f"Files created: {', '.join(sorted(set(created)))}")
+                if edited:
+                    feedback_parts.append(f"Files edited: {', '.join(sorted(set(edited)))}")
+                if cli_result:
+                    feedback_parts.append(f"CLI reply: {cli_result[:1200]}")
+                session.messages.append({
+                    "role": "user",
+                    "content": "\n".join(feedback_parts),
+                })
+                continue
+
+            # Unknown action — surface and stop.
+            await queue.put(_sse("agent_message", {"text": f"Unknown action `{kind}`. Stopping."}, role="agent"))
+            break
+    finally:
+        # Final marker — frontend uses this to flip session-state idle.
+        await queue.put(_sse("session_completed", {"conv_id": session.conv_id}, role=None))
+        await queue.put(None)  # sentinel — closes the SSE stream
 
 
 # ── Endpoints ──────────────────────────────────────────────────
@@ -971,3 +1341,153 @@ async def spawn_session(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/supervise")
+async def supervise_session(
+    body: SuperviseRequest,
+    request: Request,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Open an SSE stream that drives the supervisor loop.
+
+    First call (no conv_id): creates a new session and starts the
+    loop. Subsequent calls with the same conv_id: appends the new
+    user message to the existing session's messages and resumes.
+
+    The stream stays open until the supervisor says `done`, asks the
+    user a question, or the client disconnects. /supervise/stop
+    cancels in-flight.
+    """
+    _gc_supervisor_sessions()
+
+    config = await _get_or_create_config(str(current_user.id), db)
+    raw_token = _read_provider_token(config, body.provider)
+    if not raw_token:
+        pretty = {"claude": "Claude Code", "codex": "GPT Codex"}[body.provider]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Connect your {pretty} credential first.",
+        )
+    token = _clean_pasted_token(raw_token)
+    if token != raw_token:
+        _write_provider_token(config, body.provider, token)
+        config.updated_at = datetime.utcnow()
+        await db.commit()
+
+    # Look up or create the session.
+    session = _SESSIONS.get(body.conv_id) if body.conv_id else None
+    user_id_str = str(current_user.id)
+
+    if session is None or session.user_id != user_id_str:
+        # New session (also branch taken if a stale conv_id from a
+        # different user is supplied — never resume cross-tenant).
+        conv_id = body.conv_id or uuid.uuid4().hex[:16]
+        user_seg = _safe_segment(user_id_str, "user")
+        project_seg = _safe_segment(body.project or conv_id, conv_id)
+        user_workspace_root = (_workspace_root() / user_seg).resolve()
+        workspace = (user_workspace_root / project_seg).resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        session = SupervisorSession(
+            conv_id=conv_id,
+            user_id=user_id_str,
+            provider=body.provider,
+            workspace=workspace,
+            workspace_root=user_workspace_root,
+            token=token,
+            messages=[{"role": "user", "content": body.user_message}],
+        )
+        _SESSIONS[conv_id] = session
+    else:
+        # Continuation — refresh state.
+        session.canceled = False
+        session.token = token
+        session.provider = body.provider
+        session.last_seen_at = datetime.utcnow()
+        session.messages.append({"role": "user", "content": body.user_message})
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def stream() -> AsyncIterator[str]:
+        # Kick off the session_started immediately so the frontend can
+        # show "running" before the supervisor LLM responds.
+        yield _sse("session_started", {
+            "conv_id": session.conv_id,
+            "provider": session.provider,
+            "user_message": body.user_message,
+        })
+        # Loop runs in the background; we drain `queue` here.
+        loop_task = asyncio.create_task(_run_supervisor_loop(session, queue))
+        try:
+            while True:
+                # Cancel the loop if the client tab closes — otherwise
+                # the supervisor would keep burning the user's tokens
+                # with no one to read the reply.
+                if await request.is_disconnected():
+                    session.canceled = True
+                    break
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+                if item is None:  # sentinel
+                    break
+                yield item
+        finally:
+            session.canceled = True
+            if not loop_task.done():
+                # Give the loop a chance to emit a final session_completed
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(loop_task, timeout=2.0)
+                if not loop_task.done():
+                    loop_task.cancel()
+                    with contextlib.suppress(Exception):
+                        await loop_task
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/supervise/interject")
+async def supervise_interject(
+    body: InterjectRequest,
+    current_user=Depends(get_current_user),
+):
+    """Drop a mid-loop user message into the supervisor's queue.
+
+    The next supervisor turn will see it as a synthetic
+    `[NEW USER MESSAGE]` user-role turn and decide how to incorporate
+    it. Avoids the user having to Stop+restart to course-correct."""
+    session = _SESSIONS.get(body.conv_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if session.user_id != str(current_user.id):
+        raise HTTPException(status_code=403, detail="not your conversation")
+    session.pending_interjects.append(body.message)
+    session.last_seen_at = datetime.utcnow()
+    return {"ok": True, "queued": len(session.pending_interjects)}
+
+
+@router.post("/supervise/stop")
+async def supervise_stop(
+    body: ConvIdRequest,
+    current_user=Depends(get_current_user),
+):
+    """Cancel an in-flight supervisor session. Idempotent — calling
+    on a session that already ended is a no-op."""
+    session = _SESSIONS.get(body.conv_id)
+    if session is None:
+        return {"ok": True, "missing": True}
+    if session.user_id != str(current_user.id):
+        raise HTTPException(status_code=403, detail="not your conversation")
+    session.canceled = True
+    return {"ok": True}
