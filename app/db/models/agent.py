@@ -36,6 +36,13 @@ class CronJob(Base):
     last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     run_count: Mapped[int] = mapped_column(Integer, default=0)
 
+    # Phase B (mig 042): pointer to the Routine that replaced this row.
+    # NULL until mig 043 backfills. When set, CronService skips the row
+    # at load time (Routine runner owns delivery now — anti-double-fire).
+    migrated_to_routine_id: Mapped[Optional[str]] = mapped_column(
+        String(36), nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

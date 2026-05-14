@@ -130,6 +130,17 @@ class Settings(BaseSettings):
     # safe to enable broadly, but staged rollout is still the right call.
     routines_reminders_enabled: bool = False
 
+    # Phase C — CronService deprecation switch (2026-05-14, `ecb348a`'s
+    # follow-up). The legacy CronJob/CronService system is being replaced
+    # by Routines (kind=reminder). Default True keeps current behaviour
+    # exactly — CronService starts, loads jobs, fires them. When False
+    # CronService.start() no-ops gracefully and the legacy `/cron`
+    # Telegram command surfaces a one-line deprecation banner pointing
+    # users at `/reminders`. Flip to False ONLY after every active
+    # CronJob row for the tenant has `migrated_to_routine_id` set
+    # (run mig 043 first) — otherwise those reminders stop firing.
+    cron_service_enabled: bool = True
+
     # Workspace Bootstrap
     workspace_per_user: bool = True  # Create per-user workspace subdirectories
     workspace_create_readme: bool = True  # Create README.md in new workspaces

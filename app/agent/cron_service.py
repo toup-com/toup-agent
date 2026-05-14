@@ -122,10 +122,38 @@ class CronService:
         self._agent_runner = agent_runner
 
     async def start(self):
-        """Start the scheduler and load jobs from DB."""
+        """Start the scheduler and load jobs from DB.
+
+        Phase C deprecation gate: when ``settings.cron_service_enabled``
+        is False the service does NOT start its scheduler and does NOT
+        load any jobs. The legacy ``/cron`` Telegram command still
+        renders a deprecation banner via :meth:`list_jobs` (which
+        returns the empty in-memory map) so the user can see that the
+        old surface is intentionally retired, not broken.
+        """
+        try:
+            from app.config import settings
+            if not getattr(settings, "cron_service_enabled", True):
+                logger.warning(
+                    "⏰ CronService disabled by config (cron_service_enabled=False) "
+                    "— use Routines (kind=reminder) instead. Existing cron_jobs "
+                    "rows are NOT firing; back them out via mig 043 or recreate "
+                    "as reminders before flipping the flag."
+                )
+                return
+        except Exception:
+            # Defensive: config import failure should never block the
+            # cron service from starting in the current behavior.
+            pass
         self.scheduler.start()
         await self._load_jobs_from_db()
-        logger.info("⏰ Cron service started")
+        logger.info(
+            "⏰ Cron service started — DEPRECATION: this scheduler is "
+            "being replaced by Routines (kind=reminder). New reminders "
+            "should be created via routines__remind / /remind / the "
+            "dashboard ReminderForm; this code path will be removed in "
+            "a future release."
+        )
 
     async def stop(self):
         """Shut down the scheduler."""
@@ -432,7 +460,16 @@ class CronService:
                 pass
 
     async def _load_jobs_from_db(self):
-        """Load all enabled cron jobs from DB and schedule them."""
+        """Load all enabled cron jobs from DB and schedule them.
+
+        Phase C / mig 043 interlock: rows with ``migrated_to_routine_id``
+        set were copied into the Routine system and the new Routine is
+        firing them. We skip those rows here even if their ``enabled``
+        flag somehow flipped back to True (manual SQL, operator edit) —
+        the Routine is the authoritative source. Without this guard the
+        same reminder could fire twice (once via Routine, once via
+        CronService) on misconfigured DBs.
+        """
         try:
             from app.db.database import async_session_maker
             from app.db.models import CronJob
@@ -445,7 +482,12 @@ class CronService:
                 jobs = result.scalars().all()
 
             loaded = 0
+            skipped_migrated = 0
             for job in jobs:
+                # Skip rows already migrated to a Routine — see docstring.
+                if getattr(job, "migrated_to_routine_id", None):
+                    skipped_migrated += 1
+                    continue
                 kind, trigger = parse_schedule(job.schedule_spec or "")
                 if trigger is None:
                     logger.warning(f"⏰ Skipping job with invalid schedule: {job.name} ({job.schedule_spec})")
@@ -478,5 +520,11 @@ class CronService:
 
             if loaded:
                 logger.info(f"⏰ Loaded {loaded} cron jobs from DB")
+            if skipped_migrated:
+                logger.info(
+                    "⏰ Skipped %d cron_jobs row(s) with migrated_to_routine_id set "
+                    "(Routine runner owns delivery — anti-double-fire guard).",
+                    skipped_migrated,
+                )
         except Exception as e:
             logger.warning(f"⏰ Failed to load cron jobs from DB: {e}")

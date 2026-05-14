@@ -1422,26 +1422,42 @@ class ToupTelegramBot:
         )
 
     async def _cmd_cron(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /cron — list scheduled jobs."""
+        """Handle /cron — list scheduled jobs.
+
+        Phase C deprecation: the legacy CronService is being replaced by
+        Routines. Every response now leads with a one-line banner
+        pointing the user at /reminders so they know the new surface
+        exists, regardless of whether the flag is currently flipped.
+        """
         if not self._is_allowed(update.effective_user.id):
             return
 
         user_id = await self._get_toup_user_id(update.effective_user.id)
 
+        # One-line deprecation banner — shown on every /cron response.
+        deprecation = (
+            "⚠️  <i>/cron is deprecated — use /reminders (richer schedules, "
+            "multi-channel delivery, dashboard surface).</i>\n\n"
+        )
+
         if not self.cron_service:
-            await update.message.reply_text("⏰ Cron service not available.")
+            await update.message.reply_text(
+                deprecation + "⏰ Cron service not available.",
+                parse_mode="HTML",
+            )
             return
 
         jobs = await self.cron_service.list_jobs(user_id)
         if not jobs:
             await update.message.reply_text(
-                "⏰ No scheduled jobs.\n\n"
-                "<i>Ask me to set a reminder or schedule a task.</i>",
+                deprecation
+                + "⏰ No scheduled jobs.\n\n"
+                "<i>Try </i><code>/remind me to drink water every morning at 9</code>",
                 parse_mode="HTML",
             )
             return
 
-        lines = ["⏰ <b>Scheduled Jobs</b>\n"]
+        lines = [deprecation + "⏰ <b>Scheduled Jobs (legacy)</b>\n"]
         for i, j in enumerate(jobs, 1):
             status = "✅ active" if j["enabled"] else "⏸ disabled"
             lines.append(
@@ -1450,7 +1466,10 @@ class ToupTelegramBot:
                 f"   Status: {status} | Runs: {j['run_count']}\n"
                 f"   ID: <code>{j['id'][:8]}</code>"
             )
-        lines.append("\n<i>Use the cron tool or ask me to manage jobs.</i>")
+        lines.append(
+            "\n<i>Migrate these to reminders so they survive the "
+            "CronJob removal: ask me to recreate any of them via /remind.</i>"
+        )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     # ── /remind + /reminders ─────────────────────────────────────────
