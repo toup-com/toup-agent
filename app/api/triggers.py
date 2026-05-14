@@ -34,11 +34,30 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
+
+
+def _utc_iso(v: Optional[datetime]) -> Optional[str]:
+    """Render a datetime as RFC 3339 UTC with a trailing ``Z``.
+
+    Pydantic's default `datetime` serialiser emits ISO 8601 without a
+    timezone marker for naive datetimes — e.g. ``datetime.utcnow()``
+    returns naive UTC, gets serialised as ``"2026-05-14T19:18:00"``,
+    and the browser's ``new Date()`` parses that as LOCAL time. That
+    was the 2026-05-14 dashboard bug: events stamped at 19:18 UTC
+    rendered as "7:18 PM local" instead of "3:18 PM EDT". Force the
+    ``Z`` suffix on every datetime field that crosses the wire to
+    the frontend so the parse is unambiguous.
+    """
+    if v is None:
+        return None
+    if v.tzinfo is None:
+        return v.isoformat() + "Z"
+    return v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 from sqlalchemy import desc, select
 
 logger = logging.getLogger(__name__)
@@ -187,6 +206,11 @@ class TriggerEventResponse(BaseModel):
     summary_message_id: Optional[str] = None
     coalesced_into_event_id: Optional[str] = None
 
+    # See `_utc_iso` — emit ``Z`` so the browser parses these as UTC.
+    @field_serializer("received_at", "started_at", "finished_at", when_used="json")
+    def _ser_dt(self, v: Optional[datetime]) -> Optional[str]:
+        return _utc_iso(v)
+
 
 class TriggerResponse(BaseModel):
     id: str
@@ -206,6 +230,10 @@ class TriggerResponse(BaseModel):
     delivery_channels: list[str]
     watch_provisioned: bool
     recent_events: list[TriggerEventResponse] = Field(default_factory=list)
+
+    @field_serializer("last_fired_at", "created_at", "updated_at", when_used="json")
+    def _ser_dt(self, v: Optional[datetime]) -> Optional[str]:
+        return _utc_iso(v)
 
 
 # ── Response helpers ─────────────────────────────────────────────────

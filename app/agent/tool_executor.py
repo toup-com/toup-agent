@@ -1662,67 +1662,53 @@ class ToolExecutor:
             return f"ERROR: Image analysis failed: {exc}"
 
     # ------------------------------------------------------------------
-    # 12. cron — scheduled tasks
+    # 12. cron — DEPRECATED, redirects to the routines skill
     # ------------------------------------------------------------------
     async def _tool_cron(self, inp: Dict[str, Any]) -> str:
-        action = inp.get("action", "").strip().lower()
+        """The legacy `cron` tool was removed from the tool registry on
+        2026-05-14 (the agent's tool list no longer advertises it).
+        This handler stays in place as a defensive backstop for any
+        path that still references the name — cached system prompts,
+        a still-warm Anthropic tool-use schema, an older agent
+        snapshot, etc.
 
-        if not self.cron_service:
-            return "ERROR: Cron service not available"
-
-        user_id = self._current_user_id
-        chat_id = self._chat_id
-
+        Instead of going through `CronService.add_job` (which only
+        delivered to Telegram and failed everywhere else) we surface
+        a structured ERROR string that points the model at the
+        replacement skill. The agent's recovery prompt for ERROR
+        results turns this into a follow-up call to
+        `routines__remind` / `routines__list` / etc. — no user-visible
+        regression."""
+        action = (inp.get("action") or "").strip().lower()
         if action == "add":
-            name = inp.get("name", "Unnamed task")
-            schedule = inp.get("schedule", "")
-            message = inp.get("message", "")
-            if not schedule:
-                return "ERROR: 'schedule' is required for add"
-            if not message:
-                return "ERROR: 'message' is required for add"
-            if not chat_id:
-                return "ERROR: No active Telegram chat"
-
-            result = await self.cron_service.add_job(
-                user_id=user_id,
-                chat_id=chat_id,
-                name=name,
-                schedule=schedule,
-                message=message,
+            return (
+                "ERROR: the `cron` tool is removed. Use the routines "
+                "skill instead — call `routines__remind` with `when` "
+                "(once / daily / every), `at_local` (or `daily_at_local` "
+                "/ `every_seconds`), and `reminder_text`. The routines "
+                "system delivers to website + Telegram + WhatsApp "
+                "(not just Telegram) and survives across surfaces."
             )
-            return json.dumps(result)
-
-        elif action == "list":
-            jobs = await self.cron_service.list_jobs(user_id)
-            if not jobs:
-                return "No scheduled jobs."
-            lines = []
-            for j in jobs:
-                status = "enabled" if j["enabled"] else "disabled"
-                lines.append(
-                    f"• {j['name']} (id={j['id'][:8]}...)\n"
-                    f"  Schedule: {j['schedule']} ({j['kind']})\n"
-                    f"  Status: {status} | Runs: {j['run_count']}"
-                )
-            return "\n\n".join(lines)
-
-        elif action == "remove":
-            job_id = inp.get("job_id", "")
-            if not job_id:
-                return "ERROR: 'job_id' is required for remove"
-            result = await self.cron_service.remove_job(job_id, user_id)
-            return json.dumps(result)
-
-        elif action == "run":
-            job_id = inp.get("job_id", "")
-            if not job_id:
-                return "ERROR: 'job_id' is required for run"
-            result = await self.cron_service.run_job_now(job_id, user_id)
-            return json.dumps(result)
-
-        else:
-            return f"ERROR: Unknown action '{action}'. Use: add, list, remove, run"
+        if action == "list":
+            return (
+                "ERROR: the `cron` tool is removed. Use `routines__list` "
+                "to see scheduled routines (including reminders)."
+            )
+        if action == "remove":
+            return (
+                "ERROR: the `cron` tool is removed. Use `routines__delete` "
+                "with the routine_id from `routines__list`."
+            )
+        if action == "run":
+            return (
+                "ERROR: the `cron` tool is removed. Use `routines__run_now` "
+                "with the routine_id from `routines__list`."
+            )
+        return (
+            "ERROR: the `cron` tool is removed. Use the routines skill: "
+            "`routines__remind` (set a reminder) / `routines__list` / "
+            "`routines__delete` / `routines__run_now`."
+        )
 
     # ------------------------------------------------------------------
     # 13. process — long-running background shell process management

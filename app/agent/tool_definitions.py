@@ -521,48 +521,17 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "required": ["image"],
             },
         },
-        # ------------------------------------------------------------------
-        # 12. Cron — scheduled tasks
-        # ------------------------------------------------------------------
-        {
-            "name": "cron",
-            "description": (
-                "Manage scheduled tasks. The agent can create reminders, periodic checks, "
-                "or any recurring task. Actions: add (create job), list (show jobs), "
-                "remove (delete job), run (trigger a job now)."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["add", "list", "remove", "run"],
-                        "description": "The action to perform.",
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Job name (for add).",
-                    },
-                    "schedule": {
-                        "type": "string",
-                        "description": (
-                            "Schedule expression (for add). Accepts: "
-                            "cron expr ('*/30 * * * *'), interval ('30m', '2h', '1d'), "
-                            "ISO datetime ('2025-12-31 09:00'), or relative ('in 5m')."
-                        ),
-                    },
-                    "message": {
-                        "type": "string",
-                        "description": "The prompt/message to run on schedule (for add).",
-                    },
-                    "job_id": {
-                        "type": "string",
-                        "description": "Job ID (for remove/run).",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
+        # 12. (removed) Cron — replaced by the routines skill's
+        #     `routines__remind` + `routines__create` / `routines__list` /
+        #     `routines__update` / `routines__delete` / `routines__run_now`
+        #     tools. The legacy cron tool only delivered to Telegram and
+        #     failed on every other channel ("ERROR: No active Telegram
+        #     chat" — caught 2026-05-14 when a website-chat user said
+        #     "remind me in 2 min to drink water"). The new skill is
+        #     multi-channel (website / Telegram / WhatsApp) and uses
+        #     friendlier `when=once|daily|every` inputs. See
+        #     `app/agent/skills/builtins/routines/skill.py` for the
+        #     replacement tool surface.
         # ------------------------------------------------------------------
         # 13. Spawn — background sub-agent task
         # ------------------------------------------------------------------

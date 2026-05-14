@@ -17,12 +17,25 @@ multiple per kind so weekday/weekend variants stay possible later.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
+
+
+def _utc_iso(v: Optional[datetime]) -> Optional[str]:
+    """Emit RFC 3339 UTC with trailing ``Z``. Mirrors
+    ``app.api.triggers._utc_iso`` — see that docstring for the
+    rationale (2026-05-14 dashboard timezone bug). Duplicated rather
+    than imported to keep the two API modules' blast radius
+    independent."""
+    if v is None:
+        return None
+    if v.tzinfo is None:
+        return v.isoformat() + "Z"
+    return v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 from sqlalchemy import delete, desc, select
 from sqlalchemy.exc import IntegrityError
 
@@ -340,6 +353,10 @@ class RoutineRunResponse(BaseModel):
     attempt: int
     summary_message_id: Optional[str] = None
 
+    @field_serializer("started_at", "finished_at", "fire_instant", when_used="json")
+    def _ser_dt(self, v: Optional[datetime]) -> Optional[str]:
+        return _utc_iso(v)
+
 
 class RoutineResponse(BaseModel):
     id: str
@@ -365,6 +382,13 @@ class RoutineResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     recent_runs: list[RoutineRunResponse] = []
+
+    @field_serializer(
+        "schedule_at", "last_run_at", "next_run_at", "created_at", "updated_at",
+        when_used="json",
+    )
+    def _ser_dt(self, v: Optional[datetime]) -> Optional[str]:
+        return _utc_iso(v)
 
 
 def _run_to_response(r) -> RoutineRunResponse:
