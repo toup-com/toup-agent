@@ -7,7 +7,7 @@ from app.db.models import (
     # Identity system
     Identity, IdentityType,
     # Agent platform
-    CronJob, TelegramUserMapping, AgentError, ApiKey,
+    TelegramUserMapping, AgentError, ApiKey,
     # Beta access
     Invite,
     # VPS provisioning
@@ -47,7 +47,6 @@ __all__ = [
     "Identity",
     "IdentityType",
     # Agent platform
-    "CronJob",
     "TelegramUserMapping",
     "AgentError",
     "ApiKey",

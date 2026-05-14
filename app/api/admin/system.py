@@ -341,26 +341,37 @@ async def get_bot_cron_jobs(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from app.db.models import CronJob
+    """DEPRECATED in Phase D — CronJob deleted. Returns the equivalent
+    Routine rows so the admin dashboard's old cron view still shows
+    something useful. Operators should migrate to `/admin/bot/routines`
+    (or the dashboard's Routines tab) for the canonical view."""
+    from app.db.models import Routine
 
-    result = await db.execute(select(CronJob).order_by(CronJob.created_at.desc()))
-    jobs = result.scalars().all()
+    result = await db.execute(
+        select(Routine).order_by(Routine.created_at.desc())
+    )
+    rows = result.scalars().all()
     return {
         "jobs": [
             {
-                "id": str(j.id)[:8],
-                "user_id": j.user_id[:8] + "...",
-                "name": j.name,
-                "schedule": j.schedule_expression,
-                "schedule_type": j.schedule_type,
-                "enabled": j.enabled,
-                "run_count": j.run_count,
-                "last_run_at": j.last_run_at.isoformat() if j.last_run_at else None,
-                "created_at": j.created_at.isoformat(),
+                "id": str(r.id)[:8],
+                "user_id": r.user_id[:8] + "...",
+                "name": r.name or r.kind,
+                "schedule": r.schedule_cron_local,
+                "schedule_type": getattr(r, "schedule_kind", "cron"),
+                "enabled": r.enabled,
+                "run_count": None,  # Routines don't track a simple counter;
+                                    # use /api/routines/{id}/runs for history.
+                "last_run_at": r.last_run_at.isoformat() if r.last_run_at else None,
+                "created_at": r.created_at.isoformat(),
             }
-            for j in jobs
+            for r in rows
         ],
-        "total": len(jobs),
+        "total": len(rows),
+        "note": (
+            "Phase D: CronJob deleted; this endpoint now returns Routine "
+            "rows. Use the Routines dashboard for the modern view."
+        ),
     }
 
 

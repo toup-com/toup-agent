@@ -10,44 +10,6 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 
 
-class CronJob(Base):
-    """Scheduled tasks for the Toup agent runtime."""
-    __tablename__ = "cron_jobs"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
-    name: Mapped[str] = mapped_column(String(200))
-
-    # Schedule
-    schedule_kind: Mapped[str] = mapped_column(String(20))  # "at", "every", "cron"
-    schedule_spec: Mapped[str] = mapped_column(String(200))
-    schedule_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    schedule_interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    schedule_cron_expr: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-
-    # Payload
-    payload_text: Mapped[str] = mapped_column(Text)
-
-    # Telegram chat to send results to
-    telegram_chat_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-
-    # State
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    run_count: Mapped[int] = mapped_column(Integer, default=0)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    # Phase A → C — when a cron_jobs row gets migrated into a routines
-    # sibling (Phase B), this column points to the new routine.
-    # CronService's loader skips rows where this is non-NULL so the
-    # legacy + new paths don't both fire. NULL = canonical, not migrated.
-    # Removed entirely in Phase D when the cron_jobs table is dropped.
-    migrated_to_routine_id: Mapped[Optional[str]] = mapped_column(
-        String(36), nullable=True
-    )
-
-
 class TelegramUserMapping(Base):
     """Maps Telegram user IDs to Toup user IDs for multi-user support."""
     __tablename__ = "telegram_user_mappings"

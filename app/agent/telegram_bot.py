@@ -5,7 +5,7 @@ Handles:
 - Photos → download + pass as image_url content blocks (GPT vision)
 - Voice/audio → Whisper transcription → AgentRunner
 - Documents → read content and include inline
-- Commands: /start, /help, /status, /reset, /new, /stop, /whoami, /model, /compact, /usage, /cron, /export, /subagents
+- Commands: /start, /help, /status, /reset, /new, /stop, /whoami, /model, /compact, /usage, /remind, /export, /subagents
 - Streaming responses with progressive message edits
 - Continuous typing indicator during processing
 - Reply-to context support
@@ -59,7 +59,9 @@ class ToupTelegramBot:
         self.token = token
         self.agent_runner = agent_runner
         self.app: Optional[Application] = None
-        self.cron_service = None  # Set after cron service starts
+        # Phase D — CronService deleted. Kept for back-compat with any
+        # external code that reads `bot.cron_service`; always None now.
+        self.cron_service = None
         self.subagent_manager = None  # Set after subagent manager created
 
         # Map Telegram user ID → Toup user ID (in-memory cache)
@@ -100,9 +102,8 @@ class ToupTelegramBot:
         self.app.add_handler(CommandHandler("model", self._cmd_model))
         self.app.add_handler(CommandHandler("compact", self._cmd_compact))
         self.app.add_handler(CommandHandler("usage", self._cmd_usage))
-        self.app.add_handler(CommandHandler("cron", self._cmd_cron))
-        # Phase A — /remind sets a reminder routine. Alias /reminders to
-        # the same handler so users can guess the plural form too.
+        # Phase D — /cron deleted. /remind and /reminders own scheduled
+        # tasks now, surfaced over the Routine system.
         self.app.add_handler(CommandHandler("remind", self._cmd_remind))
         self.app.add_handler(CommandHandler("reminders", self._cmd_remind))
         self.app.add_handler(CommandHandler("export", self._cmd_export))
@@ -167,10 +168,7 @@ class ToupTelegramBot:
             BotCommand("model", "Show or switch AI model"),
             BotCommand("compact", "Force context compaction"),
             BotCommand("usage", "Show token usage and cost"),
-            BotCommand("cron", "List scheduled jobs"),
-            # Phase A — /remind is the modern reminder primitive. /cron
-            # remains as a legacy listing for the old CronJob system
-            # (deprecated; removed in Phase D).
+            # Phase D — /cron removed. /remind is the canonical command.
             BotCommand("remind", "Set a reminder (one-shot or recurring)"),
             BotCommand("export", "Export conversation history"),
             BotCommand("subagents", "List background tasks"),
@@ -501,7 +499,7 @@ class ToupTelegramBot:
             "/model — Show or switch AI model\n"
             "/compact — Force context compaction\n"
             "/usage — Show token usage and cost\n"
-            "/cron — List scheduled jobs\n"
+            "/remind — Set a reminder (one-shot or recurring)\n"
             "/export — Export conversation history\n"
             "/subagents — List background tasks\n"
             "/skills — List loaded skill plugins\n"
@@ -1424,66 +1422,6 @@ class ToupTelegramBot:
             f"Rate: ${rate_in}/1K in, ${rate_out}/1K out",
             parse_mode="HTML",
         )
-
-    async def _cmd_cron(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /cron — DEPRECATED in Phase C. Lists legacy
-        un-migrated cron jobs (rare after Phase B's backfill) and
-        points users at /remind for new automations.
-        """
-        if not self._is_allowed(update.effective_user.id):
-            return
-
-        user_id = await self._get_toup_user_id(update.effective_user.id)
-
-        # Phase C — replace the cron-service listing with a routines
-        # listing. The Phase B backfill moved every cron_job into a
-        # routine, so the canonical "what's scheduled?" answer now
-        # lives there.
-        try:
-            from app.db.database import async_session_maker
-            from app.db.models import Routine
-            from sqlalchemy import select, desc
-
-            async with async_session_maker() as db:
-                result = await db.execute(
-                    select(Routine)
-                    .where(Routine.user_id == user_id, Routine.enabled == True)  # noqa: E712
-                    .order_by(desc(Routine.created_at))
-                    .limit(20)
-                )
-                rs = list(result.scalars().all())
-        except Exception as e:
-            logger.exception("[/cron] routines list failed: %s", e)
-            rs = []
-
-        if not rs:
-            await update.message.reply_text(
-                "⏰ No scheduled routines.\n\n"
-                "<i>Use /remind to set up a reminder, or ask me to "
-                "schedule a task.</i>",
-                parse_mode="HTML",
-            )
-            return
-
-        lines = ["⏰ <b>Scheduled routines</b>\n"]
-        for i, r in enumerate(rs, 1):
-            schedule_kind = getattr(r, "schedule_kind", "cron") or "cron"
-            if schedule_kind == "at" and getattr(r, "schedule_at", None):
-                sched = f"once at {r.schedule_at.isoformat()}Z"
-            elif schedule_kind == "every":
-                n = getattr(r, "schedule_interval_seconds", 0) or 0
-                sched = f"every {max(1, n // 60)} min"
-            else:
-                sched = r.schedule_cron_local
-            title = (r.name or r.reminder_text or r.kind)[:60]
-            lines.append(
-                f"{i}. <b>{title}</b>\n"
-                f"   Schedule: <code>{sched}</code> ({schedule_kind})\n"
-                f"   ID: <code>{r.id[:8]}</code>"
-            )
-        lines.append("\n<i>Use /remind to add a reminder, or manage these "
-                     "in Mission Control.</i>")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _cmd_remind(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /remind and /reminders.

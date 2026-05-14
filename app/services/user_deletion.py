@@ -507,9 +507,12 @@ async def _wipe_user_data_tables(db: AsyncSession, user_id: str) -> None:
     # Direct user_id tables
     for table_name in [
         "identities", "documents", "memories", "conversations",
-        "entities", "brain_stats", "cron_jobs", "telegram_user_mappings",
+        "entities", "brain_stats", "telegram_user_mappings",
         "api_keys", "agent_errors", "soul_configs",
         "workflows",
+        # Phase D — cron_jobs dropped. Per-user cleanup of scheduled
+        # tasks now happens via the `routines` table below.
+        "routines", "routine_runs", "routine_notification_dedupe",
     ]:
         await _safe_exec(text(
             f"DELETE FROM {table_name} WHERE user_id = :uid"
