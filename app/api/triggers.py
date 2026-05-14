@@ -590,11 +590,14 @@ async def test_trigger(trigger_id: str):
     any real Gmail message id. Dispatches via the runner, returns the
     persisted row.
 
-    For email_received: the handler will try to fetch the gmail_message_id
-    `test:<uuid>` via MCP and fail. That's the expected outcome — the
-    test verifies the wiring (auth, runner pickup, DB write), not a
-    real summary. If a user wants to test against a real message they
-    can copy a real id into the dedupe field manually."""
+    For email_received: the handler detects the `test:` prefix in
+    `_fetch_all` and substitutes a synthetic email envelope instead of
+    calling MCP (which would 404 on the synthetic id). The summariser /
+    notify / forward action then runs end-to-end against that
+    payload, posting a real "Trigger wiring check" message into
+    Day-as-Chat. The user sees an actual message in their chat
+    (matching the dashboard banner) AND the trigger flips to
+    `last_status=active` so the UI surfaces are consistent."""
     from app.db.database import async_session_maker
     from app.db.models import Trigger, TriggerEvent
 
