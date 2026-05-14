@@ -4,10 +4,15 @@ Lets the user create/manage routines from chat: "from now on read all my
 emails before I wake up and summarize them" → agent calls
 `routines__create` with kind=email_briefing + a sensible cron.
 
-Five tools, all single-user-per-container (no user_id arg — read from
+Six tools, all single-user-per-container (no user_id arg — read from
 `settings.user_id`):
 
-  routines__create   — create one routine
+  routines__create   — create one routine (email_briefing | agent_task)
+  routines__remind   — friendly shortcut for kind=reminder. Accepts
+                       human-shape inputs (once / daily / every) and
+                       translates them to the underlying schedule_kind.
+                       Use this instead of `routines__create` when the
+                       user asks for a reminder/alert/nudge.
   routines__list     — list this user's routines (id, kind, schedule, status)
   routines__update   — toggle / reschedule / rename / rewrite prompt
   routines__delete   — drop a routine
@@ -178,6 +183,122 @@ class RoutinesSkill(Skill):
                 },
             },
             {
+                "name": "routines__remind",
+                "description": (
+                    "Friendly shortcut for creating a reminder (kind=`reminder`). "
+                    "USE THIS instead of `routines__create` whenever the user "
+                    "asks for a reminder / alert / nudge / heads-up — anything "
+                    "where the value is *literal text delivered at a time*, NOT "
+                    "an LLM-generated summary.\n\n"
+                    "Three modes via `when`:\n"
+                    "  • `once` — fire one time, then auto-disable. Pass "
+                    "`at_local` as either `\"YYYY-MM-DD HH:MM\"` (full local "
+                    "datetime) or `\"HH:MM\"` (today if still future, else "
+                    "tomorrow). Example: \"remind me to call mom at 6pm\".\n"
+                    "  • `daily` — fire every day at the same wall-clock time. "
+                    "Pass `daily_at_local=\"HH:MM\"`. Example: \"remind me to "
+                    "drink water every morning at 9\".\n"
+                    "  • `every` — fire on an interval. Pass `every_seconds` "
+                    "(min 60). Optional `window_start_local` + `window_end_local` "
+                    "(HH:MM) gate fires to a daily wall-clock window — e.g. "
+                    "\"every 30 minutes between 9am and 5pm\" → "
+                    "`every_seconds=1800, window_start_local=\"09:00\", "
+                    "window_end_local=\"17:00\"`. Without a window the interval "
+                    "runs 24/7.\n\n"
+                    "The skill resolves the user's timezone server-side; all "
+                    "the time inputs are interpreted in their local tz. "
+                    "**Delivery channels**: same as `routines__create` — ALWAYS "
+                    "ask the user where they want the reminder (chat, Telegram, "
+                    "WhatsApp, or all) before calling this tool."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reminder_text": {
+                            "type": "string",
+                            "description": (
+                                "The literal text delivered at fire time. The "
+                                "reminder is text-only — no LLM, no tools. Write "
+                                "it the way you want the user to read it, "
+                                "e.g. \"Time to take your vitamins\"."
+                            ),
+                        },
+                        "when": {
+                            "type": "string",
+                            "enum": ["once", "daily", "every"],
+                            "description": (
+                                "Schedule shape. `once` = one-shot + auto-disable. "
+                                "`daily` = same time every day. `every` = on "
+                                "an interval (optionally bounded by a daily window)."
+                            ),
+                        },
+                        "at_local": {
+                            "type": "string",
+                            "description": (
+                                "Required when when=`once`. Either "
+                                "\"YYYY-MM-DD HH:MM\" (explicit date+time) or "
+                                "\"HH:MM\" (today if still in the future, else "
+                                "tomorrow). Interpreted in the user's local tz."
+                            ),
+                        },
+                        "daily_at_local": {
+                            "type": "string",
+                            "description": (
+                                "Required when when=`daily`. \"HH:MM\" in user's "
+                                "local tz, e.g. \"07:30\"."
+                            ),
+                        },
+                        "every_seconds": {
+                            "type": "integer",
+                            "description": (
+                                "Required when when=`every`. Interval in seconds "
+                                "(minimum 60). 1800 = every 30 min; 3600 = hourly."
+                            ),
+                        },
+                        "window_start_local": {
+                            "type": "string",
+                            "description": (
+                                "Optional with when=`every`. \"HH:MM\" — only "
+                                "fire after this local time each day."
+                            ),
+                        },
+                        "window_end_local": {
+                            "type": "string",
+                            "description": (
+                                "Optional with when=`every`. \"HH:MM\" — stop "
+                                "firing after this local time each day. Pair "
+                                "with `window_start_local`. Wraps midnight if "
+                                "end < start (e.g. 22:00 → 06:00 = overnight)."
+                            ),
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Optional short name shown in Mission Control. "
+                                "Defaults to first 60 chars of `reminder_text`."
+                            ),
+                        },
+                        "delivery_channels": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["website", "telegram", "whatsapp"],
+                            },
+                            "description": (
+                                "Where to deliver. Defaults to `[\"website\"]` "
+                                "(chat thread). Ask the user before picking; "
+                                "website is always included server-side."
+                            ),
+                        },
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "Default true. False = create dormant.",
+                        },
+                    },
+                    "required": ["reminder_text", "when"],
+                },
+            },
+            {
                 "name": "routines__list",
                 "description": (
                     "List all of the user's existing routines. Call this BEFORE "
@@ -281,13 +402,25 @@ class RoutinesSkill(Skill):
     # ------------------------------------------------------------------
     def get_system_prompt_section(self) -> Optional[str]:
         return (
-            "# Routines — recurring agent automations\n"
+            "# Routines — recurring agent automations + reminders\n"
             "You can create scheduled automations for the user via the "
             "`routines__*` tools. Trigger this flow whenever the user asks "
             "for something on a recurring schedule:\n"
             "  • \"From now on, read my emails before I wake up and summarize them\"\n"
             "  • \"Every weekday at 7am, give me my calendar for the day\"\n"
             "  • \"Check my GitHub notifications every hour during work hours\"\n"
+            "  • \"Remind me to call mom at 6pm\" — *use `routines__remind`*\n"
+            "  • \"Buzz me every 30 minutes between 9 and 5 to stretch\" — *use `routines__remind`*\n"
+            "\n"
+            "**Tool to pick:**\n"
+            "  • If the user wants literal text delivered at a time "
+            "(reminder / alert / nudge — \"remind me to X\", \"ping me at Y\"), "
+            "use **`routines__remind`** with the friendly `when` modes "
+            "(once / daily / every). No LLM call, no MCP — just text on a "
+            "schedule.\n"
+            "  • If the user wants the agent to DO something "
+            "(\"summarize my emails\", \"check my GitHub\"), use "
+            "`routines__create` with kind=`email_briefing` or `agent_task`.\n"
             "\n"
             "**Flow:**\n"
             "  1. Confirm the schedule with the user in plain English (\"so "
@@ -339,6 +472,7 @@ class RoutinesSkill(Skill):
     ) -> str:
         dispatch = {
             "routines__create": self._create,
+            "routines__remind": self._remind,
             "routines__list": self._list,
             "routines__update": self._update,
             "routines__delete": self._delete,
@@ -359,6 +493,245 @@ class RoutinesSkill(Skill):
     # ------------------------------------------------------------------
     # Handlers — delegate to app.api.routines for single source of truth
     # ------------------------------------------------------------------
+    async def _remind(self, args: Dict[str, Any], ctx: SkillContext) -> str:
+        """Friendly wrapper that translates ``when`` + local-time inputs
+        into the underlying RoutineCreate schedule shape.
+
+        The user thinks in their local wall clock; the API stores
+        ``schedule_at`` in UTC, so we resolve the user's tz here and do
+        the conversion before delegating to ``create_routine``.
+        """
+        from datetime import datetime, time, timedelta
+        from fastapi import HTTPException
+        from app.config import settings
+        from app.api.routines import RoutineCreate, create_routine
+        from app.agent.routines.runner import _resolve_tz
+
+        text = (args.get("reminder_text") or "").strip()
+        when = (args.get("when") or "").strip().lower()
+        if not text:
+            return "ERROR: `reminder_text` is required."
+        if when not in {"once", "daily", "every"}:
+            return "ERROR: `when` must be one of: once, daily, every."
+
+        # ── Up-front input validation (no I/O) ─────────────────────────
+        # Surface obvious shape errors BEFORE the DB tz lookup so a bad
+        # interval / malformed HH:MM doesn't masquerade as a tz problem
+        # and confuse the agent. Each branch records its inputs and
+        # defers the per-kind payload build until after we have `tz`.
+        once_raw_at: Optional[str] = None
+        daily_hhmm: Optional[tuple[int, int]] = None
+        every_secs: Optional[int] = None
+        window_start: Optional[str] = None
+        window_end: Optional[str] = None
+
+        if when == "once":
+            raw = (args.get("at_local") or "").strip()
+            if not raw:
+                return (
+                    "ERROR: `at_local` is required when when=`once`. "
+                    "Pass \"YYYY-MM-DD HH:MM\" or \"HH:MM\"."
+                )
+            once_raw_at = raw
+        elif when == "daily":
+            raw = (args.get("daily_at_local") or "").strip()
+            hhmm = self._parse_hhmm(raw)
+            if hhmm is None:
+                return (
+                    "ERROR: `daily_at_local` must be \"HH:MM\" "
+                    f"(got {raw!r})."
+                )
+            daily_hhmm = hhmm
+        else:  # when == "every"
+            secs = args.get("every_seconds")
+            if not isinstance(secs, int) or secs < 60:
+                return (
+                    "ERROR: `every_seconds` must be an integer ≥ 60 "
+                    f"(got {secs!r})."
+                )
+            every_secs = secs
+            for k, target in (
+                ("window_start_local", "window_start"),
+                ("window_end_local", "window_end"),
+            ):
+                v = args.get(k)
+                if v:
+                    if self._parse_hhmm(v) is None:
+                        return f"ERROR: `{k}` must be \"HH:MM\" (got {v!r})."
+                    if target == "window_start":
+                        window_start = v
+                    else:
+                        window_end = v
+
+        # User-visible name defaults to a trimmed slice of the reminder
+        # text so Mission Control shows something readable even when the
+        # agent didn't pass `name`.
+        name = (args.get("name") or "").strip() or text[:60]
+
+        delivery = args.get("delivery_channels")
+        enabled = bool(args.get("enabled", True))
+
+        # Resolve user's tz — required for `once` (local→UTC conversion)
+        # AND for daily (formatting the cron string in their wall clock).
+        # `_resolve_tz` returns (ZoneInfo, fellback_to_utc_bool); we
+        # surface the fallback to the agent so it can warn the user.
+        user_id = str(getattr(settings, "user_id", "") or "")
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import User
+            from sqlalchemy import select
+            user_tz_str = None
+            if user_id:
+                async with async_session_maker() as db:
+                    row = (await db.execute(
+                        select(User).where(User.id == user_id)
+                    )).scalar_one_or_none()
+                    user_tz_str = getattr(row, "timezone", None) if row else None
+            tz, fell_back = _resolve_tz(user_tz_str, user_id)
+        except Exception as e:
+            logger.exception("[routines_skill.remind] tz lookup failed")
+            return f"ERROR: could not resolve your timezone — {e}"
+        if fell_back:
+            return (
+                "ERROR: your account timezone isn't set. Open Account → "
+                "Timezone and pick the right one (or share location on the "
+                "account page), then ask me to set this reminder again."
+            )
+
+        # ── Build the create payload now that tz is resolved ───────────
+        payload: Dict[str, Any] = {
+            "kind": "reminder",
+            "name": name,
+            "reminder_text": text,
+            "enabled": enabled,
+            "delivery_channels": delivery,
+        }
+
+        if when == "once":
+            dt_local = self._parse_local_datetime(once_raw_at or "", tz)
+            if dt_local is None:
+                return (
+                    f"ERROR: couldn't parse at_local={once_raw_at!r}. Use "
+                    "\"YYYY-MM-DD HH:MM\" or \"HH:MM\"."
+                )
+            # Translate local wall-clock to a UTC-naive datetime, which
+            # is the shape `schedule_at` expects.
+            from datetime import timezone as _tzmod
+            dt_utc = dt_local.astimezone(_tzmod.utc).replace(tzinfo=None)
+            payload["schedule_kind"] = "at"
+            payload["schedule_at"] = dt_utc
+            # auto_disable defaults true server-side for 'at'; setting it
+            # explicitly is harmless and makes intent obvious in logs.
+            payload["auto_disable_after_fire"] = True
+        elif when == "daily":
+            assert daily_hhmm is not None
+            hh, mm = daily_hhmm
+            payload["schedule_kind"] = "cron"
+            payload["schedule_cron_local"] = f"{mm} {hh} * * *"
+        else:  # when == "every"
+            assert every_secs is not None
+            payload["schedule_kind"] = "every"
+            payload["schedule_interval_seconds"] = every_secs
+            if window_start:
+                payload["schedule_window_start_local"] = window_start
+            if window_end:
+                payload["schedule_window_end_local"] = window_end
+
+        try:
+            req = RoutineCreate(**payload)
+        except Exception as e:
+            return f"ERROR: invalid arguments: {e}"
+
+        try:
+            resp = await create_routine(req)
+        except HTTPException as e:
+            return f"ERROR: {e.detail}"
+
+        delivery_out = (
+            (resp.config or {}).get("delivery_channels") if resp.config else None
+        ) or ["website"]
+        return _as_json({
+            "status": "created",
+            "reminder": {
+                "id": resp.id,
+                "name": resp.name,
+                "when": when,
+                "schedule_kind": getattr(resp, "schedule_kind", None),
+                "schedule_cron_local": resp.schedule_cron_local,
+                "schedule_at_utc": (
+                    str(getattr(resp, "schedule_at", None))
+                    if getattr(resp, "schedule_at", None) else None
+                ),
+                "schedule_interval_seconds": getattr(
+                    resp, "schedule_interval_seconds", None
+                ),
+                "window_start_local": getattr(
+                    resp, "schedule_window_start_local", None
+                ),
+                "window_end_local": getattr(
+                    resp, "schedule_window_end_local", None
+                ),
+                "enabled": resp.enabled,
+                "delivery_channels": delivery_out,
+                "next_run_at": str(resp.next_run_at) if resp.next_run_at else None,
+            },
+            "hint": (
+                "Reminder is live. The user can change/cancel it any time "
+                "from Mission Control on the dashboard."
+            ),
+        })
+
+    # ── Parsing helpers (skill-private) ────────────────────────────
+    @staticmethod
+    def _parse_hhmm(raw: str) -> Optional[tuple[int, int]]:
+        """\"HH:MM\" or \"HH:MM:SS\" → (hour, minute). None on malformed."""
+        if not raw:
+            return None
+        parts = raw.strip().split(":")
+        if len(parts) not in (2, 3):
+            return None
+        try:
+            hh = int(parts[0])
+            mm = int(parts[1])
+        except ValueError:
+            return None
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+        return hh, mm
+
+    @staticmethod
+    def _parse_local_datetime(raw: str, tz):
+        """Parse \"YYYY-MM-DD HH:MM\" (explicit date) or \"HH:MM\" (today/
+        tomorrow) into a tz-aware datetime in the user's timezone.
+
+        Returns ``None`` on malformed input.
+        """
+        from datetime import datetime, time, timedelta
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        # Try ISO-shape first: YYYY-MM-DD HH:MM (also accepts "T" sep).
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                return dt.replace(tzinfo=tz)
+            except ValueError:
+                continue
+        # Else try HH:MM — pick today if still future, else tomorrow.
+        # The model_validator on RoutineCreate rejects past schedule_at
+        # so we need to land in the future here.
+        hhmm = RoutinesSkill._parse_hhmm(raw)
+        if hhmm is None:
+            return None
+        hh, mm = hhmm
+        now_local = datetime.now(tz)
+        target = now_local.replace(
+            hour=hh, minute=mm, second=0, microsecond=0
+        )
+        if target <= now_local:
+            target = target + timedelta(days=1)
+        return target
+
     async def _create(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         from fastapi import HTTPException
         from app.api.routines import RoutineCreate, create_routine

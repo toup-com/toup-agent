@@ -101,6 +101,8 @@ class ToupTelegramBot:
         self.app.add_handler(CommandHandler("compact", self._cmd_compact))
         self.app.add_handler(CommandHandler("usage", self._cmd_usage))
         self.app.add_handler(CommandHandler("cron", self._cmd_cron))
+        self.app.add_handler(CommandHandler("remind", self._cmd_remind))
+        self.app.add_handler(CommandHandler("reminders", self._cmd_reminders))
         self.app.add_handler(CommandHandler("export", self._cmd_export))
         self.app.add_handler(CommandHandler("subagents", self._cmd_subagents))
         self.app.add_handler(CommandHandler("skills", self._cmd_skills))
@@ -494,6 +496,8 @@ class ToupTelegramBot:
             "/compact — Force context compaction\n"
             "/usage — Show token usage and cost\n"
             "/cron — List scheduled jobs\n"
+            "/remind &lt;text&gt; — Set a reminder (e.g. <code>/remind call mom at 6pm</code>)\n"
+            "/reminders — List your reminders\n"
             "/export — Export conversation history\n"
             "/subagents — List background tasks\n"
             "/skills — List loaded skill plugins\n"
@@ -1449,6 +1453,124 @@ class ToupTelegramBot:
         lines.append("\n<i>Use the cron tool or ask me to manage jobs.</i>")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+    # ── /remind + /reminders ─────────────────────────────────────────
+    # Thin Telegram surface over the routines skill. `/remind <text>`
+    # routes the text into the agent so the same NL → schedule
+    # extraction logic that runs in chat applies here too — no parser
+    # duplication, one source of truth (the system prompt + the
+    # `routines__remind` tool). `/reminders` calls the routines API
+    # directly to render a compact list without needing an agent turn.
+
+    async def _cmd_remind(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle `/remind <natural language>` — pipes the text into the
+        agent, which picks `when` + extracts the time and calls
+        ``routines__remind``. Without arguments, prints usage.
+
+        The agent path keeps a single source of truth for time parsing
+        (the skill's system prompt section) — duplicating it in a
+        Telegram-specific cron parser would drift fast.
+        """
+        if not self._is_allowed(update.effective_user.id):
+            return
+        # Strip the leading "/remind" + any whitespace.
+        raw = (update.message.text or "").strip()
+        if raw.startswith("/remind"):
+            raw = raw[len("/remind"):].lstrip()
+        if not raw:
+            await update.message.reply_text(
+                "⏰ <b>/remind</b> — set a reminder via the agent.\n\n"
+                "<b>Examples:</b>\n"
+                "  • <code>/remind me to call mom at 6pm</code>\n"
+                "  • <code>/remind drink water every day at 9am</code>\n"
+                "  • <code>/remind stretch every 30 minutes between 9 and 5</code>\n\n"
+                "<i>Or just type the reminder naturally — I'll figure out the schedule.</i>",
+                parse_mode="HTML",
+            )
+            return
+        # Prepend an instruction the agent can act on. Routing through
+        # `_handle_text`'s normal flow keeps subagent / skill / memory
+        # plumbing intact.
+        # Replace the raw text on the Update so downstream handlers
+        # treat it as user input.
+        try:
+            update.message.text = f"Set a reminder: {raw}"
+        except Exception:
+            # Telegram Message objects are often frozen; fall back to
+            # passing the seed text in context.user_data for the text
+            # handler to pick up. _handle_text checks this seed first.
+            context.user_data["__remind_seed"] = f"Set a reminder: {raw}"
+        await self._handle_text(update, context)
+
+    async def _cmd_reminders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle `/reminders` — list this user's reminder routines
+        (kind=reminder only). Routine-based — uses the same DB rows the
+        skill / Mission Control read."""
+        if not self._is_allowed(update.effective_user.id):
+            return
+        user_id = await self._get_toup_user_id(update.effective_user.id)
+        if not user_id:
+            await update.message.reply_text(
+                "⏰ No reminders — your Telegram isn't linked to a Toup account."
+            )
+            return
+
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import Routine
+            from sqlalchemy import select
+            async with async_session_maker() as db:
+                rows = (await db.execute(
+                    select(Routine)
+                    .where(Routine.user_id == user_id)
+                    .where(Routine.kind == "reminder")
+                    .order_by(Routine.created_at.desc())
+                )).scalars().all()
+        except Exception as e:
+            logger.exception("[/reminders] db error")
+            await update.message.reply_text(
+                f"⚠️ Couldn't load reminders: {str(e)[:200]}"
+            )
+            return
+
+        if not rows:
+            await update.message.reply_text(
+                "⏰ No reminders yet.\n\n"
+                "<i>Try </i><code>/remind me to drink water every morning at 9</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        def _human_schedule(r) -> str:
+            kind = getattr(r, "schedule_kind", None) or "cron"
+            if kind == "at":
+                at = getattr(r, "schedule_at", None)
+                return f"once · {at}" if at else "once"
+            if kind == "every":
+                secs = getattr(r, "schedule_interval_seconds", None) or 0
+                mins = secs // 60
+                base = f"every {mins} min" if mins < 60 else f"every {mins // 60}h"
+                ws = getattr(r, "schedule_window_start_local", None)
+                we = getattr(r, "schedule_window_end_local", None)
+                if ws and we:
+                    base += f" · {ws}–{we}"
+                return base
+            return f"cron · {r.schedule_cron_local or '—'}"
+
+        lines = ["⏰ <b>Your reminders</b>\n"]
+        for i, r in enumerate(rows, 1):
+            status = "✅" if r.enabled else "⏸"
+            text = (r.reminder_text or "").strip()
+            snippet = text if len(text) <= 60 else text[:57] + "…"
+            lines.append(
+                f"{i}. {status} <b>{snippet or r.name or 'Reminder'}</b>\n"
+                f"   <code>{_human_schedule(r)}</code>"
+            )
+        lines.append(
+            "\n<i>Manage from Mission Control on the dashboard, or ask "
+            "me to update/cancel one by description.</i>"
+        )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
     async def _cmd_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /export — export conversation history as a text file."""
         if not self._is_allowed(update.effective_user.id):
@@ -1670,7 +1792,16 @@ class ToupTelegramBot:
             )
             return
 
+        # `/remind` injects a seed message via context.user_data when
+        # the python-telegram-bot Message object is immutable in the
+        # current PTB version. Consume single-use and prefer it over the
+        # raw Telegram text — without this the `/remind <text>` flow
+        # delivers the literal "/remind ..." string to the agent and
+        # the routine-creation prompt never lands.
         text = update.message.text
+        seed = context.user_data.pop("__remind_seed", None) if context.user_data else None
+        if seed:
+            text = seed
         if not text or not text.strip():
             return
 

@@ -331,7 +331,7 @@ async def test_create_when_flag_off_returns_feature_not_available_error(monkeypa
 # ── Tool definitions schema ──────────────────────────────────────────
 
 
-def test_get_tools_returns_five_tools_with_required_fields():
+def test_get_tools_returns_six_tools_with_required_fields():
     """Pin the tool surface so a refactor can't accidentally drop a tool
     the agent's system prompt mentions."""
     skill = _load_skill()
@@ -339,6 +339,7 @@ def test_get_tools_returns_five_tools_with_required_fields():
     names = {t["name"] for t in tools}
     assert names == {
         "routines__create",
+        "routines__remind",
         "routines__list",
         "routines__update",
         "routines__delete",
@@ -357,6 +358,153 @@ def test_system_prompt_section_mentions_each_tool():
     skill = _load_skill()
     section = skill.get_system_prompt_section() or ""
     assert "routines__create" in section
+    assert "routines__remind" in section
     assert "routines__list" in section
     assert "email_briefing" in section
     assert "agent_task" in section
+    assert "reminder" in section.lower()
+
+
+# ── routines__remind ─────────────────────────────────────────────────
+
+
+def test_parse_hhmm_accepts_valid_and_rejects_invalid():
+    """The skill's `_parse_hhmm` helper is the single point of truth for
+    HH:MM validation across all three `when` modes. Pin its behavior."""
+    skill = _load_skill()
+    assert skill._parse_hhmm("09:00") == (9, 0)
+    assert skill._parse_hhmm("23:59") == (23, 59)
+    assert skill._parse_hhmm("07:30:00") == (7, 30)  # HH:MM:SS also OK
+    assert skill._parse_hhmm("") is None
+    assert skill._parse_hhmm("9am") is None
+    assert skill._parse_hhmm("24:00") is None  # hour out of range
+    assert skill._parse_hhmm("12:60") is None  # minute out of range
+    assert skill._parse_hhmm("abc:def") is None
+
+
+def test_parse_local_datetime_iso_form():
+    """`YYYY-MM-DD HH:MM` parses as the user's local wall clock —
+    NOT UTC. The skill converts to UTC before delegating to the API,
+    so getting this right is load-bearing for the 'remind me at 6pm'
+    flow."""
+    from zoneinfo import ZoneInfo
+    skill = _load_skill()
+    tz = ZoneInfo("America/Toronto")
+    dt = skill._parse_local_datetime("2026-12-25 18:00", tz)
+    assert dt is not None
+    assert dt.tzinfo is tz
+    assert dt.year == 2026 and dt.month == 12 and dt.day == 25
+    assert dt.hour == 18 and dt.minute == 0
+    # T-separator form also accepted
+    dt2 = skill._parse_local_datetime("2026-12-25T18:00", tz)
+    assert dt2 == dt
+
+
+def test_parse_local_datetime_hhmm_picks_tomorrow_if_past():
+    """A bare HH:MM rolls to tomorrow when the time has already
+    passed today. Without this, `RoutineCreate`'s past-datetime
+    validator rejects the create with a confusing 400."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    skill = _load_skill()
+    tz = ZoneInfo("America/Toronto")
+    now = datetime.now(tz)
+    past_time = (now - timedelta(hours=1)).strftime("%H:%M")
+    dt = skill._parse_local_datetime(past_time, tz)
+    assert dt is not None
+    # Must be > now (i.e. tomorrow at past_time, not today).
+    assert dt > now
+
+
+@pytest.mark.asyncio
+async def test_remind_missing_text_returns_error():
+    skill = _load_skill()
+    result = await skill.execute_tool(
+        "routines__remind",
+        {"when": "daily", "daily_at_local": "09:00"},
+        _ctx(),
+    )
+    assert result.startswith("ERROR:")
+    assert "reminder_text" in result
+
+
+@pytest.mark.asyncio
+async def test_remind_unknown_when_returns_error():
+    skill = _load_skill()
+    result = await skill.execute_tool(
+        "routines__remind",
+        {"reminder_text": "stretch", "when": "biweekly"},
+        _ctx(),
+    )
+    assert result.startswith("ERROR:")
+    assert "once" in result and "daily" in result and "every" in result
+
+
+@pytest.mark.asyncio
+async def test_remind_every_rejects_sub_minute_interval():
+    skill = _load_skill()
+    result = await skill.execute_tool(
+        "routines__remind",
+        {
+            "reminder_text": "stretch",
+            "when": "every",
+            "every_seconds": 30,
+        },
+        _ctx(),
+    )
+    assert result.startswith("ERROR:")
+    assert "60" in result and "every_seconds" in result
+
+
+@pytest.mark.asyncio
+async def test_remind_daily_creates_cron_routine(monkeypatch):
+    """End-to-end: `when=daily` + `daily_at_local=\"07:30\"` should land a
+    reminder routine with kind=reminder + schedule_kind=cron +
+    schedule_cron_local=\"30 7 * * *\"."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "routines_reminders_enabled", True)
+    user_id = await _seed_user(timezone="America/Toronto")
+    monkeypatch.setattr(settings, "user_id", user_id)
+
+    skill = _load_skill()
+    result = await skill.execute_tool(
+        "routines__remind",
+        {
+            "reminder_text": "Drink water",
+            "when": "daily",
+            "daily_at_local": "07:30",
+            "delivery_channels": ["website"],
+        },
+        _ctx(),
+    )
+    assert not result.startswith("ERROR:"), result
+    payload = json.loads(result)
+    assert payload["status"] == "created"
+    r = payload["reminder"]
+    assert r["schedule_kind"] == "cron"
+    assert r["schedule_cron_local"] == "30 7 * * *"
+    assert r["delivery_channels"] == ["website"]
+
+
+@pytest.mark.asyncio
+async def test_remind_rejects_when_user_timezone_missing(monkeypatch):
+    """If the user's `User.timezone` is NULL, `_resolve_tz` falls back to
+    UTC. A reminder for 1pm-local would land at 1pm UTC = 9am Toronto =
+    bug. The skill must refuse to create instead of silently misfiring."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "routines_reminders_enabled", True)
+    user_id = await _seed_user(timezone=None)  # missing tz
+    monkeypatch.setattr(settings, "user_id", user_id)
+
+    skill = _load_skill()
+    result = await skill.execute_tool(
+        "routines__remind",
+        {
+            "reminder_text": "ping me",
+            "when": "daily",
+            "daily_at_local": "13:00",
+        },
+        _ctx(),
+    )
+    assert result.startswith("ERROR:")
+    assert "timezone" in result.lower()
