@@ -34,6 +34,65 @@ def _as_json(obj: Any) -> str:
     return json.dumps(obj, indent=2, default=str, ensure_ascii=False)
 
 
+def _provision_status_hint(t) -> tuple[str, str]:
+    """Translate the trigger row into a `(status, hint)` pair the agent
+    surfaces to the user. The agent's prompt-level honesty contract
+    (see SkillMeta.description) forbids paraphrasing the failure cases
+    as "may take a moment." This function is the source of truth for
+    that translation.
+
+    Only meaningful for kind=email_received in v1 — other kinds return
+    a generic "live" status since they don't have a provisioning step.
+    """
+    # Non-email kinds don't have a watch arming step.
+    if getattr(t, "kind", "") != "email_received":
+        return "live", "The trigger is registered."
+
+    if getattr(t, "watch_provisioned", False):
+        return (
+            "live",
+            "Trigger is armed and live. The agent will react on the next "
+            "matching event. Sending yourself a test email is a good way "
+            "to confirm the wiring end-to-end.",
+        )
+
+    last_status = (getattr(t, "last_status", "") or "").strip()
+    ps = getattr(t, "provider_state_json", None) or {}
+    err = (ps.get("provision_error") or "").strip() if isinstance(ps, dict) else ""
+
+    if last_status == "skipped_reauth" or err == "needs_reauth":
+        return (
+            "needs_user_action",
+            "Trigger is saved but NOT live. The user's Gmail connection "
+            "is missing or expired. Tell the user to reconnect Gmail "
+            "(Settings → Integrations → Gmail → Connect). Do NOT say "
+            "the trigger is working — it is not.",
+        )
+
+    if last_status == "provisioning_failed" or err in (
+        "ops_blocked", "scope_error", "transient", "feature_disabled",
+        "platform_unreachable", "agent_misconfigured", "unknown",
+    ):
+        detail = ps.get("provision_detail", "") if isinstance(ps, dict) else ""
+        return (
+            "ops_blocked",
+            "Trigger is saved but the platform couldn't arm the Gmail "
+            "watch yet (reason: "
+            f"{err or 'unknown'}{' — ' + detail if detail else ''}). "
+            "Tell the user the trigger won't fire yet, the issue is on "
+            "Toup's side and we're notified. Do NOT promise it works."
+        )
+
+    # Newly-created or pending — auto-arm hasn't reported back yet.
+    return (
+        "pending",
+        "Trigger is saved; provisioning is in progress. Tell the user "
+        "it's setting up and they should test with a new email in a "
+        "minute. If it still doesn't fire after 2 minutes, ask them to "
+        "check Settings → Integrations."
+    )
+
+
 def _trigger_summary(t) -> Dict[str, Any]:
     """Compact dict for agent reasoning. Drops recent_events to keep
     the payload small — the agent calls `triggers__list` with an
@@ -74,7 +133,21 @@ class TriggersSkill(Skill):
         version="1.0.0",
         description=(
             "Self-author event-driven agent automations: react when a new "
-            "email arrives, calendar event is created, etc."
+            "email arrives, calendar event is created, etc.\n\n"
+            "**HONESTY CONTRACT (non-negotiable):** every successful "
+            "`triggers__create`/`triggers__list` response includes a "
+            "top-level `status` field. After calling these tools, READ "
+            "`status` and adjust what you tell the user:\n"
+            "  • `live` — the trigger is armed and WILL fire. Free to "
+            "say \"from now on, when X happens, I'll do Y.\"\n"
+            "  • `needs_user_action` — the user must reconnect Gmail "
+            "before any event fires. Tell them explicitly, do NOT "
+            "promise the trigger is working.\n"
+            "  • `ops_blocked` — platform-side misconfig (Pub/Sub topic "
+            "/ GCP IAM). Tell the user the trigger is saved but won't "
+            "fire yet, and that we're notified. Do NOT promise it works.\n"
+            "Never paraphrase `needs_user_action` or `ops_blocked` as "
+            "\"may take a moment.\" The user needs to know it's blocked."
         ),
         author="Toup",
     )
@@ -352,24 +425,27 @@ class TriggersSkill(Skill):
         except HTTPException as e:
             return f"ERROR: {e.detail}"
 
+        out = _trigger_summary(resp)
+        status, hint = _provision_status_hint(resp)
         return _as_json({
-            "status": "created",
-            "trigger": _trigger_summary(resp),
-            "hint": (
-                "The trigger is registered. If the watch hasn't been "
-                "provisioned yet (`watch_provisioned: false`), the operator "
-                "needs to arm the Gmail watch — see "
-                "docs/runbooks/gmail-pubsub.md."
-            ),
+            "status": status,                     # live | needs_user_action | ops_blocked
+            "trigger": out,
+            "hint": hint,
         })
 
     async def _list(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         from app.api.triggers import list_triggers
 
         rows = await list_triggers()
+        triggers_out = []
+        for r in rows:
+            t = _trigger_summary(r)
+            s, _hint = _provision_status_hint(r)
+            t["status"] = s
+            triggers_out.append(t)
         return _as_json({
             "count": len(rows),
-            "triggers": [_trigger_summary(r) for r in rows],
+            "triggers": triggers_out,
         })
 
     async def _update(self, args: Dict[str, Any], ctx: SkillContext) -> str:

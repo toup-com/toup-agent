@@ -32,6 +32,7 @@ loud path for fields we do enforce.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -39,6 +40,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, select
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/triggers", tags=["triggers"])
@@ -328,7 +331,169 @@ async def create_trigger(req: TriggerCreate):
         db.add(row)
         await db.commit()
         await db.refresh(row)
+
+    # Auto-arm: for email_received, ask the platform to provision the
+    # Gmail `users.watch`. Until the watch is armed, no event fires —
+    # so we MUST attempt this synchronously and surface the outcome in
+    # the response. Without it the user gets the false impression the
+    # trigger is live (the bug we hit on 2026-05-14).
+    if req.kind == "email_received":
+        await _provision_email_watch(tid)
+        async with async_session_maker() as db:
+            row = await db.get(Trigger, tid)
+
     return _row_to_response(row)
+
+
+async def _provision_email_watch(trigger_id: str) -> None:
+    """Call the platform's `/v1/triggers/_provision_watch` RPC for this
+    tenant and write the result into the trigger row's
+    `provider_state_json` + `last_status`. Best-effort: every failure
+    mode produces a structured last_status (`provisioning_failed`,
+    `skipped_reauth`) the skill + UI surface verbatim, so the agent
+    never lies about "live."
+
+    Architecturally: the agent CAN'T call Gmail's `users.watch` directly
+    because the refresh token lives platform-side. The platform RPC is
+    the indirection.
+    """
+    import httpx
+    from app.config import settings as _s
+
+    base = (_s.platform_api_url or "").rstrip("/")
+    key = (_s.agent_api_key or "").strip()
+    uid = (_s.user_id or "").strip()
+    if not base or not key or not uid:
+        logger.warning(
+            "[trigger_create] auto-arm skipped trigger=%s — agent missing "
+            "platform_api_url/agent_api_key/user_id (run_mode=%s)",
+            trigger_id, _s.run_mode,
+        )
+        await _stamp_trigger_state(
+            trigger_id,
+            last_status="provisioning_failed",
+            provider_state_patch={"provision_error": "agent_misconfigured"},
+        )
+        return
+
+    url = f"{base}/v1/triggers/_provision_watch"
+    payload = {"user_id": uid, "connector_id": "gmail"}
+    headers = {"X-Agent-Key": key, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(url, json=payload, headers=headers)
+    except httpx.RequestError as e:
+        logger.warning(
+            "[trigger_create] auto-arm transport failed trigger=%s err=%s",
+            trigger_id, e,
+        )
+        await _stamp_trigger_state(
+            trigger_id,
+            last_status="provisioning_failed",
+            provider_state_patch={
+                "provision_error": "platform_unreachable",
+                "provision_detail": str(e)[:200],
+            },
+        )
+        return
+
+    if r.status_code != 200:
+        logger.warning(
+            "[trigger_create] auto-arm non-200 trigger=%s status=%d body=%s",
+            trigger_id, r.status_code, r.text[:200],
+        )
+        await _stamp_trigger_state(
+            trigger_id,
+            last_status="provisioning_failed",
+            provider_state_patch={
+                "provision_error": f"http_{r.status_code}",
+                "provision_detail": r.text[:200],
+            },
+        )
+        return
+
+    try:
+        data = r.json()
+    except Exception:
+        await _stamp_trigger_state(
+            trigger_id,
+            last_status="provisioning_failed",
+            provider_state_patch={"provision_error": "malformed_response"},
+        )
+        return
+
+    if data.get("provisioned"):
+        await _stamp_trigger_state(
+            trigger_id,
+            last_status="never_fired",
+            provider_state_patch={
+                "gmail_history_id": data.get("history_id") or "",
+                "watch_expires_at": data.get("expires_at") or "",
+                "watch_provisioned_at": datetime.utcnow().isoformat(),
+                # Clear any prior failure state.
+                "provision_error": None,
+                "provision_detail": None,
+                "needs_refresh": None,
+            },
+        )
+        return
+
+    # Provisioned=false — map to the right status so the skill + UI
+    # render the actionable message.
+    err = (data.get("error") or "").strip()
+    detail = (data.get("detail") or "")[:300]
+    status_map = {
+        "needs_reauth": "skipped_reauth",
+        "ops_blocked": "provisioning_failed",
+        "scope_error": "provisioning_failed",
+        "transient": "provisioning_failed",
+        "feature_disabled": "provisioning_failed",
+        "unsupported_connector": "provisioning_failed",
+    }
+    new_status = status_map.get(err, "provisioning_failed")
+    await _stamp_trigger_state(
+        trigger_id,
+        last_status=new_status,
+        provider_state_patch={
+            "provision_error": err or "unknown",
+            "provision_detail": detail,
+        },
+    )
+
+
+async def _stamp_trigger_state(
+    trigger_id: str,
+    *,
+    last_status: str,
+    provider_state_patch: dict[str, Any],
+) -> None:
+    """Merge `provider_state_patch` into the trigger's
+    `provider_state_json` and set `last_status`. Drops keys whose value
+    is None so callers can clear stale fields by passing them as None."""
+    from sqlalchemy import update as _update
+    from app.db.database import async_session_maker as _sm
+    from app.db.models import Trigger as _Trigger
+
+    async with _sm() as db:
+        row = await db.get(_Trigger, trigger_id)
+        if row is None:
+            return
+        existing = dict(row.provider_state_json or {})
+        for k, v in provider_state_patch.items():
+            if v is None:
+                existing.pop(k, None)
+            else:
+                existing[k] = v
+        await db.execute(
+            _update(_Trigger)
+            .where(_Trigger.id == trigger_id)
+            .values(
+                provider_state_json=existing,
+                last_status=last_status,
+                updated_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
 
 
 @router.patch("/{trigger_id}", response_model=TriggerResponse)

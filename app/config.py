@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     # Control UI surface. Per-tenant; default off until the canary cohort runs
     # for 48h with <2% failure rate.
     routines_email_briefing_enabled: bool = False
+    # Phase A — `reminder` kind flag. Per-kind gate so operators can roll
+    # out reminders independently of the email briefing flow. Defaults
+    # to True since reminders are text-only and the dominant safe path.
+    # Tenants that want to disable can set this env var explicitly.
+    routines_reminders_enabled: bool = True
 
     # Workspace Bootstrap
     workspace_per_user: bool = True  # Create per-user workspace subdirectories

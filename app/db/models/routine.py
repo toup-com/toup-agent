@@ -59,7 +59,38 @@ class Routine(Base):
 
     # 5-part cron expression evaluated in User.timezone. Stored as the user's
     # original choice so a later tz change can re-resolve without losing intent.
+    # Pre-2026-05-14: required (nullable=False). After Phase A (mig 042) became
+    # required only when schedule_kind='cron'; CHECK constraint enforces this
+    # on Postgres. SQLAlchemy column kept nullable=False for back-compat with
+    # rows written before schedule_kind existed.
     schedule_cron_local: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Phase A — schedule shape selector. 'cron' (existing rows + recurring
+    # crons), 'at' (one-shot reminder fires once at schedule_at), 'every'
+    # (interval reminder fires every schedule_interval_seconds, optionally
+    # gated by schedule_window_*).
+    schedule_kind: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="cron", server_default="cron"
+    )
+    # One-shot fire time (UTC). Required when schedule_kind='at'.
+    schedule_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Interval between fires in seconds. Required when schedule_kind='every'.
+    # Min 60 (one-minute floor) enforced by API + CHECK constraint.
+    schedule_interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Optional daily-active-window for `every` schedules. HH:MM:SS strings
+    # interpreted in User.timezone — kept as strings (not Time type) so
+    # they round-trip through every dialect cleanly. NULL = always active.
+    schedule_window_start_local: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    schedule_window_end_local: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    # When true, the runner flips enabled=false in _post_terminal after
+    # a successful fire. Server-default false; API sets it to true
+    # automatically for schedule_kind='at' (one-shot reminders).
+    auto_disable_after_fire: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # For kind='reminder': literal text to deliver. No LLM, no MCP. Required
+    # when kind='reminder' (enforced by API + Postgres CHECK constraint).
+    reminder_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Per-kind config blob. For email_briefing:
     #   {connector_identity_id, send_minutes_before_wake, priority_filters}

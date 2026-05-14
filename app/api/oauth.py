@@ -554,6 +554,18 @@ async def oauth_callback(
         payload.user_id[:8], payload.connector_id,
     )
 
+    # 6b. Gmail post-connect: arm a `users.watch` so any
+    # `email_received` trigger the user creates (now or later) starts
+    # firing as soon as Gmail produces a Pub/Sub event. Without this,
+    # a freshly-connected Gmail has no subscription and the first
+    # message after connect is silently dropped until the next daily
+    # refresh tick. Fire-and-forget — the OAuth redirect must not
+    # block on an external Google API call. Failures (token, scope,
+    # GCP misconfig) are logged + retried by the daily refresh.
+    if payload.connector_id == "gmail":
+        import asyncio as _asyncio
+        _asyncio.create_task(_arm_gmail_watch_post_connect(payload.user_id))
+
     # 7. Redirect to the frontend OAuth callback bridge. When the
     #    OAuth flow ran in a popup, the bridge posts back to the
     #    parent via BroadcastChannel and closes; when the flow ran
@@ -765,3 +777,79 @@ async def stub_token_endpoint(request: Request) -> dict:
     backing route if a test wants to call it directly."""
     form = dict(await request.form())
     return await _stub_token_exchange(form)
+
+
+# ─── Gmail post-connect watch arming (T2c) ───────────────────────────
+
+
+async def _arm_gmail_watch_post_connect(user_id: str) -> None:
+    """Fire-and-forget watch arm immediately after a successful Gmail
+    OAuth callback. Writes `gmail_history_id` + `gmail_watch_expires_at`
+    into `ConnectorIdentity.metadata_json` so the Pub/Sub webhook has
+    a baseline to resume `history.list` from on the first push.
+
+    Best-effort: every failure mode is recoverable by the daily refresh
+    job. Logged at WARN (token/scope) or ERROR (unexpected) so ops can
+    see when a user's first email after connect won't fire until
+    midnight UTC.
+
+    Idempotent: safe to call again if a retry mechanism ever fires it
+    a second time — Gmail accepts a fresh watch over a live one and
+    resets the clock.
+    """
+    from app.config import settings
+    if not settings.gcp_project or not settings.pubsub_topic:
+        logger.warning(
+            "[oauth.gmail_post_connect] skipped user=%s — GCP not configured",
+            user_id[:8],
+        )
+        return
+    if not getattr(settings, "triggers_email_enabled", True):
+        logger.info(
+            "[oauth.gmail_post_connect] skipped user=%s — triggers feature off",
+            user_id[:8],
+        )
+        return
+
+    from app.services.gmail_pubsub import start_watch, GmailWatchError
+    from app.api.triggers_provision import _write_watch_state
+    from datetime import datetime, timezone
+
+    try:
+        handle = await start_watch(user_id)
+    except GmailWatchError as e:
+        # Common: token rot, scope miss, IAM. Don't crash the callback
+        # — daily refresh is the safety net.
+        logger.warning(
+            "[oauth.gmail_post_connect] arm_failed user=%s err=%s",
+            user_id[:8], str(e)[:200],
+        )
+        return
+    except Exception as e:
+        logger.exception(
+            "[oauth.gmail_post_connect] arm_crash user=%s err=%s",
+            user_id[:8], e,
+        )
+        return
+
+    expires_iso = datetime.fromtimestamp(
+        handle.expiration_unix_ms / 1000, tz=timezone.utc,
+    ).isoformat()
+    try:
+        await _write_watch_state(
+            user_id=user_id,
+            connector_id="gmail",
+            history_id=handle.history_id,
+            expires_at_iso=expires_iso,
+        )
+    except Exception as e:
+        logger.exception(
+            "[oauth.gmail_post_connect] write_state_crash user=%s err=%s",
+            user_id[:8], e,
+        )
+        return
+
+    logger.info(
+        "[oauth.gmail_post_connect] armed user=%s history_id=%s expires=%s",
+        user_id[:8], handle.history_id, expires_iso,
+    )

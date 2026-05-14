@@ -52,6 +52,26 @@ _SUMMARY_MAX_TOKENS = 1500
 _OPERATION_TYPE = "system.trigger.email_received"
 
 
+# Per-process dedupe for reauth notices. Key: (user_id, trigger_id);
+# value: epoch seconds of last notify. Pub/Sub retries + sibling pushes
+# would otherwise spam the user with reconnect cards on every failed
+# fetch. 24h TTL — long enough that a real retry storm doesn't repeat,
+# short enough that the user gets a fresh reminder the next day if they
+# haven't acted. In-memory is sufficient: a process restart issues at
+# most one duplicate, and the typical fix is "reconnect Gmail" which
+# stops the failures (and thus the notices) at the source.
+_REAUTH_NOTICE_DEDUPE: dict[tuple[str, str], float] = {}
+_REAUTH_NOTICE_TTL_SEC = 24 * 60 * 60
+
+_REAUTH_NOTICE_CARD = (
+    "**Heads up — Gmail trigger can't fire.**\n\n"
+    "Your Gmail connection stopped working, so the trigger "
+    "**{trigger_name}** is paused until you reconnect.\n\n"
+    "Fix: open Toup → Settings → Integrations → Gmail → **Connect**.\n\n"
+    "_(You'll get this notice at most once per day until it's fixed.)_"
+)
+
+
 _SUMMARIZE_SYSTEM_PROMPT = """You are summarising a fresh inbound email (or short burst of them) for the user.
 
 Rules:
@@ -158,7 +178,12 @@ class EmailReceivedHandler:
         try:
             fetched, fetch_errors = await self._fetch_all(mcp, events)
         except _ReauthRequired as e:
-            # Whole batch fails the same way — auth is broken.
+            # Whole batch fails the same way — auth is broken. Fan out
+            # a "reconnect Gmail" card on every delivery_channel the
+            # trigger is configured for so the user actually finds out
+            # (not just on website). Dedupe at process level so a burst
+            # of failed pushes doesn't spam.
+            await self._notify_reauth(trigger, reason="gmail_token_revoked")
             return TriggerResult(
                 status="skipped_reauth",
                 per_event_status={ev.id: "failed" for ev in events},
@@ -166,6 +191,7 @@ class EmailReceivedHandler:
                 error_detail=str(e)[:300],
             )
         except _ToolMissing as e:
+            await self._notify_reauth(trigger, reason="gmail_tool_missing")
             return TriggerResult(
                 status="skipped_reauth",
                 per_event_status={ev.id: "failed" for ev in events},
@@ -251,6 +277,84 @@ class EmailReceivedHandler:
                 "model": model,
                 "coalesced_count": len(events) - 1 if len(events) > 1 else 0,
             },
+        )
+
+    # ── Reauth notice (channel-aware) ─────────────────────────────
+
+    async def _notify_reauth(self, trigger: Any, *, reason: str) -> None:
+        """Fan out a 'reconnect Gmail' card on every configured
+        delivery_channel (website + Telegram + WhatsApp). Deduped per
+        (user_id, trigger_id) for 24h so a burst of failing pushes
+        doesn't spam.
+
+        Failures here are swallowed — the trigger run is already in
+        the failure path; we won't compound it by raising over a
+        notification problem.
+        """
+        import time
+        key = (str(trigger.user_id), str(trigger.id))
+        last = _REAUTH_NOTICE_DEDUPE.get(key, 0.0)
+        now = time.time()
+        if (now - last) < _REAUTH_NOTICE_TTL_SEC:
+            logger.info(
+                "[trigger_email] reauth_notice deduped trigger_id=%s "
+                "user_id=%s age_sec=%d",
+                trigger.id, str(trigger.user_id)[:8], int(now - last),
+            )
+            return
+
+        content = _REAUTH_NOTICE_CARD.format(
+            trigger_name=(trigger.name or "Gmail trigger"),
+        )
+        delivery_channels = list(
+            (trigger.config_json or {}).get("delivery_channels") or ["website"]
+        )
+
+        # Persist a Day-as-Chat message (website channel) AND fan out
+        # to any extras. We reuse the trigger writer so the card lands
+        # in the same conversation the user expects trigger output in.
+        from app.db.database import async_session_maker
+        try:
+            async with async_session_maker() as db:
+                writer = self._writer or write_trigger_message
+                broadcaster = self._broadcaster or broadcast_trigger_message
+                msg_id, day_chat_id = await writer(
+                    db,
+                    user_id=trigger.user_id,
+                    content=content,
+                    source=self.kind,
+                    trigger_id=trigger.id,
+                    title=f"{trigger.name or 'Gmail trigger'} — reconnect needed",
+                    model_used=None,
+                )
+                try:
+                    await broadcaster(
+                        trigger.user_id,
+                        message_id=msg_id,
+                        day_chat_id=day_chat_id,
+                        source=self.kind,
+                        content=content,
+                        model_used=None,
+                        delivery_channels=delivery_channels,
+                        trigger_name=trigger.name or trigger.kind,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[trigger_email] reauth_notice broadcast failed: %s", e,
+                    )
+        except Exception as e:
+            logger.warning(
+                "[trigger_email] reauth_notice persist failed reason=%s: %s",
+                reason, e,
+            )
+            return
+
+        _REAUTH_NOTICE_DEDUPE[key] = now
+        logger.info(
+            "[trigger_email] reauth_notice sent trigger_id=%s user_id=%s "
+            "channels=%s reason=%s",
+            trigger.id, str(trigger.user_id)[:8],
+            ",".join(delivery_channels), reason,
         )
 
     # ── Fetch ─────────────────────────────────────────────────────

@@ -50,10 +50,12 @@ def test_register_path_syncs_next_run_at():
     # The sync must come AFTER add_job (otherwise the job doesn't
     # exist yet). Spot-check by ensuring the call appears in the
     # function body of _register_trigger_for. The body slice is
-    # generous (5000) so adding observability / comments to the
-    # method can't accidentally push _sync_next_run out of the window.
+    # generous (10000) — Phase A (mig 042) added DST-watchdog +
+    # multi-shape trigger dispatch, growing the method past the
+    # original 5000-char bound. Window is intentionally wide so the
+    # invariant survives future additive changes.
     idx = _RUNNER.index("async def _register_trigger_for(")
-    body = _RUNNER[idx:idx + 5000]
+    body = _RUNNER[idx:idx + 10000]
     assert "_sync_next_run(" in body, (
         "_register_trigger_for must call _sync_next_run after the "
         "scheduler.add_job call. Drop this and next_run_at stays "

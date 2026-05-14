@@ -62,7 +62,9 @@ def test_update_routine_clears_failed_runs_when_schedule_changes():
     can claim a fresh row on its next fire. Without this, the user
     is locked out of same-day retries until midnight."""
     idx = _API.index("async def update_routine(")
-    body = _API[idx:idx + 4000]
+    # Phase A (mig 042) added the multi-shape schedule fields, growing
+    # the function past the original 4000-char window.
+    body = _API[idx:idx + 8000]
     # The schedule-change branch must contain a DELETE against
     # RoutineRun filtered on today + failed/skipped statuses.
     assert "schedule_changed" in body, (

@@ -44,6 +44,22 @@ def _build_app() -> FastAPI:
     return app
 
 
+@pytest_asyncio.fixture(autouse=True)
+def _mock_auto_arm(monkeypatch):
+    """Bypass the platform→watch RPC in unit tests.
+
+    Real auto-arm fires an HTTP POST to `platform_api_url`. Unit tests
+    don't have a platform to talk to; mocking the inner function keeps
+    the API-layer assertions ("trigger was created with these fields")
+    decoupled from the cross-process provisioning. The auto-arm itself
+    is covered by `test_triggers_provision_endpoint.py`.
+    """
+    async def _noop(_trigger_id: str) -> None:
+        return None
+    from app.api import triggers as _t
+    monkeypatch.setattr(_t, "_provision_email_watch", _noop)
+
+
 @pytest_asyncio.fixture
 async def client() -> AsyncClient:
     app = _build_app()
