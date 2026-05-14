@@ -1426,35 +1426,63 @@ class ToupTelegramBot:
         )
 
     async def _cmd_cron(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /cron — list scheduled jobs."""
+        """Handle /cron — DEPRECATED in Phase C. Lists legacy
+        un-migrated cron jobs (rare after Phase B's backfill) and
+        points users at /remind for new automations.
+        """
         if not self._is_allowed(update.effective_user.id):
             return
 
         user_id = await self._get_toup_user_id(update.effective_user.id)
 
-        if not self.cron_service:
-            await update.message.reply_text("⏰ Cron service not available.")
-            return
+        # Phase C — replace the cron-service listing with a routines
+        # listing. The Phase B backfill moved every cron_job into a
+        # routine, so the canonical "what's scheduled?" answer now
+        # lives there.
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import Routine
+            from sqlalchemy import select, desc
 
-        jobs = await self.cron_service.list_jobs(user_id)
-        if not jobs:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(Routine)
+                    .where(Routine.user_id == user_id, Routine.enabled == True)  # noqa: E712
+                    .order_by(desc(Routine.created_at))
+                    .limit(20)
+                )
+                rs = list(result.scalars().all())
+        except Exception as e:
+            logger.exception("[/cron] routines list failed: %s", e)
+            rs = []
+
+        if not rs:
             await update.message.reply_text(
-                "⏰ No scheduled jobs.\n\n"
-                "<i>Ask me to set a reminder or schedule a task.</i>",
+                "⏰ No scheduled routines.\n\n"
+                "<i>Use /remind to set up a reminder, or ask me to "
+                "schedule a task.</i>",
                 parse_mode="HTML",
             )
             return
 
-        lines = ["⏰ <b>Scheduled Jobs</b>\n"]
-        for i, j in enumerate(jobs, 1):
-            status = "✅ active" if j["enabled"] else "⏸ disabled"
+        lines = ["⏰ <b>Scheduled routines</b>\n"]
+        for i, r in enumerate(rs, 1):
+            schedule_kind = getattr(r, "schedule_kind", "cron") or "cron"
+            if schedule_kind == "at" and getattr(r, "schedule_at", None):
+                sched = f"once at {r.schedule_at.isoformat()}Z"
+            elif schedule_kind == "every":
+                n = getattr(r, "schedule_interval_seconds", 0) or 0
+                sched = f"every {max(1, n // 60)} min"
+            else:
+                sched = r.schedule_cron_local
+            title = (r.name or r.reminder_text or r.kind)[:60]
             lines.append(
-                f"{i}. <b>{j['name']}</b>\n"
-                f"   Schedule: <code>{j['schedule']}</code> ({j['kind']})\n"
-                f"   Status: {status} | Runs: {j['run_count']}\n"
-                f"   ID: <code>{j['id'][:8]}</code>"
+                f"{i}. <b>{title}</b>\n"
+                f"   Schedule: <code>{sched}</code> ({schedule_kind})\n"
+                f"   ID: <code>{r.id[:8]}</code>"
             )
-        lines.append("\n<i>Use the cron tool or ask me to manage jobs.</i>")
+        lines.append("\n<i>Use /remind to add a reminder, or manage these "
+                     "in Mission Control.</i>")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _cmd_remind(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

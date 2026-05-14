@@ -1663,6 +1663,17 @@ class ToolExecutor:
 
     # ------------------------------------------------------------------
     # 12. cron — scheduled tasks
+    #
+    # DEPRECATED in Phase C. The cron-job system has been folded into
+    # the Routine primitive (kind='agent_task' or kind='reminder' with
+    # multi-channel delivery via Day-as-Chat). New automations should
+    # use the `routines__create` / `routines__remind` skill tools.
+    #
+    # The legacy `add` action now creates a Routine instead of a
+    # CronJob row so any new agent calls land on the modern surface.
+    # `list` / `remove` / `run` still touch CronJob rows so the few
+    # un-migrated legacy jobs remain reachable until Phase D drops
+    # the table.
     # ------------------------------------------------------------------
     async def _tool_cron(self, inp: Dict[str, Any]) -> str:
         action = inp.get("action", "").strip().lower()
@@ -1674,6 +1685,11 @@ class ToolExecutor:
         chat_id = self._chat_id
 
         if action == "add":
+            # Phase C — `cron(add)` is now a thin shim over the Routine
+            # system. Old agents calling this tool transparently get the
+            # modern multi-channel + Day-as-Chat delivery without code
+            # changes. New agents should call `routines__remind` or
+            # `routines__create` directly for richer semantics.
             name = inp.get("name", "Unnamed task")
             schedule = inp.get("schedule", "")
             message = inp.get("message", "")
@@ -1681,17 +1697,78 @@ class ToolExecutor:
                 return "ERROR: 'schedule' is required for add"
             if not message:
                 return "ERROR: 'message' is required for add"
-            if not chat_id:
-                return "ERROR: No active Telegram chat"
 
-            result = await self.cron_service.add_job(
-                user_id=user_id,
-                chat_id=chat_id,
-                name=name,
-                schedule=schedule,
-                message=message,
-            )
-            return json.dumps(result)
+            # Translate the legacy schedule string ("30m", "in 5m", ISO,
+            # cron) into the canonical Routine shape via the same
+            # parse_schedule helper CronService uses.
+            try:
+                from app.agent.cron_service import parse_schedule
+                kind, trigger = parse_schedule(schedule)
+            except Exception:
+                kind, trigger = "cron", None
+            if trigger is None:
+                return (
+                    f"ERROR: invalid schedule {schedule!r}. Use a cron "
+                    f"expression, interval (30m/2h), or ISO datetime."
+                )
+
+            # Build the canonical RoutineCreate payload. We pick
+            # kind='agent_task' so the existing prompt-execution path
+            # runs the message text through the agent (matches the old
+            # CronJob runner behaviour — see _execute_job in
+            # cron_service.py).
+            try:
+                from app.api.routines import RoutineCreate, create_routine
+                req_kwargs: Dict[str, Any] = {
+                    "kind": "agent_task",
+                    "name": name,
+                    "prompt_text": message,
+                    "enabled": True,
+                    # Bridge legacy Telegram-only delivery to the
+                    # multi-channel Day-as-Chat model. The user's day
+                    # chat is canonical; Telegram comes along too.
+                    "delivery_channels": ["website", "telegram"],
+                }
+                if kind == "at":
+                    req_kwargs["schedule_kind"] = "at"
+                    # parse_schedule returns DateTrigger with run_date
+                    # set; pull the datetime back out.
+                    req_kwargs["schedule_at"] = getattr(trigger, "run_date", None)
+                elif kind == "every":
+                    req_kwargs["schedule_kind"] = "every"
+                    # IntervalTrigger doesn't expose seconds directly;
+                    # use the interval timedelta.
+                    interval = getattr(trigger, "interval", None)
+                    req_kwargs["schedule_interval_seconds"] = (
+                        int(interval.total_seconds()) if interval else None
+                    )
+                else:
+                    req_kwargs["schedule_kind"] = "cron"
+                    # `schedule` IS the cron expression for the cron path.
+                    req_kwargs["schedule_cron_local"] = schedule
+
+                routine_req = RoutineCreate(**req_kwargs)
+            except Exception as e:
+                return f"ERROR: failed to translate to routine: {e}"
+
+            try:
+                resp = await create_routine(routine_req)
+            except Exception as e:
+                return f"ERROR: routine create failed: {e}"
+
+            return json.dumps({
+                "ok": True,
+                "id": resp.id,
+                "name": resp.name,
+                "schedule_kind": resp.schedule_kind,
+                "delivery_channels": (resp.config or {}).get("delivery_channels", ["website"]),
+                "note": (
+                    "Deprecated: cron(add) is a shim over the modern "
+                    "Routine system. Output is delivered to BOTH the "
+                    "day-chat (website) and Telegram. Prefer the "
+                    "`routines__create` / `routines__remind` tools."
+                ),
+            })
 
         elif action == "list":
             jobs = await self.cron_service.list_jobs(user_id)

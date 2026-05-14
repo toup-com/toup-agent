@@ -432,7 +432,18 @@ class CronService:
                 pass
 
     async def _load_jobs_from_db(self):
-        """Load all enabled cron jobs from DB and schedule them."""
+        """Load all enabled cron jobs from DB and schedule them.
+
+        Phase C — skip rows whose `migrated_to_routine_id` is set.
+        Those rows now run via the RoutineRunner under an agent_task
+        sibling created in Phase B (mig 043). Loading them here would
+        produce duplicate fires.
+
+        Operators who want to keep firing legacy CronJobs after a
+        migration must NULL out `migrated_to_routine_id` manually
+        (effectively un-migrating). Don't do this unless you also
+        disable the corresponding routine row.
+        """
         try:
             from app.db.database import async_session_maker
             from app.db.models import CronJob
@@ -440,7 +451,12 @@ class CronService:
 
             async with async_session_maker() as db:
                 result = await db.execute(
-                    select(CronJob).where(CronJob.enabled == True)
+                    select(CronJob).where(
+                        CronJob.enabled == True,  # noqa: E712
+                        # `migrated_to_routine_id` column added by mig 042.
+                        # `is_(None)` is the SQLAlchemy idiom for IS NULL.
+                        CronJob.migrated_to_routine_id.is_(None),
+                    )
                 )
                 jobs = result.scalars().all()
 

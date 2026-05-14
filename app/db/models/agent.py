@@ -38,6 +38,15 @@ class CronJob(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    # Phase A → C — when a cron_jobs row gets migrated into a routines
+    # sibling (Phase B), this column points to the new routine.
+    # CronService's loader skips rows where this is non-NULL so the
+    # legacy + new paths don't both fire. NULL = canonical, not migrated.
+    # Removed entirely in Phase D when the cron_jobs table is dropped.
+    migrated_to_routine_id: Mapped[Optional[str]] = mapped_column(
+        String(36), nullable=True
+    )
+
 
 class TelegramUserMapping(Base):
     """Maps Telegram user IDs to Toup user IDs for multi-user support."""
