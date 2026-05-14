@@ -129,25 +129,30 @@ async def gmail_pubsub_webhook(
             "latency_ms": _ms_now() - started_ms,
         }
 
-    # 4. Look up the watermark. Single source of truth is
-    # `ConnectorIdentity.metadata_json.gmail_history_id` on the
-    # platform DB — written when the OAuth callback armed the watch,
-    # refreshed daily, and advanced on every successful dispatch
-    # here. Triggers themselves live agent-side; using the connector
-    # row decouples watermark from trigger existence and avoids the
-    # cross-DB lookup the prior code attempted (which silently
-    # returned (None, 0) and dropped every push as no_active_trigger
-    # in split-DB mode).
-    watermark = await _read_watermark_from_connector(user_id, email)
+    # 4. Look up the trigger watermark for this user. We need it to
+    # know where to resume history.list from. In Gate T1 we store this
+    # in `triggers.provider_state_json.gmail_history_id`; multiple
+    # triggers for the same Gmail account share the watermark (= the
+    # furthest-advanced cursor). For the v1 single-trigger case this
+    # is straightforward.
+    watermark, trigger_count = await _read_watermark(user_id)
+    if trigger_count == 0:
+        # No enabled email_received trigger — push delivered but no
+        # action. Don't fetch history (saves a Google API call), just
+        # acknowledge so Pub/Sub stops.
+        logger.info(
+            "[gmail_pubsub] no_active_trigger user_id=%s history_id=%s",
+            user_id[:8], history_id,
+        )
+        return {
+            "status": "ok",
+            "dropped": "no_active_trigger",
+            "latency_ms": _ms_now() - started_ms,
+        }
     if not watermark:
-        # First push after watch arm — use the push's history_id as
-        # the baseline so we don't replay arbitrary history. Whoever
-        # armed the watch (OAuth callback / provision RPC / daily
-        # refresh) should have written one already; if we land here
-        # it means the arm event landed BEFORE we wrote the metadata
-        # row (race), or this is the first push after a manual REPL
-        # arm. Either way, history_id from the envelope is the
-        # correct baseline.
+        # First push after the watch was just provisioned — use the
+        # push's history_id as the baseline so we don't replay
+        # arbitrary history.
         watermark = history_id
 
     # 5. Fetch new message-ids since the watermark.
@@ -167,7 +172,7 @@ async def gmail_pubsub_webhook(
                 "[gmail_pubsub] history_too_old user_id=%s history_id=%s",
                 user_id[:8], watermark,
             )
-            await _flag_connector_needs_refresh(user_id, email)
+            await _flag_watch_needs_refresh(user_id)
             return {
                 "status": "ok",
                 "dropped": "history_too_old",
@@ -186,7 +191,7 @@ async def gmail_pubsub_webhook(
         # message was filtered out by `historyTypes=messageAdded`
         # (label changes, drafts, etc).
         if new_watermark:
-            await _advance_watermark_on_connector(user_id, email, new_watermark)
+            await _advance_watermark(user_id, new_watermark)
         return {
             "status": "ok",
             "dispatched": 0,
@@ -218,7 +223,7 @@ async def gmail_pubsub_webhook(
     # failure means we want the next retry to redo this delta. The
     # agent-side dedupe gate makes redo idempotent.
     if new_watermark:
-        await _advance_watermark_on_connector(user_id, email, new_watermark)
+        await _advance_watermark(user_id, new_watermark)
 
     latency_ms = _ms_now() - started_ms
     logger.info(
@@ -258,114 +263,124 @@ async def _resolve_user_for_email(email: str) -> str | None:
     return result
 
 
-async def _read_watermark_from_connector(
-    user_id: str, email: str,
-) -> str | None:
-    """Pull `gmail_history_id` from this user's Gmail
-    `ConnectorIdentity.metadata_json`. None means "no baseline yet"
-    — caller falls through to the push's own history_id, which is
-    the right behaviour for a freshly-armed watch.
+async def _read_watermark(user_id: str) -> tuple[str | None, int]:
+    """Pull the highest `provider_state_json.gmail_history_id` across
+    this user's enabled email_received triggers, plus the count of
+    enabled triggers. The platform's `triggers` table is agent-side —
+    we proxy this via a direct DB call only when the agent and
+    platform share a DB (monolith mode); in split-DB mode this
+    function queries the agent over the bridge.
 
-    Lives on the platform DB — same database the OAuth callback +
-    provision RPC + daily refresh write to. No cross-DB lookup, no
-    silent drop on split-DB mode.
+    For Gate T1 we use the direct-DB path. The bridge-proxied path is
+    a small follow-up that wraps the same SQL.
     """
-    from app.db.models import ConnectorIdentity
-
-    async with async_session_maker() as db:
-        row = (await db.execute(
-            select(ConnectorIdentity.metadata_json).where(
-                ConnectorIdentity.user_id == user_id,
-                ConnectorIdentity.connector_id == "gmail",
-                ConnectorIdentity.provider_account_id == email,
-            )
-        )).first()
-    if row is None or not row[0]:
-        return None
     try:
-        import json
-        meta = json.loads(row[0])
-        if not isinstance(meta, dict):
-            return None
-        hid = meta.get("gmail_history_id")
-        return str(hid) if hid is not None else None
-    except (ValueError, TypeError) as e:
-        logger.warning(
-            "[gmail_pubsub] metadata_json parse failed user=%s err=%s",
-            user_id[:8], e,
-        )
-        return None
-
-
-async def _advance_watermark_on_connector(
-    user_id: str, email: str, new_history_id: str,
-) -> None:
-    """Persist the new baseline on `ConnectorIdentity.metadata_json`.
-    No-op if the identity row vanished between push and update
-    (user disconnected mid-flight — Pub/Sub will stop on the next
-    push when email→user resolution misses)."""
-    import json
-    from sqlalchemy import update
-    from app.db.models import ConnectorIdentity
+        from app.db.models import Trigger
+    except ImportError:
+        return None, 0
 
     async with async_session_maker() as db:
-        row = (await db.execute(
-            select(ConnectorIdentity).where(
-                ConnectorIdentity.user_id == user_id,
-                ConnectorIdentity.connector_id == "gmail",
-                ConnectorIdentity.provider_account_id == email,
-            )
-        )).scalar_one_or_none()
-        if row is None:
-            return
         try:
-            meta = json.loads(row.metadata_json or "{}")
-            if not isinstance(meta, dict):
-                meta = {}
-        except (ValueError, TypeError):
-            meta = {}
-        meta["gmail_history_id"] = str(new_history_id)
-        meta.pop("needs_refresh", None)             # advancing resets the flag
-        await db.execute(
-            update(ConnectorIdentity)
-            .where(ConnectorIdentity.id == row.id)
-            .values(metadata_json=json.dumps(meta))
-        )
-        await db.commit()
+            rows = (await db.execute(
+                select(Trigger.provider_state_json).where(
+                    Trigger.user_id == user_id,
+                    Trigger.kind == "email_received",
+                    Trigger.enabled.is_(True),
+                )
+            )).all()
+        except Exception as e:
+            # Platform-mode DB doesn't have the triggers table —
+            # caller will fall through to dispatch with no
+            # baseline (uses push's history_id). Logged at debug
+            # since this is the expected platform DB shape.
+            logger.debug("[gmail_pubsub] triggers table not in this DB: %s", e)
+            return None, 0
+    if not rows:
+        return None, 0
+
+    history_ids: list[int] = []
+    for (ps,) in rows:
+        if not isinstance(ps, dict):
+            continue
+        hid = ps.get("gmail_history_id")
+        if hid is None:
+            continue
+        try:
+            history_ids.append(int(str(hid)))
+        except ValueError:
+            pass
+    if not history_ids:
+        return None, len(rows)
+    # Resume from the LOWEST baseline — Gmail's history.list is
+    # idempotent so re-fetching messages another trigger already saw
+    # is fine (the agent's UNIQUE gate dedupes). Resuming from the
+    # highest would silently skip events newer than one trigger's
+    # cursor.
+    return str(min(history_ids)), len(rows)
 
 
-async def _flag_connector_needs_refresh(user_id: str, email: str) -> None:
-    """Mark this Gmail identity for re-arm on the next refresh pass.
-    Set when `history.list` returns `historyId too old` — the watch
-    is still live but the cursor is past Gmail's retention window
-    (typically ~7 days). Re-arming generates a fresh baseline."""
-    import json
+async def _advance_watermark(user_id: str, new_history_id: str) -> None:
+    """Persist the new history_id baseline. Updates every enabled
+    email_received trigger for this user — they're all consuming the
+    same Gmail account so their cursors march together."""
     from sqlalchemy import update
-    from app.db.models import ConnectorIdentity
+    from app.db.models import Trigger
 
     async with async_session_maker() as db:
-        row = (await db.execute(
-            select(ConnectorIdentity).where(
-                ConnectorIdentity.user_id == user_id,
-                ConnectorIdentity.connector_id == "gmail",
-                ConnectorIdentity.provider_account_id == email,
-            )
-        )).scalar_one_or_none()
-        if row is None:
-            return
         try:
-            meta = json.loads(row.metadata_json or "{}")
-            if not isinstance(meta, dict):
-                meta = {}
-        except (ValueError, TypeError):
-            meta = {}
-        meta["needs_refresh"] = True
-        await db.execute(
-            update(ConnectorIdentity)
-            .where(ConnectorIdentity.id == row.id)
-            .values(metadata_json=json.dumps(meta))
-        )
-        await db.commit()
+            rows = (await db.execute(
+                select(Trigger.id, Trigger.provider_state_json).where(
+                    Trigger.user_id == user_id,
+                    Trigger.kind == "email_received",
+                    Trigger.enabled.is_(True),
+                )
+            )).all()
+            for tid, ps in rows:
+                new_state = dict(ps or {})
+                new_state["gmail_history_id"] = new_history_id
+                await db.execute(
+                    update(Trigger).where(Trigger.id == tid).values(
+                        provider_state_json=new_state,
+                    )
+                )
+            await db.commit()
+        except Exception as e:
+            logger.debug(
+                "[gmail_pubsub] watermark advance no-op (split DB?): %s",
+                str(e)[:200],
+            )
+
+
+async def _flag_watch_needs_refresh(user_id: str) -> None:
+    """Mark every email_received trigger for this user as needing a
+    watch re-arm. The refresh job picks these up on its next pass.
+    """
+    from sqlalchemy import update
+    from app.db.models import Trigger
+
+    async with async_session_maker() as db:
+        try:
+            rows = (await db.execute(
+                select(Trigger.id, Trigger.provider_state_json).where(
+                    Trigger.user_id == user_id,
+                    Trigger.kind == "email_received",
+                    Trigger.enabled.is_(True),
+                )
+            )).all()
+            for tid, ps in rows:
+                new_state = dict(ps or {})
+                new_state["needs_refresh"] = True
+                await db.execute(
+                    update(Trigger).where(Trigger.id == tid).values(
+                        provider_state_json=new_state,
+                    )
+                )
+            await db.commit()
+        except Exception as e:
+            logger.debug(
+                "[gmail_pubsub] needs_refresh flag no-op (split DB?): %s",
+                str(e)[:200],
+            )
 
 
 def _ms_now() -> int:

@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, desc, select
 from sqlalchemy.exc import IntegrityError
 
@@ -98,90 +98,14 @@ def _kind_enabled_or_404(kind: str) -> None:
 
 
 _VALID_DELIVERY_CHANNELS = {"website", "telegram", "whatsapp"}
-_VALID_SCHEDULE_KINDS = {"cron", "at", "every"}
-_VALID_ROUTINE_KINDS = {"email_briefing", "agent_task", "reminder"}
-_MIN_INTERVAL_SECONDS = 60
-
-
-def _validate_window_str(v: Optional[str], field: str) -> Optional[str]:
-    """HH:MM or HH:MM:SS, both inclusive. Returns canonical HH:MM:SS."""
-    if v is None:
-        return None
-    parts = v.strip().split(":")
-    if len(parts) not in (2, 3):
-        raise ValueError(f"{field} must be HH:MM or HH:MM:SS (got {v!r})")
-    try:
-        h, m = int(parts[0]), int(parts[1])
-        s = int(parts[2]) if len(parts) == 3 else 0
-        if not (0 <= h <= 23 and 0 <= m <= 59 and 0 <= s <= 59):
-            raise ValueError(f"{field} out of range: {v!r}")
-    except ValueError as e:
-        raise ValueError(f"{field} parse error: {e}")
-    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 class RoutineCreate(BaseModel):
-    kind: str = Field(
+    kind: str = Field(..., description="Routine handler kind: 'email_briefing' or 'agent_task'")
+    schedule_cron_local: str = Field(
         ...,
-        description=(
-            "Routine handler kind. One of: 'email_briefing' (Gmail "
-            "summary preset), 'agent_task' (generic LLM-driven), "
-            "'reminder' (text-only delivery, no LLM)."
-        ),
-    )
-    # Phase A — schedule shape selector. Existing API callers default
-    # to 'cron' so legacy `POST /routines` requests carrying only
-    # `schedule_cron_local` keep working unchanged.
-    schedule_kind: str = Field(
-        default="cron",
-        description="'cron' (default) | 'at' (one-shot) | 'every' (interval).",
-    )
-    schedule_cron_local: Optional[str] = Field(
-        default=None,
-        description=(
-            "5-part cron expression evaluated in the user's tz. "
-            "Required when schedule_kind='cron'."
-        ),
+        description="5-part cron expression evaluated in the user's tz",
         examples=["30 6 * * *"],
-    )
-    schedule_at: Optional[datetime] = Field(
-        default=None,
-        description=(
-            "One-shot fire datetime (UTC). Required when "
-            "schedule_kind='at'. Must be in the future."
-        ),
-    )
-    schedule_interval_seconds: Optional[int] = Field(
-        default=None,
-        description=(
-            "Interval between fires in seconds. Required when "
-            "schedule_kind='every'. Minimum 60."
-        ),
-    )
-    schedule_window_start_local: Optional[str] = Field(
-        default=None,
-        description=(
-            "Optional active-window start, HH:MM or HH:MM:SS in the "
-            "user's tz. Used with schedule_kind='every' to gate fires."
-        ),
-    )
-    schedule_window_end_local: Optional[str] = Field(
-        default=None,
-        description="Optional active-window end (see start_local).",
-    )
-    auto_disable_after_fire: Optional[bool] = Field(
-        default=None,
-        description=(
-            "When true, the runner disables the routine after a "
-            "successful fire. Server-default true for schedule_kind='at'."
-        ),
-    )
-    reminder_text: Optional[str] = Field(
-        default=None, max_length=4000,
-        description=(
-            "Literal text to deliver (no LLM, no MCP). Required when "
-            "kind='reminder'."
-        ),
     )
     name: Optional[str] = Field(default=None, max_length=100,
         description="User-visible name. Defaults to a kind-based label.")
@@ -202,35 +126,6 @@ class RoutineCreate(BaseModel):
     )
     config: Optional[dict] = None
 
-    @field_validator("kind")
-    @classmethod
-    def _validate_kind(cls, v: str) -> str:
-        if v not in _VALID_ROUTINE_KINDS:
-            raise ValueError(
-                f"Unknown kind {v!r}. Allowed: {sorted(_VALID_ROUTINE_KINDS)}"
-            )
-        return v
-
-    @field_validator("schedule_kind")
-    @classmethod
-    def _validate_schedule_kind(cls, v: str) -> str:
-        if v not in _VALID_SCHEDULE_KINDS:
-            raise ValueError(
-                f"Unknown schedule_kind {v!r}. "
-                f"Allowed: {sorted(_VALID_SCHEDULE_KINDS)}"
-            )
-        return v
-
-    @field_validator("schedule_window_start_local")
-    @classmethod
-    def _validate_start(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_window_str(v, "schedule_window_start_local")
-
-    @field_validator("schedule_window_end_local")
-    @classmethod
-    def _validate_end(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_window_str(v, "schedule_window_end_local")
-
     @field_validator("delivery_channels")
     @classmethod
     def _validate_delivery_channels(cls, v: Optional[list[str]]) -> Optional[list[str]]:
@@ -244,95 +139,14 @@ class RoutineCreate(BaseModel):
             )
         return v
 
-    @model_validator(mode="after")
-    def _validate_shape_invariants(self):
-        """Phase A — cross-field invariants. Mirrors the Postgres CHECK
-        constraint from migration 042 so the API surfaces clean 400s
-        instead of relying on the DB to 500."""
-        sk = self.schedule_kind
-        if sk == "cron":
-            if not (self.schedule_cron_local or "").strip():
-                raise ValueError(
-                    "schedule_cron_local is required when "
-                    "schedule_kind='cron'."
-                )
-        elif sk == "at":
-            if self.schedule_at is None:
-                raise ValueError(
-                    "schedule_at is required when schedule_kind='at'."
-                )
-            # Reject past one-shots at create-time. The 30-second slack
-            # lets clock-skew between client and server round-trip
-            # without false-positives on "fire 1 minute from now".
-            now = datetime.utcnow()
-            scheduled = self.schedule_at
-            if scheduled.tzinfo is not None:
-                # Convert tz-aware to naive UTC for comparison.
-                from datetime import timezone as _tz
-                scheduled = scheduled.astimezone(_tz.utc).replace(tzinfo=None)
-            if scheduled <= now:
-                raise ValueError(
-                    f"schedule_at must be in the future "
-                    f"(got {scheduled.isoformat()} vs now {now.isoformat()})."
-                )
-        elif sk == "every":
-            if self.schedule_interval_seconds is None:
-                raise ValueError(
-                    "schedule_interval_seconds is required when "
-                    "schedule_kind='every'."
-                )
-            if self.schedule_interval_seconds < _MIN_INTERVAL_SECONDS:
-                raise ValueError(
-                    f"schedule_interval_seconds must be >= "
-                    f"{_MIN_INTERVAL_SECONDS} (got "
-                    f"{self.schedule_interval_seconds})."
-                )
-
-        # Reminder kind needs literal text. Empty/whitespace-only fails.
-        if self.kind == "reminder" and not (self.reminder_text or "").strip():
-            raise ValueError(
-                "reminder_text is required when kind='reminder'."
-            )
-
-        return self
-
 
 class RoutineUpdate(BaseModel):
-    schedule_kind: Optional[str] = None
     schedule_cron_local: Optional[str] = None
-    schedule_at: Optional[datetime] = None
-    schedule_interval_seconds: Optional[int] = None
-    schedule_window_start_local: Optional[str] = None
-    schedule_window_end_local: Optional[str] = None
-    auto_disable_after_fire: Optional[bool] = None
-    reminder_text: Optional[str] = Field(default=None, max_length=4000)
     enabled: Optional[bool] = None
     config: Optional[dict] = None
     name: Optional[str] = Field(default=None, max_length=100)
     prompt_text: Optional[str] = None
     delivery_channels: Optional[list[str]] = None
-
-    @field_validator("schedule_kind")
-    @classmethod
-    def _validate_schedule_kind(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return v
-        if v not in _VALID_SCHEDULE_KINDS:
-            raise ValueError(
-                f"Unknown schedule_kind {v!r}. "
-                f"Allowed: {sorted(_VALID_SCHEDULE_KINDS)}"
-            )
-        return v
-
-    @field_validator("schedule_window_start_local")
-    @classmethod
-    def _validate_start(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_window_str(v, "schedule_window_start_local")
-
-    @field_validator("schedule_window_end_local")
-    @classmethod
-    def _validate_end(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_window_str(v, "schedule_window_end_local")
 
     @field_validator("delivery_channels")
     @classmethod
@@ -383,15 +197,7 @@ class RoutineResponse(BaseModel):
     name: Optional[str] = None
     prompt_text: Optional[str] = None
     enabled: bool
-    # Phase A — schedule shape and shape-specific fields.
-    schedule_kind: str = "cron"
     schedule_cron_local: str
-    schedule_at: Optional[datetime] = None
-    schedule_interval_seconds: Optional[int] = None
-    schedule_window_start_local: Optional[str] = None
-    schedule_window_end_local: Optional[str] = None
-    auto_disable_after_fire: bool = False
-    reminder_text: Optional[str] = None
     config: Optional[dict]
     last_state: Optional[dict]
     last_run_at: Optional[datetime]
@@ -434,14 +240,7 @@ def _row_to_response(routine, recent_runs=()) -> RoutineResponse:
         name=getattr(routine, "name", None),
         prompt_text=getattr(routine, "prompt_text", None),
         enabled=bool(routine.enabled),
-        schedule_kind=getattr(routine, "schedule_kind", "cron") or "cron",
         schedule_cron_local=routine.schedule_cron_local,
-        schedule_at=getattr(routine, "schedule_at", None),
-        schedule_interval_seconds=getattr(routine, "schedule_interval_seconds", None),
-        schedule_window_start_local=getattr(routine, "schedule_window_start_local", None),
-        schedule_window_end_local=getattr(routine, "schedule_window_end_local", None),
-        auto_disable_after_fire=bool(getattr(routine, "auto_disable_after_fire", False)),
-        reminder_text=getattr(routine, "reminder_text", None),
         config=routine.config_json or None,
         last_state=routine.last_state_json or None,
         last_run_at=routine.last_run_at,
@@ -527,17 +326,11 @@ async def create_routine(req: RoutineCreate):
     later without a migration."""
     _validate_kind(req.kind)
     _kind_enabled_or_404(req.kind)
-    # Phase A — cron expression validated only when schedule_kind='cron'.
-    # 'at' and 'every' kinds carry their own schedule_at /
-    # schedule_interval_seconds (validated by the Pydantic
-    # model_validator above).
-    if req.schedule_kind == "cron":
-        _validate_cron(req.schedule_cron_local)
+    _validate_cron(req.schedule_cron_local)
 
     # Generic agent_task routines NEED a prompt — that's the whole point.
     # Preset kinds (email_briefing) don't use prompt_text; the handler
-    # has its own hard-coded prompt template. Reminders carry their
-    # delivery text in `reminder_text` (enforced by the model_validator).
+    # has its own hard-coded prompt template.
     if req.kind == "agent_task" and not (req.prompt_text or "").strip():
         raise HTTPException(
             status_code=400,
@@ -620,36 +413,12 @@ async def create_routine(req: RoutineCreate):
             merged_config = merged_config or {}
             merged_config["delivery_channels"] = list(req.delivery_channels)
 
-        # Phase A — auto-disable defaults to True for one-shot ('at')
-        # reminders. The user said "remind me at 5pm" — they expect ONE
-        # delivery, not a daily repeat. Explicit True/False from the
-        # caller always wins.
-        auto_disable = req.auto_disable_after_fire
-        if auto_disable is None:
-            auto_disable = (req.schedule_kind == "at")
-
-        # `schedule_cron_local` is required by the SQLAlchemy column
-        # (nullable=False on legacy schema). For non-cron shapes we
-        # store a placeholder string so the column stays satisfied;
-        # the runner ignores it whenever schedule_kind != 'cron'.
-        # This avoids a destructive schema change for legacy rows.
-        cron_str = req.schedule_cron_local
-        if not cron_str:
-            cron_str = "* * * * *" if req.schedule_kind != "cron" else ""
-
         routine = Routine(
             user_id=user_id,
             kind=req.kind,
             name=(req.name or "").strip() or None,
             prompt_text=(req.prompt_text or "").strip() or None,
-            schedule_cron_local=cron_str,
-            schedule_kind=req.schedule_kind,
-            schedule_at=req.schedule_at,
-            schedule_interval_seconds=req.schedule_interval_seconds,
-            schedule_window_start_local=req.schedule_window_start_local,
-            schedule_window_end_local=req.schedule_window_end_local,
-            auto_disable_after_fire=bool(auto_disable),
-            reminder_text=(req.reminder_text or "").strip() or None,
+            schedule_cron_local=req.schedule_cron_local,
             enabled=bool(req.enabled),
             config_json=merged_config,
             last_status="never_run",
@@ -713,38 +482,13 @@ async def update_routine(routine_id: str, req: RoutineUpdate):
 
         _kind_enabled_or_404(routine.kind)
 
-        # Phase A — `schedule_changed` covers any shape edit: cron
-        # expression change, kind switch, schedule_at move, interval
-        # change, window adjustment. Each invalidates today's failed
-        # routine_run rows so a new fire can claim a fresh slot.
         schedule_changed = (
-            (req.schedule_cron_local is not None
-             and req.schedule_cron_local != routine.schedule_cron_local)
-            or (req.schedule_kind is not None
-                and req.schedule_kind != getattr(routine, "schedule_kind", "cron"))
-            or (req.schedule_at is not None
-                and req.schedule_at != getattr(routine, "schedule_at", None))
-            or (req.schedule_interval_seconds is not None
-                and req.schedule_interval_seconds
-                    != getattr(routine, "schedule_interval_seconds", None))
+            req.schedule_cron_local is not None
+            and req.schedule_cron_local != routine.schedule_cron_local
         )
 
         if req.schedule_cron_local is not None:
             routine.schedule_cron_local = req.schedule_cron_local
-        if req.schedule_kind is not None:
-            routine.schedule_kind = req.schedule_kind
-        if req.schedule_at is not None:
-            routine.schedule_at = req.schedule_at
-        if req.schedule_interval_seconds is not None:
-            routine.schedule_interval_seconds = req.schedule_interval_seconds
-        if req.schedule_window_start_local is not None:
-            routine.schedule_window_start_local = req.schedule_window_start_local
-        if req.schedule_window_end_local is not None:
-            routine.schedule_window_end_local = req.schedule_window_end_local
-        if req.auto_disable_after_fire is not None:
-            routine.auto_disable_after_fire = bool(req.auto_disable_after_fire)
-        if req.reminder_text is not None:
-            routine.reminder_text = (req.reminder_text or "").strip() or None
         if req.enabled is not None:
             routine.enabled = bool(req.enabled)
         if req.config is not None:

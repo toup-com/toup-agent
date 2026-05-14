@@ -105,8 +105,7 @@ _agent_runner = None
 _tool_executor = None
 _subagent_manager = None
 _skill_loader = None
-# Phase D — `_cron_service` removed (CronService deleted). All
-# scheduled work runs via `_routine_runner` (initialised below).
+_cron_service = None
 
 
 async def restart_telegram_bot():
@@ -150,15 +149,15 @@ async def restart_telegram_bot():
             _telegram_bot.subagent_manager = _subagent_manager
         if _skill_loader:
             _telegram_bot.skill_loader = _skill_loader
-        # Phase D — CronService removed; nothing to wire here.
+        if _cron_service:
+            _cron_service.set_bot(_telegram_bot)
+            _telegram_bot.cron_service = _cron_service
 
         await _telegram_bot.start()
         print("🤖 Telegram bot restarted with new token")
 
         from app.api.admin import set_bot_refs
-        # Second arg was `_cron_service` in pre-Phase-D code; pass None
-        # for back-compat with the admin module's signature.
-        set_bot_refs(_telegram_bot, None, _telegram_bot._start_time)
+        set_bot_refs(_telegram_bot, _cron_service, _telegram_bot._start_time)
     except Exception as e:
         logging.exception(f"[RESTART] Failed to start Telegram bot: {e}")
         _telegram_bot = None
@@ -488,8 +487,8 @@ async def lifespan(app: FastAPI):
     _boot_progress.update(percent=25, phase="embeddings")
     # ── Agent stack initialization ────────────────────────────
     telegram_bot = None
-    # Phase D — CronService removed; RoutineRunner owns ALL scheduled work.
-    routine_runner = None  # System-managed routines (reminders, briefings, agent tasks)
+    cron_service = None
+    routine_runner = None  # Sibling scheduler for system-managed routines (email briefing, …)
     trigger_runner = None  # Event-driven dispatcher for trigger_events (email_received, …)
     subagent_manager = None
     skill_loader = None
@@ -501,6 +500,7 @@ async def lifespan(app: FastAPI):
         from app.agent.agent_runner import AgentRunner
         from app.agent.tool_executor import ToolExecutor
         from app.services.openai_agent_service import OpenAIAgentService
+        from app.agent.cron_service import CronService
         from app.agent.subagent import SubAgentManager
         from app.agent.skills.loader import SkillLoader
 
@@ -543,12 +543,10 @@ async def lifespan(app: FastAPI):
         # Wire sub-agent manager
         subagent_manager.set_agent_runner(agent_runner)
 
-        # Phase D — CronService deleted. All scheduled-prompt work
-        # runs via `routine_runner` (started below). The tool_executor's
-        # legacy `cron_service` attribute is left as None so the
-        # tool_cron deprecation shim can still detect "service absent"
-        # and surface a clean error.
-        tool_executor.cron_service = None
+        # Cron service
+        cron_service = CronService()
+        cron_service.set_agent_runner(agent_runner)
+        tool_executor.cron_service = cron_service
 
         # Wire WebSocket and API v1 refs (so they can invoke the agent)
         from app.api.api_v1 import set_api_v1_refs
@@ -717,6 +715,7 @@ async def lifespan(app: FastAPI):
         _self._tool_executor = tool_executor
         _self._subagent_manager = subagent_manager
         _self._skill_loader = skill_loader
+        _self._cron_service = cron_service
 
         _boot_progress.update(percent=65, phase="apps")
         # ── Start Telegram bot (if configured) ────────────────
@@ -729,10 +728,8 @@ async def lifespan(app: FastAPI):
             subagent_manager.set_bot(telegram_bot)
             telegram_bot.subagent_manager = subagent_manager
             telegram_bot.skill_loader = skill_loader
-            # Phase D — CronService deleted; the bot's `cron_service`
-            # attribute stays None. /cron and /remind both read the
-            # routines table directly now.
-            telegram_bot.cron_service = None
+            cron_service.set_bot(telegram_bot)
+            telegram_bot.cron_service = cron_service
 
             await telegram_bot.start()
             _self._telegram_bot = telegram_bot
@@ -740,23 +737,28 @@ async def lifespan(app: FastAPI):
 
             # Admin dashboard refs
             from app.api.admin import set_bot_refs
-            set_bot_refs(telegram_bot, None, telegram_bot._start_time)
+            set_bot_refs(telegram_bot, cron_service, telegram_bot._start_time)
 
             # Webhook refs
             set_webhook_refs(agent_runner, telegram_bot)
 
-        # Phase D — CronService.start() block removed. RoutineRunner
-        # is the only scheduler now; it starts in the block below.
-        # Routine scheduler — owns ALL scheduled work after Phase D
-        # (was previously a sibling of CronService). Starts after the
-        # Telegram bot so its restart sweep + APScheduler tick path
-        # have a warm DB session pool and a ready bot to call into
-        # for channel fanout. The MCP client doesn't exist yet at
-        # this point (constructed later in the lifespan around the
-        # MCP block), so the runner is constructed without one;
-        # `set_mcp_client()` is called once the client is built.
-        # Failure here is non-fatal: routines silently don't run, the
-        # rest of the agent boots normally.
+        # Start cron scheduler
+        try:
+            await cron_service.start()
+            print("⏰ Cron service started")
+        except Exception as e:
+            print(f"⚠️ Could not start cron service: {e}")
+            cron_service = None
+
+        # Routine scheduler — sibling of CronService. Starts AFTER CronService
+        # so its DB session pool / async_session_maker proxy is already warm,
+        # and after the WS server scaffolding (still pre-listen at this point;
+        # the runner just registers triggers, doesn't fire until tick time).
+        # The MCP client doesn't exist yet at this point (constructed later
+        # in the lifespan around the MCP block), so the runner is constructed
+        # without one; `set_mcp_client()` is called once the client is built.
+        # Failure here is non-fatal: routines silently don't run, the rest of
+        # the agent boots normally.
         try:
             from app.agent.routines import RoutineRunner
             routine_runner = RoutineRunner()
@@ -789,11 +791,8 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ Could not start trigger runner: {e}")
             trigger_runner = None
 
-        # Phase D — Heartbeat service now piggybacks on RoutineRunner's
-        # APScheduler instance instead of CronService's. Same lifecycle
-        # (interval trigger, runs on the agent's event loop), different
-        # owner. Re-uses heartbeat_interval_hours setting unchanged.
-        if settings.heartbeat_enabled and routine_runner and routine_runner.scheduler:
+        # Heartbeat service
+        if settings.heartbeat_enabled and cron_service:
             try:
                 from app.agent.heartbeat_service import HeartbeatService
                 from apscheduler.triggers.interval import IntervalTrigger
@@ -802,20 +801,20 @@ async def lifespan(app: FastAPI):
                 heartbeat_svc.set_agent_runner(agent_runner)
                 if telegram_bot:
                     heartbeat_svc.set_bot(telegram_bot)
-                routine_runner.scheduler.add_job(
-                    heartbeat_svc.tick,
-                    trigger=IntervalTrigger(hours=settings.heartbeat_interval_hours),
-                    id="heartbeat",
-                    name="Proactive Agent Heartbeat",
-                    replace_existing=True,
-                )
-                print(f"💓 Heartbeat (every {settings.heartbeat_interval_hours}h)")
+                if cron_service.scheduler:
+                    cron_service.scheduler.add_job(
+                        heartbeat_svc.tick,
+                        trigger=IntervalTrigger(hours=settings.heartbeat_interval_hours),
+                        id="heartbeat",
+                        name="Proactive Agent Heartbeat",
+                        replace_existing=True,
+                    )
+                    print(f"💓 Heartbeat (every {settings.heartbeat_interval_hours}h)")
             except Exception as e:
                 print(f"⚠️ Could not start heartbeat: {e}")
 
         # ── Periodic self-update check (every 6 hours) ────────
-        # Phase D — moved off CronService's scheduler to RoutineRunner's.
-        if routine_runner and routine_runner.scheduler:
+        if cron_service and cron_service.scheduler:
             try:
                 from apscheduler.triggers.interval import IntervalTrigger as _IT
 
@@ -854,7 +853,7 @@ async def lifespan(app: FastAPI):
                     print("🔄 Restarting agent with new code...")
                     _os.execv(_sys.executable, [_sys.executable] + _sys.argv)
 
-                routine_runner.scheduler.add_job(
+                cron_service.scheduler.add_job(
                     _periodic_update,
                     trigger=_IT(hours=6),
                     id="auto_update",
@@ -1379,7 +1378,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-    # Phase D — cron_service stop block removed (service deleted).
+    if cron_service:
+        try:
+            await cron_service.stop()
+            print("⏰ Cron stopped")
+        except Exception:
+            pass
+
     if subagent_manager:
         try:
             active = [r for r in subagent_manager._runs.values() if r.status == "running"]

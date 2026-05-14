@@ -834,12 +834,6 @@ async def run_gmail_watch_refresh():
             )
         )).all()
 
-    from datetime import datetime, timezone
-    # Local import to avoid a startup-time circular dep (oauth.py
-    # imports from this module at scheduler boot via the FastAPI
-    # router init order).
-    from app.api.triggers_provision import _write_watch_state
-
     refreshed = 0
     failed = 0
     skipped_no_token = 0
@@ -864,32 +858,10 @@ async def run_gmail_watch_refresh():
                 str(user_id)[:8], e,
             )
             continue
-        # Persist baseline + expiration to ConnectorIdentity.metadata_json
-        # so the Pub/Sub webhook reads a fresh watermark on the very
-        # next push. Without this, `watch_provisioned` stays false in
-        # the API forever even though Gmail is happily pushing —
-        # exactly the bug we hit on 2026-05-14.
-        expires_iso = datetime.fromtimestamp(
-            handle.expiration_unix_ms / 1000, tz=timezone.utc,
-        ).isoformat()
-        try:
-            await _write_watch_state(
-                user_id=user_id, connector_id="gmail",
-                history_id=handle.history_id,
-                expires_at_iso=expires_iso,
-            )
-        except Exception as e:
-            # Don't sink the refresh on a metadata-write blip — the
-            # watch is live at Gmail's end, that's what matters. Next
-            # tick will re-attempt.
-            logger.warning(
-                "[gmail_watch_refresh] metadata_write_failed user=%s err=%s",
-                str(user_id)[:8], str(e)[:200],
-            )
         refreshed += 1
         logger.info(
-            "[gmail_watch_refresh] ok user=%s history_id=%s expires=%s",
-            str(user_id)[:8], handle.history_id, expires_iso,
+            "[gmail_watch_refresh] ok user=%s history_id=%s expires_ms=%d",
+            str(user_id)[:8], handle.history_id, handle.expiration_unix_ms,
         )
 
     logger.info(
@@ -992,19 +964,16 @@ def setup_scheduler(
         misfire_grace_time=3600,
     )
 
-    # Gmail watch refresh — every 6 hours (0:45, 6:45, 12:45, 18:45 UTC).
-    # Bumped from daily 2026-05-14: the OAuth callback now arms watches
-    # post-connect, but users who connected BEFORE that fix landed need
-    # the refresh job to bootstrap them. Six-hour cadence bounds that
-    # at <6h instead of <24h while keeping Google API cost negligible
-    # (one call per Gmail-connected user per tick — N tenants × 4).
-    # Also re-arms ahead of the 7-day expiration (any tick wins).
-    # See docs/runbooks/gmail-pubsub.md §4.1 for the manual path.
+    # Gmail watch refresh — daily at 4:45 UTC, before the reapers.
+    # Re-arms every active Gmail connector_identity's `users.watch`
+    # so the 7-day expiration never causes a notification gap. No-op
+    # when the triggers feature flag is off. See
+    # docs/runbooks/gmail-pubsub.md §4.1 for the manual recovery path.
     scheduler.add_job(
         run_gmail_watch_refresh,
-        trigger=CronTrigger(hour="0,6,12,18", minute=45),
+        trigger=CronTrigger(hour=4, minute=45),
         id="gmail_watch_refresh",
-        name="Gmail Watch Refresh (6h cadence; pre-7d expiration re-arm)",
+        name="Gmail Watch Refresh (pre-7d-expiration re-arm)",
         replace_existing=True,
         misfire_grace_time=3600,
     )

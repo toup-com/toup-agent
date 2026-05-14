@@ -81,9 +81,7 @@ AGENT_ONLY_TABLES: set[str] = {
     "build_usage",
     "reconciliation_logs",
     # Agent runtime
-    # `cron_jobs` was the legacy Telegram-only scheduler primitive,
-    # folded into Routines via migrations 042/043/044 (Phase A–D
-    # consolidation). Routines now own all scheduled-prompt automation.
+    "cron_jobs",
     "telegram_user_mappings",
     "agent_errors",
     "api_keys",

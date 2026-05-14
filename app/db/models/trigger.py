@@ -61,11 +61,6 @@ TRIGGER_ACTIONS = frozenset({
 
 TRIGGER_STATUSES = frozenset({
     "never_fired", "active", "failed", "skipped_reauth",
-    # Auto-arm at create_trigger failed for an ops reason (GCP/Pub-Sub
-    # misconfig, transport blip). The trigger row exists but no Gmail
-    # watch is live — the agent + UI surface this as "Setup error"
-    # rather than the misleading "Provisioning…" pill.
-    "provisioning_failed",
 })
 
 # `trigger_events.status` enum. `queued` is the brief window between row

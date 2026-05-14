@@ -522,13 +522,47 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
-        # 12. (removed in Phase D — was `cron`)
-        #
-        # Scheduled tasks are now created via the Routines skill:
-        #   - `routines__remind`  — set a reminder (text-only, multi-channel)
-        #   - `routines__create`  — kind='agent_task' for prompts that the
-        #                           agent runs at fire time
-        # CronJob was Telegram-only and is fully migrated into Routines.
+        # 12. Cron — scheduled tasks
+        # ------------------------------------------------------------------
+        {
+            "name": "cron",
+            "description": (
+                "Manage scheduled tasks. The agent can create reminders, periodic checks, "
+                "or any recurring task. Actions: add (create job), list (show jobs), "
+                "remove (delete job), run (trigger a job now)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "list", "remove", "run"],
+                        "description": "The action to perform.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Job name (for add).",
+                    },
+                    "schedule": {
+                        "type": "string",
+                        "description": (
+                            "Schedule expression (for add). Accepts: "
+                            "cron expr ('*/30 * * * *'), interval ('30m', '2h', '1d'), "
+                            "ISO datetime ('2025-12-31 09:00'), or relative ('in 5m')."
+                        ),
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The prompt/message to run on schedule (for add).",
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job ID (for remove/run).",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
         # ------------------------------------------------------------------
         # 13. Spawn — background sub-agent task
         # ------------------------------------------------------------------

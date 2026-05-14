@@ -49,8 +49,7 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "send_file": 1_000,
     "send_photo": 1_000,
     "analyze_image": 10_000,
-    # Phase D — `cron` tool removed; scheduled work goes through the
-    # routines__* skill tools (`routines__remind`, `routines__create`).
+    "cron": 5_000,
     "spawn": 1_000,
     "process": 10_000,
     "tts": 1_000,
@@ -181,11 +180,7 @@ class ToolExecutor:
         self.workspace = workspace or settings.agent_workspace_dir
         os.makedirs(self.workspace, exist_ok=True)
         self.telegram_bot = telegram_bot  # Set after bot starts
-        # Phase D — `cron_service` kwarg kept for signature compat with
-        # any external caller; always None now. Scheduled work runs via
-        # the RoutineRunner instance accessible through the
-        # `routines__*` skill tools.
-        self.cron_service = None
+        self.cron_service = cron_service  # Set after cron service starts
         self.subagent_manager = subagent_manager  # Set after subagent manager created
         self.skill_loader = None  # Set after skills are loaded
         self._chat_id: Optional[int] = None
@@ -1665,6 +1660,69 @@ class ToolExecutor:
         except Exception as exc:
             logger.exception("analyze_image failed")
             return f"ERROR: Image analysis failed: {exc}"
+
+    # ------------------------------------------------------------------
+    # 12. cron — scheduled tasks
+    # ------------------------------------------------------------------
+    async def _tool_cron(self, inp: Dict[str, Any]) -> str:
+        action = inp.get("action", "").strip().lower()
+
+        if not self.cron_service:
+            return "ERROR: Cron service not available"
+
+        user_id = self._current_user_id
+        chat_id = self._chat_id
+
+        if action == "add":
+            name = inp.get("name", "Unnamed task")
+            schedule = inp.get("schedule", "")
+            message = inp.get("message", "")
+            if not schedule:
+                return "ERROR: 'schedule' is required for add"
+            if not message:
+                return "ERROR: 'message' is required for add"
+            if not chat_id:
+                return "ERROR: No active Telegram chat"
+
+            result = await self.cron_service.add_job(
+                user_id=user_id,
+                chat_id=chat_id,
+                name=name,
+                schedule=schedule,
+                message=message,
+            )
+            return json.dumps(result)
+
+        elif action == "list":
+            jobs = await self.cron_service.list_jobs(user_id)
+            if not jobs:
+                return "No scheduled jobs."
+            lines = []
+            for j in jobs:
+                status = "enabled" if j["enabled"] else "disabled"
+                lines.append(
+                    f"• {j['name']} (id={j['id'][:8]}...)\n"
+                    f"  Schedule: {j['schedule']} ({j['kind']})\n"
+                    f"  Status: {status} | Runs: {j['run_count']}"
+                )
+            return "\n\n".join(lines)
+
+        elif action == "remove":
+            job_id = inp.get("job_id", "")
+            if not job_id:
+                return "ERROR: 'job_id' is required for remove"
+            result = await self.cron_service.remove_job(job_id, user_id)
+            return json.dumps(result)
+
+        elif action == "run":
+            job_id = inp.get("job_id", "")
+            if not job_id:
+                return "ERROR: 'job_id' is required for run"
+            result = await self.cron_service.run_job_now(job_id, user_id)
+            return json.dumps(result)
+
+        else:
+            return f"ERROR: Unknown action '{action}'. Use: add, list, remove, run"
 
     # ------------------------------------------------------------------
     # 13. process — long-running background shell process management

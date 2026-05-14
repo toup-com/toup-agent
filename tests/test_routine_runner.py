@@ -294,39 +294,45 @@ async def test_feature_flag_off_skips_email_briefing_kind():
 
 
 @pytest.mark.asyncio
-async def test_routine_runner_two_jobs_independent_ticks():
-    """Phase D — CronService deleted; this test used to verify
-    coexistence with it. Now we verify two independent APScheduler
-    jobs (interval ticks) on RoutineRunner's scheduler fire cleanly
-    on the same event loop — the same property the old test pinned,
-    but scoped to the single surviving scheduler.
+async def test_coexistence_routine_runner_and_cron_service():
+    """RoutineRunner.scheduler and CronService.scheduler fire independently
+    on the same event loop. Smoke: 1s interval each, ~6s wall-clock, both
+    must accumulate fires.
 
-    Smoke: 1s interval each, ~6s wall-clock, both accumulate fires
-    with sub-2s gaps (no event-loop blocking).
+    Gate evidence requires 60s; this in-pytest variant is capped at ~6s so
+    CI doesn't drag. The full 60s capture is in the runner_smoke.py CLI.
     """
     from app.agent.routines import RoutineRunner
+    from app.agent.cron_service import CronService
 
     rr = RoutineRunner()
+    cs = CronService()
     await rr.start()
+    await cs.start()
 
-    a_fires: list[datetime] = []
-    b_fires: list[datetime] = []
+    rr_fires: list[datetime] = []
+    cs_fires: list[datetime] = []
 
-    async def a_tick():
-        a_fires.append(datetime.utcnow())
+    async def rr_tick():
+        rr_fires.append(datetime.utcnow())
 
-    async def b_tick():
-        b_fires.append(datetime.utcnow())
+    async def cs_tick():
+        cs_fires.append(datetime.utcnow())
 
-    rr.scheduler.add_job(a_tick, trigger=IntervalTrigger(seconds=1), id="a_coexist", replace_existing=True)
-    rr.scheduler.add_job(b_tick, trigger=IntervalTrigger(seconds=1), id="b_coexist", replace_existing=True)
+    rr.scheduler.add_job(rr_tick, trigger=IntervalTrigger(seconds=1), id="rr_coexist", replace_existing=True)
+    cs.scheduler.add_job(cs_tick, trigger=IntervalTrigger(seconds=1), id="cs_coexist", replace_existing=True)
 
     await asyncio.sleep(5.5)
-    await rr.stop()
 
-    assert len(a_fires) >= 3, f"job A fired {len(a_fires)} times in 5.5s (expected ≥3)"
-    assert len(b_fires) >= 3, f"job B fired {len(b_fires)} times in 5.5s (expected ≥3)"
-    a_gaps = [(a_fires[i + 1] - a_fires[i]).total_seconds() for i in range(len(a_fires) - 1)]
-    b_gaps = [(b_fires[i + 1] - b_fires[i]).total_seconds() for i in range(len(b_fires) - 1)]
-    assert all(g < 2.0 for g in a_gaps), f"job A blocked: gaps={a_gaps}"
-    assert all(g < 2.0 for g in b_gaps), f"job B blocked: gaps={b_gaps}"
+    await rr.stop()
+    await cs.stop()
+
+    assert len(rr_fires) >= 3, f"RoutineRunner fired {len(rr_fires)} times in 5.5s (expected ≥3)"
+    assert len(cs_fires) >= 3, f"CronService fired {len(cs_fires)} times in 5.5s (expected ≥3)"
+    # Cross-check independence: the gap between consecutive fires on each
+    # scheduler should stay near 1s — if one were blocking the other, the
+    # gaps would balloon.
+    rr_gaps = [(rr_fires[i + 1] - rr_fires[i]).total_seconds() for i in range(len(rr_fires) - 1)]
+    cs_gaps = [(cs_fires[i + 1] - cs_fires[i]).total_seconds() for i in range(len(cs_fires) - 1)]
+    assert all(g < 2.0 for g in rr_gaps), f"RoutineRunner blocked: gaps={rr_gaps}"
+    assert all(g < 2.0 for g in cs_gaps), f"CronService blocked: gaps={cs_gaps}"

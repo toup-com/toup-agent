@@ -5,7 +5,7 @@ Handles:
 - Photos → download + pass as image_url content blocks (GPT vision)
 - Voice/audio → Whisper transcription → AgentRunner
 - Documents → read content and include inline
-- Commands: /start, /help, /status, /reset, /new, /stop, /whoami, /model, /compact, /usage, /remind, /export, /subagents
+- Commands: /start, /help, /status, /reset, /new, /stop, /whoami, /model, /compact, /usage, /cron, /export, /subagents
 - Streaming responses with progressive message edits
 - Continuous typing indicator during processing
 - Reply-to context support
@@ -59,9 +59,7 @@ class ToupTelegramBot:
         self.token = token
         self.agent_runner = agent_runner
         self.app: Optional[Application] = None
-        # Phase D — CronService deleted. Kept for back-compat with any
-        # external code that reads `bot.cron_service`; always None now.
-        self.cron_service = None
+        self.cron_service = None  # Set after cron service starts
         self.subagent_manager = None  # Set after subagent manager created
 
         # Map Telegram user ID → Toup user ID (in-memory cache)
@@ -102,10 +100,7 @@ class ToupTelegramBot:
         self.app.add_handler(CommandHandler("model", self._cmd_model))
         self.app.add_handler(CommandHandler("compact", self._cmd_compact))
         self.app.add_handler(CommandHandler("usage", self._cmd_usage))
-        # Phase D — /cron deleted. /remind and /reminders own scheduled
-        # tasks now, surfaced over the Routine system.
-        self.app.add_handler(CommandHandler("remind", self._cmd_remind))
-        self.app.add_handler(CommandHandler("reminders", self._cmd_remind))
+        self.app.add_handler(CommandHandler("cron", self._cmd_cron))
         self.app.add_handler(CommandHandler("export", self._cmd_export))
         self.app.add_handler(CommandHandler("subagents", self._cmd_subagents))
         self.app.add_handler(CommandHandler("skills", self._cmd_skills))
@@ -168,8 +163,7 @@ class ToupTelegramBot:
             BotCommand("model", "Show or switch AI model"),
             BotCommand("compact", "Force context compaction"),
             BotCommand("usage", "Show token usage and cost"),
-            # Phase D — /cron removed. /remind is the canonical command.
-            BotCommand("remind", "Set a reminder (one-shot or recurring)"),
+            BotCommand("cron", "List scheduled jobs"),
             BotCommand("export", "Export conversation history"),
             BotCommand("subagents", "List background tasks"),
             BotCommand("skills", "List loaded skill plugins"),
@@ -499,7 +493,7 @@ class ToupTelegramBot:
             "/model — Show or switch AI model\n"
             "/compact — Force context compaction\n"
             "/usage — Show token usage and cost\n"
-            "/remind — Set a reminder (one-shot or recurring)\n"
+            "/cron — List scheduled jobs\n"
             "/export — Export conversation history\n"
             "/subagents — List background tasks\n"
             "/skills — List loaded skill plugins\n"
@@ -1423,113 +1417,37 @@ class ToupTelegramBot:
             parse_mode="HTML",
         )
 
-    async def _cmd_remind(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /remind and /reminders.
-
-        With no args → lists this user's reminder/agent_task/email_briefing
-        routines.
-
-        With text → forwards to the agent as a natural-language
-        "remind me to ..." message. The agent's routines skill picks up
-        the intent and calls `routines__remind` to create the routine.
-        This keeps the Telegram surface thin (no per-flag parsing here)
-        and reuses the same NL → routine pipeline the website chat uses.
-        """
+    async def _cmd_cron(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /cron — list scheduled jobs."""
         if not self._is_allowed(update.effective_user.id):
             return
 
         user_id = await self._get_toup_user_id(update.effective_user.id)
-        args_text = " ".join(context.args).strip() if context.args else ""
 
-        # No args — show the routines list (replaces the /cron output
-        # with the Day-as-Chat-aware view).
-        if not args_text:
-            try:
-                from app.db.database import async_session_maker
-                from app.db.models import Routine
-                from sqlalchemy import select, desc
-
-                async with async_session_maker() as db:
-                    result = await db.execute(
-                        select(Routine)
-                        .where(Routine.user_id == user_id, Routine.enabled == True)  # noqa: E712
-                        .order_by(desc(Routine.created_at))
-                        .limit(20)
-                    )
-                    rs = list(result.scalars().all())
-            except Exception as e:
-                logger.exception("[/remind] list query failed: %s", e)
-                await update.message.reply_text(
-                    "🔔 Couldn't list your reminders right now. Try again "
-                    "in a moment, or open Mission Control on the website."
-                )
-                return
-
-            if not rs:
-                await update.message.reply_text(
-                    "🔔 No reminders or routines yet.\n\n"
-                    "<i>Reply: /remind &lt;what to remind you&gt;</i>\n"
-                    "<i>e.g. /remind Call mom at 5pm</i>",
-                    parse_mode="HTML",
-                )
-                return
-
-            lines = ["🔔 <b>Your active reminders & routines</b>\n"]
-            for r in rs[:20]:
-                title = (r.name or r.reminder_text or r.kind)[:60]
-                schedule_kind = getattr(r, "schedule_kind", "cron") or "cron"
-                if schedule_kind == "at" and getattr(r, "schedule_at", None):
-                    sched = f"once at {r.schedule_at.isoformat()}Z"
-                elif schedule_kind == "every":
-                    n = getattr(r, "schedule_interval_seconds", 0) or 0
-                    sched = f"every {max(1, n // 60)} min"
-                else:
-                    sched = f"cron {r.schedule_cron_local}"
-                kind_emoji = {"reminder": "🔔", "email_briefing": "✉️",
-                              "agent_task": "🤖"}.get(r.kind, "⏰")
-                lines.append(
-                    f"{kind_emoji} <b>{title}</b>\n"
-                    f"   <code>{sched}</code> · id <code>{r.id[:8]}</code>"
-                )
-            lines.append("\n<i>Manage these in Mission Control on the website.</i>")
-            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        if not self.cron_service:
+            await update.message.reply_text("⏰ Cron service not available.")
             return
 
-        # Args present — forward to the agent as a NL reminder request.
-        # The agent's routines skill will translate it into a
-        # `routines__remind` tool call with the right schedule shape.
-        try:
-            # Reuse the standard inbound text path so the message lands
-            # in the right Day-as-Chat conversation and the agent has
-            # full context.
-            from telegram import Message as TgMessage  # noqa
-            # Synthesize a "remind me to ..." prompt phrasing if the
-            # user just typed the reminder body raw. Keep their literal
-            # text if they already phrased it as a request.
-            if not args_text.lower().startswith(("remind me", "remind")):
-                forwarded = f"Remind me to {args_text}"
-            else:
-                forwarded = args_text
-            # Push it through the same handler the bot uses for normal
-            # text messages, but bypass the user-typed echo since we
-            # already showed the command above.
-            await self._handle_text(update, context, override_text=forwarded)
-        except AttributeError:
-            # Fallback when `_handle_text` doesn't accept override_text
-            # (older bot version). Just send a reply explaining what to
-            # do — the next plain-text message the user sends will
-            # naturally hit the agent.
+        jobs = await self.cron_service.list_jobs(user_id)
+        if not jobs:
             await update.message.reply_text(
-                f"🔔 Got it — say \"{args_text}\" and I'll set it up. "
-                "(Tip: just text me the reminder directly, no /remind "
-                "command needed.)"
+                "⏰ No scheduled jobs.\n\n"
+                "<i>Ask me to set a reminder or schedule a task.</i>",
+                parse_mode="HTML",
             )
-        except Exception as e:
-            logger.exception("[/remind] forward to agent failed: %s", e)
-            await update.message.reply_text(
-                f"🔔 Couldn't process the reminder — try again, or just "
-                f"text me \"remind me to {args_text}\" directly."
+            return
+
+        lines = ["⏰ <b>Scheduled Jobs</b>\n"]
+        for i, j in enumerate(jobs, 1):
+            status = "✅ active" if j["enabled"] else "⏸ disabled"
+            lines.append(
+                f"{i}. <b>{j['name']}</b>\n"
+                f"   Schedule: <code>{j['schedule']}</code> ({j['kind']})\n"
+                f"   Status: {status} | Runs: {j['run_count']}\n"
+                f"   ID: <code>{j['id'][:8]}</code>"
             )
+        lines.append("\n<i>Use the cron tool or ask me to manage jobs.</i>")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _cmd_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /export — export conversation history as a text file."""

@@ -124,77 +124,17 @@ class RoutinesSkill(Skill):
                     "properties": {
                         "kind": {
                             "type": "string",
-                            "enum": ["email_briefing", "agent_task", "reminder"],
+                            "enum": ["email_briefing", "agent_task"],
                             "description": (
                                 "`email_briefing` for Gmail summaries; "
-                                "`agent_task` for any other recurring agent prompt; "
-                                "`reminder` for plain text-only reminders (no LLM "
-                                "work, just delivers `reminder_text`). For most "
-                                "\"remind me to...\" requests use the dedicated "
-                                "`routines__remind` tool which has a cleaner UX."
-                            ),
-                        },
-                        "schedule_kind": {
-                            "type": "string",
-                            "enum": ["cron", "at", "every"],
-                            "description": (
-                                "Default `cron` (recurring at a wall-clock time). "
-                                "`at` = one-shot at a specific datetime (use "
-                                "schedule_at). `every` = interval (use "
-                                "schedule_interval_seconds)."
+                                "`agent_task` for any other recurring prompt."
                             ),
                         },
                         "schedule_cron_local": {
                             "type": "string",
                             "description": (
                                 "5-part cron expression in the user's local tz, "
-                                "e.g. `30 6 * * *` for 06:30 daily. Required "
-                                "when schedule_kind=`cron`."
-                            ),
-                        },
-                        "schedule_at": {
-                            "type": "string",
-                            "description": (
-                                "One-shot fire datetime as ISO-8601 (UTC), e.g. "
-                                "`2026-05-14T22:00:00Z`. Required when "
-                                "schedule_kind=`at`. Must be in the future."
-                            ),
-                        },
-                        "schedule_interval_seconds": {
-                            "type": "integer",
-                            "minimum": 60,
-                            "description": (
-                                "Seconds between fires. Required when "
-                                "schedule_kind=`every`. Minimum 60."
-                            ),
-                        },
-                        "schedule_window_start_local": {
-                            "type": "string",
-                            "description": (
-                                "Optional. HH:MM in the user's tz. With "
-                                "schedule_window_end_local, restricts interval "
-                                "reminders to a daily active window."
-                            ),
-                        },
-                        "schedule_window_end_local": {
-                            "type": "string",
-                            "description": "Optional. HH:MM in the user's tz.",
-                        },
-                        "auto_disable_after_fire": {
-                            "type": "boolean",
-                            "description": (
-                                "When true, the routine disables itself after a "
-                                "successful fire. Server defaults to true for "
-                                "schedule_kind=`at` (one-shot reminders)."
-                            ),
-                        },
-                        "reminder_text": {
-                            "type": "string",
-                            "description": (
-                                "REQUIRED when kind=`reminder`. The literal text "
-                                "to deliver to the user — no LLM transformation, "
-                                "no MCP tools. Write it in the user's voice "
-                                "(\"Time to take vitamins\")."
+                                "e.g. `30 6 * * *` for 06:30 daily."
                             ),
                         },
                         "name": {
@@ -234,90 +174,7 @@ class RoutinesSkill(Skill):
                             ),
                         },
                     },
-                    "required": ["kind"],
-                },
-            },
-            {
-                "name": "routines__remind",
-                "description": (
-                    "Set a reminder for the user. Plain text delivery — no LLM "
-                    "work, no MCP. Use this for any \"remind me to ...\" request "
-                    "where the user wants a literal notification at a time.\n\n"
-                    "Schedule modes:\n"
-                    "  • `at`    — one-shot. `when_iso` is ISO-8601 UTC ('2026-05-14T22:00:00Z'). Auto-disables after fire.\n"
-                    "  • `cron`  — recurring (daily/weekly time). `cron` is 5-part 'm h dom mon dow'.\n"
-                    "  • `every` — interval (every N seconds), optionally gated by an active window.\n\n"
-                    "Always confirm the time with the user in plain English before "
-                    "calling (\"so you want a reminder at 5pm today, right?\")."
-                ),
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": (
-                                "The reminder text the user will literally see. "
-                                "Write in the user's voice; don't preface with "
-                                "\"Reminder:\" — the UI does that. Examples: "
-                                "\"Call mom\", \"Stand up and stretch\", \"Take "
-                                "the chicken out of the freezer\"."
-                            ),
-                        },
-                        "schedule_kind": {
-                            "type": "string",
-                            "enum": ["at", "cron", "every"],
-                            "description": "Default `at` (one-shot).",
-                        },
-                        "when_iso": {
-                            "type": "string",
-                            "description": (
-                                "Required when schedule_kind=`at`. ISO-8601 UTC, "
-                                "must be in the future."
-                            ),
-                        },
-                        "cron_local": {
-                            "type": "string",
-                            "description": (
-                                "Required when schedule_kind=`cron`. 5-part cron "
-                                "in the user's tz (e.g. `0 17 * * *` for 5pm daily)."
-                            ),
-                        },
-                        "every_seconds": {
-                            "type": "integer",
-                            "minimum": 60,
-                            "description": (
-                                "Required when schedule_kind=`every`. Minimum 60."
-                            ),
-                        },
-                        "window_start_local": {
-                            "type": "string",
-                            "description": "Optional HH:MM (with `every`).",
-                        },
-                        "window_end_local": {
-                            "type": "string",
-                            "description": "Optional HH:MM (with `every`).",
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": (
-                                "Optional short name shown in Mission Control "
-                                "(≤100 chars). Defaults to the first 40 chars "
-                                "of `text`."
-                            ),
-                        },
-                        "delivery_channels": {
-                            "type": "array",
-                            "items": {
-                                "type": "string",
-                                "enum": ["website", "telegram", "whatsapp"],
-                            },
-                            "description": (
-                                "Where the reminder should buzz. Ask the user "
-                                "before picking. Default `[\"website\"]`."
-                            ),
-                        },
-                    },
-                    "required": ["text", "schedule_kind"],
+                    "required": ["kind", "schedule_cron_local"],
                 },
             },
             {
@@ -486,7 +343,6 @@ class RoutinesSkill(Skill):
             "routines__update": self._update,
             "routines__delete": self._delete,
             "routines__run_now": self._run_now,
-            "routines__remind": self._remind,
         }
         handler = dispatch.get(tool_name)
         if not handler:
@@ -508,29 +364,16 @@ class RoutinesSkill(Skill):
         from app.api.routines import RoutineCreate, create_routine
 
         kind = (args.get("kind") or "").strip()
+        schedule = (args.get("schedule_cron_local") or "").strip()
         if not kind:
-            return "ERROR: `kind` is required (`email_briefing`, `agent_task`, or `reminder`)."
-
-        # Phase A — `schedule_kind` defaults to 'cron' for backward compat
-        # with existing callers. Each shape has its own required field
-        # which Pydantic's model_validator enforces; we surface the
-        # validation error as `ERROR: …` instead of a 422 the agent
-        # wouldn't recover from.
-        schedule_kind = (args.get("schedule_kind") or "cron").strip()
-        if schedule_kind == "cron" and not (args.get("schedule_cron_local") or "").strip():
-            return "ERROR: `schedule_cron_local` is required when schedule_kind='cron'."
+            return "ERROR: `kind` is required (`email_briefing` or `agent_task`)."
+        if not schedule:
+            return "ERROR: `schedule_cron_local` is required (5-part cron)."
 
         try:
             req = RoutineCreate(
                 kind=kind,
-                schedule_kind=schedule_kind,
-                schedule_cron_local=args.get("schedule_cron_local"),
-                schedule_at=args.get("schedule_at"),
-                schedule_interval_seconds=args.get("schedule_interval_seconds"),
-                schedule_window_start_local=args.get("schedule_window_start_local"),
-                schedule_window_end_local=args.get("schedule_window_end_local"),
-                auto_disable_after_fire=args.get("auto_disable_after_fire"),
-                reminder_text=args.get("reminder_text"),
+                schedule_cron_local=schedule,
                 name=args.get("name"),
                 prompt_text=args.get("prompt_text"),
                 enabled=bool(args.get("enabled", True)),
@@ -680,69 +523,5 @@ class RoutinesSkill(Skill):
             "hint": (
                 "The result was posted into the day-chat as the assistant. "
                 "Tell the user to scroll up to today's date to see it."
-            ),
-        })
-
-    async def _remind(self, args: Dict[str, Any], ctx: SkillContext) -> str:
-        """Sugar over `_create` for the dominant reminder UX. Translates
-        the friendlier `text` + `when_iso` / `cron_local` / `every_seconds`
-        args into the canonical Routine shape and delegates."""
-        from fastapi import HTTPException
-        from app.api.routines import RoutineCreate, create_routine
-
-        text = (args.get("text") or "").strip()
-        if not text:
-            return "ERROR: `text` is required — what should the reminder say?"
-
-        sk = (args.get("schedule_kind") or "at").strip()
-        if sk not in ("at", "cron", "every"):
-            return f"ERROR: schedule_kind must be one of at/cron/every (got {sk!r})."
-
-        name = (args.get("name") or "").strip() or (text[:40] + ("…" if len(text) > 40 else ""))
-
-        # Map the friendlier reminder-specific args to the canonical
-        # RoutineCreate schema. Validation runs through the same
-        # model_validator the API uses, so the agent sees the same
-        # invariants the dashboard does.
-        try:
-            req = RoutineCreate(
-                kind="reminder",
-                schedule_kind=sk,
-                schedule_cron_local=args.get("cron_local") if sk == "cron" else None,
-                schedule_at=args.get("when_iso") if sk == "at" else None,
-                schedule_interval_seconds=args.get("every_seconds") if sk == "every" else None,
-                schedule_window_start_local=args.get("window_start_local"),
-                schedule_window_end_local=args.get("window_end_local"),
-                reminder_text=text,
-                name=name,
-                enabled=True,
-                delivery_channels=args.get("delivery_channels"),
-            )
-        except Exception as e:
-            return f"ERROR: invalid arguments: {e}"
-
-        try:
-            resp = await create_routine(req)
-        except HTTPException as e:
-            return f"ERROR: {e.detail}"
-
-        delivery = (resp.config or {}).get("delivery_channels") if resp.config else None
-        return _as_json({
-            "status": "reminder_set",
-            "routine": {
-                "id": resp.id,
-                "name": resp.name,
-                "schedule_kind": resp.schedule_kind,
-                "schedule_at": str(resp.schedule_at) if resp.schedule_at else None,
-                "schedule_cron_local": resp.schedule_cron_local if sk == "cron" else None,
-                "schedule_interval_seconds": resp.schedule_interval_seconds,
-                "auto_disable_after_fire": resp.auto_disable_after_fire,
-                "next_run_at": str(resp.next_run_at) if resp.next_run_at else None,
-                "delivery_channels": delivery or ["website"],
-            },
-            "hint": (
-                "The reminder is registered with the scheduler. The user "
-                "can cancel it from Mission Control or by asking you to "
-                "delete it. One-shot reminders auto-disable after fire."
             ),
         })

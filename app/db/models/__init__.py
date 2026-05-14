@@ -41,7 +41,7 @@ from .document import Document, DocumentChunk, Media
 from .app import App, BuildJob, BuildUsage, ReconciliationLog
 
 # Agent runtime
-from .agent import TelegramUserMapping, AgentError, ApiKey, AgentConfig, ExtensionDevice
+from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig, ExtensionDevice
 
 # Routines (system-managed scheduled actions — email briefing, etc.)
 from .routine import Routine, RoutineRun, RoutineNotificationDedupe
@@ -121,7 +121,7 @@ __all__ = [
     "Entity", "EntityLink", "EntityRelationship",
     "Document", "DocumentChunk", "Media",
     "App", "BuildJob", "BuildUsage", "ReconciliationLog",
-    "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig", "ExtensionDevice",
+    "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig", "ExtensionDevice",
     "Routine", "RoutineRun", "RoutineNotificationDedupe",
     "Trigger", "TriggerEvent",
     "TRIGGER_KINDS", "TRIGGER_ACTIONS", "TRIGGER_STATUSES", "TRIGGER_EVENT_STATUSES",
