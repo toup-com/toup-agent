@@ -24,6 +24,7 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, desc, select
+from sqlalchemy.exc import IntegrityError
 
 
 router = APIRouter(prefix="/routines", tags=["routines"])
@@ -370,22 +371,37 @@ async def create_routine(req: RoutineCreate):
         # One-active-per-kind enforcement is preserved for preset kinds
         # (email_briefing → one Gmail briefing per user). For the generic
         # `agent_task` kind we allow MANY active routines — each one is a
-        # distinct task ("morning briefing", "noon GitHub check", etc.)
-        # and per-task uniqueness on (kind=agent_task) would be useless.
-        if req.kind != "agent_task":
-            existing = await db.execute(
-                select(Routine).where(
-                    Routine.user_id == user_id,
-                    Routine.kind == req.kind,
-                    Routine.enabled == True,  # noqa: E712
-                )
+        # distinct task ("morning briefing", "noon GitHub check", etc.).
+        #
+        # Pre-2026-05-14 this used `scalar_one_or_none()` which raises
+        # `MultipleResultsFound` when ≥2 enabled routines of the same
+        # kind already exist — i.e., the guard CRASHED in exactly the
+        # state it was meant to prevent. After the cleanup migration
+        # (041) and the partial UNIQUE index that pairs with it, two
+        # enabled rows of a preset kind cannot exist concurrently; the
+        # Python check below is the friendly 409 path. The DB index is
+        # the load-bearing guarantee, the Python check is for the nice
+        # error message.
+        from app.services.routine_uniqueness import (
+            find_conflicting_enabled_routine_ids,
+        )
+        existing_ids = await find_conflicting_enabled_routine_ids(
+            db, user_id=user_id, kind=req.kind,
+        )
+        if existing_ids:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        f"An enabled {req.kind!r} routine already exists "
+                        f"for this user. Disable or delete it first, "
+                        f"or update the existing one instead of "
+                        f"creating a new one."
+                    ),
+                    "existing_routine_ids": existing_ids,
+                    "kind": req.kind,
+                },
             )
-            if existing.scalar_one_or_none() is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"An enabled {req.kind!r} routine already exists. "
-                           f"Disable or delete it first.",
-                )
 
         # Merge delivery_channels into config_json. We keep them on the
         # SAME blob so the handler can read everything at fire time
@@ -408,7 +424,29 @@ async def create_routine(req: RoutineCreate):
             last_status="never_run",
         )
         db.add(routine)
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError as e:
+            # The partial UNIQUE index (migration 041) caught a race
+            # the Python guard missed — two concurrent `POST /routines`
+            # both passed the in-app check, only one row can win. The
+            # loser comes back as 409 (not 500) so the agent / UI can
+            # retry-via-update cleanly.
+            await db.rollback()
+            if "uq_routines_one_per_kind" in str(e).lower() \
+                    or "unique" in str(e).lower():
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            f"Another concurrent request created an "
+                            f"enabled {req.kind!r} routine first. "
+                            f"Refresh and update the existing one."
+                        ),
+                        "kind": req.kind,
+                    },
+                )
+            raise
         await db.refresh(routine)
 
     # Register the trigger with the runner so the routine fires at its
@@ -490,7 +528,36 @@ async def update_routine(routine_id: str, req: RoutineUpdate):
                 )
             )
 
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError as e:
+            # Enabling a disabled preset-kind routine when another
+            # enabled one already exists for this user trips the partial
+            # UNIQUE (migration 041). 409 with the existing routine id
+            # so the agent can offer to swap them.
+            await db.rollback()
+            from app.services.routine_uniqueness import (
+                find_conflicting_enabled_routine_ids, KINDS_EXEMPT_FROM_ONE_PER_KIND,
+            )
+            if routine.kind not in KINDS_EXEMPT_FROM_ONE_PER_KIND:
+                other_ids = await find_conflicting_enabled_routine_ids(
+                    db, user_id=user_id, kind=routine.kind,
+                    exclude_routine_id=routine_id,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            f"Cannot enable: another enabled "
+                            f"{routine.kind!r} routine already exists. "
+                            f"Disable it first or update this one's "
+                            f"settings into that routine."
+                        ),
+                        "existing_routine_ids": other_ids,
+                        "kind": routine.kind,
+                    },
+                )
+            raise
         await db.refresh(routine)
 
     if _runner is not None:
