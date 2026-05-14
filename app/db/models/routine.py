@@ -121,12 +121,68 @@ class RoutineRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # Phase 2 / Ticket 2.1: APScheduler's scheduled trigger fire time
+    # (UTC). Distinct from started_at = datetime.utcnow() at the head of
+    # _fire — a slow-handler run can have finished_at - started_at ≈
+    # handler_latency, but `last_run_at` (= fire_instant after Ticket 2.3)
+    # is the user-visible "when the routine fired" instant. Nullable for
+    # backward compat with pre-migration rows.
+    fire_instant: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # finished_at rendered in the user's tz, ISO8601 — render-time helper
+    # for dashboards so they don't have to join through User.timezone.
+    finished_local_at: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+
     # "running" | "success" | "partial" | "failed" | "skipped_reauth"
+    # Legacy column. Kept for backward compat with `/api/routines/{id}/runs`
+    # consumers, Mission Control dashboards, and any operator query that
+    # filters on it. New code should branch on `outcome` instead — see
+    # Ticket 2.1 in docs/routines/.
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="running", server_default="running"
     )
+    # New (Ticket 2.1) — richer state machine:
+    #   "success"        — full success, handler ran AND all configured
+    #                      channels confirmed delivery.
+    #   "success_empty"  — handler ran cleanly, nothing to deliver
+    #                      (empty Gmail inbox / no new emails since
+    #                      watermark). Distinct from "success" so the
+    #                      dashboard can show "delivered" vs "ran".
+    #   "partial"        — message landed on at least one channel but
+    #                      another channel skipped silently (most common
+    #                      Defect-A symptom).
+    #   "tool_error"     — Gmail returned reauth_required / scope_missing
+    #                      / tool_missing. User-actionable: needs to
+    #                      reconnect. Distinct from "failure" so the
+    #                      nudge / reconnect notice flow can branch on it.
+    #   "failure"        — handler exhausted its retry budget on a
+    #                      retryable error (rate_limited / provider_down /
+    #                      handler exception). Not user-actionable;
+    #                      operator gets the alert.
+    outcome: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     error_class: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     error_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Structured error blob — superset of error_class+error_detail. Carries
+    # `class`, `detail`, `attempt`, optional `tool_name`, optional `tool_call_id`.
+    error_json: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
+    # Per-channel delivery results. Shape:
+    #   {
+    #     "website": {"status": "delivered", "message_id": "...",
+    #                 "ws_count": 2, "day_chat_id": "..."},
+    #     "telegram": {"status": "delivered", "telegram_message_id": 12345,
+    #                  "chat_id": 987654321},
+    #     "whatsapp": {"status": "skipped", "reason": "no_self_e164"},
+    #   }
+    # Empty/null on tool_error / failure outcomes (nothing was sent).
+    channel_results_json: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
+    # List of MCP tool names the handler invoked during this run. Helpful
+    # for "did this routine actually call Gmail?" forensics on a failure.
+    tools_invoked_json: Mapped[Optional[list]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
 
     emails_fetched: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
@@ -147,4 +203,39 @@ class RoutineRun(Base):
         ),
         Index("ix_routine_runs_user_started", "user_id", "started_at"),
         Index("ix_routine_runs_status_started", "status", "started_at"),
+        Index("ix_routine_runs_outcome_started", "outcome", "started_at"),
+    )
+
+
+class RoutineNotificationDedupe(Base):
+    """Per-routine, per-kind, per-local-day rate-limit row for the
+    reconnect / failure notice path (Ticket 2.2).
+
+    The UNIQUE (routine_id, kind, scope_date) constraint is the gate:
+    `INSERT … ON UNIQUE → IntegrityError` means "already sent today,
+    don't send again." Cron / dashboards don't read this directly — it's
+    a write-once dedupe table consumed exclusively by `_write_nudge`.
+    """
+
+    __tablename__ = "routine_notification_dedupe"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    routine_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("routines.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Notice kind: "reauth" | "failure" | future kinds. Keep loose so a
+    # new notice type can be added without a migration.
+    kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    # Local calendar day the notice is scoped to. Same semantic as
+    # `routine_runs.scheduled_for_local_date` — the user's day.
+    scope_date: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "routine_id", "kind", "scope_date",
+            name="uq_routine_notification_dedupe_key",
+        ),
     )

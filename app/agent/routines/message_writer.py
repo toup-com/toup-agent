@@ -115,21 +115,30 @@ async def broadcast_routine_message(
     model_used: Optional[str] = None,
     delivery_channels: Optional[list[str]] = None,
     routine_name: Optional[str] = None,
-) -> int:
+):
     """Push a routine Message to any live WS clients AND (optionally) to
     extra outbound channels the routine asked for (Telegram / WhatsApp).
-    Returns the number of WS queues that accepted the event.
+
+    Return shape (Ticket 2.5 — was `int` pre-fix):
+      {
+        "ws_count": int,   # WS frames pushed
+        "channel_results": {
+          "website": {"status": "delivered", "message_id": ..., "ws_count": ..., "day_chat_id": ...},
+          "telegram": {"status": "delivered" | "skipped" | "failed", ...},
+          "whatsapp": {...},
+        },
+      }
+
+    Callers that previously expected an int can use `out["ws_count"]`.
 
     `delivery_channels` is the list the user picked when they created
-    the routine — typically `["website"]` (no-op here), or with extra
-    channel slugs like `["website", "telegram"]`. The 'website' slug is
-    served by this broadcast (the chat UI subscribes to the WS event);
-    other slugs route through `channel_dispatcher.deliver_to_extra_channels`.
+    the routine. The 'website' slug is served by this broadcast (the
+    chat UI subscribes to the WS event AND/OR fetches via
+    `/api/messages/since`); other slugs route through
+    `channel_dispatcher.deliver_to_extra_channels_detailed`.
+    """
+    channel_results: dict[str, dict[str, Any]] = {}
 
-    Lazy-imports `broadcast_to_user` so this module is importable in test
-    environments where the full `app.api` package can't load (the
-    FastAPI/Starlette version skew the test env exhibits). Broadcast in
-    such envs degrades silently to a no-op."""
     try:
         from app.api.ws_chat import broadcast_to_user
     except Exception as e:
@@ -145,6 +154,9 @@ async def broadcast_routine_message(
             "source": source,
             "content": content,
             "model_used": model_used,
+            # Ticket 2.5 — flag so the chat UI's parser can render the
+            # routine card vs a normal assistant bubble.
+            "routine_message": True,
             "created_at": datetime.utcnow().isoformat(),
         }
         try:
@@ -153,25 +165,38 @@ async def broadcast_routine_message(
             logger.warning("[routine_writer] broadcast failed: %s", e)
             ws_count = 0
 
+    # Website always counts as delivered when the Message row landed.
+    # ws_count == 0 just means the user wasn't viewing the day-chat
+    # live; they'll see the row on next /messages/since fetch.
+    channel_results["website"] = {
+        "status": "delivered",
+        "message_id": message_id,
+        "day_chat_id": day_chat_id,
+        "ws_count": ws_count,
+    }
+
     # Optional fan-out to extra channels. Best-effort by design — the
     # canonical Day-as-Chat record already landed via write_routine_message,
     # so a Telegram outage must not block or fail the routine.
     extras = [c for c in (delivery_channels or []) if c and c != "website"]
     if extras:
         try:
-            from .channel_dispatcher import deliver_to_extra_channels
+            from .channel_dispatcher import deliver_to_extra_channels_detailed
             from app.db.database import async_session_maker
-            results = await deliver_to_extra_channels(
+            extras_results = await deliver_to_extra_channels_detailed(
                 user_id=user_id,
                 delivery_channels=extras,
                 routine_name=routine_name or source,
                 content=content,
                 db_session_maker=async_session_maker,
             )
-            if results:
+            if extras_results:
+                channel_results.update(extras_results)
                 logger.info(
                     "[routine_writer] extra channel fan-out user=%s results=%s",
-                    user_id, results,
+                    user_id,
+                    # Log a compact summary so the line stays grep-friendly.
+                    {k: (v or {}).get("status") for k, v in extras_results.items()},
                 )
         except Exception as e:  # pragma: no cover — top-level guard
             logger.warning(
@@ -179,4 +204,4 @@ async def broadcast_routine_message(
                 type(e).__name__, e,
             )
 
-    return ws_count
+    return {"ws_count": ws_count, "channel_results": channel_results}

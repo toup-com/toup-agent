@@ -369,10 +369,17 @@ class EmailBriefingHandler:
             # row is consistent with day_archival.
             tokens_prompt=None,
             tokens_completion=None,
+            extra_metadata={"routine_message": True, "routine_id": routine.id,
+                            "routine_name": routine.name or "Morning email briefing"},
         )
+
+        # Ticket 2.5 — capture per-channel delivery results so the
+        # runner can downgrade outcome to `partial` when any channel
+        # skipped silently.
+        channel_results: dict[str, dict[str, Any]] = {}
         if broadcaster is not None:
             from .channel_dispatcher import parse_delivery_channels
-            await broadcaster(
+            broadcast_out = await broadcaster(
                 routine.user_id,
                 message_id=msg_id,
                 day_chat_id=day_chat_id,
@@ -382,6 +389,9 @@ class EmailBriefingHandler:
                 delivery_channels=parse_delivery_channels(routine.config_json),
                 routine_name=routine.name or "Morning email briefing",
             )
+            # Support both legacy (int) and Ticket-2.5 (dict) return shape.
+            if isinstance(broadcast_out, dict):
+                channel_results = broadcast_out.get("channel_results", {}) or {}
 
         new_watermark = self._advance_watermark(routine.last_state_json, emails)
         return RoutineResult(
@@ -389,6 +399,8 @@ class EmailBriefingHandler:
             emails_fetched=fetched_count,
             summary_message_id=msg_id,
             new_watermark=new_watermark,
+            channel_results=channel_results,
+            tools_invoked=["gmail__list_messages", "gmail__get_message"],
             metrics={
                 "summary_chars": len(summary_text),
                 "emails_summarized": len(emails),
@@ -506,10 +518,13 @@ class EmailBriefingHandler:
             routine_id=routine.id,
             title=f"Morning briefing — {datetime.utcnow().date().isoformat()}",
             model_used=None,
+            extra_metadata={"routine_message": True, "routine_id": routine.id,
+                            "routine_name": routine.name or "Morning email briefing"},
         )
+        channel_results: dict[str, dict[str, Any]] = {}
         if broadcaster is not None:
             from .channel_dispatcher import parse_delivery_channels
-            await broadcaster(
+            broadcast_out = await broadcaster(
                 routine.user_id,
                 message_id=msg_id,
                 day_chat_id=day_chat_id,
@@ -519,11 +534,15 @@ class EmailBriefingHandler:
                 delivery_channels=parse_delivery_channels(routine.config_json),
                 routine_name=routine.name or "Morning email briefing",
             )
+            if isinstance(broadcast_out, dict):
+                channel_results = broadcast_out.get("channel_results", {}) or {}
         return RoutineResult(
             status="success",
             emails_fetched=0,
             summary_message_id=msg_id,
             new_watermark=None,  # don't regress
+            channel_results=channel_results,
+            tools_invoked=["gmail__list_messages"],
             metrics={"empty_run": True},
         )
 

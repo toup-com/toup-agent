@@ -90,6 +90,7 @@ AGENT_ONLY_TABLES: set[str] = {
     # in Mission Control reads via authenticated API, not direct DB query.
     "routines",
     "routine_runs",
+    "routine_notification_dedupe",
     # Event-driven automations (Gmail Pub/Sub etc.). Platform-side
     # webhook authenticates the Pub/Sub push and dispatches an envelope
     # to the user's per-tenant agent container via the bridge; the

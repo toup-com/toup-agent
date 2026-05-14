@@ -82,32 +82,82 @@ async def deliver_to_extra_channels(
     `routine_name` is prepended to the body as a soft header so the user
     can tell WHICH routine just buzzed their phone, especially when
     multiple routines deliver to the same channel.
+
+    The legacy `string-tag` return shape is preserved for callers that
+    grep the existing log line. Richer per-channel detail (provider
+    message_id, chat_id, error_class) is available via
+    `deliver_to_extra_channels_detailed` (Ticket 2.5).
+    """
+    detailed = await deliver_to_extra_channels_detailed(
+        user_id=user_id,
+        delivery_channels=delivery_channels,
+        routine_name=routine_name,
+        content=content,
+        db_session_maker=db_session_maker,
+    )
+    # Collapse the detailed dict into the legacy tag-only shape that
+    # existing log-grep / dashboards rely on.
+    flat: dict[str, str] = {}
+    for ch, entry in detailed.items():
+        st = (entry or {}).get("status") or "error"
+        if st == "delivered":
+            flat[ch] = "sent"
+        elif st == "skipped":
+            flat[ch] = (entry or {}).get("reason") or "no_recipient"
+        else:
+            flat[ch] = "error"
+    return flat
+
+
+async def deliver_to_extra_channels_detailed(
+    *,
+    user_id: str,
+    delivery_channels: Sequence[str],
+    routine_name: str,
+    content: str,
+    db_session_maker,
+) -> dict[str, dict[str, object]]:
+    """Ticket 2.5 — structured per-channel delivery contract.
+
+    Returns `{channel: confirmation_dict}` where each confirmation has:
+      - `status`: "delivered" | "skipped" | "failed"
+      - `reason`: present on "skipped" — "no_recipient" / "no_adapter"
+      - `error_class` + `error_detail`: present on "failed"
+      - provider-specific id fields on "delivered":
+          telegram → `telegram_message_id`, `chat_id`
+          whatsapp → `whatsapp_message_id` (when the adapter returns one)
+
+    This is the shape consumed by `RoutineResult.channel_results` and
+    persisted into `routine_runs.channel_results_json` so the dashboard
+    can render a per-channel matrix.
     """
     targets = [c for c in delivery_channels if c != "website"]
     if not targets:
         return {}
 
     body = _format_body(routine_name, content)
-    results: dict[str, str] = {}
+    out: dict[str, dict[str, object]] = {}
 
     for ch in targets:
         try:
             if ch == "telegram":
-                results["telegram"] = await _send_telegram(user_id, body, db_session_maker)
+                out["telegram"] = await _send_telegram_detailed(user_id, body, db_session_maker)
             elif ch == "whatsapp":
-                results["whatsapp"] = await _send_whatsapp(body, db_session_maker)
+                out["whatsapp"] = await _send_whatsapp_detailed(body, db_session_maker)
             else:
-                results[ch] = "no_adapter"
+                out[ch] = {"status": "skipped", "reason": "no_adapter"}
         except Exception as e:
-            # Per-channel guard — one channel falling over must not block
-            # the others. The handler decided this was best-effort.
             logger.warning(
                 "[routine_dispatch] channel=%s user=%s err=%s: %s",
                 ch, user_id, type(e).__name__, str(e)[:160],
             )
-            results[ch] = "error"
+            out[ch] = {
+                "status": "failed",
+                "error_class": type(e).__name__,
+                "error_detail": str(e)[:200],
+            }
 
-    return results
+    return out
 
 
 def _format_body(routine_name: str, content: str) -> str:
@@ -121,6 +171,57 @@ def _format_body(routine_name: str, content: str) -> str:
 
 
 # ── Telegram ────────────────────────────────────────────────────────
+
+
+async def _send_telegram_detailed(
+    user_id: str, body: str, db_session_maker,
+) -> dict[str, object]:
+    """Ticket 2.5 — structured Telegram confirmation. Same logic as
+    `_send_telegram` but returns the dict shape used by
+    `channel_results`. Captures `telegram_message_id` + `chat_id` on
+    success."""
+    bot = _get_telegram_bot()
+    if bot is None or getattr(bot, "app", None) is None:
+        return {"status": "skipped", "reason": "no_adapter"}
+
+    from app.db.models import TelegramUserMapping
+
+    async with db_session_maker() as db:
+        chat_id = await db.scalar(
+            select(TelegramUserMapping.telegram_id).where(
+                TelegramUserMapping.user_id == user_id,
+            ).limit(1)
+        )
+
+    if not chat_id:
+        logger.info(
+            "[routine_dispatch] telegram skipped user=%s reason=no_mapping",
+            user_id,
+        )
+        return {"status": "skipped", "reason": "no_recipient"}
+
+    sent_msg = None
+    try:
+        sent_msg = await bot.app.bot.send_message(
+            chat_id=int(chat_id), text=body,
+            parse_mode="Markdown", disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.info(
+            "[routine_dispatch] telegram markdown failed (%s), retrying plain",
+            type(e).__name__,
+        )
+        sent_msg = await bot.app.bot.send_message(
+            chat_id=int(chat_id), text=body, disable_web_page_preview=True,
+        )
+
+    # telegram.Message exposes `.message_id`. Bot v20+ returns a tg.Message.
+    msg_id = getattr(sent_msg, "message_id", None)
+    return {
+        "status": "delivered",
+        "chat_id": int(chat_id),
+        "telegram_message_id": msg_id,
+    }
 
 
 async def _send_telegram(user_id: str, body: str, db_session_maker) -> str:
@@ -184,6 +285,41 @@ def _get_telegram_bot():
 
 
 # ── WhatsApp ────────────────────────────────────────────────────────
+
+
+async def _send_whatsapp_detailed(body: str, db_session_maker) -> dict[str, object]:
+    """Ticket 2.5 — structured WhatsApp confirmation. Same logic as
+    `_send_whatsapp`; captures the provider message_id when the adapter
+    surfaces it."""
+    from app.agent.channels.registry import ChannelRegistry
+    from app.agent.channels.base import ChannelType
+    from app.db.models import AgentConfig
+
+    channel = ChannelRegistry.get(ChannelType.WHATSAPP)
+    if channel is None:
+        return {"status": "skipped", "reason": "no_adapter"}
+
+    async with db_session_maker() as db:
+        cfg = await db.scalar(select(AgentConfig).limit(1))
+
+    recipient = getattr(cfg, "whatsapp_self_e164", None) if cfg else None
+    if not recipient:
+        logger.info(
+            "[routine_dispatch] whatsapp skipped reason=no_self_e164",
+        )
+        return {"status": "skipped", "reason": "no_recipient"}
+
+    send_result = await channel.send_text(str(recipient), body)
+    out: dict[str, object] = {"status": "delivered", "recipient": str(recipient)}
+    # Some adapters return a dict with `messages: [{id: ...}]` (Cloud API),
+    # others return None or a string. Capture whatever's available.
+    if isinstance(send_result, dict):
+        msgs = send_result.get("messages") or []
+        if msgs and isinstance(msgs, list) and msgs[0].get("id"):
+            out["whatsapp_message_id"] = msgs[0]["id"]
+    elif isinstance(send_result, str):
+        out["whatsapp_message_id"] = send_result
+    return out
 
 
 async def _send_whatsapp(body: str, db_session_maker) -> str:

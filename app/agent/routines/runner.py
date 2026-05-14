@@ -74,6 +74,36 @@ def _parse_cron(expr: str, tz) -> Optional[CronTrigger]:
         return None
 
 
+def _independent_next_fire(expr: str, tz) -> Optional[datetime]:
+    """Compute the next fire instant via croniter (independent of APScheduler).
+
+    Used by the DST watchdog at trigger registration. If croniter is not
+    available the watchdog is a no-op (returns None) — we don't fail
+    registration on a missing optional dependency.
+
+    Returns a tz-aware datetime in the SAME tz, or None on parse error /
+    missing croniter.
+    """
+    try:
+        from croniter import croniter
+    except ImportError:
+        return None
+    parts = (expr or "").split()
+    if len(parts) != 5:
+        return None
+    try:
+        now = datetime.now(tz)
+        nxt = croniter(expr, now).get_next(datetime)
+        # croniter returns naive datetimes when base is naive, tz-aware
+        # when base is aware. We pass an aware base; verify the result
+        # carries the right tz.
+        if nxt.tzinfo is None:
+            return nxt.replace(tzinfo=tz)
+        return nxt
+    except Exception:
+        return None
+
+
 class RoutineRunner:
     """Scheduler + dispatcher for `Routine` rows.
 
@@ -125,6 +155,9 @@ class RoutineRunner:
         self._missed_fires_total = 0
         self._reload_failures_total = 0
         self._reconcile_runs_total = 0
+        # Ticket 2.3 — DST watchdog drift counter (CRITICAL when bumps,
+        # surfaced via /_runner_status for Mission Control).
+        self._watchdog_drift_total = 0
         # In-memory background task for the periodic reconciler. Started
         # alongside the scheduler in `start()`, cancelled in `stop()`.
         self._reconcile_task: Optional[asyncio.Task] = None
@@ -267,11 +300,30 @@ class RoutineRunner:
     async def reload_all(self) -> None:
         """Drop every registered trigger and rebuild from DB. Exposed for
         ops — `await rr.reload_all()` recovers from "I edited the DB
-        directly and the runner is stale" situations."""
-        for rid in list(self._jobs.keys()):
+        directly and the runner is stale" situations.
+
+        Ticket 2.3(d): post-deploy operators run this once via the
+        `/api/routines/_reload_all` endpoint after a release that
+        changes scheduler semantics (DST audit, fire-time logic, cron
+        parser). Logs before/after delta so the on-call sees what
+        actually moved."""
+        from app.db.models import Routine
+
+        before_ids = set(self._jobs.keys())
+        for rid in list(before_ids):
             self._unregister(rid)
-        for routine in await self._load_enabled_routines():
+        loaded = await self._load_enabled_routines()
+        for routine in loaded:
             await self._register_trigger_for(routine)
+        after_ids = set(self._jobs.keys())
+        added = after_ids - before_ids
+        removed = before_ids - after_ids
+        logger.info(
+            "[routine_runner] reload_all_complete before=%d after=%d "
+            "added=%d removed=%d watchdog_drift_total=%d",
+            len(before_ids), len(after_ids),
+            len(added), len(removed), self._watchdog_drift_total,
+        )
 
     # ------------------------------------------------------------------ internals
     async def _load_enabled_routines(self):
@@ -363,6 +415,39 @@ class RoutineRunner:
             misfire_grace_time=300,  # if container was down ≤5min, still fire
         )
         self._jobs[routine.id] = routine.id
+
+        # Ticket 2.3 — DST watchdog. Independently recompute the next
+        # fire instant via croniter+ZoneInfo and compare against
+        # APScheduler's projection. >60s drift triggers a CRITICAL log
+        # AND we count it on `_watchdog_drift_total` (Mission Control
+        # observability). The watchdog is a *passive* safety net — we
+        # do NOT refuse to register, because Phase 1.3 proved APScheduler
+        # 3.10.4 is currently correct. Future regressions (apscheduler
+        # bump, tzdata churn) will trip the watchdog with a SEV-2 alert
+        # before they ship to users.
+        try:
+            independent = _independent_next_fire(routine.schedule_cron_local, tz)
+            job = self.scheduler.get_job(routine.id)
+            aps_next = getattr(job, "next_run_time", None) if job else None
+            if independent is not None and aps_next is not None:
+                drift = abs((aps_next - independent).total_seconds())
+                if drift > 60:
+                    self._watchdog_drift_total += 1
+                    logger.critical(
+                        "[routine_runner] dst_watchdog_drift routine_id=%s "
+                        "cron=%r tz=%s aps_next=%s croniter_next=%s "
+                        "drift_seconds=%.1f counter_total=%d — possible "
+                        "APScheduler regression vs croniter, review needed",
+                        routine.id, routine.schedule_cron_local, tz_str,
+                        aps_next.isoformat(), independent.isoformat(),
+                        drift, self._watchdog_drift_total,
+                    )
+        except Exception as e:  # pragma: no cover — watchdog must never block
+            logger.debug(
+                "[routine_runner] dst_watchdog_skipped routine_id=%s err=%s",
+                routine.id, e,
+            )
+
         # APScheduler computes next_run_time at register-time. Sync to
         # the DB so the dashboard + `/api/routines/{id}` response know
         # when the next fire is — pre-2026-05-12 the `next_run_at`
@@ -466,7 +551,8 @@ class RoutineRunner:
     async def _fire(self, routine_id: str) -> None:
         """Per-trigger dispatch. Full flow:
           1. Reload routine fresh
-          2. Compute scheduled_for_local_date in user tz
+          2. Capture fire_instant from APScheduler (Ticket 2.3) and
+             compute scheduled_for_local_date in user tz
           3. Idempotency claim (INSERT … UNIQUE collision → silent exit)
           4. Look up handler in KIND_HANDLERS
           5. Retry loop: 3 attempts with backoff (10s/30s/90s default)
@@ -487,6 +573,22 @@ class RoutineRunner:
         tz_str = await self._user_tz_async(routine.user_id)
         tz, _ = _resolve_tz(tz_str, routine.user_id)
         local_date = datetime.now(tz).date()
+
+        # Ticket 2.3: capture the scheduled fire instant BEFORE doing any
+        # other work. APScheduler hands us this via `job.next_run_time`
+        # at fire-callback entry — it's the wall-clock the trigger was
+        # supposed to fire at, not "now". Persisted into `fire_instant`
+        # so `last_run_at` can be stamped from it (instead of from
+        # datetime.utcnow() at end of _post_terminal, which lies about
+        # the fire time by `handler_latency` seconds/minutes).
+        fire_instant: Optional[datetime] = None
+        try:
+            _job = self.scheduler.get_job(routine_id)
+            _scheduled_for = getattr(_job, "next_run_time", None) if _job else None
+            if _scheduled_for is not None:
+                fire_instant = _scheduled_for.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:  # pragma: no cover — never block on this
+            pass
 
         # Missed-fire detection (Ticket 3 / Bug D). APScheduler invokes
         # _fire whenever it decides the trigger is due — including a
@@ -524,6 +626,7 @@ class RoutineRunner:
                     user_id=routine.user_id,
                     scheduled_for_local_date=local_date,
                     status="running",
+                    fire_instant=fire_instant,
                 )
                 db.add(run)
                 await db.commit()
@@ -634,6 +737,68 @@ class RoutineRunner:
         logger.info("[metric] routine.run.failed kind=%s", routine.kind)
         return last_result  # final failed result after exhausting retries
 
+    # ------------------------------------------------------------------ outcome derivation
+    @staticmethod
+    def _derive_outcome(result) -> str:
+        """Map a `RoutineResult` into the Ticket 2.1 outcome state machine.
+
+        Precedence:
+          1. Explicit `result.outcome` (when a handler knows better).
+          2. Status-driven mapping:
+               status="skipped_reauth" → "tool_error"
+               status="failed"         → "failure"
+               status="partial"        → "partial"
+          3. Channel-results-driven downgrade on `status="success"`:
+               - any channel_results value with status != "delivered" → "partial"
+               - empty inbox (emails_fetched==0 AND new_watermark is None) → "success_empty"
+               - otherwise → "success"
+        """
+        if getattr(result, "outcome", None):
+            return result.outcome  # type: ignore[return-value]
+        s = result.status
+        if s == "skipped_reauth":
+            return "tool_error"
+        if s == "failed":
+            return "failure"
+        if s == "partial":
+            return "partial"
+        # status == "success" — branch on channel_results then emails_fetched.
+        channel_results = getattr(result, "channel_results", None) or {}
+        if channel_results:
+            statuses = {
+                (entry or {}).get("status", "unknown")
+                for entry in channel_results.values()
+            }
+            if statuses and any(s != "delivered" for s in statuses):
+                # At least one channel failed to deliver. The Day-as-Chat
+                # row may still exist (handler wrote it). Outcome is
+                # "partial" so the operator and the user can see which.
+                return "partial"
+        # Empty-inbox signal: handler returned success with no new
+        # watermark AND no emails fetched. `_post_empty` path.
+        if (result.emails_fetched or 0) == 0 and result.new_watermark is None:
+            return "success_empty"
+        return "success"
+
+    @staticmethod
+    def _build_error_json(result, attempt: Optional[int] = None) -> Optional[dict]:
+        """Build the structured error blob persisted into routine_runs.error_json.
+        Returns None for success outcomes so we don't pollute the column."""
+        if result.status == "success" or not (result.error_class or result.error_detail):
+            return None
+        out: dict[str, Any] = {
+            "class": result.error_class,
+            "detail": result.error_detail,
+        }
+        if attempt is not None:
+            out["attempt"] = attempt
+        # Optional fields handlers may have set on metrics.
+        m = result.metrics or {}
+        for k in ("tool_name", "tool_call_id", "provider", "http_status"):
+            if k in m:
+                out[k] = m[k]
+        return out
+
     # ------------------------------------------------------------------ terminal post + finalize
     async def _post_terminal(self, routine, run_id: str, result) -> None:
         """Handle the terminal RoutineResult: write nudge Message for
@@ -648,23 +813,58 @@ class RoutineRunner:
 
         message_id_for_run: Optional[str] = result.summary_message_id
 
+        # Ticket 2.1 — derive outcome from result + channel_results map.
+        outcome = self._derive_outcome(result)
+
         if result.status == "skipped_reauth":
-            message_id_for_run = await self._write_nudge(
+            # Ticket 2.2: build the reconnect notice + dedupe + fan-out
+            # across `delivery_channels` so Telegram/WhatsApp are no longer
+            # silent on tool failures.
+            nudge_msg_id, nudge_channel_results = await self._write_nudge(
                 routine, run_id,
-                content=(
-                    "⚠ Reconnect Gmail to resume morning briefings. "
-                    "Open Mission Control → Routines and click Reconnect."
-                ),
+                content=self._build_reconnect_message(routine, kind="reauth"),
                 source=routine.kind,
+                notice_kind="reauth",
             )
+            if nudge_msg_id:
+                message_id_for_run = nudge_msg_id
+            # Per-channel reconnect-notice results live alongside any
+            # handler-emitted channel_results — merge so the run row
+            # reflects everything that actually went out.
+            if nudge_channel_results:
+                cr = dict(getattr(result, "channel_results", None) or {})
+                cr.update(nudge_channel_results)
+                result.channel_results = cr  # type: ignore[attr-defined]
         elif result.status == "failed":
-            message_id_for_run = await self._write_nudge(
+            nudge_msg_id, nudge_channel_results = await self._write_nudge(
                 routine, run_id,
-                content=(
-                    "Couldn't reach Gmail this morning — I'll try again tomorrow."
-                ),
+                content=self._build_reconnect_message(routine, kind="failure"),
                 source=routine.kind,
+                notice_kind="failure",
             )
+            if nudge_msg_id:
+                message_id_for_run = nudge_msg_id
+            if nudge_channel_results:
+                cr = dict(getattr(result, "channel_results", None) or {})
+                cr.update(nudge_channel_results)
+                result.channel_results = cr  # type: ignore[attr-defined]
+
+        # Ticket 2.3: use fire_instant for last_run_at instead of
+        # datetime.utcnow() at end of _post_terminal. The fire instant
+        # is what "when did the routine run?" actually means to a user
+        # — the post-terminal stamp lies by handler_latency seconds, and
+        # for a slow run with retries can lie by minutes.
+        # Fall back to utcnow when fire_instant isn't recoverable (e.g.,
+        # a force-run via /api/routines/{id}/run skipped through _fire).
+        fire_at: Optional[datetime] = None
+        try:
+            async with self._session_maker() as db:
+                run_row = await db.get(RoutineRun, run_id)
+                fire_at = getattr(run_row, "fire_instant", None) if run_row else None
+        except Exception:
+            fire_at = None
+        if fire_at is None:
+            fire_at = datetime.utcnow()
 
         # Advance watermark on success only.
         if result.status == "success" and result.new_watermark is not None:
@@ -675,7 +875,7 @@ class RoutineRunner:
                         .where(Routine.id == routine.id)
                         .values(
                             last_state_json=result.new_watermark,
-                            last_run_at=datetime.utcnow(),
+                            last_run_at=fire_at,
                             last_status="success",
                             last_error=None,
                         )
@@ -694,7 +894,7 @@ class RoutineRunner:
                         update(Routine)
                         .where(Routine.id == routine.id)
                         .values(
-                            last_run_at=datetime.utcnow(),
+                            last_run_at=fire_at,
                             last_status=result.status,
                             last_error=result.error_detail,
                         )
@@ -710,19 +910,145 @@ class RoutineRunner:
         # boot) until the next scheduler restart.
         await self._sync_next_run(routine.id)
 
+        # Structured logging at the outcome boundary. Operators read this
+        # to spot drift between status (legacy) and outcome (new) — for
+        # example status=success + outcome=partial means "handler said
+        # success but a channel skipped" — exactly the Defect A symptom.
+        logger.info(
+            "[routine_run] terminal kind=%s routine_id=%s run_id=%s "
+            "status=%s outcome=%s emails_fetched=%d channels=%d tools=%d",
+            routine.kind, routine.id, run_id,
+            result.status, outcome,
+            int(result.emails_fetched or 0),
+            len(getattr(result, "channel_results", None) or {}),
+            len(getattr(result, "tools_invoked", None) or []),
+        )
+
         await self._finalize_run(
             run_id,
             status=result.status,
+            outcome=outcome,
             error_class=result.error_class,
             error_detail=result.error_detail,
+            error_json=self._build_error_json(result),
             emails_fetched=result.emails_fetched,
             summary_message_id=message_id_for_run,
+            channel_results=dict(getattr(result, "channel_results", None) or {}) or None,
+            tools_invoked=list(getattr(result, "tools_invoked", None) or []) or None,
         )
 
-    async def _write_nudge(self, routine, run_id: str, *, content: str, source: str) -> Optional[str]:
-        """Post a routine-channel Message for the reauth or failure path.
-        Returns the new message id (or None if the writer raised)."""
+    @staticmethod
+    def _build_reconnect_message(routine, *, kind: str) -> str:
+        """Per-channel content for the reauth/failure notice (Ticket 2.2).
+
+        Body carries both plain text + the inline connector-card marker
+        `[[connector_card:<slug>|Reconnect]]`. The chat UI's
+        `parseMessageSections` (frontend/src/modules/chat/parseMessageBlocks.ts)
+        recognises the marker and renders a one-tap Reconnect card.
+        Telegram/WhatsApp clients render the URL as a clickable link
+        (the bracket marker degrades to plain text — the URL still works).
+
+        Connector slug defaults to `gmail` for `email_briefing` kinds.
+        A future kind can override via `config_json.reconnect_connector`.
+        """
+        connector = "gmail"
+        try:
+            cfg = routine.config_json or {}
+            connector = (cfg.get("reconnect_connector") or "gmail").strip().lower()
+        except Exception:
+            pass
+
+        if kind == "reauth":
+            return (
+                f"⚠ Reconnect {connector.title()} to resume your routine. "
+                f"Tap the card below, or open "
+                f"https://toup.ai/agent/integrations?reconnect={connector}\n\n"
+                f"[[connector_card:{connector}|Reconnect]]"
+            )
+        return (
+            f"Couldn't reach {connector.title()} this morning — I'll try again "
+            f"tomorrow. If this keeps happening, reconnect:\n\n"
+            f"[[connector_card:{connector}|Reconnect]]"
+        )
+
+    async def _notice_dedupe_taken(
+        self,
+        *,
+        routine_id: str,
+        kind: str,
+        scope_date: date,
+    ) -> bool:
+        """Ticket 2.2 — 24h rate limit on reconnect/failure notices.
+
+        Returns True if a notice of this kind was already sent for this
+        (routine, scope_date). The dedupe key is `(routine_id, kind,
+        scope_date)`; one notice per kind per local day per routine.
+        Misses the first time → claim the slot and return False.
+        """
+        from app.db.models import RoutineNotificationDedupe
+
+        try:
+            async with self._session_maker() as db:
+                row = RoutineNotificationDedupe(
+                    routine_id=routine_id, kind=kind, scope_date=scope_date,
+                )
+                db.add(row)
+                await db.commit()
+                return False
+        except IntegrityError:
+            return True
+        except Exception as e:
+            logger.warning(
+                "[routine_runner] notice_dedupe_check_failed routine_id=%s err=%s",
+                routine_id, e,
+            )
+            # Fail-open: we'd rather post a duplicate than swallow the
+            # first one. The 24h window is a UX nicety, not a hard
+            # guarantee.
+            return False
+
+    async def _write_nudge(
+        self,
+        routine,
+        run_id: str,
+        *,
+        content: str,
+        source: str,
+        notice_kind: str,
+    ) -> tuple[Optional[str], dict[str, dict[str, Any]]]:
+        """Post a routine-channel reconnect/failure notice.
+
+        Ticket 2.2 — broadcasts to EVERY configured `delivery_channels`
+        (not just website). Also rate-limits via `routine_notification_dedupe`
+        so the same notice can't post twice for the same routine on the
+        same local day.
+
+        Returns (message_id, channel_results) — both consumed by the
+        caller to fold into the run row.
+        """
         from .message_writer import write_routine_message, broadcast_routine_message
+        from .channel_dispatcher import parse_delivery_channels
+
+        # Dedupe — at most one notice of each kind per routine per local day.
+        try:
+            tz_str = await self._user_tz_async(routine.user_id)
+            tz, _ = _resolve_tz(tz_str, routine.user_id)
+            local_date = datetime.now(tz).date()
+        except Exception:
+            local_date = datetime.utcnow().date()
+
+        if await self._notice_dedupe_taken(
+            routine_id=routine.id, kind=notice_kind, scope_date=local_date,
+        ):
+            logger.info(
+                "[routine_runner] nudge_deduped routine_id=%s kind=%s scope_date=%s "
+                "— suppressing duplicate notice (24h window)",
+                routine.id, notice_kind, local_date,
+            )
+            return None, {}
+
+        delivery_channels = parse_delivery_channels(routine.config_json)
+        routine_name = (routine.name or "").strip() or "Morning email briefing"
 
         try:
             async with self._session_maker() as db:
@@ -734,51 +1060,95 @@ class RoutineRunner:
                     routine_id=routine.id,
                     title=f"Morning briefing — {datetime.utcnow().date().isoformat()}",
                     model_used=None,
+                    extra_metadata={
+                        "notice_kind": notice_kind,
+                        "routine_message": True,
+                    },
                 )
-            await broadcast_routine_message(
+            broadcast_out = await broadcast_routine_message(
                 routine.user_id,
                 message_id=msg_id,
                 day_chat_id=day_chat_id,
                 source=source,
                 content=content,
                 model_used=None,
+                delivery_channels=delivery_channels,
+                routine_name=routine_name,
             )
-            return msg_id
+            # Broadcast helper returns either int (legacy) or a
+            # ChannelResults dict (Ticket 2.5 — after upgrade). Support both.
+            channel_results: dict[str, dict[str, Any]] = {}
+            if isinstance(broadcast_out, dict):
+                channel_results = broadcast_out.get("channel_results", {}) or {}
+            return msg_id, channel_results
         except Exception as e:
             logger.warning(
                 "[routine_runner] nudge_write_failed routine_id=%s err=%s",
                 routine.id, e,
             )
-            return None
+            return None, {}
 
     async def _finalize_run(
         self,
         run_id: str,
         *,
         status: str,
+        outcome: Optional[str] = None,
         error_class: Optional[str] = None,
         error_detail: Optional[str] = None,
+        error_json: Optional[dict] = None,
         emails_fetched: int = 0,
         summary_message_id: Optional[str] = None,
+        channel_results: Optional[dict] = None,
+        tools_invoked: Optional[list] = None,
     ) -> None:
         """Close out the routine_runs row. Best-effort — a failure here
         leaves the row in 'running' which the next-boot restart sweep
         will clean up."""
-        from app.db.models import RoutineRun
+        from app.db.models import Routine, RoutineRun
+
+        finished_at = datetime.utcnow()
+        # finished_local_at: ISO8601 in the user's tz. Best-effort — falls
+        # back to UTC if we can't resolve the tz cheaply.
+        finished_local_iso: Optional[str] = None
+        try:
+            async with self._session_maker() as db:
+                run_row = await db.get(RoutineRun, run_id)
+                if run_row is not None:
+                    user_id = run_row.user_id
+            tz_str = await self._user_tz_async(user_id)  # noqa
+            tz, _ = _resolve_tz(tz_str, user_id)
+            finished_local_iso = finished_at.replace(tzinfo=timezone.utc).astimezone(tz).isoformat()
+        except Exception:
+            try:
+                finished_local_iso = finished_at.isoformat() + "Z"
+            except Exception:
+                finished_local_iso = None
+
+        values: dict[str, Any] = {
+            "status": status,
+            "error_class": error_class,
+            "error_detail": error_detail,
+            "emails_fetched": emails_fetched,
+            "summary_message_id": summary_message_id,
+            "finished_at": finished_at,
+            "finished_local_at": finished_local_iso,
+        }
+        if outcome is not None:
+            values["outcome"] = outcome
+        if error_json is not None:
+            values["error_json"] = error_json
+        if channel_results is not None:
+            values["channel_results_json"] = channel_results
+        if tools_invoked is not None:
+            values["tools_invoked_json"] = tools_invoked
 
         try:
             async with self._session_maker() as db:
                 await db.execute(
                     update(RoutineRun)
                     .where(RoutineRun.id == run_id)
-                    .values(
-                        status=status,
-                        error_class=error_class,
-                        error_detail=error_detail,
-                        emails_fetched=emails_fetched,
-                        summary_message_id=summary_message_id,
-                        finished_at=datetime.utcnow(),
-                    )
+                    .values(**values)
                 )
                 await db.commit()
         except Exception as e:
@@ -808,4 +1178,5 @@ class RoutineRunner:
                 self._reconcile_task is not None
                 and not self._reconcile_task.done()
             ),
+            "watchdog_drift_total": self._watchdog_drift_total,
         }

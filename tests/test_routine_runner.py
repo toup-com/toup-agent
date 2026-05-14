@@ -83,7 +83,14 @@ async def test_runner_starts_and_stops_with_zero_routines():
     await rr.start()
     assert rr.scheduler.running is True
     snap = rr.status_snapshot()
-    assert snap == {"running": True, "routines_registered": 0, "next_fire_at": None}
+    # Snapshot must carry the baseline lifecycle fields. Additional
+    # observability counters (missed_fires_total, reload_failures_total,
+    # reconcile_runs_total, reconcile_active) are present in current
+    # implementations — checked individually rather than equality so this
+    # test doesn't break every time we add a counter.
+    assert snap["running"] is True
+    assert snap["routines_registered"] == 0
+    assert snap["next_fire_at"] is None
     await rr.stop()
     assert rr.scheduler.running is False
 
@@ -248,7 +255,9 @@ async def test_runner_status_snapshot_shape():
     # Down case: scheduler not started
     rr_down = RoutineRunner()
     snap = rr_down.status_snapshot()
-    assert snap == {"running": False, "routines_registered": 0, "next_fire_at": None}
+    assert snap["running"] is False
+    assert snap["routines_registered"] == 0
+    assert snap["next_fire_at"] is None
 
     # Up case with one registered routine
     user_id = await _make_user("UTC")

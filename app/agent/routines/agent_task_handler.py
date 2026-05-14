@@ -126,6 +126,26 @@ class AgentTaskHandler:
                 error_detail="Agent returned empty response",
             )
 
+        # Best-effort tool-invocation capture for `tools_invoked_json`
+        # (Ticket 2.5). The AgentRunner response shape evolves; we look
+        # for a handful of plausible attributes and fall back to empty.
+        tools_used: list[str] = []
+        for attr in ("tools_invoked", "tool_calls", "tools"):
+            raw = getattr(response, attr, None)
+            if raw:
+                for entry in raw:
+                    if isinstance(entry, str):
+                        tools_used.append(entry)
+                    elif isinstance(entry, dict):
+                        name = entry.get("name") or entry.get("tool")
+                        if name:
+                            tools_used.append(name)
+                    else:
+                        n = getattr(entry, "name", None)
+                        if n:
+                            tools_used.append(n)
+                break  # first attribute that exists wins
+
         # The agent runner already wrote its own Message rows. Persist a
         # SEPARATE routine-tagged Message so Mission Control can find it
         # by `source=agent_task` without coupling to the runner's
@@ -137,6 +157,7 @@ class AgentTaskHandler:
             content=text,
             model_used=getattr(response, "model", None),
             emails_fetched=0,
+            tools_invoked=tools_used,
             metrics={"path": "agent_runner", "tokens": getattr(response, "tokens_total", 0)},
         )
 
@@ -200,6 +221,7 @@ class AgentTaskHandler:
         model_used: Optional[str],
         emails_fetched: int,
         metrics: dict,
+        tools_invoked: Optional[list[str]] = None,
     ) -> RoutineResult:
         writer = self._writer
         if writer is None:
@@ -218,10 +240,19 @@ class AgentTaskHandler:
             routine_id=routine.id,
             title=f"{title} — {datetime.utcnow().date().isoformat()}",
             model_used=model_used,
+            extra_metadata={"routine_message": True, "routine_id": routine.id,
+                            "routine_name": routine.name or routine.kind},
         )
+
+        # Ticket 2.5 — capture per-channel delivery confirmations so the
+        # runner can downgrade outcome to `partial` when a configured
+        # channel silently skipped (same Defect A contract as
+        # email_briefing). Without this, agent_task routines have the
+        # same silent-success bug Phase 2 was designed to close.
+        channel_results: dict[str, dict[str, Any]] = {}
         if broadcaster is not None:
             from .channel_dispatcher import parse_delivery_channels
-            await broadcaster(
+            broadcast_out = await broadcaster(
                 routine.user_id,
                 message_id=msg_id,
                 day_chat_id=day_chat_id,
@@ -231,10 +262,14 @@ class AgentTaskHandler:
                 delivery_channels=parse_delivery_channels(routine.config_json),
                 routine_name=routine.name or routine.kind,
             )
+            if isinstance(broadcast_out, dict):
+                channel_results = broadcast_out.get("channel_results", {}) or {}
         return RoutineResult(
             status="success",
             emails_fetched=emails_fetched,
             summary_message_id=msg_id,
             new_watermark={"last_run_at": datetime.utcnow().isoformat()},
+            channel_results=channel_results,
+            tools_invoked=list(tools_invoked or []),
             metrics=metrics,
         )

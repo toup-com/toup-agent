@@ -44,7 +44,7 @@ from .app import App, BuildJob, BuildUsage, ReconciliationLog
 from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig, ExtensionDevice
 
 # Routines (system-managed scheduled actions — email briefing, etc.)
-from .routine import Routine, RoutineRun
+from .routine import Routine, RoutineRun, RoutineNotificationDedupe
 
 # Triggers (event-driven automations — Gmail Pub/Sub, etc.)
 from .trigger import (
@@ -122,7 +122,7 @@ __all__ = [
     "Document", "DocumentChunk", "Media",
     "App", "BuildJob", "BuildUsage", "ReconciliationLog",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig", "ExtensionDevice",
-    "Routine", "RoutineRun",
+    "Routine", "RoutineRun", "RoutineNotificationDedupe",
     "Trigger", "TriggerEvent",
     "TRIGGER_KINDS", "TRIGGER_ACTIONS", "TRIGGER_STATUSES", "TRIGGER_EVENT_STATUSES",
     "SoulConfig",

@@ -166,12 +166,28 @@ class RoutineRunResponse(BaseModel):
     scheduled_for_local_date: date
     started_at: datetime
     finished_at: Optional[datetime]
-    status: str
-    error_class: Optional[str]
-    error_detail: Optional[str]
+    # Ticket 2.3: APScheduler's scheduled fire time (UTC). Differs from
+    # `started_at` for slow handlers; the dashboard renders this as
+    # "fired at X" and `finished_at - fire_instant` as handler latency.
+    fire_instant: Optional[datetime] = None
+    # Ticket 2.1 — finished_at rendered in the user's tz (ISO8601 string).
+    finished_local_at: Optional[str] = None
+    status: str  # legacy compat
+    # Ticket 2.1 — richer outcome state machine:
+    # "success" | "success_empty" | "partial" | "tool_error" | "failure".
+    outcome: Optional[str] = None
+    error_class: Optional[str] = None
+    error_detail: Optional[str] = None
+    # Structured error blob (superset of error_class + error_detail).
+    error_json: Optional[dict] = None
+    # Ticket 2.5 — per-channel delivery confirmations:
+    # {channel: {"status": "delivered"|"skipped"|"failed", "message_id": ..., ...}}
+    channel_results_json: Optional[dict] = None
+    # MCP tool names the handler invoked during this run.
+    tools_invoked_json: Optional[list] = None
     emails_fetched: int
     attempt: int
-    summary_message_id: Optional[str]
+    summary_message_id: Optional[str] = None
 
 
 class RoutineResponse(BaseModel):
@@ -192,6 +208,30 @@ class RoutineResponse(BaseModel):
     recent_runs: list[RoutineRunResponse] = []
 
 
+def _run_to_response(r) -> RoutineRunResponse:
+    """Build a RoutineRunResponse from a RoutineRun row, including the
+    Ticket 2.1 / 2.3 / 2.5 columns. `getattr` for the new fields so
+    pre-migration rows (NULL columns) and older legacy tests don't break."""
+    return RoutineRunResponse(
+        id=r.id,
+        scheduled_for_local_date=r.scheduled_for_local_date,
+        started_at=r.started_at,
+        finished_at=r.finished_at,
+        fire_instant=getattr(r, "fire_instant", None),
+        finished_local_at=getattr(r, "finished_local_at", None),
+        status=r.status,
+        outcome=getattr(r, "outcome", None),
+        error_class=r.error_class,
+        error_detail=r.error_detail,
+        error_json=getattr(r, "error_json", None),
+        channel_results_json=getattr(r, "channel_results_json", None),
+        tools_invoked_json=getattr(r, "tools_invoked_json", None),
+        emails_fetched=r.emails_fetched,
+        attempt=r.attempt,
+        summary_message_id=r.summary_message_id,
+    )
+
+
 def _row_to_response(routine, recent_runs=()) -> RoutineResponse:
     return RoutineResponse(
         id=routine.id,
@@ -208,21 +248,7 @@ def _row_to_response(routine, recent_runs=()) -> RoutineResponse:
         last_error=routine.last_error,
         created_at=routine.created_at,
         updated_at=routine.updated_at,
-        recent_runs=[
-            RoutineRunResponse(
-                id=r.id,
-                scheduled_for_local_date=r.scheduled_for_local_date,
-                started_at=r.started_at,
-                finished_at=r.finished_at,
-                status=r.status,
-                error_class=r.error_class,
-                error_detail=r.error_detail,
-                emails_fetched=r.emails_fetched,
-                attempt=r.attempt,
-                summary_message_id=r.summary_message_id,
-            )
-            for r in recent_runs
-        ],
+        recent_runs=[_run_to_response(r) for r in recent_runs],
     )
 
 
@@ -240,6 +266,22 @@ async def runner_status():
             "next_fire_at": None,
             "reason": "runner_not_started",
         }
+    return _runner.status_snapshot()
+
+
+@router.post("/_reload_all")
+async def runner_reload_all():
+    """Ticket 2.3(d) — post-deploy reload backfill.
+
+    Drops every registered trigger and rebuilds from DB. Operator-run
+    after a deploy that changes scheduler semantics so any
+    pre-deploy-stamped `next_run_at` columns get refreshed to the
+    post-deploy code's calculation. Logs before/after delta via the
+    runner.
+    """
+    if _runner is None:
+        raise HTTPException(status_code=503, detail="Routine runner not started")
+    await _runner.reload_all()
     return _runner.status_snapshot()
 
 
@@ -587,18 +629,7 @@ async def force_run(routine_id: str):
         # idempotency gate (already covered above). Defensive 500 so
         # the operator notices.
         raise HTTPException(status_code=500, detail="run row missing after _fire")
-    return RoutineRunResponse(
-        id=run.id,
-        scheduled_for_local_date=run.scheduled_for_local_date,
-        started_at=run.started_at,
-        finished_at=run.finished_at,
-        status=run.status,
-        error_class=run.error_class,
-        error_detail=run.error_detail,
-        emails_fetched=run.emails_fetched,
-        attempt=run.attempt,
-        summary_message_id=run.summary_message_id,
-    )
+    return _run_to_response(run)
 
 
 @router.get("/{routine_id}/runs", response_model=list[RoutineRunResponse])
@@ -624,18 +655,4 @@ async def list_runs(
             .offset(offset)
         )
         runs = list(result.scalars().all())
-    return [
-        RoutineRunResponse(
-            id=r.id,
-            scheduled_for_local_date=r.scheduled_for_local_date,
-            started_at=r.started_at,
-            finished_at=r.finished_at,
-            status=r.status,
-            error_class=r.error_class,
-            error_detail=r.error_detail,
-            emails_fetched=r.emails_fetched,
-            attempt=r.attempt,
-            summary_message_id=r.summary_message_id,
-        )
-        for r in runs
-    ]
+    return [_run_to_response(r) for r in runs]

@@ -18,6 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # Status values that match `routine_runs.status` exactly.
 RoutineStatus = str  # "running" | "success" | "partial" | "failed" | "skipped_reauth"
 
+# Phase 2 / Ticket 2.1 — outcome state machine. See model docstring for
+# semantics. The `status` field above stays as the legacy compatibility
+# shim; new code branches on `outcome`. Mapping derived in `_outcome_for_result`.
+RoutineOutcome = str  # "success" | "success_empty" | "partial" | "tool_error" | "failure"
+
+VALID_OUTCOMES: frozenset[str] = frozenset({
+    "success", "success_empty", "partial", "tool_error", "failure",
+})
+
 
 @dataclass
 class RoutineResult:
@@ -36,6 +45,21 @@ class RoutineResult:
     new_watermark: Optional[dict[str, Any]] = None
     error_class: Optional[str] = None
     error_detail: Optional[str] = None
+    # Ticket 2.1 additions:
+    # Per-channel delivery confirmations populated by the handler /
+    # broadcaster pipeline. Shape:
+    #   {"website": {"status": "delivered", "message_id": "...", ...},
+    #    "telegram": {"status": "skipped", "reason": "no_recipient"}, ...}
+    channel_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # MCP tool names invoked while handling this run. Useful for forensics
+    # when a tool_error outcome surfaces — operator sees exactly which
+    # gmail__* call failed.
+    tools_invoked: list[str] = field(default_factory=list)
+    # Optional explicit outcome override. When set, runner uses this
+    # value verbatim instead of deriving from `status` + channel_results.
+    # Reserved for handlers that have richer outcome knowledge than the
+    # generic mapping (e.g., agent_task with structured agent feedback).
+    outcome: Optional[RoutineOutcome] = None
     # Free-form per-handler metrics for the structured log line (latency,
     # token counts, model name, etc.). Logged but not persisted.
     metrics: dict[str, Any] = field(default_factory=dict)

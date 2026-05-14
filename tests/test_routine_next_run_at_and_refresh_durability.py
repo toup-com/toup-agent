@@ -67,7 +67,10 @@ def test_post_terminal_resyncs_next_run_at():
     next_run_at sticks at the FIRST fire time forever — which is
     in the past for every subsequent dashboard load."""
     idx = _RUNNER.index("async def _post_terminal(")
-    body = _RUNNER[idx:idx + 4000]
+    # Generous body window (10000) — _post_terminal grew with Ticket 2.1
+    # (outcome derivation) and Ticket 2.2 (nudge fan-out + dedupe). The
+    # claim under test is presence, not position.
+    body = _RUNNER[idx:idx + 10000]
     assert "_sync_next_run(" in body, (
         "_post_terminal must re-sync next_run_at after the run row "
         "is finalised. Without it, the dashboard shows yesterday's "

@@ -83,7 +83,7 @@ async def test_broadcast_with_no_extra_channels_is_unchanged():
     # accidental dispatch would log a no_adapter. Asserting the call
     # returns 0 (no WS clients, no extra side effects) is the cheapest
     # signal that the legacy contract is intact.
-    count = await broadcast_routine_message(
+    out = await broadcast_routine_message(
         user_id="test-user",
         message_id="msg-1",
         day_chat_id=None,
@@ -92,7 +92,12 @@ async def test_broadcast_with_no_extra_channels_is_unchanged():
         delivery_channels=["website"],
         routine_name="Morning briefing",
     )
-    assert count == 0  # no WS clients in test env
+    # Ticket 2.5: structured return shape.
+    assert isinstance(out, dict)
+    assert out["ws_count"] == 0  # no WS clients in test env
+    assert out["channel_results"]["website"]["status"] == "delivered"
+    # No extras requested → no telegram/whatsapp keys.
+    assert "telegram" not in out["channel_results"]
 
 
 @pytest.mark.asyncio
