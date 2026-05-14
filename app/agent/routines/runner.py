@@ -20,6 +20,8 @@ from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -72,6 +74,79 @@ def _parse_cron(expr: str, tz) -> Optional[CronTrigger]:
         )
     except Exception:
         return None
+
+
+def _build_trigger_for_routine(routine, tz):
+    """Mig 042 — dispatch on schedule_kind.
+
+    Treats NULL schedule_kind as 'cron' (legacy default) so rows that
+    pre-date the migration keep firing as cron triggers — no operator
+    intervention needed.
+
+    Returns (trigger, tag) where tag is one of:
+      'cron' | 'at' | 'every' | 'invalid' | 'past_at'
+    """
+    # NULL-tolerant read — DB rows older than mig 042 don't have a value.
+    raw_kind = getattr(routine, "schedule_kind", None)
+    kind = (raw_kind or "cron").strip() or "cron"
+
+    if kind == "at":
+        when = getattr(routine, "schedule_at", None)
+        if when is None:
+            return None, "invalid"
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if when <= datetime.now(timezone.utc):
+            return None, "past_at"
+        return DateTrigger(run_date=when), "at"
+
+    if kind == "every":
+        interval = getattr(routine, "schedule_interval_seconds", None) or 0
+        if interval < 60:
+            return None, "invalid"
+        return IntervalTrigger(seconds=int(interval), timezone=tz), "every"
+
+    # Default path: cron (legacy, plus any row whose schedule_kind is NULL).
+    trigger = _parse_cron(routine.schedule_cron_local, tz)
+    if trigger is None:
+        return None, "invalid"
+    return trigger, "cron"
+
+
+def _parse_window_time(s: Optional[str]):
+    """Parse an HH:MM or HH:MM:SS string into a datetime.time.
+    Returns None on missing/invalid input."""
+    if not s:
+        return None
+    from datetime import time as dtime
+    try:
+        parts = s.split(":")
+        if len(parts) == 2:
+            return dtime(int(parts[0]), int(parts[1]))
+        if len(parts) == 3:
+            return dtime(int(parts[0]), int(parts[1]), int(parts[2]))
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def _in_active_window(now_local_time, start_local, end_local) -> bool:
+    """True if `now_local_time` falls inside the daily active window.
+
+    Handles overnight windows (22:00–06:00) by wrapping past midnight.
+    None on either bound means that side is unbounded; both None means
+    "always active" and the caller shouldn't be calling this.
+    """
+    if start_local is None and end_local is None:
+        return True
+    if start_local is None:
+        return now_local_time < end_local
+    if end_local is None:
+        return now_local_time >= start_local
+    if start_local <= end_local:
+        return start_local <= now_local_time < end_local
+    # Overnight wrap.
+    return now_local_time >= start_local or now_local_time < end_local
 
 
 def _independent_next_fire(expr: str, tz) -> Optional[datetime]:
@@ -365,6 +440,13 @@ class RoutineRunner:
         # to flip a real production setting on.
         if kind.startswith("_test_") or kind == "_smoke":
             return True
+        # Mig 042 — reminder kind has its own dedicated flag so operators
+        # can roll out reminders independently of email briefing. Falls
+        # back to the master flag for canary tenants that already have
+        # the master one set. `getattr` with default False means tenants
+        # whose Settings haven't picked up the new field stay safe.
+        if kind == "reminder":
+            return bool(getattr(settings, "routines_reminders_enabled", master))
         if kind in ("email_briefing", "agent_task"):
             return master
         return False
@@ -396,11 +478,23 @@ class RoutineRunner:
             )
             return "missing_tz"
         tz, fellback = _resolve_tz(tz_str, routine.user_id)
-        trigger = _parse_cron(routine.schedule_cron_local, tz)
+        # Mig 042: dispatch on schedule_kind (NULL → cron). Old rows with
+        # NULL schedule_kind keep behaving as cron triggers.
+        trigger, trigger_tag = _build_trigger_for_routine(routine, tz)
         if trigger is None:
+            if trigger_tag == "past_at":
+                logger.info(
+                    "[routine_runner] past_at routine_id=%s kind=%s "
+                    "schedule_at=%s — already delivered or expired, skipping",
+                    routine.id, routine.kind,
+                    getattr(routine, "schedule_at", None),
+                )
+                return "past_at"
             logger.warning(
-                "[routine_runner] invalid_cron routine_id=%s kind=%s expr=%r — skipped",
-                routine.id, routine.kind, routine.schedule_cron_local,
+                "[routine_runner] invalid_schedule routine_id=%s kind=%s "
+                "schedule_kind=%s — skipped",
+                routine.id, routine.kind,
+                getattr(routine, "schedule_kind", None) or "cron",
             )
             return "invalid_cron"
 
@@ -572,7 +666,28 @@ class RoutineRunner:
 
         tz_str = await self._user_tz_async(routine.user_id)
         tz, _ = _resolve_tz(tz_str, routine.user_id)
-        local_date = datetime.now(tz).date()
+        now_local = datetime.now(tz)
+        local_date = now_local.date()
+
+        # Mig 042: daily active-window gate for interval reminders.
+        # When schedule_kind='every' and a window is configured, fires
+        # outside the window are silently dropped (no run row, no
+        # broadcast). Cron + at kinds fire at literal scheduled times;
+        # they don't use the window.
+        if (getattr(routine, "schedule_kind", None) == "every"
+                and (getattr(routine, "schedule_window_start_local", None)
+                     or getattr(routine, "schedule_window_end_local", None))):
+            start = _parse_window_time(getattr(routine, "schedule_window_start_local", None))
+            end = _parse_window_time(getattr(routine, "schedule_window_end_local", None))
+            if not _in_active_window(now_local.time(), start, end):
+                logger.debug(
+                    "[routine_runner] window_skip routine_id=%s now_local=%s "
+                    "window=[%s, %s] — outside active hours",
+                    routine_id, now_local.time().isoformat(),
+                    getattr(routine, "schedule_window_start_local", None),
+                    getattr(routine, "schedule_window_end_local", None),
+                )
+                return
 
         # Ticket 2.3: capture the scheduled fire instant BEFORE doing any
         # other work. APScheduler hands us this via `job.next_run_time`
@@ -936,6 +1051,34 @@ class RoutineRunner:
             channel_results=dict(getattr(result, "channel_results", None) or {}) or None,
             tools_invoked=list(getattr(result, "tools_invoked", None) or []) or None,
         )
+
+        # Mig 042 — auto-disable after a successful fire for one-shot
+        # reminders (and any future kind that opts in). Only triggers
+        # on delivered outcomes (success / success_empty / partial) so
+        # transient failures still get a retry on the next tick.
+        # `getattr` is NULL-tolerant — rows pre-dating the migration
+        # have auto_disable_after_fire=None, treated as False.
+        if (getattr(routine, "auto_disable_after_fire", False)
+                and outcome in ("success", "success_empty", "partial")):
+            try:
+                async with self._session_maker() as db:
+                    await db.execute(
+                        update(Routine)
+                        .where(Routine.id == routine.id)
+                        .values(enabled=False, updated_at=datetime.utcnow())
+                    )
+                    await db.commit()
+                self._unregister(routine.id)
+                logger.info(
+                    "[routine_runner] auto_disabled routine_id=%s kind=%s "
+                    "outcome=%s — one-shot delivered, removing trigger",
+                    routine.id, routine.kind, outcome,
+                )
+            except Exception as e:  # pragma: no cover — best-effort cleanup
+                logger.warning(
+                    "[routine_runner] auto_disable_failed routine_id=%s err=%s",
+                    routine.id, e,
+                )
 
     @staticmethod
     def _build_reconnect_message(routine, *, kind: str) -> str:

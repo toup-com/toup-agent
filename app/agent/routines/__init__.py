@@ -14,20 +14,24 @@ right — Routines stand alone.
 from .agent_task_handler import AgentTaskHandler
 from .base_handler import RoutineHandler, RoutineResult, RoutineStatus
 from .email_briefing_handler import EmailBriefingHandler
+from .reminder_handler import ReminderHandler
 from .registry import KIND_HANDLERS, register_handler
 from .runner import RoutineRunner
 
 
-# Default handler registrations. Both kinds gate on the per-tenant
-# feature flag (see `RoutineRunner._kind_enabled`).
-#   - `email_briefing` — Gmail-specialised preset
-#   - `agent_task` — generic prompt-driven, runs through the agent
+# Default handler registrations. Each kind has its own feature flag
+# gate (see `RoutineRunner._kind_enabled`).
+#   - `email_briefing` — Gmail-specialised preset (LLM + MCP)
+#   - `agent_task`     — generic prompt-driven, runs through the agent (LLM)
+#   - `reminder`       — text-only delivery, no LLM/MCP (mig 042)
 register_handler(EmailBriefingHandler())
 register_handler(AgentTaskHandler())
+register_handler(ReminderHandler())
 
 __all__ = [
     "AgentTaskHandler",
     "EmailBriefingHandler",
+    "ReminderHandler",
     "RoutineHandler",
     "RoutineResult",
     "RoutineStatus",

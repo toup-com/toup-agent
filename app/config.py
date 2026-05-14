@@ -123,6 +123,12 @@ class Settings(BaseSettings):
     # Control UI surface. Per-tenant; default off until the canary cohort runs
     # for 48h with <2% failure rate.
     routines_email_briefing_enabled: bool = False
+    # Mig 042 — `reminder` kind gate. Default False so a code deploy
+    # doesn't immediately activate reminders for every tenant; operators
+    # flip via `ROUTINES_REMINDERS_ENABLED=true` env var per tenant once
+    # the canary is happy. Reminders are text-only (no LLM, no MCP) and
+    # safe to enable broadly, but staged rollout is still the right call.
+    routines_reminders_enabled: bool = False
 
     # Workspace Bootstrap
     workspace_per_user: bool = True  # Create per-user workspace subdirectories

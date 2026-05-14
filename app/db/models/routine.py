@@ -61,6 +61,38 @@ class Routine(Base):
     # original choice so a later tz change can re-resolve without losing intent.
     schedule_cron_local: Mapped[str] = mapped_column(String(100), nullable=False)
 
+    # Schedule shape (mig 042). NULLABLE in DB on purpose — the migration
+    # that adds these columns is metadata-only (no NOT NULL, no
+    # server_default) to avoid AccessExclusiveLock conflicts during
+    # blue-green deploys. Application code treats NULL `schedule_kind`
+    # as 'cron' (the legacy default), so rows that pre-date the
+    # migration keep working unchanged.
+    #
+    # `default="cron"` is the Python-side default applied to NEW rows
+    # inserted via the ORM; existing rows stay NULL in the DB. Reading
+    # code uses `(routine.schedule_kind or "cron")` everywhere.
+    schedule_kind: Mapped[Optional[str]] = mapped_column(
+        String(10), nullable=True, default="cron"
+    )
+    # One-shot fire time (UTC). Required when schedule_kind='at'.
+    schedule_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Interval between fires in seconds. Required when schedule_kind='every'.
+    # Min 60 enforced at the API layer (Pydantic model_validator).
+    schedule_interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Optional daily active-window for interval reminders. HH:MM:SS strings
+    # in User.timezone. NULL = always active.
+    schedule_window_start_local: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    schedule_window_end_local: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    # When true, the runner flips enabled=false after a successful fire.
+    # API sets it to true automatically for schedule_kind='at'. Python
+    # default False so writes via the ORM always have a concrete value.
+    auto_disable_after_fire: Mapped[Optional[bool]] = mapped_column(
+        Boolean, nullable=True, default=False
+    )
+    # For kind='reminder': literal text to deliver. No LLM, no MCP.
+    # Required when kind='reminder' (enforced at the API layer).
+    reminder_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # Per-kind config blob. For email_briefing:
     #   {connector_identity_id, send_minutes_before_wake, priority_filters}
     config_json: Mapped[Optional[dict]] = mapped_column(
