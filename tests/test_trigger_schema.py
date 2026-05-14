@@ -113,6 +113,7 @@ def test_trigger_enum_constants_pinned():
     })
     assert TRIGGER_STATUSES == frozenset({
         "never_fired", "active", "failed", "skipped_reauth",
+        "provisioning_failed",
     })
     assert TRIGGER_EVENT_STATUSES == frozenset({
         "queued", "running", "success", "failed",
