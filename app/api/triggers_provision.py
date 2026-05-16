@@ -205,6 +205,161 @@ async def provision_watch(
     )
 
 
+class ProbeWatchReq(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=36)
+    connector_id: str = Field(default="gmail", min_length=1, max_length=64)
+
+
+class ProbeWatchResponse(BaseModel):
+    """Platform-side observability slice consumed by the agent's
+    `/api/triggers/{id}/probe`. Returns just the bits the agent
+    can't see (connector vault, live Gmail API call). The agent
+    merges this with its own trigger-row fields to compute the final
+    diagnosis."""
+
+    watch_alive: bool
+    watch_alive_reason: Optional[str] = None
+    last_push_received_at: Optional[str] = None
+    history_id: Optional[str] = None
+    expires_at: Optional[str] = None
+    gmail_connector_present: bool = False
+
+
+@router.post("/_probe_watch", response_model=ProbeWatchResponse)
+async def probe_watch(
+    req: ProbeWatchReq,
+    x_agent_key: Optional[str] = Header(default=None, alias="X-Agent-Key"),
+) -> ProbeWatchResponse:
+    """Confirm Gmail's `users.getProfile` succeeds with the user's
+    token (= the watch is alive) AND return the last_push_received_at
+    timestamp from the connector's metadata. Used by the agent-side
+    probe to compute the final diagnosis string.
+
+    Why we don't just trust `watch_expires_at` from metadata: a watch
+    can be revoked by Gmail (auth lost, scope removed) before its
+    nominal expiration. `users.getProfile` makes a real call with the
+    stored credentials, so a 401 there means "token invalid; watch
+    effectively dead" regardless of what the cached expiration says.
+    """
+    await _auth_agent(x_agent_key, req.user_id)
+
+    async with async_session_maker() as db:
+        ident = (await db.execute(
+            select(ConnectorIdentity).where(
+                ConnectorIdentity.user_id == req.user_id,
+                ConnectorIdentity.connector_id == req.connector_id,
+            )
+        )).scalar_one_or_none()
+
+    if ident is None:
+        return ProbeWatchResponse(
+            watch_alive=False,
+            watch_alive_reason="no_connector_identity",
+            gmail_connector_present=False,
+        )
+
+    meta = _parse_metadata(ident.metadata_json)
+    last_push = meta.get("last_push_received_at")
+    history_id = meta.get("gmail_history_id")
+    expires_at = meta.get("gmail_watch_expires_at")
+
+    # Live check: hit Gmail. A token-mint failure or 401 on
+    # users.getProfile is the most reliable "watch is dead" signal —
+    # `watch_expires_at` is a best-effort cache that can lag a manual
+    # revocation by up to 6h (the refresh interval).
+    if ident.status != "active":
+        return ProbeWatchResponse(
+            watch_alive=False,
+            watch_alive_reason=f"connector_status={ident.status}",
+            last_push_received_at=last_push,
+            history_id=history_id,
+            expires_at=expires_at,
+            gmail_connector_present=True,
+        )
+
+    try:
+        from app.services.gmail_pubsub import _resolve_token_for, GmailWatchError
+    except Exception as e:  # pragma: no cover — defensive
+        return ProbeWatchResponse(
+            watch_alive=False,
+            watch_alive_reason=f"import_failed:{type(e).__name__}",
+            last_push_received_at=last_push,
+            history_id=history_id,
+            expires_at=expires_at,
+            gmail_connector_present=True,
+        )
+
+    try:
+        access = await _resolve_token_for(req.user_id)
+    except GmailWatchError as e:
+        return ProbeWatchResponse(
+            watch_alive=False,
+            watch_alive_reason=f"token_mint_failed:{str(e)[:80]}",
+            last_push_received_at=last_push,
+            history_id=history_id,
+            expires_at=expires_at,
+            gmail_connector_present=True,
+        )
+
+    import httpx as _httpx
+    try:
+        async with _httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+                headers={"Authorization": f"Bearer {access}"},
+            )
+    except _httpx.RequestError as e:
+        return ProbeWatchResponse(
+            watch_alive=False,
+            watch_alive_reason=f"network:{type(e).__name__}",
+            last_push_received_at=last_push,
+            history_id=history_id,
+            expires_at=expires_at,
+            gmail_connector_present=True,
+        )
+
+    if r.status_code == 401:
+        return ProbeWatchResponse(
+            watch_alive=False,
+            watch_alive_reason="gmail_401",
+            last_push_received_at=last_push,
+            history_id=history_id,
+            expires_at=expires_at,
+            gmail_connector_present=True,
+        )
+    if r.status_code >= 300:
+        return ProbeWatchResponse(
+            watch_alive=False,
+            watch_alive_reason=f"gmail_{r.status_code}",
+            last_push_received_at=last_push,
+            history_id=history_id,
+            expires_at=expires_at,
+            gmail_connector_present=True,
+        )
+
+    # 200 — token is good, watch is implicitly alive (Gmail wouldn't
+    # be holding a watch handle for a dead identity). Also enforce the
+    # cached expiration check so a missed daily refresh shows up
+    # before the next push attempt fails.
+    if expires_at and _expired(expires_at):
+        return ProbeWatchResponse(
+            watch_alive=False,
+            watch_alive_reason="watch_expired",
+            last_push_received_at=last_push,
+            history_id=history_id,
+            expires_at=expires_at,
+            gmail_connector_present=True,
+        )
+
+    return ProbeWatchResponse(
+        watch_alive=True,
+        last_push_received_at=last_push,
+        history_id=history_id,
+        expires_at=expires_at,
+        gmail_connector_present=True,
+    )
+
+
 @router.get("/_watch_status", response_model=WatchStatusResponse)
 async def watch_status(
     user_id: str,

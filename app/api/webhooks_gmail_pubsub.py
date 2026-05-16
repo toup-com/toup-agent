@@ -40,10 +40,11 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.config import settings
 from app.db.database import async_session_maker
@@ -90,6 +91,47 @@ async def gmail_pubsub_webhook(
         logger.info("[gmail_pubsub] dropped: feature disabled")
         return {"status": "ok", "dropped": "feature_disabled"}
 
+    # Decode the body BEFORE JWT verify so we can record
+    # `last_push_received_at` on the matching ConnectorIdentity even
+    # when JWT verification subsequently fails (audience mismatch /
+    # expired token / forged push). That signal is what tells the
+    # operator "Pub/Sub IS pushing, the issue is downstream" — exactly
+    # the diagnostic that was missing in the previous fix and a
+    # prerequisite for the `/probe` endpoint's `push_rejected_at_platform`
+    # diagnosis.
+    #
+    # We pre-fetch the JSON here; the verify_pubsub_jwt + decode_pubsub_
+    # envelope blocks below still own the actual validation. A forged
+    # body whose envelope happens to decode to a real email address
+    # will get its timestamp updated — that's intentional: the timestamp
+    # only proves "something hit this endpoint claiming to be for X",
+    # which is the signal we want for diagnosis. Real ops follow-up
+    # uses the JWT verify outcome (logged separately) to distinguish
+    # legitimate from forged pushes.
+    body: dict[str, Any] = {}
+    pre_decoded_email: Optional[str] = None
+    try:
+        body = await request.json()
+    except Exception:
+        # Defer the 400 until after the JWT verify so we don't leak
+        # "we accept anything as long as it has a Bearer token" — but
+        # we have no body so nothing to record; skip and let the decode
+        # block below raise 400.
+        body = {}
+    if body:
+        try:
+            pre_decoded_email, _pre_history_id = decode_pubsub_envelope(body)
+        except ValueError:
+            pre_decoded_email = None
+    if pre_decoded_email:
+        try:
+            await _record_push_received(pre_decoded_email)
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning(
+                "[gmail_pubsub] record_push_received failed email=%s err=%s",
+                (pre_decoded_email or "")[:32], e,
+            )
+
     # 1. JWT verify. Pub/Sub uses `Authorization: Bearer <JWT>`.
     try:
         claims = await verify_pubsub_jwt(authorization)
@@ -100,10 +142,9 @@ async def gmail_pubsub_webhook(
             detail=f"pubsub auth failed: {e}",
         )
 
-    # 2. Decode envelope.
-    try:
-        body = await request.json()
-    except Exception:
+    # 2. Decode envelope (re-run so the validation branches below
+    # behave exactly as before — pre-decode above is observability-only).
+    if not body:
         raise HTTPException(status_code=400, detail="invalid JSON body")
     try:
         email, history_id = decode_pubsub_envelope(body)
@@ -219,6 +260,18 @@ async def gmail_pubsub_webhook(
     # agent-side dedupe gate makes redo idempotent.
     if new_watermark:
         await _advance_watermark_on_connector(user_id, email, new_watermark)
+    # Stamp last_webhook_dispatch_at on every Gmail trigger this user
+    # owns so the `/probe` diagnosis can distinguish
+    # "dispatched but no handler response" from "push never reached
+    # platform". Idempotent — Pub/Sub retries overwrite with a fresher
+    # timestamp.
+    try:
+        await _stamp_triggers_dispatched(user_id)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning(
+            "[gmail_pubsub] stamp_triggers_dispatched failed user_id=%s err=%s",
+            user_id[:8], e,
+        )
 
     latency_ms = _ms_now() - started_ms
     logger.info(
@@ -370,3 +423,74 @@ async def _flag_connector_needs_refresh(user_id: str, email: str) -> None:
 
 def _ms_now() -> int:
     return int(time.perf_counter() * 1000)
+
+
+def _utc_iso_z() -> str:
+    """ISO-8601 UTC string with a `Z` suffix. Matches the format used
+    by `_utc_iso` in triggers.py so frontend parsing is consistent."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+async def _record_push_received(email: str) -> None:
+    """Stamp `last_push_received_at` on the matching ConnectorIdentity.
+
+    Called BEFORE JWT verification so even a forged / mis-audienced
+    push leaves a footprint the operator can use to confirm "Pub/Sub
+    is reaching us; the issue is JWT/audience/IAM". The `/probe`
+    endpoint reads this timestamp to compute its diagnosis.
+
+    Idempotent: every push overwrites with a fresher timestamp.
+    Missing connector identity → no-op (forged push or stale
+    subscription).
+    """
+    import json as _json
+    from app.db.models import ConnectorIdentity
+
+    async with async_session_maker() as db:
+        row = (await db.execute(
+            select(ConnectorIdentity).where(
+                ConnectorIdentity.connector_id == "gmail",
+                ConnectorIdentity.provider_account_id == email,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            return
+        try:
+            meta = _json.loads(row.metadata_json or "{}")
+            if not isinstance(meta, dict):
+                meta = {}
+        except (ValueError, TypeError):
+            meta = {}
+        meta["last_push_received_at"] = _utc_iso_z()
+        await db.execute(
+            update(ConnectorIdentity)
+            .where(ConnectorIdentity.id == row.id)
+            .values(metadata_json=_json.dumps(meta))
+        )
+        await db.commit()
+
+
+async def _stamp_triggers_dispatched(user_id: str) -> None:
+    """Update `last_webhook_dispatch_at` on every email_received
+    Trigger owned by `user_id`.
+
+    One transaction per user (the spec's "no per-trigger commits"
+    rule). The in-Python JSONB merge keeps the SQLite test variant
+    behavioural; production runs through asyncpg JSONB without
+    materialising the row's entire blob.
+    """
+    from app.db.models import Trigger
+
+    now_iso = _utc_iso_z()
+    async with async_session_maker() as db:
+        triggers = (await db.execute(
+            select(Trigger).where(
+                Trigger.user_id == user_id,
+                Trigger.kind == "email_received",
+            )
+        )).scalars().all()
+        for trig in triggers:
+            ps = dict(trig.provider_state_json or {})
+            ps["last_webhook_dispatch_at"] = now_iso
+            trig.provider_state_json = ps
+        await db.commit()

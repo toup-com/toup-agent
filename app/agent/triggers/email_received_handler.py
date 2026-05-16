@@ -26,6 +26,12 @@ failure on event K doesn't sink K-1; it gets marked `failed` and the
 remaining events continue. Reauth required short-circuits the whole
 batch (every event is the same Gmail account; if auth is broken
 once, it's broken for the rest).
+
+Every batch result also carries `last_handler_completed_at` +
+`last_handler_status` in `new_provider_state` so the runner stamps them
+on the parent trigger row. The `/probe` diagnosis endpoint reads
+those fields to tell "handler reached terminal state recently" from
+"dispatched but no handler response (handler hang / runner crash)".
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -223,6 +230,57 @@ class EmailReceivedHandler:
         events: list[Any],
         db: AsyncSession,
     ) -> TriggerResult:
+        """Thin wrapper around `_execute_core` that stamps observability
+        timestamps onto `new_provider_state` regardless of which branch
+        of the core returned. The `/probe` endpoint reads these so the
+        operator can tell "handler ran recently" from "dispatched but
+        the handler never reached terminal state."
+
+        This wrapper is NOT a new abstraction — it's a single tail
+        stamp run on every result. The eight return sites in the core
+        would otherwise each need the same three lines duplicated.
+        """
+        result = await self._execute_core(trigger, events, db)
+        # Mirror `status` into a stable "last_handler_status" string the
+        # frontend / probe surface can read without knowing the enum.
+        # The runner already maps `status` to `Trigger.last_status` with
+        # different semantics; this field is separate, observability-only.
+        new_ps = dict(result.new_provider_state or {})
+        new_ps["last_handler_completed_at"] = (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+        new_ps["last_handler_status"] = result.status
+        if result.error_class:
+            new_ps["last_handler_error_class"] = result.error_class
+        else:
+            # Clear stale error from prior failure so the probe doesn't
+            # report a long-fixed error as current.
+            new_ps.pop("last_handler_error_class", None)
+        result.new_provider_state = new_ps
+        return result
+
+    async def _execute_core(
+        self,
+        trigger: Any,
+        events: list[Any],
+        db: AsyncSession,
+    ) -> TriggerResult:
+        # ── 0. Synthetic test-fire short-circuit ──────────────────────
+        # When EVERY event in the batch is synthetic (event_dedupe_id
+        # starts with "test:"), bypass the LLM / MCP / broadcast chain
+        # entirely and write a deterministic "wiring works" message
+        # straight to Day-as-Chat. The Test button's job is to answer
+        # "is the trigger plumbing alive?" — it must not also be a
+        # health check for OpenAI/Anthropic, the MCP client, or the
+        # connector vault. Bug 2 in the 2026-05-16 fix series:
+        # previously test fires went through call_system_llm and
+        # silently failed when OpenAI was rate-limited / down / mis-keyed,
+        # producing the misleading "5 fires, all Failed" UI state.
+        if events and all(
+            (ev.event_dedupe_id or "").startswith("test:") for ev in events
+        ):
+            return await self._do_test_fire(trigger, events, db)
+
         mcp = self._mcp_client
         if mcp is None:
             return TriggerResult(
@@ -275,12 +333,28 @@ class EmailReceivedHandler:
             kept.append(fe)
 
         if not kept:
-            # All filtered out — return success on the batch (nothing to do,
-            # but the handler ran clean). Per-event statuses already set.
+            # All filtered out OR all events failed to fetch — the handler
+            # ran clean but did NOT deliver a message anywhere. Distinguish
+            # this from "delivered a real summary" so the runner doesn't
+            # false-promote the trigger to last_status='active'. Bug 1 in
+            # the 2026-05-16 fix series: returning status="success" here
+            # caused triggers with zero real successful fires to show a
+            # green "Active" pill alongside a list of failed events.
+            had_fetch_failure = bool(fetch_errors)
             return TriggerResult(
-                status="success",
+                status="success_empty",
                 per_event_status=per_event_status,
-                metrics={"fetched": len(fetched), "filtered_kept": 0},
+                error_class="all_fetch_failed" if had_fetch_failure else "all_filtered_out",
+                error_detail=(
+                    "Every event in the batch failed to fetch from Gmail."
+                    if had_fetch_failure
+                    else "Every event matched a filter exclusion rule."
+                ),
+                metrics={
+                    "fetched": len(fetched),
+                    "filtered_kept": 0,
+                    "fetch_errors": len(fetch_errors),
+                },
             )
 
         # ── 3. Dispatch by action ──
@@ -334,6 +408,95 @@ class EmailReceivedHandler:
                 "action": action,
                 "model": model,
                 "coalesced_count": len(events) - 1 if len(events) > 1 else 0,
+            },
+        )
+
+    # ── Synthetic test fire (Test button) ─────────────────────────
+
+    async def _do_test_fire(
+        self, trigger: Any, events: list[Any], db: AsyncSession,
+    ) -> TriggerResult:
+        """Deterministic write path for events from the Test button.
+
+        Bypasses MCP, the LLM, and the rate limiter so a "Test" click
+        answers exactly one question — is the trigger row wired to the
+        Day-as-Chat writer? — and gives the user a real signal that's
+        unaffected by external service health. The result is reported
+        with ``status="test_success"`` so the runner can keep the
+        trigger's ``last_status`` honest: a test pass proves the
+        plumbing but does NOT prove a real Gmail event would deliver.
+        """
+        msg_body = (
+            "**Trigger wiring check — passed.**\n\n"
+            f"Synthetic test fire for trigger "
+            f"**{trigger.name or 'Gmail trigger'}**. No real Gmail "
+            "message was fetched — this run only confirms the agent "
+            "can write to Day-as-Chat on this trigger's behalf and "
+            f"fan out to {', '.join((trigger.config_json or {}).get('delivery_channels') or ['website'])}.\n\n"
+            "A real inbound email will deliver the actual summary."
+        )
+
+        from app.db.database import async_session_maker
+        writer = self._writer or write_trigger_message
+        broadcaster = self._broadcaster or broadcast_trigger_message
+
+        try:
+            async with async_session_maker() as wdb:
+                msg_id, day_chat_id = await writer(
+                    wdb,
+                    user_id=trigger.user_id,
+                    content=msg_body,
+                    source=self.kind,
+                    trigger_id=trigger.id,
+                    title=f"{trigger.name or 'Email trigger'} — wiring check",
+                    model_used=None,
+                )
+        except Exception as e:
+            logger.exception(
+                "[trigger_email] test_fire_write_failed trigger_id=%s err=%s",
+                trigger.id, e,
+            )
+            return TriggerResult(
+                status="failed",
+                per_event_status={ev.id: "failed" for ev in events},
+                error_class=type(e).__name__,
+                error_detail=f"Day-as-Chat write failed: {e}"[:300],
+            )
+
+        delivery_channels = list(
+            (trigger.config_json or {}).get("delivery_channels") or ["website"]
+        )
+        try:
+            await broadcaster(
+                trigger.user_id,
+                message_id=msg_id,
+                day_chat_id=day_chat_id,
+                source=self.kind,
+                content=msg_body,
+                model_used=None,
+                delivery_channels=delivery_channels,
+                trigger_name=trigger.name or trigger.kind,
+            )
+        except Exception as e:
+            # Broadcast failure is non-fatal for the test: the message
+            # landed in Day-as-Chat, which is what the test promises.
+            # Telegram/WhatsApp fan-out can fail later without making the
+            # wiring check itself a lie.
+            logger.warning(
+                "[trigger_email] test_fire_broadcast_failed trigger_id=%s err=%s",
+                trigger.id, e,
+            )
+
+        return TriggerResult(
+            status="test_success",
+            per_event_status={ev.id: "success" for ev in events},
+            summary_message_id=msg_id,
+            metrics={
+                "fetched": 0,
+                "filtered_kept": 0,
+                "action": "test_fire",
+                "model": None,
+                "test_event_count": len(events),
             },
         )
 

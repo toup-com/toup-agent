@@ -821,9 +821,9 @@ async def run_gmail_watch_refresh():
         return
 
     from app.db.database import async_session_maker
-    from app.db.models import ConnectorIdentity
+    from app.db.models import ConnectorIdentity, Trigger
     from app.services.gmail_pubsub import refresh_watch, GmailWatchError
-    from sqlalchemy import select
+    from sqlalchemy import select, update
 
     async with async_session_maker() as db:
         rows = (await db.execute(
@@ -843,6 +843,7 @@ async def run_gmail_watch_refresh():
     refreshed = 0
     failed = 0
     skipped_no_token = 0
+    trigger_rows_synced = 0
     for user_id, email in rows:
         try:
             handle = await refresh_watch(user_id)
@@ -886,15 +887,64 @@ async def run_gmail_watch_refresh():
                 "[gmail_watch_refresh] metadata_write_failed user=%s err=%s",
                 str(user_id)[:8], str(e)[:200],
             )
+        # Fan out the fresh state to every email_received Trigger row
+        # owned by this user. Without this, `Trigger.provider_state_json`
+        # keeps the original (now stale) `watch_expires_at` from
+        # provisioning time. `_derive_health` reads that field and would
+        # report `watch_expired` for healthy triggers about 7 days after
+        # creation — the regression the 2026-05-16 health pill made
+        # visible.
+        #
+        # ONE transaction per user covers all their triggers (spec
+        # requirement: no per-trigger commits). The merge is in-Python
+        # rather than `jsonb_set` so the same code path works on the
+        # SQLite test variant.
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        try:
+            async with async_session_maker() as db:
+                user_triggers = (await db.execute(
+                    select(Trigger).where(
+                        Trigger.user_id == user_id,
+                        Trigger.kind == "email_received",
+                    )
+                )).scalars().all()
+                for trig in user_triggers:
+                    ps = dict(trig.provider_state_json or {})
+                    ps["gmail_history_id"] = str(handle.history_id)
+                    ps["watch_expires_at"] = expires_iso
+                    ps["last_watch_refresh_at"] = now_iso
+                    # Clear any prior failure flag — the refresh just
+                    # succeeded, so an old `provision_error` is stale.
+                    ps.pop("provision_error", None)
+                    ps.pop("provision_detail", None)
+                    ps.pop("needs_refresh", None)
+                    trig.provider_state_json = ps
+                    trigger_rows_synced += 1
+                    # If the row was marked provisioning_failed by an
+                    # earlier auto-arm hiccup, the successful refresh
+                    # demonstrates the watch is now alive — flip back
+                    # to never_fired so the UI stops showing setup_*.
+                    if trig.last_status == "provisioning_failed":
+                        trig.last_status = "never_fired"
+                        trig.last_error = None
+                await db.commit()
+        except Exception as e:
+            logger.warning(
+                "[gmail_watch_refresh] trigger_fanout_failed user=%s err=%s",
+                str(user_id)[:8], str(e)[:200],
+            )
         refreshed += 1
         logger.info(
-            "[gmail_watch_refresh] ok user=%s history_id=%s expires=%s",
+            "[gmail_watch_refresh] ok user=%s history_id=%s expires=%s "
+            "trigger_rows_synced=%d",
             str(user_id)[:8], handle.history_id, expires_iso,
+            trigger_rows_synced,
         )
 
     logger.info(
-        "[gmail_watch_refresh] complete refreshed=%d failed=%d skipped=%d total=%d",
-        refreshed, failed, skipped_no_token, len(rows),
+        "[gmail_watch_refresh] complete refreshed=%d failed=%d skipped=%d "
+        "total=%d trigger_rows_synced=%d",
+        refreshed, failed, skipped_no_token, len(rows), trigger_rows_synced,
     )
 
 

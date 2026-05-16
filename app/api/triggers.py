@@ -37,7 +37,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
+
+from app.config import settings
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
 
@@ -229,11 +231,155 @@ class TriggerResponse(BaseModel):
     updated_at: datetime
     delivery_channels: list[str]
     watch_provisioned: bool
+    # Derived health signal — the UI pill should read THIS, not
+    # `last_status` directly. See `_derive_health` for the state machine.
+    # Values:
+    #   "delivering"            — at least one real event has fired successfully
+    #   "test_passed"           — Test button worked, but no real event yet
+    #   "awaiting_event"        — watch armed, no fires of any kind
+    #   "needs_reauth"          — Gmail connector lost auth
+    #   "setup_error"           — generic provisioning failure
+    #   "setup_blocked_ops"     — GCP/Pub-Sub misconfig on the platform
+    #   "setup_scope_error"     — Google rejected the watch (scope/IAM)
+    #   "setup_transient"       — token mint, 5xx, network — retryable
+    #   "setup_feature_disabled"— triggers_email_enabled=false somewhere
+    #   "watch_expired"         — watch was armed but is past its 7d window
+    #   "last_fire_failed"      — most recent REAL fire crashed; needs attention
+    #
+    # Defaulted to "setup_error" so callers / tests that build the model
+    # without going through `_row_to_response` (which always derives the
+    # real value) don't trip a `Field required`. Production code always
+    # populates this via `_derive_health`.
+    health: str = "setup_error"
+    # Last successful REAL event delivery (not test fires, not empty batches).
+    # Sourced from provider_state_json.last_real_fired_at.
+    last_real_fired_at: Optional[str] = None
+    # Last Test-button fire that wrote to Day-as-Chat.
+    last_test_at: Optional[str] = None
+    # Specific code from `_provision_email_watch` when the auto-arm
+    # failed. Surfaced verbatim so the UI's expanded row can render
+    # actionable detail (eg. "Gmail refresh token is rejected — reconnect").
+    provision_error: Optional[str] = None
+    provision_detail: Optional[str] = None
+    # Latest delivery-path timestamps used by the diagnose probe + UI
+    # banners. Strings (ISO-Z) because the JSONB blob already stores
+    # them as strings; serializing as datetime would require a parse.
+    last_webhook_dispatch_at: Optional[str] = None
+    last_handler_completed_at: Optional[str] = None
+    last_handler_status: Optional[str] = None
     recent_events: list[TriggerEventResponse] = Field(default_factory=list)
 
     @field_serializer("last_fired_at", "created_at", "updated_at", when_used="json")
     def _ser_dt(self, v: Optional[datetime]) -> Optional[str]:
         return _utc_iso(v)
+
+
+def _derive_health(trigger, watch_provisioned: bool) -> str:
+    """Compute the user-facing health signal from the trigger row.
+
+    Decoupled from `last_status` because the runner's `last_status`
+    field had to keep its existing semantics for back-compat with the
+    skill + Mission Control read paths. The new `health` field is the
+    single source of truth for the UI pill — same input row, more
+    honest output.
+
+    State machine (priority top to bottom):
+      1. last_status == 'skipped_reauth'          → needs_reauth
+      2. last_status == 'provisioning_failed'     → map provision_error
+         to a specific setup_* code so the user sees what to do, not
+         a generic "Setup error". Codes come from `_provision_email_watch`:
+           - needs_reauth          → needs_reauth
+           - ops_blocked           → setup_blocked_ops
+           - scope_error           → setup_scope_error
+           - transient / http_5xx
+             / platform_unreachable→ setup_transient
+           - feature_disabled      → setup_feature_disabled
+           - anything else / unset → setup_error
+      3. provider_state.watch_expires_at < now    → watch_expired
+      4. provider_state.last_real_fired_at present → delivering
+         (unless last_status=='failed' AFTER that → last_fire_failed)
+      5. provider_state.last_test_at present      → test_passed
+      6. watch_provisioned                        → awaiting_event
+      7. default                                  → setup_error
+    """
+    ps = trigger.provider_state_json or {}
+    ls = trigger.last_status or "never_fired"
+    if ls == "skipped_reauth":
+        return "needs_reauth"
+    if ls == "provisioning_failed":
+        err = str((ps.get("provision_error") or "")).strip()
+        # Bucket the http_4xx / http_5xx variants. Google's 4xx for the
+        # watch call is almost always a scope / IAM problem; 5xx is
+        # transient.
+        if err.startswith("http_"):
+            try:
+                code = int(err.split("_", 1)[1])
+            except ValueError:
+                code = 0
+            if 500 <= code < 600:
+                return "setup_transient"
+            if 400 <= code < 500:
+                return "setup_scope_error"
+            return "setup_error"
+        return {
+            "needs_reauth": "needs_reauth",
+            "ops_blocked": "setup_blocked_ops",
+            "scope_error": "setup_scope_error",
+            "transient": "setup_transient",
+            "platform_unreachable": "setup_transient",
+            "feature_disabled": "setup_feature_disabled",
+        }.get(err, "setup_error")
+
+    # Watch expired?
+    expires_at_raw = ps.get("watch_expires_at") or ""
+    if expires_at_raw:
+        try:
+            exp = datetime.fromisoformat(
+                str(expires_at_raw).replace("Z", "+00:00")
+            )
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp <= datetime.now(timezone.utc):
+                return "watch_expired"
+        except (ValueError, TypeError):
+            pass
+
+    last_real = ps.get("last_real_fired_at")
+    last_test = ps.get("last_test_at")
+
+    if last_real:
+        # We have proof a real event delivered. If the most recent
+        # batch failed AFTER that, surface that signal so the user
+        # sees the regression — `last_fired_at` is post-real means
+        # the runner ran after the last real success and failed.
+        last_fired = trigger.last_fired_at
+        try:
+            real_dt = datetime.fromisoformat(
+                str(last_real).replace("Z", "+00:00")
+            )
+            if real_dt.tzinfo is None:
+                real_dt = real_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            real_dt = None
+        if (
+            ls == "failed"
+            and last_fired is not None
+            and real_dt is not None
+        ):
+            last_fired_aware = last_fired
+            if last_fired_aware.tzinfo is None:
+                last_fired_aware = last_fired_aware.replace(tzinfo=timezone.utc)
+            if last_fired_aware > real_dt:
+                return "last_fire_failed"
+        return "delivering"
+
+    if last_test:
+        return "test_passed"
+
+    if watch_provisioned:
+        return "awaiting_event"
+
+    return "setup_error"
 
 
 # ── Response helpers ─────────────────────────────────────────────────
@@ -246,6 +392,7 @@ def _row_to_response(trigger, recent_events=()) -> TriggerResponse:
     watch_provisioned = bool(ps.get("gmail_history_id")) and not bool(
         ps.get("needs_refresh")
     )
+    health = _derive_health(trigger, watch_provisioned)
     return TriggerResponse(
         id=trigger.id,
         kind=trigger.kind,
@@ -263,6 +410,14 @@ def _row_to_response(trigger, recent_events=()) -> TriggerResponse:
         updated_at=trigger.updated_at,
         delivery_channels=delivery,
         watch_provisioned=watch_provisioned,
+        health=health,
+        last_real_fired_at=ps.get("last_real_fired_at"),
+        last_test_at=ps.get("last_test_at"),
+        provision_error=ps.get("provision_error"),
+        provision_detail=ps.get("provision_detail"),
+        last_webhook_dispatch_at=ps.get("last_webhook_dispatch_at"),
+        last_handler_completed_at=ps.get("last_handler_completed_at"),
+        last_handler_status=ps.get("last_handler_status"),
         recent_events=[
             TriggerEventResponse(
                 id=e.id,
@@ -663,3 +818,335 @@ async def test_trigger(trigger_id: str):
         summary_message_id=ev.summary_message_id,
         coalesced_into_event_id=ev.coalesced_into_event_id,
     )
+
+
+class TriggerProbeResponse(BaseModel):
+    """Structured diagnosis returned by `/api/triggers/{id}/probe`.
+
+    Frontend renders `diagnosis` verbatim as the headline + the four
+    age timestamps in the modal body. The `diagnosis` enum is closed —
+    the state machine that computes it lives in `_compute_diagnosis`.
+    """
+
+    watch_alive: bool
+    watch_alive_reason: Optional[str] = None
+    last_push_received_at: Optional[str] = None
+    last_dispatch_received_at: Optional[str] = None
+    last_handler_completed_at: Optional[str] = None
+    last_handler_status: Optional[str] = None
+    last_handler_error_class: Optional[str] = None
+    last_push_age_seconds: Optional[int] = None
+    last_dispatch_age_seconds: Optional[int] = None
+    last_handler_age_seconds: Optional[int] = None
+    # See `_compute_diagnosis` for the closed enum:
+    #   pubsub_not_pushing | push_rejected_at_platform |
+    #   dispatched_but_no_handler_response | handler_failing |
+    #   healthy | needs_reauth | watch_expired
+    diagnosis: str
+    diagnosis_detail: Optional[str] = None
+
+
+def _age_seconds(iso_str: Optional[str]) -> Optional[int]:
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int((datetime.now(timezone.utc) - dt).total_seconds())
+
+
+def _compute_diagnosis(
+    *,
+    watch_alive: bool,
+    watch_alive_reason: Optional[str],
+    push_age: Optional[int],
+    dispatch_age: Optional[int],
+    handler_age: Optional[int],
+    handler_status: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Closed-enum diagnosis state machine.
+
+    The "fresh push but stale handler" gap is the load-bearing
+    signal: if push_age is recent but handler_age is None or much
+    older, the chain is failing somewhere between platform dispatch
+    and the agent's handler — exactly the kind of break that's
+    invisible without these timestamps.
+    """
+    PUSH_STALE_SEC = 7 * 24 * 3600                # > 7d → assume Pub/Sub silent
+    HANDLER_LAG_SEC = 5 * 60                       # handler runs within 5 min of push
+
+    if not watch_alive:
+        if watch_alive_reason in ("gmail_401", "token_mint_failed"):
+            return ("needs_reauth",
+                    "Gmail refused our token. Reconnect Gmail to resume.")
+        if watch_alive_reason == "watch_expired":
+            return ("watch_expired",
+                    "Cached watch expiration is past. Click Verify to re-arm.")
+        if watch_alive_reason == "no_connector_identity":
+            return ("needs_reauth",
+                    "No active Gmail identity for this user.")
+        return ("pubsub_not_pushing",
+                f"Watch not alive (reason: {watch_alive_reason or 'unknown'}).")
+
+    if push_age is None or push_age > PUSH_STALE_SEC:
+        return ("pubsub_not_pushing",
+                "Watch is alive but no Pub/Sub push has reached the platform "
+                "in 7+ days. Check the GCP Pub/Sub subscription's push URL "
+                "and IAM bindings.")
+
+    if dispatch_age is None:
+        return ("push_rejected_at_platform",
+                "Pub/Sub is pushing but the platform never dispatched. "
+                "Common cause: JWT audience mismatch. Check "
+                "PUBSUB_PUSH_AUDIENCE matches the subscription's audience.")
+
+    if dispatch_age > push_age + HANDLER_LAG_SEC:
+        # Dispatches are much older than the freshest push — the
+        # platform stopped reaching the agent.
+        return ("push_rejected_at_platform",
+                "Recent pushes are not being dispatched. Platform-side "
+                "history-fetch or agent reachability is broken.")
+
+    if handler_age is None or handler_age > dispatch_age + HANDLER_LAG_SEC:
+        return ("dispatched_but_no_handler_response",
+                "Events reached the agent but the handler hasn't run. "
+                "The TriggerRunner may be stuck or crashing.")
+
+    if handler_status and handler_status not in ("success", "test_success",
+                                                 "success_empty"):
+        return ("handler_failing",
+                f"Handler last terminated with status={handler_status}. "
+                "Inspect Recent events for the specific error.")
+
+    return ("healthy",
+            "Watch alive, pushes received, dispatched, handler running clean.")
+
+
+class RecordProvisionFailureReq(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=36)
+    connector_id: str = Field(default="gmail", min_length=1, max_length=64)
+    error: str = Field(..., min_length=1, max_length=100)
+    detail: Optional[str] = Field(default=None, max_length=500)
+
+
+class RecordProvisionFailureResponse(BaseModel):
+    triggers_updated: int
+
+
+@router.post(
+    "/_record_provision_failure",
+    response_model=RecordProvisionFailureResponse,
+    summary="Platform-to-agent: record a watch arming failure on this user's triggers",
+)
+async def record_provision_failure(
+    req: RecordProvisionFailureReq,
+    x_agent_key: Optional[str] = Header(default=None, alias="X-Agent-Key"),
+):
+    """Called by the platform's OAuth callback when
+    `_arm_gmail_watch_post_connect` fails. Without this, an arm
+    failure was invisible until the 6h refresh tick — the user
+    reconnected Gmail, the trigger silently stayed dormant.
+
+    Auth: same X-Agent-Key contract as the inbound dispatch endpoint
+    (the env-var copy of `AgentConfig.agent_api_key`). Body's user_id
+    must match the container owner.
+
+    Idempotent at the row level — each call overwrites
+    provision_error/detail/timestamp. Multiple Gmail triggers per
+    user are all updated in one transaction.
+    """
+    expected_key = (getattr(settings, "agent_api_key", "") or "").strip()
+    container_user_id = (getattr(settings, "user_id", "") or "").strip()
+    if not expected_key or not container_user_id:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent not configured for provision-failure inbound",
+        )
+    if not x_agent_key or x_agent_key.strip() != expected_key:
+        raise HTTPException(status_code=401, detail="invalid X-Agent-Key")
+    if req.user_id != container_user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="envelope user_id does not match container owner",
+        )
+
+    # Only gmail today. We dispatch by connector_id explicitly so
+    # future connectors (calendar, drive) get their own kind-of-trigger
+    # update without accidentally hitting email_received rows.
+    kind_for_connector = {
+        "gmail": "email_received",
+    }
+    kind = kind_for_connector.get(req.connector_id)
+    if kind is None:
+        return RecordProvisionFailureResponse(triggers_updated=0)
+
+    from app.db.database import async_session_maker
+    from app.db.models import Trigger
+    from sqlalchemy import update as _update
+
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    updated = 0
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(Trigger).where(
+                Trigger.user_id == req.user_id,
+                Trigger.kind == kind,
+            )
+        )).scalars().all()
+        for row in rows:
+            ps = dict(row.provider_state_json or {})
+            ps["provision_error"] = req.error
+            if req.detail:
+                ps["provision_detail"] = req.detail[:300]
+            ps["last_provision_attempt_at"] = now_iso
+            row.provider_state_json = ps
+            row.last_status = "provisioning_failed"
+            row.last_error = (req.detail or req.error)[:1000]
+            updated += 1
+        await db.commit()
+
+    logger.info(
+        "[record_provision_failure] user=%s connector=%s error=%s updated=%d",
+        req.user_id[:8], req.connector_id, req.error, updated,
+    )
+    return RecordProvisionFailureResponse(triggers_updated=updated)
+
+
+@router.post("/{trigger_id}/probe", response_model=TriggerProbeResponse)
+async def probe_trigger(trigger_id: str):
+    """End-to-end delivery-chain diagnosis.
+
+    Reads agent-side trigger timestamps + calls the platform's
+    `_probe_watch` RPC for connector-side state. Returns a structured
+    diagnosis the UI's Diagnose modal renders verbatim.
+
+    Idempotent and side-effect-free apart from logging — safe to call
+    on every dashboard refresh if the UI wants live status.
+    """
+    from app.db.database import async_session_maker
+    from app.db.models import Trigger
+
+    async with async_session_maker() as db:
+        row = await db.get(Trigger, trigger_id)
+        if row is None or row.user_id != _user_id():
+            raise HTTPException(status_code=404, detail="Trigger not found")
+        if row.kind != "email_received":
+            raise HTTPException(
+                status_code=400,
+                detail=f"probe not supported for kind={row.kind!r}",
+            )
+
+    ps = row.provider_state_json or {}
+
+    # Call platform's _probe_watch to get the connector-side bits.
+    import httpx as _httpx
+    from app.config import settings as _s
+
+    base = (_s.platform_api_url or "").rstrip("/")
+    key = (_s.agent_api_key or "").strip()
+    uid = (_s.user_id or "").strip()
+    watch_alive = False
+    watch_reason: Optional[str] = "agent_misconfigured"
+    last_push: Optional[str] = None
+    if base and key and uid:
+        try:
+            async with _httpx.AsyncClient(timeout=12.0) as client:
+                r = await client.post(
+                    f"{base}/v1/triggers/_probe_watch",
+                    json={"user_id": uid, "connector_id": "gmail"},
+                    headers={
+                        "X-Agent-Key": key,
+                        "Content-Type": "application/json",
+                    },
+                )
+            if r.status_code == 200:
+                data = r.json()
+                watch_alive = bool(data.get("watch_alive"))
+                watch_reason = data.get("watch_alive_reason")
+                last_push = data.get("last_push_received_at")
+            else:
+                watch_reason = f"platform_probe_http_{r.status_code}"
+        except _httpx.RequestError as e:
+            watch_reason = f"platform_probe_unreachable:{type(e).__name__}"
+
+    last_dispatch = ps.get("last_webhook_dispatch_at")
+    last_handler = ps.get("last_handler_completed_at")
+    handler_status = ps.get("last_handler_status")
+    handler_error_class = ps.get("last_handler_error_class")
+
+    push_age = _age_seconds(last_push)
+    dispatch_age = _age_seconds(last_dispatch)
+    handler_age = _age_seconds(last_handler)
+
+    diagnosis, detail = _compute_diagnosis(
+        watch_alive=watch_alive,
+        watch_alive_reason=watch_reason,
+        push_age=push_age,
+        dispatch_age=dispatch_age,
+        handler_age=handler_age,
+        handler_status=handler_status,
+    )
+
+    return TriggerProbeResponse(
+        watch_alive=watch_alive,
+        watch_alive_reason=watch_reason,
+        last_push_received_at=last_push,
+        last_dispatch_received_at=last_dispatch,
+        last_handler_completed_at=last_handler,
+        last_handler_status=handler_status,
+        last_handler_error_class=handler_error_class,
+        last_push_age_seconds=push_age,
+        last_dispatch_age_seconds=dispatch_age,
+        last_handler_age_seconds=handler_age,
+        diagnosis=diagnosis,
+        diagnosis_detail=detail,
+    )
+
+
+@router.post("/{trigger_id}/reverify", response_model=TriggerResponse)
+async def reverify_trigger(trigger_id: str):
+    """Re-run watch provisioning for this trigger and return the
+    refreshed row.
+
+    Why this exists: the auto-arm in `create_trigger` is best-effort.
+    If it fails (platform RPC blip, transient Google 5xx, GCP
+    misconfig at the time of creation), the trigger row sits forever
+    with stale `provider_state_json`. The daily refresh job
+    (`run_gmail_watch_refresh`) re-arms the *connector identity's*
+    watch but doesn't touch this trigger row's metadata. Before this
+    endpoint existed, the only recovery was delete + recreate, which
+    loses the event history and any custom filters.
+
+    The endpoint is idempotent at the Gmail end — a fresh `users.watch`
+    over a live one is harmless and resets the expiration clock. So
+    calling reverify on a healthy trigger is a no-op apart from
+    updating `gmail_history_id` to whatever Gmail thinks is current.
+    """
+    from app.db.database import async_session_maker
+    from app.db.models import Trigger
+
+    async with async_session_maker() as db:
+        row = await db.get(Trigger, trigger_id)
+        if row is None or row.user_id != _user_id():
+            raise HTTPException(status_code=404, detail="Trigger not found")
+        if row.kind != "email_received":
+            raise HTTPException(
+                status_code=400,
+                detail=f"reverify not supported for kind={row.kind!r}",
+            )
+
+    await _provision_email_watch(trigger_id)
+
+    async with async_session_maker() as db:
+        row = await db.get(Trigger, trigger_id)
+        # Eagerly load recent events for the response so the UI can
+        # render the refreshed card without a separate GET round trip.
+        from app.db.models import TriggerEvent
+        recent = (await db.execute(
+            select(TriggerEvent).where(TriggerEvent.trigger_id == trigger_id)
+            .order_by(desc(TriggerEvent.received_at)).limit(20)
+        )).scalars().all()
+    return _row_to_response(row, recent)

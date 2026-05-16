@@ -819,16 +819,34 @@ async def _arm_gmail_watch_post_connect(user_id: str) -> None:
         handle = await start_watch(user_id)
     except GmailWatchError as e:
         # Common: token rot, scope miss, IAM. Don't crash the callback
-        # — daily refresh is the safety net.
+        # — daily refresh is the safety net. BUT: notify the agent so
+        # the trigger rows surface "Setup error" / "Reconnect Gmail"
+        # to the user instead of silently sitting dormant until the
+        # next refresh tick.
+        msg = str(e)
+        if "no active gmail identity" in msg.lower() or "token refresh failed" in msg.lower():
+            err_code = "needs_reauth"
+        elif "gcp_project or pubsub_topic unset" in msg.lower():
+            err_code = "ops_blocked"
+        elif "status=4" in msg.lower():
+            err_code = "scope_error"
+        else:
+            err_code = "transient"
         logger.warning(
-            "[oauth.gmail_post_connect] arm_failed user=%s err=%s",
-            user_id[:8], str(e)[:200],
+            "[oauth.gmail_post_connect] arm_failed user=%s err=%s code=%s",
+            user_id[:8], msg[:200], err_code,
+        )
+        await _notify_agent_provision_failure(
+            user_id, error=err_code, detail=msg[:300],
         )
         return
     except Exception as e:
         logger.exception(
             "[oauth.gmail_post_connect] arm_crash user=%s err=%s",
             user_id[:8], e,
+        )
+        await _notify_agent_provision_failure(
+            user_id, error="transient", detail=f"unexpected: {type(e).__name__}",
         )
         return
 
@@ -853,3 +871,62 @@ async def _arm_gmail_watch_post_connect(user_id: str) -> None:
         "[oauth.gmail_post_connect] armed user=%s history_id=%s expires=%s",
         user_id[:8], handle.history_id, expires_iso,
     )
+
+
+async def _notify_agent_provision_failure(
+    user_id: str, *, error: str, detail: str,
+) -> None:
+    """POST to the agent's `/api/triggers/_record_provision_failure`
+    endpoint so the user's email_received triggers flip to
+    `last_status='provisioning_failed'` with a specific `provision_error`
+    code. Without this, an arm failure was invisible on the dashboard
+    until the user manually clicked Verify or the 6h refresh fan-out
+    (Gap 1) ran.
+
+    Best-effort: if the agent is unreachable we log and return — the
+    daily refresh will re-attempt arming, and Gap 1's fan-out will
+    clear stale provision_error fields when arming succeeds.
+    """
+    import httpx
+    from app.services.trigger_dispatch import resolve_agent_target, TriggerDispatchError
+
+    try:
+        agent_url, agent_key = await resolve_agent_target(user_id)
+    except TriggerDispatchError as e:
+        logger.warning(
+            "[oauth.notify_agent] no agent target user=%s err=%s",
+            user_id[:8], e,
+        )
+        return
+
+    url = f"{agent_url.rstrip('/')}/api/triggers/_record_provision_failure"
+    payload = {
+        "user_id": user_id,
+        "connector_id": "gmail",
+        "error": error,
+        "detail": detail,
+    }
+    headers = {"X-Agent-Key": agent_key, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.post(url, json=payload, headers=headers)
+    except httpx.RequestError as e:
+        logger.warning(
+            "[oauth.notify_agent] transport failed user=%s err=%s",
+            user_id[:8], e,
+        )
+        return
+    if r.status_code != 200:
+        logger.warning(
+            "[oauth.notify_agent] non-200 user=%s status=%d body=%s",
+            user_id[:8], r.status_code, r.text[:200],
+        )
+        return
+    try:
+        body = r.json()
+        logger.info(
+            "[oauth.notify_agent] recorded user=%s triggers_updated=%s",
+            user_id[:8], body.get("triggers_updated"),
+        )
+    except Exception:
+        pass

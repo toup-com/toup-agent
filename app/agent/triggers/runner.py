@@ -424,20 +424,76 @@ class TriggerRunner:
                 )
 
             # ── 6. Update parent trigger.last_* fields ──
+            # The handler reports one of five statuses:
+            #   success         — a real event delivered a summary
+            #   test_success    — a synthetic Test-button fire wrote a
+            #                     wiring-check message (no real delivery)
+            #   success_empty   — handler ran clean but produced no
+            #                     output (filters dropped all events,
+            #                     or every fetch failed). NOT proof the
+            #                     trigger works end-to-end.
+            #   skipped_reauth  — connector lost auth
+            #   failed          — anything else
+            #
+            # last_status='active' is the user-facing "this trigger is
+            # delivering real value" signal. We promote ONLY on real
+            # success — test fires and empty batches stay in whatever
+            # previous state the trigger was in. The dedicated test
+            # fields (last_test_at) and empty-batch counters live in
+            # provider_state_json so the UI can show "Test passed —
+            # awaiting first real event" without a schema change.
             new_state_patch: dict[str, Any] = dict(trigger.provider_state_json or {})
             if result.new_provider_state:
                 new_state_patch.update(result.new_provider_state)
 
+            res_status = result.status
+            promote_active = res_status == "success"
+            if promote_active:
+                next_last_status = "active"
+                next_last_error: Optional[str] = None
+                new_state_patch["last_real_fired_at"] = now.isoformat() + "Z"
+            elif res_status == "test_success":
+                # Wiring check passed. Keep last_status untouched (don't
+                # downgrade or false-promote). Stamp last_test_at so the
+                # UI can show "Test passed at <ts>" honestly.
+                next_last_status = trigger.last_status or "never_fired"
+                next_last_error = trigger.last_error
+                new_state_patch["last_test_at"] = now.isoformat() + "Z"
+            elif res_status == "skipped_reauth":
+                next_last_status = "skipped_reauth"
+                next_last_error = (result.error_detail or "")[:1000]
+            elif res_status == "success_empty":
+                # Don't claim "active" — nothing was actually delivered.
+                # Don't claim "failed" either — the handler ran clean,
+                # there just wasn't anything to do. Reflect the run
+                # outcome on the event rows and leave last_status as
+                # whatever it was before this batch.
+                next_last_status = trigger.last_status or "never_fired"
+                next_last_error = trigger.last_error
+                new_state_patch["last_empty_batch_at"] = now.isoformat() + "Z"
+            else:
+                next_last_status = "failed"
+                next_last_error = (result.error_detail or "")[:1000]
+
+            # fire_count counts every batch the runner dispatched, REAL
+            # or synthetic. For an "events that mattered" count, sum
+            # real_fire_count + test_fire_count from provider_state_json.
+            if res_status == "test_success":
+                new_state_patch["test_fire_count"] = (
+                    int(new_state_patch.get("test_fire_count") or 0) + 1
+                )
+            elif res_status == "success":
+                new_state_patch["real_fire_count"] = (
+                    int(new_state_patch.get("real_fire_count") or 0) + 1
+                )
+
             trigger_values: dict[str, Any] = {
                 "last_fired_at": now,
                 "fire_count": (trigger.fire_count or 0) + 1,
-                "last_status": "active" if result.status == "success" else
-                               ("skipped_reauth" if result.status == "skipped_reauth"
-                                else "failed"),
-                "last_error": (result.error_detail or "")[:1000] if result.status != "success" else None,
+                "last_status": next_last_status,
+                "last_error": next_last_error,
+                "provider_state_json": new_state_patch,
             }
-            if result.new_provider_state:
-                trigger_values["provider_state_json"] = new_state_patch
             await db.execute(
                 update(Trigger)
                 .where(Trigger.id == trigger.id)
