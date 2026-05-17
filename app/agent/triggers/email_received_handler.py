@@ -623,9 +623,17 @@ class EmailReceivedHandler:
                 continue
 
             try:
+                # The connector provider expects ``message_id``, not
+                # ``id``. Using the wrong param name produced a
+                # ``message_id required`` ConnectorToolError that the
+                # handler caught as a fetch failure — every event in
+                # every batch reached ``all_fetch_failed`` even when
+                # the underlying Gmail message existed. Caught
+                # 2026-05-17 after deploying the structured-error agent
+                # and seeing all_fetch_failed on real arrivals.
                 call_result = await mcp.call_tool(
                     "gmail__get_message",
-                    {"id": gmail_id, "format": "full"},
+                    {"message_id": gmail_id, "format": "full"},
                 )
                 data = _unpack_ok(call_result, "gmail__get_message")
             except _ReauthRequired:
