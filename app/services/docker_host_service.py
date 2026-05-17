@@ -218,6 +218,7 @@ async def provision_container(
     user_id: str,
     agent_config: Optional[AgentConfig] = None,
     recreate: bool = False,
+    override_image_tag: Optional[str] = None,
 ) -> ManagedContainer:
     """Provision a new Docker container for a user's agent, via the bridge.
 
@@ -251,7 +252,16 @@ async def provision_container(
     # default ("toup-agent:latest") is only a fresh-install sentinel — it
     # is NOT published to GHCR, so falling through to it for new tenants
     # is what caused the 2026-04-26 Alireza incident.
-    image_tag = await _latest_known_good_image_tag(db) or settings.docker_agent_image
+    #
+    # Override priority: explicit ``override_image_tag`` (operator
+    # recovery) > pin_image_tag on the existing managed_containers row
+    # > latest known-good rollout > settings sentinel.
+    if override_image_tag:
+        image_tag = override_image_tag
+    elif existing and existing.pin_image_tag:
+        image_tag = existing.pin_image_tag
+    else:
+        image_tag = await _latest_known_good_image_tag(db) or settings.docker_agent_image
     body = {
         "prefix": prefix,
         "user_id": user_id,

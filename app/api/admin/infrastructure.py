@@ -344,10 +344,25 @@ async def deploy_update_deprecated(
 @router.post("/provision/{user_id}")
 async def admin_provision(
     user_id: str,
+    recreate: bool = False,
+    image_tag: Optional[str] = None,
     _=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: provision a managed container for any user."""
+    """Admin: provision a managed container for any user.
+
+    ``recreate=true`` forces the bridge ``POST /v1/tenants`` call even
+    when a running container already exists. The bridge then force-
+    removes the stale container, rewrites ``.env``, and re-runs with
+    the new image — same idempotent path used by ``update_container_env``
+    after bundle activation. Use this to recover a tenant from a
+    failed canary rollout when the bridge's ``/upgrade`` path 404s
+    because the bridge has lost the tenant's container record.
+
+    ``image_tag`` overrides the per-rollout image lookup. If omitted,
+    falls through to ``_latest_known_good_image_tag`` (current
+    behaviour).
+    """
     from app.services.docker_host_service import provision_container
 
     # Get the user's agent config
@@ -357,11 +372,15 @@ async def admin_provision(
     agent_config = result.scalar_one_or_none()
 
     try:
-        container = await provision_container(db, user_id, agent_config)
+        container = await provision_container(
+            db, user_id, agent_config,
+            recreate=recreate, override_image_tag=image_tag,
+        )
         return {
             "status": container.status,
             "port": container.host_port,
             "container_name": container.container_name,
+            "image_tag": container.image_tag,
         }
     except Exception as e:
         return {"error": str(e)}
