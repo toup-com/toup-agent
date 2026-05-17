@@ -872,6 +872,59 @@ async def _arm_gmail_watch_post_connect(user_id: str) -> None:
         user_id[:8], handle.history_id, expires_iso,
     )
 
+    # Persist provider_account_id (the Gmail address). The generic
+    # vault.put at OAuth callback used to set this from the token
+    # response, but Google's token endpoint doesn't return account/login
+    # — those are GitHub-style fields. Result: provider_account_id stayed
+    # NULL on every Gmail OAuth, and the Pub/Sub webhook's email→user
+    # resolver (`_resolve_user_for_email`) returned None, silently
+    # dropping every push as `unknown_email`. We fetch the actual email
+    # via Gmail's users.getProfile and write it here so the next push
+    # resolves correctly. Idempotent — every arm rewrites with the same
+    # address. (2026-05-17 — burned hours on the silent-drop diagnosis.)
+    try:
+        from sqlalchemy import update as _sa_update
+        from app.db.database import async_session_maker as _asm
+        from app.db.models import ConnectorIdentity as _CI
+        from app.services.gmail_pubsub import (
+            _resolve_token_for as _gmail_token,
+            GMAIL_API_BASE as _gmail_base,
+        )
+        import httpx as _httpx
+        access = await _gmail_token(user_id)
+        async with _httpx.AsyncClient(timeout=10.0) as _c:
+            _r = await _c.get(
+                f"{_gmail_base}/profile",
+                headers={"Authorization": f"Bearer {access}"},
+            )
+        if _r.status_code == 200:
+            _email = (_r.json().get("emailAddress") or "").strip().lower()
+            if _email:
+                async with _asm() as _db:
+                    await _db.execute(
+                        _sa_update(_CI).where(
+                            _CI.user_id == user_id,
+                            _CI.connector_id == "gmail",
+                        ).values(provider_account_id=_email)
+                    )
+                    await _db.commit()
+                logger.info(
+                    "[oauth.gmail_post_connect] provider_account_id_set user=%s email=%s",
+                    user_id[:8], _email,
+                )
+        else:
+            logger.warning(
+                "[oauth.gmail_post_connect] getProfile status=%s for user=%s",
+                _r.status_code, user_id[:8],
+            )
+    except Exception as _e:
+        # Best-effort — the watch is already armed, the daily refresh
+        # will re-run this path. Don't crash the callback.
+        logger.warning(
+            "[oauth.gmail_post_connect] provider_account_id write failed user=%s err=%s",
+            user_id[:8], _e,
+        )
+
 
 async def _notify_agent_provision_failure(
     user_id: str, *, error: str, detail: str,

@@ -260,18 +260,13 @@ async def gmail_pubsub_webhook(
     # agent-side dedupe gate makes redo idempotent.
     if new_watermark:
         await _advance_watermark_on_connector(user_id, email, new_watermark)
-    # Stamp last_webhook_dispatch_at on every Gmail trigger this user
-    # owns so the `/probe` diagnosis can distinguish
-    # "dispatched but no handler response" from "push never reached
-    # platform". Idempotent — Pub/Sub retries overwrite with a fresher
-    # timestamp.
-    try:
-        await _stamp_triggers_dispatched(user_id)
-    except Exception as e:  # pragma: no cover — defensive
-        logger.warning(
-            "[gmail_pubsub] stamp_triggers_dispatched failed user_id=%s err=%s",
-            user_id[:8], e,
-        )
+    # Trigger rows live on the per-tenant agent DB in split-DB mode,
+    # not on the platform DB. The historical `_stamp_triggers_dispatched`
+    # call queried `triggers` here and produced a warning on every push
+    # ("relation triggers does not exist"). The agent's
+    # `triggers/inbound` handler already stamps `last_fired_at` on the
+    # Trigger row when it inserts a TriggerEvent — that's the source of
+    # truth for `/probe`. No platform-side stamp needed.
 
     latency_ms = _ms_now() - started_ms
     logger.info(
@@ -470,27 +465,3 @@ async def _record_push_received(email: str) -> None:
         await db.commit()
 
 
-async def _stamp_triggers_dispatched(user_id: str) -> None:
-    """Update `last_webhook_dispatch_at` on every email_received
-    Trigger owned by `user_id`.
-
-    One transaction per user (the spec's "no per-trigger commits"
-    rule). The in-Python JSONB merge keeps the SQLite test variant
-    behavioural; production runs through asyncpg JSONB without
-    materialising the row's entire blob.
-    """
-    from app.db.models import Trigger
-
-    now_iso = _utc_iso_z()
-    async with async_session_maker() as db:
-        triggers = (await db.execute(
-            select(Trigger).where(
-                Trigger.user_id == user_id,
-                Trigger.kind == "email_received",
-            )
-        )).scalars().all()
-        for trig in triggers:
-            ps = dict(trig.provider_state_json or {})
-            ps["last_webhook_dispatch_at"] = now_iso
-            trig.provider_state_json = ps
-        await db.commit()
