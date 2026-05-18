@@ -83,6 +83,70 @@ class JobLogger:
             except Exception:
                 pass
 
+        # ── Dual-write to job_events (PR 3 of unified jobs arc) ──
+        # ``build_logs_json`` stays as the per-job verbose log capped
+        # at 500 entries (rendered in the job detail drawer). The new
+        # ``job_events`` table is the cross-job indexable activity-
+        # feed surface — one row per material event, JOINed to
+        # ``build_jobs.title`` for attribution. Writes are
+        # best-effort: a failed event insert must not fail the job.
+        await self._write_job_event(level, message, detail, meta)
+
+    async def _write_job_event(
+        self,
+        level: str,
+        message: str,
+        detail: str = "",
+        meta: Optional[Dict] = None,
+    ) -> None:
+        """Insert one ``job_events`` row for this log entry.
+
+        Maps JobLogger levels to the ``job_events.kind`` closed enum:
+
+          info → ``info`` (a generic progress signal; not in the
+                  closed enum but used as a catch-all for plain log
+                  lines until Auto Builder + handlers emit explicit
+                  phase_started / phase_completed / output_posted
+                  events from PR 5 onwards)
+          tool → ``tool_call``
+          edit → ``tool_call`` (file edit is a kind of tool call)
+          error → ``error``
+
+        Best-effort write: any exception is swallowed and warning-
+        logged. Logging must never cascade into a job failure.
+        """
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import JobEvent
+
+            kind_map = {"info": "info", "tool": "tool_call", "edit": "tool_call", "error": "error"}
+            kind = kind_map.get(level, "info")
+            metadata_payload: Optional[str] = None
+            if detail or meta:
+                metadata_payload = json.dumps(
+                    {"detail": detail or "", "meta": meta or {}},
+                    default=str,
+                )
+
+            async with async_session_maker() as db:
+                db.add(JobEvent(
+                    job_id=self.job_id,
+                    user_id=self.user_id,
+                    kind=kind,
+                    label=message[:200] if message else None,
+                    level=level,
+                    metadata_json=metadata_payload,
+                ))
+                await db.commit()
+        except Exception as e:
+            # Swallow — a failed event write must not propagate into
+            # the job's success path. The build_logs_json fallback
+            # still captures everything; we just lose this row from
+            # the cross-job feed.
+            logger.warning(
+                f"[JOB:{self.job_id[:8]}] job_events write failed: {e}"
+            )
+
     async def persist(self):
         """Save accumulated logs to the database."""
         from app.db.database import async_session_maker
