@@ -29,6 +29,7 @@ prompts even before the runner is fully integrated.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Any, Optional
@@ -83,9 +84,9 @@ class AgentTaskHandler:
         self, routine: Any, runner: Any, prompt: str, db: AsyncSession,
     ) -> RoutineResult:
         """Full path — uses the agent's normal turn pipeline with tool
-        access. The runner persists its own Message (we set channel +
-        source via metadata so the frontend can render it as a routine
-        post, not a normal assistant reply)."""
+        access. AgentRunner persists its own assistant Message; we reuse
+        that row (stamping `source` + routine metadata onto it) instead
+        of writing a duplicate."""
         try:
             response = await runner.run(
                 user_message=prompt,
@@ -146,19 +147,43 @@ class AgentTaskHandler:
                             tools_used.append(n)
                 break  # first attribute that exists wins
 
-        # The agent runner already wrote its own Message rows. Persist a
-        # SEPARATE routine-tagged Message so Mission Control can find it
-        # by `source=agent_task` without coupling to the runner's
-        # internal Conversation. Cheap (one extra row) and the duplication
-        # makes the routine output discoverable independent of any
-        # changes to the agent runner.
+        # Reuse the Message AgentRunner already persisted, instead of
+        # writing a second row. Pre-fix (≤2026-05-17) this handler
+        # unconditionally called `_persist_and_return` here on top of the
+        # runner's own `_save_messages`, producing TWO identical
+        # `role=assistant channel=routine` bubbles in the user's day-chat
+        # on every agent_task fire — the bug visible in the user-report
+        # screenshots where one Gmail summary appeared twice.
+        #
+        # The runner exposes its row id on `AgentResponse.asst_message_id`
+        # (added by the 2026-05-10 "thread server message id through `done`"
+        # fix). When present, decorate that row with routine metadata +
+        # broadcast + fan out — one row, no duplicate. When absent (older
+        # response shape, or a unit-test mock), fall back to the legacy
+        # write path so test stubs that don't model `asst_message_id`
+        # keep working.
+        metrics = {
+            "path": "agent_runner",
+            "tokens": getattr(response, "tokens_total", 0),
+        }
+        asst_id = (getattr(response, "asst_message_id", "") or "").strip()
+        if asst_id:
+            return await self._decorate_existing_and_fanout(
+                routine, db,
+                existing_msg_id=asst_id,
+                content=text,
+                model_used=getattr(response, "model", None),
+                tools_invoked=tools_used,
+                metrics=metrics,
+            )
+
         return await self._persist_and_return(
             routine, db,
             content=text,
             model_used=getattr(response, "model", None),
             emails_fetched=0,
             tools_invoked=tools_used,
-            metrics={"path": "agent_runner", "tokens": getattr(response, "tokens_total", 0)},
+            metrics=metrics,
         )
 
     # ------------------------------------------------------------------
@@ -211,6 +236,140 @@ class AgentTaskHandler:
             model_used=model_choice,
             emails_fetched=0,
             metrics={"path": "internal_llm", "summary_chars": len(text)},
+        )
+
+    # ------------------------------------------------------------------
+    async def _decorate_existing_and_fanout(
+        self, routine: Any, db: AsyncSession,
+        *,
+        existing_msg_id: str,
+        content: str,
+        model_used: Optional[str],
+        tools_invoked: Optional[list[str]],
+        metrics: dict,
+    ) -> RoutineResult:
+        """Reuse the assistant Message that AgentRunner already persisted.
+
+        Stamps `source = self.kind` and the routine identity on the row
+        so Mission Control filtering on `source=agent_task` finds it
+        (the runner doesn't set `source` by default — that field is
+        reserved for non-user-originated message kinds). Then broadcasts
+        the row over the user's WS connections so the chat UI renders
+        the routine card in real time, and fans out to extra delivery
+        channels (Telegram / WhatsApp) per the routine's config.
+
+        No new Message row is written here. That's the entire point of
+        this path — one routine fire produces exactly one assistant
+        bubble.
+        """
+        from app.db.models import Message
+
+        msg_day_chat_id: Optional[str] = None
+        msg_row_present = False
+        try:
+            msg = await db.get(Message, existing_msg_id)
+            if msg is not None:
+                msg_row_present = True
+                msg_day_chat_id = msg.day_chat_id
+                if not msg.source:
+                    msg.source = self.kind
+                existing_meta: dict = {}
+                if msg.metadata_json:
+                    try:
+                        parsed = json.loads(msg.metadata_json)
+                        if isinstance(parsed, dict):
+                            existing_meta = parsed
+                    except (json.JSONDecodeError, TypeError):
+                        # Corrupt JSON — overwrite rather than crash. The
+                        # routine card needs the flag more than we need
+                        # to preserve unparseable bytes.
+                        existing_meta = {}
+                existing_meta["routine_message"] = True
+                existing_meta["routine_id"] = routine.id
+                existing_meta["routine_name"] = routine.name or routine.kind
+                msg.metadata_json = json.dumps(existing_meta)
+                await db.commit()
+            else:
+                logger.warning(
+                    "[agent_task] decorate skipped — Message %s vanished "
+                    "between runner save and routine decorate",
+                    existing_msg_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "[agent_task] decorate_existing_message failed msg_id=%s err=%s",
+                existing_msg_id, e,
+            )
+
+        # WS broadcast + extra-channel fan-out. AgentRunner does NOT
+        # broadcast on its own when run from a routine (no WS callbacks
+        # wired by the handler), so this is the first time the user's
+        # active chat clients hear about the new row.
+        channel_results: dict[str, dict[str, Any]] = {}
+        ws_count = 0
+        try:
+            from app.api.ws_chat import broadcast_to_user
+        except Exception as e:
+            logger.debug(
+                "[agent_task] WS broadcast skipped — ws_chat unavailable: %s", e,
+            )
+        else:
+            event = {
+                "type": "message",
+                "id": existing_msg_id,
+                "day_chat_id": msg_day_chat_id,
+                "role": "assistant",
+                "channel": "routine",
+                "source": self.kind,
+                "content": content,
+                "model_used": model_used,
+                "routine_message": True,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+            try:
+                ws_count = await broadcast_to_user(routine.user_id, event)
+            except Exception as e:
+                logger.warning("[agent_task] WS broadcast failed: %s", e)
+
+        channel_results["website"] = {
+            "status": "delivered" if msg_row_present else "failed",
+            "message_id": existing_msg_id,
+            "day_chat_id": msg_day_chat_id,
+            "ws_count": ws_count,
+        }
+
+        from .channel_dispatcher import (
+            deliver_to_extra_channels_detailed,
+            parse_delivery_channels,
+        )
+        delivery_channels = parse_delivery_channels(routine.config_json)
+        extras = [c for c in delivery_channels if c and c != "website"]
+        if extras:
+            from app.db.database import async_session_maker
+            try:
+                extras_results = await deliver_to_extra_channels_detailed(
+                    user_id=routine.user_id,
+                    delivery_channels=extras,
+                    routine_name=routine.name or routine.kind,
+                    content=content,
+                    db_session_maker=async_session_maker,
+                )
+                if extras_results:
+                    channel_results.update(extras_results)
+            except Exception as e:
+                logger.warning(
+                    "[agent_task] extra channel dispatch failed: %s: %s",
+                    type(e).__name__, e,
+                )
+
+        return RoutineResult(
+            status="success",
+            emails_fetched=0,
+            summary_message_id=existing_msg_id,
+            new_watermark={"last_run_at": datetime.utcnow().isoformat()},
+            channel_results=channel_results,
+            tools_invoked=list(tools_invoked or []),
+            metrics=metrics,
         )
 
     # ------------------------------------------------------------------
