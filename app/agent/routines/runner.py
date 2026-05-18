@@ -780,6 +780,46 @@ class RoutineRunner:
             )
             return
 
+        # ── Unified-jobs dual-write (PR 4b) ──────────────────────────
+        # Mint a mirrored BuildJob row. Idempotency_key uses the same
+        # user-local-date discriminator as the RoutineRun UNIQUE
+        # constraint (``(routine_id, scheduled_for_local_date)``), so
+        # the composite UNIQUE on ``(source_id, idempotency_key)``
+        # collapses to the exact same dedupe gate. Stamp the
+        # ``routine_runs.job_id`` linkage so ``_finalize_run`` can
+        # mirror terminal state onto the Job in the same UPDATE.
+        # Best-effort: a Job mint failure does NOT roll back the
+        # RoutineRun insert — the legacy fire path is unaffected.
+        try:
+            from app.agent.job_runner import JobRunner, TaskSpec
+            _runner = JobRunner()
+            _spec = TaskSpec(
+                user_id=routine.user_id,
+                channel="routine",
+                source_kind="routine",
+                source_id=routine_id,
+            )
+            _idempotency_key = str(local_date)
+            _job = await _runner.create_job(
+                job_type="routine_run",
+                spec=_spec,
+                title=f"Routine fire: {routine.kind} {local_date}",
+                idempotency_key=_idempotency_key,
+            )
+            async with self._session_maker() as db:
+                await db.execute(
+                    update(RoutineRun)
+                    .where(RoutineRun.id == run_id)
+                    .values(job_id=_job.id)
+                )
+                await db.commit()
+        except Exception as _e:
+            logger.warning(
+                "[routine_runner] Job dual-write failed run_id=%s err=%s "
+                "(legacy fire path unaffected)",
+                run_id, _e,
+            )
+
         # Find handler. Unknown kind → log "would_execute" + finalize as
         # success (Gate 1 no-op behavior preserved for _smoke / _test_*
         # kinds that have no real handler).
@@ -1324,6 +1364,90 @@ class RoutineRunner:
                 await db.commit()
         except Exception as e:
             logger.warning("[routine_runner] finalize_failed run_id=%s err=%s", run_id, e)
+
+        # Mirror terminal state onto the linked BuildJob (PR 4b
+        # unified-jobs arc). Best-effort: a mirror failure is logged
+        # + swallowed so the legacy fire path stays correct.
+        await self._mirror_run_terminal_to_job(
+            run_id=run_id,
+            status=status,
+            outcome=outcome,
+            error_message=error_detail,
+            summary_message_id=summary_message_id,
+            finished_at=finished_at,
+        )
+
+    async def _mirror_run_terminal_to_job(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        outcome: Optional[str] = None,
+        error_message: Optional[str] = None,
+        summary_message_id: Optional[str] = None,
+        finished_at: Optional[datetime] = None,
+    ) -> None:
+        """Mirror a RoutineRun's terminal state onto its linked
+        ``build_jobs`` row (PR 4b of the unified-jobs arc).
+
+        RoutineRun has granular ``status`` and ``outcome`` fields.
+        Mapping to the closed BuildJob enum:
+
+          status=success      → status='completed', outcome=<derived outcome>
+          status=partial      → status='completed', outcome='partial'
+          status=skipped_reauth → status='completed', outcome='skipped_reauth'
+          status=failed       → status='failed',    outcome=NULL
+
+        When ``outcome`` is supplied (the derived Ticket-2.1 value),
+        it takes precedence and lands on ``BuildJob.outcome`` so the
+        Mission Control surface can distinguish success / success_empty
+        / partial / failure / tool_error.
+
+        No-op when the RoutineRun has no ``job_id`` (legacy rows from
+        before PR 4b, or a Job-mint failure at fire-time). Best-effort
+        — any exception is logged and swallowed."""
+        try:
+            from app.db.models import BuildJob, RoutineRun
+            async with self._session_maker() as db:
+                run_row = await db.get(RoutineRun, run_id)
+                if run_row is None or run_row.job_id is None:
+                    return  # no Job to mirror — silent no-op
+                if status == "failed":
+                    job_status = "failed"
+                    job_outcome: Optional[str] = None
+                elif status in ("success", "partial", "skipped_reauth"):
+                    job_status = "completed"
+                    # Prefer the derived `outcome` value when present
+                    # (Ticket 2.1 — success_empty, partial, etc.).
+                    # Fall back to the raw status as a discriminator.
+                    job_outcome = outcome or status
+                else:
+                    # Unknown status — be conservative and mark
+                    # completed with the raw value as outcome so we
+                    # can audit later.
+                    job_status = "completed"
+                    job_outcome = outcome or status
+                values: dict[str, Any] = {
+                    "status": job_status,
+                    "outcome": job_outcome,
+                    "completed_at": finished_at or datetime.utcnow(),
+                }
+                if error_message and job_status == "failed":
+                    values["error_message"] = (error_message or "")[:1000]
+                if summary_message_id and job_status == "completed":
+                    values["summary_message_id"] = summary_message_id
+                await db.execute(
+                    update(BuildJob)
+                    .where(BuildJob.id == run_row.job_id)
+                    .values(**values)
+                )
+                await db.commit()
+        except Exception as e:
+            logger.warning(
+                "[routine_runner] mirror_to_job failed run_id=%s err=%s "
+                "(legacy fire path unaffected)",
+                run_id, e,
+            )
 
     # ------------------------------------------------------------------ status (for /_runner_status)
     def status_snapshot(self) -> dict[str, Any]:

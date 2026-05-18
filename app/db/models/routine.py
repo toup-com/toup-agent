@@ -228,6 +228,16 @@ class RoutineRun(Base):
         String(50), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
     )
 
+    # Soft pointer to the mirrored ``build_jobs`` row created at fire
+    # time (PR 4b of the unified-jobs arc). No FK — same precedent as
+    # ``cron_jobs.migrated_to_routine_id`` and ``trigger_events.job_id``:
+    # the linkage survives a future Phase-D drop of this table without
+    # CASCADE firing on the Job side. Populated by ``RoutineRunner._fire``
+    # immediately after the idempotency claim; consumed by the runner's
+    # status-sync path (``_post_terminal``, ``_finalize_run``) so the
+    # Job row mirrors the legacy row's terminal state.
+    job_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
     __table_args__ = (
         UniqueConstraint(
             "routine_id", "scheduled_for_local_date",
