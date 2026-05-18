@@ -293,16 +293,12 @@ async def _send_whatsapp_detailed(body: str, db_session_maker) -> dict[str, obje
     surfaces it."""
     from app.agent.channels.registry import ChannelRegistry
     from app.agent.channels.base import ChannelType
-    from app.db.models import AgentConfig
 
     channel = ChannelRegistry.get(ChannelType.WHATSAPP)
     if channel is None:
         return {"status": "skipped", "reason": "no_adapter"}
 
-    async with db_session_maker() as db:
-        cfg = await db.scalar(select(AgentConfig).limit(1))
-
-    recipient = getattr(cfg, "whatsapp_self_e164", None) if cfg else None
+    recipient = await _resolve_whatsapp_recipient(db_session_maker)
     if not recipient:
         logger.info(
             "[routine_dispatch] whatsapp skipped reason=no_self_e164",
@@ -328,16 +324,12 @@ async def _send_whatsapp(body: str, db_session_maker) -> str:
     pattern used by the in-conversation flow."""
     from app.agent.channels.registry import ChannelRegistry
     from app.agent.channels.base import ChannelType
-    from app.db.models import AgentConfig
 
     channel = ChannelRegistry.get(ChannelType.WHATSAPP)
     if channel is None:
         return "no_adapter"
 
-    async with db_session_maker() as db:
-        cfg = await db.scalar(select(AgentConfig).limit(1))
-
-    recipient = getattr(cfg, "whatsapp_self_e164", None) if cfg else None
+    recipient = await _resolve_whatsapp_recipient(db_session_maker)
     if not recipient:
         logger.info(
             "[routine_dispatch] whatsapp skipped reason=no_self_e164 — "
@@ -347,3 +339,41 @@ async def _send_whatsapp(body: str, db_session_maker) -> str:
 
     await channel.send_text(str(recipient), body)
     return "sent"
+
+
+async def _resolve_whatsapp_recipient(db_session_maker) -> Optional[str]:
+    """Return the agent's own WhatsApp E.164, or None if not configured.
+
+    Two sources, in order:
+
+      1. ``settings.whatsapp_self_e164`` — env var ``WHATSAPP_SELF_E164``,
+         injected per-tenant by the bridge. This is the canonical source
+         on tenant agent containers (the tenant DB doesn't always carry
+         an ``agent_configs`` row; the env var always does when the
+         channel is paired). Pre-2026-05-18 the dispatcher only read
+         from ``AgentConfig`` and silently skipped WhatsApp delivery
+         when the table didn't exist on the tenant DB
+         (``UndefinedTableError: relation "agent_configs" does not exist``,
+         caught in ``deliver_to_extra_channels_detailed`` and surfaced as
+         ``channel_results.whatsapp.status="failed"``).
+      2. ``AgentConfig.whatsapp_self_e164`` — same field on the table,
+         kept as a fallback for the platform-side path where the row is
+         the canonical store.
+    """
+    from app.config import settings
+
+    env_e164 = (getattr(settings, "whatsapp_self_e164", None) or "").strip()
+    if env_e164:
+        return env_e164
+
+    try:
+        from app.db.models import AgentConfig
+        async with db_session_maker() as db:
+            cfg = await db.scalar(select(AgentConfig).limit(1))
+        return (getattr(cfg, "whatsapp_self_e164", None) or "").strip() or None
+    except Exception as e:
+        logger.info(
+            "[routine_dispatch] whatsapp recipient lookup via AgentConfig "
+            "fell back (no row / no table): %s", type(e).__name__,
+        )
+        return None

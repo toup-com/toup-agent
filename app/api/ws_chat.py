@@ -274,10 +274,19 @@ async def _check_age_and_swap(video_id: str, user_id: str) -> None:
 # ── Task intent detection ──────────────────────────────────────────
 # Keyword/regex heuristic: detects imperative task requests in chat.
 # Matches phrases like "research X", "find me Y", "monitor Z", "set up A".
+#
+# IMPORTANT: reminder-shaped phrases ("remind me…", "schedule a…", "ping
+# me at…", "wake me up in…") are deliberately EXCLUDED. They flow into
+# the routines/reminder skill (routines__remind), not the agent_task
+# BuildJob pipeline. Pre-2026-05-18 this regex matched "remind\s+me"
+# which created an empty agent_task BuildJob for every reminder, leaving
+# an orphan "Thinking…" indicator in chat (because the BuildJob's
+# steps_json stayed "[]" forever) and a bogus "No build steps recorded"
+# job card on /jobs.
 import re as _re
 _TASK_INTENT_PATTERN = _re.compile(
-    r"^(research|find\s+(me\s+)?|look\s+up|monitor|track|set\s+up|remind\s+me|"
-    r"schedule|analyze|investigate|summarize|compile|gather|collect|prepare|"
+    r"^(research|find\s+(me\s+)?|look\s+up|monitor|track|set\s+up|"
+    r"analyze|investigate|summarize|compile|gather|collect|prepare|"
     r"write\s+(me\s+)?(a\s+)?|draft\s+(me\s+)?(a\s+)?|create\s+(a\s+)?report|"
     r"compare|review|check\s+(if|whether)|scan|audit|benchmark|evaluate)",
     _re.IGNORECASE,
