@@ -65,6 +65,66 @@ class BuildJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # ── Unified-jobs arc (migration 046) ─────────────────────────────
+    # Discriminator + back-link columns added so triggers and routines
+    # can materialise a BuildJob row on every fire (PR 4 onwards). All
+    # nullable, no behavior change in this PR — population starts when
+    # JobRunner.create_job (PR 3) replaces the inline BuildJob(...)
+    # constructions across the codebase. See
+    # docs/architecture/jobs-investigation-2026-05-18.md D1+D3.
+    source_kind: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    source_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    conversation_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    summary_message_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # Richer per-type sub-state — `status` is the closed enum across
+    # all job_types; `outcome` covers per-type specifics like
+    # success_empty / skipped_rate_limit / skipped_filter /
+    # skipped_reauth / coalesced / partial.
+    outcome: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    # Composite UNIQUE with `source_id` (partial index in migration 046,
+    # WHERE idempotency_key IS NOT NULL). Carries the existing
+    # UNIQUE (routine_id, scheduled_for_local_date) and
+    # UNIQUE (trigger_id, event_dedupe_id) semantics forward.
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+
+
+class JobEvent(Base):
+    """One material event emitted during a job's lifecycle.
+
+    The activity-feed surface for the dashboard's Mission Control
+    "ACTIVITY" section. One row per phase boundary, tool call, error,
+    or output post — see migration 046 for the closed `kind` enum.
+    Read via ``SELECT FROM job_events WHERE user_id=? ORDER BY ts
+    DESC LIMIT 50`` (joined to ``build_jobs.title`` for attribution).
+
+    Independent from ``BuildJob.build_logs_json`` (the per-job
+    verbose log capped at 500 entries, JSON blob on the row):
+    ``job_events`` is cross-job and indexable; ``build_logs_json``
+    is per-job and high-cardinality. They answer different questions.
+    """
+
+    __tablename__ = "job_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("build_jobs.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # Denormalised so the cross-job activity-feed query doesn't have
+    # to JOIN build_jobs to filter by user. Same pattern as
+    # trigger_events.user_id and routine_runs.user_id.
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    # Closed enum (application-validated):
+    #   phase_started | phase_completed | tool_call | error | output_posted
+    kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    label: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    # Mirrors build_jobs.status enum where applicable; NULL for kinds
+    # that don't carry a status (tool_call, error).
+    status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    level: Mapped[str] = mapped_column(String(10), nullable=False, default="info")
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
 
 class BuildUsage(Base):
     """Per-LLM-call usage row emitted during an auto-builder build.

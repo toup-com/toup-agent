@@ -50,6 +50,34 @@ CONTAINER_USER_ID = "00000000-0000-0000-0000-0000000000e0"
 TRIGGER_ID = "00000000-0000-0000-0000-0000000ff000"
 
 
+# Override the conftest autouse `_reset_database` fixture. The default
+# fixture calls ``init_db()`` which tries to create the entire agent
+# schema, including the ``entities`` table whose pgvector ``embedding``
+# column generates a SQLAlchemy NullType DDL error under SQLite. CI
+# defaults the job to RUN_MODE=platform precisely to skip that table —
+# but RUN_MODE=platform also excludes ``triggers`` / ``trigger_events``,
+# which these tests need.
+#
+# Solution: build only the 3 tables the trigger-runner tests touch
+# (``users``, ``triggers``, ``trigger_events``). SQLite doesn't
+# enforce foreign keys by default, so the FK on
+# ``trigger_events.summary_message_id`` → ``messages.id`` is harmless
+# even though we don't create ``messages``.
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_database():
+    from app.db.database import engine
+    from app.db.models import Trigger, TriggerEvent, User
+
+    async with engine.begin() as conn:
+        for model_cls in (User, Trigger, TriggerEvent):
+            await conn.run_sync(model_cls.__table__.create, checkfirst=True)
+    yield
+    async with engine.begin() as conn:
+        for model_cls in (TriggerEvent, Trigger, User):
+            await conn.run_sync(model_cls.__table__.drop, checkfirst=True)
+    await engine.dispose()
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Source-grep guard — the fix's existence in the codebase.
 # ──────────────────────────────────────────────────────────────────────

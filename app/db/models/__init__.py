@@ -38,7 +38,7 @@ from .entity import Entity, EntityLink, EntityRelationship
 from .document import Document, DocumentChunk, Media
 
 # Apps & Build Jobs
-from .app import App, BuildJob, BuildUsage, ReconciliationLog
+from .app import App, BuildJob, BuildUsage, JobEvent, ReconciliationLog
 
 # Agent runtime
 from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig, ExtensionDevice
