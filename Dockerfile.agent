@@ -90,6 +90,15 @@ ENV EMBEDDING_PROVIDER=openai \
 # still flip it off via `.env` if needed.
 ENV ENABLE_DAY_RECALL=true
 
+# Routines (email briefing + reminders) — flag-gated in code but
+# every per-tenant agent ships with the feature ON. Pre-2026-05-18
+# the defaults were False so the agent skill returned "Feature not
+# available" when a user asked for a daily Gmail briefing. The gate
+# remains for staged rollouts; this default flips it on per-agent
+# without changing the platform-side default.
+ENV ROUTINES_EMAIL_BRIEFING_ENABLED=true \
+    ROUTINES_REMINDERS_ENABLED=true
+
 # Agent listens on 8001 internally (mapped to unique host port)
 EXPOSE 8001
 
@@ -98,4 +107,13 @@ EXPOSE 8001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
     CMD curl -sf http://localhost:8001/agent/health || exit 1
 
-CMD ["uvicorn", "agent_main:app", "--host", "0.0.0.0", "--port", "8001"]
+# Apply pending Alembic migrations before serving requests, then start
+# uvicorn. Best-effort: if upgrade fails (env, race, transient DB
+# hiccup) the container still serves so the user isn't locked out;
+# the failure is loud in stdout for the operator. This mirrors the
+# platform Dockerfile's pattern. Before 2026-05-18 the agent never
+# ran migrations on boot — tenant DBs drifted behind the model
+# definitions, surfacing as "column X of relation Y does not exist"
+# the moment a new feature column was referenced (e.g. routines.schedule_kind
+# from migration 042 broke every reminder create call).
+CMD ["bash", "-c", "alembic upgrade head || echo '[boot] alembic upgrade failed — continuing without applying migrations; check logs above'; exec uvicorn agent_main:app --host 0.0.0.0 --port 8001"]
