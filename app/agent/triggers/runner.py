@@ -248,11 +248,18 @@ class TriggerRunner:
     # ── Per-event dispatch ──────────────────────────────────────
 
     async def _handle_event_with_retry(self, event_id: str) -> None:
-        """Top-level dispatch for one event. Implements the runner's
-        retry policy (three attempts, exponential backoff) around the
-        handler.execute call. On terminal failure, the event row is
-        flipped to status='failed' and the parent trigger's last_error
-        is set."""
+        """Top-level dispatch for one event. Three attempts with
+        exponential backoff. On terminal failure (all retries exhausted),
+        the event row is flipped to ``status='failed'`` with
+        ``error_class='all_retries_exhausted'`` and
+        ``error_detail=<repr of last exception>``, and the parent trigger
+        is stamped with ``last_status='failed'`` + ``last_error`` +
+        ``fire_count`` bump. The row is never left in ``status='running'``
+        for the 10-minute orphan sweep to find — that path was the cause
+        of the "N fires, status=failed, error fields NULL" symptom
+        on the live Gmail trigger before this fix.
+        """
+        last_error_text: Optional[str] = None
         for attempt_idx, delay in enumerate(self._retry_delays):
             try:
                 done = await self._dispatch_one(event_id, attempt_idx=attempt_idx)
@@ -263,11 +270,63 @@ class TriggerRunner:
                     "[trigger_runner] dispatch_one crash event_id=%s attempt=%d err=%s",
                     event_id, attempt_idx, e,
                 )
+                last_error_text = repr(e)[:1000]
             if attempt_idx < len(self._retry_delays) - 1:
                 try:
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     return
+        # All retries exhausted. Terminalise the row + parent trigger so
+        # the orphan sweep doesn't have to clean up 10 minutes later
+        # with no error context. Idempotent / race-safe inside.
+        await self._finalise_exhausted(event_id, last_error_text or "unknown")
+
+    async def _finalise_exhausted(self, event_id: str, error_detail: str) -> None:
+        """Mark a ``TriggerEvent`` as failed after the retry loop in
+        ``_handle_event_with_retry`` exhausts. Idempotent and race-safe:
+        if the row already reached a terminal state (success/failed/
+        coalesced/skipped — e.g. a sibling drain claimed it), preserve
+        existing state and return without writing. Same for a vanished
+        row. The parent ``Trigger`` is only stamped when we actually
+        write the event row, so we don't double-bump ``fire_count``."""
+        from app.db.models import Trigger, TriggerEvent
+        now = datetime.utcnow()
+        async with self._session_maker() as db:
+            ev = await db.get(TriggerEvent, event_id)
+            if ev is None:
+                return  # row vanished — nothing to do
+            if ev.status not in ("queued", "running"):
+                # Already terminal — preserve whatever the racing writer
+                # set. This is the same race-safe pattern _dispatch_one
+                # uses on step 1 (claim).
+                return
+            await db.execute(
+                update(TriggerEvent)
+                .where(TriggerEvent.id == event_id)
+                .values(
+                    status="failed",
+                    error_class="all_retries_exhausted",
+                    error_detail=error_detail[:1000],
+                    finished_at=now,
+                )
+            )
+            trigger = await db.get(Trigger, ev.trigger_id)
+            if trigger is not None:
+                await db.execute(
+                    update(Trigger)
+                    .where(Trigger.id == trigger.id)
+                    .values(
+                        last_fired_at=now,
+                        fire_count=(trigger.fire_count or 0) + 1,
+                        last_status="failed",
+                        last_error=error_detail[:1000],
+                    )
+                )
+            await db.commit()
+        logger.warning(
+            "[trigger_runner] terminalised_after_retries event_id=%s detail=%s",
+            event_id, error_detail[:200],
+        )
 
     async def _dispatch_one(self, event_id: str, *, attempt_idx: int) -> bool:
         """One attempt at handling an event. Returns True when the
@@ -400,9 +459,17 @@ class TriggerRunner:
                     "[trigger_runner] handler_crash trigger_id=%s event_id=%s err=%s",
                     trigger.id, event_id, e,
                 )
-                # Transient — let the retry loop handle.
+                # Release the limiter and let the retry loop decide. We
+                # re-raise (rather than `return False`) so the outer
+                # `_handle_event_with_retry` can capture the exception
+                # text and, if all retries exhaust, write it into
+                # `TriggerEvent.error_detail` instead of leaving the row
+                # stuck in `status='running'` with NULL error fields for
+                # the 10-minute orphan sweep to find. Behaviour is
+                # otherwise unchanged — the outer except already treats
+                # both raise and `return False` as "retry me".
                 self._limiter.release(trigger.id)
-                return False  # retry
+                raise
 
             # ── 5. Persist outcomes ──
             now = datetime.utcnow()
