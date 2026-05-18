@@ -248,15 +248,22 @@ class RoutineCreate(BaseModel):
                 raise ValueError(
                     "schedule_at is required when schedule_kind='at'."
                 )
-            now = datetime.utcnow()
-            scheduled = self.schedule_at
-            if scheduled.tzinfo is not None:
+            # The routines.schedule_at column is `TIMESTAMP WITHOUT TIME
+            # ZONE`. Pydantic parses an ISO string with a Z suffix into a
+            # tz-aware datetime, which asyncpg refuses to bind to the
+            # naive column. Strip the offset HERE (not just locally for
+            # the comparison) so every downstream consumer sees a single
+            # canonical naive-UTC value.
+            if self.schedule_at.tzinfo is not None:
                 from datetime import timezone as _tz
-                scheduled = scheduled.astimezone(_tz.utc).replace(tzinfo=None)
-            if scheduled <= now:
+                self.schedule_at = self.schedule_at.astimezone(
+                    _tz.utc
+                ).replace(tzinfo=None)
+            now = datetime.utcnow()
+            if self.schedule_at <= now:
                 raise ValueError(
                     f"schedule_at must be in the future "
-                    f"(got {scheduled.isoformat()} vs now {now.isoformat()})."
+                    f"(got {self.schedule_at.isoformat()} vs now {now.isoformat()})."
                 )
         elif sk == "every":
             if self.schedule_interval_seconds is None:
@@ -300,6 +307,16 @@ class RoutineUpdate(BaseModel):
                 f"Unknown schedule_kind {v!r}. Allowed: {sorted(_VALID_SCHEDULE_KINDS)}"
             )
         return v
+
+    @field_validator("schedule_at")
+    @classmethod
+    def _strip_tz_from_schedule_at(cls, v: Optional[datetime]) -> Optional[datetime]:
+        # Match the naive-UTC convention enforced in RoutineCreate so
+        # PATCH /routines/{id} doesn't fall over on tz-aware datetimes.
+        if v is None or v.tzinfo is None:
+            return v
+        from datetime import timezone as _tz
+        return v.astimezone(_tz.utc).replace(tzinfo=None)
 
     @field_validator("schedule_window_start_local")
     @classmethod
