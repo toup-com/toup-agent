@@ -83,13 +83,15 @@ _SUMMARIZE_SYSTEM_PROMPT = """You write the SUMMARY body of a Gmail notification
 
 Rules:
 - Tight 1–3 sentence summary of what the email actually says.
+- If body has ANY content (even one short line, even with typos, even with unfamiliar acronyms / names / jargon), produce a summary by paraphrasing or quoting the text directly. NEVER bail with "(no body)" when the body has content — the user wrote it and wants to see what they wrote reflected back.
+- Only respond "(no body)" when the body block below is literally empty / whitespace-only.
 - ONLY include an "Action: …" line when the email explicitly asks for a reply, deadline, approval, or RSVP.
 - Multiple emails: list each as "• <one-line gist>" (sender comes from the header above, don't repeat it).
 - ≤120 words for one email, ≤250 words for a burst. Hard cap 400.
 - Markdown OK for emphasis (**bold** sparingly, ⚑ for boss/family/financial/security).
 - NEVER write "From:", "Subject:", "(unknown)", "Here is a summary", or any opening boilerplate — the header card already covers that.
 
-Never invent details. If the body is empty, say "(no body)" instead of guessing."""
+Never invent details. When unsure, quote the sender's exact words rather than paraphrasing or refusing."""
 
 
 class _ReauthRequired(Exception):
@@ -726,6 +728,18 @@ class EmailReceivedHandler:
                 "internal_llm returned None (timeout / auth / parse failure)"
             )
 
+        # Output-guard at the LLM boundary. The system prompt tells the
+        # model to only emit "(no body)" when the body is literally
+        # empty, but gpt-4o-mini still occasionally bails on short or
+        # cryptic content (e.g. immigration acronyms like "pgwp" /
+        # "workpwrmit" — caught 2026-05-18, gmail msg 19e3cea85b2c9bcf
+        # where the body was the literal string the user had typed but
+        # the model returned "(no body)"). When that happens, swap in
+        # a deterministic fallback that quotes the sender's actual text
+        # so the user always sees what they wrote. Catches single-email
+        # case; batch case is rarer and the per-email gist guards itself.
+        text = _guard_summary_against_no_body(text, emails)
+
         model_used = model_choice
 
         # Wrap the LLM body with a Gmail-flavoured header so the chat
@@ -954,6 +968,46 @@ def _compose_email_chat_card(
         f"{preview}\n\n"
         f"{summary_body.strip()}"
     )
+
+
+_NO_BODY_OUTPUTS = {
+    "(no body)",
+    "no body",
+    "(no body.)",
+    "no body.",
+    "(empty)",
+    "the body is empty",
+    "the email body is empty",
+    "there is no body",
+}
+
+
+def _guard_summary_against_no_body(
+    summary: str, emails: list[_FetchedEmail],
+) -> str:
+    """If the LLM emitted a "(no body)"-shaped response but we hold
+    real body text, replace the response with a deterministic quote of
+    what the sender wrote. Trust the source of truth (the fetched
+    Gmail body) over the model's interpretation.
+
+    Single-email only — batch summaries get one combined response and
+    almost never trip this case in practice; if they do, the user can
+    still see per-email previews above the summary block.
+    """
+    if not emails or len(emails) != 1:
+        return summary
+    stripped = (summary or "").strip().lower().rstrip(".!")
+    if stripped not in _NO_BODY_OUTPUTS:
+        return summary
+    e = emails[0]
+    body_text = (e.body or e.snippet or "").strip()
+    if not body_text:
+        # LLM was right — body really is empty. Pass through.
+        return summary
+    # Trim to a one-card-sized excerpt; the trigger surface is a
+    # notification, not a full read pane.
+    excerpt = body_text if len(body_text) <= 400 else body_text[:400] + "…"
+    return excerpt
 
 
 def _sender_display(raw: str) -> str:
