@@ -253,6 +253,16 @@ class TriggerEvent(Base):
         nullable=True,
     )
 
+    # Soft pointer to the mirrored ``build_jobs`` row created at
+    # intake time (PR 4a of the unified-jobs arc). No FK — same
+    # precedent as ``cron_jobs.migrated_to_routine_id``: the linkage
+    # survives a future Phase-D drop of this table without CASCADE
+    # firing on the Job side. Populated by
+    # ``triggers_inbound._idempotent_insert``; consumed by the
+    # runner's status-sync path so the Job row mirrors terminal
+    # state on the legacy row.
+    job_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
     __table_args__ = (
         # The actual idempotency gate. The runner does
         # `INSERT … ON CONFLICT DO NOTHING` keyed on this pair before

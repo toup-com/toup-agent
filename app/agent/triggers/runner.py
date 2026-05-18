@@ -281,6 +281,78 @@ class TriggerRunner:
         # with no error context. Idempotent / race-safe inside.
         await self._finalise_exhausted(event_id, last_error_text or "unknown")
 
+    async def _mirror_event_terminal_to_job(
+        self,
+        db,
+        *,
+        event_id: str,
+        terminal_status: str,
+        error_class: Optional[str] = None,
+        error_detail: Optional[str] = None,
+        summary_message_id: Optional[str] = None,
+        finished_at: Optional[datetime] = None,
+    ) -> None:
+        """Mirror a TriggerEvent's terminal state onto its linked
+        ``build_jobs`` row (PR 4a of the unified-jobs arc).
+
+        TriggerEvent has more granular statuses than BuildJob — the
+        BuildJob enum is the closed ``queued/running/completed/failed``
+        set, with the per-source granularity living on
+        ``BuildJob.outcome``. Mapping:
+
+          success          → status='completed', outcome='success'
+          failed           → status='failed',    outcome=NULL
+          skipped_rate_limit → status='completed', outcome='skipped_rate_limit'
+          skipped_filter   → status='completed', outcome='skipped_filter'
+          coalesced        → status='completed', outcome='coalesced'
+
+        If the TriggerEvent row has no ``job_id`` (legacy events from
+        before PR 4a, or a Job-mint failure at intake), this is a
+        no-op — the legacy fire path still works without the mirror.
+        Best-effort: any exception is logged and swallowed so a mirror
+        failure can't fail the handler.
+        """
+        from app.db.models import BuildJob, TriggerEvent
+        try:
+            ev = await db.get(TriggerEvent, event_id)
+            if ev is None or ev.job_id is None:
+                return  # no Job to mirror to — silent no-op
+            if terminal_status == "success":
+                job_status, job_outcome = "completed", "success"
+            elif terminal_status == "failed":
+                job_status, job_outcome = "failed", None
+            elif terminal_status in (
+                "skipped_rate_limit", "skipped_filter", "coalesced",
+            ):
+                job_status, job_outcome = "completed", terminal_status
+            else:
+                # Unknown enum value — be conservative: mark completed
+                # with the raw value as outcome so we can audit later.
+                job_status, job_outcome = "completed", terminal_status
+            values: dict[str, Any] = {
+                "status": job_status,
+                "outcome": job_outcome,
+                "completed_at": finished_at or datetime.utcnow(),
+            }
+            if error_detail and job_status == "failed":
+                # ``error_message`` is the BuildJob-side equivalent of
+                # TriggerEvent.error_detail. Mirror it so the dashboard
+                # can render a single attribution either way.
+                values["error_message"] = (error_detail or "")[:1000]
+            if summary_message_id and job_status == "completed":
+                values["summary_message_id"] = summary_message_id
+            await db.execute(
+                update(BuildJob)
+                .where(BuildJob.id == ev.job_id)
+                .values(**values)
+            )
+        except Exception as e:
+            logger.warning(
+                "[trigger_runner] mirror_to_job failed event_id=%s err=%s "
+                "(legacy fire path unaffected)",
+                event_id, e,
+            )
+
     async def _finalise_exhausted(self, event_id: str, error_detail: str) -> None:
         """Mark a ``TriggerEvent`` as failed after the retry loop in
         ``_handle_event_with_retry`` exhausts. Idempotent and race-safe:
@@ -309,6 +381,14 @@ class TriggerRunner:
                     error_detail=error_detail[:1000],
                     finished_at=now,
                 )
+            )
+            await self._mirror_event_terminal_to_job(
+                db,
+                event_id=event_id,
+                terminal_status="failed",
+                error_class="all_retries_exhausted",
+                error_detail=error_detail,
+                finished_at=now,
             )
             trigger = await db.get(Trigger, ev.trigger_id)
             if trigger is not None:
@@ -350,6 +430,13 @@ class TriggerRunner:
                 ev.status = "skipped_filter"
                 ev.error_class = "trigger_missing_or_disabled"
                 ev.finished_at = datetime.utcnow()
+                await self._mirror_event_terminal_to_job(
+                    db,
+                    event_id=event_id,
+                    terminal_status="skipped_filter",
+                    error_class="trigger_missing_or_disabled",
+                    finished_at=ev.finished_at,
+                )
                 await db.commit()
                 return True
 
@@ -362,6 +449,7 @@ class TriggerRunner:
         if decision.action == "coalesce":
             # Mark this event coalesced; the in-flight parent will
             # pick it up via limiter.drain_coalesced when it runs.
+            _now = datetime.utcnow()
             async with self._session_maker() as db:
                 await db.execute(
                     update(TriggerEvent)
@@ -369,9 +457,13 @@ class TriggerRunner:
                     .values(
                         status="coalesced",
                         coalesced_into_event_id=decision.parent_event_id,
-                        started_at=datetime.utcnow(),
-                        finished_at=datetime.utcnow(),
+                        started_at=_now,
+                        finished_at=_now,
                     )
+                )
+                await self._mirror_event_terminal_to_job(
+                    db, event_id=event_id, terminal_status="coalesced",
+                    finished_at=_now,
                 )
                 await db.commit()
             logger.info(
@@ -381,6 +473,8 @@ class TriggerRunner:
             return True
 
         if decision.action == "rate_limit":
+            _now = datetime.utcnow()
+            _detail = f"fires_in_window={decision.fires_in_window}"
             async with self._session_maker() as db:
                 await db.execute(
                     update(TriggerEvent)
@@ -388,10 +482,17 @@ class TriggerRunner:
                     .values(
                         status="skipped_rate_limit",
                         error_class=decision.reason,
-                        error_detail=f"fires_in_window={decision.fires_in_window}",
-                        started_at=datetime.utcnow(),
-                        finished_at=datetime.utcnow(),
+                        error_detail=_detail,
+                        started_at=_now,
+                        finished_at=_now,
                     )
+                )
+                await self._mirror_event_terminal_to_job(
+                    db, event_id=event_id,
+                    terminal_status="skipped_rate_limit",
+                    error_class=decision.reason,
+                    error_detail=_detail,
+                    finished_at=_now,
                 )
                 await db.commit()
             logger.info(
@@ -413,6 +514,8 @@ class TriggerRunner:
 
         handler = KIND_HANDLERS.get(trigger.kind)
         if handler is None:
+            _now = datetime.utcnow()
+            _detail = f"no handler for kind={trigger.kind!r}"
             async with self._session_maker() as db:
                 await db.execute(
                     update(TriggerEvent)
@@ -420,9 +523,15 @@ class TriggerRunner:
                     .values(
                         status="failed",
                         error_class="no_handler",
-                        error_detail=f"no handler for kind={trigger.kind!r}",
-                        finished_at=datetime.utcnow(),
+                        error_detail=_detail,
+                        finished_at=_now,
                     )
+                )
+                await self._mirror_event_terminal_to_job(
+                    db, event_id=event_id, terminal_status="failed",
+                    error_class="no_handler",
+                    error_detail=_detail,
+                    finished_at=_now,
                 )
                 await db.commit()
             self._limiter.release(trigger.id)
@@ -479,15 +588,32 @@ class TriggerRunner:
                     "status": final,
                     "finished_at": now,
                 }
+                _summary_msg_for_mirror: Optional[str] = None
+                _err_class_for_mirror: Optional[str] = None
+                _err_detail_for_mirror: Optional[str] = None
                 if result.summary_message_id and final == "success":
                     values["summary_message_id"] = result.summary_message_id
+                    _summary_msg_for_mirror = result.summary_message_id
                 if final != "success" and result.error_class:
                     values["error_class"] = result.error_class
                     values["error_detail"] = (result.error_detail or "")[:1000]
+                    _err_class_for_mirror = result.error_class
+                    _err_detail_for_mirror = result.error_detail or ""
                 await db.execute(
                     update(TriggerEvent)
                     .where(TriggerEvent.id == batch_ev.id)
                     .values(**values)
+                )
+                # Mirror this event's terminal state onto its
+                # linked BuildJob (PR 4a unified-jobs arc).
+                await self._mirror_event_terminal_to_job(
+                    db,
+                    event_id=batch_ev.id,
+                    terminal_status=final,
+                    error_class=_err_class_for_mirror,
+                    error_detail=_err_detail_for_mirror,
+                    summary_message_id=_summary_msg_for_mirror,
+                    finished_at=now,
                 )
 
             # ── 6. Update parent trigger.last_* fields ──

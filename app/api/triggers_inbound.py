@@ -52,7 +52,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -346,6 +346,47 @@ async def _idempotent_insert(
 
     if inserted_id is None:
         return "dedupe_hit"
+
+    # ── Unified-jobs dual-write (PR 4a) ──────────────────────────
+    # Mint a parallel BuildJob row so every TriggerEvent has a
+    # mirrored Job that the activity feed in PR 6 can JOIN against.
+    # Idempotency key = event_dedupe_id; source_id = trigger_id.
+    # This mirrors the existing UNIQUE (trigger_id, event_dedupe_id)
+    # on trigger_events: any racing call producing the same pair
+    # gets a single Job back, never duplicates. Stamp
+    # ``trigger_events.job_id`` so the runner's status-sync path
+    # can update both rows when the handler terminates.
+    #
+    # Best-effort: a failed Job mint must NOT roll back the
+    # TriggerEvent insert. The legacy fire path still works; we
+    # just lose the Job linkage for this one event.
+    try:
+        from app.agent.job_runner import JobRunner, TaskSpec
+        runner = JobRunner()
+        spec = TaskSpec(
+            user_id=user_id,
+            channel="trigger",
+            source_kind="trigger",
+            source_id=trigger_id,
+        )
+        job = await runner.create_job(
+            job_type="trigger_run",
+            spec=spec,
+            title=f"Trigger fire: {event_dedupe_id[:40]}",
+            idempotency_key=event_dedupe_id,
+        )
+        await db.execute(
+            sa_update(TriggerEvent)
+            .where(TriggerEvent.id == str(inserted_id))
+            .values(job_id=job.id)
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(
+            "[trigger_inbound] Job dual-write failed for event=%s: %s "
+            "(legacy fire path unaffected)",
+            inserted_id, e,
+        )
 
     # Fire-and-forget runner hand-off. The event is in 'queued' state
     # in the DB; the runner picks it up, applies rate/coalesce/filter,
