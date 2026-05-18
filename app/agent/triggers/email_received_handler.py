@@ -658,13 +658,25 @@ class EmailReceivedHandler:
                 errors[ev.id] = type(e).__name__
                 continue
 
-            headers = _flatten_headers(data)
+            # The Gmail connector returns a pre-flattened envelope:
+            # {headers: {From,Subject,...}, body, snippet, labelIds}.
+            # Raw Gmail REST is {payload.headers: [{name,value}], ...}.
+            # Detect which one and read accordingly.
+            raw_headers = data.get("headers")
+            if isinstance(raw_headers, dict):
+                headers = dict(raw_headers)
+                body_text = (data.get("body") or "").strip() \
+                    or (data.get("snippet") or "")
+            else:
+                headers = _flatten_headers(data)
+                body_text = _extract_body(data) or data.get("snippet") or ""
+
             fetched.append(_FetchedEmail(
                 event_id=ev.id,
                 gmail_id=gmail_id,
                 headers=headers,
                 snippet=data.get("snippet") or "",
-                body=_extract_body(data) or data.get("snippet") or "",
+                body=body_text,
                 labels=list(data.get("labelIds") or []),
                 raw_message=data,
             ))

@@ -185,6 +185,7 @@ class GmailProvider(BaseConnectorProvider):
                     "headers": headers,
                     "snippet": result.get("snippet"),
                     "body": body_text,
+                    "labelIds": result.get("labelIds") or [],
                 }))
 
             if tool_name == "gmail__send_message":

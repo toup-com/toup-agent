@@ -129,10 +129,28 @@ def matches_filter(
 
 
 def _flatten_headers(message: dict[str, Any]) -> dict[str, str]:
-    """Gmail returns headers as a list of `{name, value}` dicts.
-    Flatten to a name→value dict (lowercased keys for case-insensitive
-    lookup, since 'From' / 'FROM' / 'from' all show up in the wild)."""
+    """Return a lowercased name→value header dict from either of the
+    two production shapes:
+
+      A. Connector envelope — `message["headers"]` is already a flat
+         dict with capitalised RFC 5322 names. Hot path for live
+         trigger fires (gmail/provider.py:gmail__get_message).
+      B. Raw Gmail REST response — `message["payload"]["headers"]` is
+         a list of `{name, value}` dicts. Synthesised test events.
+
+    Lowercase the keys so callers can use `headers["from"]` /
+    `headers["subject"]` without per-call case-juggling.
+    """
     out: dict[str, str] = {}
+    raw = message.get("headers")
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if not k:
+                continue
+            lk = str(k).lower()
+            if lk not in out:
+                out[lk] = v or ""
+        return out
     payload = message.get("payload") or {}
     for h in payload.get("headers") or []:
         n = (h.get("name") or "").lower()
