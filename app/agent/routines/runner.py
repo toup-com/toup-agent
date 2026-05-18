@@ -258,13 +258,41 @@ class RoutineRunner:
 
         Order matters: sweep BEFORE registering so a routine that orphaned
         last boot doesn't get a fresh fire while its old run row is still
-        'running'."""
+        'running'.
+
+        Per-routine registration failures are caught and logged so one
+        bad row (missing tz, malformed schedule, APScheduler refusing
+        the trigger expression) does NOT prevent the runner from
+        starting and registering the rest. set_runner_ref must run for
+        /api/routines GET to render — a fail-fast here was producing
+        runner_not_started + every /api/routines call 500ing on the
+        dashboard for the affected tenant. Caught 2026-05-18.
+        """
         swept = await self._restart_sweep()
-        routines = await self._load_enabled_routines()
+        try:
+            routines = await self._load_enabled_routines()
+        except Exception as e:
+            logger.exception(
+                "[routine_runner] load_enabled_routines failed: %s — "
+                "starting with empty schedule, /_reload_all can recover",
+                e,
+            )
+            routines = []
         tz_fallbacks = 0
+        register_errors = 0
         for r in routines:
-            if await self._register_trigger_for(r) == "utc_fallback":
-                tz_fallbacks += 1
+            try:
+                if await self._register_trigger_for(r) == "utc_fallback":
+                    tz_fallbacks += 1
+            except Exception as e:
+                register_errors += 1
+                logger.exception(
+                    "[routine_runner] register_trigger crash routine_id=%s "
+                    "kind=%s — skipping this routine, continuing with rest: %s",
+                    getattr(r, "id", "?"),
+                    getattr(r, "kind", "?"),
+                    e,
+                )
         if not self.scheduler.running:
             self.scheduler.start()
         # Periodic reconciler — backstop for any in-memory↔DB drift

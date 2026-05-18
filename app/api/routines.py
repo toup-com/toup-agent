@@ -485,7 +485,16 @@ async def list_routines():
     most recent 7 runs.
 
     Returns 200 with `[]` (not 404) if the user has zero routines —
-    consumers want an empty list, not an error."""
+    consumers want an empty list, not an error.
+
+    Per-row failures (Pydantic validation on a row whose mig 042 columns
+    haven't been backfilled to a known-good value, etc.) are caught and
+    logged so the rest of the list still renders. This avoids the
+    dashboard's "Internal Server Error" banner on the whole Routines
+    section because one routine row in agent DB has stale state.
+    Diagnosed 2026-05-18: a single bad row in one tenant returned 500
+    on GET / instead of degrading to "empty plus a server-side log."
+    """
     from app.db.database import async_session_maker
     from app.db.models import Routine, RoutineRun
 
@@ -500,14 +509,25 @@ async def list_routines():
 
         out: list[RoutineResponse] = []
         for r in routines:
-            runs_result = await db.execute(
-                select(RoutineRun)
-                .where(RoutineRun.routine_id == r.id)
-                .order_by(desc(RoutineRun.started_at))
-                .limit(7)
-            )
-            recent = list(runs_result.scalars().all())
-            out.append(_row_to_response(r, recent))
+            try:
+                runs_result = await db.execute(
+                    select(RoutineRun)
+                    .where(RoutineRun.routine_id == r.id)
+                    .order_by(desc(RoutineRun.started_at))
+                    .limit(7)
+                )
+                recent = list(runs_result.scalars().all())
+                out.append(_row_to_response(r, recent))
+            except Exception as e:
+                # Pydantic validation failure on a single row OR a runs
+                # query that hit a DB-level constraint. Log loud, drop
+                # this row, keep going. The /api/routines/{id} GET
+                # endpoint will surface the same error per-row for
+                # operators who want to investigate.
+                logger.exception(
+                    "list_routines: skipping routine_id=%s due to render error: %s: %s",
+                    getattr(r, "id", "?"), type(e).__name__, str(e)[:200],
+                )
     return out
 
 

@@ -79,18 +79,17 @@ _REAUTH_NOTICE_CARD = (
 )
 
 
-_SUMMARIZE_SYSTEM_PROMPT = """You are summarising a fresh inbound email (or short burst of them) for the user.
+_SUMMARIZE_SYSTEM_PROMPT = """You write the SUMMARY body of a Gmail notification card. The header (📧 sender + subject) is rendered by the surface; your job is only the bullet-content underneath.
 
 Rules:
-- Open with the absolute essentials: who, what, why it matters.
-- For one email: 2–4 sentence summary + an explicit "Action: …" line ONLY if a reply / deadline / approval is being requested.
-- For multiple emails: open with "You got N new emails." then one bullet per email (sender → one-line gist + action if any).
-- Skip newsletters, promotions, automated noise. Note them as "(N newsletters skipped)".
-- ≤200 words for one email, ≤350 words for a burst. Hard cap 500.
-- Markdown supported — use **bold** for sender names + ⚑ for boss/family/financial/security urgency.
-- No greeting, no sign-off, no "Here is a summary".
+- Tight 1–3 sentence summary of what the email actually says.
+- ONLY include an "Action: …" line when the email explicitly asks for a reply, deadline, approval, or RSVP.
+- Multiple emails: list each as "• <one-line gist>" (sender comes from the header above, don't repeat it).
+- ≤120 words for one email, ≤250 words for a burst. Hard cap 400.
+- Markdown OK for emphasis (**bold** sparingly, ⚑ for boss/family/financial/security).
+- NEVER write "From:", "Subject:", "(unknown)", "Here is a summary", or any opening boilerplate — the header card already covers that.
 
-Never invent details. If the body was empty, say so."""
+Never invent details. If the body is empty, say "(no body)" instead of guessing."""
 
 
 class _ReauthRequired(Exception):
@@ -717,9 +716,19 @@ class EmailReceivedHandler:
 
         model_used = model_choice
 
+        # Wrap the LLM body with a Gmail-flavoured header so the chat
+        # card reads like a notification, not a generic agent reply.
+        # The frontend's markdown renderer turns this into the same
+        # visual structure as the "Latest Gmail" cards from the manual
+        # fetch path. Without this header the trigger output was just
+        # raw bullet text starting with "(unknown) →" which gave the
+        # user no signal it was a Gmail event. Improved 2026-05-18 from
+        # production feedback.
+        content = _compose_email_chat_card(emails, text)
+
         return await self._persist_message(
             trigger=trigger, db=db,
-            content=text,
+            content=content,
             model_used=model_used,
             title_suffix=_compose_title_suffix(emails),
         )
@@ -834,10 +843,26 @@ class EmailReceivedHandler:
 # ── Formatters ────────────────────────────────────────────────────────
 
 
+def _h(headers: dict, key: str, default: str = "") -> str:
+    """Case-insensitive header lookup. Gmail's connector provider
+    returns headers with the canonical capitalised RFC 5322 names
+    (``From``, ``Subject``, ``Date``); the handler used to read with
+    lowercase keys, so every sender/subject came back as the default
+    and the LLM happily included ``(unknown)`` in the summary. Caught
+    2026-05-18 once the end-to-end pipeline finally produced a real
+    chat card and Nariman's barbecue email rendered as
+    ``(unknown) → Informing Ali``. Fixing this in one helper makes the
+    fetch + LLM + notify paths agree."""
+    for k in (key, key.lower(), key.title(), key.upper()):
+        if k in headers:
+            return headers[k] or default
+    return default
+
+
 def _format_one_for_llm(e: _FetchedEmail) -> str:
-    sender = e.headers.get("from", "(unknown)")
-    subject = e.headers.get("subject", "(no subject)")
-    date = e.headers.get("date", "")
+    sender = _h(e.headers, "From", "(unknown sender)")
+    subject = _h(e.headers, "Subject", "(no subject)")
+    date = _h(e.headers, "Date", "")
     body = (e.body or e.snippet or "").strip()
     if len(body) > 2500:
         body = body[:2500] + "…"
@@ -849,8 +874,8 @@ def _format_one_for_llm(e: _FetchedEmail) -> str:
 def _format_batch_for_llm(emails: list[_FetchedEmail]) -> str:
     blocks: list[str] = []
     for e in emails:
-        sender = e.headers.get("from", "(unknown)")
-        subject = e.headers.get("subject", "(no subject)")
+        sender = _h(e.headers, "From", "(unknown sender)")
+        subject = _h(e.headers, "Subject", "(no subject)")
         body = (e.body or e.snippet or "").strip()
         if len(body) > 800:
             body = body[:800] + "…"
@@ -862,8 +887,8 @@ def _format_batch_for_llm(emails: list[_FetchedEmail]) -> str:
 
 
 def _format_one_for_notify(e: _FetchedEmail) -> str:
-    sender = e.headers.get("from", "(unknown)")
-    subject = e.headers.get("subject", "(no subject)")
+    sender = _h(e.headers, "From", "(unknown sender)")
+    subject = _h(e.headers, "Subject", "(no subject)")
     snippet = (e.snippet or "").strip()
     if len(snippet) > 200:
         snippet = snippet[:200] + "…"
@@ -872,11 +897,65 @@ def _format_one_for_notify(e: _FetchedEmail) -> str:
 
 def _compose_title_suffix(emails: list[_FetchedEmail]) -> str:
     if len(emails) == 1:
-        subj = emails[0].headers.get("subject", "(no subject)")
+        subj = _h(emails[0].headers, "Subject", "(no subject)")
         if len(subj) > 60:
             subj = subj[:60] + "…"
         return subj
     return f"{len(emails)} new emails"
+
+
+def _compose_email_chat_card(
+    emails: list[_FetchedEmail], summary_body: str,
+) -> str:
+    """Wrap the LLM-produced summary with a recognisable Gmail header
+    card so the chat surface renders it as a notification, not a
+    formless agent reply. Single email → "📧 **Sender** — Subject"
+    line, then the summary body. Batch → "📧 **N new emails**" line,
+    then a one-line preview per email, then the summary. Markdown is
+    intentionally minimal — the day-chat renderer is what styles it.
+
+    Why a header at all: the trigger card the user saw on first
+    end-to-end fire ("(unknown) → Informing Ali…") had no visible
+    indication it was a Gmail event, no Gmail glyph, no sender name.
+    Pre-pending a structured header gives the renderer the
+    information it needs without changing the storage schema, and the
+    LLM is told (in the system prompt) NOT to repeat any of this.
+    """
+    if not emails:
+        return summary_body
+    if len(emails) == 1:
+        e = emails[0]
+        sender = _sender_display(_h(e.headers, "From", "(unknown sender)"))
+        subject = _h(e.headers, "Subject", "(no subject)").strip() or "(no subject)"
+        return (
+            f"📧 **{sender}** — _{subject}_\n\n"
+            f"{summary_body.strip()}"
+        )
+    # Batch: small one-line preview per email above the bulk summary.
+    preview = "\n".join(
+        f"• **{_sender_display(_h(e.headers, 'From', '(unknown sender)'))}**"
+        f" — _{(_h(e.headers, 'Subject', '(no subject)') or '(no subject)').strip()}_"
+        for e in emails
+    )
+    return (
+        f"📧 **{len(emails)} new emails**\n\n"
+        f"{preview}\n\n"
+        f"{summary_body.strip()}"
+    )
+
+
+def _sender_display(raw: str) -> str:
+    """Strip the email-in-angle-brackets to leave a clean name when
+    Gmail's From header is the canonical ``Name <addr@host>`` form.
+    Fallback: address-as-name if there's no display name."""
+    raw = (raw or "").strip()
+    if "<" in raw and ">" in raw:
+        name = raw.split("<")[0].strip().strip('"').strip("'")
+        if name:
+            return name
+        addr = raw.split("<")[1].split(">")[0].strip()
+        return addr or raw
+    return raw
 
 
 # ── Gmail body extraction ─────────────────────────────────────────────
