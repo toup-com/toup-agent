@@ -623,18 +623,26 @@ class EmailReceivedHandler:
                 continue
 
             try:
-                # The connector provider expects ``message_id``, not
-                # ``id``. Using the wrong param name produced a
-                # ``message_id required`` ConnectorToolError that the
-                # handler caught as a fetch failure — every event in
-                # every batch reached ``all_fetch_failed`` even when
-                # the underlying Gmail message existed. Caught
-                # 2026-05-17 after deploying the structured-error agent
-                # and seeing all_fetch_failed on real arrivals.
-                call_result = await mcp.call_tool(
-                    "gmail__get_message",
-                    {"message_id": gmail_id, "format": "full"},
-                )
+                # FastMCP Client requires ``async with`` to establish
+                # the streamable-HTTP session before call_tool can
+                # round-trip. Without this wrapper every call_tool
+                # raised a "session not started" exception that got
+                # caught generically below as a fetch failure — the
+                # sibling email_briefing handler at routines/
+                # email_briefing_handler.py:469 has had this wrapper
+                # since launch; the trigger handler missed it. Caught
+                # 2026-05-18 after fixing the message_id param and
+                # still seeing every event fail with
+                # all_fetch_failed AND no `tool_called` event landing
+                # on the platform (confirming the call never left the
+                # agent). Param ``message_id`` matches the connector
+                # provider's tool_input schema (was previously ``id``
+                # in the same regression).
+                async with mcp:
+                    call_result = await mcp.call_tool(
+                        "gmail__get_message",
+                        {"message_id": gmail_id},
+                    )
                 data = _unpack_ok(call_result, "gmail__get_message")
             except _ReauthRequired:
                 raise
