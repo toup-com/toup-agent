@@ -499,35 +499,41 @@ async def list_routines():
     from app.db.models import Routine, RoutineRun
 
     user_id = _user_id()
-    async with async_session_maker() as db:
-        result = await db.execute(
-            select(Routine)
-            .where(Routine.user_id == user_id)
-            .order_by(Routine.created_at)
-        )
-        routines = list(result.scalars().all())
+    out: list[RoutineResponse] = []
+    try:
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(Routine)
+                .where(Routine.user_id == user_id)
+                .order_by(Routine.created_at)
+            )
+            routines = list(result.scalars().all())
 
-        out: list[RoutineResponse] = []
-        for r in routines:
-            try:
-                runs_result = await db.execute(
-                    select(RoutineRun)
-                    .where(RoutineRun.routine_id == r.id)
-                    .order_by(desc(RoutineRun.started_at))
-                    .limit(7)
-                )
-                recent = list(runs_result.scalars().all())
-                out.append(_row_to_response(r, recent))
-            except Exception as e:
-                # Pydantic validation failure on a single row OR a runs
-                # query that hit a DB-level constraint. Log loud, drop
-                # this row, keep going. The /api/routines/{id} GET
-                # endpoint will surface the same error per-row for
-                # operators who want to investigate.
-                logger.exception(
-                    "list_routines: skipping routine_id=%s due to render error: %s: %s",
-                    getattr(r, "id", "?"), type(e).__name__, str(e)[:200],
-                )
+            for r in routines:
+                try:
+                    runs_result = await db.execute(
+                        select(RoutineRun)
+                        .where(RoutineRun.routine_id == r.id)
+                        .order_by(desc(RoutineRun.started_at))
+                        .limit(7)
+                    )
+                    recent = list(runs_result.scalars().all())
+                    out.append(_row_to_response(r, recent))
+                except Exception as e:
+                    logger.exception(
+                        "list_routines: skipping routine_id=%s due to render "
+                        "error: %s: %s",
+                        getattr(r, "id", "?"), type(e).__name__, str(e)[:200],
+                    )
+    except Exception as e:
+        # Catastrophic: model column drift, DB unreachable, etc. Return
+        # an empty list with a server-side log instead of bricking the
+        # dashboard Routines panel for everyone. /_runner_status is the
+        # operational source of truth for "is the runner alive" anyway.
+        logger.exception(
+            "list_routines: catastrophic failure (returning []): %s: %s",
+            type(e).__name__, str(e)[:200],
+        )
     return out
 
 
