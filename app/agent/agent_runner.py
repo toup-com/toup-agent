@@ -516,6 +516,23 @@ class AgentRunner:
                 system_prompt += build_today_so_far_block(_day_context["summary"])
                 self._memory_health["today_summary_present"] = True
 
+            # Reply-to directive: if the current user turn carries a <reply_to>
+            # block, reinforce in the system prompt so the model can't fall back
+            # to "most recent topic" when day history dominates the context.
+            # Cheap belt-and-suspenders — checked by literal prefix to avoid
+            # threading another bool parameter from the WS layer.
+            if user_message.lstrip().startswith("<reply_to>"):
+                system_prompt += (
+                    "\n<reply_to_directive>\n"
+                    "The user's latest turn below begins with a "
+                    "<reply_to>…</reply_to> block. That block names the specific "
+                    "earlier message they are replying to. Answer the user's "
+                    "question about THAT quoted message — do NOT substitute "
+                    "another topic from the day's history, even if other "
+                    "topics are more prominent in the recent context.\n"
+                    "</reply_to_directive>\n"
+                )
+
             # F8: Inject <recent_days> recap on day-boundary warm starts.
             # Only fires when today's day-chat is fresh (no rolling summary
             # yet, low message count). Once the day grows its own context,
