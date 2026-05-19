@@ -269,9 +269,31 @@ class TriggerResponse(BaseModel):
     last_handler_status: Optional[str] = None
     recent_events: list[TriggerEventResponse] = Field(default_factory=list)
 
+    # PR 7 of the unified-jobs arc: the last few mirrored BuildJob
+    # rows for this trigger. Each fire (PR 4a wired the dual-write)
+    # produces a parallel Job row in ``build_jobs`` with
+    # ``source_id=trigger.id``. Surfacing them here lets the
+    # Mission Control card render "Last 5 fires" as Job-detail-drawer
+    # links — the activity-feed-from-the-trigger-side equivalent
+    # of PR 6's cross-job feed.
+    recent_jobs: list["TriggerRecentJob"] = Field(default_factory=list)
+
     @field_serializer("last_fired_at", "created_at", "updated_at", when_used="json")
     def _ser_dt(self, v: Optional[datetime]) -> Optional[str]:
         return _utc_iso(v)
+
+
+class TriggerRecentJob(BaseModel):
+    """Compact projection of a recent ``build_jobs`` row mirrored
+    from a TriggerEvent (PR 4a). Only the fields the dashboard card
+    needs to render a "Last fires" list item + link."""
+
+    id: str
+    title: Optional[str] = None
+    status: Optional[str] = None
+    outcome: Optional[str] = None
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
 
 
 def _derive_health(trigger, watch_provisioned: bool) -> str:
@@ -385,7 +407,7 @@ def _derive_health(trigger, watch_provisioned: bool) -> str:
 # ── Response helpers ─────────────────────────────────────────────────
 
 
-def _row_to_response(trigger, recent_events=()) -> TriggerResponse:
+def _row_to_response(trigger, recent_events=(), recent_jobs=()) -> TriggerResponse:
     cfg = trigger.config_json or {}
     ps = trigger.provider_state_json or {}
     delivery = cfg.get("delivery_channels") or ["website"]
@@ -434,6 +456,17 @@ def _row_to_response(trigger, recent_events=()) -> TriggerResponse:
             )
             for e in recent_events
         ],
+        recent_jobs=[
+            TriggerRecentJob(
+                id=j.id,
+                title=j.title,
+                status=j.status,
+                outcome=getattr(j, "outcome", None),
+                created_at=j.created_at,
+                completed_at=j.completed_at,
+            )
+            for j in recent_jobs
+        ],
     )
 
 
@@ -454,7 +487,7 @@ async def list_triggers():
     recent 20 events per trigger. The frontend uses these for the
     Mission Control card grid."""
     from app.db.database import async_session_maker
-    from app.db.models import Trigger, TriggerEvent
+    from app.db.models import BuildJob, Trigger, TriggerEvent
 
     async with async_session_maker() as db:
         rows = (await db.execute(
@@ -467,7 +500,23 @@ async def list_triggers():
                 select(TriggerEvent).where(TriggerEvent.trigger_id == t.id)
                 .order_by(desc(TriggerEvent.received_at)).limit(20)
             )).scalars().all()
-            out.append(_row_to_response(t, recent))
+            # PR 7 of the unified-jobs arc: surface the last 5
+            # mirrored BuildJob rows for this trigger. Each fire
+            # produces a parallel Job (PR 4a dual-write) with
+            # ``source_id=trigger.id``. The dashboard card uses
+            # this for a "Last 5 fires" list of detail-drawer
+            # links — same shape the routine card will get in
+            # this same PR. Best-effort: if the JOIN is empty
+            # (no fires yet, or a tenant pre-dating PR 4a),
+            # ``recent_jobs`` is an empty list — the card hides
+            # the section gracefully.
+            recent_jobs = (await db.execute(
+                select(BuildJob).where(
+                    BuildJob.source_kind == "trigger",
+                    BuildJob.source_id == t.id,
+                ).order_by(desc(BuildJob.created_at)).limit(5)
+            )).scalars().all()
+            out.append(_row_to_response(t, recent, recent_jobs))
     return out
 
 

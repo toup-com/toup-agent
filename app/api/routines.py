@@ -400,12 +400,33 @@ class RoutineResponse(BaseModel):
     updated_at: datetime
     recent_runs: list[RoutineRunResponse] = []
 
+    # PR 7 of the unified-jobs arc: last 5 mirrored BuildJob rows
+    # for this routine (one per fire — the dual-write from PR 4b).
+    # The Mission Control card renders these as a "Last fires"
+    # list linking through to the Job detail drawer. Sibling of
+    # ``TriggerResponse.recent_jobs``.
+    recent_jobs: list["RoutineRecentJob"] = []
+
     @field_serializer(
         "schedule_at", "last_run_at", "next_run_at", "created_at", "updated_at",
         when_used="json",
     )
     def _ser_dt(self, v: Optional[datetime]) -> Optional[str]:
         return _utc_iso(v)
+
+
+class RoutineRecentJob(BaseModel):
+    """Compact projection of a recent ``build_jobs`` row mirrored
+    from a RoutineRun (PR 4b). Sibling of ``TriggerRecentJob`` —
+    same shape so frontend cards can share the rendering
+    component."""
+
+    id: str
+    title: Optional[str] = None
+    status: Optional[str] = None
+    outcome: Optional[str] = None
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
 
 
 def _run_to_response(r) -> RoutineRunResponse:
@@ -432,7 +453,7 @@ def _run_to_response(r) -> RoutineRunResponse:
     )
 
 
-def _row_to_response(routine, recent_runs=()) -> RoutineResponse:
+def _row_to_response(routine, recent_runs=(), recent_jobs=()) -> RoutineResponse:
     # Mig 042 — `getattr(..., default)` for every new column so rows
     # that pre-date the migration (NULL columns) render with sensible
     # defaults. The Optional bits stay None; schedule_kind falls
@@ -460,6 +481,17 @@ def _row_to_response(routine, recent_runs=()) -> RoutineResponse:
         created_at=routine.created_at,
         updated_at=routine.updated_at,
         recent_runs=[_run_to_response(r) for r in recent_runs],
+        recent_jobs=[
+            RoutineRecentJob(
+                id=j.id,
+                title=j.title,
+                status=j.status,
+                outcome=getattr(j, "outcome", None),
+                created_at=j.created_at,
+                completed_at=j.completed_at,
+            )
+            for j in recent_jobs
+        ],
     )
 
 
@@ -513,7 +545,7 @@ async def list_routines():
     on GET / instead of degrading to "empty plus a server-side log."
     """
     from app.db.database import async_session_maker
-    from app.db.models import Routine, RoutineRun
+    from app.db.models import BuildJob, Routine, RoutineRun
 
     user_id = _user_id()
     out: list[RoutineResponse] = []
@@ -535,7 +567,23 @@ async def list_routines():
                         .limit(7)
                     )
                     recent = list(runs_result.scalars().all())
-                    out.append(_row_to_response(r, recent))
+                    # PR 7 of the unified-jobs arc: surface the
+                    # last 5 mirrored BuildJob rows for this routine
+                    # (one per fire — PR 4b dual-write). The
+                    # ``recent_runs`` and ``recent_jobs`` arrays are
+                    # complementary: recent_runs carries the
+                    # routine-specific fields (outcome,
+                    # channel_results, tools_invoked), recent_jobs
+                    # carries the Job-row projection the dashboard
+                    # links to from the unified Jobs surface.
+                    jobs_result = await db.execute(
+                        select(BuildJob).where(
+                            BuildJob.source_kind == "routine",
+                            BuildJob.source_id == r.id,
+                        ).order_by(desc(BuildJob.created_at)).limit(5)
+                    )
+                    recent_jobs = list(jobs_result.scalars().all())
+                    out.append(_row_to_response(r, recent, recent_jobs))
                 except Exception as e:
                     logger.exception(
                         "list_routines: skipping routine_id=%s due to render "
