@@ -1486,6 +1486,18 @@ app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
 app.include_router(ws_browser_router, prefix=settings.api_prefix)
 app.include_router(apps_router, prefix=settings.api_prefix)
+# Unified jobs activity feed (PR 6 of the jobs/tasks/logs arc) —
+# server-side ``GET /apps/jobs/events`` query over job_events JOIN
+# build_jobs. Replaces the dashboard's client-side flatten of
+# BuildJob.steps_json that mis-attributed every entry to the most
+# recent Auto Builder app.
+try:
+    from app.api.jobs_events import router as jobs_events_router
+    app.include_router(
+        jobs_events_router, prefix=f"{settings.api_prefix}/apps/jobs",
+    )
+except ImportError as _e:
+    print(f"⚠️ jobs_events router not loaded: {_e}", flush=True)
 # Netflix streaming (HLS)
 try:
     from app.api.ws_netflix import router as netflix_stream_router
