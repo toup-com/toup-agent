@@ -517,19 +517,31 @@ class AgentRunner:
                 self._memory_health["today_summary_present"] = True
 
             # Reply-to directive: if the current user turn carries a <reply_to>
-            # block, reinforce in the system prompt so the model can't fall back
-            # to "most recent topic" when day history dominates the context.
-            # Cheap belt-and-suspenders — checked by literal prefix to avoid
-            # threading another bool parameter from the WS layer.
-            if user_message.lstrip().startswith("<reply_to>"):
+            # block, mirror the block into the system prompt so even if day
+            # history dominates the model's attention, the quoted content is
+            # also present in the system context. Belt-and-suspenders: the
+            # preamble lives in BOTH the system prompt and the user message.
+            _stripped_um = user_message.lstrip()
+            if _stripped_um.startswith("<reply_to>"):
+                import re as _re
+                _block_match = _re.search(
+                    r"<reply_to>.*?</reply_to>", _stripped_um, _re.DOTALL,
+                )
+                _reply_block = _block_match.group(0) if _block_match else ""
                 system_prompt += (
                     "\n<reply_to_directive>\n"
-                    "The user's latest turn below begins with a "
-                    "<reply_to>…</reply_to> block. That block names the specific "
-                    "earlier message they are replying to. Answer the user's "
-                    "question about THAT quoted message — do NOT substitute "
-                    "another topic from the day's history, even if other "
-                    "topics are more prominent in the recent context.\n"
+                    "CRITICAL FOR THIS TURN ONLY:\n"
+                    "The user's latest message begins with the following "
+                    "reply-to block, which identifies the specific earlier "
+                    "message they are responding to:\n\n"
+                    f"{_reply_block}\n\n"
+                    "Answer the user's question STRICTLY about the quoted "
+                    "message above. Do NOT substitute another topic from the "
+                    "day's history, even if other topics (like prior emails, "
+                    "routines, or earlier conversations) are more prominent "
+                    "in the recent context. If the quoted message is unclear, "
+                    "ask a clarifying question about IT, not about anything "
+                    "else.\n"
                     "</reply_to_directive>\n"
                 )
 
