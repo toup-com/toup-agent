@@ -1338,9 +1338,12 @@ async def ws_chat(
                 _is_system_action = bool(msg.get("system_action"))
 
                 # Cross-channel reply-to: client passes the target message id when
-                # the user used the Reply affordance. Resolve and authorize here so
-                # downstream code can trust the pointer or treat it as missing.
-                # Also keep the row's role/content/timestamp for the LLM preamble.
+                # the user used the Reply affordance. Resolve + authorize, capture
+                # the target's role/content/timestamp so we can render the LLM
+                # preamble even if the DB column isn't there yet (init_db ALTER
+                # may not have run on a freshly-deployed tenant). Specific
+                # columns only — selecting the whole ORM entity would fail when
+                # `reply_to_message_id` is mapped in code but missing in DB.
                 _reply_to_id_raw = msg.get("reply_to_message_id")
                 reply_to_message_id: Optional[str] = None
                 _reply_target_role: Optional[str] = None
@@ -1349,33 +1352,47 @@ async def ws_chat(
                 if _reply_to_id_raw and isinstance(_reply_to_id_raw, str):
                     _candidate = _reply_to_id_raw.strip()
                     if 0 < len(_candidate) <= 50:
+                        logger.info(
+                            "[WS] reply_to received target=%s user=%s",
+                            _candidate[:8], user_id[:8],
+                        )
                         try:
                             from app.db.database import async_session_maker as _rt_sm
                             from app.db.models import Message as _RtMsg, Conversation as _RtConv
                             async with _rt_sm() as _rt_db:
-                                # Authorize: the target must belong to this user
-                                # (any of their conversations is fine — replies
-                                # legitimately span sessions + channels).
                                 _row = (await _rt_db.execute(
-                                    select(_RtMsg)
+                                    select(
+                                        _RtMsg.id,
+                                        _RtMsg.role,
+                                        _RtMsg.content,
+                                        _RtMsg.created_at,
+                                    )
                                     .join(_RtConv, _RtMsg.conversation_id == _RtConv.id)
                                     .where(
                                         _RtMsg.id == _candidate,
                                         _RtConv.user_id == user_id,
                                     )
-                                )).scalar_one_or_none()
+                                )).first()
                                 if _row is not None:
                                     reply_to_message_id = _row.id
                                     _reply_target_role = _row.role
                                     _reply_target_content = _row.content
                                     _reply_target_created_at = _row.created_at
+                                    logger.info(
+                                        "[WS] reply_to authorized target=%s role=%s content_len=%d",
+                                        _candidate[:8], _row.role,
+                                        len(_row.content or ""),
+                                    )
                                 else:
                                     logger.info(
-                                        "[WS] reply_to_message_id %s not owned by user %s — dropping pointer",
+                                        "[WS] reply_to target=%s not owned by user=%s — dropping pointer",
                                         _candidate[:8], user_id[:8],
                                     )
                         except Exception as _rt_err:
-                            logger.warning("[WS] reply_to auth lookup failed: %s", _rt_err)
+                            logger.warning(
+                                "[WS] reply_to auth lookup failed err=%s: %s",
+                                type(_rt_err).__name__, _rt_err,
+                            )
 
                 # ── Persist timezone to User if changed ──
                 # Self-healing: frontend sends tz on every message, we persist it once.
@@ -1547,17 +1564,24 @@ async def ws_chat(
                                     # pull the assistant reply if it exists.
                                     continue
                             _presave_dc_id = await _resolve_day_chat_id_for_now(_presave_db, user_id, tz_override=client_tz)
-                            _new_msg = DbMessage(
-                                # Pin id so a future replay collides via
-                                # primary-key uniqueness if our own check
-                                # races (concurrent retries from one tab).
+                            # Build kwargs defensively: omit reply_to_message_id
+                            # when None so SQLAlchemy doesn't reference the
+                            # column at all (lets regular user messages save
+                            # on tenants where the ALTER hasn't run yet). The
+                            # in-memory preamble below still threads the LLM
+                            # turn regardless of DB persistence — the structured
+                            # pointer is for future history rendering, not the
+                            # current turn.
+                            _msg_kwargs: dict = dict(
                                 id=(_derived_msg_id or str(_uuid.uuid4())),
                                 conversation_id=session_id,
                                 day_chat_id=_presave_dc_id,
                                 role="user",
                                 content=_original_user_text,
-                                reply_to_message_id=reply_to_message_id,
                             )
+                            if reply_to_message_id:
+                                _msg_kwargs["reply_to_message_id"] = reply_to_message_id
+                            _new_msg = DbMessage(**_msg_kwargs)
                             _presave_db.add(_new_msg)
                             # Update conversation timestamp
                             _conv = (await _presave_db.execute(
@@ -1566,7 +1590,36 @@ async def ws_chat(
                             if _conv:
                                 _conv.message_count = (_conv.message_count or 0) + 1
                                 _conv.updated_at = __import__('datetime').datetime.utcnow()
-                            await _presave_db.commit()
+                            try:
+                                await _presave_db.commit()
+                            except Exception as _commit_err:
+                                # Defensive retry: if the ALTER hasn't reached
+                                # this tenant DB yet, Postgres rejects the
+                                # INSERT with "column reply_to_message_id of
+                                # relation messages does not exist". Drop the
+                                # pointer column and retry — the in-memory
+                                # preamble still threads the current turn.
+                                _err_text = str(_commit_err).lower()
+                                if (
+                                    reply_to_message_id
+                                    and "reply_to_message_id" in _err_text
+                                ):
+                                    logger.warning(
+                                        "[WS] reply_to_message_id column missing on this tenant; "
+                                        "saving user message without the structured pointer. "
+                                        "Run init_db / migration 049 to enable persistence.",
+                                    )
+                                    await _presave_db.rollback()
+                                    _msg_kwargs.pop("reply_to_message_id", None)
+                                    _new_msg = DbMessage(**_msg_kwargs)
+                                    _presave_db.add(_new_msg)
+                                    if _conv:
+                                        _conv.message_count = (_conv.message_count or 0) + 1
+                                        _conv.updated_at = __import__('datetime').datetime.utcnow()
+                                        _presave_db.add(_conv)
+                                    await _presave_db.commit()
+                                else:
+                                    raise
                             await _presave_db.refresh(_new_msg)
                             _persisted_user_msg_id = _new_msg.id
                             _persisted_day_chat_id = _presave_dc_id
@@ -1773,8 +1826,9 @@ async def ws_chat(
                 # to `_agent_text` so the model treats the new user turn as a
                 # threaded reply, not a fresh question. Stored content stays
                 # clean — the structured pointer (reply_to_message_id) is what
-                # the frontend renders.
-                if reply_to_message_id and _reply_target_content is not None:
+                # the frontend renders. Runs from in-memory state, so it works
+                # even on tenants where the DB column hasn't landed yet.
+                if _reply_target_content is not None:
                     try:
                         from app.agent.reply_quote import render_reply_preamble
                         _preamble = render_reply_preamble(
@@ -1784,6 +1838,10 @@ async def ws_chat(
                             tz_name=client_tz,
                         )
                         _agent_text = f"{_preamble}\n\n{_agent_text}"
+                        logger.info(
+                            "[WS] reply_to preamble prepended preamble_len=%d agent_text_len=%d user=%s",
+                            len(_preamble), len(_agent_text), user_id[:8],
+                        )
                     except Exception as _rq_err:
                         logger.warning("[WS] reply preamble render failed: %s", _rq_err)
 
