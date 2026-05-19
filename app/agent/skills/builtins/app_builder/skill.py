@@ -766,7 +766,10 @@ class AppBuilderSkill(Skill):
         from app.db.models import App, BuildJob
 
         app_id = str(uuid.uuid4())
-        job_id = str(uuid.uuid4())
+        # job_id is now generated inside JobRunner.create_job (PR 4d
+        # of the unified-jobs arc) — the post-loop ``_job.id`` is the
+        # canonical id used by the background _build_app and the
+        # initial WebSocket broadcast.
         base_slug = _slugify(name)
         from app.agent.app_manager import APPS_DIR as _apps_dir
         # app_dir will be set after slug deduplication below
@@ -796,8 +799,12 @@ class AppBuilderSkill(Skill):
 
             app_dir = os.path.join(_apps_dir, slug)
 
-            # Retry loop: if concurrent build races for the same slug,
-            # the DB unique constraint catches it and we try the next suffix.
+            # Retry loop: if a concurrent build races for the same slug,
+            # the DB unique constraint catches it and we try the next
+            # suffix. We commit ONLY the App row here so the slug
+            # retry can rollback cleanly; the BuildJob is minted just
+            # after via ``JobRunner.create_job`` (PR 4d of the unified-
+            # jobs arc), with the post-retry slug carried through.
             _slug_committed = False
             for _slug_retry in range(5):
                 app = App(
@@ -811,17 +818,6 @@ class AppBuilderSkill(Skill):
                     platforms=",".join(platforms),
                 )
                 db.add(app)
-                job = BuildJob(
-                    id=job_id,
-                    user_id=user_id,
-                    app_id=app_id,
-                    job_type="auto_builder",
-                    title=f"Build: {name}",
-                    prompt=description,
-                    status="queued",
-                    steps_json=json.dumps(self._initial_steps()),
-                )
-                db.add(job)
                 try:
                     await db.commit()
                     _slug_committed = True
@@ -831,11 +827,44 @@ class AppBuilderSkill(Skill):
                     slug = f"{base_slug}-{_slug_retry + 2}"
                     app_dir = os.path.join(_apps_dir, slug)
                     app_id = str(uuid.uuid4())
-                    job_id = str(uuid.uuid4())
                     logger.warning("[BUILD] Slug collision on '%s', retrying with '%s'", base_slug, slug)
 
             if not _slug_committed:
                 return f"Failed to create app — slug collision after 5 retries for '{base_slug}'"
+
+        # ── Unified-jobs intake (PR 4d) ──────────────────────────
+        # Mint the BuildJob through ``JobRunner.create_job`` so the
+        # unified-arc columns are populated:
+        #   - source_kind='app_builder_skill' (distinct from
+        #     'manual' / 'chat_intent' / 'trigger' / 'routine').
+        #   - source_id=app.id — the App row is the "origin" the
+        #     activity feed can link back to.
+        #   - idempotency_key=slug — the user's plan called this out;
+        #     belt-and-braces protection if a retry somehow runs
+        #     create_job twice for the same slug.
+        # Behavior preserved: status='queued' (legitimate — the
+        # build runs through phases sequentially via the background
+        # ``_build_app`` task), steps_json populated with the 8
+        # initial phases, layer=1 (auto_builder default).
+        from app.agent.job_runner import JobRunner, TaskSpec
+        _spec = TaskSpec(
+            user_id=user_id,
+            channel="app_builder",
+            source_kind="app_builder_skill",
+            source_id=app_id,
+        )
+        _job = await JobRunner().create_job(
+            job_type="auto_builder",
+            spec=_spec,
+            title=f"Build: {name}",
+            prompt=description,
+            status="queued",
+            steps_json=json.dumps(self._initial_steps()),
+            app_id=app_id,
+            idempotency_key=slug,
+            layer=1,
+        )
+        job_id = _job.id
 
         # Broadcast initial job_update immediately (before background task starts)
         if self._ws_broadcast:
