@@ -59,18 +59,26 @@ def render_reply_preamble(
     target_created_at: Optional[datetime] = None,
     tz_name: Optional[str] = None,
 ) -> str:
-    """Render the ``[Replying to …]`` line that prefixes a replying turn.
+    """Render the quoted-reply block that prefixes a replying turn.
 
-    Mirrors the pattern Telegram's ``_extract_reply_context`` already uses
-    so the LLM sees one consistent shape regardless of which channel the
-    user replied from.
+    Uses XML-style tags rather than the looser ``[Replying to …]`` inline
+    form because frontier models attend to tagged blocks much more
+    reliably than to bracketed prose buried in a paragraph. The user's
+    actual question follows the block, separated by a blank line, so the
+    model treats the quoted content as context for that question.
     """
     quote = _format_quote_excerpt(target_content)
     who = "your earlier message" if target_role == "assistant" else "their earlier message"
     time_str = _format_local_time(target_created_at, tz_name)
-    if time_str:
-        return f'[Replying to {who} at {time_str}: "{quote}"]'
-    return f'[Replying to {who}: "{quote}"]'
+    when = f" sent at {time_str}" if time_str else ""
+    return (
+        "<reply_to>\n"
+        f"The user is directly replying to {who}{when}. "
+        f"Their question below is about THIS specific message, not earlier "
+        f"unrelated topics in the day. Quoted content:\n"
+        f'"""\n{quote}\n"""\n'
+        "</reply_to>"
+    )
 
 
 async def fetch_reply_targets(
