@@ -4085,9 +4085,22 @@ const _webDb = {
         status: str,
         detail: Optional[str] = None,
     ):
-        """Update a step in the build job and broadcast via WebSocket."""
+        """Update a step in the build job and broadcast via WebSocket.
+
+        PR 5 of the unified-jobs arc: in addition to the existing
+        ``steps_json`` mutation, dual-write to ``job_events`` so
+        the activity feed in PR 6 can JOIN against per-phase rows
+        instead of flattening ``BuildJob.steps_json`` client-side.
+
+        Event kind mapping:
+          status='running'  → kind='phase_started'
+          status='done'     → kind='phase_completed', status='done'
+          status='failed'   → kind='phase_completed', status='failed'
+        """
         from app.db.database import async_session_maker
-        from app.db.models import BuildJob
+        from app.db.models import BuildJob, JobEvent
+
+        duration_ms_for_event: Optional[int] = None
 
         async with async_session_maker() as db:
             job = await db.get(BuildJob, job_id)
@@ -4108,7 +4121,10 @@ const _webDb = {
                         if started:
                             try:
                                 start_dt = datetime.fromisoformat(started)
-                                s["duration_ms"] = int((datetime.utcnow() - start_dt).total_seconds() * 1000)
+                                duration_ms_for_event = int(
+                                    (datetime.utcnow() - start_dt).total_seconds() * 1000
+                                )
+                                s["duration_ms"] = duration_ms_for_event
                             except Exception:
                                 pass
                     step_dict = s
@@ -4118,6 +4134,44 @@ const _webDb = {
                 job.status = "running"
 
             job.steps_json = json.dumps(steps)
+
+            # ── Dual-write to job_events (PR 5) ────────────────
+            # One row per phase transition. ``label`` is the
+            # human-readable phase title from _initial_steps;
+            # ``metadata_json`` carries phase_type and duration_ms
+            # so the activity feed can render "Installing
+            # dependencies — done (12.3s)" without parsing the
+            # legacy ``steps_json`` blob.
+            #
+            # Best-effort: a failed insert is logged and the
+            # primary ``steps_json`` mutation still commits — the
+            # activity feed gracefully degrades, no build breakage.
+            try:
+                if status == "running":
+                    event_kind = "phase_started"
+                else:
+                    event_kind = "phase_completed"
+                event_meta: dict = {"phase_type": step_type}
+                if duration_ms_for_event is not None:
+                    event_meta["duration_ms"] = duration_ms_for_event
+                if detail:
+                    event_meta["detail"] = detail
+                db.add(JobEvent(
+                    job_id=job_id,
+                    user_id=user_id,
+                    kind=event_kind,
+                    label=(step_dict or {}).get("label") or step_type,
+                    status=status,
+                    level="error" if status == "failed" else "info",
+                    metadata_json=json.dumps(event_meta),
+                ))
+            except Exception as e:
+                logger.warning(
+                    "[BUILD_STEP] job_events write failed job=%s step=%s status=%s err=%s "
+                    "(steps_json still committed; feed gracefully degrades)",
+                    job_id[:8], step_type, status, e,
+                )
+
             await db.commit()
 
         if self._ws_broadcast and step_dict:
