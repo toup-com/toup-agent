@@ -111,6 +111,15 @@ class Settings(BaseSettings):
     # Frontend has its own localStorage gate (TOUP_DOC_ATTACHMENTS) for the two-pane UI.
     # Default ON as of the doc-delivery rollout — disable via FEATURE_DOC_GENERATION=false.
     feature_doc_generation: bool = True
+
+    # PR 8 of the unified-jobs arc: when True, every Auto Builder
+    # job completion (success or failure) writes one Message into
+    # the user's current-day Conversation with channel='app_builder'.
+    # The Mission Control card's "Built X" terminal step is replaced
+    # by a single timeline entry the user sees in Day-as-Chat
+    # alongside their other agent surfaces. Default OFF — the
+    # operator flips this on in a follow-up commit after smoke.
+    feature_auto_builder_chat_output: bool = False
     # Storage backend for generated files. "local" writes to {agent_workspace_dir}/generated/.
     # "s3" is stubbed for a follow-up PR.
     files_storage_backend: str = "local"

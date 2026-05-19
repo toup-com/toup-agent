@@ -2446,6 +2446,19 @@ class AppBuilderSkill(Skill):
                     job.model = _actual_model
                     await db.commit()
 
+            # PR 8 unified-jobs arc: optionally post a single
+            # completion message into Day-as-Chat (feature-flagged,
+            # default OFF). Stamps ``BuildJob.summary_message_id``
+            # for the activity-feed link-through.
+            await self._post_completion_to_day_chat(
+                job_id=job_id,
+                user_id=user_id,
+                app_id=app_id,
+                app_name=name,
+                slug=slug,
+                terminal_status="completed",
+            )
+
             # Broadcast job completion so Jobs panel updates without polling
             if self._ws_broadcast:
                 await self._ws_broadcast(user_id, {
@@ -4195,6 +4208,111 @@ const _webDb = {
         elif not step_dict:
             print(f"[BUILD_STEP] step_dict is None for step_type={step_type} in job={job_id[:8]}", flush=True)
 
+    async def _post_completion_to_day_chat(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        app_id: str,
+        app_name: str,
+        slug: str,
+        terminal_status: str,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Write one Message into the user's current-day Conversation
+        with ``channel='app_builder'``, summarising the build outcome.
+
+        PR 8 of the unified-jobs arc. Gated behind
+        ``settings.feature_auto_builder_chat_output`` — default OFF.
+        Operator flips this on in a follow-up after smoke.
+
+        Best-effort: a write failure does NOT fail the build. The Job
+        is already in its terminal status by the time this runs;
+        Day-as-Chat is the user-facing surface, not the source of
+        truth. If the post fails, the Mission Control card still
+        renders correctly off the BuildJob row.
+
+        Side-effect: stamps ``BuildJob.summary_message_id`` so the
+        unified Jobs activity feed (PR 6) can link the user from
+        the timeline entry back to the rich detail drawer.
+        """
+        from app.config import settings
+        if not getattr(settings, "feature_auto_builder_chat_output", False):
+            return  # flag-gated; no-op until operator flips
+        try:
+            from app.agent.conversation_resolver import (
+                resolve_or_create_day_conversation,
+            )
+            from app.db.database import async_session_maker
+            from app.db.message_helpers import resolve_day_chat_id_for_now
+            from app.db.models import App, BuildJob, DayChat, Message
+
+            # Compose body from the BuildJob + App rows. Keep it
+            # short — the user sees this as a single timeline entry,
+            # not a full report.
+            async with async_session_maker() as db:
+                app = await db.get(App, app_id)
+                publish_url = getattr(app, "publish_url", None) if app else None
+                github_url = getattr(app, "github_url", None) if app else None
+
+            if terminal_status == "completed":
+                lines = [f"✅ Built **{app_name}**"]
+                if publish_url:
+                    lines.append(f"Preview: {publish_url}")
+                if github_url:
+                    lines.append(f"GitHub: {github_url}")
+                content = "\n".join(lines)
+            else:
+                # Trim error to one line max; full error stays on
+                # BuildJob.error_message for the detail drawer.
+                err_short = (error_message or "Build failed").splitlines()[0][:200]
+                content = f"❌ Build failed: **{app_name}** — {err_short}"
+
+            async with async_session_maker() as db:
+                day_chat_id = await resolve_day_chat_id_for_now(db, user_id)
+                conv = await resolve_or_create_day_conversation(
+                    db,
+                    user_id=user_id,
+                    day_chat_id=day_chat_id,
+                    channel="app_builder",
+                    title=f"App Builder: {app_name}",
+                    metadata={"app_id": app_id, "slug": slug, "job_id": job_id},
+                )
+                msg_id = str(uuid.uuid4())
+                msg = Message(
+                    id=msg_id,
+                    conversation_id=conv.id,
+                    day_chat_id=day_chat_id,
+                    role="assistant",
+                    content=content,
+                    channel="app_builder",
+                    source="app_builder",
+                )
+                db.add(msg)
+                await db.flush()
+                if day_chat_id:
+                    dc = await db.get(DayChat, day_chat_id)
+                    if dc:
+                        dc.message_count = (dc.message_count or 0) + 1
+                        dc.last_message_at = datetime.utcnow()
+                # Back-link Job → Message so the unified activity
+                # feed (PR 6) can navigate from the timeline entry
+                # to the rich detail drawer.
+                job_row = await db.get(BuildJob, job_id)
+                if job_row is not None:
+                    job_row.summary_message_id = msg_id
+                await db.commit()
+            logger.info(
+                "[BUILD] day_chat post job_id=%s status=%s msg_id=%s",
+                job_id[:8], terminal_status, msg_id[:8],
+            )
+        except Exception as e:
+            logger.warning(
+                "[BUILD] day_chat post failed job_id=%s status=%s err=%s "
+                "(build outcome unaffected)",
+                job_id[:8], terminal_status, e,
+            )
+
     async def _fail_job(self, job_id: str, app_id: str, error_msg: str):
         """Mark a job as failed, stop processes, and clean up stuck step statuses."""
         from app.db.database import async_session_maker
@@ -4245,6 +4363,27 @@ const _webDb = {
                     import os
                     os.makedirs(app.app_dir, exist_ok=True)
                 await db.commit()
+            # Capture user_id / name / slug for the Day-as-Chat post
+            # below (PR 8). _fail_job is called from many sites that
+            # don't carry these — fetch from the rows we just touched.
+            _user_id_for_post: Optional[str] = (
+                getattr(job, "user_id", None) if job else None
+            )
+            _name_for_post: str = (getattr(app, "name", None) or "App") if app else "App"
+            _slug_for_post: str = (getattr(app, "slug", None) or "") if app else ""
+
+        # PR 8 unified-jobs arc: optionally post the failure into
+        # Day-as-Chat (feature-flagged, default OFF). Best-effort.
+        if _user_id_for_post:
+            await self._post_completion_to_day_chat(
+                job_id=job_id,
+                user_id=_user_id_for_post,
+                app_id=app_id,
+                app_name=_name_for_post,
+                slug=_slug_for_post,
+                terminal_status="failed",
+                error_message=error_msg,
+            )
 
         # Broadcast failure so frontend updates without a refresh
         if self._ws_broadcast:
