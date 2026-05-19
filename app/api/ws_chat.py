@@ -304,29 +304,35 @@ async def _detect_and_create_task(
     if not _TASK_INTENT_PATTERN.search(text.strip()):
         return None
 
-    import uuid
-    from app.db.database import async_session_maker
-    from app.db.models import BuildJob
-
-    job_id = str(uuid.uuid4())
     title = text.strip()[:60]
 
-    job = BuildJob(
-        id=job_id,
+    # PR 4c (unified-jobs arc): repoint through ``JobRunner.create_job``
+    # so the new columns are populated for chat-intent tasks.
+    #   - source_kind='chat_intent' (versus 'manual' for dashboard input).
+    #   - source_id = session_id when present — links the task back to
+    #     the chat conversation that spawned it.
+    #   - conversation_id = session_id too — Mission Control reads this
+    #     to show "from chat with ___" attribution.
+    # No idempotency_key: the same text fired twice IS a legitimate
+    # two-task request from the user's perspective.
+    from app.agent.job_runner import JobRunner, TaskSpec
+    spec = TaskSpec(
         user_id=user_id,
-        job_type="agent_task",
-        title=title,
-        prompt=text[:2000],
-        status="running",
-        steps_json="[]",
-        model="",
-        layer=0,
+        channel="chat_intent",
+        source_kind="chat_intent",
+        source_id=session_id,
+        conversation_id=session_id,
     )
     try:
-        async with async_session_maker() as db:
-            db.add(job)
-            await db.commit()
-
+        job = await JobRunner().create_job(
+            job_type="agent_task",
+            spec=spec,
+            title=title,
+            prompt=text[:2000],
+            status="running",
+            layer=0,
+        )
+        job_id = job.id
         # Notify frontend: "Created task → view in Dashboard"
         broadcast_queue.put_nowait({
             "type": "task_created",

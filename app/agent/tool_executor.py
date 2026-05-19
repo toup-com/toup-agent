@@ -3589,9 +3589,6 @@ class ToolExecutor:
     async def _tool_create_job(self, inp: Dict[str, Any]) -> str:
         """Create a new job visible in the dashboard and sidebar."""
         import json as _json, uuid as _uuid
-        from datetime import datetime as _dt
-        from app.db.database import async_session_maker
-        from app.db.models import BuildJob
 
         title = inp.get("title", "").strip()
         if not title:
@@ -3603,7 +3600,6 @@ class ToolExecutor:
         if not user_id:
             return "ERROR: No user context"
 
-        job_id = str(_uuid.uuid4())
         steps = []
         for i, label in enumerate(step_labels):
             steps.append({
@@ -3613,20 +3609,33 @@ class ToolExecutor:
                 "status": "pending",
             })
 
-        async with async_session_maker() as db:
-            job = BuildJob(
-                id=job_id,
-                user_id=user_id,
-                title=title,
-                prompt=description,
-                status="running",
-                steps_json=_json.dumps(steps),
-                model=settings.agent_model,
-                layer=0,  # 0 = agent task (vs 1 = app build)
-                created_at=_dt.utcnow(),
-            )
-            db.add(job)
-            await db.commit()
+        # PR 4c (unified-jobs arc): repoint through ``JobRunner.create_job``
+        # so the new columns are populated for agent-authored tasks.
+        #   - source_kind='manual' — the agent chose to create this
+        #     itself, no upstream event triggered it.
+        #   - conversation_id = current session id when set, so
+        #     Mission Control can show "spawned from chat with ___".
+        # The ``steps`` array the agent supplied lands on
+        # BuildJob.steps_json so the dashboard renders the
+        # pre-declared sub-steps.
+        from app.agent.job_runner import JobRunner, TaskSpec
+        spec = TaskSpec(
+            user_id=user_id,
+            channel="web",
+            source_kind="manual",
+            conversation_id=getattr(self, "_current_session_id", None),
+        )
+        job = await JobRunner().create_job(
+            job_type="agent_task",
+            spec=spec,
+            title=title,
+            prompt=description,
+            status="running",
+            model=settings.agent_model,
+            layer=0,
+            steps_json=_json.dumps(steps),
+        )
+        job_id = job.id
 
         # Broadcast to frontend
         try:

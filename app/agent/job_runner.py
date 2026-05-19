@@ -142,6 +142,9 @@ class JobRunner:
         idempotency_key: Optional[str] = None,
         app_id: Optional[str] = None,
         model: str = "",
+        status: str = "queued",
+        steps_json: Optional[str] = None,
+        layer: int = 1,
     ) -> Any:  # BuildJob — return type imported lazily to keep this
               # module's import surface narrow.
         """Insert a ``BuildJob`` row with the unified-arc columns
@@ -149,11 +152,24 @@ class JobRunner:
         idempotency_key)`` — on conflict, returns the *existing* row
         without writing.
 
+        ``status`` defaults to ``"queued"`` (the production-shaped
+        flow for trigger and routine fires, where the runner picks
+        up the row asynchronously). Agent-task intake paths
+        (dashboard POST, chat-intent regex, ``create_job`` tool)
+        execute inline via ``asyncio.create_task`` and want
+        ``status="running"`` from the start so the dashboard
+        doesn't briefly show "queued."
+
+        ``layer`` defaults to ``1`` (the existing default on the
+        ``BuildJob`` model — auto_builder). Agent-task intake paths
+        pass ``layer=0`` to match their pre-PR-4c behavior.
+
+        ``steps_json`` is for sources that pre-populate phases at
+        create time (``create_job`` tool with a user-supplied
+        ``steps`` array). Defaults to ``"[]"``.
+
         Callers can distinguish "fresh insert" vs "conflict-hit" by
-        comparing the returned row's ``created_at`` to ``now`` or by
-        checking ``status`` (a freshly-inserted row is always
-        ``queued``; a conflict-hit row is whatever its prior life-
-        cycle landed it on)."""
+        comparing the returned row's ``created_at`` to ``now``."""
         from app.db.models import BuildJob
 
         # ── 1. Idempotency conflict short-circuit ────────────────
@@ -185,8 +201,10 @@ class JobRunner:
                 title=title,
                 prompt=prompt if prompt is not None else (spec.prompt or ""),
                 job_type=job_type,
-                status="queued",
+                status=status,
                 model=model,
+                layer=layer,
+                steps_json=steps_json if steps_json is not None else "[]",
                 source_kind=spec.source_kind,
                 source_id=spec.source_id,
                 conversation_id=spec.conversation_id,
@@ -196,8 +214,8 @@ class JobRunner:
             await db.commit()
             await db.refresh(job)
         logger.info(
-            "[job_runner] created job_id=%s job_type=%s source=%s/%s",
-            job_id, job_type, spec.source_kind, spec.source_id,
+            "[job_runner] created job_id=%s job_type=%s status=%s source=%s/%s",
+            job_id, job_type, status, spec.source_kind, spec.source_id,
         )
         return job
 

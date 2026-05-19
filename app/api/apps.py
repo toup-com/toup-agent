@@ -526,25 +526,29 @@ class CreateJobRequest(BaseModel):
 @router.post("/jobs/")
 async def create_job(req: CreateJobRequest) -> JobResponse:
     """Create a new agent task job from the dashboard and execute it."""
-    import uuid
     user_id = _get_user_id()
-    job_id = str(uuid.uuid4())
-    job = BuildJob(
-        id=job_id,
+    # PR 4c (unified-jobs arc): repoint through ``JobRunner.create_job``
+    # so the unified-arc columns (``source_kind``, ``source_id``,
+    # ``conversation_id``, ``idempotency_key``) are populated. Behavior
+    # preservation: status='running' (this path executes inline,
+    # never sits in 'queued'); layer=0 (agent task vs auto_builder=1);
+    # no idempotency_key (dashboard input has no natural dedupe key —
+    # the user clicking "submit" twice creates two distinct jobs).
+    from app.agent.job_runner import JobRunner, TaskSpec
+    spec = TaskSpec(
         user_id=user_id,
+        channel="web",
+        source_kind="manual",
+    )
+    job = await JobRunner().create_job(
         job_type="agent_task",
+        spec=spec,
         title=req.title,
         prompt=req.description or req.title,
         status="running",
-        steps_json="[]",
-        model="",
         layer=0,
-        created_at=datetime.utcnow(),
     )
-    async with async_session_maker() as db:
-        db.add(job)
-        await db.commit()
-        await db.refresh(job)
+    job_id = job.id
 
     # Execute the task via the agent runner in background
     if _agent_runner:
