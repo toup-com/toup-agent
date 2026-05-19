@@ -1337,6 +1337,46 @@ async def ws_chat(
                 # an agent turn without a real user message. Skip presave + user message save.
                 _is_system_action = bool(msg.get("system_action"))
 
+                # Cross-channel reply-to: client passes the target message id when
+                # the user used the Reply affordance. Resolve and authorize here so
+                # downstream code can trust the pointer or treat it as missing.
+                # Also keep the row's role/content/timestamp for the LLM preamble.
+                _reply_to_id_raw = msg.get("reply_to_message_id")
+                reply_to_message_id: Optional[str] = None
+                _reply_target_role: Optional[str] = None
+                _reply_target_content: Optional[str] = None
+                _reply_target_created_at = None
+                if _reply_to_id_raw and isinstance(_reply_to_id_raw, str):
+                    _candidate = _reply_to_id_raw.strip()
+                    if 0 < len(_candidate) <= 50:
+                        try:
+                            from app.db.database import async_session_maker as _rt_sm
+                            from app.db.models import Message as _RtMsg, Conversation as _RtConv
+                            async with _rt_sm() as _rt_db:
+                                # Authorize: the target must belong to this user
+                                # (any of their conversations is fine — replies
+                                # legitimately span sessions + channels).
+                                _row = (await _rt_db.execute(
+                                    select(_RtMsg)
+                                    .join(_RtConv, _RtMsg.conversation_id == _RtConv.id)
+                                    .where(
+                                        _RtMsg.id == _candidate,
+                                        _RtConv.user_id == user_id,
+                                    )
+                                )).scalar_one_or_none()
+                                if _row is not None:
+                                    reply_to_message_id = _row.id
+                                    _reply_target_role = _row.role
+                                    _reply_target_content = _row.content
+                                    _reply_target_created_at = _row.created_at
+                                else:
+                                    logger.info(
+                                        "[WS] reply_to_message_id %s not owned by user %s — dropping pointer",
+                                        _candidate[:8], user_id[:8],
+                                    )
+                        except Exception as _rt_err:
+                            logger.warning("[WS] reply_to auth lookup failed: %s", _rt_err)
+
                 # ── Persist timezone to User if changed ──
                 # Self-healing: frontend sends tz on every message, we persist it once.
                 # If timezone changes from one real value to another, queue a re-bucket.
@@ -1516,6 +1556,7 @@ async def ws_chat(
                                 day_chat_id=_presave_dc_id,
                                 role="user",
                                 content=_original_user_text,
+                                reply_to_message_id=reply_to_message_id,
                             )
                             _presave_db.add(_new_msg)
                             # Update conversation timestamp
@@ -1727,6 +1768,24 @@ async def ws_chat(
                     _chat_task_job_id = await _detect_and_create_task(
                         text, user_id, session_id, broadcast_queue
                     )
+
+                # Reply-to preamble (LLM-only): prepend a short quoted reference
+                # to `_agent_text` so the model treats the new user turn as a
+                # threaded reply, not a fresh question. Stored content stays
+                # clean — the structured pointer (reply_to_message_id) is what
+                # the frontend renders.
+                if reply_to_message_id and _reply_target_content is not None:
+                    try:
+                        from app.agent.reply_quote import render_reply_preamble
+                        _preamble = render_reply_preamble(
+                            target_role=_reply_target_role or "assistant",
+                            target_content=_reply_target_content,
+                            target_created_at=_reply_target_created_at,
+                            tz_name=client_tz,
+                        )
+                        _agent_text = f"{_preamble}\n\n{_agent_text}"
+                    except Exception as _rq_err:
+                        logger.warning("[WS] reply preamble render failed: %s", _rq_err)
 
                 # Run agent — use the modified text for LLM but save the original user text
                 # display_user_message: the clean text to save to DB (no context injection).

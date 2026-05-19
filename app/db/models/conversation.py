@@ -114,6 +114,16 @@ class Message(Base):
     # Processing metadata
     processing_time_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # Soft pointer to the message this row is a direct reply to. Set on
+    # user-originated rows when the user picked a target via the "Reply"
+    # affordance (web/mobile) or replied natively (Telegram, WhatsApp). The
+    # referenced message can live in any session/channel on the same day —
+    # threading spans the whole DayChat. No FK: stale targets stay
+    # readable as deleted-message stubs in the UI rather than vanishing.
+    reply_to_message_id: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True, index=True
+    )
+
     # Rich content metadata (JSON): media cards, tool results, etc.
     metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

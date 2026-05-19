@@ -143,6 +143,23 @@ async def load_day_context(
     )
     rows = result.all()
 
+    # Reply-to: bulk-fetch every distinct target referenced by the day's
+    # rows so we can prepend a quoted preamble without N+1 queries. A
+    # target may live in any session/channel, so we resolve by id alone.
+    _reply_target_ids = [
+        getattr(msg, "reply_to_message_id", None)
+        for (msg, _conv_channel) in rows
+        if getattr(msg, "reply_to_message_id", None)
+    ]
+    _reply_targets: Dict[str, Any] = {}
+    if _reply_target_ids:
+        try:
+            from app.agent.reply_quote import fetch_reply_targets
+            _reply_targets = await fetch_reply_targets(db, _reply_target_ids)
+        except Exception as _rq_err:
+            logger.warning("[day_ctx] reply target fetch failed: %s", _rq_err)
+            _reply_targets = {}
+
     # Build annotated message list
     raw_messages: List[Dict[str, Any]] = []
     annotated_messages: List[Dict[str, Any]] = []
@@ -151,7 +168,27 @@ async def load_day_context(
     for msg, conv_channel in rows:
         if msg.role not in ("user", "assistant"):
             continue
-        raw = {"role": msg.role, "content": msg.content}
+
+        # If this row replies to another, prepend a short quoted preamble
+        # so the LLM sees the threading link instead of two unrelated
+        # turns. UI side reads the structured reply_to_message_id column.
+        _content = msg.content
+        _rt_id = getattr(msg, "reply_to_message_id", None)
+        if _rt_id and _rt_id in _reply_targets:
+            try:
+                from app.agent.reply_quote import render_reply_preamble
+                _target = _reply_targets[_rt_id]
+                _preamble = render_reply_preamble(
+                    target_role=_target.role,
+                    target_content=_target.content,
+                    target_created_at=_target.created_at,
+                    tz_name=tz_name,
+                )
+                _content = f"{_preamble}\n\n{_content}"
+            except Exception:
+                pass
+
+        raw = {"role": msg.role, "content": _content}
         raw_messages.append(raw)
 
         # Annotate with channel and time. resolve_channel prefers the
@@ -162,7 +199,7 @@ async def load_day_context(
             conversation_hint=conv_channel,
             site="history_annotation",
         )
-        annotated_content = annotate_message(msg.content, _msg_channel, msg.created_at, tz_name=tz_name)
+        annotated_content = annotate_message(_content, _msg_channel, msg.created_at, tz_name=tz_name)
         annotated_messages.append({"role": msg.role, "content": annotated_content})
 
     # Estimate total tokens

@@ -634,6 +634,7 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         processing_time_ms=message.processing_time_ms,
         media=msg_metadata.get("media") if msg_metadata else None,
         attachments=attachments_list,
+        reply_to_message_id=getattr(message, "reply_to_message_id", None),
     )
 
     # Enrich job card messages with current BuildJob status

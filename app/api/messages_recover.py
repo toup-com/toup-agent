@@ -187,6 +187,7 @@ async def messages_since(
             "conversation_id": msg.conversation_id,
             "attachments": _serialize_attachments(msg),
             "media": _serialize_media(msg),
+            "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
         }
         for msg, channel in rows
     ])

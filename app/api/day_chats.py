@@ -429,6 +429,7 @@ async def get_day_chat_messages(
                 "attachments": _serialize_attachments(m),
                 "media": _serialize_media(m),
                 "tool_events": _serialize_tool_events(m),
+                "reply_to_message_id": getattr(m, "reply_to_message_id", None),
             }
             for m in messages
         ])
@@ -461,6 +462,7 @@ async def get_day_chat_messages(
             "attachments": _serialize_attachments(msg),
             "media": _serialize_media(msg),
             "tool_events": _serialize_tool_events(msg),
+            "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
         }
         for msg, channel in rows
     ])

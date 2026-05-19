@@ -377,6 +377,12 @@ async def init_db():
         # a single day. See channel_util.resolve_channel.
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS channel VARCHAR(50)",
         "CREATE INDEX IF NOT EXISTS ix_messages_channel ON messages (channel)",
+        # Cross-channel reply-to pointer (migration 049). Soft pointer —
+        # no FK — so cleaning up stale day chats doesn't cascade through
+        # replies. Index lets the frontend resolve a referenced row in
+        # one shot when rendering the quoted-message card.
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_message_id VARCHAR(50)",
+        "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to_message_id)",
         # Idempotent backfill: messages.channel = conversations.channel when
         # messages.channel is NULL. Safe to re-run; WHERE clause prevents
         # re-writing rows that already have a value. Rows where BOTH are

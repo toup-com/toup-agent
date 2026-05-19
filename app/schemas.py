@@ -845,6 +845,11 @@ class ChatMessageResponse(BaseModel):
     job_total_steps: Optional[int] = None
     job_completed_steps: Optional[int] = None
     job_app_id: Optional[str] = None
+    # Cross-channel reply-to (migration 049): soft pointer to a previous
+    # message anywhere in this user's day. Frontend resolves the target
+    # client-side from its in-memory day-chat list and renders a quoted
+    # card on the bubble.
+    reply_to_message_id: Optional[str] = None
 
     class Config:
         from_attributes = True
