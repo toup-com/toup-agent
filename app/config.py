@@ -117,9 +117,11 @@ class Settings(BaseSettings):
     # the user's current-day Conversation with channel='app_builder'.
     # The Mission Control card's "Built X" terminal step is replaced
     # by a single timeline entry the user sees in Day-as-Chat
-    # alongside their other agent surfaces. Default OFF — the
-    # operator flips this on in a follow-up commit after smoke.
-    feature_auto_builder_chat_output: bool = False
+    # alongside their other agent surfaces. Flipped ON post-smoke
+    # so every user sees the new surface; per-tenant override via
+    # the FEATURE_AUTO_BUILDER_CHAT_OUTPUT env var if rollback is
+    # needed before a code revert.
+    feature_auto_builder_chat_output: bool = True
     # Storage backend for generated files. "local" writes to {agent_workspace_dir}/generated/.
     # "s3" is stubbed for a follow-up PR.
     files_storage_backend: str = "local"
