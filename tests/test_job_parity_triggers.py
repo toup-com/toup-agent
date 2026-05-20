@@ -313,11 +313,19 @@ async def test_runner_mirrors_retry_exhaustion_to_job(_seed_user_and_trigger):
 
 
 @pytest.mark.asyncio
-async def test_dual_write_robust_to_job_failure(_seed_user_and_trigger, monkeypatch):
-    """If ``JobRunner.create_job`` raises during intake, the
-    TriggerEvent insert must still succeed. The mirror is
-    best-effort — a failed Job mint must NOT roll back the legacy
-    fire path."""
+async def test_intake_aborts_when_job_mint_fails(_seed_user_and_trigger, monkeypatch):
+    """PR #46 of the unified-jobs arc inverts the dual-write order:
+    ``build_jobs`` is now the source of truth, minted first. If
+    ``JobRunner.create_job`` raises, the whole intake aborts — no
+    legacy ``trigger_events`` row gets written either. Pub/Sub will
+    retry the 5xx and we get another shot. This is the deliberate
+    new contract: a Job exists ⇔ a TriggerEvent exists, with the Job
+    being the canonical reader.
+
+    The previous test (pre-cutover) asserted the legacy fire path
+    still worked when the Job mint failed. That property no longer
+    holds, by design — keeping it would defeat the cutover's
+    invariant that the runner only reads from ``build_jobs``."""
     from app.api.triggers_inbound import _idempotent_insert
     from app.db.database import async_session_maker
     from app.db.models import BuildJob, TriggerEvent
@@ -332,25 +340,21 @@ async def test_dual_write_robust_to_job_failure(_seed_user_and_trigger, monkeypa
     import app.agent.job_runner as jr
     monkeypatch.setattr(jr.JobRunner, "create_job", _explode)
 
-    async with async_session_maker() as db:
-        outcome = await _idempotent_insert(
-            db, trigger_id=TRIGGER_ID, user_id=USER_ID,
-            event_dedupe_id=event_dedupe_id,
-        )
-    assert outcome == "inserted", (
-        "TriggerEvent insert must succeed even if Job mint crashes"
-    )
+    with pytest.raises(RuntimeError, match="simulated JobRunner.create_job crash"):
+        async with async_session_maker() as db:
+            await _idempotent_insert(
+                db, trigger_id=TRIGGER_ID, user_id=USER_ID,
+                event_dedupe_id=event_dedupe_id,
+            )
 
+    # Neither row exists — the failure aborts the whole intake.
     async with async_session_maker() as db:
-        # TriggerEvent row exists; its job_id is NULL because the mint failed.
-        ev = (await db.execute(
-            select(TriggerEvent).where(
+        ev_count = (await db.execute(
+            select(func.count(TriggerEvent.id)).where(
                 TriggerEvent.event_dedupe_id == event_dedupe_id,
             )
         )).scalar_one()
-        assert ev.status == "queued"
-        assert ev.job_id is None
-        # No mirrored Job for this trigger.
+        assert ev_count == 0
         job_count = (await db.execute(
             select(func.count(BuildJob.id)).where(
                 BuildJob.source_id == TRIGGER_ID,

@@ -143,31 +143,89 @@ class TriggerRunner:
 
     # ── Inbound-endpoint hook ────────────────────────────────────
 
-    def handle_event_background(self, event_id: str) -> None:
-        """Fire-and-forget entry point used by the inbound endpoint.
+    def handle_event_background(self, job_id: str) -> None:
+        """Fire-and-forget entry point used by the inbound endpoint
+        and the drain loop.
 
-        Schedules `_handle_event_with_retry` on the loop without
-        blocking the caller. The endpoint already INSERTed the row;
-        we just trigger dispatch.
+        PR #46 cutover: the argument is now a ``BuildJob.id`` (the
+        new source-of-truth row), NOT a ``TriggerEvent.id`` — the
+        intake and queue-scan paths both work in BuildJob ids now.
+        The dispatch pipeline below (``_handle_event_with_retry`` →
+        ``_dispatch_one``) still operates on ``TriggerEvent.id`` to
+        avoid churning the rest of the runner in this PR; we adapt
+        by looking up the TriggerEvent.id from ``trigger_events.
+        job_id`` (column added in mig 047, populated by
+        ``triggers_inbound._idempotent_insert``).
         """
         if not self._running:
             # Pre-start arrival (boot race). The drain loop will pick it
             # up on its first tick.
             return
-        task = asyncio.create_task(self._handle_event_with_retry(event_id))
+        task = asyncio.create_task(self._dispatch_for_job(job_id))
         self._inflight_tasks.add(task)
         task.add_done_callback(self._inflight_tasks.discard)
+
+    async def _dispatch_for_job(self, job_id: str) -> None:
+        """Resolve a BuildJob id to its TriggerEvent id and hand off
+        to the retry-aware dispatch loop. Single-row indexed lookup
+        on ``trigger_events.job_id``. If no TriggerEvent row exists
+        for this Job (mid-PR-#48 transition window when the legacy
+        write is gone), we silently bail — the Job-only dispatch
+        path lives in PR #48."""
+        from app.db.models import TriggerEvent
+
+        async with self._session_maker() as db:
+            row = (await db.execute(
+                select(TriggerEvent.id).where(TriggerEvent.job_id == job_id)
+            )).first()
+        if row is None:
+            logger.warning(
+                "[trigger_runner] no TriggerEvent for job_id=%s — "
+                "skipping dispatch (legacy table likely already dropped)",
+                job_id,
+            )
+            return
+        await self._handle_event_with_retry(row[0])
 
     # ── Restart sweep ────────────────────────────────────────────
 
     async def _restart_sweep(self) -> int:
         """Flip rows stuck in 'running' from a previous boot to
-        'failed'. Returns the count for the structured log."""
-        from app.db.models import TriggerEvent
+        'failed'. Returns the count for the structured log.
+
+        PR #46 of the unified-jobs arc — this sweep now reads/writes
+        ``build_jobs`` (the new source of truth) instead of
+        ``trigger_events``. The legacy table is still dual-written
+        for one more PR (#48 removes it). We use ``created_at`` as
+        the orphan-cutoff proxy on the Job side since BuildJob has
+        no ``started_at`` column — a row stuck in ``status='running'``
+        with a ``created_at`` older than the threshold is, by
+        definition, an orphan from a previous boot.
+        """
+        from app.db.models import BuildJob, TriggerEvent
 
         cutoff = datetime.utcnow() - self.ORPHAN_THRESHOLD
+        now = datetime.utcnow()
         async with self._session_maker() as db:
-            res = await db.execute(
+            # New source of truth: build_jobs. Return its rowcount.
+            res_job = await db.execute(
+                update(BuildJob)
+                .where(
+                    BuildJob.status == "running",
+                    BuildJob.source_kind == "trigger",
+                    BuildJob.created_at < cutoff,
+                )
+                .values(
+                    status="failed",
+                    error_message="agent_restarted: orphaned by agent restart",
+                    completed_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            # Legacy dual-write (PR #48 removes this) so the
+            # trigger_events table stays consistent for any reader
+            # that hasn't migrated yet.
+            await db.execute(
                 update(TriggerEvent)
                 .where(
                     TriggerEvent.status == "running",
@@ -177,34 +235,46 @@ class TriggerRunner:
                     status="failed",
                     error_class="agent_restarted",
                     error_detail="orphaned by agent restart",
-                    finished_at=datetime.utcnow(),
+                    finished_at=now,
                 )
                 .execution_options(synchronize_session=False)
             )
             await db.commit()
-            return getattr(res, "rowcount", 0) or 0
+            return getattr(res_job, "rowcount", 0) or 0
 
     async def _warm_rate_buckets(self) -> None:
         """Seed the per-trigger fire history so a hot rate-limited
         trigger doesn't reset its budget when the container recycles.
-        Reads the last hour's worth of started_at timestamps for every
-        trigger that's seen a fire."""
-        from app.db.models import TriggerEvent
+        Reads the last hour's worth of fire timestamps from
+        ``build_jobs`` (the new source of truth — PR #46 cutover).
+
+        BuildJob has no ``started_at`` column; we use ``created_at``
+        as the fire-moment proxy. The limiter is timestamp-relative;
+        the small (sub-second) skew between row-insert and
+        handler-start is below the resolution that affects rate-limit
+        decisions.
+
+        We include status='running' rows alongside terminal ones so
+        that an in-flight fire (claimed but not yet completed when the
+        container died and restarted) still counts toward the budget.
+        """
+        from app.db.models import BuildJob
 
         cutoff = datetime.utcnow() - timedelta(hours=1)
         async with self._session_maker() as db:
             rows = (await db.execute(
-                select(TriggerEvent.trigger_id, TriggerEvent.started_at)
+                select(BuildJob.source_id, BuildJob.created_at)
                 .where(
-                    TriggerEvent.started_at >= cutoff,
-                    TriggerEvent.status.in_(("success", "failed", "running")),
+                    BuildJob.source_kind == "trigger",
+                    BuildJob.created_at >= cutoff,
+                    BuildJob.status.in_(("completed", "failed", "running")),
                 )
             )).all()
         by_trigger: dict[str, list[float]] = {}
-        for tid, started_at in rows:
-            if started_at is None:
+        for tid, created_at in rows:
+            if tid is None or created_at is None:
                 continue
-            by_trigger.setdefault(tid, []).append(started_at.timestamp())
+            by_trigger.setdefault(tid, []).append(created_at.timestamp())
         for tid, fires in by_trigger.items():
             self._limiter.warmup(tid, fires)
 
@@ -222,10 +292,13 @@ class TriggerRunner:
                     if not self._running:
                         break
                     queued = await self._fetch_queued_ids(self.DRAIN_BATCH_LIMIT)
-                    for event_id in queued:
+                    for job_id in queued:
                         if not self._running:
                             break
-                        self.handle_event_background(event_id)
+                        # PR #46: queued ids are now BuildJob ids.
+                        # handle_event_background resolves to a
+                        # TriggerEvent.id before dispatching.
+                        self.handle_event_background(job_id)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -234,13 +307,21 @@ class TriggerRunner:
             return
 
     async def _fetch_queued_ids(self, limit: int) -> list[str]:
-        from app.db.models import TriggerEvent
+        """Return BuildJob ids of queued trigger-sourced rows, oldest
+        first. PR #46 — reads from ``build_jobs`` (new source of
+        truth) instead of ``trigger_events``. The returned ids are
+        ``BuildJob.id`` values; ``handle_event_background`` resolves
+        each to a TriggerEvent.id before dispatching."""
+        from app.db.models import BuildJob
 
         async with self._session_maker() as db:
             rows = (await db.execute(
-                select(TriggerEvent.id)
-                .where(TriggerEvent.status == "queued")
-                .order_by(TriggerEvent.received_at.asc())
+                select(BuildJob.id)
+                .where(
+                    BuildJob.status == "queued",
+                    BuildJob.source_kind == "trigger",
+                )
+                .order_by(BuildJob.created_at.asc())
                 .limit(limit)
             )).all()
         return [r[0] for r in rows]
@@ -280,6 +361,81 @@ class TriggerRunner:
         # the orphan sweep doesn't have to clean up 10 minutes later
         # with no error context. Idempotent / race-safe inside.
         await self._finalise_exhausted(event_id, last_error_text or "unknown")
+
+    async def _mirror_dispatch_state_to_job(
+        self,
+        db,
+        *,
+        event_id: str,
+        job_status: Optional[str] = None,
+        outcome: Optional[str] = None,
+        error_message: Optional[str] = None,
+        completed_at: Optional[datetime] = None,
+        coalesced_into_job_id_event_id: Optional[str] = None,
+        summary_message_id: Optional[str] = None,
+    ) -> None:
+        """Mirror a dispatch-time state change onto the linked
+        ``build_jobs`` row.
+
+        PR #46 of the unified-jobs arc — every UPDATE on
+        ``trigger_events`` made by the runner gets a sibling UPDATE
+        on the linked ``build_jobs`` row so that ``build_jobs``
+        becomes the readable source of truth ahead of PR #48 (which
+        removes the legacy writes entirely).
+
+        Distinct from ``_mirror_event_terminal_to_job``:
+          - terminal helper maps a TriggerEvent.status terminal value
+            (success/failed/skipped_*/coalesced) to (Job.status,
+            Job.outcome) and writes the closed set.
+          - this helper writes whatever subset of Job fields the
+            caller supplies — used for ``running`` transitions and
+            for the coalesce/rate-limit/no-handler paths where the
+            caller has already done the mapping inline.
+
+        ``coalesced_into_job_id_event_id`` is the *TriggerEvent.id*
+        of the coalesce parent — we look it up to BuildJob.id via
+        ``trigger_events.job_id``. Naming is awkward but it makes
+        the call-site read naturally (the caller knows the parent's
+        event_id, not its job_id).
+
+        Best-effort: any exception is logged and swallowed so the
+        mirror failure can't fail the handler.
+        """
+        from app.db.models import BuildJob, TriggerEvent
+        try:
+            ev = await db.get(TriggerEvent, event_id)
+            if ev is None or ev.job_id is None:
+                return  # no Job to mirror to — silent no-op
+            values: dict[str, Any] = {}
+            if job_status is not None:
+                values["status"] = job_status
+            if outcome is not None:
+                values["outcome"] = outcome
+            if error_message is not None:
+                values["error_message"] = (error_message or "")[:1000]
+            if completed_at is not None:
+                values["completed_at"] = completed_at
+            if summary_message_id is not None:
+                values["summary_message_id"] = summary_message_id
+            if coalesced_into_job_id_event_id is not None:
+                parent_ev = await db.get(
+                    TriggerEvent, coalesced_into_job_id_event_id,
+                )
+                if parent_ev is not None and parent_ev.job_id is not None:
+                    values["coalesced_into_job_id"] = parent_ev.job_id
+            if not values:
+                return
+            await db.execute(
+                update(BuildJob)
+                .where(BuildJob.id == ev.job_id)
+                .values(**values)
+            )
+        except Exception as e:
+            logger.warning(
+                "[trigger_runner] mirror_dispatch_to_job failed "
+                "event_id=%s err=%s (legacy fire path unaffected)",
+                event_id, e,
+            )
 
     async def _mirror_event_terminal_to_job(
         self,
@@ -465,6 +621,14 @@ class TriggerRunner:
                     db, event_id=event_id, terminal_status="coalesced",
                     finished_at=_now,
                 )
+                # PR #46 — write the BuildJob-side coalesce pointer
+                # alongside the TriggerEvent one. Replaces
+                # ``trigger_events.coalesced_into_event_id`` semantics
+                # on the new source-of-truth row.
+                await self._mirror_dispatch_state_to_job(
+                    db, event_id=event_id,
+                    coalesced_into_job_id_event_id=decision.parent_event_id,
+                )
                 await db.commit()
             logger.info(
                 "[trigger_runner] coalesced event_id=%s parent=%s trigger=%s",
@@ -505,10 +669,18 @@ class TriggerRunner:
         # Move the row + any siblings already in the limiter's coalesce
         # bucket into 'running'.
         async with self._session_maker() as db:
+            _now_claim = datetime.utcnow()
             await db.execute(
                 update(TriggerEvent)
                 .where(TriggerEvent.id == event_id)
-                .values(status="running", started_at=datetime.utcnow())
+                .values(status="running", started_at=_now_claim)
+            )
+            # PR #46 — mirror the queued→running claim onto the
+            # BuildJob so the new source-of-truth row reflects the
+            # in-flight state. PR #48 removes the TriggerEvent write
+            # above; this mirror stays.
+            await self._mirror_dispatch_state_to_job(
+                db, event_id=event_id, job_status="running",
             )
             await db.commit()
 
