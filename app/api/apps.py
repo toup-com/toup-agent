@@ -109,6 +109,12 @@ class JobResponse(BaseModel):
     resume_after: Optional[str] = None
     layer: int = 1
     layer2_changes: Optional[List[Dict[str, Any]]] = None
+    # Back-link from a job to the Message its handler produced. Set by
+    # JobRunner on routine/trigger/agent-task fires (mig 046 unified-
+    # jobs arc) — null for app-builder jobs and for any job whose
+    # handler hadn't written its result yet. Frontend uses this to
+    # deep-link "Open in chat" to the exact agent reply.
+    summary_message_id: Optional[str] = None
     created_at: str
     completed_at: Optional[str] = None
 
@@ -194,6 +200,7 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         resume_after=job.resume_after.isoformat() if getattr(job, 'resume_after', None) else None,
         layer=getattr(job, 'layer', 1) or 1,
         layer2_changes=layer2_changes,
+        summary_message_id=getattr(job, 'summary_message_id', None),
         created_at=job.created_at.isoformat() if job.created_at else "",
         completed_at=job.completed_at.isoformat() if job.completed_at else None,
     )
