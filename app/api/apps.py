@@ -115,6 +115,16 @@ class JobResponse(BaseModel):
     # handler hadn't written its result yet. Frontend uses this to
     # deep-link "Open in chat" to the exact agent reply.
     summary_message_id: Optional[str] = None
+    # Source linkage (mig 046 unified-jobs arc). When this job was
+    # created by a routine fire, trigger fire, or agent task, these
+    # point at the parent. The Jobs detail UI uses them to fetch the
+    # parent routine/trigger's config + sibling fire history so the
+    # detail page can render as a proper scheduled-automation surface
+    # rather than just an isolated job row.
+    source_kind: Optional[str] = None
+    source_id: Optional[str] = None
+    fire_instant: Optional[str] = None
+    attempt: Optional[int] = None
     created_at: str
     completed_at: Optional[str] = None
 
@@ -201,6 +211,12 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         layer=getattr(job, 'layer', 1) or 1,
         layer2_changes=layer2_changes,
         summary_message_id=getattr(job, 'summary_message_id', None),
+        source_kind=getattr(job, 'source_kind', None),
+        source_id=getattr(job, 'source_id', None),
+        fire_instant=(
+            job.fire_instant.isoformat() if getattr(job, 'fire_instant', None) else None
+        ),
+        attempt=getattr(job, 'attempt', None),
         created_at=job.created_at.isoformat() if job.created_at else "",
         completed_at=job.completed_at.isoformat() if job.completed_at else None,
     )
