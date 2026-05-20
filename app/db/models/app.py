@@ -87,6 +87,30 @@ class BuildJob(Base):
     # UNIQUE (trigger_id, event_dedupe_id) semantics forward.
     idempotency_key: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
 
+    # Migration 051 — runner-state columns so the runners can read
+    # build_jobs as source of truth (prerequisite for the rest of
+    # the cutover arc that retires trigger_events + routine_runs).
+    #
+    # fire_instant: routines only. The APScheduler trigger's fire
+    # moment, distinct from ``created_at`` (DB insert moment) and
+    # ``started_at`` (handler-began). Ticket 2.3 — see
+    # docs/routines/ for why ``Routine.last_run_at`` must use this
+    # value, not ``created_at``, to avoid lying by handler-latency
+    # seconds.
+    fire_instant: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # attempt: routines only. Per-retry counter; 1 on the first
+    # fire, 2..N on each retry. Mission Control surfaces this so
+    # operators can see "fired N times before succeeding/failing".
+    attempt: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # coalesced_into_job_id: triggers only. When an inbound event
+    # was folded into an already-running sibling handler (within
+    # ``coalesce_window_sec``), this points at the parent's
+    # BuildJob. Replaces ``trigger_events.coalesced_into_event_id``
+    # semantics in the build_jobs-as-source-of-truth world.
+    coalesced_into_job_id: Mapped[Optional[str]] = mapped_column(
+        String(36), nullable=True,
+    )
+
 
 class JobEvent(Base):
     """One material event emitted during a job's lifecycle.
