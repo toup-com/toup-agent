@@ -4,7 +4,8 @@ from datetime import datetime
 from typing import Optional
 import uuid
 
-from sqlalchemy import String, Text, DateTime, Integer, Float, ForeignKey
+from sqlalchemy import String, Text, DateTime, Integer, Float, ForeignKey, JSON
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -109,6 +110,30 @@ class BuildJob(Base):
     # semantics in the build_jobs-as-source-of-truth world.
     coalesced_into_job_id: Mapped[Optional[str]] = mapped_column(
         String(36), nullable=True,
+    )
+
+    # Migration 052 — additive routine-terminal columns so PR #48 can
+    # remove the legacy ``routine_runs`` writes (build_jobs becomes
+    # the only readable surface for the terminal shape). Mirrors the
+    # ``routine_runs.{emails_fetched, finished_local_at, error_json,
+    # channel_results_json, tools_invoked_json}`` columns 1:1 so the
+    # ``_mirror_run_terminal_to_job`` helper can write them verbatim.
+    # JSON variant matches ``RoutineRun`` (see app/db/models/routine.py
+    # L196-217) — TEXT on SQLite, JSONB on Postgres.
+    emails_fetched: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+    )
+    finished_local_at: Mapped[Optional[str]] = mapped_column(
+        String(40), nullable=True,
+    )
+    error_json: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True,
+    )
+    channel_results_json: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True,
+    )
+    tools_invoked_json: Mapped[Optional[list]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True,
     )
 
 

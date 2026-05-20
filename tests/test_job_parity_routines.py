@@ -299,12 +299,19 @@ async def test_finalize_run_skipped_reauth_mirrors_to_job(
 
 
 @pytest.mark.asyncio
-async def test_dual_write_robust_to_job_failure(
+async def test_intake_aborts_when_job_mint_fails(
     _seed_user_and_routine, monkeypatch,
 ):
-    """If JobRunner.create_job raises during ``_fire``, the RoutineRun
-    insert must still succeed. The mirror is best-effort — a failed
-    Job mint must NOT roll back the legacy fire path."""
+    """Contract changed in PR #47: with the Job-first inversion, a
+    failed ``JobRunner.create_job`` aborts the fire path entirely —
+    no legacy RoutineRun row is created, no BuildJob row exists,
+    APScheduler's next tick is the natural retry.
+
+    The previous test name (``test_dual_write_robust_to_job_failure``)
+    asserted the legacy fire path survived a Job mint failure. That
+    contract is intentionally inverted: ``build_jobs`` is now the
+    source of truth and the dedupe gate, so we must NOT create an
+    orphan RoutineRun without a Job to mirror against."""
     from app.agent.routines.runner import RoutineRunner
     from app.db.database import async_session_maker
     from app.db.models import BuildJob, RoutineRun
@@ -321,13 +328,20 @@ async def test_dual_write_robust_to_job_failure(
         return "UTC"
     monkeypatch.setattr(runner, "_user_tz_async", _tz)
 
+    # _fire must NOT raise — best-effort wrapper logs and bails.
     await runner._fire(ROUTINE_ID)
 
+    # Neither table got a row — APScheduler retries on next tick.
     async with async_session_maker() as db:
-        run = (await db.execute(
-            select(RoutineRun).where(RoutineRun.routine_id == ROUTINE_ID)
+        run_count = (await db.execute(
+            select(func.count(RoutineRun.id)).where(
+                RoutineRun.routine_id == ROUTINE_ID,
+            )
         )).scalar_one()
-        assert run.job_id is None
+        assert run_count == 0, (
+            "Job mint failure must NOT leave an orphan RoutineRun — "
+            "Job is the source of truth, RoutineRun is the mirror"
+        )
         job_count = (await db.execute(
             select(func.count(BuildJob.id)).where(
                 BuildJob.source_id == ROUTINE_ID,

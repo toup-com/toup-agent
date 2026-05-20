@@ -637,22 +637,53 @@ class RoutineRunner:
     async def _restart_sweep(self) -> int:
         """Mark orphaned 'running' rows from a prior boot as failed.
 
-        A `routine_runs` row in 'running' state older than ORPHAN_THRESHOLD
-        means: the agent crashed/restarted mid-execute. The next fire on
-        the same local_date would otherwise hit the idempotency UNIQUE
-        and silently exit, leaving the row stuck forever. We flip them
-        to failed/agent_restarted so the next fire can claim a fresh row.
+        A row in 'running' state older than ORPHAN_THRESHOLD means: the
+        agent crashed/restarted mid-execute. The next fire on the same
+        local_date would otherwise hit the idempotency UNIQUE and
+        silently exit, leaving the row stuck forever. We flip them to
+        failed/agent_restarted so the next fire can claim a fresh row.
 
-        NOTE: this does NOT change the (routine_id, scheduled_for_local_date)
-        unique key. The orphaned row keeps that day's slot. That's intentional
-        — we don't want to silently retry a half-completed briefing. The
-        user sees the failure status and can force-run via the API.
+        PR #47 of the unified-jobs arc — this sweep now reads/writes
+        ``build_jobs`` (the new source of truth) instead of
+        ``routine_runs``. The legacy table is still dual-written for
+        one more PR (#48 removes it). We use ``created_at`` as the
+        orphan-cutoff proxy on the Job side since BuildJob has no
+        ``started_at`` column — a row stuck in ``status='running'``
+        with a ``created_at`` older than the threshold is, by
+        definition, an orphan from a previous boot.
+
+        NOTE: this does NOT change the
+        (routine_id, scheduled_for_local_date) unique key on
+        ``routine_runs``, nor the (source_id, idempotency_key) gate on
+        ``build_jobs``. The orphaned row keeps that day's slot. That's
+        intentional — we don't want to silently retry a half-completed
+        briefing. The user sees the failure status and can force-run
+        via the API.
         """
-        from app.db.models import RoutineRun
+        from app.db.models import BuildJob, RoutineRun
 
         threshold = datetime.utcnow() - self.ORPHAN_THRESHOLD
+        now = datetime.utcnow()
         async with self._session_maker() as db:
-            stmt = (
+            # New source of truth: build_jobs. Return its rowcount.
+            res_job = await db.execute(
+                update(BuildJob)
+                .where(
+                    BuildJob.status == "running",
+                    BuildJob.source_kind == "routine",
+                    BuildJob.created_at < threshold,
+                )
+                .values(
+                    status="failed",
+                    error_message="agent_restarted: orphaned by agent restart",
+                    completed_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            # Legacy dual-write (PR #48 removes this) so the
+            # routine_runs table stays consistent for any reader that
+            # hasn't migrated yet.
+            await db.execute(
                 update(RoutineRun)
                 .where(
                     RoutineRun.status == "running",
@@ -662,12 +693,12 @@ class RoutineRunner:
                     status="failed",
                     error_class="agent_restarted",
                     error_detail="Agent restarted before run completed",
-                    finished_at=datetime.utcnow(),
+                    finished_at=now,
                 )
+                .execution_options(synchronize_session=False)
             )
-            result = await db.execute(stmt)
             await db.commit()
-            return int(result.rowcount or 0)
+            return int(getattr(res_job, "rowcount", 0) or 0)
 
     # ------------------------------------------------------------------ fire
     async def _fire(self, routine_id: str) -> None:
@@ -756,10 +787,95 @@ class RoutineRunner:
         except Exception:  # pragma: no cover — counter must never block
             pass
 
-        # Idempotency claim. SQLAlchemy raises IntegrityError on the UNIQUE
-        # violation under both Postgres and SQLite — that's our gate. A
-        # collision means another fire (or a force-run) already claimed
-        # this user-local day; exit silently.
+        # ── PR #47 cutover: Job-first intake ─────────────────────────
+        # The composite UNIQUE on ``(build_jobs.source_id,
+        # build_jobs.idempotency_key)`` is the new dedupe gate,
+        # replacing the legacy ``UNIQUE (routine_id,
+        # scheduled_for_local_date)`` on ``routine_runs`` as source of
+        # truth. We do an explicit SELECT for the pair BEFORE calling
+        # ``JobRunner.create_job`` — matches the PR #46 fix in
+        # ``triggers_inbound._idempotent_insert``: the proximity
+        # heuristic (now - job.created_at < 5s) is unreliable when two
+        # near-simultaneous calls land within microseconds (tests, and
+        # real overlapping fires on a slow DB). One indexed SELECT per
+        # fire — negligible cost on the hot path.
+        from app.agent.job_runner import JobRunner, TaskSpec
+        from app.db.models import BuildJob
+
+        idempotency_key = str(local_date)
+        async with self._session_maker() as db:
+            existing_job_id = (await db.execute(
+                select(BuildJob.id).where(
+                    BuildJob.source_id == routine_id,
+                    BuildJob.idempotency_key == idempotency_key,
+                )
+            )).scalar_one_or_none()
+        if existing_job_id is not None:
+            logger.info(
+                "[routine_runner] idempotency_collision kind=%s "
+                "routine_id=%s scheduled_local_date=%s",
+                routine.kind, routine_id, local_date,
+            )
+            return
+
+        # Fresh-mint the Job. ``JobRunner.create_job`` is still
+        # idempotent under concurrent calls (a race past the SELECT
+        # above collapses on the partial UNIQUE INSERT), so the
+        # existing row comes back to a loser thread, which then falls
+        # through to the dual-write below — the legacy IntegrityError
+        # catch covers the same race on the routine_runs side.
+        _runner = JobRunner()
+        _spec = TaskSpec(
+            user_id=routine.user_id,
+            channel="routine",
+            source_kind="routine",
+            source_id=routine_id,
+        )
+        try:
+            _job = await _runner.create_job(
+                job_type="routine_run",
+                spec=_spec,
+                title=f"Routine fire: {routine.kind} {local_date}",
+                idempotency_key=idempotency_key,
+            )
+        except Exception as _e:
+            # Contract change in PR #47 (matches PR #46): a Job mint
+            # failure aborts the fire. Job is the source of truth now;
+            # without it we have no row to read in the runner's
+            # queue-scan, no terminal mirror target, and no anchor for
+            # observability. APScheduler will fire again on the next
+            # interval; the operator gets a structured log.
+            logger.error(
+                "[routine_runner] job_mint_failed routine_id=%s "
+                "kind=%s local_date=%s err=%s — aborting fire (no "
+                "RoutineRun inserted; APScheduler will retry on next "
+                "interval)",
+                routine_id, routine.kind, local_date, _e,
+            )
+            return
+
+        # Stamp fire_instant + attempt=1 on the new BuildJob. attempt
+        # bumps in ``_run_with_retry`` per attempt; we set the floor
+        # value here so the activity feed sees attempt=1 from the
+        # moment the row is visible. fire_instant uses the APScheduler
+        # value computed above — the user-visible "when the routine
+        # fired" wall-clock.
+        async with self._session_maker() as db:
+            await db.execute(
+                update(BuildJob)
+                .where(BuildJob.id == _job.id)
+                .values(fire_instant=fire_instant, attempt=1)
+            )
+            await db.commit()
+
+        # ── Dual-write the legacy RoutineRun row ─────────────────────
+        # Preserved so the existing /api/routines/{id}/runs consumers
+        # and any handler code that still reads/writes RoutineRun keep
+        # working. PR #48 removes this dual-write. Fresh-vs-dedupe is
+        # gated on the Job side above; a concurrent race past the
+        # SELECT can in theory hit the legacy UNIQUE before the
+        # BuildJob UNIQUE — we catch + log so the surviving Job still
+        # gets to dispatch.
         run_id = str(uuid.uuid4())
         try:
             async with self._session_maker() as db:
@@ -769,56 +885,42 @@ class RoutineRunner:
                     user_id=routine.user_id,
                     scheduled_for_local_date=local_date,
                     status="running",
+                    started_at=datetime.utcnow(),
                     fire_instant=fire_instant,
+                    job_id=_job.id,
                 )
                 db.add(run)
                 await db.commit()
         except IntegrityError:
-            logger.info(
-                "[routine_runner] idempotency_collision kind=%s routine_id=%s scheduled_local_date=%s",
-                routine.kind, routine_id, local_date,
-            )
-            return
-
-        # ── Unified-jobs dual-write (PR 4b) ──────────────────────────
-        # Mint a mirrored BuildJob row. Idempotency_key uses the same
-        # user-local-date discriminator as the RoutineRun UNIQUE
-        # constraint (``(routine_id, scheduled_for_local_date)``), so
-        # the composite UNIQUE on ``(source_id, idempotency_key)``
-        # collapses to the exact same dedupe gate. Stamp the
-        # ``routine_runs.job_id`` linkage so ``_finalize_run`` can
-        # mirror terminal state onto the Job in the same UPDATE.
-        # Best-effort: a Job mint failure does NOT roll back the
-        # RoutineRun insert — the legacy fire path is unaffected.
-        try:
-            from app.agent.job_runner import JobRunner, TaskSpec
-            _runner = JobRunner()
-            _spec = TaskSpec(
-                user_id=routine.user_id,
-                channel="routine",
-                source_kind="routine",
-                source_id=routine_id,
-            )
-            _idempotency_key = str(local_date)
-            _job = await _runner.create_job(
-                job_type="routine_run",
-                spec=_spec,
-                title=f"Routine fire: {routine.kind} {local_date}",
-                idempotency_key=_idempotency_key,
+            # Rare: legacy UNIQUE collision in the race window. Look
+            # up the existing row so the rest of _fire still has a
+            # valid run_id to thread through retry + finalize.
+            logger.warning(
+                "[routine_runner] legacy_routine_run_unique_race "
+                "routine_id=%s local_date=%s — recovering existing row",
+                routine_id, local_date,
             )
             async with self._session_maker() as db:
-                await db.execute(
-                    update(RoutineRun)
-                    .where(RoutineRun.id == run_id)
-                    .values(job_id=_job.id)
-                )
-                await db.commit()
-        except Exception as _e:
-            logger.warning(
-                "[routine_runner] Job dual-write failed run_id=%s err=%s "
-                "(legacy fire path unaffected)",
-                run_id, _e,
-            )
+                existing_run = (await db.execute(
+                    select(RoutineRun).where(
+                        RoutineRun.routine_id == routine_id,
+                        RoutineRun.scheduled_for_local_date == local_date,
+                    )
+                )).scalar_one_or_none()
+                if existing_run is None:
+                    # Vanishingly unlikely (the IntegrityError implies
+                    # the row exists), but bail safely if so.
+                    return
+                run_id = existing_run.id
+                # Make sure the recovered legacy row links to OUR Job
+                # so the terminal mirror points at the right place.
+                if existing_run.job_id != _job.id:
+                    await db.execute(
+                        update(RoutineRun)
+                        .where(RoutineRun.id == run_id)
+                        .values(job_id=_job.id)
+                    )
+                    await db.commit()
 
         # Find handler. Unknown kind → log "would_execute" + finalize as
         # success (Gate 1 no-op behavior preserved for _smoke / _test_*
@@ -882,6 +984,24 @@ class RoutineRunner:
                         .values(attempt=attempt_idx + 1)
                     )
                     await db.commit()
+            except Exception:
+                pass  # Best-effort bookkeeping; don't fail the run on it.
+
+            # PR #47 cutover — mirror the attempt counter onto the
+            # linked BuildJob so Mission Control reads the new source
+            # of truth. The job_id lives on the RoutineRun we already
+            # loaded above; one indexed UPDATE per retry, best-effort.
+            try:
+                from app.db.models import BuildJob
+                async with self._session_maker() as db:
+                    _run_row = await db.get(RoutineRun, run_id)
+                    if _run_row is not None and _run_row.job_id is not None:
+                        await db.execute(
+                            update(BuildJob)
+                            .where(BuildJob.id == _run_row.job_id)
+                            .values(attempt=attempt_idx + 1)
+                        )
+                        await db.commit()
             except Exception:
                 pass  # Best-effort bookkeeping; don't fail the run on it.
 
@@ -1039,6 +1159,12 @@ class RoutineRunner:
         # for a slow run with retries can lie by minutes.
         # Fall back to utcnow when fire_instant isn't recoverable (e.g.,
         # a force-run via /api/routines/{id}/run skipped through _fire).
+        #
+        # PR #47 read note — we still read ``RoutineRun.fire_instant``
+        # because the legacy row is still being dual-written by
+        # ``_fire`` above (PR #48 removes the dual-write). PR #48 will
+        # repoint this read at ``BuildJob.fire_instant`` (mig 051
+        # column, populated identically by the Job-first intake).
         fire_at: Optional[datetime] = None
         try:
             async with self._session_maker() as db:
@@ -1436,6 +1562,21 @@ class RoutineRunner:
                     values["error_message"] = (error_message or "")[:1000]
                 if summary_message_id and job_status == "completed":
                     values["summary_message_id"] = summary_message_id
+
+                # PR #47 cutover — mirror the five legacy terminal
+                # columns onto BuildJob (mig 052). Read verbatim off
+                # the RoutineRun row we already loaded; ``_finalize_run``
+                # populated them in the same transaction-ish sequence
+                # immediately before calling us. None values are
+                # written as None — matches the legacy behaviour where
+                # a no-emails / no-channels run leaves these NULL on
+                # routine_runs too.
+                values["emails_fetched"] = run_row.emails_fetched
+                values["finished_local_at"] = run_row.finished_local_at
+                values["error_json"] = run_row.error_json
+                values["channel_results_json"] = run_row.channel_results_json
+                values["tools_invoked_json"] = run_row.tools_invoked_json
+
                 await db.execute(
                     update(BuildJob)
                     .where(BuildJob.id == run_row.job_id)
