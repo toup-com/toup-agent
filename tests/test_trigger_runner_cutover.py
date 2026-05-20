@@ -1,30 +1,29 @@
 """PR #46 — trigger runner cutover from ``trigger_events`` to
 ``build_jobs``.
 
-The 9-PR unified-jobs arc dual-writes every trigger fire into both
-tables today. This PR moves the *reads* on the runner side over to
-``build_jobs`` so the legacy table can be dropped in PR #49 without
-the runner losing visibility into queued / orphaned work.
+The 9-PR unified-jobs arc dual-wrote every trigger fire into both
+tables; PR #46 moved the *reads* on the runner side over to
+``build_jobs``, and PR #49 removed the legacy dual-write so the
+runner now reads AND writes ``build_jobs`` exclusively.
 
 What this file pins:
 
   1. ``_restart_sweep`` flips orphan ``build_jobs`` rows (status=
      'running', source_kind='trigger', stale ``created_at``) to
-     status='failed' with a clear ``error_message``, and the legacy
-     ``trigger_events`` row stays dual-written so old readers don't
-     trip.
+     status='failed' with a clear ``error_message``. PR #49: the
+     legacy ``trigger_events`` UPDATE is gone — only the BuildJob
+     write remains.
   2. ``_warm_rate_buckets`` seeds the per-trigger limiter from
      ``build_jobs.created_at`` timestamps, grouped by ``source_id``.
   3. ``_fetch_queued_ids`` returns ``BuildJob.id`` values for
      ``status='queued'`` + ``source_kind='trigger'`` rows ordered by
-     ``created_at`` ASC. The dispatch pipeline resolves these to
-     TriggerEvent ids internally — that lookup is exercised by the
-     existing parity suite.
-  4. The intake path (``_idempotent_insert``) is now Job-first: a
+     ``created_at`` ASC.
+  4. The intake path (``_idempotent_insert``) is Job-only: a
      second call with the same ``event_dedupe_id`` produces no
-     duplicate Job and no duplicate TriggerEvent.
+     duplicate Job. PR #49 removed the legacy TriggerEvent
+     dual-write.
   5. A success-path ``_dispatch_one`` writes ``status='completed'``
-     + ``outcome='success'`` onto the BuildJob (mirror parity).
+     + ``outcome='success'`` onto the BuildJob.
 
 Test fixture pattern matches ``test_job_parity_triggers.py`` — bypass
 conftest's full ``init_db()`` (entities pgvector breaks SQLite) and
@@ -56,17 +55,18 @@ TRIGGER_ID = "00000000-0000-0000-0000-0000000cc100"
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_database():
     """Narrow schema bootstrap — same approach as the rest of the
-    unified-jobs test suite. We need User, Trigger, TriggerEvent,
-    BuildJob, JobEvent for the cutover paths."""
+    unified-jobs test suite. We need User, Trigger, BuildJob,
+    JobEvent. PR #49 removed the TriggerEvent dependency from the
+    cutover paths."""
     from app.db.database import engine
-    from app.db.models import BuildJob, JobEvent, Trigger, TriggerEvent, User
+    from app.db.models import BuildJob, JobEvent, Trigger, User
 
     async with engine.begin() as conn:
-        for model_cls in (User, BuildJob, JobEvent, Trigger, TriggerEvent):
+        for model_cls in (User, BuildJob, JobEvent, Trigger):
             await conn.run_sync(model_cls.__table__.create, checkfirst=True)
     yield
     async with engine.begin() as conn:
-        for model_cls in (TriggerEvent, Trigger, JobEvent, BuildJob, User):
+        for model_cls in (Trigger, JobEvent, BuildJob, User):
             await conn.run_sync(model_cls.__table__.drop, checkfirst=True)
     await engine.dispose()
 
@@ -300,21 +300,19 @@ async def test_fetch_queued_ids_returns_build_job_ids_ordered(
 
 
 @pytest.mark.asyncio
-async def test_intake_dedupe_creates_one_job_one_event(_seed_user_and_trigger):
+async def test_intake_dedupe_creates_one_job(_seed_user_and_trigger):
     """Two ``_idempotent_insert`` calls with the same
-    ``event_dedupe_id`` produce exactly one BuildJob, exactly one
-    TriggerEvent, and the second call returns ``"dedupe_hit"``.
+    ``event_dedupe_id`` produce exactly one BuildJob and the second
+    call returns ``"dedupe_hit"``.
 
-    Pins the Job-first cutover invariant: the composite UNIQUE on
-    ``(build_jobs.source_id, build_jobs.idempotency_key)`` is the
-    canonical dedupe gate, replacing
-    ``UNIQUE (trigger_events.trigger_id, event_dedupe_id)`` as the
-    source of truth."""
+    PR #49 removed the legacy ``trigger_events`` dual-write — the
+    composite UNIQUE on ``(build_jobs.source_id,
+    build_jobs.idempotency_key)`` is the sole dedupe gate."""
     from sqlalchemy import select, func
 
     from app.api.triggers_inbound import _idempotent_insert
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, TriggerEvent
+    from app.db.models import BuildJob
 
     event_dedupe_id = f"gmail-msg-{uuid.uuid4().hex[:12]}"
 
@@ -338,22 +336,7 @@ async def test_intake_dedupe_creates_one_job_one_event(_seed_user_and_trigger):
                 BuildJob.idempotency_key == event_dedupe_id,
             )
         )).scalar_one()
-        ev_count = (await db.execute(
-            select(func.count(TriggerEvent.id)).where(
-                TriggerEvent.trigger_id == TRIGGER_ID,
-                TriggerEvent.event_dedupe_id == event_dedupe_id,
-            )
-        )).scalar_one()
-        ev = (await db.execute(
-            select(TriggerEvent).where(
-                TriggerEvent.event_dedupe_id == event_dedupe_id,
-            )
-        )).scalar_one()
         assert job_count == 1
-        assert ev_count == 1
-        assert ev.job_id is not None, (
-            "TriggerEvent.job_id must link to the BuildJob (cutover invariant)"
-        )
 
 
 # ── Dispatch success mirror ───────────────────────────────────────────
@@ -372,19 +355,19 @@ class _FakeTriggerResult:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_one_mirrors_success_to_build_job(_seed_user_and_trigger):
-    """``_dispatch_one`` on a queued event whose handler returns
-    success: TriggerEvent.status='success' AND BuildJob.status=
-    'completed' with outcome='success'. Pins the cutover invariant
-    that dispatch-time state changes are dual-written to the new
-    source of truth."""
+async def test_dispatch_one_writes_success_to_build_job(_seed_user_and_trigger):
+    """``_dispatch_one`` on a queued Job whose handler returns
+    success: BuildJob.status='completed' with outcome='success'.
+
+    PR #49: the legacy TriggerEvent mirror is gone — the BuildJob
+    UPDATE in the runner's step-5 loop IS the terminal write."""
     from sqlalchemy import select
 
     from app.agent.triggers.registry import KIND_HANDLERS
     from app.agent.triggers.runner import TriggerRunner
     from app.api.triggers_inbound import _idempotent_insert
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, TriggerEvent
+    from app.db.models import BuildJob
 
     event_dedupe_id = f"gmail-msg-{uuid.uuid4().hex[:12]}"
 
@@ -393,13 +376,13 @@ async def test_dispatch_one_mirrors_success_to_build_job(_seed_user_and_trigger)
             db, trigger_id=TRIGGER_ID, user_id=USER_ID,
             event_dedupe_id=event_dedupe_id,
         )
-        ev = (await db.execute(
-            select(TriggerEvent).where(
-                TriggerEvent.event_dedupe_id == event_dedupe_id,
+        job = (await db.execute(
+            select(BuildJob).where(
+                BuildJob.source_id == TRIGGER_ID,
+                BuildJob.idempotency_key == event_dedupe_id,
             )
         )).scalar_one()
-        event_id = ev.id
-        job_id = ev.job_id
+        job_id = job.id
 
     class _SuccessHandler:
         kind = "email_received"
@@ -415,17 +398,15 @@ async def test_dispatch_one_mirrors_success_to_build_job(_seed_user_and_trigger)
             session_maker=async_session_maker,
             retry_delays=(0.001, 0.001, 0.001),
         )
-        ok = await runner._dispatch_one(event_id, attempt_idx=0)
+        ok = await runner._dispatch_one(job_id, attempt_idx=0)
     finally:
         KIND_HANDLERS.pop("email_received", None)
 
     assert ok is True
     async with async_session_maker() as db:
-        ev = await db.get(TriggerEvent, event_id)
         job = await db.get(BuildJob, job_id)
-        assert ev.status == "success"
         assert job.status == "completed", (
-            f"BuildJob.status must mirror success; got {job.status!r}"
+            f"BuildJob.status must be completed on success; got {job.status!r}"
         )
         assert job.outcome == "success"
         assert job.completed_at is not None

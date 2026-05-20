@@ -1,3 +1,4 @@
+# PR #50 cutover: assertions updated from TriggerEvent → BuildJob. Same invariants, new source-of-truth row.
 """Trigger runner — post-loop failure-handler fix (D7).
 
 Pinned bug:
@@ -5,18 +6,17 @@ Pinned bug:
   `_handle_event_with_retry` in `backend/app/agent/triggers/runner.py`
   loops over `DEFAULT_RETRY_DELAYS = (5.0, 30.0, 120.0)` calling
   `_dispatch_one` per attempt. Pre-fix, when all three attempts crashed
-  the loop fell through with NO terminal write — the TriggerEvent row
+  the loop fell through with NO terminal write — the BuildJob row
   stayed in `status='running'` until the 10-minute orphan sweep flipped
-  it to `failed` with `error_class='agent_restarted'` and NULL
-  `error_detail`. The user's live "Summarize every new Gmail" trigger
+  it to `failed` with an `agent_restarted` marker and no useful
+  error context. The user's live "Summarize every new Gmail" trigger
   accumulated 11 such rows.
 
   Fix: after the retry loop falls through, call `_finalise_exhausted`
   which UPDATEs the row to:
     status='failed'
-    error_class='all_retries_exhausted'
-    error_detail=repr(last_exception)
-    finished_at=NOW()
+    error_message='all_retries_exhausted: ' + repr(last_exception)
+    completed_at=NOW()
   …and stamps the parent Trigger with last_status='failed', last_error,
   fire_count += 1, last_fired_at.
 
@@ -24,17 +24,37 @@ These two parametrised tests pin both halves of the spec:
 
   1. All N attempts crash → terminal state matches the spec exactly.
   2. Attempts 1..N-1 crash, attempt N succeeds → row ends in
-     status='success', NO error fields touched, retry count matches.
+     status='completed' / outcome='success', NO error fields touched,
+     retry count matches.
 
 The tests build a TriggerRunner with `retry_delays=(0.01, 0.01, 0.01)`
 so they run in milliseconds, and inject a fake handler into
 KIND_HANDLERS that's configurable per test.
+
+PR #50 cutover: the runner no longer writes ``trigger_events``. All
+assertions previously made against ``TriggerEvent`` are now made
+against ``BuildJob`` with the column mapping:
+
+  TriggerEvent.status='failed'                 → BuildJob.status='failed'
+  TriggerEvent.error_class + .error_detail     → BuildJob.error_message
+                                                  (single Text column,
+                                                  format
+                                                  'all_retries_exhausted: '
+                                                  + repr(exc))
+  TriggerEvent.finished_at                     → BuildJob.completed_at
+  TriggerEvent.status='success'                → BuildJob.status='completed'
+                                                  + BuildJob.outcome='success'
+
+Trigger-row assertions (last_status, last_error, fire_count,
+last_fired_at) are unchanged — the runner still stamps the parent
+Trigger the same way.
 """
 from __future__ import annotations
 
 import os
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Optional
 
 import pytest
@@ -55,25 +75,25 @@ TRIGGER_ID = "00000000-0000-0000-0000-0000000ff000"
 # schema, including the ``entities`` table whose pgvector ``embedding``
 # column generates a SQLAlchemy NullType DDL error under SQLite. CI
 # defaults the job to RUN_MODE=platform precisely to skip that table —
-# but RUN_MODE=platform also excludes ``triggers`` / ``trigger_events``,
+# but RUN_MODE=platform also excludes ``triggers`` / ``build_jobs``,
 # which these tests need.
 #
 # Solution: build only the 3 tables the trigger-runner tests touch
-# (``users``, ``triggers``, ``trigger_events``). SQLite doesn't
-# enforce foreign keys by default, so the FK on
-# ``trigger_events.summary_message_id`` → ``messages.id`` is harmless
-# even though we don't create ``messages``.
+# (``users``, ``triggers``, ``build_jobs``). PR #50 removed every
+# ``trigger_events`` write from the runner, so we no longer create
+# that table here. Matches the seed pattern in
+# ``test_trigger_runner_cutover.py``.
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_database():
     from app.db.database import engine
-    from app.db.models import Trigger, TriggerEvent, User
+    from app.db.models import BuildJob, Trigger, User
 
     async with engine.begin() as conn:
-        for model_cls in (User, Trigger, TriggerEvent):
+        for model_cls in (User, BuildJob, Trigger):
             await conn.run_sync(model_cls.__table__.create, checkfirst=True)
     yield
     async with engine.begin() as conn:
-        for model_cls in (TriggerEvent, Trigger, User):
+        for model_cls in (Trigger, BuildJob, User):
             await conn.run_sync(model_cls.__table__.drop, checkfirst=True)
     await engine.dispose()
 
@@ -100,7 +120,7 @@ def test_runner_source_has_finalise_exhausted_helper():
         "loop fallthrough must call something that marks the row failed."
     )
     assert "all_retries_exhausted" in _RUNNER_SRC, (
-        "error_class='all_retries_exhausted' literal missing from "
+        "error marker 'all_retries_exhausted' literal missing from "
         "runner.py — the post-loop write would not match the spec."
     )
 
@@ -149,7 +169,7 @@ class _FakeHandler:
 @pytest_asyncio.fixture
 async def _seed_user_and_trigger():
     """Insert User + Trigger rows for the runner to find. The autouse
-    `_reset_database` fixture from conftest gives us a clean schema."""
+    `_reset_database` fixture above gives us a clean schema."""
     from app.db.database import async_session_maker
     from app.db.models import Trigger, User
 
@@ -177,22 +197,29 @@ async def _seed_user_and_trigger():
     return {"user_id": CONTAINER_USER_ID, "trigger_id": TRIGGER_ID}
 
 
-async def _insert_event(trigger_id: str, user_id: str) -> str:
-    """Insert a fresh TriggerEvent in status='queued'."""
+async def _insert_buildjob(trigger_id: str, user_id: str) -> str:
+    """Insert a fresh BuildJob in status='queued' as the runner's
+    source-of-truth row for one trigger fire. PR #50: this replaces
+    the legacy ``_insert_event`` helper that wrote TriggerEvent."""
     from app.db.database import async_session_maker
-    from app.db.models import TriggerEvent
+    from app.db.models import BuildJob
 
-    eid = str(uuid.uuid4())
+    jid = str(uuid.uuid4())
     async with async_session_maker() as db:
-        db.add(TriggerEvent(
-            id=eid,
-            trigger_id=trigger_id,
+        db.add(BuildJob(
+            id=jid,
             user_id=user_id,
-            event_dedupe_id=f"test:{eid[:8]}",
+            title="Test fire",
+            prompt="",
+            job_type="trigger_run",
             status="queued",
+            source_kind="trigger",
+            source_id=trigger_id,
+            idempotency_key=f"test:{jid[:8]}",
+            created_at=datetime.utcnow(),
         ))
         await db.commit()
-    return eid
+    return jid
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -215,11 +242,11 @@ async def test_all_retries_exhausted_terminalises_row_and_trigger(
 ):
     """When _dispatch_one raises on every retry attempt, the runner must:
 
-      - flip TriggerEvent.status from 'running' to 'failed'
-      - set error_class='all_retries_exhausted'
-      - set error_detail to repr(last exception) (the actual message,
-        not NULL — that's the regression we're pinning)
-      - stamp finished_at
+      - flip BuildJob.status from 'running' to 'failed'
+      - write error_message containing 'all_retries_exhausted' AND a
+        recognisable reference to the last exception (the actual
+        message, not NULL — that's the regression we're pinning)
+      - stamp completed_at
       - bump Trigger.fire_count by 1
       - set Trigger.last_status='failed' + last_error + last_fired_at
 
@@ -227,15 +254,20 @@ async def test_all_retries_exhausted_terminalises_row_and_trigger(
     NULL error fields and the parent trigger was never stamped, so
     `fire_count` showed the count of dispatch attempts but `last_status`
     was whatever the previous fire left it (often 'active' or
-    'never_fired')."""
+    'never_fired').
+
+    PR #50: the column for the error string is the single
+    ``BuildJob.error_message`` Text column — the old TriggerEvent
+    pair (``error_class`` + ``error_detail``) is folded into one
+    string of the form ``'all_retries_exhausted: ' + repr(exc)``."""
     from app.agent.triggers.registry import KIND_HANDLERS
     from app.agent.triggers.runner import TriggerRunner
     from app.db.database import async_session_maker
-    from app.db.models import Trigger, TriggerEvent
+    from app.db.models import BuildJob, Trigger
 
     trigger_id = _seed_user_and_trigger["trigger_id"]
     user_id = _seed_user_and_trigger["user_id"]
-    event_id = await _insert_event(trigger_id, user_id)
+    job_id = await _insert_buildjob(trigger_id, user_id)
 
     fake = _FakeHandler(fail_first_n=None, failure_exc=exc)
     monkeypatch.setitem(KIND_HANDLERS, "email_received", fake)
@@ -244,7 +276,7 @@ async def test_all_retries_exhausted_terminalises_row_and_trigger(
         session_maker=async_session_maker,
         retry_delays=(0.001, 0.001, 0.001),
     )
-    await runner._handle_event_with_retry(event_id)
+    await runner._handle_event_with_retry(job_id)
 
     # Handler called once per retry attempt.
     assert fake.call_count == 3, (
@@ -252,26 +284,31 @@ async def test_all_retries_exhausted_terminalises_row_and_trigger(
     )
 
     async with async_session_maker() as db:
-        ev = await db.get(TriggerEvent, event_id)
-        assert ev is not None, "event row vanished"
-        assert ev.status == "failed", (
+        job = await db.get(BuildJob, job_id)
+        assert job is not None, "build_job row vanished"
+        assert job.status == "failed", (
             f"expected status='failed' after retries exhausted, "
-            f"got {ev.status!r} — this is the regression."
+            f"got {job.status!r} — this is the regression."
         )
-        assert ev.error_class == "all_retries_exhausted", (
-            f"expected error_class='all_retries_exhausted', "
-            f"got {ev.error_class!r}"
-        )
-        assert ev.error_detail is not None, (
-            "error_detail is NULL — pre-fix symptom. The repr of the "
+        assert job.error_message is not None, (
+            "error_message is NULL — pre-fix symptom. The "
+            "'all_retries_exhausted' marker plus the repr of the "
             "last exception must be persisted so operators can diagnose."
         )
-        # The error_detail should contain something recognisable from
-        # the exception. Each parametrised case has a unique substring.
-        assert repr(exc).split("(", 1)[0] in ev.error_detail or str(exc) in ev.error_detail, (
-            f"error_detail {ev.error_detail!r} should reference exception {exc!r}"
+        assert "all_retries_exhausted" in job.error_message, (
+            f"error_message {job.error_message!r} should carry the "
+            f"'all_retries_exhausted' marker."
         )
-        assert ev.finished_at is not None, "finished_at must be stamped"
+        # The error_message should contain something recognisable from
+        # the exception. Each parametrised case has a unique substring.
+        assert (
+            repr(exc).split("(", 1)[0] in job.error_message
+            or str(exc) in job.error_message
+        ), (
+            f"error_message {job.error_message!r} should reference "
+            f"exception {exc!r}"
+        )
+        assert job.completed_at is not None, "completed_at must be stamped"
 
         trig = await db.get(Trigger, trigger_id)
         assert trig is not None
@@ -293,21 +330,23 @@ async def test_partial_failure_then_success_does_not_touch_error_fields(
     _seed_user_and_trigger, monkeypatch, fail_first_n
 ):
     """When the first `fail_first_n` attempts crash but a later attempt
-    succeeds, the event row must reach status='success' with NO
-    error_class / error_detail / 'all_retries_exhausted' marker. The
-    parent trigger should be promoted to last_status='active' the same
-    way a normal first-try success would be.
+    succeeds, the BuildJob row must reach status='completed' /
+    outcome='success' with a NULL ``error_message`` — i.e. the
+    'all_retries_exhausted' marker is NOT written on a path that
+    ultimately succeeded. The parent trigger should be promoted to
+    last_status='active' the same way a normal first-try success would
+    be.
 
     This pins the inverse regression: don't write the 'all retries
     exhausted' marker on a path that ultimately succeeded."""
     from app.agent.triggers.registry import KIND_HANDLERS
     from app.agent.triggers.runner import TriggerRunner
     from app.db.database import async_session_maker
-    from app.db.models import Trigger, TriggerEvent
+    from app.db.models import BuildJob, Trigger
 
     trigger_id = _seed_user_and_trigger["trigger_id"]
     user_id = _seed_user_and_trigger["user_id"]
-    event_id = await _insert_event(trigger_id, user_id)
+    job_id = await _insert_buildjob(trigger_id, user_id)
 
     fake = _FakeHandler(
         fail_first_n=fail_first_n,
@@ -319,7 +358,7 @@ async def test_partial_failure_then_success_does_not_touch_error_fields(
         session_maker=async_session_maker,
         retry_delays=(0.001, 0.001, 0.001),
     )
-    await runner._handle_event_with_retry(event_id)
+    await runner._handle_event_with_retry(job_id)
 
     # Handler called fail_first_n times (crashes) + 1 time (success).
     assert fake.call_count == fail_first_n + 1, (
@@ -327,21 +366,19 @@ async def test_partial_failure_then_success_does_not_touch_error_fields(
     )
 
     async with async_session_maker() as db:
-        ev = await db.get(TriggerEvent, event_id)
-        assert ev is not None
-        assert ev.status == "success", (
-            f"after partial-failure-then-success, expected status='success', "
-            f"got {ev.status!r}"
+        job = await db.get(BuildJob, job_id)
+        assert job is not None
+        assert job.status == "completed" and job.outcome == "success", (
+            f"after partial-failure-then-success, expected "
+            f"status='completed'/outcome='success', got "
+            f"status={job.status!r} outcome={job.outcome!r}"
         )
-        assert ev.error_class is None, (
-            f"error_class should be NULL on success — got "
-            f"{ev.error_class!r}. The all-retries-exhausted marker "
+        assert job.error_message is None, (
+            f"error_message should be NULL on success — got "
+            f"{job.error_message!r}. The all-retries-exhausted marker "
             f"must NOT be written on a path that ultimately succeeded."
         )
-        assert ev.error_detail is None, (
-            f"error_detail should be NULL on success — got {ev.error_detail!r}"
-        )
-        assert ev.finished_at is not None
+        assert job.completed_at is not None
 
         trig = await db.get(Trigger, trigger_id)
         assert trig is not None
@@ -366,31 +403,33 @@ async def test_finalise_exhausted_is_idempotent_against_race(
     _seed_user_and_trigger, monkeypatch
 ):
     """If a sibling path (drain loop, inline retry) has already
-    terminalised the row by the time `_finalise_exhausted` runs, the
-    helper must NOT overwrite the existing terminal state — that would
-    clobber the legitimate outcome with a 'all_retries_exhausted' that
-    doesn't reflect what actually happened.
+    terminalised the BuildJob by the time `_finalise_exhausted` runs,
+    the helper must NOT overwrite the existing terminal state — that
+    would clobber the legitimate outcome with an
+    'all_retries_exhausted' marker that doesn't reflect what actually
+    happened.
 
-    Simulates the race by pre-flipping the row to status='success'
-    before calling _finalise_exhausted directly."""
+    Simulates the race by pre-flipping the BuildJob to
+    status='completed'/outcome='success' before calling
+    _finalise_exhausted directly."""
     from app.agent.triggers.runner import TriggerRunner
     from app.db.database import async_session_maker
-    from app.db.models import Trigger, TriggerEvent
+    from app.db.models import BuildJob, Trigger
 
     trigger_id = _seed_user_and_trigger["trigger_id"]
     user_id = _seed_user_and_trigger["user_id"]
-    event_id = await _insert_event(trigger_id, user_id)
+    job_id = await _insert_buildjob(trigger_id, user_id)
 
     # Pre-terminalise: pretend a sibling completed this row first.
     from sqlalchemy import update
-    from datetime import datetime
     async with async_session_maker() as db:
         await db.execute(
-            update(TriggerEvent)
-            .where(TriggerEvent.id == event_id)
+            update(BuildJob)
+            .where(BuildJob.id == job_id)
             .values(
-                status="success",
-                finished_at=datetime.utcnow(),
+                status="completed",
+                outcome="success",
+                completed_at=datetime.utcnow(),
             )
         )
         await db.commit()
@@ -400,16 +439,15 @@ async def test_finalise_exhausted_is_idempotent_against_race(
         retry_delays=(0.001, 0.001, 0.001),
     )
     # Call directly with a pretend last error — must be a no-op.
-    await runner._finalise_exhausted(event_id, "should_not_persist")
+    await runner._finalise_exhausted(job_id, "should_not_persist")
 
     async with async_session_maker() as db:
-        ev = await db.get(TriggerEvent, event_id)
-        assert ev.status == "success", (
+        job = await db.get(BuildJob, job_id)
+        assert job.status == "completed" and job.outcome == "success", (
             f"_finalise_exhausted clobbered a terminal row! "
-            f"status={ev.status!r}"
+            f"status={job.status!r} outcome={job.outcome!r}"
         )
-        assert ev.error_class is None
-        assert ev.error_detail is None
+        assert job.error_message is None
 
         trig = await db.get(Trigger, trigger_id)
         assert trig.fire_count == 0, (

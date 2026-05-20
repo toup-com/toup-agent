@@ -30,8 +30,12 @@ endpoint on the user's per-tenant agent container. The contract is:
 This endpoint is hot-path. Pub/Sub wants 200 in <2s p50, hard cap 10s.
 We MUST NOT do Gmail fetches, LLM calls, or Message writes here — the
 runner (Gate T2) owns that. This endpoint's job is the idempotency
-gate: INSERT…ON CONFLICT DO NOTHING into `trigger_events`. Pub/Sub
-retries collapse on the UNIQUE (trigger_id, event_dedupe_id) constraint.
+gate: an explicit SELECT on ``build_jobs(source_id, idempotency_key)``
+followed by ``JobRunner.create_job``. Pub/Sub retries collapse on the
+composite UNIQUE in ``build_jobs`` (the same dedupe semantics the
+legacy ``UNIQUE (trigger_id, event_dedupe_id)`` on ``trigger_events``
+used to enforce — PR #49 of the cutover arc finished the move to
+``build_jobs`` as the sole source of truth).
 
 Auth contract:
   - The platform calls with `X-Agent-Key: <agent_configs.agent_api_key>`
@@ -46,19 +50,16 @@ Auth contract:
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, update as sa_update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import select
 
 from app.config import settings
 from app.db.database import async_session_maker
-from app.db.models import Trigger, TriggerEvent, TRIGGER_KINDS
+from app.db.models import Trigger, TRIGGER_KINDS
 
 
 router = APIRouter(prefix="/triggers", tags=["triggers (inbound)"])
@@ -300,24 +301,25 @@ async def trigger_inbound(
 async def _idempotent_insert(
     db, *, trigger_id: str, user_id: str, event_dedupe_id: str,
 ) -> str:
-    """Mint a ``build_jobs`` row idempotently, then dual-write a
-    matching ``trigger_events`` row, returning "inserted" or
+    """Mint a ``build_jobs`` row idempotently, returning "inserted" or
     "dedupe_hit" based on whether the Job was actually created.
 
-    PR #46 of the unified-jobs arc — ``build_jobs`` is now the
-    source of truth and the dedupe gate. ``JobRunner.create_job``
-    honours the composite UNIQUE on ``(source_id, idempotency_key)``
-    and returns the existing row on conflict (no duplicate insert),
-    which matches the legacy ``UNIQUE (trigger_id, event_dedupe_id)``
-    semantics on the TriggerEvent side. The runner reads queued
-    work from ``build_jobs``; the dual-write to TriggerEvent is
-    preserved one more PR (PR #48 removes it).
+    PR #49 of the unified-jobs cutover arc — ``build_jobs`` is the
+    sole source of truth. The legacy ``trigger_events`` dual-write
+    (PR #46 → PR #48) was removed once every reader was repointed
+    at the Job. PR #50 drops the legacy table.
+
+    ``JobRunner.create_job`` honours the composite UNIQUE on
+    ``(source_id, idempotency_key)`` and returns the existing row on
+    conflict, which preserves the dedupe semantics the legacy
+    ``UNIQUE (trigger_id, event_dedupe_id)`` constraint used to
+    enforce.
 
     Fires the runner hand-off with the BuildJob id when (and only
     when) a new Job row was actually created — dedupe hits must NOT
     re-dispatch, that's the whole point of the UNIQUE gate.
     """
-    # ── 1. Job-first: source of truth + explicit dedupe check ────
+    # ── 1. Explicit dedupe check ─────────────────────────────────
     # The partial UNIQUE on (source_id, idempotency_key) in mig 046
     # is the underlying gate, but we check explicitly here so the
     # fresh-vs-dedupe signal is unambiguous (no proximity heuristic
@@ -327,7 +329,6 @@ async def _idempotent_insert(
     from app.agent.job_runner import JobRunner, TaskSpec
     from app.db.models import BuildJob
 
-    now = datetime.utcnow()
     existing_job_id = (await db.execute(
         select(BuildJob.id).where(
             BuildJob.source_id == trigger_id,
@@ -337,12 +338,13 @@ async def _idempotent_insert(
     if existing_job_id is not None:
         return "dedupe_hit"
 
-    # Fresh path: mint the Job. ``JobRunner.create_job`` is still
-    # idempotent under concurrent calls (a race past the SELECT above
-    # collapses on the partial UNIQUE INSERT), so the existing row
-    # comes back to a loser thread, which then falls through to the
-    # dual-write below — the legacy ON CONFLICT DO NOTHING covers
-    # that race too.
+    # ── 2. Fresh path: mint the Job ──────────────────────────────
+    # ``JobRunner.create_job`` is idempotent under concurrent calls
+    # (a race past the SELECT above collapses on the partial UNIQUE
+    # INSERT), so a loser thread still gets a Job reference back —
+    # we just return "inserted" twice in that very rare case, which
+    # is benign (both threads dispatch the same Job; the runner's
+    # claim step handles the race).
     spec = TaskSpec(
         user_id=user_id,
         channel="trigger",
@@ -355,69 +357,14 @@ async def _idempotent_insert(
         title=f"Trigger fire: {event_dedupe_id[:40]}",
         idempotency_key=event_dedupe_id,
     )
-
-    # ── 2. Dual-write the legacy TriggerEvent row ─────────────────
-    # Preserved so the agent_main wiring + handler code that still
-    # reads/writes TriggerEvent keeps working. PR #48 removes both
-    # the legacy table and this dual-write. We use dialect-specific
-    # ON CONFLICT DO NOTHING for defence-in-depth — a concurrent
-    # fresh-mint race could in theory hit the legacy UNIQUE before
-    # the BuildJob UNIQUE, and we treat that as a benign dedupe.
-    new_event_id = str(uuid.uuid4())
-    values = {
-        "id": new_event_id,
-        "trigger_id": trigger_id,
-        "user_id": user_id,
-        "event_dedupe_id": event_dedupe_id,
-        "received_at": now,
-        "status": "queued",
-        "job_id": job.id,
-    }
-
-    dialect_name = db.bind.dialect.name if db.bind else ""
-    if dialect_name == "postgresql":
-        stmt = pg_insert(TriggerEvent).values(**values)
-        stmt = stmt.on_conflict_do_nothing(
-            constraint="uq_trigger_events_dedupe",
-        ).returning(TriggerEvent.id)
-    elif dialect_name == "sqlite":
-        stmt = sqlite_insert(TriggerEvent).values(**values)
-        stmt = stmt.on_conflict_do_nothing(
-            index_elements=["trigger_id", "event_dedupe_id"],
-        ).returning(TriggerEvent.id)
-    else:
-        # Unknown dialect — fail loud rather than silently re-insert.
-        raise RuntimeError(
-            f"trigger_inbound: unsupported DB dialect {dialect_name!r}. "
-            "Add an ON CONFLICT branch before deploying."
-        )
-
-    result = await db.execute(stmt)
-    inserted_event_id = result.scalar_one_or_none()
-
-    # If the TriggerEvent insert conflicted (legacy row already
-    # existed from a partial prior fresh-mint), look it up and
-    # ensure its job_id points at our Job so the runner's
-    # event_id ↔ job_id resolver stays consistent.
-    if inserted_event_id is None:
-        existing = (await db.execute(
-            select(TriggerEvent).where(
-                TriggerEvent.trigger_id == trigger_id,
-                TriggerEvent.event_dedupe_id == event_dedupe_id,
-            )
-        )).scalar_one_or_none()
-        if existing is not None and existing.job_id != job.id:
-            await db.execute(
-                sa_update(TriggerEvent)
-                .where(TriggerEvent.id == existing.id)
-                .values(job_id=job.id)
-            )
-    await db.commit()
+    # JobRunner.create_job handles its own commit; we don't write
+    # any further rows here.
 
     # ── 3. Runner hand-off ────────────────────────────────────────
-    # PR #46: the runner takes a BuildJob id now (it resolves to
-    # TriggerEvent internally). If the runner isn't wired yet
-    # (boot race), its drain_loop picks the row up on its next tick.
+    # The runner is BuildJob-native after the PR #49 cutover; the
+    # hand-off carries the Job id straight through. If the runner
+    # isn't wired yet (boot race), its drain_loop picks the row up
+    # on its next tick.
     if _runner_ref is not None:
         try:
             _runner_ref.handle_event_background(job.id)

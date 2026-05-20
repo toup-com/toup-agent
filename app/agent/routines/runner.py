@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
+import types
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -643,29 +643,24 @@ class RoutineRunner:
         silently exit, leaving the row stuck forever. We flip them to
         failed/agent_restarted so the next fire can claim a fresh row.
 
-        PR #47 of the unified-jobs arc — this sweep now reads/writes
-        ``build_jobs`` (the new source of truth) instead of
-        ``routine_runs``. The legacy table is still dual-written for
-        one more PR (#48 removes it). We use ``created_at`` as the
+        PR #49 of the unified-jobs cutover arc — the legacy
+        ``routine_runs`` UPDATE was removed once the read path was
+        repointed at ``build_jobs``. We use ``created_at`` as the
         orphan-cutoff proxy on the Job side since BuildJob has no
         ``started_at`` column — a row stuck in ``status='running'``
         with a ``created_at`` older than the threshold is, by
         definition, an orphan from a previous boot.
 
-        NOTE: this does NOT change the
-        (routine_id, scheduled_for_local_date) unique key on
-        ``routine_runs``, nor the (source_id, idempotency_key) gate on
-        ``build_jobs``. The orphaned row keeps that day's slot. That's
-        intentional — we don't want to silently retry a half-completed
-        briefing. The user sees the failure status and can force-run
-        via the API.
+        NOTE: the orphaned row keeps its (source_id, idempotency_key)
+        slot. That's intentional — we don't want to silently retry a
+        half-completed briefing. The user sees the failure status and
+        can force-run via the API.
         """
-        from app.db.models import BuildJob, RoutineRun
+        from app.db.models import BuildJob
 
         threshold = datetime.utcnow() - self.ORPHAN_THRESHOLD
         now = datetime.utcnow()
         async with self._session_maker() as db:
-            # New source of truth: build_jobs. Return its rowcount.
             res_job = await db.execute(
                 update(BuildJob)
                 .where(
@@ -680,23 +675,6 @@ class RoutineRunner:
                 )
                 .execution_options(synchronize_session=False)
             )
-            # Legacy dual-write (PR #48 removes this) so the
-            # routine_runs table stays consistent for any reader that
-            # hasn't migrated yet.
-            await db.execute(
-                update(RoutineRun)
-                .where(
-                    RoutineRun.status == "running",
-                    RoutineRun.started_at < threshold,
-                )
-                .values(
-                    status="failed",
-                    error_class="agent_restarted",
-                    error_detail="Agent restarted before run completed",
-                    finished_at=now,
-                )
-                .execution_options(synchronize_session=False)
-            )
             await db.commit()
             return int(getattr(res_job, "rowcount", 0) or 0)
 
@@ -706,14 +684,22 @@ class RoutineRunner:
           1. Reload routine fresh
           2. Capture fire_instant from APScheduler (Ticket 2.3) and
              compute scheduled_for_local_date in user tz
-          3. Idempotency claim (INSERT … UNIQUE collision → silent exit)
+          3. Idempotency claim on build_jobs (SELECT + create_job)
           4. Look up handler in KIND_HANDLERS
           5. Retry loop: 3 attempts with backoff (10s/30s/90s default)
           6. On success → finalize run, advance watermark
           7. On skipped_reauth → write reauth nudge Message, finalize
           8. On terminal failed → write failure nudge Message, finalize
+
+        PR #49 of the cutover arc — the legacy ``routine_runs``
+        dual-write was removed; the BuildJob is now the only row
+        carrying per-fire state. Downstream callers (``_run_with_retry``,
+        ``_finalize_run``, ``_post_terminal``) operate on the
+        ``BuildJob.id`` returned by ``JobRunner.create_job`` — the
+        variable is still named ``run_id`` to keep the internal call
+        graph readable.
         """
-        from app.db.models import Routine, RoutineRun
+        from app.db.models import Routine
         from .registry import KIND_HANDLERS
 
         # Reload routine fresh — a toggle/edit between trigger registration
@@ -818,12 +804,11 @@ class RoutineRunner:
             )
             return
 
-        # Fresh-mint the Job. ``JobRunner.create_job`` is still
-        # idempotent under concurrent calls (a race past the SELECT
-        # above collapses on the partial UNIQUE INSERT), so the
-        # existing row comes back to a loser thread, which then falls
-        # through to the dual-write below — the legacy IntegrityError
-        # catch covers the same race on the routine_runs side.
+        # Fresh-mint the Job. ``JobRunner.create_job`` is idempotent
+        # under concurrent calls (a race past the SELECT above
+        # collapses on the partial UNIQUE INSERT), so a loser thread
+        # gets the existing Job back. PR #49 removed the legacy
+        # ``routine_runs`` dual-write that used to follow this mint.
         _runner = JobRunner()
         _spec = TaskSpec(
             user_id=routine.user_id,
@@ -847,9 +832,8 @@ class RoutineRunner:
             # interval; the operator gets a structured log.
             logger.error(
                 "[routine_runner] job_mint_failed routine_id=%s "
-                "kind=%s local_date=%s err=%s — aborting fire (no "
-                "RoutineRun inserted; APScheduler will retry on next "
-                "interval)",
+                "kind=%s local_date=%s err=%s — aborting fire "
+                "(APScheduler will retry on next interval)",
                 routine_id, routine.kind, local_date, _e,
             )
             return
@@ -860,67 +844,24 @@ class RoutineRunner:
         # moment the row is visible. fire_instant uses the APScheduler
         # value computed above — the user-visible "when the routine
         # fired" wall-clock.
+        #
+        # PR #49 cutover: the legacy ``routine_runs`` dual-write
+        # (preserved across PR #47 + #48) is gone. The BuildJob row
+        # IS the per-fire state. We keep the ``run_id`` name in the
+        # downstream call chain (``_run_with_retry`` / ``_finalize_run``
+        # / ``_post_terminal``) — it now holds ``BuildJob.id``.
+        run_id = _job.id
         async with self._session_maker() as db:
             await db.execute(
                 update(BuildJob)
                 .where(BuildJob.id == _job.id)
-                .values(fire_instant=fire_instant, attempt=1)
+                .values(
+                    status="running",
+                    fire_instant=fire_instant,
+                    attempt=1,
+                )
             )
             await db.commit()
-
-        # ── Dual-write the legacy RoutineRun row ─────────────────────
-        # Preserved so the existing /api/routines/{id}/runs consumers
-        # and any handler code that still reads/writes RoutineRun keep
-        # working. PR #48 removes this dual-write. Fresh-vs-dedupe is
-        # gated on the Job side above; a concurrent race past the
-        # SELECT can in theory hit the legacy UNIQUE before the
-        # BuildJob UNIQUE — we catch + log so the surviving Job still
-        # gets to dispatch.
-        run_id = str(uuid.uuid4())
-        try:
-            async with self._session_maker() as db:
-                run = RoutineRun(
-                    id=run_id,
-                    routine_id=routine_id,
-                    user_id=routine.user_id,
-                    scheduled_for_local_date=local_date,
-                    status="running",
-                    started_at=datetime.utcnow(),
-                    fire_instant=fire_instant,
-                    job_id=_job.id,
-                )
-                db.add(run)
-                await db.commit()
-        except IntegrityError:
-            # Rare: legacy UNIQUE collision in the race window. Look
-            # up the existing row so the rest of _fire still has a
-            # valid run_id to thread through retry + finalize.
-            logger.warning(
-                "[routine_runner] legacy_routine_run_unique_race "
-                "routine_id=%s local_date=%s — recovering existing row",
-                routine_id, local_date,
-            )
-            async with self._session_maker() as db:
-                existing_run = (await db.execute(
-                    select(RoutineRun).where(
-                        RoutineRun.routine_id == routine_id,
-                        RoutineRun.scheduled_for_local_date == local_date,
-                    )
-                )).scalar_one_or_none()
-                if existing_run is None:
-                    # Vanishingly unlikely (the IntegrityError implies
-                    # the row exists), but bail safely if so.
-                    return
-                run_id = existing_run.id
-                # Make sure the recovered legacy row links to OUR Job
-                # so the terminal mirror points at the right place.
-                if existing_run.job_id != _job.id:
-                    await db.execute(
-                        update(RoutineRun)
-                        .where(RoutineRun.id == run_id)
-                        .values(job_id=_job.id)
-                    )
-                    await db.commit()
 
         # Find handler. Unknown kind → log "would_execute" + finalize as
         # success (Gate 1 no-op behavior preserved for _smoke / _test_*
@@ -954,8 +895,18 @@ class RoutineRunner:
         """Up to len(retry_delays) attempts. Backoff between attempts
         (not before attempt 1). `skipped_reauth` short-circuits — no
         retry, it's a clean intentional exit. `success` short-circuits
-        for obvious reasons. `failed` retries up to the budget."""
-        from app.db.models import RoutineRun
+        for obvious reasons. `failed` retries up to the budget.
+
+        PR #49 cutover: ``run_id`` is now a ``BuildJob.id`` (the
+        legacy RoutineRun dual-write was removed in ``_fire``). The
+        handler signature ``execute(routine, run, db)`` stays
+        unchanged — we build a ``types.SimpleNamespace`` shim
+        from the BuildJob fields so handlers see a row-shaped
+        object. Audit (PR #47) confirmed no handler reads any
+        attribute off ``run`` today; the shim keeps the contract
+        sane for future handler authors.
+        """
+        from app.db.models import BuildJob
 
         from .base_handler import RoutineResult
 
@@ -975,40 +926,26 @@ class RoutineRunner:
                 except asyncio.CancelledError:
                     raise
 
-            # Update attempt counter so observers see progress.
+            # PR #49: single UPDATE on BuildJob.attempt — the legacy
+            # RoutineRun.attempt write was removed alongside the rest
+            # of the dual-write surface. Best-effort bookkeeping;
+            # don't fail the run on it.
             try:
                 async with self._session_maker() as db:
                     await db.execute(
-                        update(RoutineRun)
-                        .where(RoutineRun.id == run_id)
+                        update(BuildJob)
+                        .where(BuildJob.id == run_id)
                         .values(attempt=attempt_idx + 1)
                     )
                     await db.commit()
             except Exception:
-                pass  # Best-effort bookkeeping; don't fail the run on it.
-
-            # PR #47 cutover — mirror the attempt counter onto the
-            # linked BuildJob so Mission Control reads the new source
-            # of truth. The job_id lives on the RoutineRun we already
-            # loaded above; one indexed UPDATE per retry, best-effort.
-            try:
-                from app.db.models import BuildJob
-                async with self._session_maker() as db:
-                    _run_row = await db.get(RoutineRun, run_id)
-                    if _run_row is not None and _run_row.job_id is not None:
-                        await db.execute(
-                            update(BuildJob)
-                            .where(BuildJob.id == _run_row.job_id)
-                            .values(attempt=attempt_idx + 1)
-                        )
-                        await db.commit()
-            except Exception:
-                pass  # Best-effort bookkeeping; don't fail the run on it.
+                pass
 
             try:
                 async with self._session_maker() as db:
-                    run_obj = await db.get(RoutineRun, run_id)
-                    last_result = await handler.execute(routine, run_obj, db)
+                    job_row = await db.get(BuildJob, run_id)
+                    run_shim = self._build_run_shim(job_row, routine)
+                    last_result = await handler.execute(routine, run_shim, db)
             except Exception as e:
                 logger.exception(
                     "[routine_run] handler_raised kind=%s run_id=%s attempt=%d err=%s",
@@ -1039,6 +976,42 @@ class RoutineRunner:
 
         logger.info("[metric] routine.run.failed kind=%s", routine.kind)
         return last_result  # final failed result after exhausting retries
+
+    @staticmethod
+    def _build_run_shim(job_row: Any, routine: Any) -> types.SimpleNamespace:
+        """Build a row-shaped object that handlers receive as the
+        ``run`` parameter of ``handler.execute(routine, run, db)``.
+
+        PR #49 of the cutover arc: with the legacy RoutineRun gone,
+        nothing on ``run`` is read by any handler today (audit
+        confirmed pre-cutover). We still populate the fields a
+        future handler might want — sourced from the BuildJob row
+        — so the contract reads sanely. Specifically:
+
+          - ``id``: BuildJob.id (also the value of ``run_id``).
+          - ``routine_id``: BuildJob.source_id (routine.id).
+          - ``user_id``: BuildJob.user_id.
+          - ``scheduled_for_local_date``: derived from
+            BuildJob.idempotency_key, which ``_fire`` sets to
+            ``str(local_date)``. We parse leniently — if a future
+            kind uses a different idempotency_key shape, the field
+            falls back to None rather than crashing.
+          - ``fire_instant``: BuildJob.fire_instant (mig 051).
+        """
+        scheduled_local_date: Optional[date] = None
+        try:
+            raw_key = getattr(job_row, "idempotency_key", None)
+            if raw_key:
+                scheduled_local_date = date.fromisoformat(raw_key)
+        except Exception:
+            scheduled_local_date = None
+        return types.SimpleNamespace(
+            id=getattr(job_row, "id", None),
+            routine_id=getattr(job_row, "source_id", None) or routine.id,
+            user_id=getattr(job_row, "user_id", None) or routine.user_id,
+            scheduled_for_local_date=scheduled_local_date,
+            fire_instant=getattr(job_row, "fire_instant", None),
+        )
 
     # ------------------------------------------------------------------ outcome derivation
     @staticmethod
@@ -1108,11 +1081,13 @@ class RoutineRunner:
         non-success outcomes, advance the routine's watermark on
         success, finalize the run row.
 
-        The idempotency gate is the `(routine_id, scheduled_for_local_date)`
-        UNIQUE constraint that already claimed this run row — so
-        skipped_reauth and failed nudges can post at most once per
-        local day per the spec, because only one run row exists."""
-        from app.db.models import Routine, RoutineRun
+        The idempotency gate is the composite UNIQUE on
+        ``(build_jobs.source_id, build_jobs.idempotency_key)`` (where
+        ``idempotency_key=str(local_date)``) that already claimed this
+        Job row — so skipped_reauth and failed nudges can post at most
+        once per local day per the spec, because only one Job row
+        exists."""
+        from app.db.models import Routine
 
         message_id_for_run: Optional[str] = result.summary_message_id
 
@@ -1160,16 +1135,17 @@ class RoutineRunner:
         # Fall back to utcnow when fire_instant isn't recoverable (e.g.,
         # a force-run via /api/routines/{id}/run skipped through _fire).
         #
-        # PR #47 read note — we still read ``RoutineRun.fire_instant``
-        # because the legacy row is still being dual-written by
-        # ``_fire`` above (PR #48 removes the dual-write). PR #48 will
-        # repoint this read at ``BuildJob.fire_instant`` (mig 051
-        # column, populated identically by the Job-first intake).
+        # PR #49 of the cutover arc: read directly from
+        # ``BuildJob.fire_instant`` (mig 051 column, populated by the
+        # Job-first intake in ``_fire``). The legacy
+        # ``RoutineRun.fire_instant`` read was removed alongside the
+        # rest of the dual-write surface.
+        from app.db.models import BuildJob
         fire_at: Optional[datetime] = None
         try:
             async with self._session_maker() as db:
-                run_row = await db.get(RoutineRun, run_id)
-                fire_at = getattr(run_row, "fire_instant", None) if run_row else None
+                job_row = await db.get(BuildJob, run_id)
+                fire_at = getattr(job_row, "fire_instant", None) if job_row else None
         except Exception:
             fire_at = None
         if fire_at is None:
@@ -1439,156 +1415,98 @@ class RoutineRunner:
         channel_results: Optional[dict] = None,
         tools_invoked: Optional[list] = None,
     ) -> None:
-        """Close out the routine_runs row. Best-effort — a failure here
+        """Close out the BuildJob row. Best-effort — a failure here
         leaves the row in 'running' which the next-boot restart sweep
-        will clean up."""
-        from app.db.models import Routine, RoutineRun
+        will clean up.
+
+        PR #49 of the cutover arc: this used to write to both
+        ``routine_runs`` AND ``build_jobs`` (via
+        ``_mirror_run_terminal_to_job``). The legacy UPDATE was
+        removed once every reader was repointed at the Job; the
+        mirror helper is gone and the BuildJob write is the only
+        terminal stamp. All five mig 052 terminal columns
+        (``emails_fetched``, ``finished_local_at``, ``error_json``,
+        ``channel_results_json``, ``tools_invoked_json``) land on
+        ``build_jobs`` directly.
+
+        Status → (job_status, job_outcome) mapping (inlined from
+        the deleted mirror helper, same table):
+
+          status='success'        → completed, outcome=derived or 'success'
+          status='partial'        → completed, outcome=derived or 'partial'
+          status='skipped_reauth' → completed, outcome=derived or 'skipped_reauth'
+          status='failed'         → failed,    outcome=NULL
+          (unknown)               → completed, outcome=derived or <raw>
+        """
+        from app.db.models import BuildJob
 
         finished_at = datetime.utcnow()
         # finished_local_at: ISO8601 in the user's tz. Best-effort — falls
         # back to UTC if we can't resolve the tz cheaply.
         finished_local_iso: Optional[str] = None
         try:
+            user_id: Optional[str] = None
             async with self._session_maker() as db:
-                run_row = await db.get(RoutineRun, run_id)
-                if run_row is not None:
-                    user_id = run_row.user_id
-            tz_str = await self._user_tz_async(user_id)  # noqa
-            tz, _ = _resolve_tz(tz_str, user_id)
-            finished_local_iso = finished_at.replace(tzinfo=timezone.utc).astimezone(tz).isoformat()
+                job_row = await db.get(BuildJob, run_id)
+                if job_row is not None:
+                    user_id = job_row.user_id
+            if user_id is not None:
+                tz_str = await self._user_tz_async(user_id)
+                tz, _ = _resolve_tz(tz_str, user_id)
+                finished_local_iso = finished_at.replace(tzinfo=timezone.utc).astimezone(tz).isoformat()
         except Exception:
             try:
                 finished_local_iso = finished_at.isoformat() + "Z"
             except Exception:
                 finished_local_iso = None
 
+        # Status → (job_status, job_outcome) mapping, inlined from the
+        # deleted ``_mirror_run_terminal_to_job`` helper.
+        if status == "failed":
+            job_status = "failed"
+            job_outcome: Optional[str] = None
+        elif status in ("success", "partial", "skipped_reauth"):
+            job_status = "completed"
+            # Prefer the derived `outcome` value when present
+            # (Ticket 2.1 — success_empty, partial, etc.). Fall back
+            # to the raw status as a discriminator.
+            job_outcome = outcome or status
+        else:
+            # Unknown status — be conservative and mark completed
+            # with the raw value as outcome so we can audit later.
+            job_status = "completed"
+            job_outcome = outcome or status
+
         values: dict[str, Any] = {
-            "status": status,
-            "error_class": error_class,
-            "error_detail": error_detail,
+            "status": job_status,
+            "outcome": job_outcome,
+            "completed_at": finished_at,
+            # Mig 052 terminal columns — written verbatim from the
+            # handler-supplied terminal payload.
             "emails_fetched": emails_fetched,
-            "summary_message_id": summary_message_id,
-            "finished_at": finished_at,
             "finished_local_at": finished_local_iso,
+            "error_json": error_json,
+            "channel_results_json": channel_results,
+            "tools_invoked_json": tools_invoked,
         }
-        if outcome is not None:
-            values["outcome"] = outcome
-        if error_json is not None:
-            values["error_json"] = error_json
-        if channel_results is not None:
-            values["channel_results_json"] = channel_results
-        if tools_invoked is not None:
-            values["tools_invoked_json"] = tools_invoked
+        if error_detail and job_status == "failed":
+            # Unified error column on BuildJob — carries the legacy
+            # error_detail forward for the dashboard. Truncate to
+            # match Postgres column size.
+            values["error_message"] = (error_detail or "")[:1000]
+        if summary_message_id and job_status == "completed":
+            values["summary_message_id"] = summary_message_id
 
         try:
             async with self._session_maker() as db:
                 await db.execute(
-                    update(RoutineRun)
-                    .where(RoutineRun.id == run_id)
+                    update(BuildJob)
+                    .where(BuildJob.id == run_id)
                     .values(**values)
                 )
                 await db.commit()
         except Exception as e:
             logger.warning("[routine_runner] finalize_failed run_id=%s err=%s", run_id, e)
-
-        # Mirror terminal state onto the linked BuildJob (PR 4b
-        # unified-jobs arc). Best-effort: a mirror failure is logged
-        # + swallowed so the legacy fire path stays correct.
-        await self._mirror_run_terminal_to_job(
-            run_id=run_id,
-            status=status,
-            outcome=outcome,
-            error_message=error_detail,
-            summary_message_id=summary_message_id,
-            finished_at=finished_at,
-        )
-
-    async def _mirror_run_terminal_to_job(
-        self,
-        *,
-        run_id: str,
-        status: str,
-        outcome: Optional[str] = None,
-        error_message: Optional[str] = None,
-        summary_message_id: Optional[str] = None,
-        finished_at: Optional[datetime] = None,
-    ) -> None:
-        """Mirror a RoutineRun's terminal state onto its linked
-        ``build_jobs`` row (PR 4b of the unified-jobs arc).
-
-        RoutineRun has granular ``status`` and ``outcome`` fields.
-        Mapping to the closed BuildJob enum:
-
-          status=success      → status='completed', outcome=<derived outcome>
-          status=partial      → status='completed', outcome='partial'
-          status=skipped_reauth → status='completed', outcome='skipped_reauth'
-          status=failed       → status='failed',    outcome=NULL
-
-        When ``outcome`` is supplied (the derived Ticket-2.1 value),
-        it takes precedence and lands on ``BuildJob.outcome`` so the
-        Mission Control surface can distinguish success / success_empty
-        / partial / failure / tool_error.
-
-        No-op when the RoutineRun has no ``job_id`` (legacy rows from
-        before PR 4b, or a Job-mint failure at fire-time). Best-effort
-        — any exception is logged and swallowed."""
-        try:
-            from app.db.models import BuildJob, RoutineRun
-            async with self._session_maker() as db:
-                run_row = await db.get(RoutineRun, run_id)
-                if run_row is None or run_row.job_id is None:
-                    return  # no Job to mirror — silent no-op
-                if status == "failed":
-                    job_status = "failed"
-                    job_outcome: Optional[str] = None
-                elif status in ("success", "partial", "skipped_reauth"):
-                    job_status = "completed"
-                    # Prefer the derived `outcome` value when present
-                    # (Ticket 2.1 — success_empty, partial, etc.).
-                    # Fall back to the raw status as a discriminator.
-                    job_outcome = outcome or status
-                else:
-                    # Unknown status — be conservative and mark
-                    # completed with the raw value as outcome so we
-                    # can audit later.
-                    job_status = "completed"
-                    job_outcome = outcome or status
-                values: dict[str, Any] = {
-                    "status": job_status,
-                    "outcome": job_outcome,
-                    "completed_at": finished_at or datetime.utcnow(),
-                }
-                if error_message and job_status == "failed":
-                    values["error_message"] = (error_message or "")[:1000]
-                if summary_message_id and job_status == "completed":
-                    values["summary_message_id"] = summary_message_id
-
-                # PR #47 cutover — mirror the five legacy terminal
-                # columns onto BuildJob (mig 052). Read verbatim off
-                # the RoutineRun row we already loaded; ``_finalize_run``
-                # populated them in the same transaction-ish sequence
-                # immediately before calling us. None values are
-                # written as None — matches the legacy behaviour where
-                # a no-emails / no-channels run leaves these NULL on
-                # routine_runs too.
-                values["emails_fetched"] = run_row.emails_fetched
-                values["finished_local_at"] = run_row.finished_local_at
-                values["error_json"] = run_row.error_json
-                values["channel_results_json"] = run_row.channel_results_json
-                values["tools_invoked_json"] = run_row.tools_invoked_json
-
-                await db.execute(
-                    update(BuildJob)
-                    .where(BuildJob.id == run_row.job_id)
-                    .values(**values)
-                )
-                await db.commit()
-        except Exception as e:
-            logger.warning(
-                "[routine_runner] mirror_to_job failed run_id=%s err=%s "
-                "(legacy fire path unaffected)",
-                run_id, e,
-            )
 
     # ------------------------------------------------------------------ status (for /_runner_status)
     def status_snapshot(self) -> dict[str, Any]:

@@ -1,31 +1,29 @@
-"""Job parity — routine fires must materialise mirrored BuildJob rows.
+"""Job parity — routine fires materialise BuildJob rows.
 
-PR 4b of the unified-jobs arc. Sibling of test_job_parity_triggers.py.
+Originally PR 4b of the unified-jobs arc, this suite pinned a
+dual-write between ``routine_runs`` (legacy) and ``build_jobs``
+(new). PR #49 of the cutover arc removed the legacy dual-write —
+``build_jobs`` is now the sole source of truth.
 
 What we pin:
 
-  1. ``RoutineRunner._fire`` mints a mirrored BuildJob immediately
-     after the RoutineRun INSERT, in the same transaction lifecycle.
-     The RoutineRun's ``job_id`` is stamped; the Job's ``source_id``
-     points back at the routine; ``idempotency_key`` is the user-
-     local-date discriminator so the composite UNIQUE on
-     ``(source_id, idempotency_key)`` collapses to the same dedupe
-     gate as ``UNIQUE (routine_id, scheduled_for_local_date)``.
+  1. ``RoutineRunner._fire`` mints ONE BuildJob row per
+     (routine, local_date) pair. ``source_id`` points at the
+     routine; ``idempotency_key=str(local_date)``;
+     ``job_type='routine_run'``.
 
-  2. Each RoutineRun terminal status mirrors onto the linked Job
-     via ``_finalize_run`` → ``_mirror_run_terminal_to_job``:
+  2. Each terminal status maps onto the Job via the inline
+     ``_finalize_run`` write:
         success            → status='completed', outcome=<derived>
         partial            → status='completed', outcome='partial'
         skipped_reauth     → status='completed', outcome='skipped_reauth'
         failed             → status='failed',    outcome=NULL
 
   3. The Ticket-2.1 ``derived outcome`` (success / success_empty /
-     partial / tool_error / failure) survives on ``BuildJob.outcome``
-     so Mission Control can distinguish e.g. "no new emails today"
-     from "real summary delivered."
+     partial / tool_error / failure) survives on ``BuildJob.outcome``.
 
-  4. A Job mint failure at fire-time must NOT roll back the
-     RoutineRun insert (best-effort dual-write).
+  4. A Job mint failure at fire-time aborts the intake — no
+     downstream row exists.
 """
 from __future__ import annotations
 
@@ -52,16 +50,17 @@ ROUTINE_ID = "00000000-0000-0000-0000-0000000cc100"
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_database():
     """Bypass conftest's init_db autouse fixture (entities pgvector
-    breaks SQLite). Build only the tables we need."""
+    breaks SQLite). PR #49: cutover paths no longer touch RoutineRun,
+    so the fixture only sets up User, Routine, BuildJob, JobEvent."""
     from app.db.database import engine
-    from app.db.models import BuildJob, JobEvent, Routine, RoutineRun, User
+    from app.db.models import BuildJob, JobEvent, Routine, User
 
     async with engine.begin() as conn:
-        for model_cls in (User, BuildJob, JobEvent, Routine, RoutineRun):
+        for model_cls in (User, BuildJob, JobEvent, Routine):
             await conn.run_sync(model_cls.__table__.create, checkfirst=True)
     yield
     async with engine.begin() as conn:
-        for model_cls in (RoutineRun, Routine, JobEvent, BuildJob, User):
+        for model_cls in (Routine, JobEvent, BuildJob, User):
             await conn.run_sync(model_cls.__table__.drop, checkfirst=True)
     await engine.dispose()
 
@@ -92,20 +91,19 @@ async def _seed_user_and_routine():
         await db.commit()
 
 
-# ── _fire dual-write ─────────────────────────────────────────────────
+# ── _fire mint ───────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_fire_creates_mirrored_job_after_idempotency_claim(
+async def test_fire_creates_job_after_idempotency_claim(
     _seed_user_and_routine, monkeypatch,
 ):
-    """A successful ``_fire`` writes a RoutineRun AND a mirrored
-    BuildJob. The Job carries source_id=routine.id,
-    idempotency_key=str(local_date), job_type='routine_run'.
-    RoutineRun.job_id links back."""
+    """A successful ``_fire`` writes ONE BuildJob row.
+    The Job carries source_id=routine.id,
+    idempotency_key=str(local_date), job_type='routine_run'."""
     from app.agent.routines.runner import RoutineRunner
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, RoutineRun
+    from app.db.models import BuildJob
     from sqlalchemy import select
 
     runner = RoutineRunner(session_maker=async_session_maker)
@@ -117,23 +115,21 @@ async def test_fire_creates_mirrored_job_after_idempotency_claim(
 
     # No registered handler → _fire takes the "_finalize_run success"
     # short-circuit. That's fine for this parity test — we're asserting
-    # the create-side dual-write, not handler dispatch.
+    # the Job mint, not handler dispatch.
     await runner._fire(ROUTINE_ID)
 
     async with async_session_maker() as db:
-        runs = (await db.execute(
-            select(RoutineRun).where(RoutineRun.routine_id == ROUTINE_ID)
+        jobs = (await db.execute(
+            select(BuildJob).where(BuildJob.source_id == ROUTINE_ID)
         )).scalars().all()
-        assert len(runs) == 1
-        run = runs[0]
-        assert run.job_id is not None, "RoutineRun.job_id must be stamped"
-
-        job = await db.get(BuildJob, run.job_id)
-        assert job is not None
+        assert len(jobs) == 1
+        job = jobs[0]
         assert job.job_type == "routine_run"
         assert job.source_kind == "routine"
         assert job.source_id == ROUTINE_ID
-        assert job.idempotency_key == str(run.scheduled_for_local_date)
+        # idempotency_key is str(local_date); we can't pin the exact
+        # date here (depends on wall-clock), but the field must be set.
+        assert job.idempotency_key is not None
         assert job.user_id == USER_ID
 
 
@@ -141,10 +137,8 @@ async def test_fire_creates_mirrored_job_after_idempotency_claim(
 async def test_two_fires_same_day_produce_one_job(
     _seed_user_and_routine, monkeypatch,
 ):
-    """Two ``_fire`` calls for the same local-date hit the
-    ``UNIQUE (routine_id, scheduled_for_local_date)`` constraint on
-    the second call. Exactly ONE Job exists. The Job's
-    idempotency_key prevents a duplicate at the unified layer too."""
+    """Two ``_fire`` calls for the same local-date hit the explicit
+    SELECT dedupe gate on the second call. Exactly ONE Job exists."""
     from app.agent.routines.runner import RoutineRunner
     from app.db.database import async_session_maker
     from app.db.models import BuildJob
@@ -167,24 +161,23 @@ async def test_two_fires_same_day_produce_one_job(
             )
         )).scalar_one()
         assert job_count == 1, (
-            f"expected 1 mirrored Job for the dedupe pair, got {job_count}"
+            f"expected 1 Job for the dedupe pair, got {job_count}"
         )
 
 
-# ── _finalize_run mirror ─────────────────────────────────────────────
+# ── _finalize_run terminal writes ────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_finalize_run_success_mirrors_to_job(
+async def test_finalize_run_success_writes_to_job(
     _seed_user_and_routine, monkeypatch,
 ):
-    """When ``_finalize_run`` writes a success outcome, the mirror
-    helper updates the linked Job: status='completed',
-    outcome=<the derived Ticket-2.1 outcome value>, completed_at set,
-    summary_message_id mirrored."""
+    """When ``_finalize_run`` writes a success outcome, the Job is
+    updated to status='completed', outcome=<the derived Ticket-2.1
+    outcome value>, completed_at set, summary_message_id set."""
     from app.agent.routines.runner import RoutineRunner
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, RoutineRun
+    from app.db.models import BuildJob
 
     runner = RoutineRunner(session_maker=async_session_maker)
     async def _tz(uid):
@@ -195,15 +188,14 @@ async def test_finalize_run_success_mirrors_to_job(
 
     async with async_session_maker() as db:
         from sqlalchemy import select
-        run = (await db.execute(
-            select(RoutineRun).where(RoutineRun.routine_id == ROUTINE_ID)
+        job = (await db.execute(
+            select(BuildJob).where(BuildJob.source_id == ROUTINE_ID)
         )).scalar_one()
-        run_id = run.id
-        job_id = run.job_id
+        job_id = job.id
 
     # Drive _finalize_run directly with a synthesised terminal write.
     await runner._finalize_run(
-        run_id,
+        job_id,
         status="success",
         outcome="success",
         emails_fetched=3,
@@ -219,14 +211,14 @@ async def test_finalize_run_success_mirrors_to_job(
 
 
 @pytest.mark.asyncio
-async def test_finalize_run_failed_mirrors_to_job(
+async def test_finalize_run_failed_writes_to_job(
     _seed_user_and_routine, monkeypatch,
 ):
-    """``status='failed'`` mirrors as ``Job.status='failed'`` with
+    """``status='failed'`` writes ``Job.status='failed'`` with
     ``error_message`` set and ``outcome=NULL``."""
     from app.agent.routines.runner import RoutineRunner
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, RoutineRun
+    from app.db.models import BuildJob
     from sqlalchemy import select
 
     runner = RoutineRunner(session_maker=async_session_maker)
@@ -236,14 +228,13 @@ async def test_finalize_run_failed_mirrors_to_job(
 
     await runner._fire(ROUTINE_ID)
     async with async_session_maker() as db:
-        run = (await db.execute(
-            select(RoutineRun).where(RoutineRun.routine_id == ROUTINE_ID)
+        job = (await db.execute(
+            select(BuildJob).where(BuildJob.source_id == ROUTINE_ID)
         )).scalar_one()
-        run_id = run.id
-        job_id = run.job_id
+        job_id = job.id
 
     await runner._finalize_run(
-        run_id,
+        job_id,
         status="failed",
         error_class="ProviderTimeout",
         error_detail="upstream gmail.googleapis.com timed out after 30s",
@@ -259,15 +250,14 @@ async def test_finalize_run_failed_mirrors_to_job(
 
 
 @pytest.mark.asyncio
-async def test_finalize_run_skipped_reauth_mirrors_to_job(
+async def test_finalize_run_skipped_reauth_writes_to_job(
     _seed_user_and_routine, monkeypatch,
 ):
-    """``status='skipped_reauth'`` mirrors as ``Job.status='completed'``
-    + ``outcome='skipped_reauth'`` (closed BuildJob enum doesn't
-    include skipped_reauth; granular state lives on outcome)."""
+    """``status='skipped_reauth'`` writes ``Job.status='completed'``
+    + ``outcome='tool_error'`` (derived outcome takes precedence)."""
     from app.agent.routines.runner import RoutineRunner
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, RoutineRun
+    from app.db.models import BuildJob
     from sqlalchemy import select
 
     runner = RoutineRunner(session_maker=async_session_maker)
@@ -277,14 +267,13 @@ async def test_finalize_run_skipped_reauth_mirrors_to_job(
 
     await runner._fire(ROUTINE_ID)
     async with async_session_maker() as db:
-        run = (await db.execute(
-            select(RoutineRun).where(RoutineRun.routine_id == ROUTINE_ID)
+        job = (await db.execute(
+            select(BuildJob).where(BuildJob.source_id == ROUTINE_ID)
         )).scalar_one()
-        run_id = run.id
-        job_id = run.job_id
+        job_id = job.id
 
     await runner._finalize_run(
-        run_id,
+        job_id,
         status="skipped_reauth",
         outcome="tool_error",
         error_class="GmailNeedsReauth",
@@ -302,19 +291,13 @@ async def test_finalize_run_skipped_reauth_mirrors_to_job(
 async def test_intake_aborts_when_job_mint_fails(
     _seed_user_and_routine, monkeypatch,
 ):
-    """Contract changed in PR #47: with the Job-first inversion, a
-    failed ``JobRunner.create_job`` aborts the fire path entirely —
-    no legacy RoutineRun row is created, no BuildJob row exists,
-    APScheduler's next tick is the natural retry.
-
-    The previous test name (``test_dual_write_robust_to_job_failure``)
-    asserted the legacy fire path survived a Job mint failure. That
-    contract is intentionally inverted: ``build_jobs`` is now the
-    source of truth and the dedupe gate, so we must NOT create an
-    orphan RoutineRun without a Job to mirror against."""
+    """Contract from PR #47 (preserved through PR #49): a failed
+    ``JobRunner.create_job`` aborts the fire path entirely — no
+    BuildJob row exists, APScheduler's next tick is the natural
+    retry."""
     from app.agent.routines.runner import RoutineRunner
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, RoutineRun
+    from app.db.models import BuildJob
     from sqlalchemy import select, func
 
     async def _explode(*a, **kw):
@@ -331,17 +314,7 @@ async def test_intake_aborts_when_job_mint_fails(
     # _fire must NOT raise — best-effort wrapper logs and bails.
     await runner._fire(ROUTINE_ID)
 
-    # Neither table got a row — APScheduler retries on next tick.
     async with async_session_maker() as db:
-        run_count = (await db.execute(
-            select(func.count(RoutineRun.id)).where(
-                RoutineRun.routine_id == ROUTINE_ID,
-            )
-        )).scalar_one()
-        assert run_count == 0, (
-            "Job mint failure must NOT leave an orphan RoutineRun — "
-            "Job is the source of truth, RoutineRun is the mirror"
-        )
         job_count = (await db.execute(
             select(func.count(BuildJob.id)).where(
                 BuildJob.source_id == ROUTINE_ID,

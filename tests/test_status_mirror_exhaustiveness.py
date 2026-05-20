@@ -1,27 +1,24 @@
-"""Status-mirror exhaustiveness contract.
+"""Status mapping exhaustiveness contract.
 
 The unified-jobs arc replaced four bespoke status enums with the
-closed BuildJob (status, outcome) tuple. Each source's mirror
-helper translates the source's status → (job_status, job_outcome)
-combination — but the per-source tests only exercise the *common*
-statuses (success / failed). What was missing:
+closed BuildJob (status, outcome) tuple. Each runner translates
+its terminal status → (job_status, job_outcome) combination.
 
-  - Pin EVERY value in ``TRIGGER_EVENT_STATUSES`` and the routine
-    runner's known status set to a defined ``(status, outcome)``
-    pair. A new status added to the source's enum without
-    extending the mirror helper would silently produce a row with
-    ``status='completed', outcome=<the new value>`` (conservative
-    fallback) — that's the bug we want to surface via test.
-  - Pin the success / failed / skipped axes to ``completed/<axis>``
-    vs ``failed/NULL`` invariants so a regression that, say, maps
-    ``failed`` to ``completed`` (a real customer-impacting
-    mis-routing) crashes the test.
+Originally these tests pinned the mirror helper functions
+(``_mirror_event_terminal_to_job`` /
+``_mirror_run_terminal_to_job``) that dual-wrote terminal state
+from the legacy table onto BuildJob. PR #49 of the cutover arc
+removed those helpers along with the legacy dual-write — the
+runners now inline the same mapping in ``_dispatch_one`` (triggers)
+and ``_finalize_run`` (routines).
 
-These tests don't seed a DB. They unit-test the **mapping logic
-in isolation** by invoking the mirror helper with a stub TriggerEvent /
-RoutineRun (job_id present) and a stub BuildJob row, and asserting
-the UPDATE statement values match expectations. Fast, hermetic, no
-async DB ceremony.
+The pin we still need: the closed ``(status, outcome)`` mapping
+table itself. A new status added to a source's enum without
+extending the runner's mapping would silently produce a row with
+``status='completed', outcome=<the new value>`` (the conservative
+fallback both runners take). These tests exercise the runners
+end-to-end and assert the resulting BuildJob row's (status,
+outcome) tuple matches the documented table.
 
 Why this matters: the closed BuildJob enum is the read-side
 contract for the activity feed and Mission Control. If a new
@@ -32,6 +29,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -48,44 +46,37 @@ USER_ID = "00000000-0000-0000-0000-0000000sm001"
 
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_database():
-    """Per-test fresh DB. Only the tables the mirror helpers
-    touch (BuildJob + TriggerEvent + RoutineRun + Trigger +
-    Routine + User)."""
+    """Per-test fresh DB. Only the tables the runners touch
+    end-to-end (BuildJob + Trigger + Routine + User). PR #49: no
+    TriggerEvent / RoutineRun in the cutover paths."""
     from app.db.database import rebind_database
     from app.config import settings
 
     await rebind_database(settings.DATABASE_URL)
 
     from app.db.database import engine
-    from app.db.models import (
-        BuildJob, Routine, RoutineRun, Trigger, TriggerEvent, User,
-    )
+    from app.db.models import BuildJob, JobEvent, Routine, Trigger, User
 
     async with engine.begin() as conn:
-        for model_cls in (
-            User, BuildJob, Trigger, TriggerEvent, Routine, RoutineRun,
-        ):
+        for model_cls in (User, BuildJob, JobEvent, Trigger, Routine):
             await conn.run_sync(model_cls.__table__.create, checkfirst=True)
     yield
     async with engine.begin() as conn:
-        for model_cls in (
-            RoutineRun, Routine, TriggerEvent, Trigger, BuildJob, User,
-        ):
+        for model_cls in (Routine, Trigger, JobEvent, BuildJob, User):
             await conn.run_sync(model_cls.__table__.drop, checkfirst=True)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Helpers — seed the minimum rows the mirror helper reads.
+# Helpers — seed the minimum rows the runner exercises.
 # ──────────────────────────────────────────────────────────────────────
 
 
-async def _seed_user_and_trigger_event(status_in: str = "queued") -> tuple[str, str]:
-    """Seed User + Trigger + TriggerEvent + BuildJob with the linkage.
-    Returns (event_id, job_id)."""
+async def _seed_user_and_trigger_job() -> tuple[str, str]:
+    """Seed User + Trigger + BuildJob (status=queued) with linkage.
+    Returns (trigger_id, job_id)."""
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, Trigger, TriggerEvent, User
+    from app.db.models import BuildJob, Trigger, User
 
-    event_id = str(uuid.uuid4())
     trigger_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     async with async_session_maker() as db:
@@ -98,32 +89,26 @@ async def _seed_user_and_trigger_event(status_in: str = "queued") -> tuple[str, 
         db.add(Trigger(
             id=trigger_id, user_id=USER_ID, kind="email_received",
             action="agent_handle", enabled=True, config_json={},
+            provider_state_json={}, filter_json={}, last_status="never_fired",
+            fire_count=0,
         ))
         db.add(BuildJob(
             id=job_id, user_id=USER_ID, title="Mirror test",
-            prompt="", job_type="trigger_run", status="running",
+            prompt="", job_type="trigger_run", status="queued",
             source_kind="trigger", source_id=trigger_id,
+            idempotency_key=f"dedupe-{job_id[:8]}",
             created_at=datetime.utcnow(),
         ))
-        db.add(TriggerEvent(
-            id=event_id, trigger_id=trigger_id, user_id=USER_ID,
-            event_dedupe_id=f"dedupe-{event_id[:8]}",
-            received_at=datetime.utcnow(),
-            status=status_in,
-            job_id=job_id,
-        ))
         await db.commit()
-    return event_id, job_id
+    return trigger_id, job_id
 
 
-async def _seed_user_and_routine_run() -> tuple[str, str]:
-    """Seed User + Routine + RoutineRun + BuildJob with linkage.
-    Returns (run_id, job_id)."""
-    from datetime import date
+async def _seed_user_and_routine_job() -> tuple[str, str]:
+    """Seed User + Routine + BuildJob (status=running) with linkage.
+    Returns (routine_id, job_id)."""
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, Routine, RoutineRun, User
+    from app.db.models import BuildJob, Routine, User
 
-    run_id = str(uuid.uuid4())
     routine_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     async with async_session_maker() as db:
@@ -142,17 +127,11 @@ async def _seed_user_and_routine_run() -> tuple[str, str]:
             id=job_id, user_id=USER_ID, title="Mirror routine test",
             prompt="", job_type="routine_run", status="running",
             source_kind="routine", source_id=routine_id,
+            idempotency_key="2026-05-20",
             created_at=datetime.utcnow(),
         ))
-        db.add(RoutineRun(
-            id=run_id, routine_id=routine_id, user_id=USER_ID,
-            scheduled_for_local_date=date.today(),
-            started_at=datetime.utcnow(),
-            status="running",
-            job_id=job_id,
-        ))
         await db.commit()
-    return run_id, job_id
+    return routine_id, job_id
 
 
 async def _read_job(job_id: str):
@@ -163,107 +142,165 @@ async def _read_job(job_id: str):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Trigger mirror: every value in TRIGGER_EVENT_STATUSES has a mapping.
+# Trigger runner: status → (job_status, outcome) mapping.
+# Exercises ``_dispatch_one`` via a stub handler that returns each
+# per-event terminal status in turn.
 # ──────────────────────────────────────────────────────────────────────
 
 
+@dataclass
+class _FakeTriggerResult:
+    status: str = "success"
+    per_event_status: dict = field(default_factory=dict)
+    summary_message_id: Optional[str] = None
+    new_provider_state: Optional[dict] = None
+    error_class: Optional[str] = None
+    error_detail: Optional[str] = None
+    metrics: dict = field(default_factory=dict)
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("terminal_status,expected_job_status,expected_outcome", [
+@pytest.mark.parametrize("per_event_status,expected_job_status,expected_outcome", [
     ("success",            "completed", "success"),
     ("failed",             "failed",    None),
     ("skipped_rate_limit", "completed", "skipped_rate_limit"),
     ("skipped_filter",     "completed", "skipped_filter"),
     ("coalesced",          "completed", "coalesced"),
 ])
-async def test_trigger_mirror_maps_every_terminal_status(
-    terminal_status, expected_job_status, expected_outcome,
+async def test_trigger_runner_maps_terminal_status_via_dispatch(
+    per_event_status, expected_job_status, expected_outcome,
 ):
-    """For every terminal value in ``TRIGGER_EVENT_STATUSES``, the
-    mirror helper produces the documented ``(status, outcome)``
-    tuple on the linked BuildJob row. A regression that, say, maps
+    """For every documented terminal value a handler can return,
+    ``_dispatch_one`` writes the matching ``(status, outcome)``
+    tuple onto the BuildJob. A regression that, say, maps
     ``failed`` to ``completed`` would crash this test on the
-    ``failed`` row — exactly the kind of mis-routing that surfaces
-    to Mission Control as "delivered" but actually failed."""
+    ``failed`` row — exactly the kind of mis-routing that would
+    surface to Mission Control as "delivered" but actually failed.
+
+    PR #49: the mapping is inlined in the runner's step-5 batch
+    loop (the mirror helper was deleted)."""
+    from app.agent.triggers.registry import KIND_HANDLERS
     from app.agent.triggers.runner import TriggerRunner
-
-    event_id, job_id = await _seed_user_and_trigger_event()
-    runner = TriggerRunner()
-
     from app.db.database import async_session_maker
-    async with async_session_maker() as db:
-        await runner._mirror_event_terminal_to_job(
-            db,
-            event_id=event_id,
-            terminal_status=terminal_status,
+
+    trigger_id, job_id = await _seed_user_and_trigger_job()
+
+    class _StatusHandler:
+        kind = "email_received"
+        async def execute(self, trigger, events, db):
+            return _FakeTriggerResult(
+                status="success",
+                per_event_status={e.id: per_event_status for e in events},
+                error_class=("e" if per_event_status == "failed" else None),
+                error_detail=("forced" if per_event_status == "failed" else None),
+            )
+
+    KIND_HANDLERS["email_received"] = _StatusHandler()
+    try:
+        runner = TriggerRunner(
+            session_maker=async_session_maker,
+            retry_delays=(0.001, 0.001, 0.001),
         )
-        await db.commit()
+        ok = await runner._dispatch_one(job_id, attempt_idx=0)
+        assert ok is True
+    finally:
+        KIND_HANDLERS.pop("email_received", None)
 
     job = await _read_job(job_id)
     assert job.status == expected_job_status, (
-        f"terminal_status={terminal_status!r} mapped to "
+        f"per_event_status={per_event_status!r} mapped to "
         f"job.status={job.status!r}, expected {expected_job_status!r}"
     )
     assert job.outcome == expected_outcome, (
-        f"terminal_status={terminal_status!r} mapped to "
+        f"per_event_status={per_event_status!r} mapped to "
         f"job.outcome={job.outcome!r}, expected {expected_outcome!r}"
     )
 
 
 @pytest.mark.asyncio
-async def test_trigger_mirror_covers_full_enum():
+async def test_trigger_runner_covers_full_enum():
     """``TRIGGER_EVENT_STATUSES`` enumerates every legal value the
-    column can take. The runner's mirror helper exhaustively
-    branches on this enum (success / failed / skipped_* / coalesced /
-    fallback). Pin the enum membership so adding a value to the
-    enum without extending the mirror is a loud test failure here,
-    not a silent ``outcome=<new-value>`` leak."""
+    legacy column took. Pin the enum membership so adding a value
+    to the source enum without extending the runner's mapping is a
+    loud test failure here, not a silent ``outcome=<new-value>``
+    leak."""
     from app.db.models.trigger import TRIGGER_EVENT_STATUSES
 
-    # ``queued`` / ``running`` are non-terminal — the mirror is only
-    # called from terminal-status sites. The terminal set is what the
-    # mirror MUST cover.
+    # ``queued`` / ``running`` are non-terminal — the mapping is
+    # only exercised at terminal-status sites.
     expected_terminals = {
         "success", "failed", "skipped_rate_limit",
         "skipped_filter", "coalesced",
     }
     actual_terminals = TRIGGER_EVENT_STATUSES - {"queued", "running"}
     assert actual_terminals == expected_terminals, (
-        f"TRIGGER_EVENT_STATUSES terminal set drifted from the mirror "
-        f"helper's expectations: {actual_terminals} vs "
+        f"TRIGGER_EVENT_STATUSES terminal set drifted from the runner's "
+        f"mapping expectations: {actual_terminals} vs "
         f"{expected_terminals}. Update both."
     )
 
 
 @pytest.mark.asyncio
-async def test_trigger_mirror_error_message_only_set_on_failure():
-    """Invariant: ``error_message`` on the BuildJob row is populated
-    ONLY when ``terminal_status == 'failed'``. A success row carrying
-    a stale error_message would show as "succeeded with error" on the
-    dashboard — a UX regression."""
+async def test_trigger_runner_error_message_only_on_failure():
+    """Invariant: ``error_message`` on BuildJob is populated ONLY
+    when the per-event terminal is ``failed``. A success row
+    carrying a stale error_message would show as "succeeded with
+    error" on the dashboard."""
+    from app.agent.triggers.registry import KIND_HANDLERS
     from app.agent.triggers.runner import TriggerRunner
     from app.db.database import async_session_maker
 
-    event_id, job_id = await _seed_user_and_trigger_event()
-    runner = TriggerRunner()
-    async with async_session_maker() as db:
-        await runner._mirror_event_terminal_to_job(
-            db, event_id=event_id, terminal_status="success",
-            error_class="rate_limited", error_detail="should not surface",
+    # Success case: a TriggerResult.error_class set is ignored
+    # because per_event_status==success → the runner's mapping
+    # writes outcome='success' and skips error_message.
+    trigger_id_1, job_id_1 = await _seed_user_and_trigger_job()
+
+    class _SuccessLeakHandler:
+        kind = "email_received"
+        async def execute(self, trigger, events, db):
+            return _FakeTriggerResult(
+                status="success",
+                per_event_status={e.id: "success" for e in events},
+                error_class="rate_limited",
+                error_detail="should not surface",
+            )
+
+    KIND_HANDLERS["email_received"] = _SuccessLeakHandler()
+    try:
+        runner = TriggerRunner(
+            session_maker=async_session_maker,
+            retry_delays=(0.001, 0.001, 0.001),
         )
-        await db.commit()
-    job = await _read_job(job_id)
-    assert job.error_message is None, (
-        "success row leaked error_message — must be NULL when status=completed"
+        await runner._dispatch_one(job_id_1, attempt_idx=0)
+    finally:
+        KIND_HANDLERS.pop("email_received", None)
+    job_1 = await _read_job(job_id_1)
+    assert job_1.error_message is None, (
+        "success row leaked error_message — must be NULL when outcome=success"
     )
 
-    # Now test failed row carries it.
-    event_id_2, job_id_2 = await _seed_user_and_trigger_event()
-    async with async_session_maker() as db:
-        await runner._mirror_event_terminal_to_job(
-            db, event_id=event_id_2, terminal_status="failed",
-            error_class="rate_limited", error_detail="rate limit hit",
+    # Failed case: error_message lands on the row.
+    trigger_id_2, job_id_2 = await _seed_user_and_trigger_job()
+
+    class _FailHandler:
+        kind = "email_received"
+        async def execute(self, trigger, events, db):
+            return _FakeTriggerResult(
+                status="success",
+                per_event_status={e.id: "failed" for e in events},
+                error_class="rate_limited",
+                error_detail="rate limit hit",
+            )
+
+    KIND_HANDLERS["email_received"] = _FailHandler()
+    try:
+        runner = TriggerRunner(
+            session_maker=async_session_maker,
+            retry_delays=(0.001, 0.001, 0.001),
         )
-        await db.commit()
+        await runner._dispatch_one(job_id_2, attempt_idx=0)
+    finally:
+        KIND_HANDLERS.pop("email_received", None)
     job_2 = await _read_job(job_id_2)
     assert "rate limit hit" in (job_2.error_message or ""), (
         "failed row missing error_message — Mission Control needs it"
@@ -271,30 +308,43 @@ async def test_trigger_mirror_error_message_only_set_on_failure():
 
 
 @pytest.mark.asyncio
-async def test_trigger_mirror_truncates_long_error_detail():
+async def test_trigger_runner_truncates_long_error_detail():
     """Defensive: error_detail can be unbounded (provider stack
     traces). The BuildJob.error_message column is sized to a
-    bounded length; the helper truncates to 1000 chars. A
-    regression that removed the truncation could blow up the row
-    write on Postgres for a long stack trace."""
+    bounded length; the runner truncates to 1000 chars."""
+    from app.agent.triggers.registry import KIND_HANDLERS
     from app.agent.triggers.runner import TriggerRunner
     from app.db.database import async_session_maker
 
-    event_id, job_id = await _seed_user_and_trigger_event()
-    runner = TriggerRunner()
+    trigger_id, job_id = await _seed_user_and_trigger_job()
     huge_error = "x" * 5000
-    async with async_session_maker() as db:
-        await runner._mirror_event_terminal_to_job(
-            db, event_id=event_id, terminal_status="failed",
-            error_detail=huge_error,
+
+    class _HugeFailHandler:
+        kind = "email_received"
+        async def execute(self, trigger, events, db):
+            return _FakeTriggerResult(
+                status="success",
+                per_event_status={e.id: "failed" for e in events},
+                error_class="provider_error",
+                error_detail=huge_error,
+            )
+
+    KIND_HANDLERS["email_received"] = _HugeFailHandler()
+    try:
+        runner = TriggerRunner(
+            session_maker=async_session_maker,
+            retry_delays=(0.001, 0.001, 0.001),
         )
-        await db.commit()
+        await runner._dispatch_one(job_id, attempt_idx=0)
+    finally:
+        KIND_HANDLERS.pop("email_received", None)
     job = await _read_job(job_id)
     assert len(job.error_message or "") <= 1000
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Routine mirror: every documented status maps deterministically.
+# Routine runner: status → (job_status, outcome) mapping.
+# Exercises ``_finalize_run`` directly with each status combination.
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -304,35 +354,34 @@ async def test_trigger_mirror_truncates_long_error_detail():
     ("success",        None,             "completed", "success"),
     # success with derived outcome (Ticket 2.1 — success_empty / etc.)
     ("success",        "success_empty",  "completed", "success_empty"),
-    # partial: outcome is documented as 'partial', but derived takes precedence
+    # partial: derived takes precedence
     ("partial",        None,             "completed", "partial"),
     ("partial",        "partial",        "completed", "partial"),
     # skipped_reauth
     ("skipped_reauth", None,             "completed", "skipped_reauth"),
-    # failed: outcome MUST be None
+    # failed: outcome MUST be None (derived value ignored)
     ("failed",         None,             "failed",    None),
     ("failed",         "tool_error",     "failed",    None),
 ])
-async def test_routine_mirror_maps_every_status_with_optional_outcome(
+async def test_routine_runner_maps_status_via_finalize(
     legacy_status, derived_outcome,
     expected_job_status, expected_outcome,
 ):
-    """Routine mirror is more nuanced than trigger: ``RoutineRun``
-    carries both a legacy ``status`` AND a derived ``outcome``
-    (Ticket 2.1 — success_empty / tool_error / partial / failure).
-    Mirror priority:
-        - status=failed  → BuildJob.status=failed, outcome=NULL
-                           (regardless of derived outcome)
-        - status=success / partial / skipped_reauth →
-            BuildJob.status=completed,
-            outcome = derived OR raw status (fallback)
+    """Routine mapping (inlined in ``_finalize_run`` after PR #49):
+
+      - status=failed → BuildJob.status=failed, outcome=NULL
+                        (regardless of derived outcome)
+      - status=success / partial / skipped_reauth →
+          BuildJob.status=completed,
+          outcome = derived OR raw status (fallback)
     """
     from app.agent.routines.runner import RoutineRunner
+    from app.db.database import async_session_maker
 
-    run_id, job_id = await _seed_user_and_routine_run()
-    runner = RoutineRunner()
-    await runner._mirror_run_terminal_to_job(
-        run_id=run_id,
+    routine_id, job_id = await _seed_user_and_routine_job()
+    runner = RoutineRunner(session_maker=async_session_maker)
+    await runner._finalize_run(
+        job_id,
         status=legacy_status,
         outcome=derived_outcome,
     )
@@ -349,94 +398,42 @@ async def test_routine_mirror_maps_every_status_with_optional_outcome(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# No-op invariants: mirror is best-effort, never propagates.
+# completed_at always stamped on terminal write.
 # ──────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_trigger_mirror_noop_when_event_has_no_job_id():
-    """Pre-PR-4a TriggerEvent rows have ``job_id=NULL``. The mirror
-    must silently no-op (don't write to a random Job). Pre-existing
-    Job rows for these events stay as the runner first wrote them."""
-    from app.agent.triggers.runner import TriggerRunner
-    from app.db.database import async_session_maker
-    from app.db.models import TriggerEvent
-
-    event_id, _ = await _seed_user_and_trigger_event()
-    # Null out job_id — simulates a legacy row.
-    async with async_session_maker() as db:
-        ev = await db.get(TriggerEvent, event_id)
-        ev.job_id = None
-        await db.commit()
-
-    runner = TriggerRunner()
-    async with async_session_maker() as db:
-        # Must not raise — best-effort write.
-        await runner._mirror_event_terminal_to_job(
-            db, event_id=event_id, terminal_status="success",
-        )
-        await db.commit()
-
-
-@pytest.mark.asyncio
-async def test_trigger_mirror_noop_when_event_does_not_exist():
-    """A vanished TriggerEvent (mis-routing, or test setup error)
-    must NOT raise. The mirror exits silently."""
-    from app.agent.triggers.runner import TriggerRunner
-    from app.db.database import async_session_maker
-
-    runner = TriggerRunner()
-    async with async_session_maker() as db:
-        # ID that doesn't exist — must NOT raise.
-        await runner._mirror_event_terminal_to_job(
-            db, event_id="does-not-exist", terminal_status="success",
-        )
-        await db.commit()
-
-
-@pytest.mark.asyncio
-async def test_routine_mirror_noop_when_run_has_no_job_id():
-    """Pre-PR-4b RoutineRun rows have ``job_id=NULL``. The mirror
-    must silently no-op."""
-    from app.agent.routines.runner import RoutineRunner
-    from app.db.database import async_session_maker
-    from app.db.models import RoutineRun
-
-    run_id, _ = await _seed_user_and_routine_run()
-    async with async_session_maker() as db:
-        run_row = await db.get(RoutineRun, run_id)
-        run_row.job_id = None
-        await db.commit()
-
-    runner = RoutineRunner()
-    # Must NOT raise.
-    await runner._mirror_run_terminal_to_job(
-        run_id=run_id, status="success",
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# completed_at always stamped on terminal mirror.
-# ──────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("terminal_status", ["success", "failed", "skipped_filter"])
-async def test_trigger_mirror_stamps_completed_at(terminal_status):
-    """Every terminal-status mirror MUST write completed_at. A NULL
+@pytest.mark.parametrize("per_event_status", ["success", "failed", "skipped_filter"])
+async def test_trigger_runner_stamps_completed_at(per_event_status):
+    """Every terminal write MUST set completed_at. A NULL
     completed_at after a terminal call would break the dashboard's
-    "took N seconds" rendering. Pin it for every documented status."""
+    "took N seconds" rendering."""
+    from app.agent.triggers.registry import KIND_HANDLERS
     from app.agent.triggers.runner import TriggerRunner
     from app.db.database import async_session_maker
 
-    event_id, job_id = await _seed_user_and_trigger_event()
-    runner = TriggerRunner()
-    async with async_session_maker() as db:
-        await runner._mirror_event_terminal_to_job(
-            db, event_id=event_id, terminal_status=terminal_status,
+    trigger_id, job_id = await _seed_user_and_trigger_job()
+
+    class _Handler:
+        kind = "email_received"
+        async def execute(self, trigger, events, db):
+            return _FakeTriggerResult(
+                status="success",
+                per_event_status={e.id: per_event_status for e in events},
+                error_class=("e" if per_event_status == "failed" else None),
+                error_detail=("forced" if per_event_status == "failed" else None),
+            )
+
+    KIND_HANDLERS["email_received"] = _Handler()
+    try:
+        runner = TriggerRunner(
+            session_maker=async_session_maker,
+            retry_delays=(0.001, 0.001, 0.001),
         )
-        await db.commit()
+        await runner._dispatch_one(job_id, attempt_idx=0)
+    finally:
+        KIND_HANDLERS.pop("email_received", None)
     job = await _read_job(job_id)
     assert job.completed_at is not None, (
-        f"terminal mirror for {terminal_status!r} forgot completed_at"
+        f"terminal write for {per_event_status!r} forgot completed_at"
     )

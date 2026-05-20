@@ -1,30 +1,28 @@
-"""Job parity — trigger fires must materialise mirrored BuildJob rows.
+"""Job parity — trigger fires materialise BuildJob rows.
 
-PR 4a of the unified-jobs arc.
+Originally PR 4a of the unified-jobs arc, this suite pinned a
+dual-write between ``trigger_events`` (legacy) and ``build_jobs``
+(new). PR #49 of the cutover arc removed the legacy dual-write —
+``build_jobs`` is now the sole source of truth. The tests below
+were updated to reflect that: they assert the Job row shape and
+the dispatch terminal mapping, with no remaining assertions about
+``trigger_events``.
 
 What we pin:
 
-  1. ``triggers_inbound._idempotent_insert`` writes BOTH a
-     ``trigger_events`` row AND a mirrored ``build_jobs`` row in
-     the same transaction. The TriggerEvent's ``job_id`` column
-     points at the Job. Job's ``source_id`` points back at the
-     trigger.
-  2. The Job's ``idempotency_key`` is the event's
-     ``event_dedupe_id``, so the composite UNIQUE on
-     ``(source_id, idempotency_key)`` collapses to the same
-     dedupe gate as ``UNIQUE (trigger_id, event_dedupe_id)``.
-  3. Each TriggerEvent terminal status path mirrors onto the
-     linked Job: success/failed/skipped_rate_limit/skipped_filter/
-     coalesced. The Job's ``status`` is the closed
-     queued/running/completed/failed enum; the granular
-     TriggerEvent status lives on ``Job.outcome``.
-  4. The retry-exhausted path (PR 1's ``_finalise_exhausted``)
-     also mirrors onto the Job — status='failed',
-     error_message=<repr>, completed_at=NOW.
-
-A Job mint failure at intake time must not roll back the
-TriggerEvent insert (best-effort dual-write). That property is
-exercised by the explicit `dual_write_robust_to_job_failure` test.
+  1. ``triggers_inbound._idempotent_insert`` writes ONE BuildJob
+     row per (trigger, event_dedupe_id) pair. ``source_id`` points
+     at the trigger; ``idempotency_key`` is the event_dedupe_id;
+     ``job_type='trigger_run'``.
+  2. The composite UNIQUE on ``(source_id, idempotency_key)`` is
+     the dedupe gate.
+  3. Success-path dispatch through the runner writes
+     ``status='completed'`` + ``outcome='success'`` on the
+     BuildJob.
+  4. Retry exhaustion path writes ``status='failed'`` +
+     ``error_message=<repr>`` + ``completed_at`` on the BuildJob.
+  5. A Job mint failure at intake aborts the whole intake — no
+     downstream row exists.
 """
 from __future__ import annotations
 
@@ -51,19 +49,18 @@ TRIGGER_ID = "00000000-0000-0000-0000-0000000bb100"
 
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_database():
-    """Same surgical approach as test_trigger_runner_failure_handler /
-    test_job_runner — bypass conftest's init_db autouse fixture
-    (entities pgvector breaks SQLite) and build only the tables we
-    need."""
+    """Bypass conftest's init_db autouse fixture (entities pgvector
+    breaks SQLite). PR #49: tests no longer touch TriggerEvent, so
+    the fixture only sets up User, Trigger, BuildJob, JobEvent."""
     from app.db.database import engine
-    from app.db.models import BuildJob, JobEvent, Trigger, TriggerEvent, User
+    from app.db.models import BuildJob, JobEvent, Trigger, User
 
     async with engine.begin() as conn:
-        for model_cls in (User, BuildJob, JobEvent, Trigger, TriggerEvent):
+        for model_cls in (User, BuildJob, JobEvent, Trigger):
             await conn.run_sync(model_cls.__table__.create, checkfirst=True)
     yield
     async with engine.begin() as conn:
-        for model_cls in (TriggerEvent, Trigger, JobEvent, BuildJob, User):
+        for model_cls in (Trigger, JobEvent, BuildJob, User):
             await conn.run_sync(model_cls.__table__.drop, checkfirst=True)
     await engine.dispose()
 
@@ -100,14 +97,14 @@ async def _seed_user_and_trigger():
 
 
 @pytest.mark.asyncio
-async def test_idempotent_insert_creates_mirrored_job(_seed_user_and_trigger):
-    """A successful ``_idempotent_insert`` writes a TriggerEvent
-    AND a mirrored BuildJob. The Job carries source_id=trigger.id,
-    idempotency_key=event_dedupe_id, job_type='trigger_run'.
-    TriggerEvent.job_id links back to the Job."""
+async def test_idempotent_insert_creates_job(_seed_user_and_trigger):
+    """A successful ``_idempotent_insert`` writes ONE BuildJob row.
+    The Job carries source_id=trigger.id,
+    idempotency_key=event_dedupe_id, job_type='trigger_run',
+    status='queued'."""
     from app.api.triggers_inbound import _idempotent_insert
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, TriggerEvent
+    from app.db.models import BuildJob
     from sqlalchemy import select
 
     event_dedupe_id = f"gmail-msg-{uuid.uuid4().hex[:12]}"
@@ -122,18 +119,12 @@ async def test_idempotent_insert_creates_mirrored_job(_seed_user_and_trigger):
     assert outcome == "inserted"
 
     async with async_session_maker() as db:
-        ev = (await db.execute(
-            select(TriggerEvent).where(
-                TriggerEvent.trigger_id == TRIGGER_ID,
-                TriggerEvent.event_dedupe_id == event_dedupe_id,
+        job = (await db.execute(
+            select(BuildJob).where(
+                BuildJob.source_id == TRIGGER_ID,
+                BuildJob.idempotency_key == event_dedupe_id,
             )
         )).scalar_one()
-        assert ev.status == "queued"
-        assert ev.job_id is not None, (
-            "TriggerEvent.job_id must be set after dual-write"
-        )
-
-        job = await db.get(BuildJob, ev.job_id)
         assert job is not None
         assert job.job_type == "trigger_run"
         assert job.status == "queued"
@@ -145,12 +136,11 @@ async def test_idempotent_insert_creates_mirrored_job(_seed_user_and_trigger):
 
 @pytest.mark.asyncio
 async def test_idempotency_returns_same_job_on_dedupe(_seed_user_and_trigger):
-    """Two ``_idempotent_insert`` calls with the same ``event_dedupe_id``:
-    the first returns 'inserted' and mints both rows; the second
-    returns 'dedupe_hit' and creates NO duplicate Job. The
-    composite UNIQUE on ``(source_id, idempotency_key)`` collapses
-    to the same dedupe gate as ``UNIQUE (trigger_id,
-    event_dedupe_id)``."""
+    """Two ``_idempotent_insert`` calls with the same
+    ``event_dedupe_id``: the first returns 'inserted' and mints
+    a Job; the second returns 'dedupe_hit' and creates no
+    duplicate. The composite UNIQUE on
+    ``(source_id, idempotency_key)`` is the sole dedupe gate."""
     from app.api.triggers_inbound import _idempotent_insert
     from app.db.database import async_session_maker
     from app.db.models import BuildJob
@@ -171,7 +161,6 @@ async def test_idempotency_returns_same_job_on_dedupe(_seed_user_and_trigger):
     assert first_outcome == "inserted"
     assert second_outcome == "dedupe_hit"
 
-    # Exactly ONE Job row for this dedupe pair.
     async with async_session_maker() as db:
         count = (await db.execute(
             select(func.count(BuildJob.id)).where(
@@ -179,10 +168,7 @@ async def test_idempotency_returns_same_job_on_dedupe(_seed_user_and_trigger):
                 BuildJob.idempotency_key == event_dedupe_id,
             )
         )).scalar_one()
-        assert count == 1, (
-            f"expected exactly 1 mirrored Job for the dedupe pair, "
-            f"got {count}"
-        )
+        assert count == 1
 
 
 # ── Status-mirror tests via the trigger runner ───────────────────────
@@ -201,15 +187,17 @@ class _FakeTriggerResult:
 
 
 @pytest.mark.asyncio
-async def test_runner_mirrors_success_status_to_job(_seed_user_and_trigger):
+async def test_runner_writes_success_status_to_job(_seed_user_and_trigger):
     """When the handler returns ``success``, the runner's step-5 batch
-    loop mirrors onto the Job: status='completed', outcome='success',
-    completed_at set, summary_message_id linked."""
+    loop writes status='completed', outcome='success', completed_at
+    set on the BuildJob."""
+    from sqlalchemy import select
+
     from app.agent.triggers.registry import KIND_HANDLERS
     from app.agent.triggers.runner import TriggerRunner
     from app.api.triggers_inbound import _idempotent_insert
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, TriggerEvent
+    from app.db.models import BuildJob
 
     event_dedupe_id = f"gmail-msg-{uuid.uuid4().hex[:12]}"
 
@@ -218,13 +206,13 @@ async def test_runner_mirrors_success_status_to_job(_seed_user_and_trigger):
             db, trigger_id=TRIGGER_ID, user_id=USER_ID,
             event_dedupe_id=event_dedupe_id,
         )
-        ev_row = (await db.execute(
-            __import__("sqlalchemy").select(TriggerEvent).where(
-                TriggerEvent.event_dedupe_id == event_dedupe_id,
+        job_row = (await db.execute(
+            select(BuildJob).where(
+                BuildJob.source_id == TRIGGER_ID,
+                BuildJob.idempotency_key == event_dedupe_id,
             )
         )).scalar_one()
-        event_id = ev_row.id
-        job_id = ev_row.job_id
+        job_id = job_row.id
 
     class _SuccessHandler:
         kind = "email_received"
@@ -241,17 +229,15 @@ async def test_runner_mirrors_success_status_to_job(_seed_user_and_trigger):
             session_maker=async_session_maker,
             retry_delays=(0.001, 0.001, 0.001),
         )
-        await runner._handle_event_with_retry(event_id)
+        await runner._handle_event_with_retry(job_id)
     finally:
         # Don't leak the stub handler into other tests.
         KIND_HANDLERS.pop("email_received", None)
 
     async with async_session_maker() as db:
-        ev = await db.get(TriggerEvent, event_id)
-        assert ev.status == "success"
         job = await db.get(BuildJob, job_id)
         assert job.status == "completed", (
-            f"Job status must mirror success → completed; got {job.status!r}"
+            f"Job status must be completed on success; got {job.status!r}"
         )
         assert job.outcome == "success", (
             f"Job outcome must carry the granular state; got {job.outcome!r}"
@@ -260,15 +246,17 @@ async def test_runner_mirrors_success_status_to_job(_seed_user_and_trigger):
 
 
 @pytest.mark.asyncio
-async def test_runner_mirrors_retry_exhaustion_to_job(_seed_user_and_trigger):
-    """When all 3 retries crash, ``_finalise_exhausted`` mirrors onto
-    the Job too: status='failed', error_message=<repr last exc>,
-    completed_at set."""
+async def test_runner_writes_retry_exhaustion_to_job(_seed_user_and_trigger):
+    """When all 3 retries crash, ``_finalise_exhausted`` writes
+    status='failed', error_message=<repr last exc>, completed_at on
+    the BuildJob."""
+    from sqlalchemy import select
+
     from app.agent.triggers.registry import KIND_HANDLERS
     from app.agent.triggers.runner import TriggerRunner
     from app.api.triggers_inbound import _idempotent_insert
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, TriggerEvent
+    from app.db.models import BuildJob
 
     event_dedupe_id = f"gmail-msg-{uuid.uuid4().hex[:12]}"
 
@@ -277,13 +265,13 @@ async def test_runner_mirrors_retry_exhaustion_to_job(_seed_user_and_trigger):
             db, trigger_id=TRIGGER_ID, user_id=USER_ID,
             event_dedupe_id=event_dedupe_id,
         )
-        ev_row = (await db.execute(
-            __import__("sqlalchemy").select(TriggerEvent).where(
-                TriggerEvent.event_dedupe_id == event_dedupe_id,
+        job_row = (await db.execute(
+            select(BuildJob).where(
+                BuildJob.source_id == TRIGGER_ID,
+                BuildJob.idempotency_key == event_dedupe_id,
             )
         )).scalar_one()
-        event_id = ev_row.id
-        job_id = ev_row.job_id
+        job_id = job_row.id
 
     class _CrashHandler:
         kind = "email_received"
@@ -296,17 +284,14 @@ async def test_runner_mirrors_retry_exhaustion_to_job(_seed_user_and_trigger):
             session_maker=async_session_maker,
             retry_delays=(0.001, 0.001, 0.001),
         )
-        await runner._handle_event_with_retry(event_id)
+        await runner._handle_event_with_retry(job_id)
     finally:
         KIND_HANDLERS.pop("email_received", None)
 
     async with async_session_maker() as db:
-        ev = await db.get(TriggerEvent, event_id)
-        assert ev.status == "failed"
-        assert ev.error_class == "all_retries_exhausted"
         job = await db.get(BuildJob, job_id)
         assert job.status == "failed", (
-            f"Job status must mirror failed; got {job.status!r}"
+            f"Job status must be failed; got {job.status!r}"
         )
         assert job.error_message and "handler boom" in job.error_message
         assert job.completed_at is not None
@@ -314,21 +299,18 @@ async def test_runner_mirrors_retry_exhaustion_to_job(_seed_user_and_trigger):
 
 @pytest.mark.asyncio
 async def test_intake_aborts_when_job_mint_fails(_seed_user_and_trigger, monkeypatch):
-    """PR #46 of the unified-jobs arc inverts the dual-write order:
-    ``build_jobs`` is now the source of truth, minted first. If
+    """PR #46 of the unified-jobs arc inverted the dual-write order:
+    ``build_jobs`` is the source of truth, minted first. If
     ``JobRunner.create_job`` raises, the whole intake aborts — no
-    legacy ``trigger_events`` row gets written either. Pub/Sub will
-    retry the 5xx and we get another shot. This is the deliberate
-    new contract: a Job exists ⇔ a TriggerEvent exists, with the Job
-    being the canonical reader.
+    Job row gets written. Pub/Sub will retry the 5xx and we get
+    another shot.
 
-    The previous test (pre-cutover) asserted the legacy fire path
-    still worked when the Job mint failed. That property no longer
-    holds, by design — keeping it would defeat the cutover's
-    invariant that the runner only reads from ``build_jobs``."""
+    PR #49 of the cutover arc: with the legacy dual-write removed,
+    this property is even simpler — there's no other row to
+    consider. The Job is the only row."""
     from app.api.triggers_inbound import _idempotent_insert
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, TriggerEvent
+    from app.db.models import BuildJob
     from sqlalchemy import select, func
 
     event_dedupe_id = f"gmail-msg-{uuid.uuid4().hex[:12]}"
@@ -347,14 +329,7 @@ async def test_intake_aborts_when_job_mint_fails(_seed_user_and_trigger, monkeyp
                 event_dedupe_id=event_dedupe_id,
             )
 
-    # Neither row exists — the failure aborts the whole intake.
     async with async_session_maker() as db:
-        ev_count = (await db.execute(
-            select(func.count(TriggerEvent.id)).where(
-                TriggerEvent.event_dedupe_id == event_dedupe_id,
-            )
-        )).scalar_one()
-        assert ev_count == 0
         job_count = (await db.execute(
             select(func.count(BuildJob.id)).where(
                 BuildJob.source_id == TRIGGER_ID,
