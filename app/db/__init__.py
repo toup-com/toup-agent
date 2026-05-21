@@ -17,6 +17,8 @@ from app.db.models import (
     LLMBundleAllocation,
     LLMUsageRecord,
     LLMProxyEvent,
+    # Credits
+    SubscriptionPlan, CreditBalance, CreditLedger, CreditReservation,
 )
 from app.db.database import get_db, init_db, drop_db, async_session_maker, engine, get_engine, rebind_database
 

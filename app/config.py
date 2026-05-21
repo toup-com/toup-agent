@@ -124,16 +124,52 @@ class Settings(BaseSettings):
     feature_auto_builder_chat_output: bool = True
 
     # ── Latency flags (TKT-LAT wave 3) ──
-    # TKT-LAT-013: trim Chrome-extension page-context
-    # readable_content from 8000 chars to 2000 chars per turn.
+    # TKT-LAT-013: trim Chrome-extension page-context readable_content
+    # from 8000 chars to 2000 chars per turn. The agent can still pull
+    # more on demand via extension_read / browser_action. Default ON
+    # because the larger payload was burning ~6–8% of the context window
+    # on every sidepanel message regardless of relevance.
     extension_page_context_compact: bool = True
-    # TKT-LAT-012: gate per-tenant opt-in to streaming TTS
-    # playback. Default OFF until per-provider streaming is
-    # verified across mobile.
+    # TKT-LAT-012: route voice TTS through the streaming variant by
+    # default so playback can start as soon as first audio bytes arrive
+    # (~200 ms first-byte vs. 500–2 500 ms full-body wait). Defaults to
+    # OFF until per-provider streaming is verified across mobile.
     tts_streaming_enabled: bool = False
+    # TKT-LAT-015: pin Haiku for the Toup-Code supervisor loop. The
+    # supervisor only makes routing decisions (click/type/scroll/done) in
+    # ≤800 tokens — Opus/GPT-5.5 is overkill and burns ~$0.20–$1 per
+    # active session. When ON, force-pin claude-haiku-4-5-20251001 and
+    # ignore the user's `model=None` fallthrough. Defaults to OFF so the
+    # original "user OWNS this orchestration" semantics are preserved
+    # until product signoff on the model-quality trade.
+    toup_code_supervisor_use_haiku: bool = False
     # Storage backend for generated files. "local" writes to {agent_workspace_dir}/generated/.
     # "s3" is stubbed for a follow-up PR.
     files_storage_backend: str = "local"
+
+    # ── Credit-based billing (docs/credits/design.md) ────
+    credit_enforcement_enabled: bool = False
+    stripe_price_id_starter: str = ""
+    stripe_price_id_builder: str = ""
+    stripe_price_id_pro: str = ""
+    stripe_price_id_elite: str = ""
+
+    # ── Email verification (F13) + Gmail Workspace SMTP ──
+    email_provider: str = "resend"
+    resend_api_key: str = ""
+    email_from_address: str = "Toup <noreply@toup.ai>"
+    email_from_reply_to: str = "support@toup.ai"
+    app_public_base_url: str = "https://toup.ai"
+    aws_ses_region: str = "us-east-1"
+    aws_ses_access_key_id: str = ""
+    aws_ses_secret_access_key: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True
+    require_email_verification_for_credits: bool = False
+    email_verification_required_after_iso: str = ""
 
     # Day recall (recall_day tool + end-of-day archival summaries)
     enable_day_recall: bool = False  # When true, exposes recall_day tool + runs hourly archival job

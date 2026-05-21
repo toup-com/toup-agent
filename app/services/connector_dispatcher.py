@@ -349,6 +349,41 @@ async def execute(
         if "include_body" not in tool_input:
             tool_input = {**tool_input, "include_body": True}
 
+    # 5.7 Credit pre-flight — integration-credits bucket. Run before
+    # the provider call so a credit-poor tenant gets a clean
+    # ConnectorToolError instead of a successful tool call they can't
+    # pay for. Shadow-mode (credit_enforcement_enabled=False) is a
+    # no-op here; deduction still happens post-success below.
+    try:
+        from app.services.credit_service import (
+            credit_service as _credit,
+            _flat_fee_for_tool,
+            BUCKET_INTEGRATION,
+        )
+        from app.config import settings as _settings
+        flat_fee = _flat_fee_for_tool(tool_name, tool_input)
+        if getattr(_settings, "credit_enforcement_enabled", False):
+            pre = await _credit.check_balance(
+                db, user_id, BUCKET_INTEGRATION, flat_fee,
+            )
+            if not pre.success:
+                _log(user_hash, connector_id, tool_name, channel,
+                     "credits_insufficient", started)
+                return ConnectorToolError(
+                    message=(
+                        "You're out of integration credits for this month. "
+                        "Upgrade your plan or wait for the next renewal to "
+                        "use connector tools again."
+                    ),
+                    retryable=False,
+                )
+    except Exception as _credit_pre_err:
+        logger.warning(
+            "[credits] connector pre-flight failed user=%s connector=%s tool=%s: %s",
+            user_hash[:8], connector_id, tool_name, _credit_pre_err,
+        )
+        flat_fee = None
+
     # 6. Provider call. Catches both raised exceptions AND the
     #    ConnectorResult sum-type (which is the normal return shape).
     ctx = ConnectorContext(
@@ -402,6 +437,34 @@ async def execute(
         metadata=_outcome_metadata(result, manifest_tool.output_redaction),
     )
     _mark("audit_out")
+
+    # 7.5 Credit deduction (integration bucket, flat-fee). Only on
+    # ConnectorOk — rate-limited / reauth-required / provider-down all
+    # return early without charging the user. Idempotency key combines
+    # connector+tool+agent_request_id so an SDK-level retry of the
+    # exact same tool call doesn't double-charge.
+    if success and flat_fee is not None:
+        try:
+            from app.services.credit_service import (
+                credit_service as _credit,
+                BUCKET_INTEGRATION,
+            )
+            from app.db.models import LEDGER_TOOL_CALL
+            idemp = f"connector:{connector_id}:{tool_name}:{agent_request_id or 'no-id'}"
+            await _credit.try_charge(
+                db, user_id, LEDGER_TOOL_CALL, BUCKET_INTEGRATION, flat_fee,
+                idempotency_key=idemp, event_id=agent_request_id,
+                metadata={
+                    "connector_id": connector_id,
+                    "tool_name": tool_name,
+                    "channel": channel,
+                },
+            )
+        except Exception as _credit_charge_err:
+            logger.warning(
+                "[credits] connector post-charge failed user=%s connector=%s tool=%s: %s",
+                user_hash[:8], connector_id, tool_name, _credit_charge_err,
+            )
 
     # 8. Log + return. Result variants other than Ok are normal results,
     #    not errors at the log level — but rate-limit and provider-down

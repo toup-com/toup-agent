@@ -948,6 +948,55 @@ async def run_gmail_watch_refresh():
     )
 
 
+async def run_credit_period_renewal(limit: int = 500) -> dict:
+    """Renew credit periods for balances whose period_end has passed.
+
+    Picks up to ``limit`` rows from credit_balances WHERE period_end < now()
+    and runs CreditService.renew_period on each. The service-level method
+    is idempotent (no-op when period_end > now()), so a hot rerun is safe.
+
+    Returns a counters dict for the [PERF] log line.
+    """
+    from datetime import datetime
+    from sqlalchemy import select
+    from app.db.database import async_session_maker
+    from app.db.models import CreditBalance
+    from app.services.credit_service import credit_service
+
+    counters = {"scanned": 0, "renewed": 0, "errors": 0}
+    started_at = datetime.utcnow()
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(CreditBalance.user_id)
+            .where(CreditBalance.period_end < started_at)
+            .order_by(CreditBalance.period_end.asc())
+            .limit(limit)
+        )).scalars().all()
+        counters["scanned"] = len(rows)
+        for user_id in rows:
+            try:
+                async with async_session_maker() as inner:
+                    renewed = await credit_service.renew_period(inner, user_id)
+                    if renewed:
+                        await inner.commit()
+                        counters["renewed"] += 1
+                    else:
+                        await inner.rollback()
+            except Exception as e:
+                counters["errors"] += 1
+                logger.warning(
+                    "credit_period_renewal user=%s err=%s",
+                    user_id[:8] if user_id else "?", e,
+                )
+
+    elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+    logger.info(
+        "[PERF] credit_period_renewal scanned=%d renewed=%d errors=%d elapsed_ms=%d",
+        counters["scanned"], counters["renewed"], counters["errors"], elapsed_ms,
+    )
+    return counters
+
+
 def setup_scheduler(
     decay_interval_hours: int = 6,
     consolidation_interval_hours: int = 24,
@@ -1055,6 +1104,24 @@ def setup_scheduler(
         trigger=CronTrigger(hour="0,6,12,18", minute=45),
         id="gmail_watch_refresh",
         name="Gmail Watch Refresh (6h cadence; pre-7d expiration re-arm)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Credit-system period renewal — hourly scan. Each tick walks
+    # credit_balances rows where period_end < now() and runs
+    # credit_service.renew_period() on them. Adds the plan's monthly
+    # allotment (plus rollover for paid plans), zeroes
+    # message_credits_used_today, and rolls period_start →
+    # period_end. Cheap on small fleets (LIMIT 500 per tick), bounded
+    # by the partial index on (period_end) added in mig 053. Safe to
+    # run on every deployment — renew_period() short-circuits when
+    # period_end > now().
+    scheduler.add_job(
+        run_credit_period_renewal,
+        trigger=IntervalTrigger(hours=1),
+        id="credit_period_renewal",
+        name="Credit Period Renewal (monthly allotment + rollover)",
         replace_existing=True,
         misfire_grace_time=3600,
     )

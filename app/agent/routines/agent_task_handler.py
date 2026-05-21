@@ -216,7 +216,7 @@ class AgentTaskHandler:
 
         text = await llm(
             user_id=routine.user_id,
-            operation_type="system.routine.agent_task",
+            operation_type="user.routine.agent_task",
             model=model_choice,
             max_tokens=2000,
             system=_DEFAULT_SYSTEM_PROMPT,

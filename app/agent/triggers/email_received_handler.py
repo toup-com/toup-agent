@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 # summaries. 1500 tokens ≈ 1100 words; Markdown formatted output for the
 # Day-as-Chat surface.
 _SUMMARY_MAX_TOKENS = 1500
-_OPERATION_TYPE = "system.trigger.email_received"
+_OPERATION_TYPE = "user.trigger.email_received"
 
 
 # Per-process dedupe for reauth notices. Key: (user_id, trigger_id);

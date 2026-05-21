@@ -57,7 +57,13 @@ import sqlalchemy as sa
 
 
 revision = "053a"
-down_revision = "052"
+# Linearized at credit-system merge time: 052 → 053 → 053a → 054 → 055.
+# The 053 (credit-system) and 053a (reminder index) migrations don't
+# touch overlapping tables — credit creates new subscription_plans /
+# credit_* tables, 053a recreates a partial UNIQUE index on routines.
+# Order is irrelevant for correctness, but linear chain is simpler
+# than an alembic merge rev.
+down_revision = "053"
 branch_labels = None
 depends_on = None
 

@@ -46,6 +46,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
+from app.config import settings
 from app.db.database import get_db
 from app.db.models.agent import AgentConfig
 
@@ -828,10 +829,19 @@ async def _run_supervisor_loop(
             await queue.put(_sse("agent_status", {"text": "thinking…"}, role="agent"))
 
             try:
+                # TKT-LAT-015: optionally pin Haiku for the supervisor loop
+                # behind a flag. Default OFF preserves original
+                # "user OWNS this orchestration" semantics until product
+                # signs off on the model-quality trade.
+                _sup_model = (
+                    "claude-haiku-4-5-20251001"
+                    if settings.toup_code_supervisor_use_haiku
+                    else None
+                )
                 raw = await call_system_llm(
                     user_id=session.user_id,
-                    operation_type="system.toup_code.supervisor",
-                    model=None,  # use the user's agent_model — they OWN this orchestration
+                    operation_type="user.toup_code.supervisor",
+                    model=_sup_model,
                     max_tokens=800,
                     system=SUPERVISOR_SYSTEM_PROMPT,
                     messages=session.messages,

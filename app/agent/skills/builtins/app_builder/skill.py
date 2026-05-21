@@ -765,6 +765,35 @@ class AppBuilderSkill(Skill):
         from app.db.database import async_session_maker
         from app.db.models import App, BuildJob
 
+        # Credit pre-flight — Auto Builder runs many in-flight LLM
+        # calls through /llm/chat (each individually metered via the
+        # proxy's post-flight try_charge), but the whole build is wasted
+        # work if the user runs out partway through. Refuse to start
+        # when the user is already short on message credits — current
+        # threshold is a conservative 20 (covers the planning round
+        # trips); the build then naturally bails out via the proxy's
+        # 402 if mid-build the bucket hits zero. Shadow-mode
+        # (credit_enforcement_enabled=False) is always allowed.
+        try:
+            from decimal import Decimal as _Decimal
+            from app.config import settings as _settings
+            if getattr(_settings, "credit_enforcement_enabled", False):
+                from app.services.credit_service import (
+                    credit_service as _credit, BUCKET_MESSAGE,
+                )
+                async with async_session_maker() as _credit_db:
+                    pre = await _credit.check_balance(
+                        _credit_db, user_id, BUCKET_MESSAGE, _Decimal("20"),
+                    )
+                if not pre.success:
+                    return (
+                        "You don't have enough message credits to start a build "
+                        f"(need ~20, have {pre.balance_after}). Upgrade your plan "
+                        "or wait for the next renewal to use the App Builder."
+                    )
+        except Exception as _credit_err:
+            logger.warning("[credits] auto-builder pre-flight failed: %s", _credit_err)
+
         app_id = str(uuid.uuid4())
         # job_id is now generated inside JobRunner.create_job (PR 4d
         # of the unified-jobs arc) — the post-loop ``_job.id`` is the

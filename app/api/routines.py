@@ -1097,6 +1097,35 @@ async def force_run(routine_id: str):
             raise HTTPException(status_code=404, detail="Routine not found")
         _kind_enabled_or_404(routine.kind)
 
+        # Free-tier 60s run-now cooldown — prevents a credit-poor user
+        # from button-mashing a routine to drain their free 30 message
+        # credits in a few seconds. Paid tiers have no cooldown (they
+        # paid for the work). last_run_at is updated by the runner on
+        # every successful or attempted fire; comparing now()-60s
+        # against it gives the right window for an HTTP-paced retry.
+        try:
+            from app.db.models import CreditBalance
+            balance = await db.get(CreditBalance, user_id)
+            plan_id = (balance.plan_id if balance else "free") or "free"
+            if plan_id == "free" and routine.last_run_at is not None:
+                from datetime import datetime as _dt, timedelta as _td
+                if (_dt.utcnow() - routine.last_run_at) < _td(seconds=60):
+                    raise HTTPException(
+                        status_code=429,
+                        detail={
+                            "message": "Free tier limits run-now to once per 60s per routine.",
+                            "cooldown_seconds": 60,
+                            "last_run_at": routine.last_run_at.isoformat(),
+                        },
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            # Gate is best-effort — credit-table outage shouldn't break
+            # the force-run path. Fall through to the existing
+            # idempotency logic.
+            pass
+
         # Compute today in the user's tz — same path the runner uses,
         # so the idempotency key matches a scheduled fire on this day.
         user = await db.get(User, user_id)

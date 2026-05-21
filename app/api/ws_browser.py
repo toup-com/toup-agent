@@ -2034,6 +2034,15 @@ async def _run_browser_agent_inner(
                 result = await _exec_browser_tool(fn_name, fn_args, page, overlay, websocket=websocket)
                 logger.warning("[STEP %d] RESULT: %s", step + 1, result[:500])
 
+                # Credit deduction for ws_browser is deferred to Phase 2.
+                # The agent's LLM calls already pass through the bundle
+                # proxy (`make_anthropic_client` / `make_openai_client` in
+                # this function) which deducts the message-credits cost.
+                # Adding a per-action flat fee here requires threading
+                # `user_id` through `_run_browser_agent_inner`'s signature
+                # (it isn't in scope at this layer today). Tracked as
+                # P2 follow-up — design.md §6.4.
+
                 # Log page URL after action (detect if navigation happened unexpectedly)
                 try:
                     _post_url = page.url

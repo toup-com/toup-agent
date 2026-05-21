@@ -47,6 +47,20 @@ class User(Base):
     # Timezone (IANA format, e.g. "America/Toronto") — used for day boundaries
     timezone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
+    # ── Email verification (alembic 055, F13) ─────────────
+    # NULL = unverified. Set to UTC timestamp when the user clicks the
+    # link in their verification email. CreditService refuses chargeable
+    # activity for unverified users when
+    # ``settings.require_email_verification_for_credits=True``.
+    email_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Opaque urlsafe-base64 token (32 bytes raw → 43 chars). Cleared on
+    # successful verify so the link is single-use. Rotated by
+    # ``POST /api/auth/send-verification`` to invalidate the old link.
+    email_verification_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Throttle resends — /auth/send-verification refuses with 429 if a
+    # send already happened in the last 60s.
+    email_verification_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Account-level notification opt-in toggles. JSONB lets us add new
     # toggles (eg. weekly_digest, mention_emails) without an ALTER per
     # toggle. Shape: {"morning_briefing": bool, "security_alerts":

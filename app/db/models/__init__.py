@@ -58,6 +58,17 @@ from .soul_config import SoulConfig
 # Platform (VPS, invites, billing)
 from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent, PlatformSetting
 
+# Credits (free-for-everyone billing — docs/credits/design.md)
+from .credit import (
+    SubscriptionPlan, CreditBalance, CreditLedger, CreditReservation,
+    BUCKET_MESSAGE, BUCKET_INTEGRATION,
+    LEDGER_CHAT_MESSAGE, LEDGER_ROUTINE_RUN, LEDGER_TRIGGER_RUN, LEDGER_BUILD_STEP,
+    LEDGER_TOOL_CALL, LEDGER_BROWSER_ACTION, LEDGER_DOC_GEN,
+    LEDGER_RESERVATION, LEDGER_SETTLEMENT, LEDGER_REFUND, LEDGER_PLAN_GRANT,
+    LEDGER_PLAN_CHANGE, LEDGER_DAILY_RESET, LEDGER_PERIOD_RENEWAL, LEDGER_MANUAL_ADJUST,
+    RESERVATION_OPEN, RESERVATION_SETTLED, RESERVATION_REFUNDED, RESERVATION_EXPIRED,
+)
+
 # Rollouts (Phase 3 automated deployment)
 from .rollout import (
     Rollout, RolloutAttempt,

@@ -49,6 +49,10 @@ apscheduler==3.10.4
 # versions change the API shape (e.g. timezone_at vs certain_timezone_at).
 timezonefinder==6.2.0
 
+# Async SMTP — Gmail / Google Workspace / SendGrid / Brevo / any
+# SMTP-based email provider for the verification flow.
+aiosmtplib==3.0.1
+
 # Document Processing
 pypdf==4.0.1
 python-docx==1.1.0

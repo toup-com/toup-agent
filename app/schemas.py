@@ -137,6 +137,10 @@ class UserResponse(BaseModel):
     # precise location" flow. Exposed here so the account UI can render
     # the current value without a second round trip.
     timezone: Optional[str] = None
+    # Email verification state (F13). NULL = unverified. Surfaced so the
+    # frontend can render the verify-your-email banner without a second
+    # round trip.
+    email_verified_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

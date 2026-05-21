@@ -81,9 +81,9 @@ async def call_system_llm(
     Returns the text completion on success, None on failure. Failures
     are logged but never raised — caller decides how to react.
     """
-    if not operation_type.startswith("system."):
+    if not (operation_type.startswith("system.") or operation_type.startswith("user.")):
         raise ValueError(
-            f"operation_type must start with 'system.' for internal calls (got {operation_type!r})"
+            f"operation_type must start with 'system.' or 'user.' for internal calls (got {operation_type!r})"
         )
 
     from app.services.model_resolver import (
@@ -630,9 +630,9 @@ async def call_anthropic_system(
     `operation_type` must start with "system." to be exempt (enforced by caller
     contract — the exemption check is in llm_proxy._get_spend).
     """
-    if not operation_type.startswith("system."):
+    if not (operation_type.startswith("system.") or operation_type.startswith("user.")):
         raise ValueError(
-            f"operation_type must start with 'system.' for internal calls (got {operation_type!r})"
+            f"operation_type must start with 'system.' or 'user.' for internal calls (got {operation_type!r})"
         )
 
     api_key = (
@@ -725,9 +725,9 @@ async def call_openai_system(
     timeout: int = 45,
 ) -> Optional[str]:
     """OpenAI fallback for system operations (used when Anthropic key missing)."""
-    if not operation_type.startswith("system."):
+    if not (operation_type.startswith("system.") or operation_type.startswith("user.")):
         raise ValueError(
-            f"operation_type must start with 'system.' for internal calls (got {operation_type!r})"
+            f"operation_type must start with 'system.' or 'user.' for internal calls (got {operation_type!r})"
         )
 
     api_key = (

@@ -68,6 +68,7 @@ httpx>=0.28.1
 tenacity==8.2.3
 apscheduler==3.10.4  # Scheduled tasks for decay/consolidation
 timezonefinder==6.2.0  # Coords → IANA tz lookup for /auth/timezone-from-coords (account page "Share location" flow)
+aiosmtplib==3.0.1   # Async SMTP for email verification (Gmail / Workspace / SendGrid / Brevo / any SMTP provider)
 
 # Telegram Bot
 python-telegram-bot>=20.0

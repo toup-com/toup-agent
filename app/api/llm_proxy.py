@@ -16,6 +16,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 import httpx
@@ -227,6 +228,15 @@ async def _log_event(
     pass operation_type — they leave it None so user cap logic applies. System
     operations route via app/services/internal_llm.py which enforces the
     "system." prefix with a ValueError.
+
+    Credit deduction (F-credit): when status=="ok" and the call is
+    user-attributable (operation_type is None or starts with "user."), we
+    convert token counts to credits and atomically deduct from the user's
+    message-credits bucket. The LLMProxyEvent.id doubles as the credit-ledger
+    idempotency key so SDK retries / proxy replays don't double-charge.
+    Shadow-mode (credit_enforcement_enabled=False) still writes the ledger
+    row but never denies. System ops (operation_type startswith "system.")
+    are platform overhead and are NOT charged to the user.
     """
     event = LLMProxyEvent(
         id=str(uuid.uuid4()),
@@ -243,10 +253,30 @@ async def _log_event(
         operation_type=operation_type,
     )
     db.add(event)
+
+    is_system_op = bool(operation_type and operation_type.startswith("system."))
+    if status == "ok" and not is_system_op and (input_tokens > 0 or output_tokens > 0):
+        try:
+            from app.services.credit_service import (
+                credit_service, tokens_to_credits, BUCKET_MESSAGE,
+            )
+            from app.db.models import LEDGER_CHAT_MESSAGE
+            credits = tokens_to_credits(model, input_tokens, output_tokens)
+            await credit_service.try_charge(
+                db, user_id, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, credits,
+                idempotency_key=event.id, event_id=event.id, model=model,
+                provider=provider, input_tokens=input_tokens, output_tokens=output_tokens,
+                underlying_cost_cents=cost_cents,
+                metadata={"endpoint": endpoint, "operation_type": operation_type or "user"},
+            )
+        except Exception as e:
+            logger.warning("[credits] try_charge failed for user=%s event=%s: %s",
+                           user_id[:8], event.id[:8], e)
+
     await db.commit()
     # Only invalidate the user-budget cache when a user-attributable event landed.
     # System operations don't affect user caps so they can leave the cache intact.
-    if not (operation_type and operation_type.startswith("system.")):
+    if not is_system_op:
         _invalidate_cache(user_id)
 
     logger.info(
@@ -564,6 +594,36 @@ async def proxy_chat(
     resolved_model_header = {"x-toup-resolved-model": model}
 
     backend, api_key = _route_chat(model, config)
+
+    # Credit pre-flight: zero-balance gate. Only enforces when
+    # credit_enforcement_enabled=True; in shadow mode this is a no-op.
+    # Returns 402 with a structured body the agent / chat client can
+    # decode to render the "out of credits / upgrade" UI.
+    try:
+        from app.services.credit_service import (
+            credit_service, BUCKET_MESSAGE,
+            REASON_INSUFFICIENT_MESSAGE, REASON_DAILY_CAP_EXCEEDED,
+            REASON_EMAIL_NOT_VERIFIED,
+        )
+        if getattr(settings, "credit_enforcement_enabled", False):
+            preflight = await credit_service.check_balance(
+                db, config.user_id, BUCKET_MESSAGE, Decimal("0.1"),
+            )
+            if not preflight.success:
+                raise HTTPException(
+                    402,
+                    detail={
+                        "error": "out_of_credits",
+                        "reason": preflight.reason or REASON_INSUFFICIENT_MESSAGE,
+                        "bucket": "message",
+                        "balance_after": str(preflight.balance_after),
+                    },
+                )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("[credits] pre-flight check failed for user=%s: %s",
+                       config.user_id[:8], e)
 
     # Budget check
     budget_result = await _check_budget(config, backend.name, db)

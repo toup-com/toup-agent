@@ -61,7 +61,7 @@ _BOOTSTRAP_WINDOW = "newer_than:1d"
 _STEADY_WINDOW_CAP_HOURS = 168  # 7 days
 
 # operation_type prefix for internal_llm system-tagged budgeting.
-_OPERATION_TYPE = "system.routine.email_briefing"
+_OPERATION_TYPE = "user.routine.email_briefing"
 
 SYSTEM_PROMPT = """You write a concise morning email briefing. The user will read this on their phone over coffee. Rules:
 
