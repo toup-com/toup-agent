@@ -1359,34 +1359,72 @@ async def ws_chat(
                         try:
                             from app.db.database import async_session_maker as _rt_sm
                             from app.db.models import Message as _RtMsg, Conversation as _RtConv
+                            from app.db.models.day_chat import DayChat as _RtDC
                             async with _rt_sm() as _rt_db:
+                                # Ownership check accepts EITHER:
+                                #   - Conversation.user_id == user_id, OR
+                                #   - DayChat.user_id == user_id
+                                # Conversation alone is too narrow: system-channel
+                                # rows (routine, trigger, radio output) historically
+                                # carried service-stamped or null user_id even though
+                                # the message itself sits in the user's day_chat.
+                                # Day_chat ownership is the canonical user boundary
+                                # per conversation.py:21-33's Reading-A invariant.
+                                # Outer-joins so a missing Conversation or DayChat
+                                # row (older data, race conditions) doesn't fail
+                                # the whole query — we just check the side that
+                                # resolved.
                                 _row = (await _rt_db.execute(
                                     select(
                                         _RtMsg.id,
                                         _RtMsg.role,
                                         _RtMsg.content,
                                         _RtMsg.created_at,
+                                        _RtConv.user_id.label("conv_user_id"),
+                                        _RtDC.user_id.label("dc_user_id"),
                                     )
-                                    .join(_RtConv, _RtMsg.conversation_id == _RtConv.id)
-                                    .where(
-                                        _RtMsg.id == _candidate,
-                                        _RtConv.user_id == user_id,
-                                    )
+                                    .select_from(_RtMsg)
+                                    .outerjoin(_RtConv, _RtMsg.conversation_id == _RtConv.id)
+                                    .outerjoin(_RtDC, _RtMsg.day_chat_id == _RtDC.id)
+                                    .where(_RtMsg.id == _candidate)
                                 )).first()
-                                if _row is not None:
+                                if _row is None:
+                                    # Loud — id from the frontend doesn't match
+                                    # any row. Could be a stale optimistic id
+                                    # the client never reconciled, or a typo'd
+                                    # payload. Either way the user's reply
+                                    # context is lost; surface it in prod logs.
+                                    logger.warning(
+                                        "[WS] reply_to target=%s does not exist in messages "
+                                        "table (user=%s) — frontend may have sent a stale id",
+                                        _candidate[:8], user_id[:8],
+                                    )
+                                elif (
+                                    _row.conv_user_id == user_id
+                                    or _row.dc_user_id == user_id
+                                ):
                                     reply_to_message_id = _row.id
                                     _reply_target_role = _row.role
                                     _reply_target_content = _row.content
                                     _reply_target_created_at = _row.created_at
+                                    _via = "conv" if _row.conv_user_id == user_id else "day_chat"
                                     logger.info(
-                                        "[WS] reply_to authorized target=%s role=%s content_len=%d",
+                                        "[WS] reply_to authorized target=%s role=%s content_len=%d via=%s",
                                         _candidate[:8], _row.role,
-                                        len(_row.content or ""),
+                                        len(_row.content or ""), _via,
                                     )
                                 else:
-                                    logger.info(
-                                        "[WS] reply_to target=%s not owned by user=%s — dropping pointer",
+                                    # Real ownership failure: row exists but is
+                                    # in some other user's tree. Warn (not info)
+                                    # so prod alerts flag this — could be an
+                                    # IDOR attempt OR a legitimate user reply
+                                    # we've still got an auth-boundary gap on.
+                                    logger.warning(
+                                        "[WS] reply_to target=%s rejected (user=%s, "
+                                        "conv_user=%s, dc_user=%s) — dropping pointer",
                                         _candidate[:8], user_id[:8],
+                                        (_row.conv_user_id or "")[:8] if _row.conv_user_id else "NULL",
+                                        (_row.dc_user_id or "")[:8] if _row.dc_user_id else "NULL",
                                     )
                         except Exception as _rt_err:
                             logger.warning(
