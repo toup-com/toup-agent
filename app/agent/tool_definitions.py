@@ -521,19 +521,8 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "required": ["image"],
             },
         },
-        # 12. (removed) Cron — replaced by the routines skill's
-        #     `routines__remind` + `routines__create` / `routines__list` /
-        #     `routines__update` / `routines__delete` / `routines__run_now`
-        #     tools. The legacy cron tool only delivered to Telegram and
-        #     failed on every other channel ("ERROR: No active Telegram
-        #     chat" — caught 2026-05-14 when a website-chat user said
-        #     "remind me in 2 min to drink water"). The new skill is
-        #     multi-channel (website / Telegram / WhatsApp) and uses
-        #     friendlier `when=once|daily|every` inputs. See
-        #     `app/agent/skills/builtins/routines/skill.py` for the
-        #     replacement tool surface.
         # ------------------------------------------------------------------
-        # 13. Spawn — background sub-agent task
+        # Spawn — background sub-agent task
         # ------------------------------------------------------------------
         {
             "name": "spawn",

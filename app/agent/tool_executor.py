@@ -49,7 +49,6 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "send_file": 1_000,
     "send_photo": 1_000,
     "analyze_image": 10_000,
-    "cron": 5_000,
     "spawn": 1_000,
     "process": 10_000,
     "tts": 1_000,
@@ -1660,55 +1659,6 @@ class ToolExecutor:
         except Exception as exc:
             logger.exception("analyze_image failed")
             return f"ERROR: Image analysis failed: {exc}"
-
-    # ------------------------------------------------------------------
-    # 12. cron — DEPRECATED, redirects to the routines skill
-    # ------------------------------------------------------------------
-    async def _tool_cron(self, inp: Dict[str, Any]) -> str:
-        """The legacy `cron` tool was removed from the tool registry on
-        2026-05-14 (the agent's tool list no longer advertises it).
-        This handler stays in place as a defensive backstop for any
-        path that still references the name — cached system prompts,
-        a still-warm Anthropic tool-use schema, an older agent
-        snapshot, etc.
-
-        Instead of going through `CronService.add_job` (which only
-        delivered to Telegram and failed everywhere else) we surface
-        a structured ERROR string that points the model at the
-        replacement skill. The agent's recovery prompt for ERROR
-        results turns this into a follow-up call to
-        `routines__remind` / `routines__list` / etc. — no user-visible
-        regression."""
-        action = (inp.get("action") or "").strip().lower()
-        if action == "add":
-            return (
-                "ERROR: the `cron` tool is removed. Use the routines "
-                "skill instead — call `routines__remind` with `when` "
-                "(once / daily / every), `at_local` (or `daily_at_local` "
-                "/ `every_seconds`), and `reminder_text`. The routines "
-                "system delivers to website + Telegram + WhatsApp "
-                "(not just Telegram) and survives across surfaces."
-            )
-        if action == "list":
-            return (
-                "ERROR: the `cron` tool is removed. Use `routines__list` "
-                "to see scheduled routines (including reminders)."
-            )
-        if action == "remove":
-            return (
-                "ERROR: the `cron` tool is removed. Use `routines__delete` "
-                "with the routine_id from `routines__list`."
-            )
-        if action == "run":
-            return (
-                "ERROR: the `cron` tool is removed. Use `routines__run_now` "
-                "with the routine_id from `routines__list`."
-            )
-        return (
-            "ERROR: the `cron` tool is removed. Use the routines skill: "
-            "`routines__remind` (set a reminder) / `routines__list` / "
-            "`routines__delete` / `routines__run_now`."
-        )
 
     # ------------------------------------------------------------------
     # 13. process — long-running background shell process management

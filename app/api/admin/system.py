@@ -336,34 +336,6 @@ async def get_bot_usage(
     return {"usage": usage, "total_users": len(usage)}
 
 
-@router.get("/bot/cron")
-async def get_bot_cron_jobs(
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    from app.db.models import CronJob
-
-    result = await db.execute(select(CronJob).order_by(CronJob.created_at.desc()))
-    jobs = result.scalars().all()
-    return {
-        "jobs": [
-            {
-                "id": str(j.id)[:8],
-                "user_id": j.user_id[:8] + "...",
-                "name": j.name,
-                "schedule": j.schedule_expression,
-                "schedule_type": j.schedule_type,
-                "enabled": j.enabled,
-                "run_count": j.run_count,
-                "last_run_at": j.last_run_at.isoformat() if j.last_run_at else None,
-                "created_at": j.created_at.isoformat(),
-            }
-            for j in jobs
-        ],
-        "total": len(jobs),
-    }
-
-
 @router.get("/bot/errors")
 async def get_bot_errors(
     limit: int = 50,

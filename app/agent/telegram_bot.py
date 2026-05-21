@@ -5,7 +5,7 @@ Handles:
 - Photos → download + pass as image_url content blocks (GPT vision)
 - Voice/audio → Whisper transcription → AgentRunner
 - Documents → read content and include inline
-- Commands: /start, /help, /status, /reset, /new, /stop, /whoami, /model, /compact, /usage, /cron, /export, /subagents
+- Commands: /start, /help, /status, /reset, /new, /stop, /whoami, /model, /compact, /usage, /remind, /reminders, /export, /subagents
 - Streaming responses with progressive message edits
 - Continuous typing indicator during processing
 - Reply-to context support
@@ -100,7 +100,6 @@ class ToupTelegramBot:
         self.app.add_handler(CommandHandler("model", self._cmd_model))
         self.app.add_handler(CommandHandler("compact", self._cmd_compact))
         self.app.add_handler(CommandHandler("usage", self._cmd_usage))
-        self.app.add_handler(CommandHandler("cron", self._cmd_cron))
         self.app.add_handler(CommandHandler("remind", self._cmd_remind))
         self.app.add_handler(CommandHandler("reminders", self._cmd_reminders))
         self.app.add_handler(CommandHandler("export", self._cmd_export))
@@ -165,7 +164,8 @@ class ToupTelegramBot:
             BotCommand("model", "Show or switch AI model"),
             BotCommand("compact", "Force context compaction"),
             BotCommand("usage", "Show token usage and cost"),
-            BotCommand("cron", "List scheduled jobs"),
+            BotCommand("remind", "Create a reminder"),
+            BotCommand("reminders", "List your reminders"),
             BotCommand("export", "Export conversation history"),
             BotCommand("subagents", "List background tasks"),
             BotCommand("skills", "List loaded skill plugins"),
@@ -495,7 +495,6 @@ class ToupTelegramBot:
             "/model — Show or switch AI model\n"
             "/compact — Force context compaction\n"
             "/usage — Show token usage and cost\n"
-            "/cron — List scheduled jobs\n"
             "/remind &lt;text&gt; — Set a reminder (e.g. <code>/remind call mom at 6pm</code>)\n"
             "/reminders — List your reminders\n"
             "/export — Export conversation history\n"
@@ -1420,57 +1419,6 @@ class ToupTelegramBot:
             f"Rate: ${rate_in}/1K in, ${rate_out}/1K out",
             parse_mode="HTML",
         )
-
-    async def _cmd_cron(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /cron — list scheduled jobs.
-
-        Phase C deprecation: the legacy CronService is being replaced by
-        Routines. Every response now leads with a one-line banner
-        pointing the user at /reminders so they know the new surface
-        exists, regardless of whether the flag is currently flipped.
-        """
-        if not self._is_allowed(update.effective_user.id):
-            return
-
-        user_id = await self._get_toup_user_id(update.effective_user.id)
-
-        # One-line deprecation banner — shown on every /cron response.
-        deprecation = (
-            "⚠️  <i>/cron is deprecated — use /reminders (richer schedules, "
-            "multi-channel delivery, dashboard surface).</i>\n\n"
-        )
-
-        if not self.cron_service:
-            await update.message.reply_text(
-                deprecation + "⏰ Cron service not available.",
-                parse_mode="HTML",
-            )
-            return
-
-        jobs = await self.cron_service.list_jobs(user_id)
-        if not jobs:
-            await update.message.reply_text(
-                deprecation
-                + "⏰ No scheduled jobs.\n\n"
-                "<i>Try </i><code>/remind me to drink water every morning at 9</code>",
-                parse_mode="HTML",
-            )
-            return
-
-        lines = [deprecation + "⏰ <b>Scheduled Jobs (legacy)</b>\n"]
-        for i, j in enumerate(jobs, 1):
-            status = "✅ active" if j["enabled"] else "⏸ disabled"
-            lines.append(
-                f"{i}. <b>{j['name']}</b>\n"
-                f"   Schedule: <code>{j['schedule']}</code> ({j['kind']})\n"
-                f"   Status: {status} | Runs: {j['run_count']}\n"
-                f"   ID: <code>{j['id'][:8]}</code>"
-            )
-        lines.append(
-            "\n<i>Migrate these to reminders so they survive the "
-            "CronJob removal: ask me to recreate any of them via /remind.</i>"
-        )
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     # ── /remind + /reminders ─────────────────────────────────────────
     # Thin Telegram surface over the routines skill. `/remind <text>`

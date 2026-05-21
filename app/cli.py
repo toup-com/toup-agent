@@ -7,7 +7,6 @@ Usage:
     toup status
     toup doctor
     toup sessions
-    toup cron list
 """
 import argparse
 import json
@@ -175,33 +174,6 @@ def cmd_sessions(args):
         print(f"  {sid}  {channel:10s}  {msgs} msgs")
 
 
-def cmd_cron(args):
-    """Manage cron jobs."""
-    token = get_token(args.url, args.user, args.password)
-    headers = {"Authorization": f"Bearer {token}"}
-
-    if args.cron_action == "list":
-        resp = requests.get(
-            urljoin(args.url, "/api/v1/agent/cron"),
-            headers=headers,
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            print(f"❌ Error: {resp.text[:200]}")
-            return
-        jobs = resp.json()
-        if isinstance(jobs, dict):
-            jobs = jobs.get("jobs", [])
-        if not jobs:
-            print("No cron jobs.")
-            return
-        for j in jobs:
-            status = "✅" if j.get("enabled", True) else "⏸️"
-            print(f"  {status} {j.get('name', '?'):20s}  {j.get('schedule', '?'):15s}  runs={j.get('run_count', 0)}")
-    else:
-        print(f"Unknown cron action: {args.cron_action}")
-
-
 def main():
     parser = argparse.ArgumentParser(
         prog="toup",
@@ -231,11 +203,6 @@ def main():
     # sessions
     p_sess = sub.add_parser("sessions", help="List active sessions")
     p_sess.set_defaults(func=cmd_sessions)
-
-    # cron
-    p_cron = sub.add_parser("cron", help="Manage cron jobs")
-    p_cron.add_argument("cron_action", choices=["list"], help="Cron subcommand")
-    p_cron.set_defaults(func=cmd_cron)
 
     args = parser.parse_args()
     if not args.command:
