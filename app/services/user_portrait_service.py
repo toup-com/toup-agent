@@ -38,7 +38,11 @@ PORTRAIT_CATEGORIES = {
 
 # In-memory cache: {user_id: {"summary": str, "ts": float}}
 _portrait_cache: Dict[str, dict] = {}
-_CACHE_TTL_SECONDS = 3600  # 1 hour
+# TKT-LAT-008: portraits are stable for hours (only change on memory
+# writes / manual edit). Extended from 1h → 6h so the stale-while-
+# revalidate fall-through fires far less often, and the [PERF] log
+# line below shows hit/stale/miss explicitly so prod can verify.
+_CACHE_TTL_SECONDS = 6 * 3600  # 6 hours
 
 # Track in-flight background rebuilds to avoid duplicate work
 _rebuilding: Dict[str, bool] = {}
@@ -104,14 +108,18 @@ class UserPortraitService:
 
         if cached and (time.time() - cached["ts"]) < _CACHE_TTL_SECONDS:
             # Fresh cache — return immediately
+            logger.info("[PERF] portrait_cache=hit user=%s", user_id[:8])
             return cached["summary"]
 
         if cached:
             # Stale cache — return stale value, rebuild in background
+            logger.info("[PERF] portrait_cache=stale user=%s age=%.0fs",
+                        user_id[:8], time.time() - cached["ts"])
             self._schedule_background_rebuild(user_id)
             return cached["summary"]
 
         # No cache at all — schedule build, return empty for this request
+        logger.info("[PERF] portrait_cache=miss user=%s", user_id[:8])
         self._schedule_background_rebuild(user_id)
         return ""
 

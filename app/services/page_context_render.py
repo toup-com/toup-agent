@@ -33,13 +33,49 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-_LIMITS = {
+# TKT-LAT-013: extension page-context bloat. The previous
+# readable_content cap (8000 chars ≈ ~2000 tokens) prepended on every
+# turn ate 6–8 % of the model context window for sidepanel users —
+# whether they were asking about the page or not. The settings flag
+# extension_page_context_compact (default ON) trims readable_content
+# to a tighter cap so the agent still gets a useful page snapshot
+# without dominating the prompt; users who want the legacy verbose
+# version flip the flag off per tenant. The agent can still pull
+# more of the page on demand via extension_read /
+# browser_action(kind=dom_snapshot) — the system-prompt note at
+# the bottom of this block already tells it how.
+_LIMITS_COMPACT = {
+    "title":            120,
+    "url":              350,
+    "selected_text":    1200,
+    "readable_content": 2000,   # was 8000 — see TKT-LAT-013
+    "dom_summary":      400,
+}
+
+_LIMITS_VERBOSE = {
     "title":            120,
     "url":              350,
     "selected_text":    1200,
     "readable_content": 8000,
     "dom_summary":      400,
 }
+
+
+def _active_limits() -> Dict[str, int]:
+    """Pick truncation limits based on the per-tenant compaction flag."""
+    try:
+        from app.config import settings
+        if getattr(settings, "extension_page_context_compact", True):
+            return _LIMITS_COMPACT
+    except Exception:
+        # Settings not loaded yet (unit tests / agent boot edge): default
+        # to the compact policy. Verbose mode is opt-in, not the default.
+        pass
+    return _LIMITS_COMPACT
+
+
+# Back-compat alias — existing imports still work.
+_LIMITS = _LIMITS_COMPACT
 
 
 def _trunc(s: Any, n: int) -> str:
@@ -53,11 +89,12 @@ def render_page_context(payload: Optional[Dict[str, Any]]) -> str:
     if not payload or not isinstance(payload, dict):
         return ""
 
-    url   = _trunc(payload.get("url"),   _LIMITS["url"])
-    title = _trunc(payload.get("title"), _LIMITS["title"])
-    sel   = _trunc(payload.get("selected_text"),    _LIMITS["selected_text"])
-    body  = _trunc(payload.get("readable_content"), _LIMITS["readable_content"])
-    dom   = _trunc(payload.get("dom_summary"),      _LIMITS["dom_summary"])
+    limits = _active_limits()
+    url   = _trunc(payload.get("url"),   limits["url"])
+    title = _trunc(payload.get("title"), limits["title"])
+    sel   = _trunc(payload.get("selected_text"),    limits["selected_text"])
+    body  = _trunc(payload.get("readable_content"), limits["readable_content"])
+    dom   = _trunc(payload.get("dom_summary"),      limits["dom_summary"])
 
     # If the user is on chrome://newtab or about:blank we don't bother.
     if not url or url.startswith(("about:", "chrome://", "edge://", "view-source:")):

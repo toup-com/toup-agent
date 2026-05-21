@@ -95,6 +95,7 @@ class OpenAIAgentService:
         temperature: float = 0.7,
         thinking_budget: int = 0,
         tool_choice: Optional[str] = None,
+        prompt_cache_key: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a chat completion. Yields StreamEvent objects matching the
@@ -118,6 +119,11 @@ class OpenAIAgentService:
         )
         if supports_custom_temperature(model):
             kwargs["temperature"] = temperature
+        # TKT-LAT-018: stable per-session cache key — improves OpenAI
+        # prompt-cache hit rate by routing the request to a replica
+        # that already holds the session's prefix in its local cache.
+        if prompt_cache_key:
+            kwargs["prompt_cache_key"] = prompt_cache_key
 
         # Convert Anthropic-format tools to OpenAI format
         if tools:
@@ -138,9 +144,19 @@ class OpenAIAgentService:
                 async for chunk in stream:
                     # Usage comes in the final chunk
                     if chunk.usage:
+                        # TKT-LAT-018: capture cached_tokens for the
+                        # cross-provider [PERF] log line. OpenAI nests
+                        # it under prompt_tokens_details; older API
+                        # versions may omit the field entirely.
+                        _cached = 0
+                        _details = getattr(chunk.usage, "prompt_tokens_details", None)
+                        if _details is not None:
+                            _cached = getattr(_details, "cached_tokens", 0) or 0
                         usage_data = {
                             "input_tokens": chunk.usage.prompt_tokens or 0,
                             "output_tokens": chunk.usage.completion_tokens or 0,
+                            "cache_read_input_tokens": _cached,
+                            "cache_creation_input_tokens": 0,
                         }
 
                     if not chunk.choices:
@@ -207,6 +223,17 @@ class OpenAIAgentService:
                     "content_filter": "end_turn",
                 }
                 mapped_stop = stop_reason_map.get(finish_reason, finish_reason)
+
+                # TKT-LAT-018: cross-provider [PERF] log shape so a
+                # single dashboard query aggregates Anthropic + OpenAI
+                # cache hit rate without branching on provider.
+                logger.info(
+                    "[PERF] cache_read=%s cache_creation=0 input=%s output=%s model=%s provider=openai",
+                    usage_data.get("cache_read_input_tokens", 0),
+                    usage_data.get("input_tokens", 0),
+                    usage_data.get("output_tokens", 0),
+                    model,
+                )
 
                 yield StreamEvent(
                     type="message_end",

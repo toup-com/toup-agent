@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 # anything older that still matters should already be a memory or active task.
 DEFAULT_LIMIT_DAYS = 2
 
+# Hard cap on rows fetched from day_chats irrespective of date-range
+# math (TKT-LAT-009). The date-range already bounds the result tightly
+# in normal use, but a stale local_date on a row + a malformed
+# limit_days override could in principle scan the whole table for that
+# user. Belt-and-suspenders.
+DAY_CHATS_ROW_HARD_CAP = 30
+
 # Inject only when today's day-chat has fewer than this many messages.
 # Two turns of a back-and-forth = 4 messages; once we're past that, the
 # active conversation has its own continuity and the archival recap
@@ -91,7 +98,7 @@ async def get_recent_day_summaries(
                 DayChat.local_date >= cutoff,
                 DayChat.local_date < today_local_date,
             )
-        ).order_by(DayChat.local_date.desc())
+        ).order_by(DayChat.local_date.desc()).limit(DAY_CHATS_ROW_HARD_CAP)
     )).scalars().all()
 
     out: List[Dict] = []

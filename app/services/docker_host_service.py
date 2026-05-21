@@ -28,6 +28,7 @@ import logging
 import os
 import ssl
 import tempfile
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -93,13 +94,21 @@ def _write_cert_tmpfile(name: str, pem: str) -> str:
     return path
 
 
-def _bridge_client(timeout_s: Optional[int] = None) -> httpx.AsyncClient:
+_BRIDGE_CLIENT: Optional[httpx.AsyncClient] = None
+_BRIDGE_CLIENT_LOCK = asyncio.Lock()
+
+
+def _build_bridge_client(timeout_s: Optional[int] = None) -> httpx.AsyncClient:
     """Build an httpx.AsyncClient configured for mTLS to the bridge.
 
     Uses cert material from settings.bridge_{ca,client}_{cert,key}. Those
     are PEM strings stored as Railway env vars (multi-line via Raw Editor).
 
-    Caller is responsible for closing the client (use `async with`).
+    Most callers should use :func:`get_bridge_client` instead — the
+    module-level singleton holds a connection pool open for the life of
+    the process, which avoids paying the TLS+mTLS handshake (~30–50 ms)
+    on every bridge call. Use this raw builder only for the rare
+    custom-timeout case where you need a fresh client.
     """
     if not settings.bridge_url:
         raise RuntimeError(
@@ -131,6 +140,86 @@ def _bridge_client(timeout_s: Optional[int] = None) -> httpx.AsyncClient:
         verify=ctx,
         timeout=httpx.Timeout(timeout_s or settings.bridge_request_timeout_s),
     )
+
+
+async def get_bridge_client() -> httpx.AsyncClient:
+    """Return the shared mTLS bridge AsyncClient (TKT-LAT-006).
+
+    The client is constructed lazily on first use and kept open for the
+    life of the process so subsequent bridge calls reuse the same
+    connection pool — eliminating the ~30–50 ms TLS+mTLS handshake that
+    the previous per-call _bridge_client pattern paid on every
+    provision, prewarm, rollout, and health check.
+
+    Callers should NOT close the returned client. Pass per-request
+    timeouts via the ``timeout=`` kwarg on the individual call instead
+    of building a fresh client.
+    """
+    global _BRIDGE_CLIENT
+    if _BRIDGE_CLIENT is not None and not _BRIDGE_CLIENT.is_closed:
+        return _BRIDGE_CLIENT
+    async with _BRIDGE_CLIENT_LOCK:
+        if _BRIDGE_CLIENT is None or _BRIDGE_CLIENT.is_closed:
+            t = time.perf_counter()
+            _BRIDGE_CLIENT = _build_bridge_client()
+            logger.info(
+                "[PERF] bridge_client_init %.1fms",
+                (time.perf_counter() - t) * 1000,
+            )
+    return _BRIDGE_CLIENT
+
+
+async def _close_bridge_client_for_test() -> None:
+    """Test hook: dispose the singleton so a fresh one is built next call."""
+    global _BRIDGE_CLIENT
+    if _BRIDGE_CLIENT is not None:
+        try:
+            await _BRIDGE_CLIENT.aclose()
+        except Exception:
+            pass
+    _BRIDGE_CLIENT = None
+
+
+# Legacy alias: existing call sites import _bridge_client. Keep it as a
+# thin wrapper around the singleton so the diff is bounded and the
+# `async with` pattern continues to work — __aexit__ on the singleton's
+# AsyncClient.__aenter__ context is a no-op close because we override
+# __aexit__ in this returned wrapper.
+class _BridgeClientLease:
+    """Async context manager that hands out the shared client without
+    closing it on exit. Drops the `async with _bridge_client() as c:`
+    pattern in place without churning every caller."""
+
+    def __init__(self, timeout_s: Optional[int] = None):
+        self._timeout_s = timeout_s
+        self._client: Optional[httpx.AsyncClient] = None
+        # Fresh-client mode: caller asked for a non-default timeout, so
+        # we cannot hand out the shared pool. Build a one-shot client
+        # and close it on exit.
+        self._owned = timeout_s is not None
+
+    async def __aenter__(self) -> httpx.AsyncClient:
+        if self._owned:
+            self._client = _build_bridge_client(self._timeout_s)
+        else:
+            self._client = await get_bridge_client()
+        return self._client
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._owned and self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+
+
+def _bridge_client(timeout_s: Optional[int] = None) -> _BridgeClientLease:
+    """Backward-compatible entrypoint — returns a lease wrapper.
+
+    Without ``timeout_s``: yields the shared singleton (no close on exit).
+    With ``timeout_s``: yields a fresh client and closes it on exit.
+    """
+    return _BridgeClientLease(timeout_s=timeout_s)
 
 
 # ─── Lifecycle operations (stable signatures) ────────────────────

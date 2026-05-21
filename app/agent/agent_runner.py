@@ -57,6 +57,18 @@ MAX_RETRIES = 2
 RETRY_DELAY = 2.0  # seconds
 
 
+# TKT-LAT-004: process-wide TTL cache for User.timezone is implemented
+# in app/agent/_user_tz_cache.py (kept config-free so unit tests don't
+# need to boot Settings). Re-export the private helpers under their
+# legacy underscore names so existing import sites (auth.py, ws_chat.py)
+# continue to work without churn.
+from app.agent._user_tz_cache import (  # noqa: E402
+    get_cached_user_tz as _get_cached_user_tz,
+    set_cached_user_tz as _set_cached_user_tz,
+    invalidate_cached_user_tz as _invalidate_cached_user_tz,
+)
+
+
 def _is_claude_model(model: str) -> bool:
     """Check if a model name refers to an Anthropic Claude model."""
     return model.startswith("claude-")
@@ -432,28 +444,43 @@ class AgentRunner:
             # 1:58 AM". Single source of truth: User.timezone, with
             # client_tz override when the surface supplies one.
             if not client_tz:
-                try:
-                    from sqlalchemy import select as _select_for_tz
-                    from app.db.models import User as _User_for_tz
-                    _u_tz_row = (
-                        await db.execute(
-                            _select_for_tz(_User_for_tz).where(_User_for_tz.id == user_id)
-                        )
-                    ).scalar_one_or_none()
-                    _profile_tz = (
-                        getattr(_u_tz_row, "timezone", None) if _u_tz_row else None
+                # TKT-LAT-004: TTL-cache the User.timezone seed lookup so
+                # channels that never send client_tz (Telegram, voice,
+                # WhatsApp) don't pay a fresh DB round-trip every turn.
+                t_tz = time.perf_counter()
+                cached_tz = _get_cached_user_tz(user_id)
+                if cached_tz:
+                    client_tz = cached_tz
+                    logger.info(
+                        "[PERF] tz_seed=cache_hit %.1fms user=%s channel=%s tz=%s",
+                        (time.perf_counter() - t_tz) * 1000,
+                        user_id[:8], channel, cached_tz,
                     )
-                    if _profile_tz:
-                        client_tz = _profile_tz
+                else:
+                    try:
+                        from sqlalchemy import select as _select_for_tz
+                        from app.db.models import User as _User_for_tz
+                        _u_tz_row = (
+                            await db.execute(
+                                _select_for_tz(_User_for_tz).where(_User_for_tz.id == user_id)
+                            )
+                        ).scalar_one_or_none()
+                        _profile_tz = (
+                            getattr(_u_tz_row, "timezone", None) if _u_tz_row else None
+                        )
                         logger.info(
-                            "[AGENT] tz_seeded_from_profile user=%s channel=%s tz=%s",
+                            "[PERF] tz_seed=db_lookup %.1fms user=%s channel=%s tz=%s",
+                            (time.perf_counter() - t_tz) * 1000,
                             user_id[:8], channel, _profile_tz,
                         )
-                except Exception as _tz_seed_err:
-                    logger.debug(
-                        "[AGENT] tz_seed_failed user=%s err=%s",
-                        user_id[:8], _tz_seed_err,
-                    )
+                        if _profile_tz:
+                            client_tz = _profile_tz
+                            _set_cached_user_tz(user_id, _profile_tz)
+                    except Exception as _tz_seed_err:
+                        logger.debug(
+                            "[AGENT] tz_seed_failed user=%s err=%s",
+                            user_id[:8], _tz_seed_err,
+                        )
 
             t_db = time.perf_counter()
             # ── Day-Chat context path (feature-flagged) ──
@@ -835,6 +862,15 @@ class AgentRunner:
                     # In vibecoding mode, force tool use on first iteration
                     _tool_choice = "required" if (channel == "vibecoding" and iteration == 0 and current_tools) else None
 
+                    # TKT-LAT-018: stable per-session cache key. On the
+                    # OpenAI path this tells OpenAI's router to land
+                    # this user's requests on the replica that already
+                    # holds their prompt prefix in cache (lifts hit
+                    # rate under load). On the Anthropic path the
+                    # kwarg is accepted-and-ignored — cache_control
+                    # already wires the prompt cache via TKT-LAT-001.
+                    _cache_key = f"{user_id}:{session_id}" if user_id and session_id else None
+
                     async for event in active_llm.create_message_stream(
                         messages=messages,
                         system=system_prompt,
@@ -842,6 +878,7 @@ class AgentRunner:
                         model=active_model,
                         thinking_budget=thinking_budget if _is_claude_model(active_model) else 0,
                         tool_choice=_tool_choice,
+                        prompt_cache_key=_cache_key,
                     ):
                         if cancel_check and cancel_check():
                             logger.info("[AGENT] Cancelled during streaming")
@@ -935,12 +972,16 @@ class AgentRunner:
                                 text_buf = ""
                                 pending_tool_calls = []
                                 stop_reason = ""
+                                # TKT-LAT-018: pass the same per-session
+                                # cache key on the failover provider too.
+                                _fb_cache_key = f"{user_id}:{session_id}" if user_id and session_id else None
                                 async for event in fallback_llm.create_message_stream(
                                     messages=messages,
                                     system=system_prompt,
                                     tools=current_tools or None,
                                     model=fallback,
                                     thinking_budget=thinking_budget if _is_claude_model(fallback) else 0,
+                                    prompt_cache_key=_fb_cache_key,
                                 ):
                                     if cancel_check and cancel_check():
                                         raise asyncio.CancelledError("Cancelled")

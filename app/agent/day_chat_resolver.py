@@ -80,6 +80,10 @@ async def get_or_create_day_chat(
         The DayChat row for today.
     """
     from app.db.models.day_chat import DayChat
+    from app.agent._day_chat_cache import (
+        get_cached_day_chat_id,
+        set_cached_day_chat_id,
+    )
 
     if utc_now is None:
         utc_now = datetime.now(timezone.utc)
@@ -89,6 +93,19 @@ async def get_or_create_day_chat(
     # Strip tzinfo for DB insertion — codebase convention is naive UTC datetimes
     utc_now_naive = utc_now.replace(tzinfo=None) if utc_now.tzinfo else utc_now
 
+    # TKT-LAT-011: process-wide cache keyed by (user_id, local_date).
+    # The day-chat is immutable for that key for the entire day; caching
+    # the id skips the existing-check SELECT on every subsequent turn.
+    cached_id = get_cached_day_chat_id(user_id, local_date)
+    if cached_id:
+        cached_row = (await db.execute(
+            select(DayChat).where(DayChat.id == cached_id)
+        )).scalar_one_or_none()
+        if cached_row:
+            return cached_row
+        # Cache pointed at a row that no longer exists (rare: manual
+        # deletion / test reset). Fall through to the normal path.
+
     # Fast path: check if it already exists
     existing = (await db.execute(
         select(DayChat).where(
@@ -97,6 +114,7 @@ async def get_or_create_day_chat(
     )).scalar_one_or_none()
 
     if existing:
+        set_cached_day_chat_id(user_id, local_date, existing.id)
         return existing
 
     # Slow path: create via Postgres upsert (concurrent-safe)
@@ -131,6 +149,7 @@ async def get_or_create_day_chat(
     )).scalar_one_or_none()
 
     if row:
+        set_cached_day_chat_id(user_id, local_date, row.id)
         return row
 
     # Final fallback: direct insert (SQLite path, no ON CONFLICT support)
@@ -147,6 +166,7 @@ async def get_or_create_day_chat(
     )
     db.add(dc)
     await db.flush()
+    set_cached_day_chat_id(user_id, local_date, dc.id)
     return dc
 
 

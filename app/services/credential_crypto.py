@@ -68,17 +68,43 @@ def encrypt_str(plaintext: str) -> str:
     return token.decode("utf-8")
 
 
-def decrypt_str(token: str) -> str:
-    if token is None:
-        raise ValueError("decrypt_str: token is None")
+@lru_cache(maxsize=512)
+def _decrypt_cached(token: str) -> str:
+    """LRU-cached Fernet decrypt (TKT-LAT-010).
+
+    An agent turn that fires N connector tools currently decrypts the
+    same access-token N times (~5–15 ms of Fernet work per call). The
+    plaintext for a given ciphertext is constant for the life of the
+    encryption-key version, so caching by ciphertext is safe:
+
+      * Rotation: ``_multi_fernet`` itself is ``lru_cache(maxsize=1)``
+        keyed on the key list. A rotation that runs through
+        :func:`reset_decrypt_cache` (or a process restart) drops this
+        cache too.
+      * Stale plaintext: not possible. The same ciphertext under the
+        same key set always decrypts to the same plaintext; if the
+        key set changes, the cache below is reset.
+    """
     try:
         return _multi_fernet().decrypt(token.encode("utf-8")).decode("utf-8")
     except InvalidToken:
-        # Legacy plaintext row (pre-migration). Tell the caller so it can
-        # handle gracefully; in practice the data migration eliminates this.
         if not token.startswith(_FERNET_PREFIX):
             raise InvalidToken("row is legacy plaintext, not Fernet ciphertext")
         raise
+
+
+def decrypt_str(token: str) -> str:
+    if token is None:
+        raise ValueError("decrypt_str: token is None")
+    return _decrypt_cached(token)
+
+
+def reset_decrypt_cache() -> None:
+    """Drop the cached plaintexts. Call after a key rotation that does
+    not restart the process — also resets the Fernet bundle cache so the
+    next decrypt picks up the new keys."""
+    _decrypt_cached.cache_clear()
+    _multi_fernet.cache_clear()
 
 
 def looks_encrypted(value: str) -> bool:

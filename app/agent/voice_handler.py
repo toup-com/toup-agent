@@ -123,15 +123,30 @@ async def synthesize_speech(
     Generate speech audio from text using the configured TTS provider.
 
     Returns path to the generated audio file, or "ERROR: ...".
-    """
-    prov = provider or getattr(settings, "tts_provider", "openai")
 
-    if prov == TTSProvider.ELEVENLABS or prov == "elevenlabs":
-        return await _tts_elevenlabs(text, voice)
-    elif prov == TTSProvider.EDGE or prov == "edge":
-        return await _tts_edge(text, voice)
-    else:
-        return await _tts_openai(text, voice, model, speed, instructions, api_key=api_key)
+    TKT-LAT-012: callers that can consume bytes-as-they-arrive should
+    branch on ``settings.tts_streaming_enabled`` and call
+    :func:`stream_tts_elevenlabs` directly. This buffered entrypoint
+    stays for callers that need a file path. The [PERF] log line tags
+    which path was taken so voice-channel latency is observable.
+    """
+    import time as _time
+    prov = provider or getattr(settings, "tts_provider", "openai")
+    t0 = _time.perf_counter()
+    try:
+        if prov == TTSProvider.ELEVENLABS or prov == "elevenlabs":
+            result = await _tts_elevenlabs(text, voice)
+        elif prov == TTSProvider.EDGE or prov == "edge":
+            result = await _tts_edge(text, voice)
+        else:
+            result = await _tts_openai(text, voice, model, speed, instructions, api_key=api_key)
+        return result
+    finally:
+        logger.info(
+            "[PERF] tts=buffered provider=%s elapsed_ms=%.0f streaming_flag=%s",
+            prov, (_time.perf_counter() - t0) * 1000,
+            bool(getattr(settings, "tts_streaming_enabled", False)),
+        )
 
 
 async def _tts_openai(text: str, voice: str, model: str,
@@ -297,7 +312,12 @@ async def stream_tts_elevenlabs(text: str, voice: str = "rachel") -> AsyncIterat
     """
     Stream TTS audio chunks from ElevenLabs.
     Yields raw audio bytes as they arrive.
+
+    TKT-LAT-012: first-byte latency on this path is ~200 ms vs.
+    500–2 500 ms on the buffered :func:`synthesize_speech` variant.
+    Callers gate selection on ``settings.tts_streaming_enabled``.
     """
+    import time as _time
     api_key = getattr(settings, "elevenlabs_api_key", None)
     if not api_key:
         return
@@ -305,6 +325,8 @@ async def stream_tts_elevenlabs(text: str, voice: str = "rachel") -> AsyncIterat
     voice_id = ELEVENLABS_DEFAULT_VOICES.get(voice.lower(), voice)
     model_id = getattr(settings, "elevenlabs_model", "eleven_multilingual_v2")
 
+    first_byte_at = None
+    t0 = _time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             async with client.stream(
@@ -321,8 +343,14 @@ async def stream_tts_elevenlabs(text: str, voice: str = "rachel") -> AsyncIterat
                 },
             ) as response:
                 async for chunk in response.aiter_bytes(1024):
+                    if first_byte_at is None:
+                        first_byte_at = _time.perf_counter()
+                        logger.info(
+                            "[PERF] tts=streaming provider=elevenlabs first_byte_ms=%.0f",
+                            (first_byte_at - t0) * 1000,
+                        )
                     yield chunk
-    except Exception as e:
+    except Exception:
         logger.exception("[TTS] ElevenLabs streaming failed")
 
 

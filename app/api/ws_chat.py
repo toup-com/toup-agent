@@ -1411,6 +1411,14 @@ async def ws_chat(
                                     _user.timezone = client_tz
                                     await _tz_db.commit()
                                     logger.info("[WS] Updated timezone for %s: %s → %s", user_id[:8], _old_tz, client_tz)
+                                    # TKT-LAT-004: drop the in-process tz
+                                    # cache so the next agent turn picks
+                                    # up the new value instead of stale.
+                                    try:
+                                        from app.agent._user_tz_cache import invalidate_cached_user_tz
+                                        invalidate_cached_user_tz(user_id)
+                                    except Exception:
+                                        pass
 
                                     # Auto-rebucket if timezone changed from one real value to another
                                     # (not just NULL → real, which is the initial backfill case)

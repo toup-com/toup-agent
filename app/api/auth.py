@@ -344,6 +344,13 @@ async def update_profile(
             raise HTTPException(status_code=400, detail="Invalid timezone")
         current_user.timezone = body.timezone
         changed = True
+        # TKT-LAT-004: drop the in-process tz cache so the next agent
+        # turn picks up the new value instead of serving stale.
+        try:
+            from app.agent._user_tz_cache import invalidate_cached_user_tz
+            invalidate_cached_user_tz(current_user.id)
+        except Exception:
+            pass
     if changed:
         current_user.updated_at = datetime.utcnow()
         await db.commit()
@@ -428,6 +435,13 @@ async def timezone_from_coords(
         current_user.timezone = tz_name
         current_user.updated_at = datetime.utcnow()
         await db.commit()
+        # TKT-LAT-004: drop the in-process tz cache so the next agent
+        # turn picks up the new value instead of serving stale.
+        try:
+            from app.agent._user_tz_cache import invalidate_cached_user_tz
+            invalidate_cached_user_tz(current_user.id)
+        except Exception:
+            pass
 
     return {"timezone": tz_name}
 

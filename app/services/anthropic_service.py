@@ -38,6 +38,48 @@ def _mark_tools_cacheable(tools: Optional[List[Dict[str, Any]]]) -> Optional[Lis
     return marked
 
 
+def _mark_messages_cacheable(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Add ephemeral cache_control to the final content block of the last
+    message so the entire history prefix becomes cacheable. Subsequent turns
+    that share the same prefix (system + tools + earlier turns) get a cache
+    hit and pay only ~10% of the cached input tokens.
+
+    Handles both content shapes:
+      - string content → wrap into a single text block with cache_control
+      - list-of-blocks content → set cache_control on the last block
+
+    Cache control is incompatible with tool_result blocks containing only
+    image content for some models, but for our agent loop the last message
+    is always either user text or a tool_result with text — both supported.
+    """
+    if not messages:
+        return messages
+    out = [dict(m) for m in messages]
+    last = dict(out[-1])
+    content = last.get("content")
+    if isinstance(content, str):
+        if not content:
+            return out
+        last["content"] = [
+            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+        ]
+    elif isinstance(content, list) and content:
+        new_blocks = [dict(b) if isinstance(b, dict) else b for b in content]
+        # Only mark cache_control on dict blocks; skip non-dict (defensive).
+        for i in range(len(new_blocks) - 1, -1, -1):
+            block = new_blocks[i]
+            if isinstance(block, dict):
+                new_blocks[i] = {**block, "cache_control": {"type": "ephemeral"}}
+                break
+        last["content"] = new_blocks
+    else:
+        return out
+    out[-1] = last
+    return out
+
+
 def _convert_messages_for_anthropic(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert OpenAI-format messages to Anthropic format.
 
@@ -158,12 +200,29 @@ class AnthropicService:
     
     def _prepare_system(self, system: str) -> any:
         """
-        Prepare system prompt. For OAuth tokens, prepend Claude Code identity
-        as required by Anthropic's credential check.
+        Prepare system prompt.
+
+        Always wraps the system prompt in a text block with ephemeral
+        ``cache_control`` so Anthropic's 5-minute prompt cache covers the
+        (large, mostly-stable) system block across consecutive turns. OAuth
+        tokens additionally prepend the Claude Code identity (Anthropic's
+        credential check) — also cached.
+
+        Returns:
+            The raw string only when there's no system prompt to cache; a
+            list-of-blocks otherwise.
         """
         if not self.is_oauth:
-            return system
-        
+            if not system:
+                return system
+            return [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+
         # OAuth tokens MUST include Claude Code identity prefix
         cc_identity = "You are Claude Code, Anthropic's official CLI for Claude."
         parts = [
@@ -210,6 +269,9 @@ class AnthropicService:
             )
         max_tokens = max_tokens or self.default_max_tokens
         messages = _convert_messages_for_anthropic(messages)
+        # TKT-LAT-001: mark the final message block cacheable so the
+        # conversation prefix participates in Anthropic's 5-minute cache.
+        messages = _mark_messages_cacheable(messages)
 
         kwargs: Dict[str, Any] = dict(
             model=model,
@@ -228,7 +290,8 @@ class AnthropicService:
             }
             # Thinking requires temperature=1 per Anthropic docs
             kwargs["temperature"] = 1
-        # Prepare system prompt (adds Claude Code identity for OAuth tokens)
+        # Prepare system prompt (adds Claude Code identity for OAuth tokens;
+        # also wraps every system block in ephemeral cache_control — TKT-LAT-001).
         prepared_system = self._prepare_system(system)
         if prepared_system:
             kwargs["system"] = prepared_system
@@ -252,7 +315,19 @@ class AnthropicService:
                             "name": block.name,
                             "input": block.input,
                         })
-                
+
+                # TKT-LAT-001: surface cache hit/write counts so prod can
+                # observe the cache working without scraping the SDK object.
+                usage = response.usage
+                logger.info(
+                    "[PERF] cache_read=%s cache_creation=%s input=%s output=%s model=%s",
+                    getattr(usage, "cache_read_input_tokens", 0) or 0,
+                    getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    response.model,
+                )
+
                 return AnthropicResponse(
                     content="\n".join(text_parts),
                     tool_calls=tool_calls,
@@ -292,6 +367,7 @@ class AnthropicService:
         temperature: float = 0.7,
         thinking_budget: int = 0,
         tool_choice: Optional[str] = None,
+        prompt_cache_key: Optional[str] = None,  # noqa: ARG002 — TKT-LAT-018: accepted for cross-provider signature parity, unused on Anthropic (cache_control already wires the prompt cache)
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a message. Yields StreamEvent objects for text chunks,
@@ -306,6 +382,9 @@ class AnthropicService:
         model = model or self.default_model
         max_tokens = max_tokens or self.default_max_tokens
         messages = _convert_messages_for_anthropic(messages)
+        # TKT-LAT-001: mark the final message block cacheable so the
+        # conversation prefix participates in Anthropic's 5-minute cache.
+        messages = _mark_messages_cacheable(messages)
 
         kwargs: Dict[str, Any] = dict(
             model=model,
@@ -324,7 +403,8 @@ class AnthropicService:
             }
             # Thinking requires temperature=1 per Anthropic docs
             kwargs["temperature"] = 1
-        # Prepare system prompt (adds Claude Code identity for OAuth tokens)
+        # Prepare system prompt (adds Claude Code identity for OAuth tokens;
+        # also wraps every system block in ephemeral cache_control — TKT-LAT-001).
         prepared_system = self._prepare_system(system)
         if prepared_system:
             kwargs["system"] = prepared_system
@@ -389,12 +469,27 @@ class AnthropicService:
 
                     # After stream ends, get final message for usage/stop_reason
                     final = await stream.get_final_message()
+                    # TKT-LAT-001: surface cache hit/write counts so prod can
+                    # observe the cache working without scraping the SDK object.
+                    final_usage = final.usage
+                    cache_read = getattr(final_usage, "cache_read_input_tokens", 0) or 0
+                    cache_creation = getattr(final_usage, "cache_creation_input_tokens", 0) or 0
+                    logger.info(
+                        "[PERF] cache_read=%s cache_creation=%s input=%s output=%s model=%s",
+                        cache_read,
+                        cache_creation,
+                        final_usage.input_tokens,
+                        final_usage.output_tokens,
+                        final.model,
+                    )
                     yield StreamEvent(
                         type="message_end",
                         stop_reason=final.stop_reason,
                         usage={
-                            "input_tokens": final.usage.input_tokens,
-                            "output_tokens": final.usage.output_tokens,
+                            "input_tokens": final_usage.input_tokens,
+                            "output_tokens": final_usage.output_tokens,
+                            "cache_read_input_tokens": cache_read,
+                            "cache_creation_input_tokens": cache_creation,
                         },
                     )
                 return  # Success — exit retry loop
