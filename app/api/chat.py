@@ -676,10 +676,16 @@ async def get_chat_history(
 
 @router.get("/conversations/{conversation_id}/builder-mode")
 async def get_builder_mode(conversation_id: str, db: AsyncSession = Depends(get_db)):
-    """Get the builder mode for a conversation. NULL means 'auto' (default)."""
+    """Get the builder mode for a conversation. NULL or unknown ID means 'auto' (default).
+
+    Returns 200 with `auto` for missing conversations instead of 404 so a stale
+    conversation_id in the frontend (held across logouts, server resets, or
+    fresh accounts) does not surface a red error in every user's devtools.
+    The frontend already treats both responses identically via .catch fallback.
+    """
     conv = await db.get(Conversation, conversation_id)
     if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+        return {"builder_mode": "auto"}
     return {"builder_mode": getattr(conv, 'builder_mode', None) or "auto"}
 
 
