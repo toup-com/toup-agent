@@ -28,12 +28,21 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
-# `agent_task` is the generic "run this prompt" kind. Users genuinely
-# want many: "morning briefing", "noon GitHub check", "evening calendar
-# review". One-per-kind would collapse these into a single row which is
-# useless. Other kinds (email_briefing, future calendar_briefing, etc.)
-# are presets where one active instance per user is the design.
-KINDS_EXEMPT_FROM_ONE_PER_KIND: frozenset[str] = frozenset({"agent_task"})
+# Kinds that are NOT singleton-per-user.
+#
+# - `agent_task`: generic "run this prompt" — users want many ("morning
+#   briefing", "noon GitHub check", "evening calendar review"). One-per-
+#   kind would collapse them into a single row, useless.
+# - `reminder`: users naturally have many ("call mom at 6", "water the
+#   plants Tuesday", "standup ping at 9:30") — the routines__remind
+#   skill was designed to support N reminders per user. Adding only
+#   `agent_task` was an oversight in mig 041; without `reminder` here,
+#   creating a second reminder returns 409 and the agent surfaces a
+#   confusing error to the user.
+#
+# Other kinds (email_briefing, future calendar_briefing, etc.) are
+# presets where one active instance per user is the design.
+KINDS_EXEMPT_FROM_ONE_PER_KIND: frozenset[str] = frozenset({"agent_task", "reminder"})
 
 
 async def find_conflicting_enabled_routine_ids(

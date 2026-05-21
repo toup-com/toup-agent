@@ -173,6 +173,32 @@ async def test_agent_task_is_exempt_returns_empty_even_with_duplicates():
 
 
 @pytest.mark.asyncio
+async def test_reminder_is_exempt_returns_empty_even_with_duplicates():
+    """`reminder` is the second non-singleton kind. The
+    `routines__remind` skill creates ONE reminder per "remind me to X"
+    request — users have many ("call mom at 6", "water plants Tuesday",
+    "standup ping at 9:30"). Without this exemption, the second
+    reminder a user creates 409s with `An enabled 'reminder' routine
+    already exists` and the agent surfaces a confusing error.
+    Regression test for the 2026-05-21 production bug where the user
+    asked "remind me in 2 minutes to test reminders" and got told the
+    reminder system was wired to Telegram."""
+    from app.db import async_session_maker
+    from app.services.routine_uniqueness import find_conflicting_enabled_routine_ids
+
+    user_id = await _make_user()
+    await _seed_routine(user_id, kind="reminder")
+    await _seed_routine(user_id, kind="reminder")
+    await _seed_routine(user_id, kind="reminder")
+
+    async with async_session_maker() as db:
+        result = await find_conflicting_enabled_routine_ids(
+            db, user_id=user_id, kind="reminder",
+        )
+    assert result == []
+
+
+@pytest.mark.asyncio
 async def test_exclude_routine_id_excludes_self_for_update_enable_path():
     """When the update path re-enables a previously-disabled routine,
     it passes its OWN id as exclude_routine_id so a self-enable
