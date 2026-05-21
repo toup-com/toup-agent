@@ -4,6 +4,8 @@ Supports async SQLAlchemy with PostgreSQL.
 """
 
 import asyncio
+import logging
+import time
 from logging.config import fileConfig
 import os
 import sys
@@ -13,6 +15,8 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
+from alembic.script import ScriptDirectory
+from alembic.runtime.migration import MigrationContext
 
 # Add the app directory to the path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -79,12 +83,62 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
+# TKT-LAT-016: short-circuit the migration run when the DB is already
+# at the script-directory head(s). Saves ~1–5 s of script discovery +
+# version-table chatter per agent boot. Gated by env var so operators
+# can disable if some out-of-band schema drift sneaks in.
+_LAT016_SKIP_DEFAULT = "true"
+
+
+def _is_at_head(connection: Connection) -> bool:
+    """Return True iff the DB schema is already at the script head(s).
+
+    Defensive: any failure (no alembic_version table, dialect quirk,
+    multiple-heads ambiguity) → False so the regular migration path
+    runs. The cost of a false negative is one full alembic evaluation,
+    which is exactly what we'd have done without this optimization.
+    """
+    try:
+        ctx = MigrationContext.configure(connection)
+        current_heads = set(ctx.get_current_heads())
+        script = ScriptDirectory.from_config(config)
+        target_heads = set(script.get_heads())
+        # Require the DB to have at least one revision row to skip;
+        # a brand-new database (empty set) must go through migrations.
+        return bool(current_heads) and current_heads == target_heads
+    except Exception:
+        return False
+
+
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode using synchronous driver."""
     url = config.get_main_option("sqlalchemy.url")
     connectable = create_engine(url, poolclass=pool.NullPool)
 
+    log = logging.getLogger("alembic.env")
+    skip_enabled = os.environ.get(
+        "LAT_SKIP_NOOP_MIGRATIONS", _LAT016_SKIP_DEFAULT
+    ).strip().lower() in ("1", "true", "yes", "on")
+
     with connectable.connect() as connection:
+        if skip_enabled:
+            t0 = time.monotonic()
+            at_head = _is_at_head(connection)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            if at_head:
+                log.info(
+                    "[PERF] alembic_noop=true elapsed_ms=%d "
+                    "skipped_full_evaluation=true",
+                    elapsed_ms,
+                )
+                connectable.dispose()
+                return
+            log.info(
+                "[PERF] alembic_noop=false elapsed_ms=%d "
+                "head_check_ran_then_proceeding=true",
+                elapsed_ms,
+            )
+
         do_run_migrations(connection)
 
     connectable.dispose()
