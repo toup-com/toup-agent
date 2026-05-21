@@ -407,6 +407,84 @@ def _derive_health(trigger, watch_provisioned: bool) -> str:
 # ── Response helpers ─────────────────────────────────────────────────
 
 
+def _job_to_event_response(j) -> TriggerEventResponse:
+    """Project a ``build_jobs`` row into the legacy ``TriggerEventResponse``
+    shape so the events history endpoints can serve from BuildJob without
+    a frontend contract change.
+
+    PR #51 of the unified-jobs cutover arc: the legacy ``trigger_events``
+    table is going away in PR #52 (mig 050). Every API consumer that used
+    to SELECT TriggerEvent now reads BuildJob; this helper keeps the
+    wire shape stable so dashboards/extensions don't notice the swap.
+
+    Field mapping (mirrors the runner's terminal-write mapping in
+    ``app/agent/triggers/runner.py``):
+
+      BuildJob.id                 → id
+      BuildJob.source_id          → trigger_id
+      BuildJob.idempotency_key    → event_dedupe_id
+      BuildJob.created_at         → received_at  (BuildJob has no
+                                     received-vs-started split; the
+                                     intake INSERT moment IS the
+                                     received moment)
+      None                        → started_at   (no equivalent on
+                                     BuildJob; the legacy
+                                     ``started_at`` column was set
+                                     when the runner claimed the row.
+                                     The new model doesn't track that
+                                     boundary — the dashboard reads
+                                     ``created_at`` for "when fired",
+                                     ``completed_at`` for "when done")
+      BuildJob.completed_at       → finished_at
+      BuildJob.status + outcome   → status  (see _job_status_to_legacy)
+      BuildJob.error_message      → error_detail  (single Text column
+                                     on BuildJob; ``error_class`` has
+                                     no separate column so we leave
+                                     it None — the dashboard renders
+                                     the detail string verbatim)
+      BuildJob.summary_message_id → summary_message_id
+      BuildJob.coalesced_into_job_id → coalesced_into_event_id
+    """
+    return TriggerEventResponse(
+        id=j.id,
+        trigger_id=j.source_id or "",
+        event_dedupe_id=j.idempotency_key or "",
+        received_at=j.created_at,
+        started_at=None,
+        finished_at=j.completed_at,
+        status=_job_status_to_legacy(j.status, getattr(j, "outcome", None)),
+        error_class=None,
+        error_detail=j.error_message,
+        summary_message_id=j.summary_message_id,
+        coalesced_into_event_id=getattr(j, "coalesced_into_job_id", None),
+    )
+
+
+def _job_status_to_legacy(status: Optional[str], outcome: Optional[str]) -> str:
+    """Collapse BuildJob's (status, outcome) two-column state back into
+    the single legacy ``TriggerEvent.status`` string the frontend reads.
+
+    Inverse of the runner's write mapping (see
+    ``app/agent/triggers/runner.py:_dispatch_single``):
+
+      completed + 'success'            → 'success'
+      completed + 'skipped_rate_limit' → 'skipped_rate_limit'
+      completed + 'skipped_filter'     → 'skipped_filter'
+      completed + 'coalesced'          → 'coalesced'
+      failed    + NULL                 → 'failed'
+      queued    + NULL                 → 'queued'
+      running   + NULL                 → 'running'
+
+    Unknown combinations fall back to the raw status — better than
+    returning an empty string and breaking the dashboard's icon
+    switch."""
+    if status == "completed":
+        return outcome or "success"
+    if status == "failed":
+        return "failed"
+    return status or "queued"
+
+
 def _row_to_response(trigger, recent_events=(), recent_jobs=()) -> TriggerResponse:
     cfg = trigger.config_json or {}
     ps = trigger.provider_state_json or {}
@@ -440,22 +518,11 @@ def _row_to_response(trigger, recent_events=(), recent_jobs=()) -> TriggerRespon
         last_webhook_dispatch_at=ps.get("last_webhook_dispatch_at"),
         last_handler_completed_at=ps.get("last_handler_completed_at"),
         last_handler_status=ps.get("last_handler_status"),
-        recent_events=[
-            TriggerEventResponse(
-                id=e.id,
-                trigger_id=e.trigger_id,
-                event_dedupe_id=e.event_dedupe_id,
-                received_at=e.received_at,
-                started_at=e.started_at,
-                finished_at=e.finished_at,
-                status=e.status,
-                error_class=e.error_class,
-                error_detail=e.error_detail,
-                summary_message_id=e.summary_message_id,
-                coalesced_into_event_id=e.coalesced_into_event_id,
-            )
-            for e in recent_events
-        ],
+        # PR #51 cutover: ``recent_events`` is now a sequence of
+        # BuildJob rows (source_kind='trigger', source_id=trigger.id).
+        # ``_job_to_event_response`` projects each into the legacy
+        # TriggerEventResponse shape so the wire contract is stable.
+        recent_events=[_job_to_event_response(e) for e in recent_events],
         recent_jobs=[
             TriggerRecentJob(
                 id=j.id,
@@ -487,7 +554,7 @@ async def list_triggers():
     recent 20 events per trigger. The frontend uses these for the
     Mission Control card grid."""
     from app.db.database import async_session_maker
-    from app.db.models import BuildJob, Trigger, TriggerEvent
+    from app.db.models import BuildJob, Trigger
 
     async with async_session_maker() as db:
         rows = (await db.execute(
@@ -496,9 +563,21 @@ async def list_triggers():
         )).scalars().all()
         out: list[TriggerResponse] = []
         for t in rows:
+            # PR #51 cutover: source the recent-events list from
+            # ``build_jobs`` instead of the legacy ``trigger_events``
+            # table (which mig 050 drops in PR #52). Each fire mints
+            # a BuildJob row with ``source_kind='trigger'`` +
+            # ``source_id=trigger.id`` — same shape as ``recent_jobs``
+            # below, just with a higher limit. We KEEP ``recent_events``
+            # and ``recent_jobs`` as separate fields on the response so
+            # the frontend's two-list rendering (legacy events table
+            # vs. unified Jobs links) keeps working with no contract
+            # change. The data is just one query now.
             recent = (await db.execute(
-                select(TriggerEvent).where(TriggerEvent.trigger_id == t.id)
-                .order_by(desc(TriggerEvent.received_at)).limit(20)
+                select(BuildJob).where(
+                    BuildJob.source_kind == "trigger",
+                    BuildJob.source_id == t.id,
+                ).order_by(desc(BuildJob.created_at)).limit(20)
             )).scalars().all()
             # PR 7 of the unified-jobs arc: surface the last 5
             # mirrored BuildJob rows for this trigger. Each fire
@@ -507,9 +586,8 @@ async def list_triggers():
             # this for a "Last 5 fires" list of detail-drawer
             # links — same shape the routine card will get in
             # this same PR. Best-effort: if the JOIN is empty
-            # (no fires yet, or a tenant pre-dating PR 4a),
-            # ``recent_jobs`` is an empty list — the card hides
-            # the section gracefully.
+            # (no fires yet), ``recent_jobs`` is an empty list —
+            # the card hides the section gracefully.
             recent_jobs = (await db.execute(
                 select(BuildJob).where(
                     BuildJob.source_kind == "trigger",
@@ -786,11 +864,15 @@ async def list_events(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
-    """Paginated event history. The hot path index
-    `ix_trigger_events_trigger_received` makes this trivially cheap
-    up to N=500 / offset=10k."""
+    """Paginated event history.
+
+    PR #51 cutover: backed by ``build_jobs`` (PR #52 / mig 050 drops
+    the legacy ``trigger_events`` table). The same composite index on
+    ``(source_kind, source_id, created_at desc)`` keeps this cheap up
+    to N=500 / offset=10k — see migration 046 for the index
+    definition."""
     from app.db.database import async_session_maker
-    from app.db.models import Trigger, TriggerEvent
+    from app.db.models import BuildJob, Trigger
 
     async with async_session_maker() as db:
         # Auth: trigger must belong to the container owner.
@@ -798,75 +880,77 @@ async def list_events(
         if trig is None or trig.user_id != _user_id():
             raise HTTPException(status_code=404, detail="Trigger not found")
         rows = (await db.execute(
-            select(TriggerEvent).where(TriggerEvent.trigger_id == trigger_id)
-            .order_by(desc(TriggerEvent.received_at))
+            select(BuildJob).where(
+                BuildJob.source_kind == "trigger",
+                BuildJob.source_id == trigger_id,
+            )
+            .order_by(desc(BuildJob.created_at))
             .limit(limit).offset(offset)
         )).scalars().all()
-    return [
-        TriggerEventResponse(
-            id=e.id, trigger_id=e.trigger_id, event_dedupe_id=e.event_dedupe_id,
-            received_at=e.received_at, started_at=e.started_at,
-            finished_at=e.finished_at, status=e.status,
-            error_class=e.error_class, error_detail=e.error_detail,
-            summary_message_id=e.summary_message_id,
-            coalesced_into_event_id=e.coalesced_into_event_id,
-        )
-        for e in rows
-    ]
+    return [_job_to_event_response(j) for j in rows]
 
 
 @router.post("/{trigger_id}/test", response_model=TriggerEventResponse)
 async def test_trigger(trigger_id: str):
-    """Synthesise a test event. Inserts a row with `event_dedupe_id`
-    prefix `test:` and a fresh uuid — guaranteed not to collide with
-    any real Gmail message id. Dispatches via the runner, returns the
-    persisted row.
+    """Synthesise a test event. Mints a BuildJob row with
+    ``idempotency_key`` prefix ``test:`` and a fresh uuid — guaranteed
+    not to collide with any real Gmail message id. Hands off to the
+    runner, returns the persisted row in the legacy
+    ``TriggerEventResponse`` shape.
 
-    For email_received: the handler detects the `test:` prefix in
-    `_fetch_all` and substitutes a synthetic email envelope instead of
-    calling MCP (which would 404 on the synthetic id). The summariser /
-    notify / forward action then runs end-to-end against that
-    payload, posting a real "Trigger wiring check" message into
+    For email_received: the handler detects the ``test:`` prefix in
+    ``_fetch_all`` and substitutes a synthetic email envelope instead
+    of calling MCP (which would 404 on the synthetic id). The
+    summariser / notify / forward action then runs end-to-end against
+    that payload, posting a real "Trigger wiring check" message into
     Day-as-Chat. The user sees an actual message in their chat
     (matching the dashboard banner) AND the trigger flips to
-    `last_status=active` so the UI surfaces are consistent."""
+    ``last_status=active`` so the UI surfaces are consistent.
+
+    PR #51 cutover: replaces the legacy ``INSERT TriggerEvent`` with
+    ``JobRunner.create_job`` — same idempotency semantics
+    (the composite UNIQUE on ``(source_id, idempotency_key)`` in
+    mig 046 carries the legacy ``(trigger_id, event_dedupe_id)`` UNIQUE
+    forward) and same runner hand-off, just one table to write to.
+    Mirrors the inbound dispatch path in
+    ``app/api/triggers_inbound.py:_idempotent_insert``."""
+    from app.agent.job_runner import JobRunner, TaskSpec
     from app.db.database import async_session_maker
-    from app.db.models import Trigger, TriggerEvent
+    from app.db.models import BuildJob, Trigger
 
     async with async_session_maker() as db:
         trig = await db.get(Trigger, trigger_id)
         if trig is None or trig.user_id != _user_id():
             raise HTTPException(status_code=404, detail="Trigger not found")
 
-        event_id = str(uuid.uuid4())
-        dedupe = f"test:{uuid.uuid4().hex}"
-        ev = TriggerEvent(
-            id=event_id,
-            trigger_id=trigger_id,
-            user_id=_user_id(),
-            event_dedupe_id=dedupe,
-            received_at=datetime.utcnow(),
-            status="queued",
-        )
-        db.add(ev)
-        await db.commit()
-        await db.refresh(ev)
+    dedupe = f"test:{uuid.uuid4().hex}"
+    spec = TaskSpec(
+        user_id=_user_id(),
+        channel="trigger",
+        source_kind="trigger",
+        source_id=trigger_id,
+    )
+    job = await JobRunner().create_job(
+        job_type="trigger_run",
+        spec=spec,
+        title=f"Trigger fire: {dedupe[:40]}",
+        idempotency_key=dedupe,
+    )
 
     # Hand off to the runner — it'll claim the row + run the handler.
     if _runner is not None:
         try:
-            _runner.handle_event_background(event_id)
+            _runner.handle_event_background(job.id)
         except Exception:
             pass
 
-    return TriggerEventResponse(
-        id=ev.id, trigger_id=ev.trigger_id, event_dedupe_id=ev.event_dedupe_id,
-        received_at=ev.received_at, started_at=ev.started_at,
-        finished_at=ev.finished_at, status=ev.status,
-        error_class=ev.error_class, error_detail=ev.error_detail,
-        summary_message_id=ev.summary_message_id,
-        coalesced_into_event_id=ev.coalesced_into_event_id,
-    )
+    # Re-read the fresh row so the response reflects whatever the
+    # runner has stamped in the synchronous claim path (best-effort —
+    # for inline test mode the runner's hand-off is fire-and-forget,
+    # the row may still be queued).
+    async with async_session_maker() as db:
+        fresh = await db.get(BuildJob, job.id) or job
+    return _job_to_event_response(fresh)
 
 
 class TriggerProbeResponse(BaseModel):
@@ -1193,9 +1277,12 @@ async def reverify_trigger(trigger_id: str):
         row = await db.get(Trigger, trigger_id)
         # Eagerly load recent events for the response so the UI can
         # render the refreshed card without a separate GET round trip.
-        from app.db.models import TriggerEvent
+        # PR #51 cutover: same BuildJob-backed query as list_triggers.
+        from app.db.models import BuildJob
         recent = (await db.execute(
-            select(TriggerEvent).where(TriggerEvent.trigger_id == trigger_id)
-            .order_by(desc(TriggerEvent.received_at)).limit(20)
+            select(BuildJob).where(
+                BuildJob.source_kind == "trigger",
+                BuildJob.source_id == trigger_id,
+            ).order_by(desc(BuildJob.created_at)).limit(20)
         )).scalars().all()
     return _row_to_response(row, recent)

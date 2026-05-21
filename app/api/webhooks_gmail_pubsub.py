@@ -265,8 +265,9 @@ async def gmail_pubsub_webhook(
     # call queried `triggers` here and produced a warning on every push
     # ("relation triggers does not exist"). The agent's
     # `triggers/inbound` handler already stamps `last_fired_at` on the
-    # Trigger row when it inserts a TriggerEvent — that's the source of
-    # truth for `/probe`. No platform-side stamp needed.
+    # Trigger row when it mints a BuildJob (PR #51 cutover; was
+    # TriggerEvent pre-cutover) — that's the source of truth for
+    # `/probe`. No platform-side stamp needed.
 
     latency_ms = _ms_now() - started_ms
     logger.info(
