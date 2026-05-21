@@ -110,6 +110,8 @@ class PlanRow(BaseModel):
     message_credits_daily_cap: Optional[float] = None
     rollover_message_credits: bool
     rollover_integration_credits: bool
+    rollover_max_pct: Optional[float] = None
+    stripe_price_id: Optional[str] = None
     sort_order: int
 
 
@@ -188,6 +190,9 @@ async def list_plans(db: AsyncSession = Depends(get_db)) -> PlansResponse:
                                        if p.message_credits_daily_cap is not None else None),
             rollover_message_credits=p.rollover_message_credits,
             rollover_integration_credits=p.rollover_integration_credits,
+            rollover_max_pct=(float(p.rollover_max_pct)
+                              if p.rollover_max_pct is not None else None),
+            stripe_price_id=p.stripe_price_id,
             sort_order=p.sort_order,
         ) for p in rows
     ])
