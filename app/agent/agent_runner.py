@@ -495,10 +495,10 @@ class AgentRunner:
                     )
                     _use_day_ctx = False
                     _day_context = None
-                    history = await self._load_history(db, session_id)
+                    history = await self._load_history(db, session_id, client_tz=client_tz)
                     logger.info(f"[PERF] load_history: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages (fallback)")
             else:
-                history = await self._load_history(db, session_id)
+                history = await self._load_history(db, session_id, client_tz=client_tz)
                 logger.info(f"[PERF] load_history: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages")
 
             # If conversation has active app_builder context (direction cards,
@@ -2590,11 +2590,22 @@ class AgentRunner:
         db: AsyncSession,
         session_id: str,
         max_messages: int = 50,
+        client_tz: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Load recent messages in Anthropic format (user/assistant roles)."""
+        """Load recent messages in Anthropic format (user/assistant roles).
+
+        Reply-to handling mirrors ``day_context_loader``: historical
+        user turns that carry a ``reply_to_message_id`` get prefixed
+        with the same ``<reply_to>`` XML preamble. Target lookup is
+        GLOBAL by id — a reply may point at a message in any session,
+        channel, or day, so scoping the lookup to the current
+        ``session_id`` would silently drop cross-surface threads. The
+        fallback path used to turn every historical reply into two
+        unrelated turns from the model's perspective (Bug A).
+        """
         from sqlalchemy import select
         from app.db.models import Message
-        
+
         result = await db.execute(
             select(Message)
             .where(Message.conversation_id == session_id)
@@ -2602,12 +2613,45 @@ class AgentRunner:
             .limit(max_messages)
         )
         rows = list(reversed(result.scalars().all()))
-        
+
+        # Bulk-fetch reply targets globally (across all sessions/channels).
+        # getattr soft-reads the column so a tenant pre-mig-049 degrades
+        # to plain history instead of erroring at attribute access.
+        _reply_target_ids = [
+            getattr(msg, "reply_to_message_id", None)
+            for msg in rows
+            if getattr(msg, "reply_to_message_id", None)
+        ]
+        _reply_targets: Dict[str, Any] = {}
+        if _reply_target_ids:
+            try:
+                from app.agent.reply_quote import fetch_reply_targets
+                _reply_targets = await fetch_reply_targets(db, _reply_target_ids)
+            except Exception as _rq_err:
+                logger.warning("[history] reply target fetch failed: %s", _rq_err)
+                _reply_targets = {}
+
         messages: List[Dict[str, Any]] = []
         for msg in rows:
-            if msg.role in ("user", "assistant"):
-                messages.append({"role": msg.role, "content": msg.content})
-        
+            if msg.role not in ("user", "assistant"):
+                continue
+            _content = msg.content
+            _rt_id = getattr(msg, "reply_to_message_id", None)
+            if _rt_id and _rt_id in _reply_targets:
+                try:
+                    from app.agent.reply_quote import render_reply_preamble
+                    _target = _reply_targets[_rt_id]
+                    _preamble = render_reply_preamble(
+                        target_role=_target.role,
+                        target_content=_target.content,
+                        target_created_at=_target.created_at,
+                        tz_name=client_tz,
+                    )
+                    _content = f"{_preamble}\n\n{_content}"
+                except Exception:
+                    pass
+            messages.append({"role": msg.role, "content": _content})
+
         return messages
     
     # ------------------------------------------------------------------
