@@ -122,6 +122,15 @@ class Settings(BaseSettings):
     # the FEATURE_AUTO_BUILDER_CHAT_OUTPUT env var if rollback is
     # needed before a code revert.
     feature_auto_builder_chat_output: bool = True
+
+    # ── Latency flags (TKT-LAT wave 3) ──
+    # TKT-LAT-013: trim Chrome-extension page-context
+    # readable_content from 8000 chars to 2000 chars per turn.
+    extension_page_context_compact: bool = True
+    # TKT-LAT-012: gate per-tenant opt-in to streaming TTS
+    # playback. Default OFF until per-provider streaming is
+    # verified across mobile.
+    tts_streaming_enabled: bool = False
     # Storage backend for generated files. "local" writes to {agent_workspace_dir}/generated/.
     # "s3" is stubbed for a follow-up PR.
     files_storage_backend: str = "local"
