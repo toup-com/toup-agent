@@ -854,6 +854,13 @@ class ChatMessageResponse(BaseModel):
     # client-side from its in-memory day-chat list and renders a quoted
     # card on the bubble.
     reply_to_message_id: Optional[str] = None
+    # Denormalized reply target — when reply_to_message_id is set, the
+    # serializer inlines {id, role, content, created_at} of the target
+    # so the frontend can render the quoted card on first paint instead
+    # of waiting for older days to hydrate. None when the target is
+    # unresolvable (deleted / column missing). content is excerpted to
+    # 240 chars; see app/agent/reply_quote.py:serialize_reply_target.
+    reply_to: Optional[dict] = None
 
     class Config:
         from_attributes = True

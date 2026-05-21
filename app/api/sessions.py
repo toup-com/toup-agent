@@ -298,7 +298,9 @@ async def get_session(
             )
             for bj in bj_result.scalars().all():
                 build_jobs[bj.id] = bj
-        response_dict["messages"] = [_message_to_response(m, build_jobs) for m in messages]
+        from app.agent.reply_quote import resolve_reply_targets_for_serialization
+        reply_targets = await resolve_reply_targets_for_serialization(db, messages)
+        response_dict["messages"] = [_message_to_response(m, build_jobs, reply_targets) for m in messages]
     else:
         response_dict["messages"] = []
     
@@ -488,7 +490,13 @@ async def get_session_messages(
         for bj in bj_result.scalars().all():
             build_jobs[bj.id] = bj
 
-    return [_message_to_response(m, build_jobs) for m in messages]
+    # Bulk-resolve reply targets so each row's reply_to card paints
+    # immediately instead of flashing the "(message not in current view)"
+    # stub. See api/day_chats.py for the same pattern.
+    from app.agent.reply_quote import resolve_reply_targets_for_serialization
+    reply_targets = await resolve_reply_targets_for_serialization(db, messages)
+
+    return [_message_to_response(m, build_jobs, reply_targets) for m in messages]
 
 
 @router.post("/{session_id}/messages", response_model=ChatMessageResponse, status_code=status.HTTP_201_CREATED)
@@ -588,8 +596,19 @@ def _session_to_response(session: Conversation) -> SessionResponse:
     )
 
 
-def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessageResponse:
-    """Convert Message model to ChatMessageResponse."""
+def _message_to_response(
+    message: Message,
+    build_jobs: dict = None,
+    reply_targets: Optional[dict] = None,
+) -> ChatMessageResponse:
+    """Convert Message model to ChatMessageResponse.
+
+    ``reply_targets`` is the bulk-resolved map from
+    ``resolve_reply_targets_for_serialization``: ``{replier_id: target_dict}``.
+    Optional — single-message callers (POST .../messages) pass None and
+    the resulting row just won't have a ``reply_to`` payload (the path
+    doesn't carry one anyway).
+    """
     memories_retrieved = None
     if message.memories_retrieved_json:
         try:
@@ -635,6 +654,7 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
         media=msg_metadata.get("media") if msg_metadata else None,
         attachments=attachments_list,
         reply_to_message_id=getattr(message, "reply_to_message_id", None),
+        reply_to=(reply_targets or {}).get(message.id),
     )
 
     # Enrich job card messages with current BuildJob status
@@ -757,6 +777,9 @@ async def get_messages_by_date(
         for bj in bj_result.scalars().all():
             build_jobs[bj.id] = bj
 
+    from app.agent.reply_quote import resolve_reply_targets_for_serialization
+    reply_targets = await resolve_reply_targets_for_serialization(db, messages)
+
     return JSONResponse(content=[
-        _message_to_response(m, build_jobs).model_dump(mode="json") for m in messages
+        _message_to_response(m, build_jobs, reply_targets).model_dump(mode="json") for m in messages
     ])

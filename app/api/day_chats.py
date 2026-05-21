@@ -418,6 +418,12 @@ async def get_day_chat_messages(
         )
         messages = msgs_result.scalars().all()
 
+        # Bulk-resolve reply targets so each replying row can render its
+        # quoted card on first paint instead of flashing the "(message
+        # not in current view)" stub while older days hydrate.
+        from app.agent.reply_quote import resolve_reply_targets_for_serialization
+        reply_targets = await resolve_reply_targets_for_serialization(db, messages)
+
         return JSONResponse(content=[
             {
                 "id": m.id,
@@ -430,6 +436,7 @@ async def get_day_chat_messages(
                 "media": _serialize_media(m),
                 "tool_events": _serialize_tool_events(m),
                 "reply_to_message_id": getattr(m, "reply_to_message_id", None),
+                "reply_to": reply_targets.get(m.id),
             }
             for m in messages
         ])
@@ -451,6 +458,14 @@ async def get_day_chat_messages(
         await db.rollback()
         return JSONResponse(content=[])
 
+    # Bulk-resolve reply targets so each replying row can render its
+    # quoted card on first paint instead of flashing the "(message not
+    # in current view)" stub while older days hydrate.
+    from app.agent.reply_quote import resolve_reply_targets_for_serialization
+    reply_targets = await resolve_reply_targets_for_serialization(
+        db, [msg for msg, _ in rows]
+    )
+
     return JSONResponse(content=[
         {
             "id": msg.id,
@@ -463,6 +478,7 @@ async def get_day_chat_messages(
             "media": _serialize_media(msg),
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
+            "reply_to": reply_targets.get(msg.id),
         }
         for msg, channel in rows
     ])

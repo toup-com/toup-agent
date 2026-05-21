@@ -7,12 +7,17 @@ relationship — not just see two unrelated turns — we prefix the replying
 turn's content with a short quoted preamble before handing it to the
 model.
 
-Two call sites use this:
+Three call sites use this:
 
 1. ``api/ws_chat.py`` — the current turn's user text, before passing to
    ``agent_runner.run(user_message=...)``.
 2. ``agent/day_context_loader.py`` — historical user turns when assembling
    day context for the LLM.
+3. Message-list serializers (``api/day_chats.py``, ``api/messages_recover.py``,
+   ``api/sessions.py``) — to inline the target's role/content/timestamp
+   under each replying message, so the frontend renders the quoted card
+   immediately on refresh instead of flashing a "(message not in current
+   view)" stub while older days hydrate.
 
 The preamble is LLM-only. The DB row stores the user's clean original
 content; the structured pointer (``reply_to_message_id``) is what the
@@ -22,7 +27,7 @@ frontend reads to render the quoted card.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, Optional, Sequence
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -121,3 +126,75 @@ class ReplyTarget:
         self.role = role
         self.content = content
         self.created_at = created_at
+
+
+# Cap inlined excerpts at 240 chars — the UI line-clamps to two lines
+# (~200 chars at common widths), so this is enough headroom for the
+# clamp without bloating /api/day-chats responses on chatty days.
+_INLINE_REPLY_EXCERPT_CHARS = 240
+
+
+def serialize_reply_target(target: ReplyTarget) -> Dict[str, Any]:
+    """Frontend-facing dict for a resolved reply target.
+
+    ``content`` is excerpted (not full message body) because:
+      - the UI clamps to two lines anyway,
+      - inlining full content on every replying message in a 7-day
+        window would bloat /api/day-chats responses,
+      - the frontend already has a pointer (``reply_to_message_id``)
+        to fetch the full row on demand if the user needs it.
+    """
+    text = (target.content or "").strip().replace("\n", " ")
+    if len(text) > _INLINE_REPLY_EXCERPT_CHARS:
+        text = text[: _INLINE_REPLY_EXCERPT_CHARS - 1] + "…"
+    return {
+        "id": target.id,
+        "role": target.role,
+        "content": text,
+        "created_at": (
+            target.created_at.isoformat() if target.created_at else None
+        ),
+    }
+
+
+async def resolve_reply_targets_for_serialization(
+    db: AsyncSession,
+    messages: Iterable[Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Bulk-resolve reply targets for a batch of messages about to be
+    serialized to the frontend.
+
+    Returns ``{ replying_message_id: {id, role, content, created_at} }``
+    so the caller can attach a ``reply_to`` field on each replying row
+    without doing N+1 lookups. Soft-reads ``reply_to_message_id`` via
+    ``getattr`` so a tenant pre-mig-049 (column missing) returns an
+    empty map cleanly.
+
+    The output dict is keyed by the REPLYING message id, NOT the target
+    id, because a single target may be replied to by multiple messages
+    (rare but real on busy days).
+    """
+    pairs: list[tuple[str, str]] = []
+    for m in messages:
+        rid = getattr(m, "reply_to_message_id", None)
+        if rid:
+            pairs.append((m.id, rid))
+    if not pairs:
+        return {}
+
+    target_ids = list({rid for _, rid in pairs})
+    try:
+        targets = await fetch_reply_targets(db, target_ids)
+    except Exception:
+        # Column missing or schema mismatch — degrade gracefully. The
+        # replying row still serializes (reply_to_message_id stays as
+        # the raw pointer); the UI just falls back to the stub state
+        # until the target's day hydrates.
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for replier_id, target_id in pairs:
+        target = targets.get(target_id)
+        if target is not None:
+            out[replier_id] = serialize_reply_target(target)
+    return out

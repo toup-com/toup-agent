@@ -177,6 +177,13 @@ async def messages_since(
         )
         return JSONResponse(content=[])
 
+    # Bulk-resolve reply targets so each replying row can render its
+    # quoted card on first paint — see api/day_chats.py for rationale.
+    from app.agent.reply_quote import resolve_reply_targets_for_serialization
+    reply_targets = await resolve_reply_targets_for_serialization(
+        db, [msg for msg, _ in rows]
+    )
+
     return JSONResponse(content=[
         {
             "id": msg.id,
@@ -188,6 +195,7 @@ async def messages_since(
             "attachments": _serialize_attachments(msg),
             "media": _serialize_media(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
+            "reply_to": reply_targets.get(msg.id),
         }
         for msg, channel in rows
     ])

@@ -655,7 +655,12 @@ async def get_chat_history(
     
     result = await db.execute(query)
     messages = result.scalars().all()
-    
+
+    # Bulk-resolve reply targets so the frontend's quoted card paints
+    # immediately. Same pattern as api/day_chats.py and api/sessions.py.
+    from app.agent.reply_quote import resolve_reply_targets_for_serialization
+    reply_targets = await resolve_reply_targets_for_serialization(db, messages)
+
     return [
         ChatMessageResponse(
             id=msg.id,
@@ -666,7 +671,9 @@ async def get_chat_history(
             tokens_completion=msg.tokens_completion,
             model_used=msg.model_used,
             memories_retrieved=json.loads(msg.memories_retrieved_json) if msg.memories_retrieved_json else None,
-            processing_time_ms=msg.processing_time_ms
+            processing_time_ms=msg.processing_time_ms,
+            reply_to_message_id=getattr(msg, "reply_to_message_id", None),
+            reply_to=reply_targets.get(msg.id),
         )
         for msg in messages
     ]
