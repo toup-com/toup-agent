@@ -275,6 +275,15 @@ async def init_db():
         # interpreted as DEFAULT_NOTIFICATION_PREFERENCES by the
         # account preferences endpoint.
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_preferences JSONB",
+        # Email verification (alembic 055). Mirrored here because the
+        # agent's boot path runs init_db() but NOT alembic upgrade —
+        # without these ALTERs, every endpoint that loads a User row
+        # 500s with "column users.email_verified_at does not exist"
+        # the moment an agent is rolled to a build that references the
+        # new column on the ORM model. Self-healing on next boot.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_token VARCHAR(64)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_sent_at TIMESTAMP",
         # ── Agent configs ──
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_mode VARCHAR(20) DEFAULT 'manual'",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS google_api_key TEXT",
