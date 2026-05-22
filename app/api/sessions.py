@@ -65,18 +65,24 @@ async def _get_agent_proxy_info(
 async def _proxy_sessions(
     agent_url: str, agent_api_key: str, path: str, params: Optional[dict] = None
 ):
-    """Proxy a sessions request to the VPS agent."""
+    """Proxy a sessions request to the VPS agent.
+
+    TKT-LAT-007: uses the shared agent_http client.
+    """
+    from app.services.agent_http import get_agent_http_client
+
     url = f"{agent_url}/api/sessions/{path}" if path else f"{agent_url}/api/sessions"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                url,
-                headers={"X-Agent-Key": agent_api_key},
-                params=params or {},
-            )
-            if resp.status_code == 200:
-                return resp.json()
-            logger.warning("Agent sessions proxy %s returned %s", url, resp.status_code)
+        client = get_agent_http_client()
+        resp = await client.get(
+            url,
+            headers={"X-Agent-Key": agent_api_key},
+            params=params or {},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning("Agent sessions proxy %s returned %s", url, resp.status_code)
     except Exception as e:
         logger.warning("Agent sessions proxy %s failed: %s", url, e)
     return None

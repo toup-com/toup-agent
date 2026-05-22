@@ -110,6 +110,29 @@ def _is_at_head(connection: Connection) -> bool:
         return False
 
 
+def _is_head_invocation() -> bool:
+    """True only when alembic was invoked with target == 'head'.
+
+    Migration tests (and any programmatic caller that wants to advance
+    to a specific revision) use `command.upgrade(cfg, "050")` — those
+    MUST NOT short-circuit, even if the DB happens to be at the
+    script-directory head. We're stricter than `current_heads ==
+    script_heads` for exactly that reason: skip only when the user
+    actually asked for "head". CLI `alembic upgrade head` sets
+    `config.cmd_opts.revision = "head"`. Programmatic
+    `command.upgrade(cfg, "050")` leaves `cmd_opts` as None or the
+    revision string the caller passed.
+    """
+    try:
+        cmd_opts = getattr(config, "cmd_opts", None)
+        if cmd_opts is None:
+            return False
+        target = getattr(cmd_opts, "revision", None)
+        return target in ("head", "heads")
+    except Exception:
+        return False
+
+
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode using synchronous driver."""
     url = config.get_main_option("sqlalchemy.url")
@@ -120,8 +143,14 @@ def run_migrations_online() -> None:
         "LAT_SKIP_NOOP_MIGRATIONS", _LAT016_SKIP_DEFAULT
     ).strip().lower() in ("1", "true", "yes", "on")
 
+    # Only consider skipping when (a) the operator hasn't disabled the
+    # optimization AND (b) alembic was invoked with target == "head".
+    # The second guard prevents migration tests (`command.upgrade(cfg,
+    # "050")`) from being silently no-op'd.
+    can_skip = skip_enabled and _is_head_invocation()
+
     with connectable.connect() as connection:
-        if skip_enabled:
+        if can_skip:
             t0 = time.monotonic()
             at_head = _is_at_head(connection)
             elapsed_ms = int((time.monotonic() - t0) * 1000)

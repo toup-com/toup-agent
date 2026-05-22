@@ -72,21 +72,29 @@ async def _get_agent_proxy_info(user_id: str, db: AsyncSession) -> Optional[Tupl
 async def _proxy_messages_since(
     agent_url: str, agent_api_key: str, message_id: str, limit: int
 ):
-    """Proxy a messages-since request to the VPS agent."""
+    """Proxy a messages-since request to the VPS agent.
+
+    TKT-LAT-007: uses the shared agent_http client (module-level
+    AsyncClient) so the chat-poll backstop — which fires every 12 s
+    during a streaming turn — doesn't pay a TLS handshake per tick.
+    """
+    from app.services.agent_http import get_agent_http_client
+
     url = f"{agent_url}/api/messages/since/{message_id}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                url,
-                headers={"X-Agent-Key": agent_api_key},
-                params={"limit": limit},
-            )
-            if resp.status_code == 200:
-                return resp.json()
-            # 404 propagates as None → caller returns 404 below; we
-            # don't pretend the message exists by returning [].
-            if resp.status_code == 404:
-                return "404"
+        client = get_agent_http_client()
+        resp = await client.get(
+            url,
+            headers={"X-Agent-Key": agent_api_key},
+            params={"limit": limit},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        # 404 propagates as None → caller returns 404 below; we
+        # don't pretend the message exists by returning [].
+        if resp.status_code == 404:
+            return "404"
     except Exception as e:
         logger.warning("messages_recover proxy %s failed: %s", url, e)
     return None

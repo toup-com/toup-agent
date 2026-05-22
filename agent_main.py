@@ -926,20 +926,44 @@ async def lifespan(app: FastAPI):
             # strips every connector tool from the agent — and we lost
             # a day of "no Gmail tool" once because the print() above
             # only showed the exception's str(), not its type or stack.
-            try:
-                await mcp_tools_cache.refresh()
-                print(
-                    f"🔗 MCP connected ({len(mcp_tools_cache.tools)} tools) "
-                    f"at {mcp_url}: {mcp_tools_cache.tools}"
+            #
+            # TKT-LAT-017: when `agent_defer_boot_init` is on, schedule
+            # this refresh as a background task instead of awaiting it.
+            # uvicorn can then start serving immediately; the periodic
+            # refresh task (60-s loop) covers retry if this one fails.
+            # The wiring of tool_executor.mcp_* below is fine to do
+            # against an empty cache — the executor reads cache.tools
+            # at call time, not at wire time, so the first chat turn
+            # that lands before the refresh completes simply sees an
+            # empty MCP tool list (same observable behavior as a slow
+            # MCP discovery on the old blocking path).
+            async def _boot_refresh_mcp() -> None:
+                import time as _t
+                _t0 = _t.monotonic()
+                try:
+                    await mcp_tools_cache.refresh()
+                    _ms = int((_t.monotonic() - _t0) * 1000)
+                    print(
+                        f"🔗 MCP connected ({len(mcp_tools_cache.tools)} tools) "
+                        f"at {mcp_url}: {mcp_tools_cache.tools} "
+                        f"[PERF] boot_mcp_refresh_ms={_ms}"
+                    )
+                except Exception as e:
+                    import traceback
+                    print(
+                        f"⚠️ MCP tool discovery failed at {mcp_url} "
+                        f"({type(e).__name__}: {e}) — connector tools will be "
+                        f"unavailable until next refresh succeeds:\n"
+                        f"{traceback.format_exc()}"
+                    )
+
+            if settings.agent_defer_boot_init:
+                asyncio.create_task(
+                    _boot_refresh_mcp(), name="lat017-mcp-refresh"
                 )
-            except Exception as e:
-                import traceback
-                print(
-                    f"⚠️ MCP tool discovery failed at {mcp_url} "
-                    f"({type(e).__name__}: {e}) — connector tools will be "
-                    f"unavailable until next refresh succeeds:\n"
-                    f"{traceback.format_exc()}"
-                )
+                print("[PERF] boot_deferred=mcp_refresh")
+            else:
+                await _boot_refresh_mcp()
 
             # Wire the cache into the executor BEFORE starting the
             # periodic loop — the loop refreshes the cache, which the
@@ -1109,8 +1133,33 @@ async def lifespan(app: FastAPI):
                 auth_token=settings.toup_token,
                 tool_executor=tool_executor,
             )
-            await tunnel_client.start()
-            print("🔗 Platform tunnel connecting...")
+            # TKT-LAT-017: tunnel start sets up a WS to the platform
+            # for config sync + chat relay. The first chat request does
+            # NOT require it (chat lands via the agent's own /ws/chat),
+            # so we can defer the start to a background task and let
+            # uvicorn begin serving immediately. The tunnel reconnects
+            # itself on connection drops, so any race during boot is
+            # handled by its own reconnect loop.
+            async def _boot_start_tunnel() -> None:
+                import time as _t
+                _t0 = _t.monotonic()
+                try:
+                    await tunnel_client.start()
+                    _ms = int((_t.monotonic() - _t0) * 1000)
+                    print(
+                        f"🔗 Platform tunnel connecting... "
+                        f"[PERF] boot_tunnel_start_ms={_ms}"
+                    )
+                except Exception as e:
+                    print(f"⚠️ Platform tunnel not available: {e}")
+
+            if settings.agent_defer_boot_init:
+                asyncio.create_task(
+                    _boot_start_tunnel(), name="lat017-tunnel-start"
+                )
+                print("[PERF] boot_deferred=tunnel_start")
+            else:
+                await _boot_start_tunnel()
         except Exception as e:
             print(f"⚠️ Platform tunnel not available: {e}")
     elif settings.user_id and not settings.toup_token:

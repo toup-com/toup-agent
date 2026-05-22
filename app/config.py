@@ -143,6 +143,29 @@ class Settings(BaseSettings):
     # original "user OWNS this orchestration" semantics are preserved
     # until product signoff on the model-quality trade.
     toup_code_supervisor_use_haiku: bool = False
+    # TKT-LAT-017: defer non-essential agent-boot init (MCP tool cache
+    # refresh + platform tunnel start) to background tasks so uvicorn
+    # can begin serving the first request ~1–3 s sooner. Both targets
+    # already have "errors silently swallowed, retry handles it"
+    # semantics (mcp_tools_cache has a 60-s periodic refresh loop;
+    # tunnel_client.start() is wrapped in try/except and the first
+    # chat request doesn't need it). Default ON because the win is
+    # real and the surface is safe; operators can disable by flipping
+    # to False if a regression surfaces.
+    agent_defer_boot_init: bool = True
+    # TKT-LAT-003: when the WS chat proxy can't find an active agent
+    # for the user, the current behavior retries 6 × 5 s = 30 s
+    # before giving up — visible to the user as a 30-second
+    # "Connecting…" spinner. When this flag is ON, the proxy
+    # fast-fails on the *first* lookup with WS close code 4503
+    # "agent_starting" so the frontend can immediately render a
+    # "Waking your agent…" UI and either retry the WS connection or
+    # poll a status endpoint. Default OFF until the frontend ships
+    # the corresponding handler — flipping ON without that work
+    # would just turn a 30-s spinner into a hard error. Observability
+    # log line `[PERF] ws_proxy_agent_wait_ms=…` fires regardless of
+    # the flag so we can see real-world wait distributions.
+    agent_ws_proxy_fast_fail: bool = False
     # Storage backend for generated files. "local" writes to {agent_workspace_dir}/generated/.
     # "s3" is stubbed for a follow-up PR.
     files_storage_backend: str = "local"

@@ -151,13 +151,25 @@ async def _get_agent_proxy_info(user_id: str, db: AsyncSession) -> Optional[Tupl
 
 
 async def _proxy_day_chats(agent_url: str, agent_api_key: str, path: str = "", params: dict = None):
-    """Proxy a day-chats request to the VPS agent."""
+    """Proxy a day-chats request to the VPS agent.
+
+    TKT-LAT-007: uses the shared agent_http client so calendar opens
+    (which fire many day-chat hops on the chat page) don't pay a
+    TLS handshake per request.
+    """
+    from app.services.agent_http import get_agent_http_client
+
     url = f"{agent_url}/api/day-chats/{path}" if path else f"{agent_url}/api/day-chats"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers={"X-Agent-Key": agent_api_key}, params=params or {})
-            if resp.status_code == 200:
-                return resp.json()
+        client = get_agent_http_client()
+        resp = await client.get(
+            url,
+            headers={"X-Agent-Key": agent_api_key},
+            params=params or {},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
     except Exception as e:
         logger.warning("Day-chats proxy %s failed: %s", url, e)
     return None

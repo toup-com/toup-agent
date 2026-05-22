@@ -49,18 +49,24 @@ async def _proxy_stats(
     path: str,
     params: Optional[dict] = None,
 ) -> Optional[dict | list]:
-    """Proxy a stats request to the VPS agent. Returns parsed JSON or None on failure."""
+    """Proxy a stats request to the VPS agent. Returns parsed JSON or None on failure.
+
+    TKT-LAT-007: shared agent_http client.
+    """
+    from app.services.agent_http import get_agent_http_client
+
     url = f"{agent_url}/api/stats/{path}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                url,
-                headers={"X-Agent-Key": agent_api_key},
-                params=params or {},
-            )
-            if resp.status_code == 200:
-                return resp.json()
-            logger.warning("Agent stats proxy %s returned %s", url, resp.status_code)
+        client = get_agent_http_client()
+        resp = await client.get(
+            url,
+            headers={"X-Agent-Key": agent_api_key},
+            params=params or {},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning("Agent stats proxy %s returned %s", url, resp.status_code)
     except Exception as e:
         logger.warning("Agent stats proxy %s failed: %s", url, e)
     return None
