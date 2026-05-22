@@ -511,20 +511,52 @@ class RoutineRunner:
         trigger, trigger_tag = _build_trigger_for_routine(routine, tz)
         if trigger is None:
             if trigger_tag == "past_at":
-                logger.info(
-                    "[routine_runner] past_at routine_id=%s kind=%s "
-                    "schedule_at=%s — already delivered or expired, skipping",
+                # CATCH-UP semantics for one-shot reminders that never
+                # fired. Without this, a reminder scheduled for "in 2
+                # minutes" silently drops if the agent was restarting
+                # at that exact moment (mig 042 self-heal, deploy, etc.)
+                # — user-visible: the reminder never appears in chat,
+                # last_status stays 'never_run'. Bug reported on
+                # 2026-05-21 (agent rolled at 01:35 UTC, reminder was
+                # scheduled for 01:28 UTC). Now: if the row was never
+                # delivered (last_run_at IS NULL), fire it as soon as
+                # the scheduler is ready, in ~5s. APScheduler's
+                # DateTrigger accepts run_date in the immediate future;
+                # the fire path is otherwise identical, so
+                # auto_disable_after_fire still runs and one-shots
+                # don't re-fire.
+                already_fired = getattr(routine, "last_run_at", None) is not None
+                if routine.kind == "reminder" and not already_fired:
+                    catch_up_at = datetime.now(timezone.utc) + timedelta(seconds=5)
+                    trigger = DateTrigger(run_date=catch_up_at)
+                    trigger_tag = "catch_up"
+                    logger.warning(
+                        "[routine_runner] catch_up routine_id=%s "
+                        "kind=reminder original_schedule_at=%s "
+                        "rescheduled_to=%s last_run_at=None — never "
+                        "delivered, firing immediately so the user sees it",
+                        routine.id,
+                        getattr(routine, "schedule_at", None),
+                        catch_up_at.isoformat(),
+                    )
+                else:
+                    logger.info(
+                        "[routine_runner] past_at routine_id=%s kind=%s "
+                        "schedule_at=%s last_run_at=%s — already delivered "
+                        "or non-reminder one-shot, skipping",
+                        routine.id, routine.kind,
+                        getattr(routine, "schedule_at", None),
+                        getattr(routine, "last_run_at", None),
+                    )
+                    return "past_at"
+            else:
+                logger.warning(
+                    "[routine_runner] invalid_schedule routine_id=%s kind=%s "
+                    "schedule_kind=%s — skipped",
                     routine.id, routine.kind,
-                    getattr(routine, "schedule_at", None),
+                    getattr(routine, "schedule_kind", None) or "cron",
                 )
-                return "past_at"
-            logger.warning(
-                "[routine_runner] invalid_schedule routine_id=%s kind=%s "
-                "schedule_kind=%s — skipped",
-                routine.id, routine.kind,
-                getattr(routine, "schedule_kind", None) or "cron",
-            )
-            return "invalid_cron"
+                return "invalid_cron"
 
         # job_id == routine_id keeps replace_existing idempotent and makes
         # reload_routine() a single add_job call.

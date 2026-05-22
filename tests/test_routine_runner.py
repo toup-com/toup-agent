@@ -336,3 +336,168 @@ async def test_coexistence_routine_runner_and_cron_service():
     cs_gaps = [(cs_fires[i + 1] - cs_fires[i]).total_seconds() for i in range(len(cs_fires) - 1)]
     assert all(g < 2.0 for g in rr_gaps), f"RoutineRunner blocked: gaps={rr_gaps}"
     assert all(g < 2.0 for g in cs_gaps), f"CronService blocked: gaps={cs_gaps}"
+
+
+# ── Catch-up: never-fired one-shot reminders whose schedule_at is in the past ──
+
+@pytest.mark.asyncio
+async def test_past_reminder_never_fired_catches_up_immediately():
+    """A `kind=reminder` row with schedule_kind='at', schedule_at in the
+    past, and last_run_at=NULL is a never-delivered one-shot. Without
+    catch-up the user never sees the reminder — the runner silently
+    drops it as "past_at, already delivered or expired". Production bug
+    reported 2026-05-21: agent restarted (image upgrade) at 01:35 UTC
+    while the reminder was scheduled for 01:28 UTC; the reminder stayed
+    `last_status='never_run'` forever.
+
+    Expected: _register_trigger_for reschedules the routine for
+    ~now+5s with a DateTrigger so the user gets the (slightly-late)
+    reminder. auto_disable_after_fire keeps the one-shot semantic
+    intact — the rescheduled fire still won't repeat.
+    """
+    from app.agent.routines import RoutineRunner
+    from app.db import async_session_maker
+    from app.db.models import Routine
+
+    user_id = await _make_user(timezone="UTC")
+
+    # Seed a reminder scheduled 2 minutes in the past, never fired.
+    rid = str(uuid.uuid4())
+    past_at = datetime.utcnow() - timedelta(minutes=2)
+    async with async_session_maker() as db:
+        db.add(
+            Routine(
+                id=rid,
+                user_id=user_id,
+                kind="reminder",
+                enabled=True,
+                schedule_kind="at",
+                schedule_at=past_at,
+                schedule_cron_local="* * * * *",  # placeholder, ignored for kind=at
+                reminder_text="catch-up smoke test",
+                auto_disable_after_fire=True,
+                last_status="never_run",
+                last_run_at=None,
+            )
+        )
+        await db.commit()
+
+    # Enable the reminder kind so _load_enabled_routines doesn't filter it.
+    from app.config import settings
+    settings.routines_reminders_enabled = True
+
+    runner = RoutineRunner()
+    await runner.start()
+    try:
+        # After start(), the catch-up branch should have registered the
+        # routine with APScheduler instead of dropping it.
+        job = runner.scheduler.get_job(rid)
+        assert job is not None, (
+            "past-scheduled reminder with last_run_at=None was silently "
+            "dropped — catch-up branch didn't fire"
+        )
+        # The reschedule lands ~5s from now. Wide window so test isn't
+        # flaky under CI load.
+        now = datetime.utcnow().replace(tzinfo=job.next_run_time.tzinfo)
+        delta = (job.next_run_time - now).total_seconds()
+        assert -2 < delta < 30, (
+            f"catch-up fire was scheduled outside expected window: "
+            f"next_run_time={job.next_run_time} now={now} delta={delta:.1f}s"
+        )
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.asyncio
+async def test_past_reminder_already_fired_is_NOT_re_caught_up():
+    """If the reminder DID fire previously (last_run_at IS NOT NULL),
+    catch-up MUST NOT re-fire it. Otherwise every restart would re-send
+    every old one-shot — spam in chat / Telegram / WhatsApp.
+    """
+    from app.agent.routines import RoutineRunner
+    from app.db import async_session_maker
+    from app.db.models import Routine
+
+    user_id = await _make_user(timezone="UTC")
+
+    rid = str(uuid.uuid4())
+    past_at = datetime.utcnow() - timedelta(hours=2)
+    async with async_session_maker() as db:
+        db.add(
+            Routine(
+                id=rid,
+                user_id=user_id,
+                kind="reminder",
+                enabled=True,
+                schedule_kind="at",
+                schedule_at=past_at,
+                schedule_cron_local="* * * * *",
+                reminder_text="already delivered",
+                auto_disable_after_fire=True,
+                last_status="success",
+                last_run_at=past_at,  # already fired at scheduled time
+            )
+        )
+        await db.commit()
+
+    # Enable the reminder kind so _load_enabled_routines doesn't filter it.
+    from app.config import settings
+    settings.routines_reminders_enabled = True
+
+    runner = RoutineRunner()
+    await runner.start()
+    try:
+        # Already delivered → silently skipped, no APScheduler job.
+        assert runner.scheduler.get_job(rid) is None, (
+            "already-delivered reminder got re-registered — would re-spam the user"
+        )
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.asyncio
+async def test_past_non_reminder_at_routine_is_NOT_caught_up():
+    """Catch-up is reminder-specific. A past `at` schedule for any other
+    kind (email_briefing, agent_task, etc.) keeps the old skip behavior
+    — those aren't user-visible "ping me" one-shots and re-firing
+    them after a restart could be expensive (LLM calls) or wrong.
+    """
+    from app.agent.routines import RoutineRunner
+    from app.db import async_session_maker
+    from app.db.models import Routine
+
+    user_id = await _make_user(timezone="UTC")
+
+    rid = str(uuid.uuid4())
+    past_at = datetime.utcnow() - timedelta(minutes=2)
+    async with async_session_maker() as db:
+        db.add(
+            Routine(
+                id=rid,
+                user_id=user_id,
+                kind="agent_task",  # NOT reminder
+                enabled=True,
+                schedule_kind="at",
+                schedule_at=past_at,
+                schedule_cron_local="* * * * *",
+                prompt_text="some task",
+                last_status="never_run",
+                last_run_at=None,
+            )
+        )
+        await db.commit()
+
+    # Enable the reminder kind so _load_enabled_routines doesn't filter it.
+    from app.config import settings
+    settings.routines_reminders_enabled = True
+
+    runner = RoutineRunner()
+    await runner.start()
+    try:
+        # Past `at` for non-reminder is still skipped.
+        assert runner.scheduler.get_job(rid) is None, (
+            "past-scheduled agent_task got caught up — catch-up should "
+            "only apply to kind=reminder one-shots"
+        )
+    finally:
+        await runner.stop()
