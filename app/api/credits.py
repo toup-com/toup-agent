@@ -198,6 +198,72 @@ async def list_plans(db: AsyncSession = Depends(get_db)) -> PlansResponse:
     ])
 
 
+# ── Stripe Checkout for credit-tier upgrade ───────────────────────
+
+
+class CreditCheckoutResponse(BaseModel):
+    url: str
+
+
+@billing_router.post("/credit-checkout/{plan_id}", response_model=CreditCheckoutResponse)
+async def create_credit_checkout(
+    plan_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CreditCheckoutResponse:
+    """Create a Stripe Checkout Session for a credit-tier subscription.
+
+    Distinct from the legacy /billing/create-subscription (which is for
+    the old LLM Bundle): this endpoint mints the checkout for the four
+    new credit tiers (starter/builder/pro/elite). The Stripe price id
+    comes from `subscription_plans.stripe_price_id` which the boot-
+    time `sync_subscription_plan_stripe_ids` populates from env vars
+    `STRIPE_PRICE_ID_{TIER}`.
+
+    Returns 503 with a clear, actionable error when the tier's price
+    id isn't configured — operators see "set STRIPE_PRICE_ID_X in
+    Railway" instead of a cryptic Stripe error.
+    """
+    from app.config import settings as _settings
+    from app.api.billing import _ensure_stripe_customer
+    from app.services.stripe_service import create_credit_checkout_session
+
+    if plan_id == "free":
+        raise HTTPException(400, "The free tier doesn't require checkout.")
+
+    plan = await db.get(SubscriptionPlan, plan_id)
+    if plan is None:
+        raise HTTPException(404, f"Unknown plan: {plan_id!r}")
+    if not plan.stripe_price_id:
+        raise HTTPException(
+            503,
+            f"{plan.display_name} isn't available for checkout yet — "
+            f"Stripe price not configured. Set "
+            f"STRIPE_PRICE_ID_{plan_id.upper()} in Railway env "
+            f"and redeploy.",
+        )
+    if not _settings.stripe_secret_key:
+        raise HTTPException(503, "Stripe secret key not configured on platform.")
+
+    user_result = await db.execute(select(User).where(User.id == current_user.id))
+    user = user_result.scalar_one()
+    customer_id = await _ensure_stripe_customer(user, db)
+
+    base_url = (_settings.app_public_base_url or "https://toup.ai").rstrip("/")
+    try:
+        session = create_credit_checkout_session(
+            customer_id=customer_id,
+            price_id=plan.stripe_price_id,
+            plan_id=plan_id,
+            user_id=current_user.id,
+            success_url=f"{base_url}/account?upgrade=success&plan={plan_id}",
+            cancel_url=f"{base_url}/pricing?upgrade=cancelled",
+        )
+    except Exception as e:
+        raise HTTPException(502, f"Stripe checkout creation failed: {e}")
+    return CreditCheckoutResponse(url=session["url"])
+
+
 # ── Admin endpoints ─────────────────────────────────────────────────
 
 
@@ -219,6 +285,88 @@ async def admin_set_plan_stripe_price_id(
     plan.stripe_price_id = payload.stripe_price_id.strip()
     await db.commit()
     return {"plan_id": plan.id, "stripe_price_id": plan.stripe_price_id}
+
+
+class StripePriceIdBulkUpdate(BaseModel):
+    """Bulk update — set all four credit-tier Stripe Price IDs at once.
+
+    Useful for operators who want to wire up Stripe via a single POST
+    without flipping Railway env vars and waiting for a redeploy.
+    Empty strings are ignored (preserves existing value).
+    """
+    starter: Optional[str] = None
+    builder: Optional[str] = None
+    pro: Optional[str] = None
+    elite: Optional[str] = None
+
+
+@admin_router.post("/plans/stripe-price-ids/bulk")
+async def admin_set_plan_stripe_price_ids_bulk(
+    payload: StripePriceIdBulkUpdate,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Set all credit-tier price IDs in one call. Idempotent; empty
+    values preserved. Returns the resulting {tier_id: price_id} map."""
+    updates = {
+        "starter": (payload.starter or "").strip(),
+        "builder": (payload.builder or "").strip(),
+        "pro":     (payload.pro or "").strip(),
+        "elite":   (payload.elite or "").strip(),
+    }
+    applied: dict[str, str] = {}
+    for tier_id, price_id in updates.items():
+        if not price_id:
+            continue
+        plan = await db.get(SubscriptionPlan, tier_id)
+        if plan is None:
+            continue
+        plan.stripe_price_id = price_id
+        applied[tier_id] = price_id
+    if applied:
+        await db.commit()
+    # Return the FULL set so caller sees what's now in the DB.
+    rows = (await db.execute(
+        select(SubscriptionPlan).where(
+            SubscriptionPlan.id.in_(["starter", "builder", "pro", "elite"])
+        )
+    )).scalars().all()
+    return {
+        "applied": applied,
+        "current": {r.id: r.stripe_price_id for r in rows},
+    }
+
+
+class CreditBalanceRehydrate(BaseModel):
+    user_id: str
+
+
+@admin_router.post("/balance/rehydrate")
+async def admin_rehydrate_balance(
+    payload: CreditBalanceRehydrate,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Force-create a CreditBalance row for a user.
+
+    Useful for diagnosing "credits aren't deducting" — users created
+    before mig 053 don't have a balance row, and the
+    `credit_service.get_or_create_balance` is called lazily on first
+    deduction. If the deduction hook silently fails (try/except swallow),
+    the row never gets created and subsequent reads show zero usage.
+    This endpoint forces creation so the operator can verify writes.
+    """
+    target = await db.get(User, payload.user_id)
+    if target is None:
+        raise HTTPException(404, f"user {payload.user_id!r} not found")
+    balance = await credit_service.get_or_create_balance(db, payload.user_id)
+    await db.commit()
+    return {
+        "user_id": target.id,
+        "plan_id": balance.plan_id,
+        "message_credits_remaining": float(balance.message_credits_remaining),
+        "integration_credits_remaining": float(balance.integration_credits_remaining),
+    }
 
 
 class FlatFeeUpdate(BaseModel):

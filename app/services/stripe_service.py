@@ -289,6 +289,47 @@ def create_checkout_session(
     return {"id": session.id, "url": session.url, "customer": session.customer}
 
 
+def create_credit_checkout_session(
+    *,
+    customer_id: str,
+    price_id: str,
+    plan_id: str,
+    user_id: str,
+    success_url: str,
+    cancel_url: str,
+) -> dict:
+    """Create a Stripe Checkout Session for a credit-system tier subscription.
+
+    Distinct from `create_checkout_session` (which is VPS-specific) — this
+    one carries metadata.type='credit_subscription' so the
+    customer.subscription.updated webhook in api/vps.py can identify it
+    and call credit_service.apply_plan_change to flip the user's tier.
+    """
+    client = _get_stripe_client()
+    params: dict = {
+        "mode": "subscription",
+        "customer": customer_id,
+        "line_items": [{"price": price_id, "quantity": 1}],
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "metadata": {
+            "user_id": user_id,
+            "type": "credit_subscription",
+            "plan_id": plan_id,
+        },
+        "subscription_data": {
+            "metadata": {
+                "user_id": user_id,
+                "type": "credit_subscription",
+                "plan_id": plan_id,
+            }
+        },
+        "allow_promotion_codes": True,
+    }
+    session = client.checkout.sessions.create(params=params)
+    return {"id": session.id, "url": session.url}
+
+
 def get_stripe_price_for_plan(plan_id: str) -> str:
     """Return the Stripe Price ID for a VPS plan."""
     attr = PLAN_PRICE_MAP.get(plan_id)

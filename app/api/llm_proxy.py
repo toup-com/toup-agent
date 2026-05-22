@@ -262,16 +262,26 @@ async def _log_event(
             )
             from app.db.models import LEDGER_CHAT_MESSAGE
             credits = tokens_to_credits(model, input_tokens, output_tokens)
-            await credit_service.try_charge(
+            result = await credit_service.try_charge(
                 db, user_id, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, credits,
                 idempotency_key=event.id, event_id=event.id, model=model,
                 provider=provider, input_tokens=input_tokens, output_tokens=output_tokens,
                 underlying_cost_cents=cost_cents,
                 metadata={"endpoint": endpoint, "operation_type": operation_type or "user"},
             )
-        except Exception as e:
-            logger.warning("[credits] try_charge failed for user=%s event=%s: %s",
-                           user_id[:8], event.id[:8], e)
+            logger.info(
+                "[credits] deducted user=%s model=%s tokens=%d/%d credits=%s "
+                "balance_after=%s idempotent=%s",
+                user_id[:8], model, input_tokens, output_tokens, credits,
+                result.balance_after, result.idempotent_hit,
+            )
+        except Exception:
+            # Full stack trace so we can debug silent deduction failures.
+            # Earlier warning-only log made schema mismatches invisible.
+            logger.exception(
+                "[credits] try_charge failed user=%s event=%s model=%s tokens=%d/%d",
+                user_id[:8], event.id[:8], model, input_tokens, output_tokens,
+            )
 
     await db.commit()
     # Only invalidate the user-budget cache when a user-attributable event landed.
