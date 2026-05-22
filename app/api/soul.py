@@ -306,23 +306,29 @@ async def _sync_soul_to_vps(
 
     Returns True on success, False on failure. Never raises.
     """
-    import httpx
+    # TKT-LAT-007 (wave 3): shared agent_http client.
+    from app.services.agent_http import get_agent_http_client
     url = f"{agent_url}/api/soul/sync"
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.put(url, json={
+        client = get_agent_http_client()
+        resp = await client.put(
+            url,
+            json={
                 "user_id": user_id,
                 "name": name,
                 "compiled_text": compiled_text,
                 "deactivate_agent_soul_memories": deactivate_agent_soul_memories,
                 "agent_config_updates": agent_config_updates,
-            }, headers={"X-Agent-Key": agent_api_key})
-            if resp.status_code == 200:
-                logger.info(f"[SOUL] Synced soul to VPS at {agent_url}")
-                return True
-            else:
-                logger.error(f"[SOUL] VPS soul sync failed: {resp.status_code} {resp.text}")
-                return False
+            },
+            headers={"X-Agent-Key": agent_api_key},
+            timeout=15.0,
+        )
+        if resp.status_code == 200:
+            logger.info(f"[SOUL] Synced soul to VPS at {agent_url}")
+            return True
+        else:
+            logger.error(f"[SOUL] VPS soul sync failed: {resp.status_code} {resp.text}")
+            return False
     except Exception as e:
         logger.error(f"[SOUL] VPS soul sync error: {e}")
         return False

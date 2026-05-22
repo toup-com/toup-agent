@@ -476,19 +476,23 @@ async def _vps_api(
     Uses X-Agent-Key header — VPS auth.py resolves to settings.user_id.
     """
     url = f"{agent_url}{path}"
+    # TKT-LAT-007 (wave 3): shared agent_http client.
+    from app.services.agent_http import get_agent_http_client
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            if method == "GET":
-                resp = await client.get(
-                    url, headers={"X-Agent-Key": agent_api_key}, params=params or {},
-                )
-            else:
-                resp = await client.post(
-                    url, headers={"X-Agent-Key": agent_api_key}, json=json_body or {},
-                )
-            if resp.status_code == 200:
-                return resp.json()
-            logger.warning("[REALTIME] VPS API %s %s → %s", method, path, resp.status_code)
+        client = get_agent_http_client()
+        if method == "GET":
+            resp = await client.get(
+                url, headers={"X-Agent-Key": agent_api_key},
+                params=params or {}, timeout=15.0,
+            )
+        else:
+            resp = await client.post(
+                url, headers={"X-Agent-Key": agent_api_key},
+                json=json_body or {}, timeout=15.0,
+            )
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning("[REALTIME] VPS API %s %s → %s", method, path, resp.status_code)
     except Exception as e:
         logger.warning("[REALTIME] VPS API %s %s failed: %s", method, path, e)
     return None
@@ -506,15 +510,18 @@ async def _ensure_vps_user(user_id: str):
     vps = await _get_vps_info(user_id)
     if vps:
         agent_url, agent_api_key = vps
+        # TKT-LAT-007 (wave 3): shared agent_http client.
+        from app.services.agent_http import get_agent_http_client
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(
-                    f"{agent_url}/agent/health",
-                    headers={"X-Agent-Key": agent_api_key},
-                )
-                if resp.status_code == 200:
-                    logger.info("[REALTIME] VPS agent healthy for user %s", user_id[:8])
-                    return
+            client = get_agent_http_client()
+            resp = await client.get(
+                f"{agent_url}/agent/health",
+                headers={"X-Agent-Key": agent_api_key},
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                logger.info("[REALTIME] VPS agent healthy for user %s", user_id[:8])
+                return
         except Exception as e:
             logger.warning("[REALTIME] VPS health check failed (non-fatal): %s", e)
 
@@ -911,11 +918,14 @@ async def _finalize_onboarding(user_id: str) -> str:
                             for old_id in id_list:
                                 old_id_val = old_id.get("id", "")
                                 if old_id_val:
-                                    async with httpx.AsyncClient(timeout=10.0) as client:
-                                        await client.delete(
-                                            f"{agent_url}/api/identity/{old_id_val}",
-                                            headers={"X-Agent-Key": agent_api_key},
-                                        )
+                                    # TKT-LAT-007 (wave 3): shared agent_http client.
+                                    from app.services.agent_http import get_agent_http_client
+                                    _id_client = get_agent_http_client()
+                                    await _id_client.delete(
+                                        f"{agent_url}/api/identity/{old_id_val}",
+                                        headers={"X-Agent-Key": agent_api_key},
+                                        timeout=10.0,
+                                    )
 
                     # Create new identity
                     await _vps_api(agent_url, agent_api_key, "POST", "/api/identity", json_body={

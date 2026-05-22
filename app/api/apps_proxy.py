@@ -584,19 +584,22 @@ async def _proxy(
     method: str = "GET", body: Optional[dict] = None,
     timeout: float = 10.0,
 ):
+    """TKT-LAT-007 (wave 3): shared agent_http client; per-call timeout."""
+    from app.services.agent_http import get_agent_http_client
+
     url = f"{agent_url}/api/apps/{path}"
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            headers = {"X-Agent-Key": agent_api_key}
-            if method == "GET":
-                resp = await client.get(url, headers=headers)
-            elif method == "POST":
-                resp = await client.post(url, headers=headers, json=body or {})
-            elif method == "DELETE":
-                resp = await client.delete(url, headers=headers)
-            else:
-                return None
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        client = get_agent_http_client()
+        headers = {"X-Agent-Key": agent_api_key}
+        if method == "GET":
+            resp = await client.get(url, headers=headers, timeout=timeout)
+        elif method == "POST":
+            resp = await client.post(url, headers=headers, json=body or {}, timeout=timeout)
+        elif method == "DELETE":
+            resp = await client.delete(url, headers=headers, timeout=timeout)
+        else:
+            return None
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)
     except Exception as e:
         logger.warning("Apps proxy %s %s failed: %s", method, url, e)
         raise HTTPException(502, "Agent unreachable")
@@ -631,17 +634,20 @@ async def get_server_info(current_user=Depends(get_current_user), db: AsyncSessi
     if not agent_info:
         return JSONResponse(content={"status": "offline"}, status_code=200)
     agent_url, key, _ = agent_info
+    # TKT-LAT-007 (wave 3): shared agent_http client.
+    from app.services.agent_http import get_agent_http_client
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{agent_url}/agent/system",
-                headers={"X-Agent-Key": key},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                data["status"] = "online"
-                data["ip"] = agent_url.replace("http://", "").replace("https://", "").split(":")[0]
-                return JSONResponse(content=data)
+        client = get_agent_http_client()
+        resp = await client.get(
+            f"{agent_url}/agent/system",
+            headers={"X-Agent-Key": key},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            data["status"] = "online"
+            data["ip"] = agent_url.replace("http://", "").replace("https://", "").split(":")[0]
+            return JSONResponse(content=data)
     except Exception as e:
         logger.warning("Server info proxy failed: %s", e)
     return JSONResponse(content={"status": "offline"})
@@ -656,14 +662,17 @@ async def get_capabilities(current_user=Depends(get_current_user), db: AsyncSess
     if not agent_info:
         return JSONResponse(content={"core_tools": [], "skills": [], "total_tools": 0})
     agent_url, key, _ = agent_info
+    # TKT-LAT-007 (wave 3): shared agent_http client.
+    from app.services.agent_http import get_agent_http_client
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{agent_url}/agent/capabilities",
-                headers={"X-Agent-Key": key},
-            )
-            if resp.status_code == 200:
-                return JSONResponse(content=resp.json())
+        client = get_agent_http_client()
+        resp = await client.get(
+            f"{agent_url}/agent/capabilities",
+            headers={"X-Agent-Key": key},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return JSONResponse(content=resp.json())
     except Exception as e:
         logger.warning("Capabilities proxy failed: %s", e)
     return JSONResponse(content={"core_tools": [], "skills": [], "total_tools": 0})
@@ -691,11 +700,13 @@ async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = D
         return JSONResponse(content=[])  # No agent configured
     agent_url, key, _ = agent_info
     url = f"{agent_url}/api/apps/"
+    # TKT-LAT-007 (wave 3): shared agent_http client.
+    from app.services.agent_http import get_agent_http_client
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers={"X-Agent-Key": key})
-            data = _rewrite_app_urls(resp.json())
-            return JSONResponse(content=data, status_code=resp.status_code)
+        client = get_agent_http_client()
+        resp = await client.get(url, headers={"X-Agent-Key": key}, timeout=10.0)
+        data = _rewrite_app_urls(resp.json())
+        return JSONResponse(content=data, status_code=resp.status_code)
     except Exception as e:
         logger.warning("Apps proxy list failed: %s", e)
         return JSONResponse(content=[])  # Return empty list, not 502
@@ -825,10 +836,12 @@ async def preview_proxy(
     if params:
         target += f"?{urlencode(params)}"
 
+    # TKT-LAT-007 (wave 3): shared agent_http client. 120-s timeout per call.
+    from app.services.agent_http import get_agent_http_client
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.get(target, headers={"X-Agent-Key": key})
-            content_type = resp.headers.get("content-type", "text/html")
+        client = get_agent_http_client()
+        resp = await client.get(target, headers={"X-Agent-Key": key}, timeout=120.0)
+        content_type = resp.headers.get("content-type", "text/html")
 
             body = resp.content
 
@@ -1049,11 +1062,13 @@ async def app_chat_proxy(
 async def get_app(app_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     url = f"{agent_url}/api/apps/{app_id}"
+    # TKT-LAT-007 (wave 3): shared agent_http client.
+    from app.services.agent_http import get_agent_http_client
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url, headers={"X-Agent-Key": key})
-            data = _rewrite_app_urls(resp.json())
-            return JSONResponse(content=data, status_code=resp.status_code)
+        client = get_agent_http_client()
+        resp = await client.get(url, headers={"X-Agent-Key": key}, timeout=30.0)
+        data = _rewrite_app_urls(resp.json())
+        return JSONResponse(content=data, status_code=resp.status_code)
     except Exception as e:
         logger.warning("Apps proxy get failed: %s", e)
         raise HTTPException(502, "Agent unreachable")

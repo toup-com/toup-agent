@@ -153,6 +153,17 @@ class Settings(BaseSettings):
     # real and the surface is safe; operators can disable by flipping
     # to False if a regression surfaces.
     agent_defer_boot_init: bool = True
+    # TKT-LAT-017 (wave 3): defer cron + routine scheduler starts to
+    # background tasks. cron_service.start() and routine_runner.start()
+    # each load jobs from DB + warm APScheduler — ~200–800 ms each,
+    # totaling ~400 ms–1.6 s of boot time that the first chat request
+    # doesn't need. Both schedulers fire on a time basis (cron daily
+    # 3 am, routines at user tz-local wake), so a 1–2 s startup delay
+    # never causes a missed fire. trigger_runner is NOT deferred — it
+    # registers webhook handlers + a restart sweep, and an inbound
+    # Gmail push arriving during start() would land in undefined
+    # state. Default ON for the same reason as agent_defer_boot_init.
+    agent_defer_scheduler_init: bool = True
     # TKT-LAT-003: when the WS chat proxy can't find an active agent
     # for the user, the current behavior retries 6 × 5 s = 30 s
     # before giving up — visible to the user as a 30-second

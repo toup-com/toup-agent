@@ -317,10 +317,16 @@ async def get_usage_summary(
         row = result.first()
         if row and row.agent_url and row.agent_api_key:
             url = f"{row.agent_url}/api/llm-setup/usage/summary"
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url, headers={"X-Agent-Key": row.agent_api_key})
-                if resp.status_code == 200:
-                    return resp.json()
+            # TKT-LAT-007 (wave 3): shared agent_http client.
+            from app.services.agent_http import get_agent_http_client
+            client = get_agent_http_client()
+            resp = await client.get(
+                url,
+                headers={"X-Agent-Key": row.agent_api_key},
+                timeout=15.0,
+            )
+            if resp.status_code == 200:
+                return resp.json()
             logger.warning("Agent usage proxy failed, falling back to local DB")
     except Exception as e:
         logger.warning("Agent usage proxy error: %s, falling back to local DB", e)

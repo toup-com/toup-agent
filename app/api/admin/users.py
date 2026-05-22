@@ -351,10 +351,16 @@ async def get_user_usage(
         row = result.first()
         if row and row.agent_url and row.agent_api_key:
             url = f"{row.agent_url}/api/llm-setup/usage/summary"
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                resp = await client.get(url, headers={"X-Agent-Key": row.agent_api_key})
-                if resp.status_code == 200:
-                    return resp.json()
+            # TKT-LAT-007 (wave 3): shared agent_http client.
+            from app.services.agent_http import get_agent_http_client
+            client = get_agent_http_client()
+            resp = await client.get(
+                url,
+                headers={"X-Agent-Key": row.agent_api_key},
+                timeout=8.0,
+            )
+            if resp.status_code == 200:
+                return resp.json()
             logger.warning("Agent usage proxy failed for user %s, falling back to local DB", user_id)
     except Exception as e:
         logger.warning("Agent usage proxy error for user %s: %s", user_id, e)
@@ -679,10 +685,16 @@ async def get_usage_overview(
             row = result.first()
             if row and row.agent_url and row.agent_api_key:
                 url = f"{row.agent_url}/api/llm-setup/usage/summary"
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.get(url, headers={"X-Agent-Key": row.agent_api_key})
-                    if resp.status_code == 200:
-                        agent_data = resp.json()
+                # TKT-LAT-007 (wave 3): shared agent_http client.
+                from app.services.agent_http import get_agent_http_client
+                client = get_agent_http_client()
+                resp = await client.get(
+                    url,
+                    headers={"X-Agent-Key": row.agent_api_key},
+                    timeout=5.0,
+                )
+                if resp.status_code == 200:
+                    agent_data = resp.json()
         except Exception:
             pass
 
@@ -1093,9 +1105,15 @@ async def diagnose_user_usage(
         proxy: dict = {"attempted": True}
         try:
             url = f"{cfg_row.agent_url}/api/llm-setup/usage/summary"
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(url, headers={"X-Agent-Key": cfg_row.agent_api_key})
-                proxy["status_code"] = resp.status_code
+            # TKT-LAT-007 (wave 3): shared agent_http client.
+            from app.services.agent_http import get_agent_http_client
+            client = get_agent_http_client()
+            resp = await client.get(
+                url,
+                headers={"X-Agent-Key": cfg_row.agent_api_key},
+                timeout=5.0,
+            )
+            proxy["status_code"] = resp.status_code
                 if resp.status_code == 200:
                     data = resp.json()
                     summary_30d = next((s for s in data if s.get("period") == "30d"), None) or {}

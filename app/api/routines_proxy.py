@@ -88,14 +88,18 @@ async def _proxy(
     body = await request.body()
     method = request.method.upper()
 
+    # TKT-LAT-007 (wave 3): shared agent_http client.
+    from app.services.agent_http import get_agent_http_client
+
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.request(
-                method, url,
-                params=dict(request.query_params),
-                headers=headers,
-                content=body if body else None,
-            )
+        client = get_agent_http_client()
+        resp = await client.request(
+            method, url,
+            params=dict(request.query_params),
+            headers=headers,
+            content=body if body else None,
+            timeout=30.0,
+        )
     except httpx.RequestError as e:
         logger.warning("routines_proxy %s %s failed: %s", method, url, e)
         raise HTTPException(status_code=502, detail="Agent unreachable")

@@ -61,22 +61,28 @@ async def _proxy_memories(
     agent_url: str, agent_api_key: str, path: str,
     params: Optional[dict] = None, method: str = "GET", body: Optional[dict] = None,
 ):
-    """Proxy a memories request to the VPS agent."""
+    """Proxy a memories request to the VPS agent.
+
+    TKT-LAT-007 (wave 3): shared agent_http client.
+    """
+    from app.services.agent_http import get_agent_http_client
+
     url = f"{agent_url}/api/memories/{path}" if path else f"{agent_url}/api/memories"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            if method == "GET":
-                resp = await client.get(
-                    url, headers={"X-Agent-Key": agent_api_key}, params=params or {},
-                )
-            else:
-                resp = await client.post(
-                    url, headers={"X-Agent-Key": agent_api_key},
-                    params=params or {}, json=body or {},
-                )
-            if resp.status_code == 200:
-                return resp.json()
-            logger.warning("Agent memories proxy %s returned %s", url, resp.status_code)
+        client = get_agent_http_client()
+        if method == "GET":
+            resp = await client.get(
+                url, headers={"X-Agent-Key": agent_api_key},
+                params=params or {}, timeout=10.0,
+            )
+        else:
+            resp = await client.post(
+                url, headers={"X-Agent-Key": agent_api_key},
+                params=params or {}, json=body or {}, timeout=10.0,
+            )
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning("Agent memories proxy %s returned %s", url, resp.status_code)
     except Exception as e:
         logger.warning("Agent memories proxy %s failed: %s", url, e)
     return None

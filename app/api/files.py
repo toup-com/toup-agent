@@ -68,15 +68,22 @@ async def _proxy_file(agent_url: str, agent_api_key: str, path: str, params: dic
     encoding when content-length is absent, which matches the iterator.
     """
     url = f"{agent_url.rstrip('/')}/api/files/{path}"
-    # Shorter timeout — files on the agent are local-disk reads, should be
-    # subsecond. Long timeout just hides transport issues.
-    client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0))
-    req = client.build_request("GET", url, headers={"X-Agent-Key": agent_api_key}, params=params)
+    # TKT-LAT-007 (wave 3): shared agent_http client. Streaming response
+    # is independent of the client lifecycle — we close the response,
+    # not the client (which is shared across call sites).
+    from app.services.agent_http import get_agent_http_client
+
+    client = get_agent_http_client()
+    req = client.build_request(
+        "GET", url,
+        headers={"X-Agent-Key": agent_api_key},
+        params=params,
+        timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
+    )
     resp = await client.send(req, stream=True)
     if resp.status_code >= 400:
         body = await resp.aread()
         await resp.aclose()
-        await client.aclose()
         raise HTTPException(status_code=resp.status_code, detail=body.decode(errors="replace")[:500])
 
     async def _iter():
@@ -85,7 +92,6 @@ async def _proxy_file(agent_url: str, agent_api_key: str, path: str, params: dic
                 yield chunk
         finally:
             await resp.aclose()
-            await client.aclose()
 
     # Only forward content-type and content-disposition. Let chunked transfer
     # encoding handle framing so the browser doesn't wait on a size that may

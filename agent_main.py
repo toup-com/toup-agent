@@ -743,12 +743,31 @@ async def lifespan(app: FastAPI):
             set_webhook_refs(agent_runner, telegram_bot)
 
         # Start cron scheduler
-        try:
-            await cron_service.start()
-            print("⏰ Cron service started")
-        except Exception as e:
-            print(f"⚠️ Could not start cron service: {e}")
-            cron_service = None
+        # TKT-LAT-017 (wave 3): when agent_defer_scheduler_init is ON,
+        # schedule cron_service.start() in the background so uvicorn can
+        # accept the first request without waiting for APScheduler +
+        # _load_jobs_from_db. Cron fires are time-based (daily/hourly),
+        # so a 200-800ms startup delay never misses a tick.
+        async def _boot_start_cron() -> None:
+            import time as _t
+            _t0 = _t.monotonic()
+            try:
+                await cron_service.start()
+                _ms = int((_t.monotonic() - _t0) * 1000)
+                print(f"⏰ Cron service started [PERF] boot_cron_start_ms={_ms}")
+            except Exception as e:
+                print(f"⚠️ Could not start cron service: {e}")
+
+        if settings.agent_defer_scheduler_init:
+            asyncio.create_task(_boot_start_cron(), name="lat017-cron-start")
+            print("[PERF] boot_deferred=cron_start")
+        else:
+            try:
+                await cron_service.start()
+                print("⏰ Cron service started")
+            except Exception as e:
+                print(f"⚠️ Could not start cron service: {e}")
+                cron_service = None
 
         # Routine scheduler — sibling of CronService. Starts AFTER CronService
         # so its DB session pool / async_session_maker proxy is already warm,
@@ -759,12 +778,31 @@ async def lifespan(app: FastAPI):
         # without one; `set_mcp_client()` is called once the client is built.
         # Failure here is non-fatal: routines silently don't run, the rest of
         # the agent boots normally.
+        # TKT-LAT-017 (wave 3): defer routine_runner.start() behind
+        # the same flag. The runner just registers triggers; first
+        # scheduled fire is the user's tz-local wake time — far future.
         try:
             from app.agent.routines import RoutineRunner
             routine_runner = RoutineRunner()
-            await routine_runner.start()
-            set_routines_runner_ref(routine_runner)
-            print("📅 Routine runner started")
+
+            async def _boot_start_routine() -> None:
+                import time as _t
+                _t0 = _t.monotonic()
+                try:
+                    await routine_runner.start()
+                    _ms = int((_t.monotonic() - _t0) * 1000)
+                    print(f"📅 Routine runner started [PERF] boot_routine_start_ms={_ms}")
+                except Exception as e:
+                    print(f"⚠️ Routine runner start failed (post-boot): {e}")
+
+            if settings.agent_defer_scheduler_init:
+                asyncio.create_task(_boot_start_routine(), name="lat017-routine-start")
+                set_routines_runner_ref(routine_runner)
+                print("[PERF] boot_deferred=routine_start")
+            else:
+                await routine_runner.start()
+                set_routines_runner_ref(routine_runner)
+                print("📅 Routine runner started")
         except Exception as e:
             print(f"⚠️ Could not start routine runner: {e}")
             routine_runner = None
