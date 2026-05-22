@@ -129,3 +129,76 @@ def classify_query(query: str) -> Dict:
         result["categories"] = ["learning", "knowledge", "goals"]
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Trivial-query classifier — TKT-LAT-019 (context trim)
+# ---------------------------------------------------------------------------
+#
+# Returns True for messages that don't need the full memory/portrait/entity
+# context to answer well: short greetings, acknowledgments, simple time/date
+# questions, and other low-information utterances. When True, the agent
+# runner skips ~5-15 k tokens of optional context (portrait, hybrid memory
+# search, entities, active tasks) so a one-word answer like "what time is
+# it?" doesn't pay a 11-second tax.
+#
+# Conservative by design — favor false negatives (run with full context)
+# over false positives (drop context that the user needed). If a query
+# might benefit from memory, leave it on the non-trivial path.
+
+# Single-word/short acknowledgments + greetings + thanks. Token-level set
+# because we want exact-match on the trimmed lowercase string.
+_TRIVIAL_EXACT = {
+    "ok", "okay", "k", "kk", "alright", "right", "sure", "yep", "yup", "yeah",
+    "yes", "no", "nope", "nah", "ty", "thx", "thanks", "thank you",
+    "got it", "cool", "nice", "great", "awesome", "perfect", "sweet",
+    "hi", "hello", "hey", "yo", "sup",
+    "good morning", "good afternoon", "good evening", "good night", "gn", "gm",
+    "bye", "goodbye", "cya", "later",
+    "lol", "haha", "ha", "lmao", "wow", "omg",
+}
+
+# Substring patterns for short factual questions that the agent can answer
+# from current context alone (date/time/day of week). These are intentionally
+# narrow — broader "what is X" stays non-trivial because the answer often
+# depends on user memory.
+_TRIVIAL_RE = re.compile(
+    r"^("
+    r"what(?:'s| is)\s+the\s+(?:time|date|day|hour)"
+    r"|what\s+time\s+is\s+it"
+    r"|what\s+day\s+is\s+(?:it|today)"
+    r"|what(?:'s| is)\s+today"
+    r"|tell\s+me\s+the\s+(?:time|date)"
+    r")\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+
+# Hard cap on word count for the trivial classifier to even look at the
+# message. Anything longer almost certainly has enough content to benefit
+# from full context.
+_TRIVIAL_MAX_WORDS = 6
+
+
+def is_trivial_query(text: str) -> bool:
+    """Return True iff the message can be answered without
+    portrait/memory/entity context.
+
+    See module-level comment for the design constraints. Always lossless
+    against the existing behavior: when this returns False, downstream
+    callers run the full context pipeline exactly as before.
+    """
+    if not text:
+        return False
+    stripped = text.strip().lower()
+    # Drop trailing punctuation that doesn't change meaning.
+    stripped = stripped.rstrip("?!.")
+    if not stripped:
+        return False
+    # 1. Exact-string acknowledgments / greetings.
+    if stripped in _TRIVIAL_EXACT:
+        return True
+    # 2. Short, simple time/date questions (regex above already enforces
+    #    structure; the word-count cap is belt-and-suspenders).
+    if len(stripped.split()) <= _TRIVIAL_MAX_WORDS and _TRIVIAL_RE.match(stripped + "?"):
+        return True
+    return False

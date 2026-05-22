@@ -164,6 +164,16 @@ class Settings(BaseSettings):
     # Gmail push arriving during start() would land in undefined
     # state. Default ON for the same reason as agent_defer_boot_init.
     agent_defer_scheduler_init: bool = True
+    # TKT-LAT-019: skip portrait + hybrid_search + entity_search +
+    # active_tasks for trivial queries (greetings, acknowledgments,
+    # simple time/date questions). The 24 548-token "what time is it?"
+    # observation is the motivator — these context blocks are useful
+    # for substantive turns but waste ~5-15 k tokens + 500-2000 ms of
+    # portrait generation on one-word answers. Conservative classifier
+    # (services/query_classifier.py:is_trivial_query) favors false
+    # negatives. Default ON; operator can disable if a regression
+    # surfaces by setting CONTEXT_TRIM_FOR_TRIVIAL_QUERIES=false.
+    context_trim_for_trivial_queries: bool = True
     # TKT-LAT-003: when the WS chat proxy can't find an active agent
     # for the user, the current behavior retries 6 × 5 s = 30 s
     # before giving up — visible to the user as a 30-second

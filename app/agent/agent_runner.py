@@ -122,6 +122,12 @@ OnAttachment = Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]
 # Vault CP4: emitted when save_streaming_credential is invoked; carries
 # the full frame payload (already shaped for the WS wire).
 OnCredentialConfirmRequest = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
+# Emitted exactly once when an LLM call is blocked by the credit
+# system. Carries the rendered exhausted-balance payload (see
+# services/credit_exhausted.py:response_to_stream_event). The runner
+# also emits the plaintext message through on_text_chunk so chat
+# clients without a custom card renderer still show the explanation.
+OnCreditExhausted = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 class AgentRunner:
@@ -317,6 +323,7 @@ class AgentRunner:
         on_tool_progress: Optional[OnToolProgress] = None,
         on_attachment: Optional[OnAttachment] = None,
         on_credential_confirm_request: Optional[OnCredentialConfirmRequest] = None,
+        on_credit_exhausted: Optional[OnCreditExhausted] = None,
         media_paths: Optional[List[str]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         model_override: Optional[str] = None,
@@ -923,6 +930,49 @@ class AgentRunner:
                     raise
 
                 except Exception as e:
+                    # Credit-exhausted is NEVER retryable — the user is
+                    # blocked until their balance refills or they
+                    # upgrade. Convert into a clean stream event +
+                    # user-visible chat message, then end this turn.
+                    # Retrying or falling over to the other provider
+                    # would just burn another roundtrip; falling open
+                    # silently would also defeat the purpose of
+                    # enforcement.
+                    try:
+                        from app.services.credit_exhausted import (
+                            OutOfCreditsError as _OutOfCreditsError,
+                        )
+                        if isinstance(e, _OutOfCreditsError):
+                            from app.services.credit_exhausted import (
+                                response_to_stream_event,
+                            )
+                            payload = response_to_stream_event(e.response)
+                            logger.info(
+                                "[AGENT] credit_exhausted user=%s reason=%s bucket=%s balance=%.2f",
+                                user_id[:8] if user_id else "?",
+                                e.response.reason, e.response.bucket,
+                                e.response.balance_after,
+                            )
+                            if on_credit_exhausted:
+                                try:
+                                    await on_credit_exhausted(payload)
+                                except Exception:
+                                    logger.exception("on_credit_exhausted raised")
+                            # Always also stream the plaintext message
+                            # so chat clients without a card renderer
+                            # still show the explanation.
+                            if on_text_chunk and e.response.message:
+                                try:
+                                    await on_text_chunk(e.response.message)
+                                except Exception:
+                                    pass
+                            text_buf = e.response.message
+                            stop_reason = "end_turn"
+                            pending_tool_calls = []
+                            break  # exit retry loop, exit iteration loop below
+                    except ImportError:
+                        pass
+
                     # Detect errors that warrant immediate cross-provider fallback:
                     # - 401 auth errors: broken credentials, skip retries entirely
                     # - 429 rate limits: after exhausting retries, cross to other provider
@@ -1831,6 +1881,22 @@ class AgentRunner:
             "mentioned doing something earlier and haven't, it's fine to check in."
         )
 
+        # TKT-LAT-019: classify the user message — trivial questions
+        # (greetings, acknowledgments, "what time is it?", etc.) skip
+        # the portrait + hybrid_search + entity_search + active_tasks
+        # blocks below. Saves ~5–15 k input tokens + 500–2000 ms
+        # portrait generation on low-information turns.
+        from app.services.query_classifier import is_trivial_query as _is_trivial_query
+        _skip_deep_context = bool(
+            getattr(settings, "context_trim_for_trivial_queries", True)
+            and _is_trivial_query(user_message or "")
+        )
+        logger.info(
+            "[PERF] context_depth=%s user_message_len=%d",
+            "trivial" if _skip_deep_context else "normal",
+            len(user_message or ""),
+        )
+
         # ── 2. Agent Brain — disabled (Soul page is source of truth) ──
         agent_memories = []
         AGENT_BRAIN_ENABLED = os.environ.get("AGENT_BRAIN_ENABLED", "false").lower() == "true"
@@ -1874,106 +1940,115 @@ class AgentRunner:
         # ── 3. Retrieve relevant user memories (hybrid search) ──────
         # Always retrieve — 200ms cost is acceptable for context quality.
         # Previously gated by intent.skip_memory_retrieval, now unconditional.
+        #
+        # TKT-LAT-019: skip the entire block (hybrid_search + entity_search
+        # + portrait + facts rendering) when the message is trivial.
+        # Saves ~500-2000 ms on portrait generation alone, plus the
+        # serialized memory tokens that would have hit the LLM input.
         t_memory = time.perf_counter()
         memory_sections = []
-        try:
-            from app.services.memory_service import MemoryService
-            from app.services.query_classifier import classify_query
+        if _skip_deep_context:
+            self._memory_health["retrieved"] = 0
+            logger.info("[PERF] memory_retrieval_skipped reason=trivial_query")
+        else:
+            try:
+                from app.services.memory_service import MemoryService
+                from app.services.query_classifier import classify_query
 
-            mem_svc = MemoryService(db)
-            _t0 = time.perf_counter()
-            classification = classify_query(user_message)
-            logger.info(f'[PERF] query_classify: {(time.perf_counter()-_t0)*1000:.0f}ms — type={classification["type"]}')
+                mem_svc = MemoryService(db)
+                _t0 = time.perf_counter()
+                classification = classify_query(user_message)
+                logger.info(f'[PERF] query_classify: {(time.perf_counter()-_t0)*1000:.0f}ms — type={classification["type"]}')
 
-            search_strategies = classification.get("strategies") or ["vector", "keyword", "graph"]
-            search_categories = classification.get("categories")
+                search_strategies = classification.get("strategies") or ["vector", "keyword", "graph"]
+                search_categories = classification.get("categories")
 
-            _t0 = time.perf_counter()
-            memories = await mem_svc.hybrid_search(
-                user_id=user_id, query=user_message, limit=15,
-                min_similarity=0.1, strategies=search_strategies,
-                categories=search_categories,
-            )
-            logger.info(f"[PERF] hybrid_search: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(memories)} results")
+                _t0 = time.perf_counter()
+                memories = await mem_svc.hybrid_search(
+                    user_id=user_id, query=user_message, limit=15,
+                    min_similarity=0.1, strategies=search_strategies,
+                    categories=search_categories,
+                )
+                logger.info(f"[PERF] hybrid_search: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(memories)} results")
 
-            if classification.get("entity_hint"):
+                if classification.get("entity_hint"):
+                    _t0 = time.perf_counter()
+                    try:
+                        entity_mems = await mem_svc.search_by_entity_graph(
+                            user_id=user_id, entity_name=classification["entity_hint"],
+                            depth=2, limit=5,
+                        )
+                        existing_ids = {m["id"] for m in memories}
+                        for em in entity_mems:
+                            if em["id"] not in existing_ids:
+                                memories.insert(0, em)
+                        logger.info(f"[PERF] entity_search: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(entity_mems)} results")
+                    except Exception as e:
+                        logger.warning(f"Entity graph search failed: {e}")
+
+                user_memories = [m for m in memories if m.get("brain_type") == "user"]
+                self._last_retrieved_memories = user_memories
+                self._memory_health["retrieved"] = len(user_memories)
+                logger.info(f"[AGENT] Found {len(user_memories)} relevant user memories (hybrid)")
+
+                # A. User Portrait
                 _t0 = time.perf_counter()
                 try:
-                    entity_mems = await mem_svc.search_by_entity_graph(
-                        user_id=user_id, entity_name=classification["entity_hint"],
-                        depth=2, limit=5,
-                    )
-                    existing_ids = {m["id"] for m in memories}
-                    for em in entity_mems:
-                        if em["id"] not in existing_ids:
-                            memories.insert(0, em)
-                    logger.info(f"[PERF] entity_search: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(entity_mems)} results")
+                    from app.services.user_portrait_service import UserPortraitService
+                    portrait_svc = UserPortraitService(db)
+                    portrait = await portrait_svc.get_or_build_portrait(user_id)
+                    if portrait:
+                        memory_sections.append(f"## Who this user is\n{portrait}")
+                    logger.info(f"[PERF] portrait: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(portrait) if portrait else 0} chars")
                 except Exception as e:
-                    logger.warning(f"Entity graph search failed: {e}")
+                    logger.warning(f"Portrait generation failed ({(time.perf_counter()-_t0)*1000:.0f}ms): {e}")
 
-            user_memories = [m for m in memories if m.get("brain_type") == "user"]
-            self._last_retrieved_memories = user_memories
-            self._memory_health["retrieved"] = len(user_memories)
-            logger.info(f"[AGENT] Found {len(user_memories)} relevant user memories (hybrid)")
+                if user_memories:
+                    # B. Core facts
+                    core_facts = [
+                        m for m in user_memories
+                        if m.get("strength", 0) >= 0.7
+                        and m.get("memory_type") not in ("event", "conversation")
+                    ]
+                    if core_facts:
+                        memory_sections.append("## Core facts about this user")
+                        for m in core_facts[:5]:
+                            memory_sections.append(f"- {m.get('content', '')}")
 
-            # A. User Portrait
-            _t0 = time.perf_counter()
-            try:
-                from app.services.user_portrait_service import UserPortraitService
-                portrait_svc = UserPortraitService(db)
-                portrait = await portrait_svc.get_or_build_portrait(user_id)
-                if portrait:
-                    memory_sections.append(f"## Who this user is\n{portrait}")
-                logger.info(f"[PERF] portrait: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(portrait) if portrait else 0} chars")
+                    # C. Relevant memories
+                    core_ids = {m.get("id") for m in core_facts}
+                    regular = [m for m in user_memories if m.get("id") not in core_ids]
+                    if regular:
+                        memory_sections.append("\n## Relevant to this conversation")
+                        for i, m in enumerate(regular[:10], 1):
+                            cat = m.get("category", "")
+                            content = m.get("content", "")
+                            age = self._format_memory_age(m.get("created_at"))
+                            memory_sections.append(f"{i}. [{cat}] {content} ({age})")
+
+                    for m in user_memories:
+                        score = m.get("similarity_score", 0)
+                        logger.info(f"[AGENT]   Memory: [{m.get('category','')}] ({score:.2f}) {m.get('content','')[:80]}")
+
+                # D. Related entities
+                try:
+                    entity_data = await mem_svc.get_entities(user_id=user_id, limit=8)
+                    if entity_data:
+                        entity_lines = ["\n## People and things the user has mentioned"]
+                        for e in entity_data[:8]:
+                            desc = e.get("entity_type", "")
+                            name = e.get("name", "")
+                            if name:
+                                entity_lines.append(f"- {name} ({desc})")
+                        if len(entity_lines) > 1:
+                            memory_sections.append("\n".join(entity_lines))
+                except Exception:
+                    pass
+
+                if memory_sections:
+                    section_parts["user_brain"] = "# User Brain\n" + "\n".join(memory_sections)
             except Exception as e:
-                logger.warning(f"Portrait generation failed ({(time.perf_counter()-_t0)*1000:.0f}ms): {e}")
-
-            if user_memories:
-                # B. Core facts
-                core_facts = [
-                    m for m in user_memories
-                    if m.get("strength", 0) >= 0.7
-                    and m.get("memory_type") not in ("event", "conversation")
-                ]
-                if core_facts:
-                    memory_sections.append("## Core facts about this user")
-                    for m in core_facts[:5]:
-                        memory_sections.append(f"- {m.get('content', '')}")
-
-                # C. Relevant memories
-                core_ids = {m.get("id") for m in core_facts}
-                regular = [m for m in user_memories if m.get("id") not in core_ids]
-                if regular:
-                    memory_sections.append("\n## Relevant to this conversation")
-                    for i, m in enumerate(regular[:10], 1):
-                        cat = m.get("category", "")
-                        content = m.get("content", "")
-                        age = self._format_memory_age(m.get("created_at"))
-                        memory_sections.append(f"{i}. [{cat}] {content} ({age})")
-
-                for m in user_memories:
-                    score = m.get("similarity_score", 0)
-                    logger.info(f"[AGENT]   Memory: [{m.get('category','')}] ({score:.2f}) {m.get('content','')[:80]}")
-
-            # D. Related entities
-            try:
-                entity_data = await mem_svc.get_entities(user_id=user_id, limit=8)
-                if entity_data:
-                    entity_lines = ["\n## People and things the user has mentioned"]
-                    for e in entity_data[:8]:
-                        desc = e.get("entity_type", "")
-                        name = e.get("name", "")
-                        if name:
-                            entity_lines.append(f"- {name} ({desc})")
-                    if len(entity_lines) > 1:
-                        memory_sections.append("\n".join(entity_lines))
-            except Exception:
-                pass
-
-            if memory_sections:
-                section_parts["user_brain"] = "# User Brain\n" + "\n".join(memory_sections)
-        except Exception as e:
-            logger.warning(f"Memory retrieval failed in agent prompt: {e}")
+                logger.warning(f"Memory retrieval failed in agent prompt: {e}")
 
         # Close with perf log either way
         if memory_sections and "user_brain" not in section_parts:
@@ -1985,16 +2060,24 @@ class AgentRunner:
         # reaches the assembled prompt is decided by SECTION_ORDER below — that
         # filter is the canonical "is this section in the prompt?" check.
         # See the assembly-time log for the post-filter truth.
-        try:
-            from app.services.active_task_service import get_active_tasks, build_active_tasks_block
-            active_tasks = await get_active_tasks(db, user_id)
-            self._memory_health["active_tasks"] = len(active_tasks) if active_tasks else 0
-            if active_tasks:
-                section_parts["active_tasks"] = build_active_tasks_block(active_tasks)
-                logger.info(f"[AGENT] active_tasks built: {len(active_tasks)} task(s)")
-        except Exception as _at_err:
+        #
+        # TKT-LAT-019: skip active_tasks load for trivial queries. The
+        # block costs a DB query + ~200-500 tokens when present, and a
+        # one-word answer doesn't need to know what threads are open.
+        if _skip_deep_context:
             self._memory_health["active_tasks"] = 0
-            logger.debug(f"[AGENT] Active tasks build skipped: {_at_err}")
+            logger.debug("[AGENT] active_tasks skipped (trivial query)")
+        else:
+            try:
+                from app.services.active_task_service import get_active_tasks, build_active_tasks_block
+                active_tasks = await get_active_tasks(db, user_id)
+                self._memory_health["active_tasks"] = len(active_tasks) if active_tasks else 0
+                if active_tasks:
+                    section_parts["active_tasks"] = build_active_tasks_block(active_tasks)
+                    logger.info(f"[AGENT] active_tasks built: {len(active_tasks)} task(s)")
+            except Exception as _at_err:
+                self._memory_health["active_tasks"] = 0
+                logger.debug(f"[AGENT] Active tasks build skipped: {_at_err}")
 
         # ── 4. Skills (only if intent requires them) ─────────────
         if self.skill_loader and intent.include_skill_prompts:
