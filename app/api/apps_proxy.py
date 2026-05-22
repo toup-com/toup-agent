@@ -843,88 +843,88 @@ async def preview_proxy(
         resp = await client.get(target, headers={"X-Agent-Key": key}, timeout=120.0)
         content_type = resp.headers.get("content-type", "text/html")
 
-            body = resp.content
+        body = resp.content
 
-            # For HTML responses (the initial page), inject <base href> so
-            # relative URLs like /index.ts.bundle resolve through the proxy
-            # path instead of toup.ai root.
-            # Also rewrite script src to include ?token= so sub-resource
-            # requests authenticate without relying on cookies (WebView
-            # may not send cookies for cross-origin sub-requests).
-            if "text/html" in content_type:
-                base_href = f"/api/apps/{app_id}/preview/"
-                base_tag = f'<base href="{base_href}">'
-                # Inject deterministic agent bridge — connects the app's
-                # AgentPlaceholder to the user's real agent via WebSocket.
-                # This runs BEFORE the Expo bundle, so window.__TOUP_AGENT_BRIDGE
-                # is ready when the generated agentBridge.ts loads.
-                agent_bridge_script = _build_agent_bridge_script(
-                    resolved_token or "", app_id
-                )
-                # Meta charset MUST be first in <head> — WKWebView uses it to
-                # decide text encoding before parsing any other content.
-                meta_charset = '<meta charset="utf-8">'
-                # Emoji font CSS — iOS WKWebView doesn't auto-fallback to emoji fonts.
-                # react-native-web sets font via shorthand which blocks emoji fallback.
-                # Use both font-family AND font shorthand override to be bulletproof.
-                emoji_css = (
-                    '<style id="emoji-fix">'
-                    '*, *::before, *::after { '
-                    'font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, '
-                    'Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", '
-                    '"Noto Color Emoji" !important; }'
-                    '</style>'
-                )
-                agent_widget_script = _build_agent_widget_script(
-                    agent_color=agent_color
-                )
-                html = body.decode("utf-8", errors="replace")
-                html = html.replace("<head>", f"<head>\n{meta_charset}\n{base_tag}\n{agent_bridge_script}\n{agent_widget_script}\n{emoji_css}", 1)
-                # Rewrite absolute src="/..." to relative so <base href>
-                # routes them through the preview proxy path.
-                # Also inject ?token= so bundle requests are authenticated
-                # (WebView may not send cookies for sub-resource requests).
-                def _rewrite_src(m):
-                    src = m.group(1)
-                    # Strip leading / to make relative (so <base href> applies)
-                    if src.startswith("/"):
-                        src = src[1:]
-                    # Inject auth token
-                    if resolved_token:
-                        sep = "&" if "?" in src else "?"
-                        src = f"{src}{sep}token={resolved_token}"
-                    return f'src="{src}"'
-                html = re.sub(r'src="(/[^"]*)"', _rewrite_src, html)
-                body = html.encode("utf-8")
+        # For HTML responses (the initial page), inject <base href> so
+        # relative URLs like /index.ts.bundle resolve through the proxy
+        # path instead of toup.ai root.
+        # Also rewrite script src to include ?token= so sub-resource
+        # requests authenticate without relying on cookies (WebView
+        # may not send cookies for cross-origin sub-requests).
+        if "text/html" in content_type:
+            base_href = f"/api/apps/{app_id}/preview/"
+            base_tag = f'<base href="{base_href}">'
+            # Inject deterministic agent bridge — connects the app's
+            # AgentPlaceholder to the user's real agent via WebSocket.
+            # This runs BEFORE the Expo bundle, so window.__TOUP_AGENT_BRIDGE
+            # is ready when the generated agentBridge.ts loads.
+            agent_bridge_script = _build_agent_bridge_script(
+                resolved_token or "", app_id
+            )
+            # Meta charset MUST be first in <head> — WKWebView uses it to
+            # decide text encoding before parsing any other content.
+            meta_charset = '<meta charset="utf-8">'
+            # Emoji font CSS — iOS WKWebView doesn't auto-fallback to emoji fonts.
+            # react-native-web sets font via shorthand which blocks emoji fallback.
+            # Use both font-family AND font shorthand override to be bulletproof.
+            emoji_css = (
+                '<style id="emoji-fix">'
+                '*, *::before, *::after { '
+                'font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, '
+                'Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", '
+                '"Noto Color Emoji" !important; }'
+                '</style>'
+            )
+            agent_widget_script = _build_agent_widget_script(
+                agent_color=agent_color
+            )
+            html = body.decode("utf-8", errors="replace")
+            html = html.replace("<head>", f"<head>\n{meta_charset}\n{base_tag}\n{agent_bridge_script}\n{agent_widget_script}\n{emoji_css}", 1)
+            # Rewrite absolute src="/..." to relative so <base href>
+            # routes them through the preview proxy path.
+            # Also inject ?token= so bundle requests are authenticated
+            # (WebView may not send cookies for sub-resource requests).
+            def _rewrite_src(m):
+                src = m.group(1)
+                # Strip leading / to make relative (so <base href> applies)
+                if src.startswith("/"):
+                    src = src[1:]
+                # Inject auth token
+                if resolved_token:
+                    sep = "&" if "?" in src else "?"
+                    src = f"{src}{sep}token={resolved_token}"
+                return f'src="{src}"'
+            html = re.sub(r'src="(/[^"]*)"', _rewrite_src, html)
+            body = html.encode("utf-8")
 
-            # Ensure charset=utf-8 is in Content-Type for text responses.
-            # iOS WKWebView uses the HTTP header (not <meta charset>) to decode,
-            # and defaults to ASCII when charset is missing — corrupting emoji bytes.
-            resp_content_type = content_type
-            if "text/html" in content_type and "charset" not in content_type:
-                resp_content_type = "text/html; charset=utf-8"
-            elif "javascript" in content_type and "charset" not in content_type:
-                resp_content_type = content_type + "; charset=utf-8"
+        # Ensure charset=utf-8 is in Content-Type for text responses.
+        # iOS WKWebView uses the HTTP header (not <meta charset>) to decode,
+        # and defaults to ASCII when charset is missing — corrupting emoji bytes.
+        resp_content_type = content_type
+        if "text/html" in content_type and "charset" not in content_type:
+            resp_content_type = "text/html; charset=utf-8"
+        elif "javascript" in content_type and "charset" not in content_type:
+            resp_content_type = content_type + "; charset=utf-8"
 
-            response = StreamingResponse(
-                iter([body]),
-                status_code=resp.status_code,
-                media_type=resp_content_type,
+        response = StreamingResponse(
+            iter([body]),
+            status_code=resp.status_code,
+            media_type=resp_content_type,
+        )
+
+        # Set auth cookie so sub-resource requests (JS bundles, etc.)
+        # are authenticated without needing ?token= on every URL.
+        if resolved_token and "text/html" in content_type:
+            response.set_cookie(
+                key="preview_token",
+                value=resolved_token,
+                max_age=3600,
+                httponly=True,
+                samesite="none",
+                secure=True,
             )
 
-            # Set auth cookie so sub-resource requests (JS bundles, etc.)
-            # are authenticated without needing ?token= on every URL.
-            if resolved_token and "text/html" in content_type:
-                response.set_cookie(
-                    key="preview_token",
-                    value=resolved_token,
-                    max_age=3600,
-                    httponly=True,
-                    samesite="none",
-                    secure=True,
-                )
-
-            return response
+        return response
     except Exception as e:
         logger.warning("Preview proxy failed: %s → %s", target, e)
         raise HTTPException(502, "App preview unreachable")

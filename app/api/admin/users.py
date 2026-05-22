@@ -1114,16 +1114,16 @@ async def diagnose_user_usage(
                 timeout=5.0,
             )
             proxy["status_code"] = resp.status_code
-                if resp.status_code == 200:
-                    data = resp.json()
-                    summary_30d = next((s for s in data if s.get("period") == "30d"), None) or {}
-                    summary_all = next((s for s in data if s.get("period") == "all"), None) or {}
-                    proxy["reported_tokens_30d"] = summary_30d.get("total_tokens", 0)
-                    proxy["reported_requests_30d"] = summary_30d.get("total_requests", 0)
-                    proxy["reported_tokens_all"] = summary_all.get("total_tokens", 0)
-                    proxy["reported_requests_all"] = summary_all.get("total_requests", 0)
-                else:
-                    proxy["body_preview"] = resp.text[:500]
+            if resp.status_code == 200:
+                data = resp.json()
+                summary_30d = next((s for s in data if s.get("period") == "30d"), None) or {}
+                summary_all = next((s for s in data if s.get("period") == "all"), None) or {}
+                proxy["reported_tokens_30d"] = summary_30d.get("total_tokens", 0)
+                proxy["reported_requests_30d"] = summary_30d.get("total_requests", 0)
+                proxy["reported_tokens_all"] = summary_all.get("total_tokens", 0)
+                proxy["reported_requests_all"] = summary_all.get("total_requests", 0)
+            else:
+                proxy["body_preview"] = resp.text[:500]
         except Exception as e:
             proxy["error"] = f"{type(e).__name__}: {e}"
         out["agent_proxy"] = proxy
