@@ -328,6 +328,25 @@ class AnthropicService:
                     response.model,
                 )
 
+                # Credit metering for direct (non-proxy) LLM calls.
+                # Fire-and-forget — failures never block the chat response.
+                # See services/credit_reporter.py for the full design.
+                try:
+                    from app.services.credit_reporter import report_llm_usage
+                    user_id = getattr(settings, "user_id", "") or ""
+                    if user_id:
+                        await report_llm_usage(
+                            user_id=user_id,
+                            model=response.model,
+                            provider="anthropic",
+                            input_tokens=int(response.usage.input_tokens or 0),
+                            output_tokens=int(response.usage.output_tokens or 0),
+                            idempotency_key=getattr(response, "id", None),
+                            event_id=getattr(response, "id", None),
+                        )
+                except Exception:
+                    logger.exception("[credits] anthropic non-stream report failed")
+
                 return AnthropicResponse(
                     content="\n".join(text_parts),
                     tool_calls=tool_calls,
@@ -482,6 +501,24 @@ class AnthropicService:
                         final_usage.output_tokens,
                         final.model,
                     )
+                    # Credit metering for streaming direct (non-proxy) calls.
+                    # Fire-and-forget — never blocks the stream end.
+                    try:
+                        from app.services.credit_reporter import report_llm_usage
+                        user_id = getattr(settings, "user_id", "") or ""
+                        if user_id:
+                            await report_llm_usage(
+                                user_id=user_id,
+                                model=final.model,
+                                provider="anthropic",
+                                input_tokens=int(final_usage.input_tokens or 0),
+                                output_tokens=int(final_usage.output_tokens or 0),
+                                idempotency_key=getattr(final, "id", None),
+                                event_id=getattr(final, "id", None),
+                            )
+                    except Exception:
+                        logger.exception("[credits] anthropic stream report failed")
+
                     yield StreamEvent(
                         type="message_end",
                         stop_reason=final.stop_reason,

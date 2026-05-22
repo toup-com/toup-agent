@@ -14,7 +14,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +23,7 @@ from app.api.admin.deps import require_admin
 from app.api.auth import get_current_user
 from app.db import get_db
 from app.db.models import (
-    CreditLedger, PlatformSetting, SubscriptionPlan, User,
+    AgentConfig, CreditLedger, PlatformSetting, SubscriptionPlan, User,
 )
 from app.services.credit_service import FLAT_FEES, credit_service
 
@@ -172,6 +172,125 @@ async def get_credit_ledger(
             created_at=r.created_at,
         ) for r in rows
     ])
+
+
+# ── Agent → platform credit deduction (manual mode metering) ──────
+#
+# Bundle-mode LLM calls flow through /api/llm/chat where the
+# _log_event hook already deducts. Manual-mode users (own API key)
+# bypass the proxy entirely — their agent talks direct to
+# Anthropic/OpenAI and the platform never learns of the call.
+#
+# This endpoint closes that gap: the agent's anthropic_service /
+# openai_agent_service POSTs a deduction record here AFTER every
+# successful LLM call. The platform validates the agent_api_key,
+# looks up the user, and routes through credit_service.try_charge
+# with the same idempotency + enforcement semantics as the proxy
+# hook. Manual-mode users now get the same metering + enforcement
+# as bundle-mode users.
+
+
+class AgentDeductRequest(BaseModel):
+    """Posted by the tenant agent after every direct LLM call.
+
+    `idempotency_key` should be the agent's own request_id (e.g.
+    Anthropic message.id or OpenAI completion.id) so a retry from
+    inside the agent doesn't double-charge.
+    """
+    user_id: str
+    model: str
+    provider: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    underlying_cost_cents: Optional[float] = None
+    operation_type: Optional[str] = None  # "user.*" or "system.*"
+    idempotency_key: Optional[str] = None
+    event_id: Optional[str] = None
+
+
+class AgentDeductResponse(BaseModel):
+    success: bool
+    bucket: str
+    amount_charged: float
+    balance_after: float
+    enforcement_enabled: bool
+    reason: Optional[str] = None
+    idempotent_hit: bool = False
+
+
+@router.post("/agent-deduct", response_model=AgentDeductResponse)
+async def agent_deduct(
+    body: AgentDeductRequest,
+    x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
+    db: AsyncSession = Depends(get_db),
+) -> AgentDeductResponse:
+    """Authenticated by X-Agent-Key. The agent's
+    `agent_api_key` (stored in AgentConfig on the platform side and
+    in the agent container's env) is the shared secret.
+
+    Returns success=False when enforcement is on AND the user is
+    out of credits — the agent SHOULD honor this by short-circuiting
+    the next LLM call client-side. Until then, this endpoint is a
+    metering surface; the deduction still gets recorded so admin
+    /credits/ledger sees the true cost.
+    """
+    from app.services.credit_service import (
+        tokens_to_credits as _tokens_to_credits,
+        BUCKET_MESSAGE as _BUCKET_MESSAGE,
+    )
+    from app.db.models import LEDGER_CHAT_MESSAGE as _LEDGER_CHAT_MESSAGE
+
+    if not x_agent_key:
+        raise HTTPException(401, "X-Agent-Key required")
+
+    # Authenticate: agent_api_key must match the AgentConfig of the
+    # claimed user_id. Stops one tenant's agent from charging another
+    # tenant's credit balance even if it discovers their X-Agent-Key
+    # (which it shouldn't — keys are per-tenant secrets).
+    cfg_result = await db.execute(
+        select(AgentConfig).where(
+            AgentConfig.user_id == body.user_id,
+            AgentConfig.agent_api_key == x_agent_key,
+        )
+    )
+    cfg = cfg_result.scalar_one_or_none()
+    if cfg is None:
+        raise HTTPException(403, "agent key mismatch")
+
+    # System ops aren't charged to the user. Match the proxy hook's
+    # rule: "system.*" → platform overhead, exempt.
+    op = body.operation_type or "user"
+    if op.startswith("system."):
+        return AgentDeductResponse(
+            success=True, bucket=_BUCKET_MESSAGE, amount_charged=0.0,
+            balance_after=0.0, enforcement_enabled=False,
+            reason="system_op_exempt",
+        )
+
+    credits = _tokens_to_credits(body.model, body.input_tokens, body.output_tokens)
+    result = await credit_service.try_charge(
+        db, body.user_id, _LEDGER_CHAT_MESSAGE, _BUCKET_MESSAGE, credits,
+        idempotency_key=body.idempotency_key,
+        event_id=body.event_id,
+        model=body.model,
+        provider=body.provider,
+        input_tokens=body.input_tokens,
+        output_tokens=body.output_tokens,
+        underlying_cost_cents=body.underlying_cost_cents,
+        metadata={"surface": "agent_direct", "operation_type": op},
+    )
+    await db.commit()
+
+    from app.config import settings as _settings
+    return AgentDeductResponse(
+        success=result.success,
+        bucket=_BUCKET_MESSAGE,
+        amount_charged=float(credits) if result.success else 0.0,
+        balance_after=float(result.balance_after),
+        enforcement_enabled=bool(getattr(_settings, "credit_enforcement_enabled", False)),
+        reason=result.reason,
+        idempotent_hit=result.idempotent_hit,
+    )
 
 
 @billing_router.get("/plans", response_model=PlansResponse)

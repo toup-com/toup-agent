@@ -235,6 +235,24 @@ class OpenAIAgentService:
                     model,
                 )
 
+                # Credit metering for direct (non-proxy) OpenAI calls.
+                # Fire-and-forget; never blocks the stream end.
+                try:
+                    from app.services.credit_reporter import report_llm_usage
+                    from app.config import settings as _cr_settings
+                    user_id = getattr(_cr_settings, "user_id", "") or ""
+                    if user_id:
+                        await report_llm_usage(
+                            user_id=user_id,
+                            model=model,
+                            provider="openai",
+                            input_tokens=int(usage_data.get("input_tokens", 0) or 0),
+                            output_tokens=int(usage_data.get("output_tokens", 0) or 0),
+                            idempotency_key=prompt_cache_key,
+                        )
+                except Exception:
+                    logger.exception("[credits] openai stream report failed")
+
                 yield StreamEvent(
                     type="message_end",
                     stop_reason=mapped_stop,
