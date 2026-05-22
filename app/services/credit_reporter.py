@@ -195,6 +195,144 @@ def raise_if_exhausted() -> None:
         raise OutOfCreditsError(resp)
 
 
+# ── Authoritative HTTP pre-flight ───────────────────────────────────
+
+
+async def check_balance_remote(
+    *,
+    user_id: str,
+    bucket: str = "message",
+    required: float = 0.5,
+) -> Optional["PreflightResult"]:
+    """Authoritative balance check against the platform.
+
+    Use this when the in-process :func:`raise_if_exhausted` state isn't
+    fresh enough — typically at agent boot (CreditState is cold) or
+    before launching a long-running task like an app build (where we
+    want to refuse to start, not just rely on per-LLM-call deductions
+    to bail out mid-flight).
+
+    Hits ``GET {platform_api_url}/credits/preflight?bucket=…&required=…``
+    authenticated with the agent's ``X-Agent-Key`` + ``X-Agent-User-Id``.
+
+    Updates the in-process :class:`CreditState` with the platform's
+    latest balance / period_end / plan, so subsequent
+    :func:`raise_if_exhausted` calls reflect the fresh state.
+
+    Returns:
+        :class:`PreflightResult` on success.
+        ``None`` when platform isn't configured (dev mode) or the
+        network call failed — fail-open so callers don't accidentally
+        block when the platform is unreachable.
+
+    The CALLER is responsible for raising :class:`OutOfCreditsError`
+    if it wants the same short-circuit semantics as
+    :func:`raise_if_exhausted` (we don't auto-raise here because some
+    callers prefer to render a custom message — e.g. app_builder
+    surfaces the message in the chat bubble that started the build,
+    not as a stream-level exception).
+    """
+    url = _platform_endpoint("/credits/preflight")
+    agent_key = _agent_key()
+    if url is None or not agent_key or not user_id:
+        return None
+
+    params = {"bucket": bucket, "required": str(required)}
+    headers = {
+        "X-Agent-Key": agent_key,
+        "X-Agent-User-Id": user_id,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_STATUS_TIMEOUT_S) as client:
+            resp = await client.get(url, params=params, headers=headers)
+        if resp.status_code != 200:
+            logger.warning(
+                "[credits] preflight non-200 status=%d user=%s body=%s",
+                resp.status_code, (user_id or "?")[:8], resp.text[:200],
+            )
+            return None
+        data = resp.json() or {}
+    except httpx.TimeoutException:
+        logger.warning(
+            "[credits] preflight timed out (>%ss) user=%s",
+            _STATUS_TIMEOUT_S, (user_id or "?")[:8],
+        )
+        return None
+    except Exception:
+        logger.exception(
+            "[credits] preflight failed user=%s", (user_id or "?")[:8],
+        )
+        return None
+
+    period_end_iso = (data.get("period_end") or "").replace("Z", "+00:00")
+    try:
+        period_end = datetime.fromisoformat(period_end_iso) if period_end_iso else None
+    except Exception:
+        period_end = None
+
+    result = PreflightResult(
+        enforcement_enabled=bool(data.get("enforcement_enabled", False)),
+        sufficient=bool(data.get("sufficient", True)),
+        bucket=str(data.get("bucket") or bucket),
+        remaining=float(data.get("remaining") or 0.0),
+        reason=data.get("reason"),
+        plan_id=str(data.get("plan_id") or "free"),
+        plan_display_name=str(data.get("plan_display_name") or "Free"),
+        period_end=period_end,
+    )
+
+    # Refresh the in-process CreditState with what we learned, so
+    # subsequent raise_if_exhausted() calls see the fresh data without
+    # another round-trip. If the platform says we're not exhausted but
+    # CreditState was stuck on a stale exhausted outcome, this clears it.
+    fresh_outcome = DeductOutcome(
+        network_ok=True,
+        success=result.sufficient,
+        enforcement_enabled=result.enforcement_enabled,
+        balance_after=result.remaining,
+        reason=result.reason,
+        bucket=result.bucket,
+    )
+    _state.record_deduct(
+        outcome=fresh_outcome,
+        period_end=period_end,
+        plan_id=result.plan_id,
+        plan_display_name=result.plan_display_name,
+    )
+
+    return result
+
+
+@dataclass
+class PreflightResult:
+    """Parsed `/credits/preflight` response."""
+    enforcement_enabled: bool
+    sufficient: bool
+    bucket: str
+    remaining: float
+    plan_id: str
+    plan_display_name: str
+    period_end: Optional[datetime] = None
+    reason: Optional[str] = None
+
+    def to_exhausted_response(self) -> ExhaustedResponse:
+        """Convenience: render this PreflightResult as an
+        ExhaustedResponse (the shared card-rendering shape).
+
+        Only meaningful when ``sufficient=False`` AND
+        ``enforcement_enabled=True`` — i.e. the user really is blocked.
+        """
+        from app.services.credit_exhausted import build_exhausted_response
+        return build_exhausted_response(
+            reason=self.reason or REASON_INSUFFICIENT_MESSAGE,
+            bucket=self.bucket,
+            balance_after=self.remaining,
+            plan_id=self.plan_id,
+            plan_display_name=self.plan_display_name,
+            period_end=self.period_end,
+        )
+
+
 # ── HTTP surface ────────────────────────────────────────────────────
 
 

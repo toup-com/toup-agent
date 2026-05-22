@@ -769,51 +769,48 @@ class AppBuilderSkill(Skill):
         # calls through /llm/chat (each individually metered via the
         # proxy's post-flight try_charge), but the whole build is wasted
         # work if the user runs out partway through. Refuse to start
-        # when the user is already short on message credits — current
-        # threshold is a conservative 20 (covers the planning round
-        # trips); the build then naturally bails out via the proxy's
-        # 402 if mid-build the bucket hits zero. Shadow-mode
+        # when the user is already short on message credits — threshold
+        # is a conservative 20 (covers the planning round trips); the
+        # build then naturally bails out via the proxy's 402 if mid-
+        # build the bucket hits zero. Shadow-mode
         # (credit_enforcement_enabled=False) is always allowed.
         #
-        # NOTE: we intentionally do NOT use reserve/settle here — per-
-        # call deductions inside the build (via internal_llm + the
-        # proxy hook) are the authoritative metering surface, and
-        # wrapping with reserve would double-charge.
+        # NOTE: this skill runs on the TENANT AGENT process, whose
+        # local DB has no credit tables / no balance rows. The previous
+        # incarnation called `credit_service.check_balance(_credit_db,
+        # ...)` against the agent's DB, raised "subscription_plans 'free'
+        # row missing", got swallowed by the except below, and the gate
+        # silently no-op'd. Authoritative check now goes through the
+        # platform's `/api/credits/preflight` endpoint via
+        # credit_reporter.check_balance_remote — same source of truth
+        # the bundle-mode proxy uses.
+        #
+        # Reserve/settle deliberately NOT used here — per-call deductions
+        # inside the build (via internal_llm + the proxy hook) are the
+        # authoritative metering surface; wrapping with reserve would
+        # double-charge.
         try:
-            from decimal import Decimal as _Decimal
-            from app.config import settings as _settings
-            if getattr(_settings, "credit_enforcement_enabled", False):
-                from app.services.credit_service import (
-                    credit_service as _credit, BUCKET_MESSAGE,
+            from app.services.credit_reporter import check_balance_remote
+            pre = await check_balance_remote(
+                user_id=user_id, bucket="message", required=20.0,
+            )
+            # `pre is None` → platform unreachable or not configured.
+            # Fail-open: don't block the build on a credit-system outage.
+            # `enforcement_enabled=False` → shadow mode; let it through.
+            if (
+                pre is not None
+                and pre.enforcement_enabled
+                and not pre.sufficient
+            ):
+                resp = pre.to_exhausted_response()
+                return (
+                    f"⚠️ Build blocked — {resp.message}\n\n"
+                    f"App Builder needs ~20 message credits to start. "
+                    f"You have {pre.remaining}."
                 )
-                async with async_session_maker() as _credit_db:
-                    pre = await _credit.check_balance(
-                        _credit_db, user_id, BUCKET_MESSAGE, _Decimal("20"),
-                    )
-                    if not pre.success:
-                        # Render the same exhausted-balance card the
-                        # chat shows. The build button on the frontend
-                        # can detect the structured marker and surface
-                        # an upgrade CTA in-place.
-                        from app.services.credit_exhausted import (
-                            build_exhausted_response,
-                        )
-                        view = await _credit.get_balance_view(_credit_db, user_id)
-                        resp = build_exhausted_response(
-                            reason=pre.reason or "insufficient_message_credits",
-                            bucket="message",
-                            balance_after=pre.balance_after,
-                            plan_id=view.plan_id,
-                            plan_display_name=view.plan_display_name,
-                            period_end=view.period_end,
-                            has_daily_cap=view.message_credits_daily_cap is not None,
-                        )
-                        return (
-                            f"⚠️ Build blocked — {resp.message}\n\n"
-                            f"App Builder needs ~20 message credits to start. "
-                            f"You have {pre.balance_after}."
-                        )
         except Exception as _credit_err:
+            # Same as before: a credit-system outage MUST NOT break the
+            # build flow. Logged loudly so operators can spot the regression.
             logger.warning("[credits] auto-builder pre-flight failed: %s", _credit_err)
 
         app_id = str(uuid.uuid4())
