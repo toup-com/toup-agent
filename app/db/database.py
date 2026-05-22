@@ -414,6 +414,31 @@ async def init_db():
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS job_type VARCHAR(20) DEFAULT 'auto_builder'",
         # Backfill: existing rows without job_type get auto_builder
         "UPDATE build_jobs SET job_type = 'auto_builder' WHERE job_type IS NULL",
+        # Unified-jobs cutover (alembic 046 + 051 + 052). Mirrored here
+        # because agents boot via init_db, not alembic upgrade — without
+        # these ALTERs, /api/apps/jobs/ and any other build_jobs reader
+        # 500s with "column build_jobs.<X> does not exist" the moment an
+        # agent rolls to a build that references the new column. The
+        # cascade then surfaces as the "Reconnecting…" banner because
+        # the frontend's idempotent /api/apps/jobs/ poll keeps retrying
+        # 502s. Self-healing on next boot.
+        # 046 — unified-jobs discriminator + back-links
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS source_kind VARCHAR(20)",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS source_id VARCHAR(36)",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS conversation_id VARCHAR(36)",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS summary_message_id VARCHAR(50)",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS outcome VARCHAR(30)",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(120)",
+        # 051 — runner-state columns
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS fire_instant TIMESTAMP",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS attempt INTEGER",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS coalesced_into_job_id VARCHAR(36)",
+        # 052 — routine-terminal columns
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS emails_fetched INTEGER",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS finished_local_at VARCHAR(40)",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS error_json JSONB",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS channel_results_json JSONB",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS tools_invoked_json JSONB",
         # Day-as-Chat: FK from conversations/messages to day_chats.
         # On agent (day_chats exists): add with FK constraint.
         # On platform (day_chats missing): add without FK so ORM queries don't crash.
