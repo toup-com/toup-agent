@@ -74,6 +74,22 @@ class AgentTaskHandler:
                 error_detail="Routine has no prompt_text — nothing to run.",
             )
 
+        # Credit pre-flight: skip cleanly when the user is out. See
+        # email_briefing_handler.py for the rationale.
+        try:
+            from app.services.credit_reporter import raise_if_exhausted
+            from app.services.credit_exhausted import OutOfCreditsError
+            try:
+                raise_if_exhausted()
+            except OutOfCreditsError as _oce:
+                return RoutineResult(
+                    status="skipped",
+                    error_class="insufficient_credits",
+                    error_detail=_oce.response.message[:300],
+                )
+        except ImportError:
+            pass
+
         runner = self._agent_runner
         if runner is not None and hasattr(runner, "run"):
             return await self._run_via_agent_runner(routine, runner, prompt, db)

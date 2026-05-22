@@ -255,6 +255,31 @@ async def _system_call_anthropic(
         status=status,
     )
 
+    # Credit deduction for direct-API mode. Bundle mode already
+    # deducts via llm_proxy._log_event so we'd double-charge if we
+    # called report_llm_usage in that case. Only fires for user.*
+    # ops — system.* is exempt server-side and skipping the round-
+    # trip saves a few ms per turn.
+    if (
+        not _bundle_active()
+        and status == "ok"
+        and (input_tokens > 0 or output_tokens > 0)
+        and not operation_type.startswith("system.")
+    ):
+        try:
+            from app.services.credit_reporter import report_llm_usage
+            await report_llm_usage(
+                user_id=user_id,
+                model=model,
+                provider="anthropic",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                underlying_cost_cents=float(cost_cents),
+                operation_type=operation_type,
+            )
+        except Exception:
+            logger.exception("[credits] internal_llm anthropic direct deduct failed")
+
     # Production fallback: Anthropic dispatch couldn't complete cleanly
     # — call gpt-4o-mini through the OpenAI path and return its result.
     # Both calls get logged separately to llm_proxy_events so the dashboard
@@ -402,6 +427,27 @@ async def _system_call_openai(
         latency_ms=latency_ms,
         status=status,
     )
+
+    # Credit deduction for direct-API mode (see _system_call_anthropic).
+    if (
+        not _bundle_active()
+        and status == "ok"
+        and (input_tokens > 0 or output_tokens > 0)
+        and not operation_type.startswith("system.")
+    ):
+        try:
+            from app.services.credit_reporter import report_llm_usage
+            await report_llm_usage(
+                user_id=user_id,
+                model=model,
+                provider="openai",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                underlying_cost_cents=float(cost_cents),
+                operation_type=operation_type,
+            )
+        except Exception:
+            logger.exception("[credits] internal_llm openai direct deduct failed")
     return text
 
 

@@ -149,13 +149,30 @@ def classify_query(query: str) -> Dict:
 # Single-word/short acknowledgments + greetings + thanks. Token-level set
 # because we want exact-match on the trimmed lowercase string.
 _TRIVIAL_EXACT = {
+    # Acknowledgments
     "ok", "okay", "k", "kk", "alright", "right", "sure", "yep", "yup", "yeah",
-    "yes", "no", "nope", "nah", "ty", "thx", "thanks", "thank you",
-    "got it", "cool", "nice", "great", "awesome", "perfect", "sweet",
-    "hi", "hello", "hey", "yo", "sup",
-    "good morning", "good afternoon", "good evening", "good night", "gn", "gm",
-    "bye", "goodbye", "cya", "later",
-    "lol", "haha", "ha", "lmao", "wow", "omg",
+    "yes", "no", "nope", "nah", "got it", "gotcha", "noted", "understood",
+    "copy", "copy that", "roger", "roger that", "10-4",
+    # Thanks
+    "ty", "thx", "tysm", "thanks", "thank you", "thanks so much",
+    "much appreciated", "appreciate it", "appreciated", "cheers",
+    # Affirmations
+    "cool", "nice", "great", "awesome", "perfect", "sweet", "rad",
+    "love it", "love that", "amazing", "brilliant", "excellent",
+    "good", "good stuff", "good one", "well done", "nicely done",
+    "sounds good", "looks good", "lgtm", "works for me", "wfm",
+    "no worries", "np", "no problem", "all good", "of course",
+    "of course!", "ofc", "exactly", "right on", "true", "fair", "fair enough",
+    # Greetings
+    "hi", "hello", "hey", "yo", "sup", "howdy",
+    "good morning", "good afternoon", "good evening", "good night",
+    "gn", "gm", "gnight", "morning", "evening",
+    # Farewells
+    "bye", "goodbye", "cya", "see ya", "see you", "later", "ttyl",
+    "talk later", "catch you later", "take care", "peace",
+    # Reactions
+    "lol", "haha", "ha", "hahaha", "lmao", "lmfao", "wow", "omg",
+    "yikes", "oof", "oops", "huh", "hmm", "uh", "uhh",
 }
 
 # Substring patterns for short factual questions that the agent can answer

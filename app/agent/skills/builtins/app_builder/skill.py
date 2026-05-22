@@ -774,6 +774,11 @@ class AppBuilderSkill(Skill):
         # trips); the build then naturally bails out via the proxy's
         # 402 if mid-build the bucket hits zero. Shadow-mode
         # (credit_enforcement_enabled=False) is always allowed.
+        #
+        # NOTE: we intentionally do NOT use reserve/settle here — per-
+        # call deductions inside the build (via internal_llm + the
+        # proxy hook) are the authoritative metering surface, and
+        # wrapping with reserve would double-charge.
         try:
             from decimal import Decimal as _Decimal
             from app.config import settings as _settings
@@ -785,12 +790,29 @@ class AppBuilderSkill(Skill):
                     pre = await _credit.check_balance(
                         _credit_db, user_id, BUCKET_MESSAGE, _Decimal("20"),
                     )
-                if not pre.success:
-                    return (
-                        "You don't have enough message credits to start a build "
-                        f"(need ~20, have {pre.balance_after}). Upgrade your plan "
-                        "or wait for the next renewal to use the App Builder."
-                    )
+                    if not pre.success:
+                        # Render the same exhausted-balance card the
+                        # chat shows. The build button on the frontend
+                        # can detect the structured marker and surface
+                        # an upgrade CTA in-place.
+                        from app.services.credit_exhausted import (
+                            build_exhausted_response,
+                        )
+                        view = await _credit.get_balance_view(_credit_db, user_id)
+                        resp = build_exhausted_response(
+                            reason=pre.reason or "insufficient_message_credits",
+                            bucket="message",
+                            balance_after=pre.balance_after,
+                            plan_id=view.plan_id,
+                            plan_display_name=view.plan_display_name,
+                            period_end=view.period_end,
+                            has_daily_cap=view.message_credits_daily_cap is not None,
+                        )
+                        return (
+                            f"⚠️ Build blocked — {resp.message}\n\n"
+                            f"App Builder needs ~20 message credits to start. "
+                            f"You have {pre.balance_after}."
+                        )
         except Exception as _credit_err:
             logger.warning("[credits] auto-builder pre-flight failed: %s", _credit_err)
 

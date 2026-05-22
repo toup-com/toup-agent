@@ -105,6 +105,15 @@ class OpenAIAgentService:
         model = model or self.default_model
         max_tokens = max_tokens or self.default_max_tokens
 
+        # Pre-flight: short-circuit if the last known platform state
+        # says the user is out of credits. Raises OutOfCreditsError
+        # which agent_runner converts into a credit_exhausted stream
+        # event. Cheap, no extra HTTP — relies on state updated by
+        # the previous call's deduct response. The first call after a
+        # cold start fail-opens; subsequent calls are gated.
+        from app.services.credit_reporter import raise_if_exhausted
+        raise_if_exhausted()
+
         # Build OpenAI messages list
         oai_messages = self._build_openai_messages(system, messages)
 
@@ -236,7 +245,10 @@ class OpenAIAgentService:
                 )
 
                 # Credit metering for direct (non-proxy) OpenAI calls.
-                # Fire-and-forget; never blocks the stream end.
+                # Updates the in-process CreditState so the NEXT call's
+                # pre-flight short-circuits if this one took us to zero.
+                # Network failures fail-open (DeductOutcome.network_ok=False
+                # leaves state untouched).
                 try:
                     from app.services.credit_reporter import report_llm_usage
                     from app.config import settings as _cr_settings

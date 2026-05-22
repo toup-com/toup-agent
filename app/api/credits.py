@@ -527,3 +527,275 @@ async def admin_set_flat_fee(
 @admin_router.get("/flat-fees")
 async def admin_list_flat_fees(_admin: User = Depends(require_admin)) -> dict[str, dict[str, Any]]:
     return {k: {"bucket": v["bucket"], "credits": float(v["credits"])} for k, v in FLAT_FEES.items()}
+
+
+@admin_router.get("/audit/{user_id}")
+async def admin_credit_audit(
+    user_id: str,
+    limit: int = Query(50, le=500),
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Per-user credit audit — answers "why isn't this user's balance changing?"
+
+    Returns the user's:
+      * Current balance + plan + period window
+      * AgentConfig snapshot (agent_api_key present? when last seen?)
+      * Last N ledger rows with timestamps + denial reasons surfaced
+      * Last N LLMProxyEvent rows (proxy bundle-mode metering trail)
+      * Computed gaps: ledger rows last 24h vs proxy events last 24h
+        (mismatch → the proxy hook isn't firing OR the bundle/manual
+        routing has drifted)
+
+    This is the FIRST endpoint to hit when the operator sees a user
+    showing 30/30 credits despite active chat usage. The output
+    distinguishes the four common failure modes:
+
+      A. AgentConfig.agent_api_key is empty → tenant agent boot env
+         drift; the agent can't authenticate against /agent-deduct.
+      B. ledger has 0 deductions but llm_proxy_events shows charges →
+         the bundle-mode hook is broken OR enforcement_enabled was off
+         when those events landed (shadow mode + early flag flip).
+      C. ledger has 0 rows AND llm_proxy_events has 0 user.* rows →
+         manual mode + agent code on this tenant predates credit_reporter
+         wiring. Operator should restart the agent on a current image.
+      D. Recent ledger rows show `metadata.denied=true` → enforcement IS
+         working; the user really is out of credits, and the operator
+         should look at the user-side UX (did the upgrade card render?).
+    """
+    from datetime import timedelta
+    from sqlalchemy import func
+
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(404, f"user {user_id!r} not found")
+
+    view = await credit_service.get_balance_view(db, user_id)
+
+    cfg_q = await db.execute(
+        select(AgentConfig).where(AgentConfig.user_id == user_id)
+    )
+    cfg = cfg_q.scalar_one_or_none()
+
+    ledger_q = await db.execute(
+        select(CreditLedger)
+        .where(CreditLedger.user_id == user_id)
+        .order_by(CreditLedger.created_at.desc())
+        .limit(limit)
+    )
+    ledger_rows = ledger_q.scalars().all()
+
+    # Cross-reference with the bundle-mode proxy log so we can spot the
+    # bundle-vs-manual + enforcement-was-off failure modes.
+    from app.db.models import LLMProxyEvent
+    proxy_q = await db.execute(
+        select(LLMProxyEvent)
+        .where(LLMProxyEvent.user_id == user_id)
+        .order_by(LLMProxyEvent.created_at.desc())
+        .limit(limit)
+    )
+    proxy_rows = proxy_q.scalars().all()
+
+    now = datetime.utcnow()
+    day_ago = now - timedelta(hours=24)
+    ledger_24h_count = sum(1 for r in ledger_rows if r.created_at >= day_ago)
+    proxy_24h_count = sum(1 for r in proxy_rows if r.created_at >= day_ago)
+    proxy_24h_user_count = sum(
+        1 for r in proxy_rows
+        if r.created_at >= day_ago and (not r.operation_type or not r.operation_type.startswith("system."))
+    )
+    ledger_24h_denials = sum(
+        1 for r in ledger_rows
+        if r.created_at >= day_ago
+        and r.metadata_json
+        and r.metadata_json.get("denied") is True
+    )
+
+    # Heuristic diagnosis — what's the most likely root cause?
+    diagnosis: list[str] = []
+    if cfg is None:
+        diagnosis.append(
+            "AgentConfig row missing — user never finished onboarding "
+            "or the row was deleted; manual-mode metering can't authenticate."
+        )
+    elif not (cfg.agent_api_key or "").strip():
+        diagnosis.append(
+            "AgentConfig.agent_api_key is empty — the tenant agent can't "
+            "authenticate against /credits/agent-deduct. Fix by re-running "
+            "agent provisioning or rotating the key."
+        )
+    if ledger_24h_count == 0 and proxy_24h_user_count > 0:
+        diagnosis.append(
+            "0 ledger rows in last 24h but proxy_events shows user.* "
+            "calls — the bundle-mode hook isn't writing to ledger. "
+            "Check llm_proxy._log_event for the try_charge branch."
+        )
+    if ledger_24h_count == 0 and proxy_24h_user_count == 0 and proxy_24h_count > 0:
+        diagnosis.append(
+            "All proxy_events in last 24h are system.* (exempt). The user "
+            "is on direct-API manual mode; deductions should arrive via "
+            "/credits/agent-deduct. If the ledger is still empty, the agent "
+            "container is running pre-credit_reporter code — redeploy."
+        )
+    if ledger_24h_count == 0 and proxy_24h_count == 0:
+        diagnosis.append(
+            "No LLM activity recorded for this user in 24h via any path. "
+            "Either the user isn't chatting, or their agent's outbound "
+            "calls are landing on a different platform_api_url (Railway "
+            "env drift)."
+        )
+    if ledger_24h_denials > 0:
+        diagnosis.append(
+            f"{ledger_24h_denials} denial(s) in last 24h — enforcement IS "
+            "working server-side. Verify the user is seeing the "
+            "credit_exhausted card on the client (check ChatPage console)."
+        )
+
+    from app.config import settings as _settings
+    return {
+        "user": {
+            "id": target.id,
+            "email": target.email,
+            "created_at": target.created_at.isoformat() if target.created_at else None,
+            "email_verified_at": (
+                target.email_verified_at.isoformat()
+                if target.email_verified_at else None
+            ),
+        },
+        "balance": {
+            "plan_id": view.plan_id,
+            "plan_display_name": view.plan_display_name,
+            "message_credits_remaining": float(view.message_credits_remaining),
+            "message_credits_monthly": float(view.message_credits_monthly),
+            "message_credits_used_today": float(view.message_credits_used_today),
+            "message_credits_daily_cap": (
+                float(view.message_credits_daily_cap)
+                if view.message_credits_daily_cap is not None else None
+            ),
+            "integration_credits_remaining": float(view.integration_credits_remaining),
+            "integration_credits_monthly": float(view.integration_credits_monthly),
+            "period_start": view.period_start.isoformat(),
+            "period_end": view.period_end.isoformat(),
+            "enforcement_enabled": view.enforcement_enabled,
+        },
+        "agent_config": {
+            "exists": cfg is not None,
+            "agent_api_key_set": bool(cfg and (cfg.agent_api_key or "").strip()),
+            "agent_url": (cfg.agent_url if cfg else None),
+        },
+        "activity_24h": {
+            "ledger_rows": ledger_24h_count,
+            "ledger_denials": ledger_24h_denials,
+            "proxy_events_total": proxy_24h_count,
+            "proxy_events_user_attributable": proxy_24h_user_count,
+        },
+        "platform_state": {
+            "credit_enforcement_enabled": bool(
+                getattr(_settings, "credit_enforcement_enabled", False)
+            ),
+            "require_email_verification_for_credits": bool(
+                getattr(_settings, "require_email_verification_for_credits", False)
+            ),
+        },
+        "diagnosis": diagnosis or [
+            "No anomaly detected — balance state appears coherent with activity."
+        ],
+        "recent_ledger": [
+            {
+                "id": r.id,
+                "event_type": r.event_type,
+                "bucket": r.bucket,
+                "amount": float(r.amount),
+                "balance_after": float(r.balance_after),
+                "denied": bool(r.metadata_json and r.metadata_json.get("denied")),
+                "reason": (r.metadata_json or {}).get("reason"),
+                "model": r.model,
+                "provider": r.provider,
+                "created_at": r.created_at.isoformat(),
+            } for r in ledger_rows
+        ],
+        "recent_proxy_events": [
+            {
+                "id": r.id,
+                "provider": r.provider,
+                "model": r.model,
+                "operation_type": r.operation_type,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "cost_cents": r.cost_cents,
+                "status": r.status,
+                "created_at": r.created_at.isoformat(),
+            } for r in proxy_rows
+        ],
+    }
+
+
+# ── Lightweight preflight endpoint for the agent ──────────────────
+
+
+class PreflightResponse(BaseModel):
+    enforcement_enabled: bool
+    sufficient: bool
+    bucket: str
+    remaining: float
+    reason: Optional[str] = None
+    plan_id: str
+    plan_display_name: str
+    period_end: datetime
+
+
+@router.get("/preflight", response_model=PreflightResponse)
+async def credit_preflight(
+    bucket: str = Query("message", regex="^(message|integration)$"),
+    required: float = Query(0.5, ge=0),
+    x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
+    x_agent_user_id: Optional[str] = Header(None, alias="X-Agent-User-Id"),
+    db: AsyncSession = Depends(get_db),
+) -> PreflightResponse:
+    """Cheap preflight read for tenant agents.
+
+    The agent can call this to refresh its in-process CreditState
+    without burning a deduct — useful at agent boot (so the first
+    chat call doesn't fail-open through CreditState's cold start)
+    and before scheduled routines fire (to skip cleanly).
+
+    Authenticated via X-Agent-Key matched against AgentConfig.
+    """
+    if not x_agent_key or not x_agent_user_id:
+        raise HTTPException(401, "X-Agent-Key + X-Agent-User-Id required")
+
+    cfg_q = await db.execute(
+        select(AgentConfig).where(
+            AgentConfig.user_id == x_agent_user_id,
+            AgentConfig.agent_api_key == x_agent_key,
+        )
+    )
+    if cfg_q.scalar_one_or_none() is None:
+        raise HTTPException(403, "agent key mismatch")
+
+    from decimal import Decimal as _Dec
+    from app.services.credit_service import (
+        BUCKET_MESSAGE, BUCKET_INTEGRATION,
+    )
+    bucket_const = BUCKET_MESSAGE if bucket == "message" else BUCKET_INTEGRATION
+
+    view = await credit_service.get_balance_view(db, x_agent_user_id)
+    check = await credit_service.check_balance(
+        db, x_agent_user_id, bucket_const, _Dec(str(required)),
+    )
+    await db.commit()
+
+    remaining = (
+        view.message_credits_remaining if bucket == "message"
+        else view.integration_credits_remaining
+    )
+    return PreflightResponse(
+        enforcement_enabled=view.enforcement_enabled,
+        sufficient=check.success,
+        bucket=bucket,
+        remaining=float(remaining),
+        reason=check.reason,
+        plan_id=view.plan_id,
+        plan_display_name=view.plan_display_name,
+        period_end=view.period_end,
+    )

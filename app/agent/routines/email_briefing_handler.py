@@ -229,6 +229,26 @@ class EmailBriefingHandler:
         self._writer = writer
 
     async def execute(self, routine: Any, run: Any, db: AsyncSession) -> RoutineResult:
+        # Credit pre-flight: skip cleanly when the user is already out
+        # of message credits. Avoids burning a Gmail integration call
+        # (charged to the integration bucket) just to drop the LLM
+        # summary step. raise_if_exhausted() uses in-process state from
+        # the last platform reply — cold-start fires fall through and
+        # the LLM step's normal 402 handling takes over.
+        try:
+            from app.services.credit_reporter import raise_if_exhausted
+            from app.services.credit_exhausted import OutOfCreditsError
+            try:
+                raise_if_exhausted()
+            except OutOfCreditsError as _oce:
+                return RoutineResult(
+                    status="skipped",
+                    error_class="insufficient_credits",
+                    error_detail=_oce.response.message[:300],
+                )
+        except ImportError:
+            pass
+
         cfg = routine.config_json or {}
         mcp = self._mcp_client
         if mcp is None:

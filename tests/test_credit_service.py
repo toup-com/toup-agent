@@ -144,7 +144,14 @@ async def test_try_charge_idempotent(credit_user, monkeypatch):
 
 
 async def test_try_charge_denies_when_enforced_and_insufficient(credit_user, monkeypatch):
-    """Enforcement ON + amount > remaining → denied with insufficient_message_credits."""
+    """Enforcement ON + amount > remaining → denied with insufficient_message_credits.
+
+    Free tier has a daily_cap of 5 — draining the monthly bucket via
+    repeated small charges would trip DAILY_CAP_EXCEEDED first, masking
+    the INSUFFICIENT_MESSAGE branch we're trying to exercise. Charge a
+    single amount > monthly_remaining instead so the amount-vs-remaining
+    check fires before the daily-cap check.
+    """
     from app.config import settings
     from app.db import async_session_maker
     from app.db.models import LEDGER_CHAT_MESSAGE
@@ -154,15 +161,9 @@ async def test_try_charge_denies_when_enforced_and_insufficient(credit_user, mon
     monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
 
     async with async_session_maker() as db:
-        # Drain the bucket first.
-        await credit_service.try_charge(
-            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("30"),
-            idempotency_key="drain",
-        )
-        await db.commit()
-    async with async_session_maker() as db:
+        # Try to spend more than the entire monthly grant (30 credits).
         result = await credit_service.try_charge(
-            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("1.0"),
+            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("31"),
             idempotency_key="should-deny",
         )
         await db.commit()

@@ -268,6 +268,11 @@ class AnthropicService:
                 "(or activate bundle mode with TOUP_TOKEN) and try again."
             )
         max_tokens = max_tokens or self.default_max_tokens
+        # Pre-flight: gate on the last known credit state. See
+        # services/credit_reporter.py for the rationale.
+        from app.services.credit_reporter import raise_if_exhausted
+        raise_if_exhausted()
+
         messages = _convert_messages_for_anthropic(messages)
         # TKT-LAT-001: mark the final message block cacheable so the
         # conversation prefix participates in Anthropic's 5-minute cache.
@@ -400,6 +405,11 @@ class AnthropicService:
             )
         model = model or self.default_model
         max_tokens = max_tokens or self.default_max_tokens
+
+        # Pre-flight: gate on the last known credit state.
+        from app.services.credit_reporter import raise_if_exhausted
+        raise_if_exhausted()
+
         messages = _convert_messages_for_anthropic(messages)
         # TKT-LAT-001: mark the final message block cacheable so the
         # conversation prefix participates in Anthropic's 5-minute cache.

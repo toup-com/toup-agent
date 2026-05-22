@@ -1745,6 +1745,18 @@ async def ws_chat(
                     except Exception:
                         logger.exception("on_credential_confirm_request send_json failed")
 
+                async def on_credit_exhausted(payload: dict):
+                    """Forward the exhausted-balance card payload to the client.
+
+                    Carries `monthly_reset_at` / `daily_reset_at` ISO
+                    timestamps so the frontend can render a live
+                    countdown without trusting server clock skew.
+                    """
+                    try:
+                        await websocket.send_json(payload)
+                    except Exception:
+                        logger.exception("on_credit_exhausted send_json failed")
+
                 # Collect build job info during tool execution for later persistence
                 _pending_job_cards: list = []
 
@@ -1907,6 +1919,7 @@ async def ws_chat(
                     on_tool_end=on_tool_end,
                     on_attachment=on_attachment,
                     on_credential_confirm_request=on_credential_confirm_request,
+                    on_credit_exhausted=on_credit_exhausted,
                     model_override=model,
                     save_user_message=not is_onboarding_msg and not _user_msg_presaved and not _is_system_action,
                     media_paths=_media_paths if _media_paths else None,
