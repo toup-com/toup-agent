@@ -516,6 +516,52 @@ async def init_db():
         # NL prompt for `kind='agent_task'`. Nullable for existing rows.
         "ALTER TABLE routines ADD COLUMN IF NOT EXISTS name VARCHAR(100)",
         "ALTER TABLE routines ADD COLUMN IF NOT EXISTS prompt_text TEXT",
+        # Reminder shapes (alembic 042). Without these, `routines__remind`
+        # fails INSERT with "column schedule_kind of relation routines does
+        # not exist" the moment the user asks the agent to set ANY
+        # reminder — diagnosed live on 2026-05-21 across three tenants
+        # (mrhx, sam, parmida) whose schemas were created by an earlier
+        # `create_all` snapshot. Mirrors mig 042 verbatim so fresh agent
+        # boots self-heal without an alembic upgrade.
+        "ALTER TABLE routines ADD COLUMN IF NOT EXISTS schedule_kind VARCHAR(20)",
+        "ALTER TABLE routines ADD COLUMN IF NOT EXISTS schedule_at TIMESTAMP",
+        "ALTER TABLE routines ADD COLUMN IF NOT EXISTS schedule_interval_seconds INTEGER",
+        "ALTER TABLE routines ADD COLUMN IF NOT EXISTS schedule_window_start_local VARCHAR(10)",
+        "ALTER TABLE routines ADD COLUMN IF NOT EXISTS schedule_window_end_local VARCHAR(10)",
+        "ALTER TABLE routines ADD COLUMN IF NOT EXISTS auto_disable_after_fire BOOLEAN",
+        "ALTER TABLE routines ADD COLUMN IF NOT EXISTS reminder_text TEXT",
+        # One-active-per-kind partial UNIQUE (alembic 041 + 053a). The
+        # current predicate exempts agent_task AND reminder — without
+        # `reminder` in the exempt list, a user's second reminder
+        # 409s with "An enabled 'reminder' routine already exists"
+        # which the model paraphrases as a misleading "wired to
+        # Telegram" reply (root-cause for PR #59). Drop+recreate so
+        # the predicate is correct regardless of which alembic state
+        # we land in.
+        "DROP INDEX IF EXISTS uq_routines_one_per_kind",
+        "CREATE UNIQUE INDEX uq_routines_one_per_kind "
+        "ON routines (user_id, kind) "
+        "WHERE enabled = true AND kind NOT IN ('agent_task', 'reminder')",
+        # Routine-run terminal mapping (alembic 040). Same self-heal
+        # rationale — without these the routine runner's UPDATE of
+        # routine_runs after fire 500s.
+        "ALTER TABLE routine_runs ADD COLUMN IF NOT EXISTS outcome VARCHAR(30)",
+        "ALTER TABLE routine_runs ADD COLUMN IF NOT EXISTS retry_attempt INTEGER",
+        "ALTER TABLE routine_runs ADD COLUMN IF NOT EXISTS retry_of_run_id VARCHAR(36)",
+        "ALTER TABLE routine_runs ADD COLUMN IF NOT EXISTS latency_ms INTEGER",
+        "ALTER TABLE routine_runs ADD COLUMN IF NOT EXISTS delivery_json TEXT",
+        # Unified-jobs mirrors (alembic 047 + 048). Adds the `job_id`
+        # backreference column on the legacy event tables so the runner's
+        # dual-write phase (now removed; mig 050 drops these tables in a
+        # later opt-in step) doesn't 500 if the migration didn't run.
+        "ALTER TABLE trigger_events ADD COLUMN IF NOT EXISTS job_id VARCHAR(36)",
+        "ALTER TABLE routine_runs ADD COLUMN IF NOT EXISTS job_id VARCHAR(36)",
+        # CronJob backfill pointer (alembic 042 — paired with the
+        # routines schedule shapes above). Lets the cron→routine
+        # migrator stamp each legacy cron_jobs row with its new routine
+        # id. Column is harmless on platform DBs where cron_jobs has 0
+        # rows; load-bearing for tenant DBs mid-cutover.
+        "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS migrated_to_routine_id VARCHAR(36)",
         # Triggers (event-driven automations — Gate T1). `triggers` and
         # `trigger_events` tables are created by Base.metadata.create_all
         # on fresh containers; these ALTERs ensure idempotent re-runs on
