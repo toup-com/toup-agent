@@ -725,7 +725,37 @@ async def upgrade_tenant_image(
 
     async with _bridge_client(timeout_s or settings.bridge_upgrade_timeout_s) as client:
         r = await client.post(endpoint, json=body)
-        if r.status_code == 404:
+        if r.status_code == 404 and use_blue_green:
+            # The bridge may not have the blue-green endpoint deployed
+            # yet (older bridge image, or it was rolled back). Distinguish
+            # "endpoint missing" (the route itself is unknown) from
+            # "container not found" (tenant has no container) by checking
+            # the tenant whois endpoint first. If the tenant exists on
+            # the bridge, the 404 is the route — fall back to legacy
+            # /upgrade so canary doesn't false-abort with
+            # "orphan tenant" when the real issue is bridge capability.
+            # Self-heals once the bridge is updated.
+            try:
+                whois = await client.get(f"/v1/tenants/{prefix}/whois")
+                tenant_exists = whois.status_code == 200
+            except Exception:
+                tenant_exists = False
+            if tenant_exists:
+                logger.warning(
+                    "[rollout] bridge has no /blue-green-upgrade route; "
+                    "falling back to legacy /upgrade for tenant=%s",
+                    prefix,
+                )
+                # Drop blue-green-only field before retrying legacy endpoint
+                body.pop("drain_timeout_s", None)
+                r = await client.post(f"/v1/tenants/{prefix}/upgrade", json=body)
+                if r.status_code == 404:
+                    # Now it's a real "container not found" — surface it
+                    raise BridgeContainerNotFound(prefix=prefix, raw=r.text[:200])
+            else:
+                # Tenant really has no container on the bridge — orphan.
+                raise BridgeContainerNotFound(prefix=prefix, raw=r.text[:200])
+        elif r.status_code == 404:
             # Tenant has no container on the bridge — orphan. The bridge
             # legitimately can't upgrade what doesn't exist; the rollout
             # service should record the attempt as failed and SKIP the
