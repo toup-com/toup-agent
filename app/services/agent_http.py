@@ -86,5 +86,3 @@ def reset_for_test() -> None:
     global _client
     _client = None
 
-
-# CI re-trigger marker (wave 2): forces GitHub Actions to evaluate this commit
