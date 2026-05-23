@@ -486,6 +486,33 @@ def _frontend_complete_url(*, token: str, is_new: bool, redirect: Optional[str],
     return f"{landing}#{'&'.join(parts)}"
 
 
+def _pick_google_display_name(info: dict, email: str) -> str:
+    # Google's userinfo can ship any subset of {given_name, family_name,
+    # name}. Prefer the structured pair when we have at least one half —
+    # joining lets locales that order surname-first (e.g. Japanese,
+    # Hungarian) keep Google's own ordering rather than us guessing.
+    # Final fallback is the email local-part so the User row's `name`
+    # column never lands NULL on a Google signup (admin user list +
+    # avatar initials both render `name || email`, so NULL works, but
+    # populated is friendlier and matches what the user typed into
+    # Google).
+    #
+    # No transliteration: `name` is stored as UTF-8 end-to-end so
+    # Persian / Arabic / CJK names render correctly in the admin panel
+    # and chat sidebar. Only sanitisation is whitespace trimming.
+    given = (info.get("given_name") or "").strip()
+    family = (info.get("family_name") or "").strip()
+    if given or family:
+        return f"{given} {family}".strip()
+    full = (info.get("name") or "").strip()
+    if full:
+        return full
+    local = (email or "").split("@", 1)[0].strip()
+    # Cap to the column's String(255) limit defensively; Gmail addresses
+    # max out at 64 chars locally so this is mostly belt-and-braces.
+    return local[:64] if local else "User"
+
+
 @router.get("/google/callback")
 async def google_auth_callback(
     request: Request,
@@ -626,7 +653,7 @@ async def google_auth_callback(
             )},
         )
     email_verified = bool(info.get("email_verified", False))
-    display_name = (info.get("name") or info.get("given_name") or "").strip() or None
+    display_name = _pick_google_display_name(info, email)
 
     # Find or create user.
     existing = await get_user_by_email(db, email)
