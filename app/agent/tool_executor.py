@@ -211,6 +211,34 @@ def _is_app_building_write(file_path: str, content: str) -> bool:
     return False
 
 
+async def _read_subagent_flag_for_user(user_id: str) -> bool:
+    """Read ``agent_configs.subagent_spawning_enabled`` for a user.
+
+    Returns False on any error (DB unavailable, column missing on an
+    agent that's lagging the migration, no row for the user, etc.) —
+    the kill-switch defaults safe and the env-var path
+    (``settings.subagent_spawning_enabled``) is the global override.
+
+    Called from ``_tool_spawn`` only when the env-var is False, so the
+    DB roundtrip happens at most once per spawn attempt. Spawn is a
+    rare, turn-level operation; no caching is justified.
+    """
+    if not user_id:
+        return False
+    try:
+        from sqlalchemy import select
+        from app.db import async_session_maker, AgentConfig
+        async with async_session_maker() as db:
+            row = (await db.execute(
+                select(AgentConfig.subagent_spawning_enabled).where(
+                    AgentConfig.user_id == user_id
+                )
+            )).scalar_one_or_none()
+            return bool(row) if row is not None else False
+    except Exception:
+        return False
+
+
 class ToolExecutor:
     """Executes agent tools and returns results as strings.
 
@@ -1985,7 +2013,19 @@ class ToolExecutor:
                 timeout = None
 
         # ── Path A: unified-job sub-agent (kill switch ON) ───────
-        if _cfg.subagent_spawning_enabled:
+        # The kill-switch can be flipped two ways:
+        #   1. SUBAGENT_SPAWNING_ENABLED=true in the agent's env (the
+        #      mig-056-era path, requires bridge whitelist forwarding
+        #      which is not yet wired on the production bridge).
+        #   2. agent_configs.subagent_spawning_enabled=TRUE for this
+        #      tenant (mig 057). Lets ops flip per-tenant via SQL
+        #      without redeploying the bridge or recreating the
+        #      container. Read at spawn-time (rare path; single
+        #      indexed lookup is cheaper than env-var roundtripping).
+        spawning_enabled = bool(_cfg.subagent_spawning_enabled)
+        if not spawning_enabled:
+            spawning_enabled = await _read_subagent_flag_for_user(user_id)
+        if spawning_enabled:
             from app.agent.subagent_orchestrator import spawn_subagent
             # The parent's current job_id is plumbed through the
             # tool executor as ``_current_job_id`` so the orchestrator

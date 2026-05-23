@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field, field_validator
 #
 # `tests/test_bridge_contract.py` enforces this — bumping the constant
 # without updating the snapshot (or vice versa) fails CI.
-BRIDGE_SCHEMA_VERSION = 1
+BRIDGE_SCHEMA_VERSION = 2
 
 
 class AgentEnvContract(BaseModel):
@@ -91,6 +91,16 @@ class AgentEnvContract(BaseModel):
     enable_day_recall: bool = Field(
         default=False,
         description="recall_day tool + archival summaries. Opt-in per tenant.",
+    )
+    subagent_spawning_enabled: bool = Field(
+        default=False,
+        description=(
+            "Routes the `spawn` tool to the new orchestrator "
+            "(channels: web/extension/voice/telegram) instead of the "
+            "legacy Telegram-only SubAgentManager. Default False so "
+            "fresh tenants stay on legacy until ops opts them in by "
+            "flipping agent_configs.subagent_spawning_enabled."
+        ),
     )
 
     # ── Validators ─────────────────────────────────────────────────

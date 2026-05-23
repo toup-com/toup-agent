@@ -299,6 +299,15 @@ def _agent_config_to_bridge_body(agent_config: Optional[AgentConfig]) -> dict:
         out["whatsapp_self_e164"] = agent_config.whatsapp_self_e164
     if getattr(agent_config, "whatsapp_baileys_allowlist", None):
         out["whatsapp_baileys_allowlist"] = agent_config.whatsapp_baileys_allowlist
+    # Sub-agent spawning kill-switch (alembic 057). Forwarded ONLY
+    # when True so existing tenants with the default-False column
+    # don't get a redundant SUBAGENT_SPAWNING_ENABLED=false line in
+    # their .env (the agent's pydantic-settings default is already
+    # False). Flipping this column for a tenant + recreate-container
+    # writes SUBAGENT_SPAWNING_ENABLED=true into the .env so spawn
+    # routes to the new orchestrator instead of legacy.
+    if getattr(agent_config, "subagent_spawning_enabled", False):
+        out["subagent_spawning_enabled"] = True
     return out
 
 

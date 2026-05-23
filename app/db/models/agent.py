@@ -330,6 +330,18 @@ class AgentConfig(Base):
     # Tool access control
     disabled_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default="")
 
+    # Sub-agent spawning kill-switch (migration 057). FALSE means the
+    # `spawn` tool routes to the legacy Telegram-only SubAgentManager;
+    # TRUE wires it to the new orchestrator (channels: web, extension,
+    # voice, telegram). Forwarded into the tenant container's `.env`
+    # via _agent_config_to_bridge_body so the agent's
+    # `settings.subagent_spawning_enabled` reads it at boot. Default
+    # False so a fresh tenant can't accidentally use the new path
+    # before ops opts them in.
+    subagent_spawning_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     # Connect token
     connect_token: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 

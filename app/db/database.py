@@ -351,6 +351,13 @@ async def init_db():
         # net mirrors the claude_code_oauth_token entry above and
         # guarantees schema-completeness regardless of alembic state.
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS openai_codex_token VARCHAR(2000)",
+        # Sub-agent spawning kill-switch (alembic 057). Mirrored here
+        # per the READ-FIRST rule in MEMORY.md — agents boot via
+        # init_db, NOT alembic upgrade. Without this, every SELECT
+        # from agent_configs 500s with "column agent_configs.
+        # subagent_spawning_enabled does not exist" the moment an
+        # agent rolls to a build that references the new column.
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS subagent_spawning_enabled BOOLEAN NOT NULL DEFAULT FALSE",
         # ── Connector identities ──
         # Per-identity read-only switch (2026-05-11). True means the
         # MCP tool filter drops every manifest tool with mutates=true
