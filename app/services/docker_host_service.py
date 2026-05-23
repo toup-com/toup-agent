@@ -798,6 +798,35 @@ async def upgrade_tenant_image(
     if container:
         container.image_tag = image_tag
         await db.commit()
+
+    # Defensive process restart. Bridge bug observed 2026-05-23: the
+    # ``/upgrade`` endpoint pulls the new image AND updates the
+    # tenant's bind-mounted code, but does NOT actually restart the
+    # uvicorn process. Result: every tenant on every rollout ran
+    # stale code in memory until a manual restart was triggered.
+    # Audit across 4 tenants showed processes running from 27s to
+    # 1d11h while their image_tag column showed the new tag.
+    # ``/restart`` is idempotent and quick (~3-5s) — costs less than
+    # a single rollout retry. Blue-green tenants get an extra restart
+    # of their already-fresh process; tolerable given the cost ratio.
+    # Failures here MUST NOT fail the upgrade — bridge already
+    # confirmed the image swap; restart is belt-and-suspenders.
+    try:
+        async with _bridge_client(timeout_s or settings.bridge_upgrade_timeout_s) as client:
+            rr = await client.post(f"/v1/tenants/{prefix}/restart")
+            if rr.status_code >= 400:
+                logger.warning(
+                    "[rollout] defensive restart returned %d for tenant=%s; "
+                    "process may still be on stale code. raw=%s",
+                    rr.status_code, prefix, rr.text[:200],
+                )
+    except Exception as e:
+        logger.warning(
+            "[rollout] defensive restart raised for tenant=%s: %s — "
+            "process may be on stale code, manual restart required",
+            prefix, e,
+        )
+
     return data
 
 
