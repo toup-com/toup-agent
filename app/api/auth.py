@@ -380,19 +380,38 @@ def _google_auth_callback_url() -> str:
     return f"{base}/api/auth/google/callback"
 
 
-def _google_auth_credentials() -> tuple[str, str]:
-    """Resolve (client_id, client_secret). Raises 503 on missing config
-    so the API failure mode is observable rather than a silent redirect
-    to a broken Google consent screen."""
-    cid = (getattr(settings, "google_oauth_client_id", "") or "").strip()
-    csec = (getattr(settings, "google_oauth_client_secret", "") or "").strip()
+async def _google_auth_credentials() -> tuple[str, str]:
+    """Resolve (client_id, client_secret).
+
+    Reads from the same source the Gmail connector uses
+    (`provider_apps.get_provider_app_async`), which transparently
+    consults the `provider_app_credentials` table FIRST then falls back
+    to the env-var snapshot. The admin UI saves Google credentials to
+    that table — reusing the resolver means a single Google OAuth
+    client powers both connector OAuth (Gmail / Drive / Calendar) and
+    sign-in OAuth without the operator having to set duplicate env
+    vars.
+
+    Raises HTTPException(400) on missing config — NOT 503 — because
+    Cloudflare's origin-shield Worker substitutes a branded "Updating
+    Toup" page for any 5xx response on toup.ai/*. A 400 surfaces the
+    real reason to the operator; sign-in misconfiguration is a
+    client/config problem, not a server outage.
+    """
+    from app.services.provider_apps import get_provider_app_async
+    app_cfg = await get_provider_app_async("google")
+    cid = (app_cfg.client_id if app_cfg else "").strip()
+    csec = (app_cfg.client_secret if app_cfg else "").strip()
     if not cid or not csec:
         raise HTTPException(
-            status_code=503,
+            status_code=400,
             detail=(
-                "Google sign-in isn't configured on this deploy — set "
-                "GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET, "
-                "and add the callback URL to the Google Cloud Console."
+                "Google sign-in isn't configured. An operator needs to "
+                "save Google OAuth credentials via the admin Connectors "
+                "UI (or set GOOGLE_OAUTH_CLIENT_ID + "
+                "GOOGLE_OAUTH_CLIENT_SECRET in env) AND add "
+                f"{_google_auth_callback_url()} to the Google Cloud "
+                "Console project's Authorized Redirect URIs."
             ),
         )
     return cid, csec
@@ -410,10 +429,22 @@ async def google_auth_start(
     server-side — if the email is new we create the user, if it's known
     we just log them in). The frontend uses it to choose post-callback
     copy ("Welcome!" vs "Welcome back!"); we round-trip it through state.
+
+    Returns JSON `{"authorize_url": ...}` so the frontend can do a
+    top-level `window.location.assign(authorize_url)`. We deliberately
+    do NOT 307-redirect from this endpoint anymore:
+
+      * Cloudflare's origin-shield Worker on toup.ai/* substitutes a
+        branded "Updating Toup" page for ANY 5xx response. Letting the
+        frontend handle the navigation puts a same-origin XHR / fetch
+        in front of that Worker — the Worker only catches navigations,
+        so a fetch sees the real backend response (errors and all).
+      * Browser back-button behavior is cleaner: the user is never
+        parked on `/api/auth/google/start` in their history.
     """
     import urllib.parse
 
-    client_id, _ = _google_auth_credentials()
+    client_id, _ = await _google_auth_credentials()
     signed_state = _sign_signin_state(mode=mode, redirect=redirect)
 
     params = {
@@ -434,10 +465,7 @@ async def google_auth_start(
     authorize_url = (
         f"{_GOOGLE_AUTH_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
     )
-    return Response(
-        status_code=307,
-        headers={"Location": authorize_url, "Cache-Control": "no-store"},
-    )
+    return {"authorize_url": authorize_url}
 
 
 def _frontend_complete_url(*, token: str, is_new: bool, redirect: Optional[str], error: Optional[str] = None) -> str:
@@ -495,7 +523,7 @@ async def google_auth_callback(
             )},
         )
 
-    client_id, client_secret = _google_auth_credentials()
+    client_id, client_secret = await _google_auth_credentials()
 
     # Verify state — rejects expired (>10min) and tampered states.
     try:
