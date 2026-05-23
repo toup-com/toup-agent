@@ -214,27 +214,44 @@ def _is_app_building_write(file_path: str, content: str) -> bool:
 async def _read_subagent_flag_for_user(user_id: str) -> bool:
     """Read ``agent_configs.subagent_spawning_enabled`` for a user.
 
-    Returns False on any error (DB unavailable, column missing on an
-    agent that's lagging the migration, no row for the user, etc.) —
-    the kill-switch defaults safe and the env-var path
-    (``settings.subagent_spawning_enabled``) is the global override.
+    On the tenant agent process the local DB is partitioned —
+    agent_configs lives ONLY on the platform DB. So we fetch the
+    flag via the platform HTTP callback at
+    ``GET /api/agent/runtime-flags`` (auth: X-Agent-Key +
+    X-Agent-User-Id, same contract as streaming.py / credits.py).
+
+    Returns False on any error (platform unreachable, 403, no
+    agent_api_key configured, network timeout, etc.) — the kill-
+    switch defaults safe and the env-var path
+    (``settings.subagent_spawning_enabled``) remains the global
+    override.
 
     Called from ``_tool_spawn`` only when the env-var is False, so the
-    DB roundtrip happens at most once per spawn attempt. Spawn is a
+    HTTP roundtrip happens at most once per spawn attempt. Spawn is a
     rare, turn-level operation; no caching is justified.
     """
     if not user_id:
         return False
     try:
-        from sqlalchemy import select
-        from app.db import async_session_maker, AgentConfig
-        async with async_session_maker() as db:
-            row = (await db.execute(
-                select(AgentConfig.subagent_spawning_enabled).where(
-                    AgentConfig.user_id == user_id
-                )
-            )).scalar_one_or_none()
-            return bool(row) if row is not None else False
+        from app.config import settings as _settings
+        import httpx
+        platform_url = (getattr(_settings, "platform_api_url", "") or "").rstrip("/")
+        agent_key = (getattr(_settings, "agent_api_key", "") or "").strip()
+        if not platform_url or not agent_key:
+            # Self-hosted or misconfigured tenant: no callback target.
+            # Fail closed — the env-var path is the only enable lever.
+            return False
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(
+                f"{platform_url}/agent/runtime-flags",
+                headers={
+                    "X-Agent-Key": agent_key,
+                    "X-Agent-User-Id": user_id,
+                },
+            )
+        if r.status_code != 200:
+            return False
+        return bool(r.json().get("subagent_spawning_enabled", False))
     except Exception:
         return False
 

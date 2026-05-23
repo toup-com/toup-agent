@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import desc, select, and_
 
-from app.db import get_db, Memory, Entity, EntityLink
+from app.db import get_db, Memory, Entity, EntityLink, AgentConfig
 from app.db.models import AgentSecurityEvent, EVENT_AGENT_KEY_ROTATED
 from app.schemas import (
     AgentStoreRequest, AgentRecallRequest, AgentRecallResponse,
@@ -536,4 +536,70 @@ async def mcp_cache_status(request: Request):
         consecutive_failures=getattr(cache, "consecutive_failures", 0),
         last_error=getattr(cache, "last_error", None),
         is_fresh=cache.is_fresh(),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Runtime feature flags — read by the tenant agent process.
+# ──────────────────────────────────────────────────────────────────────
+#
+# The tenant agent's DB is partitioned (PLATFORM_ONLY_TABLES excludes
+# agent_configs), so the agent process CAN'T `SELECT
+# subagent_spawning_enabled FROM agent_configs` against its own DB —
+# the table doesn't exist there. The flag lives on the platform DB,
+# which only the platform-api can reach.
+#
+# This endpoint gives the agent process a way to read per-tenant
+# runtime flags without growing a second DB connection pool. Auth is
+# the standard multi-tenant X-Agent-Key contract: the agent sends its
+# own ``agent_api_key`` + ``user_id``, the platform validates them
+# against the same row on agent_configs and returns the row's flag
+# values. A wrong key for a known user returns 403, not 404, so a
+# leaked-key probe can't enumerate user_ids.
+
+
+class AgentRuntimeFlagsResponse(BaseModel):
+    """Per-tenant runtime flag payload. Add new flags as fields here
+    — keep the keys snake_case so they pair 1:1 with the
+    ``agent_configs`` column names."""
+    subagent_spawning_enabled: bool
+
+
+@router.get("/runtime-flags", response_model=AgentRuntimeFlagsResponse)
+async def get_runtime_flags(
+    x_agent_key: Optional[str] = Header(default=None, alias="X-Agent-Key"),
+    x_agent_user_id: Optional[str] = Header(default=None, alias="X-Agent-User-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the tenant's runtime flag values from the platform DB.
+
+    Called from the agent process (``_read_subagent_flag_for_user`` in
+    ``tool_executor.py``) at spawn-time. Single indexed lookup —
+    ``agent_configs(user_id)`` is UNIQUE.
+
+    Auth: same X-Agent-Key + X-Agent-User-Id contract used by
+    ``streaming.py``, ``credits.py``, etc. Validates the (user, key)
+    pair against the agent_configs row so a tenant can only read its
+    own flags. 401 on missing headers, 403 on key mismatch."""
+    if not x_agent_key or not x_agent_user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="X-Agent-Key + X-Agent-User-Id required",
+        )
+
+    cfg = (await db.execute(
+        select(AgentConfig).where(
+            and_(
+                AgentConfig.user_id == x_agent_user_id,
+                AgentConfig.agent_api_key == x_agent_key,
+            )
+        )
+    )).scalar_one_or_none()
+    if cfg is None:
+        raise HTTPException(status_code=403, detail="agent key mismatch")
+
+    return AgentRuntimeFlagsResponse(
+        subagent_spawning_enabled=bool(
+            getattr(cfg, "subagent_spawning_enabled", False)
+        ),
     )

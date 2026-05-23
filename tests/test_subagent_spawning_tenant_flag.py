@@ -144,93 +144,126 @@ def test_agent_env_contract_emits_uppercase_env_key_when_true():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 4. Runtime DB-read path (the actual unlock)
+# 4. Runtime HTTP-callback path (the actual unlock on partitioned agents)
 # ──────────────────────────────────────────────────────────────────────
+#
+# The tenant agent process has a partitioned DB — agent_configs lives
+# ONLY on the platform DB. So the helper queries the platform via the
+# /agent/runtime-flags HTTP endpoint, auth'd with X-Agent-Key +
+# X-Agent-User-Id (the same multi-tenant contract used by
+# streaming.py, credits.py, etc).
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_database():
-    """Override conftest autouse — this test owns its own engine."""
+    """Override conftest autouse — this test doesn't need an engine."""
     yield
 
 
-@pytest_asyncio.fixture
-async def db_with_agent_configs(monkeypatch):
-    """In-memory SQLite with a minimal agent_configs table — enough
-    for _read_subagent_flag_for_user to query it."""
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///file:flagtest?mode=memory&cache=shared&uri=true",
-        connect_args={"check_same_thread": False, "uri": True},
-    )
-    async with engine.begin() as conn:
-        await conn.execute(sa.text(
-            "CREATE TABLE agent_configs ("
-            "  id VARCHAR(36) PRIMARY KEY,"
-            "  user_id VARCHAR(36) UNIQUE NOT NULL,"
-            "  subagent_spawning_enabled BOOLEAN NOT NULL DEFAULT 0"
-            ")"
-        ))
-    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+@pytest.fixture
+def fake_settings(monkeypatch):
+    """Wire ``settings.platform_api_url`` + ``settings.agent_api_key``
+    so the helper has a callback target to reach."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "platform_api_url", "https://toup.ai/api", raising=False)
+    monkeypatch.setattr(settings, "agent_api_key", "toup_ak_testkey_xxxxxxxx", raising=False)
+    return settings
 
-    import app.db.database as db_database
-    import app.db as app_db
-    monkeypatch.setattr(db_database, "engine", engine)
-    monkeypatch.setattr(db_database, "async_session_maker", session_maker)
-    monkeypatch.setattr(app_db, "async_session_maker", session_maker)
 
-    yield session_maker
-    await engine.dispose()
+def _patch_httpx(monkeypatch, response_status: int, response_body: dict | None = None,
+                 raise_exc: Exception | None = None,
+                 capture: dict | None = None):
+    """Patch ``httpx.AsyncClient`` so the helper hits a fake response.
+
+    capture: optional dict that records the outgoing (url, headers)
+    so tests can assert the auth surface is correct."""
+    import httpx
+
+    class _FakeResp:
+        def __init__(self, status, body):
+            self.status_code = status
+            self._body = body or {}
+        def json(self):
+            return self._body
+
+    class _FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, headers=None, **_):
+            if capture is not None:
+                capture["url"] = url
+                capture["headers"] = dict(headers or {})
+            if raise_exc is not None:
+                raise raise_exc
+            return _FakeResp(response_status, response_body)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
 
 
 @pytest.mark.asyncio
-async def test_read_subagent_flag_returns_true_when_column_true(
-    db_with_agent_configs,
+async def test_read_subagent_flag_returns_true_when_platform_says_true(
+    fake_settings, monkeypatch,
 ):
-    """The unlock path: SELECT subagent_spawning_enabled WHERE user_id=?
-    returns True when ops has flipped the column."""
+    """The unlock path: platform returns ``subagent_spawning_enabled=true``
+    → helper returns True. Pin the JSON-decode shape so a server-side
+    rename surfaces here."""
     from app.agent.tool_executor import _read_subagent_flag_for_user
+    capture: dict = {}
+    _patch_httpx(monkeypatch, 200, {"subagent_spawning_enabled": True}, capture=capture)
 
     uid = str(uuid.uuid4())
-    async with db_with_agent_configs() as s:
-        await s.execute(sa.text(
-            "INSERT INTO agent_configs (id, user_id, subagent_spawning_enabled) "
-            "VALUES (:id, :uid, 1)"
-        ), {"id": str(uuid.uuid4()), "uid": uid})
-        await s.commit()
-
     assert await _read_subagent_flag_for_user(uid) is True
+    # Verify the auth surface — wrong URL or missing header is a
+    # silent production-grade bug otherwise.
+    assert capture["url"] == "https://toup.ai/api/agent/runtime-flags"
+    assert capture["headers"].get("X-Agent-Key") == "toup_ak_testkey_xxxxxxxx"
+    assert capture["headers"].get("X-Agent-User-Id") == uid
 
 
 @pytest.mark.asyncio
-async def test_read_subagent_flag_returns_false_when_column_false(
-    db_with_agent_configs,
+async def test_read_subagent_flag_returns_false_when_platform_says_false(
+    fake_settings, monkeypatch,
 ):
-    """Default-False rows stay on the legacy path."""
+    """Default-False tenants stay on the legacy path."""
     from app.agent.tool_executor import _read_subagent_flag_for_user
-
-    uid = str(uuid.uuid4())
-    async with db_with_agent_configs() as s:
-        await s.execute(sa.text(
-            "INSERT INTO agent_configs (id, user_id, subagent_spawning_enabled) "
-            "VALUES (:id, :uid, 0)"
-        ), {"id": str(uuid.uuid4()), "uid": uid})
-        await s.commit()
-
-    assert await _read_subagent_flag_for_user(uid) is False
-
-
-@pytest.mark.asyncio
-async def test_read_subagent_flag_returns_false_for_unknown_user(
-    db_with_agent_configs,
-):
-    """No row for the user → fail closed."""
-    from app.agent.tool_executor import _read_subagent_flag_for_user
+    _patch_httpx(monkeypatch, 200, {"subagent_spawning_enabled": False})
     assert await _read_subagent_flag_for_user(str(uuid.uuid4())) is False
 
 
 @pytest.mark.asyncio
-async def test_read_subagent_flag_returns_false_for_empty_user_id():
-    """Empty/None user_id should short-circuit without a DB hit. Belt
+async def test_read_subagent_flag_returns_false_on_403(fake_settings, monkeypatch):
+    """403 (key mismatch / unknown user) MUST fail closed — bug-class
+    where a key gets rotated and the agent process still has the old
+    one. We don't want a rotation to silently break the kill-switch's
+    safety semantics in either direction."""
+    from app.agent.tool_executor import _read_subagent_flag_for_user
+    _patch_httpx(monkeypatch, 403)
+    assert await _read_subagent_flag_for_user(str(uuid.uuid4())) is False
+
+
+@pytest.mark.asyncio
+async def test_read_subagent_flag_returns_false_on_500(fake_settings, monkeypatch):
+    """Platform-side 5xx → fail closed."""
+    from app.agent.tool_executor import _read_subagent_flag_for_user
+    _patch_httpx(monkeypatch, 500)
+    assert await _read_subagent_flag_for_user(str(uuid.uuid4())) is False
+
+
+@pytest.mark.asyncio
+async def test_read_subagent_flag_returns_false_on_network_error(
+    fake_settings, monkeypatch,
+):
+    """Platform unreachable (timeout, ConnectError) → fail closed."""
+    import httpx
+    from app.agent.tool_executor import _read_subagent_flag_for_user
+    _patch_httpx(monkeypatch, 0, raise_exc=httpx.ConnectError("boom"))
+    assert await _read_subagent_flag_for_user(str(uuid.uuid4())) is False
+
+
+@pytest.mark.asyncio
+async def test_read_subagent_flag_returns_false_for_empty_user_id(fake_settings):
+    """Empty/None user_id short-circuits without an HTTP hit. Belt
     and suspenders — _tool_spawn rejects empty user_id earlier, but
     the helper should still be safe to call from anywhere."""
     from app.agent.tool_executor import _read_subagent_flag_for_user
@@ -239,29 +272,119 @@ async def test_read_subagent_flag_returns_false_for_empty_user_id():
 
 
 @pytest.mark.asyncio
-async def test_read_subagent_flag_swallows_db_errors():
-    """The helper MUST NOT raise on DB errors — a stale agent that
-    predates the migration would see "no such column" and that must
-    not blow up every spawn turn. Fail closed (return False)."""
+async def test_read_subagent_flag_returns_false_when_no_platform_url(monkeypatch):
+    """Self-hosted tenant with no platform_api_url → no callback target
+    → fail closed (env-var path is the only enable lever)."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "platform_api_url", "", raising=False)
+    monkeypatch.setattr(settings, "agent_api_key", "toup_ak_x", raising=False)
     from app.agent.tool_executor import _read_subagent_flag_for_user
+    assert await _read_subagent_flag_for_user(str(uuid.uuid4())) is False
 
-    # Force a session that has no agent_configs table at all.
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///file:flagtest-err?mode=memory&cache=shared&uri=true",
-        connect_args={"check_same_thread": False, "uri": True},
+
+@pytest.mark.asyncio
+async def test_read_subagent_flag_returns_false_when_no_agent_key(monkeypatch):
+    """Misconfigured tenant with no agent_api_key → fail closed."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "platform_api_url", "https://toup.ai/api", raising=False)
+    monkeypatch.setattr(settings, "agent_api_key", "", raising=False)
+    from app.agent.tool_executor import _read_subagent_flag_for_user
+    assert await _read_subagent_flag_for_user(str(uuid.uuid4())) is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 5. /api/agent/runtime-flags endpoint behaviour
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_endpoint_requires_x_agent_key_and_user_id_headers():
+    """Missing either header → 401. Pin the contract so a future
+    refactor that loosens auth lights up here."""
+    from fastapi import HTTPException
+    from app.api.agent import get_runtime_flags
+
+    # Missing both
+    with pytest.raises(HTTPException) as ei:
+        await get_runtime_flags(x_agent_key=None, x_agent_user_id=None, db=None)
+    assert ei.value.status_code == 401
+
+    # Missing user_id only
+    with pytest.raises(HTTPException) as ei:
+        await get_runtime_flags(x_agent_key="x", x_agent_user_id=None, db=None)
+    assert ei.value.status_code == 401
+
+    # Missing key only
+    with pytest.raises(HTTPException) as ei:
+        await get_runtime_flags(x_agent_key=None, x_agent_user_id="x", db=None)
+    assert ei.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_endpoint_returns_403_when_key_does_not_match():
+    """Wrong (user, key) pair → 403, NOT 404 (so a leaked key can't
+    enumerate user_ids via probe-with-known-user, probe-with-unknown-
+    user). The platform DB lookup uses ``AND user_id=? AND
+    agent_api_key=?``, so any mismatch lands here."""
+    from fastapi import HTTPException
+    from app.api.agent import get_runtime_flags
+
+    class _FakeDB:
+        async def execute(self, _stmt):
+            class _Res:
+                def scalar_one_or_none(self): return None
+            return _Res()
+
+    with pytest.raises(HTTPException) as ei:
+        await get_runtime_flags(
+            x_agent_key="wrong", x_agent_user_id="11111111-1111-1111-1111-111111111111",
+            db=_FakeDB(),
+        )
+    assert ei.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_endpoint_returns_flag_when_key_matches():
+    """Happy path: matching (user, key) pair returns the row's flag
+    value. ``subagent_spawning_enabled`` defaults False but operators
+    flip it to True for tenants that should use the new path."""
+    from app.api.agent import get_runtime_flags
+
+    class _FakeCfg:
+        subagent_spawning_enabled = True
+
+    class _FakeDB:
+        async def execute(self, _stmt):
+            class _Res:
+                def scalar_one_or_none(self): return _FakeCfg()
+            return _Res()
+
+    resp = await get_runtime_flags(
+        x_agent_key="right-key",
+        x_agent_user_id="22222222-2222-2222-2222-222222222222",
+        db=_FakeDB(),
     )
-    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    assert resp.subagent_spawning_enabled is True
 
-    import app.db.database as db_database
-    import app.db as app_db
-    original_db = db_database.async_session_maker
-    original_app = app_db.async_session_maker
-    db_database.async_session_maker = session_maker
-    app_db.async_session_maker = session_maker
-    try:
-        result = await _read_subagent_flag_for_user(str(uuid.uuid4()))
-        assert result is False
-    finally:
-        db_database.async_session_maker = original_db
-        app_db.async_session_maker = original_app
-        await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_endpoint_returns_false_when_column_value_is_false():
+    """Default-False rows return False — the legacy path stays
+    selected for tenants not yet rolled out."""
+    from app.api.agent import get_runtime_flags
+
+    class _FakeCfg:
+        subagent_spawning_enabled = False
+
+    class _FakeDB:
+        async def execute(self, _stmt):
+            class _Res:
+                def scalar_one_or_none(self): return _FakeCfg()
+            return _Res()
+
+    resp = await get_runtime_flags(
+        x_agent_key="right-key",
+        x_agent_user_id="33333333-3333-3333-3333-333333333333",
+        db=_FakeDB(),
+    )
+    assert resp.subagent_spawning_enabled is False
