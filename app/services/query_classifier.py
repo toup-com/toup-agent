@@ -173,19 +173,49 @@ _TRIVIAL_EXACT = {
     # Reactions
     "lol", "haha", "ha", "hahaha", "lmao", "lmfao", "wow", "omg",
     "yikes", "oof", "oops", "huh", "hmm", "uh", "uhh",
+    # Conversational openers (apostrophe-stripped variants too, since the
+    # is_trivial_query() check strips trailing punctuation but not interior).
+    "how's it going", "hows it going", "how is it going",
+    "how are you", "how r u", "how are ya", "how're you", "how are things",
+    "how's your day", "hows your day", "how's everything", "hows everything",
+    "what's up", "whats up", "wassup", "wazzup", "sup",
+    "you there", "are you there", "are you alive",
+    "long time no see", "good to see you", "miss you",
 }
 
-# Substring patterns for short factual questions that the agent can answer
-# from current context alone (date/time/day of week). These are intentionally
-# narrow — broader "what is X" stays non-trivial because the answer often
-# depends on user memory.
+# Substring patterns for short conversational openers + factual questions
+# that the agent can answer from current context alone. Two families:
+#
+#   1. Time/date/day questions (no user memory needed — agent has tz +
+#      current time in its system prompt).
+#   2. Conversational greetings / status-check openers — "how's it going",
+#      "how are you", "what's up", etc. These are social openers; the
+#      agent's response is a natural-language hello, not a memory recall.
+#
+# Both families are bounded by _TRIVIAL_MAX_WORDS (6) so a longer message
+# that happens to start with one of these phrases stays on the full path.
 _TRIVIAL_RE = re.compile(
     r"^("
-    r"what(?:'s| is)\s+the\s+(?:time|date|day|hour)"
-    r"|what\s+time\s+is\s+it"
-    r"|what\s+day\s+is\s+(?:it|today)"
-    r"|what(?:'s| is)\s+today"
+    # ── Time / date / day questions ───────────────────────────────
+    r"what(?:'s| is| s)?\s+the\s+(?:time|date|day|hour)"
+    r"|what(?:'s|s)?\s+time\s+is\s+it"
+    r"|what(?:'s|s)?\s+day\s+is\s+(?:it|today)"
+    r"|what(?:'s| is| s)?\s+today(?:'s\s+date)?"
     r"|tell\s+me\s+the\s+(?:time|date)"
+    # ── Conversational greetings / "how are you" family ───────────
+    # Apostrophe-optional to catch typos like "hows it going" without
+    # the apostrophe — see Toup chat 2026-05-23 12:06 PM screenshot.
+    r"|how(?:'s|s|\s+is)?\s+it\s+(?:going|been|hanging)"
+    r"|how(?:'re|re|\s+are)?\s+(?:you|ya|things|you\s+doing|you\s+doin|things\s+going)"
+    r"|how(?:'s|s|\s+is)?\s+(?:your\s+day|everything|life|stuff)"
+    r"|how(?:'ve|ve|\s+have)?\s+you\s+been(?:\s+(?:today|lately|recently|so\s+far|this\s+week))?"
+    r"|what(?:'s|s)?\s+(?:up|good|new|happening|going\s+on)"
+    r"|you\s+(?:there|good|ok|okay|alive|around)"
+    r"|are\s+you\s+(?:there|alive|good|ok|okay|around|busy)"
+    r"|still\s+(?:there|alive|with\s+me)"
+    r"|good\s+to\s+(?:see|hear\s+from)\s+you"
+    r"|long\s+time\s+no\s+(?:see|chat|talk)"
+    r"|miss\s+(?:you|me)"
     r")\s*[?!.]*\s*$",
     re.IGNORECASE,
 )
@@ -193,7 +223,7 @@ _TRIVIAL_RE = re.compile(
 # Hard cap on word count for the trivial classifier to even look at the
 # message. Anything longer almost certainly has enough content to benefit
 # from full context.
-_TRIVIAL_MAX_WORDS = 6
+_TRIVIAL_MAX_WORDS = 8  # bumped from 6 to fit "how have you been today"-class openers
 
 
 def is_trivial_query(text: str) -> bool:
