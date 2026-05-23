@@ -187,6 +187,12 @@ class AgentConfig(Base):
 
     # Step 2: LLM
     llm_mode: Mapped[str] = mapped_column(String(20), default="manual")
+    # Onboarding-v2 PR 2 (mig 057) — backfill column preserving the
+    # pre-v2 value of `llm_mode`. Set once by mig 057's upgrade(); the
+    # downgrade restores `llm_mode` from this. Stays NULL for users
+    # provisioned after the migration. Forensic / reversibility only —
+    # no business logic reads this column.
+    llm_mode_pre_v2: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     openai_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     anthropic_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     google_api_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)

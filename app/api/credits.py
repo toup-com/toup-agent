@@ -324,9 +324,26 @@ class CreditCheckoutResponse(BaseModel):
     url: str
 
 
+def _resolve_checkout_redirect(
+    base_url: str, *, candidate: Optional[str], default_path: str,
+) -> str:
+    """Pick a Stripe success/cancel URL, defending against open redirects.
+
+    The frontend may pass a same-origin path (e.g.
+    `/onboarding/install?upgraded=1&plan=builder`) — we accept any path
+    that starts with `/`, prefix it with the platform's public base
+    URL, and reject anything else by falling back to `default_path`.
+    """
+    if candidate and candidate.startswith("/"):
+        return f"{base_url}{candidate}"
+    return f"{base_url}{default_path}"
+
+
 @billing_router.post("/credit-checkout/{plan_id}", response_model=CreditCheckoutResponse)
 async def create_credit_checkout(
     plan_id: str,
+    return_url: Optional[str] = None,
+    cancel_url: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> CreditCheckoutResponse:
@@ -342,6 +359,11 @@ async def create_credit_checkout(
     Returns 503 with a clear, actionable error when the tier's price
     id isn't configured — operators see "set STRIPE_PRICE_ID_X in
     Railway" instead of a cryptic Stripe error.
+
+    Optional `return_url` / `cancel_url` accept a same-origin PATH
+    (e.g. `/onboarding/install?upgraded=1&plan=builder`) used by the
+    onboarding-v2 LLM step. Non-path candidates are ignored — Stripe
+    only ever sees a URL on the platform's public host.
     """
     from app.config import settings as _settings
     from app.api.billing import _ensure_stripe_customer
@@ -369,14 +391,22 @@ async def create_credit_checkout(
     customer_id = await _ensure_stripe_customer(user, db)
 
     base_url = (_settings.app_public_base_url or "https://toup.ai").rstrip("/")
+    success = _resolve_checkout_redirect(
+        base_url, candidate=return_url,
+        default_path=f"/account?upgrade=success&plan={plan_id}",
+    )
+    cancel = _resolve_checkout_redirect(
+        base_url, candidate=cancel_url,
+        default_path="/pricing?upgrade=cancelled",
+    )
     try:
         session = create_credit_checkout_session(
             customer_id=customer_id,
             price_id=plan.stripe_price_id,
             plan_id=plan_id,
             user_id=current_user.id,
-            success_url=f"{base_url}/account?upgrade=success&plan={plan_id}",
-            cancel_url=f"{base_url}/pricing?upgrade=cancelled",
+            success_url=success,
+            cancel_url=cancel,
         )
     except Exception as e:
         raise HTTPException(502, f"Stripe checkout creation failed: {e}")

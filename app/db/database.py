@@ -286,6 +286,12 @@ async def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_sent_at TIMESTAMP",
         # ── Agent configs ──
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_mode VARCHAR(20) DEFAULT 'manual'",
+        # Mig 057 (onboarding-v2 PR 2) — backfill column preserves the
+        # pre-v2 llm_mode value so the migration is reversible. Per the
+        # READ FIRST memory: any alembic column added on a shared
+        # platform table must mirror here so agent boots that ran
+        # `create_all` against an older snapshot self-heal on restart.
+        "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_mode_pre_v2 VARCHAR(20)",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS google_api_key TEXT",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS mistral_api_key TEXT",
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS groq_api_key TEXT",
