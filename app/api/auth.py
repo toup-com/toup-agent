@@ -251,6 +251,442 @@ async def register(
     return user
 
 
+# ── Google OAuth sign-in / sign-up ───────────────────────────────
+#
+# Lets users skip the username/password form by clicking "Continue
+# with Google." Same Google OAuth client we already use for the Gmail
+# connector — different scope set (openid + email + profile, no
+# Gmail access). One callback URL `/api/auth/google/callback`, which
+# MUST be registered as an Authorized Redirect URI in the same Google
+# Cloud Console project that owns GOOGLE_OAUTH_CLIENT_ID.
+#
+# Flow:
+#   1. Frontend → GET /api/auth/google/start?mode=signup&redirect=...
+#      → 302 to https://accounts.google.com/o/oauth2/v2/auth?... with
+#      HMAC-signed state carrying mode + redirect.
+#   2. User consents → Google → GET /api/auth/google/callback?code&state
+#   3. Backend exchanges code for token, fetches userinfo, finds-or-
+#      creates the User, issues a JWT, redirects to the frontend at
+#      /auth/google/complete#token=<jwt>&new=<1|0>&redirect=<path>.
+#   4. Frontend reads the hash, stores the JWT, navigates the user to
+#      /onboarding/welcome (new) or the redirect param (returning).
+#
+# CSRF protection: state is HMAC-signed with the existing oauth_state
+# secret; tampered or expired states are rejected before we touch the
+# DB. Same primitive used by the connector OAuth path.
+#
+# Email verification: Google's userinfo carries `email_verified=true`
+# for verified accounts; we stamp User.email_verified_at on signup so
+# the email-verification gate (F13) doesn't block the new user from
+# spending their credits.
+
+import base64 as _base64
+import hashlib as _hashlib
+import hmac as _hmac
+import json as _json
+import secrets as _secrets
+import time as _time
+
+_GOOGLE_AUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_AUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_AUTH_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+# OpenID Connect minimum scope set — `openid` triggers OIDC mode,
+# `email` and `profile` give us the address + display name. No Gmail
+# or Drive scopes — sign-in is read-only of the user's identity.
+_GOOGLE_AUTH_SCOPES = "openid email profile"
+
+
+def _signin_state_secret() -> bytes:
+    """Same JWT secret reused for HMAC-signing the sign-in state token.
+    Distinct purpose from the JWT (no claims, no expiration encoded in
+    the token itself — we add iat + verify a TTL on the server side),
+    same trust root. Rotating jwt_secret invalidates in-flight sign-ins,
+    which is the same blast radius rotating the JWT has — acceptable."""
+    raw = (settings.jwt_secret or "").strip()
+    if not raw:
+        raise HTTPException(500, "JWT_SECRET not configured")
+    return raw.encode("utf-8")
+
+
+def _b64url_encode(b: bytes) -> str:
+    return _base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return _base64.urlsafe_b64decode((s + pad).encode("ascii"))
+
+
+def _sign_signin_state(*, mode: str, redirect: Optional[str]) -> str:
+    """Mint a state token carrying (mode, redirect, nonce, iat).
+
+    Format: `<body_b64>.<sig_b64>`. Same shape as
+    services/oauth_state.py uses for the connector flow — distinct
+    payload keys so a cross-flow replay is rejected by the
+    `kind` field check on verify."""
+    payload = {
+        "kind": "auth_signin",
+        "mode": (mode or "signup").strip().lower()[:16],
+        "redirect": (redirect or "").strip()[:512] or None,
+        "nonce": _secrets.token_urlsafe(16),
+        "iat": int(_time.time()),
+    }
+    body = _json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    body_b64 = _b64url_encode(body)
+    sig = _hmac.new(_signin_state_secret(), body_b64.encode("ascii"), _hashlib.sha256).digest()
+    return f"{body_b64}.{_b64url_encode(sig)}"
+
+
+def _verify_signin_state(token: str, *, max_age_seconds: int = 600) -> dict:
+    """Parse + verify the sign-in state. Raises HTTPException on any
+    failure so the callback can fall straight through to its error
+    redirect."""
+    if not token or "." not in token:
+        raise HTTPException(400, "invalid_state")
+    try:
+        body_b64, sig_b64 = token.rsplit(".", 1)
+    except ValueError:
+        raise HTTPException(400, "invalid_state")
+    expected = _hmac.new(_signin_state_secret(), body_b64.encode("ascii"), _hashlib.sha256).digest()
+    try:
+        provided = _b64url_decode(sig_b64)
+    except Exception:
+        raise HTTPException(400, "invalid_state")
+    if not _hmac.compare_digest(expected, provided):
+        raise HTTPException(400, "invalid_state")
+    try:
+        payload = _json.loads(_b64url_decode(body_b64).decode("utf-8"))
+    except Exception:
+        raise HTTPException(400, "invalid_state")
+    if not isinstance(payload, dict) or payload.get("kind") != "auth_signin":
+        raise HTTPException(400, "wrong_state_kind")
+    iat = payload.get("iat")
+    if not isinstance(iat, int):
+        raise HTTPException(400, "invalid_state")
+    age = int(_time.time()) - iat
+    if age < -60 or age > max_age_seconds:
+        raise HTTPException(400, "state_expired")
+    return payload
+
+
+def _google_auth_callback_url() -> str:
+    """The exact redirect_uri we send to Google AND register in the
+    Cloud Console. Override via GOOGLE_AUTH_CALLBACK_URL if a deploy
+    fronts the API at a non-default host."""
+    override = (getattr(settings, "google_auth_callback_url", "") or "").strip()
+    if override:
+        return override
+    base = (settings.app_public_base_url or "https://toup.ai").rstrip("/")
+    return f"{base}/api/auth/google/callback"
+
+
+def _google_auth_credentials() -> tuple[str, str]:
+    """Resolve (client_id, client_secret). Raises 503 on missing config
+    so the API failure mode is observable rather than a silent redirect
+    to a broken Google consent screen."""
+    cid = (getattr(settings, "google_oauth_client_id", "") or "").strip()
+    csec = (getattr(settings, "google_oauth_client_secret", "") or "").strip()
+    if not cid or not csec:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Google sign-in isn't configured on this deploy — set "
+                "GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET, "
+                "and add the callback URL to the Google Cloud Console."
+            ),
+        )
+    return cid, csec
+
+
+@router.get("/google/start")
+async def google_auth_start(
+    request: Request,
+    mode: str = "signup",
+    redirect: Optional[str] = None,
+):
+    """Begin the Google OAuth flow. Redirects to Google's consent screen.
+
+    `mode` is informational only (sign-in vs sign-up behave identically
+    server-side — if the email is new we create the user, if it's known
+    we just log them in). The frontend uses it to choose post-callback
+    copy ("Welcome!" vs "Welcome back!"); we round-trip it through state.
+    """
+    import urllib.parse
+
+    client_id, _ = _google_auth_credentials()
+    signed_state = _sign_signin_state(mode=mode, redirect=redirect)
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": _google_auth_callback_url(),
+        "response_type": "code",
+        "scope": _GOOGLE_AUTH_SCOPES,
+        "state": signed_state,
+        # `select_account` so users with multiple Google accounts see
+        # the chooser rather than getting silently signed in with the
+        # last-used account. Matches the GitHub `/select_account` UX.
+        "prompt": "select_account",
+        # `access_type=online` — we don't need refresh tokens here.
+        # The user signs in, we issue our own JWT, Google's token is
+        # discarded immediately. Refresh tokens would just be cruft.
+        "access_type": "online",
+    }
+    authorize_url = (
+        f"{_GOOGLE_AUTH_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+    )
+    return Response(
+        status_code=307,
+        headers={"Location": authorize_url, "Cache-Control": "no-store"},
+    )
+
+
+def _frontend_complete_url(*, token: str, is_new: bool, redirect: Optional[str], error: Optional[str] = None) -> str:
+    """Build the post-callback redirect URL. The JWT lives in the URL
+    fragment so it stays out of HTTP logs / referer headers (the
+    fragment isn't sent to the server on the GET that loads the page)."""
+    import urllib.parse
+    base = (settings.app_public_base_url or "https://toup.ai").rstrip("/")
+    landing = f"{base}/auth/google/complete"
+    parts: list[str] = []
+    if token:
+        parts.append(f"token={urllib.parse.quote(token)}")
+    parts.append(f"new={'1' if is_new else '0'}")
+    if redirect:
+        parts.append(f"redirect={urllib.parse.quote(redirect)}")
+    if error:
+        parts.append(f"error={urllib.parse.quote(error)}")
+    return f"{landing}#{'&'.join(parts)}"
+
+
+@router.get("/google/callback")
+async def google_auth_callback(
+    request: Request,
+    response: Response,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Handle Google's OAuth redirect. Exchanges the code for tokens,
+    fetches userinfo, finds or creates the User, issues a Toup JWT,
+    and redirects the browser to the frontend's `/auth/google/complete`
+    landing with the JWT in the URL fragment.
+
+    All failure paths redirect with `error=<reason>` in the fragment so
+    the frontend can surface a usable message — never returns a bare
+    500 or a JSON blob the user can't read.
+    """
+    import httpx
+
+    # Provider-side error — user clicked "Cancel" on Google's screen.
+    if error:
+        return Response(
+            status_code=307,
+            headers={"Location": _frontend_complete_url(
+                token="", is_new=False, redirect=None, error=error,
+            )},
+        )
+    if not code or not state:
+        return Response(
+            status_code=307,
+            headers={"Location": _frontend_complete_url(
+                token="", is_new=False, redirect=None,
+                error="missing_code_or_state",
+            )},
+        )
+
+    client_id, client_secret = _google_auth_credentials()
+
+    # Verify state — rejects expired (>10min) and tampered states.
+    try:
+        payload = _verify_signin_state(state)
+    except HTTPException as e:
+        logger.warning("[google-auth] state verification failed: %s", e.detail)
+        return Response(
+            status_code=307,
+            headers={"Location": _frontend_complete_url(
+                token="", is_new=False, redirect=None,
+                error=str(e.detail or "invalid_state"),
+            )},
+        )
+    caller_redirect = payload.get("redirect")
+
+    # Exchange code → tokens.
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            token_resp = await client.post(
+                _GOOGLE_AUTH_TOKEN_URL,
+                data={
+                    "code": code,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "redirect_uri": _google_auth_callback_url(),
+                    "grant_type": "authorization_code",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        if token_resp.status_code != 200:
+            logger.warning(
+                "[google-auth] token exchange %d: %s",
+                token_resp.status_code, token_resp.text[:300],
+            )
+            return Response(
+                status_code=307,
+                headers={"Location": _frontend_complete_url(
+                    token="", is_new=False, redirect=caller_redirect,
+                    error="token_exchange_failed",
+                )},
+            )
+        tokens = token_resp.json()
+    except Exception:
+        logger.exception("[google-auth] token exchange exception")
+        return Response(
+            status_code=307,
+            headers={"Location": _frontend_complete_url(
+                token="", is_new=False, redirect=caller_redirect,
+                error="token_exchange_failed",
+            )},
+        )
+
+    access_token = (tokens or {}).get("access_token", "")
+    if not access_token:
+        return Response(
+            status_code=307,
+            headers={"Location": _frontend_complete_url(
+                token="", is_new=False, redirect=caller_redirect,
+                error="no_access_token",
+            )},
+        )
+
+    # Fetch userinfo (email + name).
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            info_resp = await client.get(
+                _GOOGLE_AUTH_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        if info_resp.status_code != 200:
+            logger.warning(
+                "[google-auth] userinfo %d: %s",
+                info_resp.status_code, info_resp.text[:300],
+            )
+            return Response(
+                status_code=307,
+                headers={"Location": _frontend_complete_url(
+                    token="", is_new=False, redirect=caller_redirect,
+                    error="userinfo_failed",
+                )},
+            )
+        info = info_resp.json() or {}
+    except Exception:
+        logger.exception("[google-auth] userinfo exception")
+        return Response(
+            status_code=307,
+            headers={"Location": _frontend_complete_url(
+                token="", is_new=False, redirect=caller_redirect,
+                error="userinfo_failed",
+            )},
+        )
+
+    email = (info.get("email") or "").strip().lower()
+    if not email:
+        return Response(
+            status_code=307,
+            headers={"Location": _frontend_complete_url(
+                token="", is_new=False, redirect=caller_redirect,
+                error="no_email",
+            )},
+        )
+    email_verified = bool(info.get("email_verified", False))
+    display_name = (info.get("name") or info.get("given_name") or "").strip() or None
+
+    # Find or create user.
+    existing = await get_user_by_email(db, email)
+    is_new = False
+    if existing is not None:
+        user = existing
+    else:
+        # OAuth signup — set a random unguessable password so the user
+        # can never log in via /login until they explicitly set one via
+        # the password-change flow. (`get_password_hash` would otherwise
+        # be called with an empty string which the password verifier
+        # would reject — but defense-in-depth: random secret.)
+        random_password = _secrets.token_urlsafe(48)
+        user = await create_user(
+            db, email=email, password=random_password, name=display_name,
+        )
+        is_new = True
+        # Google verified the email → stamp it. The credit-verification
+        # gate (F13) trusts this flag for charge eligibility.
+        if email_verified:
+            user.email_verified_at = datetime.utcnow()
+            await db.commit()
+            await db.refresh(user)
+
+        # Same prewarm-on-signup behavior as the /register path so the
+        # tenant container is warming while the user finishes onboarding.
+        if settings.prewarm_on_soul_save:
+            try:
+                from app.api.agent_setup import _get_or_create_config
+                from app.services.pool_service import claim_or_prewarm
+                config = await _get_or_create_config(str(user.id), db)
+                dirty = False
+                if config.hosting_mode in (None, "self-hosted"):
+                    config.hosting_mode = "managed"
+                    dirty = True
+                if not config.whatsapp_mode:
+                    config.whatsapp_mode = "qr_link"
+                    dirty = True
+                if dirty:
+                    await db.commit()
+                await claim_or_prewarm(db, str(user.id))
+            except Exception as e:
+                logger.warning(
+                    "[google-auth] prewarm/claim failed user=%s: %s",
+                    str(user.id)[:8], e,
+                )
+
+    if not user.is_active:
+        return Response(
+            status_code=307,
+            headers={"Location": _frontend_complete_url(
+                token="", is_new=False, redirect=caller_redirect,
+                error="account_disabled",
+            )},
+        )
+
+    # Issue a Toup JWT. Same path as the /login endpoint — record the
+    # session so the per-device "Sign out" UI sees this login.
+    jwt_token = create_access_token(user.id)
+    try:
+        await record_login_session(db, user.id, jwt_token, request)
+    except Exception:
+        # Session-tracker is non-critical for the auth flow — log and
+        # continue. The user can still log out via password change.
+        logger.exception("[google-auth] record_login_session failed")
+
+    # Set the SSO cookie too, matching the /login + /register UX so
+    # cross-subdomain navigation stays authenticated without the
+    # frontend having to forward the bearer token via JS.
+    response.set_cookie(
+        key=SSO_COOKIE_NAME, value=jwt_token, domain=SSO_COOKIE_DOMAIN,
+        max_age=SSO_COOKIE_MAX_AGE, httponly=True, secure=True,
+        samesite="none", path="/",
+    )
+
+    redirect_url = _frontend_complete_url(
+        token=jwt_token, is_new=is_new, redirect=caller_redirect,
+    )
+    return Response(
+        status_code=307,
+        headers={
+            "Location": redirect_url,
+            "Cache-Control": "no-store",
+            **{k: v for k, v in response.headers.items() if k.lower() == "set-cookie"},
+        },
+    )
+
+
 # ── Login (with rate limiting) ───────────────────────────────────
 
 @router.post("/login", response_model=Token)

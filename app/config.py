@@ -522,6 +522,13 @@ class Settings(BaseSettings):
     # Default uses the canonical platform host `toup.ai` (no `app.`
     # prefix) — matches how the frontend is currently served.
     oauth_callback_url: str = "https://toup.ai/api/oauth/callback"
+    # Sign-in (NOT connector) Google OAuth callback. Distinct path from
+    # the connector flow so the sign-in handler can have its own
+    # state-validation rules. MUST be added to the same Google Cloud
+    # Console project's Authorized Redirect URIs. Override per deploy
+    # via GOOGLE_AUTH_CALLBACK_URL when the API is fronted on a non-
+    # default host.
+    google_auth_callback_url: str = ""
 
     # ── VPS Provisioning (AWS + Stripe) ──────────────────────
     aws_access_key_id: Optional[str] = None        # Set via AWS_ACCESS_KEY_ID
