@@ -136,6 +136,40 @@ class BuildJob(Base):
         JSON().with_variant(JSONB(), "postgresql"), nullable=True,
     )
 
+    # Migration 053 — sub-agent columns. Phase 1 of the sub-agent
+    # spawning arc. All nullable except ``credit_spent`` (NOT NULL +
+    # server_default 0.0 so SUM aggregations don't need COALESCE).
+    # See app/agent/subagent_dispatcher.py for the read/write sites
+    # introduced in Phase 2+.
+    #
+    # parent_job_id: self-FK enabling parent→child traceability and
+    # depth/cap checks. ON DELETE SET NULL on Postgres; SQLite has no
+    # FK constraint (matches the existing soft-FK pattern on
+    # coalesced_into_job_id / conversation_id).
+    parent_job_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("build_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # config_json: per-job opaque config. Sub-agent intake stores
+    # {task, label, timeout_seconds, credit_budget_allocated, parent_depth}
+    # so the dispatcher has one source of truth.
+    config_json: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True,
+    )
+    # credit_budget_allocated: USD/credit slice the parent gave this
+    # child. NULL when budget enforcement is off (default) or the row
+    # isn't a sub-agent.
+    credit_budget_allocated: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+    )
+    # credit_spent: running total updated by the LLM-proxy credit
+    # hook. NOT NULL (default 0.0) so aggregations stay simple.
+    credit_spent: Mapped[float] = mapped_column(
+        Float, nullable=False, server_default="0.0", default=0.0,
+    )
+
 
 class JobEvent(Base):
     """One material event emitted during a job's lifecycle.

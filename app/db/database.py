@@ -439,6 +439,19 @@ async def init_db():
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS error_json JSONB",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS channel_results_json JSONB",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS tools_invoked_json JSONB",
+        # 056 — sub-agent spawning columns. Mirrored here per the
+        # READ-FIRST rule in MEMORY.md: agents boot via init_db, NOT
+        # alembic upgrade. Without these, the moment an agent rolls
+        # to a build that references BuildJob.parent_job_id /
+        # credit_spent on the ORM model, every SELECT from build_jobs
+        # 500s. config_json is JSONB on PG; SQLite tolerates JSONB as
+        # an alias for TEXT so the same DDL works in both dialects.
+        # credit_spent has NOT NULL DEFAULT 0.0 to match the migration.
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS parent_job_id VARCHAR(36)",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS config_json JSONB",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS credit_budget_allocated DOUBLE PRECISION",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS credit_spent DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+        "CREATE INDEX IF NOT EXISTS ix_build_jobs_parent_status ON build_jobs (parent_job_id, status)",
         # Day-as-Chat: FK from conversations/messages to day_chats.
         # On agent (day_chats exists): add with FK constraint.
         # On platform (day_chats missing): add without FK so ORM queries don't crash.

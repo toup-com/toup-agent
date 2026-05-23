@@ -177,10 +177,39 @@ async def lifespan(app: FastAPI):
             # Give tool executor access to the bot for send_file/send_photo
             tool_executor.telegram_bot = telegram_bot
 
-            # Wire sub-agent manager
+            # Wire sub-agent manager (legacy Telegram-only path) +
+            # unified-job path (Phase 4+).
             subagent_manager.set_agent_runner(agent_runner)
             subagent_manager.set_bot(telegram_bot)
             telegram_bot.subagent_manager = subagent_manager
+
+            # Phase 8 wiring — finishes the sub-agent arc:
+            #
+            # 1. tool_executor.agent_runner so _tool_spawn's Path-A
+            #    can find the runner without falling back to the
+            #    legacy manager attribute.
+            # 2. set_telegram_bot_holder so the orchestrator's
+            #    Telegram fan-out has a bot reference (best-effort
+            #    delivery on top of the canonical Day-as-Chat write).
+            # 3. orphan_sweep_on_boot to flip rows stuck in
+            #    status='running' from a previous crash. Idempotent
+            #    — safe to run on every boot.
+            tool_executor.agent_runner = agent_runner
+            try:
+                from app.agent.subagent_orchestrator import (
+                    orphan_sweep_on_boot,
+                    set_telegram_bot_holder,
+                )
+                set_telegram_bot_holder(subagent_manager)
+                _swept = await orphan_sweep_on_boot()
+                print(f"🧹 Sub-agent orphan sweep: {_swept} row(s) flipped to failed")
+            except Exception as _phase8_err:
+                # Non-fatal — boot proceeds. The orphan sweep is a
+                # cleanup convenience, not a correctness gate; if
+                # it fails the rows stay stuck and operator can
+                # clear them manually. The Telegram fan-out
+                # similarly degrades to "no-op" rather than crash.
+                print(f"⚠️ Phase 8 sub-agent wiring failed (non-fatal): {_phase8_err}")
 
             # Set up cron service
             cron_service = CronService()

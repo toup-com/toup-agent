@@ -1,5 +1,43 @@
 """
-Sub-Agent Manager — Background task system for Toup.
+Sub-Agent Manager — DEPRECATED legacy Telegram-only spawn path.
+
+Sub-agents now run through the unified-job path:
+
+  app/agent/subagent_orchestrator.py
+  app/agent/subagent_dispatcher.py
+  app/agent/subagent_message_writer.py
+
+The unified path:
+  - Works on every channel (web / mobile / extension / voice /
+    telegram), not just Telegram.
+  - Persists each run as a ``BuildJob`` row so spawned tasks
+    survive a platform-api restart and appear on Mission Control
+    / /jobs.
+  - Enforces kill switch, depth, per-parent + per-user caps,
+    idempotency via ``app/agent/subagent_dispatcher.py``.
+  - Announces back via Day-as-Chat (channel="subagent") so the
+    user sees the result in chat, not just on Telegram.
+  - Tracks credit spend per run (Phase 6 telemetry).
+
+This module is kept ONLY as the fallback path when
+``settings.subagent_spawning_enabled = False`` so the existing
+Telegram ``/subagents`` command keeps working through the
+deprecation window.
+
+Deprecation timeline
+--------------------
+Removal trigger: 30 days after Phase 4 ships with zero P1
+incidents. A follow-up PR will:
+  - Delete this file.
+  - Remove the Path-B fallback in
+    ``app/agent/tool_executor._tool_spawn``.
+  - Remove the Telegram ``/subagents`` command.
+
+Until then, the import emits a single DEBUG log line so an
+operator can confirm legacy callers vs unified-path callers
+during the cutover.
+
+Original docstring follows:
 
 The agent can spawn independent background tasks that:
 - Run with their own isolated session
@@ -16,6 +54,16 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Deprecation breadcrumb — fires once at import. An operator watching
+# logs during the cutover window can see whether something still
+# imports this legacy module after Phase 4 ships.
+logger.debug(
+    "[subagent.py] DEPRECATED legacy SubAgentManager imported. "
+    "New code should use app.agent.subagent_orchestrator.spawn_subagent. "
+    "Removal trigger: 30 days after Phase 4 ships with zero P1 incidents. "
+    "See module docstring."
+)
 
 
 @dataclass

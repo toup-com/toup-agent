@@ -74,6 +74,15 @@ def _is_claude_model(model: str) -> bool:
     return model.startswith("claude-")
 
 
+def _profile_name_for_log(profile) -> str:
+    """One-token profile name for [PERF] log lines. Tolerates None
+    so callers that haven't yet set the default don't crash the log
+    format string."""
+    if profile is None:
+        return "full"
+    return getattr(profile, "value", str(profile))
+
+
 # Vault CP4.1: channels that cannot render the CredentialConfirmCard today.
 # `telegram` and `voice` are permanently excluded (their retention model
 # makes chat-save the wrong UX). `mobile` is excluded until the RN
@@ -330,6 +339,12 @@ class AgentRunner:
         thinking_budget: int = 0,
         idempotency_key: Optional[str] = None,
         save_user_message: bool = True,
+        save_assistant_message: bool = True,
+        disable_post_processing: bool = False,
+        prompt_profile: Optional["PromptProfile"] = None,
+        subagent_task_label: Optional[str] = None,
+        credit_budget: Optional[float] = None,
+        current_job_id: Optional[str] = None,
         display_user_message: Optional[str] = None,
         client_tz: Optional[str] = None,
         app_id: Optional[str] = None,
@@ -337,9 +352,56 @@ class AgentRunner:
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
+
+        Phase 3 additions (sub-agent spawning arc):
+
+          - ``prompt_profile`` (``PromptProfile``) — section allow-list
+            for the assembled system prompt. Defaults to ``FULL`` (the
+            historic behaviour). ``PromptProfile.SUBAGENT`` strips
+            persona / memory / continuity sections for child runs.
+          - ``save_assistant_message`` (default True) — when False,
+            skips persisting the assistant turn into the Day-as-Chat
+            (Message + counter updates at the save-messages call).
+            Sub-agent runs pass False so the child's reply doesn't
+            pollute the parent's day. Phase 4's announce-back posts
+            ONE row via write_subagent_message instead.
+          - ``disable_post_processing`` (default False) — when True,
+            skips the ``_background_post_processing`` task (memory
+            extraction, active_task store, retrieval feedback) AND the
+            day-chat summarizer. Sub-agent runs disable both because
+            the child's turn isn't a user-facing event.
+          - ``subagent_task_label`` — when the sub-agent dispatcher
+            invokes ``run()``, this label is surfaced in the
+            ``subagent_task_preamble`` system-prompt section so the
+            child knows the brief.
+          - ``credit_budget`` — USD/credit slice the parent allocated
+            to this child. v1 stub: the parameter is plumbed through
+            and logged; the actual enforcement hook lives on the
+            credit-billing branch and gets wired by a follow-up when
+            both branches merge to main. While unwired here, passing
+            a value still feeds the dispatcher's bookkeeping at the
+            tool-result + job-row level (Phase 4) so cost attribution
+            telemetry (Phase 6) lights up immediately.
         """
+        # Late-import the profile module so this file's import cycle
+        # stays simple. PromptProfile is a small dependency module
+        # that depends on nothing else from app.agent.
+        from app.agent.prompt_profile import PromptProfile  # local import
+
+        # Default to FULL so all existing call sites (Telegram, web,
+        # voice, routines, triggers, app builder, vibecoding) keep
+        # historical behaviour without code changes.
+        if prompt_profile is None:
+            prompt_profile = PromptProfile.FULL
         start = time.time()
-        logger.info(f"[AGENT] === New agent run for user_id={user_id} ===")
+        logger.info(
+            "[AGENT] === New agent run for user_id=%s profile=%s "
+            "save_user=%s save_asst=%s post_proc=%s credit_budget=%s ===",
+            user_id, prompt_profile.value, save_user_message,
+            save_assistant_message,
+            "off" if disable_post_processing else "on",
+            f"{credit_budget:.4f}" if credit_budget is not None else "none",
+        )
 
         # F6: zero per-turn memory_health dict so a previous turn's counts
         # can't leak into this turn's [memory_health] log line.
@@ -373,6 +435,14 @@ class AgentRunner:
         self.tools.set_user_id(user_id)
         self.tools.set_chat_id(telegram_chat_id)
         self.tools.set_channel(channel)
+        # Phase 8: plumb the current job_id (set by routine_runner /
+        # trigger_runner / dashboard task intake) onto the tool
+        # executor's ContextVar so a sub-agent spawned during this
+        # turn lands as a CHILD of this job rather than as a
+        # top-level row. None when the turn isn't tied to a job
+        # (e.g. interactive web chat) — the spawn then has
+        # parent_job_id=None and is a top-level sub-agent.
+        self.tools.set_current_job_id(current_job_id)
         self.tools._on_tool_progress = on_tool_progress
         # Vault CP4: handler uses this to emit credential_confirm_request frames.
         self.tools._on_credential_confirm_request = on_credential_confirm_request
@@ -436,6 +506,26 @@ class AgentRunner:
             except Exception:
                 self.tools.user_disabled_tools = set()
                 self._disabled_tool_names = set()
+
+            # Sub-agent runs override the disabled set with the
+            # memory-write defaults. The child cannot store user
+            # memories (no persistence side effects on the user's
+            # brain), cannot spawn further sub-agents (depth=1 in
+            # v1), and cannot create dashboard jobs / routines /
+            # triggers (those are user-intent surfaces, not
+            # sub-agent surfaces). Read-only memory access via
+            # memory_search remains available.
+            from app.agent.prompt_profile import disabled_tools_for
+            _profile_disabled = disabled_tools_for(prompt_profile)
+            if _profile_disabled:
+                merged = self._disabled_tool_names | set(_profile_disabled)
+                self.tools.user_disabled_tools = merged
+                self._disabled_tool_names = merged
+                logger.info(
+                    "[AGENT] sub-agent run — disabling %d additional tools "
+                    "(memory-write + spawn + job/routine/trigger mutators)",
+                    len(_profile_disabled),
+                )
             logger.info(f"[PERF] load_agent_config: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
             # Resolve effective timezone here (not just inside
@@ -542,10 +632,26 @@ class AgentRunner:
                 logger.info("[AGENT] Overriding intent to FULL — app_builder context detected in history")
 
             t_prompt = time.perf_counter()
-            system_prompt = await self._build_system_prompt(db, user_id, user_message, channel=channel, intent=query_intent, client_tz=client_tz)
+            system_prompt = await self._build_system_prompt(
+                db, user_id, user_message,
+                channel=channel, intent=query_intent, client_tz=client_tz,
+                prompt_profile=prompt_profile,
+                subagent_task_label=subagent_task_label,
+            )
+
+            # Post-builder appended blocks (today_so_far / reply_to_directive /
+            # recent_days) are skipped when the profile doesn't want
+            # day-chat continuity surface. SUBAGENT profile: skipped.
+            from app.agent.prompt_profile import allows_post_builder_blocks
+            _allow_post_builder = allows_post_builder_blocks(prompt_profile)
 
             # Inject <today_so_far> block when using day-chat context with a summary
-            if _use_day_ctx and _day_context and _day_context.get("summary"):
+            if (
+                _allow_post_builder
+                and _use_day_ctx
+                and _day_context
+                and _day_context.get("summary")
+            ):
                 from app.agent.day_context_loader import build_today_so_far_block
                 system_prompt += build_today_so_far_block(_day_context["summary"])
                 self._memory_health["today_summary_present"] = True
@@ -556,7 +662,7 @@ class AgentRunner:
             # also present in the system context. Belt-and-suspenders: the
             # preamble lives in BOTH the system prompt and the user message.
             _stripped_um = user_message.lstrip()
-            if _stripped_um.startswith("<reply_to>"):
+            if _allow_post_builder and _stripped_um.startswith("<reply_to>"):
                 import re as _re
                 _block_match = _re.search(
                     r"<reply_to>.*?</reply_to>", _stripped_um, _re.DOTALL,
@@ -589,7 +695,7 @@ class AgentRunner:
             # so the [memory_health] line below can surface summarizer
             # health (e.g. "summary=failed reason=auth_error") at every
             # turn, not just on warm starts.
-            if _use_day_ctx and _day_context and _day_chat_id:
+            if _allow_post_builder and _use_day_ctx and _day_context and _day_chat_id:
                 try:
                     from app.services.recent_days_service import (
                         should_inject_recent_days,
@@ -1208,29 +1314,56 @@ class AgentRunner:
 
         # ── Phase 3: Save to DB (short-lived session) ────────────
         t_phase3 = time.perf_counter()
-        # Save messages synchronously (fast, needed for conversation continuity)
-        async with async_session_maker() as db:
-            await self._save_messages(
-                db=db,
-                session_id=session_id,
-                user_id=user_id,
-                user_message=display_user_message or user_message,
-                assistant_response=final_text,
-                tokens_input=total_input,
-                tokens_output=total_output,
-                model=model_used,
-                processing_time_ms=int((time.time() - start) * 1000),
-                save_user_message=save_user_message,
-                client_tz=client_tz,
-                asst_message_id=asst_message_id,
-                channel=channel,
-                tool_event_records=tool_event_records,
+        # Save messages synchronously (fast, needed for conversation continuity).
+        # Sub-agent runs pass save_assistant_message=False so the child's
+        # reply does not pollute the user's Day-as-Chat — Phase 4's
+        # announce-back posts ONE channel="subagent" row via
+        # write_subagent_message instead.
+        if save_assistant_message:
+            async with async_session_maker() as db:
+                await self._save_messages(
+                    db=db,
+                    session_id=session_id,
+                    user_id=user_id,
+                    user_message=display_user_message or user_message,
+                    assistant_response=final_text,
+                    tokens_input=total_input,
+                    tokens_output=total_output,
+                    model=model_used,
+                    processing_time_ms=int((time.time() - start) * 1000),
+                    save_user_message=save_user_message,
+                    client_tz=client_tz,
+                    asst_message_id=asst_message_id,
+                    channel=channel,
+                    tool_event_records=tool_event_records,
+                )
+                await db.commit()
+            logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
+        else:
+            logger.info(
+                "[PERF] phase3_save: SKIPPED (save_assistant_message=False, "
+                "profile=%s) — caller owns persistence",
+                _profile_name_for_log(prompt_profile),
             )
-            await db.commit()
-        logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
 
         # ── Phase 3b: Background tasks (memory extraction, feedback) ──
-        # These are slow (LLM calls) — run in background so response returns immediately
+        # These are slow (LLM calls) — run in background so response returns
+        # immediately. Sub-agent runs pass disable_post_processing=True;
+        # the child's turn is NOT a user-facing event and memory writes /
+        # active-task detection / retrieval feedback should not fire.
+        #
+        # Amendment 3 (concurrency audit, Phase 3): capture
+        # self._last_retrieved_memories into a closure-local copy BEFORE
+        # scheduling the task. AgentRunner is a process singleton (one
+        # instance constructed at app/main.py:168, wired into every
+        # channel). A concurrent sub-agent run's _build_system_prompt
+        # call writes the same instance attribute (line ~1902);
+        # without this capture, the parent's background task would
+        # later read the child's retrieved memories instead of its
+        # own and log them as the parent's retrieval feedback.
+        # See the Phase 3 PR description for the audit detail.
+        _retrieved_for_bg = list(self._last_retrieved_memories or [])
+
         async def _background_post_processing():
             try:
                 async with async_session_maker() as bg_db:
@@ -1264,7 +1397,9 @@ class AgentRunner:
                             await feedback_svc.log_retrieval_feedback(
                                 user_id=user_id,
                                 query=user_message,
-                                retrieved_memories=self._last_retrieved_memories,
+                                # Closure-captured at task-schedule time
+                                # — see Amendment 3 note above.
+                                retrieved_memories=_retrieved_for_bg,
                                 response=final_text,
                                 conversation_id=session_id,
                                 strategies_used=["vector", "keyword", "graph"],
@@ -1279,10 +1414,18 @@ class AgentRunner:
             except Exception as e:
                 logger.warning(f"[AGENT] Background session error (non-fatal): {e}")
 
-        asyncio.create_task(_background_post_processing())
+        if not disable_post_processing:
+            asyncio.create_task(_background_post_processing())
+        else:
+            logger.debug(
+                "[AGENT] background post-processing SKIPPED "
+                "(disable_post_processing=True)"
+            )
 
         # ── Day-Chat summarizer (async, debounced, never blocks) ──
-        if _use_day_ctx and _day_chat_id:
+        # Also gated by disable_post_processing — sub-agent runs do
+        # not bump the user's day-chat summary.
+        if not disable_post_processing and _use_day_ctx and _day_chat_id:
             try:
                 from app.services.day_summarizer import run_summarizer_if_needed
                 asyncio.create_task(run_summarizer_if_needed(async_session_maker, _day_chat_id))
@@ -1536,6 +1679,8 @@ class AgentRunner:
         channel: Optional[str] = None,
         intent: Optional[QueryIntent] = None,
         client_tz: Optional[str] = None,
+        prompt_profile: Optional["PromptProfile"] = None,
+        subagent_task_label: Optional[str] = None,
     ) -> str:
         """Build a rich system prompt from identities + memories + runtime context.
 
@@ -2651,29 +2796,43 @@ class AgentRunner:
                 "full result in detail."
             )
 
+        # ── Sub-agent task preamble (PromptProfile.SUBAGENT) ────────
+        # Replaces the persona/identity stack when the prompt profile
+        # is SUBAGENT. The child knows it's a sub-agent, has a brief,
+        # and knows to end with a summary. No user-facing tone rules,
+        # no banned phrases, no platform map — this is a worker
+        # agent, not the user's friend.
+        from app.agent.prompt_profile import PromptProfile  # local import
+        _profile = prompt_profile if prompt_profile is not None else PromptProfile.FULL
+        if _profile == PromptProfile.SUBAGENT:
+            _label = (subagent_task_label or "background task").strip()
+            section_parts["subagent_task_preamble"] = (
+                "# Sub-agent task\n"
+                f"You are a background sub-agent. Your supervisor delegated "
+                f"this task to you: **{_label}**\n\n"
+                "Run-time contract:\n"
+                "- Complete the task using the tools available to you.\n"
+                "- Do not ask the user clarifying questions — they are "
+                "not on this conversation. Make reasonable assumptions "
+                "and proceed.\n"
+                "- Do not store or update any user memory (memory_store, "
+                "memory_delete, active-task writes). Read-only access "
+                "to memory is fine via memory_search.\n"
+                "- Do not spawn further sub-agents.\n"
+                "- When done, produce ONE final assistant message that "
+                "summarises what you did, what you found, and (if "
+                "relevant) what you recommend. This message is what "
+                "the supervisor and the user will see.\n"
+            )
+
         # ── Assemble in order ──────────────────────────────────────
-        SECTION_ORDER = [
-            "identity",         # WHO the agent is (soul + behavioral)
-            "identity_anchor",  # Don't break white-label by naming underlying LLM
-            "voice_rules",    # Always-apply anti-chatbot tone (survives custom Souls)
-            "self_knowledge", # HOW your memory actually works (F7) — agent can explain itself when asked
-            "platform_knowledge",  # WHAT Toup is — pages, capabilities, decision rules
-            "about_you",      # User's name + local time-of-day for tonal calibration
-            "user_brain",       # WHO the user is
-            "active_tasks",   # CONTINUITY — what user is working on right now (7-day TTL)
-            "agent_brain",    # Agent brain (disabled by default)
-            "work_brain",     # Work brain (disabled by default)
-            "skills",         # WHAT the agent can do
-            "environment",    # WHAT the agent has access to
-            "doc_generation", # Document generation (PDF/DOCX/XLSX/PPTX/MD) — flag-gated
-            "media",          # Media playback instructions (web/app)
-            "runtime",        # WHEN/WHERE
-            "vibecoding",     # Vibe coding mode override (when active)
-            "formatting",     # HOW to respond
-            "onboarding",     # Temporary onboarding instructions
-            "activation",     # Optional activation prompt
-            "verbose",        # Optional verbose mode
-        ]
+        # Per-profile section allow-list. The FULL profile mirrors
+        # the historical SECTION_ORDER one-for-one. SUBAGENT strips
+        # persona/memory/continuity. See app/agent/prompt_profile.py
+        # for the canonical lists — keep them in sync if a new section
+        # is added here.
+        from app.agent.prompt_profile import sections_for
+        SECTION_ORDER = list(sections_for(_profile))
 
         # Apply SECTION_ORDER filter. This IS the canonical "in the prompt"
         # check — anything in section_parts but not in SECTION_ORDER is

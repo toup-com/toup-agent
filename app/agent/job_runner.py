@@ -194,6 +194,14 @@ class JobRunner:
         # ── 2. Fresh insert ──────────────────────────────────────
         job_id = str(uuid.uuid4())
         async with self._session_maker() as db:
+            # Phase 4 (sub-agent arc): copy spec.config_json onto
+            # the BuildJob row so the handler can read its own
+            # config without a JOIN. Existing non-subagent callers
+            # don't populate spec.config_json so this is a no-op
+            # (None default on the model).
+            parent_job_id = None
+            if spec.config_json:
+                parent_job_id = spec.config_json.get("parent_job_id")
             job = BuildJob(
                 id=job_id,
                 user_id=spec.user_id,
@@ -209,6 +217,8 @@ class JobRunner:
                 source_id=spec.source_id,
                 conversation_id=spec.conversation_id,
                 idempotency_key=idempotency_key,
+                config_json=spec.config_json,
+                parent_job_id=parent_job_id,
             )
             db.add(job)
             await db.commit()

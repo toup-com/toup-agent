@@ -91,13 +91,20 @@ class AgentTaskHandler:
             pass
 
         runner = self._agent_runner
+        # Phase 8: extract the BuildJob id from the run shim if the
+        # caller provided one. Powers parent_job_id linkage on any
+        # sub-agent the routine's agent run spawns during its turn.
+        job_id = getattr(run, "job_id", None) or getattr(run, "id", None)
         if runner is not None and hasattr(runner, "run"):
-            return await self._run_via_agent_runner(routine, runner, prompt, db)
+            return await self._run_via_agent_runner(
+                routine, runner, prompt, db, current_job_id=job_id,
+            )
         return await self._run_via_internal_llm(routine, prompt, db)
 
     # ------------------------------------------------------------------
     async def _run_via_agent_runner(
         self, routine: Any, runner: Any, prompt: str, db: AsyncSession,
+        *, current_job_id: Optional[str] = None,
     ) -> RoutineResult:
         """Full path — uses the agent's normal turn pipeline with tool
         access. AgentRunner persists its own assistant Message; we reuse
@@ -108,6 +115,7 @@ class AgentTaskHandler:
                 user_message=prompt,
                 user_id=routine.user_id,
                 channel="routine",
+                current_job_id=current_job_id,
                 # Don't propagate to other channels — this is a scheduled
                 # background turn, not an inbound user message.
                 telegram_chat_id=None,

@@ -16,6 +16,7 @@ Per-tool output limits prevent bloating context:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -28,6 +29,44 @@ import httpx
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-call state ContextVars (Phase 8 concurrency refactor)
+#
+# ToolExecutor is a process singleton (constructed at
+# app/main.py:166, wired into every channel). Without per-task
+# isolation, two concurrent ``agent_runner.run`` calls — e.g. a
+# parent and its spawned sub-agent — would clobber each other's
+# user_id / chat_id / channel / job_id mid-tool-loop.
+#
+# ContextVars solve this elegantly for asyncio: each task gets a
+# copy of the parent's context on ``asyncio.create_task``, then
+# modifications stay isolated. So the child's
+# ``set_user_id(child_uid)`` only affects the child's context;
+# the parent's tool loop continues to read the parent's value.
+#
+# These live at module level so ToolExecutor properties read them
+# directly. They're not user-facing — the public surface is the
+# ``set_*`` methods + the ``self._current_*`` properties.
+# ──────────────────────────────────────────────────────────────────────
+
+
+_USER_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "tool_executor_user_id", default=None,
+)
+_CHAT_ID_CTX: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "tool_executor_chat_id", default=None,
+)
+_CHANNEL_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "tool_executor_channel", default=None,
+)
+_JOB_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "tool_executor_job_id", default=None,
+)
+_SESSION_WS_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "tool_executor_session_workspace", default=None,
+)
 
 # Per-tool output limits (bytes)
 TOOL_OUTPUT_LIMITS: Dict[str, int] = {
@@ -173,8 +212,28 @@ def _is_app_building_write(file_path: str, content: str) -> bool:
 
 
 class ToolExecutor:
-    """Executes agent tools and returns results as strings."""
-    
+    """Executes agent tools and returns results as strings.
+
+    Phase 8 concurrency refactor (sub-agent arc): per-call state
+    (``_current_user_id``, ``_chat_id``, ``_current_channel``,
+    ``_current_job_id``) lives in ``contextvars.ContextVar`` instances
+    rather than instance attributes. ToolExecutor is a process
+    singleton wired into every channel at app/main.py:166. Without
+    contextvars, concurrent ``agent_runner.run`` calls (parent +
+    spawned sub-agent on the same event loop) would clobber each
+    other's user_id/chat_id/channel mid-tool-loop.
+
+    ContextVars are per-asyncio-task. ``asyncio.create_task`` copies
+    the parent task's context, then mutations in the child are
+    isolated. So a spawned sub-agent calling ``set_user_id(...)`` in
+    its own ``agent_runner.run`` modifies only the child's context;
+    the parent's tool loop continues to see the parent's state.
+
+    The instance no longer carries these fields; the ``_current_*``
+    properties read the ContextVars. Existing tool handlers read
+    ``self._current_user_id`` etc. unchanged.
+    """
+
     def __init__(self, workspace: Optional[str] = None, telegram_bot=None, cron_service=None, subagent_manager=None):
         self.workspace = workspace or settings.agent_workspace_dir
         os.makedirs(self.workspace, exist_ok=True)
@@ -182,8 +241,10 @@ class ToolExecutor:
         self.cron_service = cron_service  # Set after cron service starts
         self.subagent_manager = subagent_manager  # Set after subagent manager created
         self.skill_loader = None  # Set after skills are loaded
-        self._chat_id: Optional[int] = None
-        self._current_channel: Optional[str] = None  # web/telegram/discord/slack/app
+        # Phase 8: per-call state moved to ContextVars (see class
+        # docstring). Instance attrs below are NOT used for the
+        # per-call mutable surface; they remain only for callbacks
+        # / cached objects that legitimately live on the instance.
         self._on_tool_progress: Optional[Any] = None  # Callback for streaming tool output
         # Track which user workspaces have been bootstrapped this session
         self._bootstrapped_users: Set[str] = set()
@@ -197,9 +258,38 @@ class ToolExecutor:
         # at assistant-message persistence to set Message.attachments. Cleared there.
         self.pending_attachments: List[Dict[str, Any]] = []
 
+    # ── Per-call ContextVar-backed state (Phase 8) ──────────────
+    #
+    # READ via ``self._current_user_id`` etc. (property).
+    # WRITE via ``self.set_user_id(...)`` etc. (writes ContextVar).
+    #
+    # The ContextVars are module-level so multiple ToolExecutor
+    # instances (in tests) share the same per-task isolation
+    # semantics — exactly one ContextVar lookup per attribute.
+
+    @property
+    def _current_user_id(self) -> Optional[str]:
+        return _USER_ID_CTX.get()
+
+    @property
+    def _chat_id(self) -> Optional[int]:
+        return _CHAT_ID_CTX.get()
+
+    @property
+    def _current_channel(self) -> Optional[str]:
+        return _CHANNEL_CTX.get()
+
+    @property
+    def _current_job_id(self) -> Optional[str]:
+        return _JOB_ID_CTX.get()
+
+    @property
+    def _session_workspace(self) -> Optional[str]:
+        return _SESSION_WS_CTX.get()
+
     def set_chat_id(self, chat_id: Optional[int]):
         """Set the current Telegram chat ID for send_file/send_photo tools."""
-        self._chat_id = chat_id
+        _CHAT_ID_CTX.set(chat_id)
 
     async def _resolve_chat_id(self) -> Optional[int]:
         """Get the active chat_id, falling back to the user's Telegram ID from DB."""
@@ -1853,36 +1943,118 @@ class ToolExecutor:
     # 14. spawn — background sub-agent task
     # ------------------------------------------------------------------
     async def _tool_spawn(self, inp: Dict[str, Any]) -> str:
+        """Spawn a non-blocking background sub-agent.
+
+        Two paths, switched on settings.subagent_spawning_enabled:
+
+          - When ON (production target): route through the Phase 4
+            orchestrator → BuildJob row → dispatcher gates →
+            agent_runner.run(prompt_profile=SUBAGENT) → announce-back
+            via Day-as-Chat. Works on every channel (web, mobile,
+            extension, telegram).
+          - When OFF (default): fall through to the legacy
+            SubAgentManager singleton (Telegram-only) so the existing
+            Telegram /subagents experience keeps working during the
+            deprecation window. SubAgentManager will be removed in a
+            follow-up after the smoke matrix passes.
+        """
+        from app.config import settings as _cfg
+
         task = inp.get("task", "").strip()
         if not task:
             return "ERROR: 'task' is required"
 
-        if not self.subagent_manager:
-            return "ERROR: Sub-agent manager not available"
-
-        # Agent spawn policy — restrict which agents can be spawned
-        from app.config import settings as _cfg
+        # Agent spawn policy — restrict which agents can be spawned.
+        # Applies regardless of which path we take.
         if _cfg.allow_agents:
             agent_id = inp.get("agent_id", "default")
             if agent_id not in _cfg.allow_agents and agent_id != "default":
                 return f"ERROR: Agent '{agent_id}' not in allow_agents policy: {_cfg.allow_agents}"
 
         user_id = self._current_user_id
-        chat_id = self._chat_id
-        if not chat_id:
-            return "ERROR: No active Telegram chat"
+        if not user_id:
+            return "ERROR: No user context"
 
         label = inp.get("label", None)
         model = inp.get("model", None)
-        timeout = min(int(inp.get("timeout_seconds", 300)), 600)
+        timeout = inp.get("timeout_seconds")
+        if timeout is not None:
+            try:
+                timeout = int(timeout)
+            except (TypeError, ValueError):
+                timeout = None
 
+        # ── Path A: unified-job sub-agent (kill switch ON) ───────
+        if _cfg.subagent_spawning_enabled:
+            from app.agent.subagent_orchestrator import spawn_subagent
+            # The parent's current job_id is plumbed through the
+            # tool executor as ``_current_job_id`` so the orchestrator
+            # can walk the parent chain for depth checks.
+            parent_job_id = getattr(self, "_current_job_id", None)
+            agent_runner = getattr(
+                self, "agent_runner", None,
+            ) or getattr(
+                self.subagent_manager, "_agent_runner", None,
+            )
+            if agent_runner is None:
+                return (
+                    '{"error":"SUBAGENT_NOT_WIRED","message":'
+                    '"Sub-agent orchestrator has no agent_runner reference. '
+                    'Operator: confirm app/main.py wires ToolExecutor.agent_runner."}'
+                )
+            # Phase 9: credit_budget defaults to None (no enforcement
+            # without an explicit cap). The LLM can pass a budget in
+            # the tool input as ``credit_budget_usd`` — useful for
+            # bounding expensive research tasks. The orchestrator
+            # caps via _compute_run_cost vs credit_budget_allocated
+            # at run end.
+            credit_budget = inp.get("credit_budget_usd")
+            try:
+                credit_budget = (
+                    float(credit_budget) if credit_budget is not None else None
+                )
+            except (TypeError, ValueError):
+                credit_budget = None
+
+            result = await spawn_subagent(
+                user_id=user_id,
+                task=task,
+                label=label,
+                model=model,
+                timeout_seconds=timeout,
+                parent_job_id=parent_job_id,
+                channel=self._current_channel,
+                telegram_chat_id=self._chat_id,
+                agent_runner=agent_runner,
+                credit_budget=credit_budget,
+            )
+            return json.dumps(result)
+
+        # ── Path B: legacy SubAgentManager (kill switch OFF) ─────
+        # Backward compat: Telegram-only spawn keeps working until
+        # the operator flips the kill switch.
+        if not self.subagent_manager:
+            return (
+                '{"error":"SUBAGENT_DISABLED","message":"Sub-agent spawning is disabled. '
+                'Operator: set SUBAGENT_SPAWNING_ENABLED=true to enable the unified job path."}'
+            )
+
+        chat_id = self._chat_id
+        if not chat_id:
+            return (
+                '{"error":"SUBAGENT_LEGACY_TELEGRAM_ONLY","message":'
+                '"Legacy spawn path requires an active Telegram chat. '
+                'Operator: set SUBAGENT_SPAWNING_ENABLED=true to spawn on web/extension/voice."}'
+            )
+
+        legacy_timeout = min(int(timeout or 300), 600)
         result = await self.subagent_manager.spawn(
             task=task,
             user_id=user_id,
             telegram_chat_id=chat_id,
             label=label,
             model=model,
-            timeout_seconds=timeout,
+            timeout_seconds=legacy_timeout,
         )
         return json.dumps(result)
 
@@ -3141,28 +3313,42 @@ class ToolExecutor:
         return os.path.join(base, path)
 
     def set_user_id(self, user_id: str):
-        """Set the current user ID for memory tools."""
-        self._current_user_id = user_id
+        """Set the current user ID for memory tools.
+
+        Phase 8: writes to ``_USER_ID_CTX`` (asyncio per-task
+        context) — see class docstring. Reads via the
+        ``_current_user_id`` property at the top of the class."""
+        _USER_ID_CTX.set(user_id)
 
     def set_channel(self, channel: Optional[str]):
-        """Set the active channel for this turn (web/telegram/discord/slack/app)."""
-        self._current_channel = (channel or "").strip().lower() or None
+        """Set the active channel for this turn (web/telegram/discord/slack/app).
+        Writes to the ``_CHANNEL_CTX`` ContextVar."""
+        _CHANNEL_CTX.set((channel or "").strip().lower() or None)
 
     def set_session_workspace(self, path: Optional[str]):
         """Set a per-session workspace override. Relative paths resolve against this.
 
         Used by vibecoding to direct file writes into vibecoding/{slug}/.
-        Call with None to reset to the default workspace.
+        Call with None to reset to the default workspace. Writes to
+        the ``_SESSION_WS_CTX`` ContextVar.
         """
-        self._session_workspace = path
-    
-    @property
-    def _current_user_id(self) -> str:
-        return getattr(self, "_user_id", "")
-    
-    @_current_user_id.setter
-    def _current_user_id(self, value: str):
-        self._user_id = value
+        _SESSION_WS_CTX.set(path)
+
+    def set_current_job_id(self, job_id: Optional[str]):
+        """Set the current BuildJob id this run is processing.
+
+        Phase 8: enables ``_tool_spawn`` to write ``parent_job_id``
+        on the spawned BuildJob row so Mission Control's "child of X"
+        breadcrumb renders. Writes to ``_JOB_ID_CTX``.
+
+        ``AgentRunner.run`` calls this at the top of each invocation
+        when the caller (routine runner, trigger runner, dashboard
+        task intake) passed a ``current_job_id`` kwarg. A run that
+        isn't tied to a job (e.g. interactive chat from the web)
+        leaves it None and any sub-agent spawned in that turn lands
+        as a top-level row.
+        """
+        _JOB_ID_CTX.set(job_id)
 
     # ─────────────────────────────────────────────────────────
     # 33. canvas — Agent-to-UI push

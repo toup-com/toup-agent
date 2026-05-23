@@ -344,6 +344,45 @@ class Settings(BaseSettings):
     lane_cron_model: Optional[str] = None  # Override model for cron lane
     lane_hook_model: Optional[str] = None  # Override model for hook lane
 
+    # ── Sub-agent spawning ───────────────────────────────────
+    # Phase 1 of the sub-agent spawning arc. Off by default; operator
+    # flips per-environment after the smoke matrix in
+    # docs/runbooks/subagent-rollout.md passes. While off, the spawn
+    # tool returns SUBAGENT_DISABLED to the LLM without creating any
+    # rows.
+    subagent_spawning_enabled: bool = False
+    # Depth = 1 in v1: no grandchildren. The spawn dispatcher walks
+    # parent_job_id and rejects with SUBAGENT_DEPTH_EXCEEDED past this
+    # value. Bump to 2-3 after telemetry shows v1 is healthy.
+    subagent_max_depth: int = 1
+    # Per-parent live-children cap (count_running_children > this
+    # rejects with SUBAGENT_PARENT_CAP). Stops a chatty supervisor
+    # from fanning out indefinitely on one turn.
+    subagent_max_children_per_parent: int = 5
+    # Per-user concurrent sub-agent cap. With the global
+    # `lane_max_concurrent=5` semaphore, this also implicitly bounds
+    # the SUBAGENT lane share so the user's foreground MAIN run never
+    # starves.
+    subagent_max_per_user_concurrent: int = 3
+    # Rolling 24h ceiling on sub-agent spawns per user. Backstop
+    # against runaway loops the per-parent + concurrent caps miss
+    # (e.g. a user prompt that legitimately spawns 5 in series, 10x).
+    subagent_max_per_user_24h: int = 50
+    # Cost knob — multiplier the credit hook applies to LLM spend
+    # inside a sub-agent run. 1.0 = same rate as the parent.
+    # Crank up to dampen sub-agent abuse without disabling outright.
+    subagent_credit_multiplier: float = 1.0
+    # Default wall-clock budget for a sub-agent run. The spawn tool
+    # accepts an override on the LLM call clamped to
+    # `subagent_max_timeout_seconds`.
+    subagent_default_timeout_seconds: int = 300
+    subagent_max_timeout_seconds: int = 900
+    # Threshold beyond which a `status=running` sub-agent BuildJob
+    # row is considered orphaned by a platform restart and gets swept
+    # to `failed`. See app/agent/subagent_dispatcher.py orphan sweep
+    # (mirrors triggers/runner.py:177 pattern).
+    subagent_orphan_sweep_threshold_minutes: int = 10
+
     # ── Enhanced Telegram ────────────────────────────────────
     telegram_forum_support: bool = True  # Support Telegram forum topics
     telegram_topic_routing: bool = True  # Route by topic thread_id

@@ -527,9 +527,18 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "spawn",
             "description": (
-                "Spawn a background task that runs independently and reports back when done. "
-                "Use for: long-running research, complex multi-step tasks, work that shouldn't block "
-                "the conversation. The result will be announced in chat when the task completes."
+                "Spawn a background sub-agent to do an independent task. "
+                "**This is non-blocking** — the call returns immediately with "
+                "a job_id; the sub-agent runs separately and announces its "
+                "result as a new assistant message in the conversation when "
+                "done. **After calling spawn, END YOUR TURN.** Do not wait or "
+                "poll. Do not chain more tool calls expecting the sub-agent's "
+                "result. Tell the user briefly what you've spawned, then stop. "
+                "Use for: long-running research, complex multi-step tasks, "
+                "work that would otherwise block the conversation for many "
+                "seconds. The sub-agent has tools but cannot itself spawn "
+                "further sub-agents (no grandchildren) and cannot write to "
+                "your user's memory."
             ),
             "input_schema": {
                 "type": "object",
@@ -549,6 +558,17 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                     "timeout_seconds": {
                         "type": "integer",
                         "description": "Max time in seconds (default 300, max 600).",
+                    },
+                    "credit_budget_usd": {
+                        "type": "number",
+                        "description": (
+                            "Optional USD spend cap for the sub-agent run. "
+                            "If the run exceeds this, it terminates with "
+                            "outcome=budget_exhausted and a partial-result "
+                            "announce. Use for expensive research tasks "
+                            "where you want to bound cost. Leave unset for "
+                            "no cap."
+                        ),
                     },
                 },
                 "required": ["task"],

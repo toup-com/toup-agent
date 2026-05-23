@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # the partial unique index predicate in `app.db.database.init_db`. Add a
 # channel here only if it's system-driven (push-style, not a user UI
 # thread) — see Reading A in the bug-sweep doc.
-SYSTEM_CHANNELS: frozenset[str] = frozenset({"routine", "trigger", "api", "digest"})
+SYSTEM_CHANNELS: frozenset[str] = frozenset({"routine", "trigger", "api", "digest", "subagent"})
 
 
 async def resolve_or_create_day_conversation(

@@ -125,6 +125,19 @@ class JobResponse(BaseModel):
     source_id: Optional[str] = None
     fire_instant: Optional[str] = None
     attempt: Optional[int] = None
+    # Sub-agent arc (Phase 6 cost-attribution exposure). Null for any
+    # non-sub-agent job; populated by the orchestrator on sub-agent
+    # rows. ``credit_spent`` is the running total updated by the
+    # LLM-proxy credit hook; ``credit_budget_allocated`` is the slice
+    # the parent allocated (null when budget enforcement is off).
+    # ``parent_job_id`` lets the Jobs detail UI render the parent
+    # chain breadcrumb. ``outcome`` is the per-type sub-state already
+    # written by other handlers; sub-agents use {success, failed,
+    # timeout, cancelled, budget_exhausted}.
+    parent_job_id: Optional[str] = None
+    credit_budget_allocated: Optional[float] = None
+    credit_spent: Optional[float] = None
+    outcome: Optional[str] = None
     created_at: str
     completed_at: Optional[str] = None
 
@@ -217,6 +230,13 @@ def _job_to_response(job: BuildJob) -> JobResponse:
             job.fire_instant.isoformat() if getattr(job, 'fire_instant', None) else None
         ),
         attempt=getattr(job, 'attempt', None),
+        # Sub-agent arc — exposed on every job row (None for
+        # non-sub-agent rows, which keeps the field optional in the
+        # client schema).
+        parent_job_id=getattr(job, 'parent_job_id', None),
+        credit_budget_allocated=getattr(job, 'credit_budget_allocated', None),
+        credit_spent=getattr(job, 'credit_spent', None),
+        outcome=getattr(job, 'outcome', None),
         created_at=job.created_at.isoformat() if job.created_at else "",
         completed_at=job.completed_at.isoformat() if job.completed_at else None,
     )
@@ -585,6 +605,10 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
                     user_id=user_id,
                     session_id=f"dashboard-task-{job_id[:8]}",
                     channel="web",
+                    # Phase 8: enable parent_job_id linkage so any
+                    # sub-agent spawned during this dashboard task
+                    # lands as a child row in Mission Control.
+                    current_job_id=job_id,
                     on_tool_start=lambda name, args: asyncio.ensure_future(
                         blog.tool(f"Using {name}", meta={"tool": name})
                     ),
