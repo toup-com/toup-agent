@@ -111,6 +111,100 @@ async def post_plan_selected(
     return Response(status_code=204)
 
 
+# ── Free-tier activation (hotfix for PR 2 BYO removal) ──────────────
+#
+# The legacy LLM Bundle flow paid for chat via Stripe; the
+# `invoice.payment_succeeded` webhook then minted `llm_token_hash` and
+# flipped `bundle_status='active'`. The LLM proxy still gates on
+# `bundle_status in ('active', 'cancelling')`, so Free users (who
+# never go through Stripe) land in chat with `bundle_status='none'`
+# and a NULL `llm_token_hash` — every LLM call 403s and the chat
+# surfaces "Error: Something went wrong."
+#
+# This endpoint closes the gap. Called by the new LlmRoute when the
+# user clicks "Continue on Free", and (idempotent) on Install mount
+# as a defensive backstop. Mirrors the first-activation half of
+# `vps.py::_handle_invoice_succeeded` minus the Stripe / period
+# bookkeeping — Free has no period to track; the credit-system
+# `subscription_plans.free` row is the quota source of truth.
+
+
+class FreeTierActivateResponse(BaseModel):
+    activated: bool
+    already_active: bool
+    bundle_status: str
+
+
+@events_router.post("/activate-free-tier", response_model=FreeTierActivateResponse)
+async def post_activate_free_tier(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> FreeTierActivateResponse:
+    import hashlib
+    import secrets as _secrets
+    from sqlalchemy import select
+    from datetime import datetime
+    from app.db.models import AgentConfig
+
+    cfg = (await db.execute(
+        select(AgentConfig).where(AgentConfig.user_id == user.id)
+    )).scalar_one_or_none()
+    if cfg is None:
+        # Fresh signup that hasn't hit /agent-setup yet — the legacy
+        # `_get_or_create_config` path is the proper way to materialise
+        # the row. Use it so we don't drift from defaults.
+        from app.api.agent_setup import _get_or_create_config
+        cfg = await _get_or_create_config(str(user.id), db)
+
+    was_already_active = cfg.bundle_status in ("active", "cancelling")
+
+    # llm_token: agent reads this from its env (TOUP_LLM_TOKEN); proxy
+    # SHA-256-hashes the incoming bearer and compares to llm_token_hash.
+    # We reuse connect_token as the canonical source so a future Stripe
+    # checkout doesn't mint a second one.
+    if not cfg.connect_token:
+        cfg.connect_token = f"toup_ct_{_secrets.token_urlsafe(32)}"
+    _expected_hash = hashlib.sha256(cfg.connect_token.encode()).hexdigest()
+    if cfg.llm_token_hash != _expected_hash:
+        cfg.llm_token_hash = _expected_hash
+        logger.info(
+            "onboarding.free_activate: refreshed llm_token_hash user=%s",
+            str(user.id),
+        )
+
+    if not was_already_active:
+        cfg.bundle_status = "active"
+        cfg.bundle_started_at = cfg.bundle_started_at or datetime.utcnow()
+        cfg.llm_mode = "bundle"
+        logger.info(
+            "onboarding.free_activate: bundle_status -> active user=%s",
+            str(user.id),
+        )
+
+    await db.commit()
+    await db.refresh(cfg)
+
+    # Best-effort: push the new env to the running tenant container so
+    # the agent picks up the TOUP_LLM_TOKEN without a manual restart.
+    # The bridge call is idempotent and returns quickly when the env
+    # is already up-to-date.
+    try:
+        from app.services.docker_host_service import update_container_env
+        await update_container_env(db, str(user.id), cfg)
+    except Exception as e:
+        logger.warning(
+            "onboarding.free_activate: container env push failed user=%s err=%s",
+            str(user.id), e,
+        )
+        # Non-fatal — the next /agent-setup/config save will re-push.
+
+    return FreeTierActivateResponse(
+        activated=not was_already_active,
+        already_active=was_already_active,
+        bundle_status=cfg.bundle_status or "none",
+    )
+
+
 # ── Admin: rollout toggle ────────────────────────────────────────────
 
 admin_router = APIRouter(
