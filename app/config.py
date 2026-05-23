@@ -665,6 +665,16 @@ class Settings(BaseSettings):
     admin_alert_telegram_token: str = ""    # Bot token for admin alerts (shared / user-facing bot)
     admin_alert_telegram_chat_id: str = ""
 
+    # ── Onboarding v2 rollout (PR 4 of 4) ─────────────────────────
+    # `onboarding.v2_rollout_pct` (0-100) gates the new Free+credit-tier
+    # LLM step that replaces the binary Toup-bundle / BYO card. Stored in
+    # platform_settings.value as an integer string so admins can flip
+    # 10 → 50 → 100 without a backend redeploy. This env-var default is
+    # the boot-time fallback when no DB row exists yet (e.g. fresh
+    # deploys); per-user opt-in is computed via a deterministic hash of
+    # user_id mod 100 in feature_flags.py.
+    onboarding_v2_rollout_pct: int = 0
+
     # ── Provisioning bridge (Phase 3, replaces SSH-as-root) ───────
     # mTLS-secured FastAPI service on the VPS. Platform talks to it with a
     # client cert; bridge does all docker / PG lifecycle work.
