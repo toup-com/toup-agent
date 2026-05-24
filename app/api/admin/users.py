@@ -1452,6 +1452,92 @@ async def register_with_invite(
     }
 
 
+# ─── Sub-agent spawning kill-switch ──────────────────────────────
+
+
+class SubagentSpawningRequest(BaseModel):
+    enabled: bool
+
+
+class SubagentSpawningResponse(BaseModel):
+    user_id: str
+    enabled: bool
+    container_restart: str  # "ok" | "skipped_no_container" | "failed:<reason>"
+
+
+@router.post(
+    "/users/{user_id}/subagent-spawning",
+    response_model=SubagentSpawningResponse,
+)
+async def set_subagent_spawning(
+    user_id: str,
+    body: SubagentSpawningRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Flip a tenant's sub-agent spawning kill-switch.
+
+    Updates ``agent_configs.subagent_spawning_enabled`` AND triggers
+    a bridge ``/v1/tenants/<prefix>/restart`` so the tenant agent's
+    running process picks up the change immediately. Without the
+    restart, the flag flip is invisible to the agent until its next
+    rollout or manual restart — that gap was diagnosed live on
+    2026-05-23 across 4 production tenants.
+
+    Restart failures do NOT roll back the DB change — the column is
+    the source of truth; the restart is an "eager apply" optimization.
+    Operators see ``container_restart`` in the response so they can
+    spot when manual intervention is needed.
+    """
+    # Late imports to keep the module's top-level light.
+    from app.db.models.agent import AgentConfig
+    from app.services.docker_host_service import restart_container as svc_restart
+
+    # 1. Verify the user exists (defense-in-depth — UPDATE silently
+    #    succeeds with 0 rows for unknown user_ids).
+    user_row = (await db.execute(
+        select(User).where(User.id == user_id)
+    )).scalar_one_or_none()
+    if user_row is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 2. Update agent_configs.subagent_spawning_enabled.
+    ac = (await db.execute(
+        select(AgentConfig).where(AgentConfig.user_id == user_id)
+    )).scalar_one_or_none()
+    if ac is None:
+        raise HTTPException(
+            status_code=404,
+            detail="User has no AgentConfig row (not provisioned)",
+        )
+    ac.subagent_spawning_enabled = bool(body.enabled)
+    ac.updated_at = datetime.utcnow()
+    await db.commit()
+
+    # 3. Restart the tenant container so the change takes effect now
+    #    (not at the next rollout). svc_restart is best-effort: if the
+    #    user has no managed container OR the bridge is unreachable,
+    #    the DB state is still correct — the next rollout will
+    #    eventually pick it up.
+    restart_status = "skipped_no_container"
+    try:
+        c = await svc_restart(db, user_id)
+        if c is None:
+            restart_status = "skipped_no_container"
+        elif getattr(c, "status", None) == "error":
+            restart_status = f"failed:{(getattr(c, 'error_message', '') or 'unknown')[:80]}"
+        else:
+            restart_status = "ok"
+    except Exception as e:
+        restart_status = f"failed:{type(e).__name__}:{str(e)[:80]}"
+
+    return SubagentSpawningResponse(
+        user_id=user_id,
+        enabled=bool(body.enabled),
+        container_restart=restart_status,
+    )
+
+
 # ─── Helpers ───────────────────────────────────────────────────
 
 def _invite_to_response(invite: Invite) -> InviteResponse:
