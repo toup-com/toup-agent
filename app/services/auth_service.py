@@ -107,10 +107,31 @@ async def create_user(
     )
     db.add(user)
     await db.flush()  # Get user.id before creating identities
-    
+
     # Create default identities for the new user
     await _seed_default_identities(db, user.id)
-    
+
+    # Pre-seed credit_balances with plan_id='free' so the provision
+    # gate (managed_agents.py) and any other downstream check sees a
+    # consistent invariant: every user has a credit_balances row from
+    # signup onward. Without this, the row is lazy-created on first
+    # credit charge — meaning fresh users provision without it, which
+    # used to mis-route them through the paid-awaiting-Stripe path.
+    #
+    # Guarded: in CI / dev the subscription_plans.free row may not be
+    # seeded (alembic 053 doesn't run in init_db()), so we swallow the
+    # error rather than break signup. Production has the row from mig
+    # 053.
+    try:
+        from app.services.credit_service import CreditService
+        await CreditService().get_or_create_balance(db, user.id)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[create_user] credit_balances seed skipped for user %s",
+            str(user.id)[:8], exc_info=True,
+        )
+
     await db.commit()
     await db.refresh(user)
     return user

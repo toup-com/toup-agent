@@ -90,3 +90,49 @@ def test_provision_force_env_push_false():
     # waste ~200ms and introduce an extra failure point.
     src = inspect.getsource(managed_agents.provision)
     assert "force_env_push=False" in src
+
+
+def test_provision_does_not_gate_activation_on_credit_balance_existence():
+    """Regression guard for the 2026-05-23 → 2026-05-24 production bug.
+
+    PR #102 originally guarded activate_free_tier on the presence of a
+    credit_balances row. That row is lazy-created on first credit
+    charge — NOT at signup — so every fresh Free user fell through the
+    gate and provisioned a container with empty TOUP_TOKEN. The chat
+    UI surfaced "Error: Something went wrong" on every message.
+
+    The current gate must drive off ``credit_balances.plan_id``
+    (paid vs. free), NOT off the row existing at all. This test fails
+    if anyone re-introduces the original existence-check pattern.
+    """
+    src = inspect.getsource(managed_agents.provision)
+    # The buggy pattern: `on_credit_system = ... scalar_one_or_none() is not None`
+    # followed by `if on_credit_system:` gating the activation call.
+    assert "on_credit_system" not in src, (
+        "provision endpoint must NOT gate activate_free_tier on the "
+        "existence of a credit_balances row — that row is lazy-created "
+        "on first charge, not at signup. Use credit_balances.plan_id "
+        "to distinguish Free vs. paid-awaiting-Stripe."
+    )
+    # The correct pattern keys on plan_id.
+    assert "plan_id" in src and "free" in src, (
+        "provision endpoint must distinguish Free users from paid-plan "
+        "users via credit_balances.plan_id."
+    )
+
+
+def test_provision_skips_activation_for_paid_plan_awaiting_stripe():
+    """The 402 gate from the 2026-04-27 Arshia incident MUST still
+    fire for users with a paid plan selected (credit_balances.plan_id
+    != 'free') but bundle_status not yet active. Auto-activating them
+    as Free would bypass Stripe and let them provision without paying.
+    """
+    src = inspect.getsource(managed_agents.provision)
+    # The new logic computes a paid-plan signal and skips activation
+    # when it's true. The exact variable name is part of the contract
+    # so the gate is greppable.
+    assert "is_paid_plan_awaiting_stripe" in src, (
+        "provision endpoint must compute a paid-plan signal so users "
+        "with a non-free plan_id awaiting Stripe activation are NOT "
+        "auto-activated as Free."
+    )

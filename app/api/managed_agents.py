@@ -40,35 +40,46 @@ async def provision(
     if not agent_config:
         raise HTTPException(400, "Agent config not found. Complete setup first.")
 
-    # Onboarding-v2 hotfix: credit-system users (those with a row in
-    # credit_balances — Free or paid tier) should have
-    # bundle_status='active' + a valid connect_token / llm_token_hash
-    # by the time we get here. Activate them if they aren't already.
-    # Legacy bundle-only users (no credit_balances row, llm_mode='bundle'
-    # but bundle_status='none' because Stripe hasn't confirmed yet) are
-    # NOT touched — the 402 gate below correctly blocks them per the
-    # 2026-04-27 Arshia incident.
-    try:
+    # Free-tier auto-activation. The credit-system rollout made Free the
+    # default for every new user, but credit_balances rows are lazy-
+    # created on first credit charge — NOT at signup — so the previous
+    # gate (PR #102) that checked for a credit_balances row skipped
+    # activation for every fresh signup. The agent then booted with
+    # LLM_MODE=manual + empty TOUP_TOKEN and every chat surfaced as
+    # "Error: Something went wrong".
+    #
+    # Rule: auto-activate as Free tier UNLESS the user is on a paid
+    # plan awaiting Stripe activation. Paid-awaiting-Stripe is detected
+    # via credit_balances.plan_id != 'free' AND bundle_status not yet
+    # active — those users fall through to the 402 gate below per the
+    # 2026-04-27 Arshia incident (no paid agent provisions without a
+    # paid subscription). Legacy paid users already in 'active'/
+    # 'cancelling' don't need to re-activate.
+    if agent_config.bundle_status not in ("active", "cancelling"):
         from app.db.models import CreditBalance
-        on_credit_system = (await db.execute(
-            select(CreditBalance.user_id).where(
+        cb = (await db.execute(
+            select(CreditBalance).where(
                 CreditBalance.user_id == current_user.id
             )
-        )).scalar_one_or_none() is not None
-        if on_credit_system:
-            from app.services.free_tier_activation import activate_free_tier
-            # force_env_push=False — the recreate=True call below
-            # handles the env refresh, so a redundant bridge push
-            # would just be ~200ms wasted plus an extra failure point.
-            await activate_free_tier(
-                db, str(current_user.id), force_env_push=False,
-            )
-            await db.refresh(agent_config)
-    except Exception as _e:
-        logger.warning(
-            "[PROVISION] free-tier activation skipped for user %s: %s",
-            str(current_user.id)[:8], _e,
+        )).scalar_one_or_none()
+        is_paid_plan_awaiting_stripe = (
+            cb is not None and cb.plan_id and cb.plan_id != "free"
         )
+        if not is_paid_plan_awaiting_stripe:
+            try:
+                from app.services.free_tier_activation import activate_free_tier
+                # force_env_push=False — the recreate=True call below
+                # handles the env refresh, so a redundant bridge push
+                # would waste ~200ms and add a failure point.
+                await activate_free_tier(
+                    db, str(current_user.id), force_env_push=False,
+                )
+                await db.refresh(agent_config)
+            except Exception as _e:
+                logger.warning(
+                    "[PROVISION] free-tier activation failed for user %s: %s",
+                    str(current_user.id)[:8], _e,
+                )
 
     # Defense-in-depth: bundle users must have an active subscription before
     # we'll provision a container. Without this gate, a frontend bug or a

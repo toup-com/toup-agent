@@ -69,6 +69,55 @@ async def _get_agent_config(user_id: str):
         return result.scalar_one_or_none()
 
 
+async def _seed_paid_plan_credit_balance(user_id: str, *, plan_id: str = "starter") -> None:
+    """Seed subscription_plans + credit_balances rows modelling a user
+    who has selected a paid plan but has NOT yet completed Stripe
+    activation (the only scenario where the provision endpoint must
+    still 402).
+
+    Post-credit-system, "paid plan awaiting Stripe" is encoded as
+    ``credit_balances.plan_id != 'free'`` + ``bundle_status != 'active'``.
+    """
+    from decimal import Decimal
+    from datetime import datetime, timedelta
+    from app.db import async_session_maker
+    from app.db.models import SubscriptionPlan, CreditBalance
+
+    async with async_session_maker() as db:
+        existing = await db.get(SubscriptionPlan, plan_id)
+        if existing is None:
+            db.add(SubscriptionPlan(
+                id=plan_id,
+                display_name=plan_id.capitalize(),
+                price_cents=1600,
+                stripe_price_id=f"price_test_{plan_id}",
+                message_credits_monthly=Decimal("100"),
+                integration_credits_monthly=Decimal("500"),
+                message_credits_daily_cap=None,
+                rollover_message_credits=True,
+                rollover_integration_credits=True,
+                rollover_max_pct=Decimal("100"),
+                active=True,
+                sort_order=10,
+            ))
+            await db.flush()
+        now = datetime.utcnow()
+        existing_cb = await db.get(CreditBalance, user_id)
+        if existing_cb is None:
+            db.add(CreditBalance(
+                user_id=user_id, plan_id=plan_id,
+                message_credits_remaining=Decimal("0"),
+                integration_credits_remaining=Decimal("0"),
+                message_credits_used_today=Decimal("0"),
+                message_credits_daily_cap=None,
+                day_anchor_local_date=now.date().isoformat(),
+                period_start=now, period_end=now + timedelta(days=30),
+            ))
+        else:
+            existing_cb.plan_id = plan_id
+        await db.commit()
+
+
 def _fake_get_subscription(sub_id: str, *, status: str = "active", days_ahead: int = 30):
     """Drop-in stand-in for stripe_service.get_subscription."""
     return {
@@ -733,6 +782,13 @@ async def test_provision_blocked_when_bundle_inactive(
             cfg.bundle_status = "none"
             await db.commit()
 
+        # Post-credit-system, "paid plan awaiting Stripe" is signalled by
+        # credit_balances.plan_id != 'free'. Without this row the user
+        # looks like a fresh Free signup and the provision endpoint
+        # auto-activates them (which is correct for Free, wrong for the
+        # defense-in-depth scenario this test guards).
+        await _seed_paid_plan_credit_balance(test_user_id, plan_id="starter")
+
         resp = await client.post("/api/managed-agent/provision", headers=auth_headers)
         assert resp.status_code == 402, \
             f"expected 402 Payment Required, got {resp.status_code}: {resp.text}"
@@ -763,7 +819,91 @@ async def test_provision_blocked_for_past_due_bundle(
             cfg.bundle_status = "past_due"
             await db.commit()
 
+        # Paid-plan signal — see the sibling test for why this is required
+        # post-credit-system.
+        await _seed_paid_plan_credit_balance(test_user_id, plan_id="starter")
+
         resp = await client.post("/api/managed-agent/provision", headers=auth_headers)
         assert resp.status_code == 402
+    finally:
+        settings.managed_hosting_enabled = False
+
+
+@pytest.mark.asyncio
+async def test_provision_auto_activates_fresh_free_user(
+    client: AsyncClient,
+    auth_headers: dict[str, str],
+    test_user_id: str,
+):
+    """Regression for the 2026-05-23 → 2026-05-24 production bug.
+
+    A user who just finished onboarding has:
+      - AgentConfig with llm_mode='bundle' (post-mig-057), bundle_status='none'
+      - NO credit_balances row (lazy-created on first charge)
+      - NO connect_token, NULL llm_token_hash
+
+    The provision endpoint must auto-activate them as Free tier — mint
+    connect_token, flip bundle_status='active', set llm_mode='bundle' —
+    NOT return 402. Before this fix, the user landed in chat with
+    every message surfacing as "Error: Something went wrong" because
+    the LLM proxy 403'd on bundle_status='none'.
+
+    This test fails on main (returns 402); passes with the fix.
+    """
+    from app.config import settings
+    settings.managed_hosting_enabled = True
+    try:
+        await _seed_agent_config(test_user_id, bundle_status="none")
+        from app.db import AgentConfig, async_session_maker
+        async with async_session_maker() as db:
+            cfg = (await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == test_user_id)
+            )).scalar_one()
+            cfg.llm_mode = "bundle"
+            cfg.bundle_status = "none"
+            cfg.connect_token = None
+            cfg.llm_token_hash = None
+            await db.commit()
+
+        # Mock provision_container — the test asserts the gate behaviour,
+        # not the bridge round-trip. If activation succeeds we expect
+        # provision_container to be called; if the 402 gate fires we
+        # expect 402 before reaching the bridge.
+        from app.services import docker_host_service
+
+        class _FakeContainer:
+            status = "running"
+            host_port = 12345
+            container_name = "fake-container"
+
+        async def _fake_provision_container(*_a, **_kw):
+            return _FakeContainer()
+
+        with patch.object(
+            docker_host_service, "provision_container",
+            side_effect=_fake_provision_container,
+        ):
+            resp = await client.post(
+                "/api/managed-agent/provision", headers=auth_headers,
+            )
+
+        assert resp.status_code == 200, (
+            f"fresh Free user must be auto-activated; got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body["status"] == "running"
+        assert body["port"] == 12345
+
+        # And the AgentConfig now reflects a usable bundle state — the
+        # agent container will have correct env on next recreate.
+        cfg = await _get_agent_config(test_user_id)
+        assert cfg.bundle_status == "active", (
+            f"activate_free_tier must flip bundle_status; got "
+            f"{cfg.bundle_status!r}"
+        )
+        assert cfg.connect_token, "connect_token must be minted"
+        assert cfg.llm_token_hash, "llm_token_hash must be set"
+        assert cfg.llm_mode == "bundle"
     finally:
         settings.managed_hosting_enabled = False
