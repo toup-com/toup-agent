@@ -683,12 +683,22 @@ async def init_db():
         # fixture never seeds plans. Same numbers as
         # alembic/versions/20260521_0053_053_credit_system_tables.py
         # `_PLAN_SEED` — keep the two in sync.
+        # rollover_message_credits / rollover_integration_credits / active
+        # are BOOLEAN columns (alembic 053 schema, see _PLAN_SEED there).
+        # Previously these literals were `0`/`1` integers, which Postgres
+        # refuses to coerce to bool ("column ... is of type boolean but
+        # expression is of type integer"). Every boot logged
+        # `[init_db] seed skipped` for all 5 rows — harmless when the
+        # alembic seed had already run, but loud and misleading. Use
+        # `false`/`true` so the seed actually inserts on fresh DBs
+        # without an applied alembic 053 (i.e. the CI test fixture
+        # path).
         """INSERT INTO subscription_plans
             (id, display_name, price_cents, message_credits_monthly,
              integration_credits_monthly, message_credits_daily_cap,
              rollover_message_credits, rollover_integration_credits,
              rollover_max_pct, sort_order, active, created_at)
-           VALUES ('free', 'Free', 0, 30, 120, 5, 0, 0, 0, 0, 1,
+           VALUES ('free', 'Free', 0, 30, 120, 5, false, false, 0, 0, true,
                    CURRENT_TIMESTAMP)
            ON CONFLICT (id) DO NOTHING""",
         """INSERT INTO subscription_plans
@@ -696,32 +706,32 @@ async def init_db():
              integration_credits_monthly, message_credits_daily_cap,
              rollover_message_credits, rollover_integration_credits,
              rollover_max_pct, sort_order, active, created_at)
-           VALUES ('starter', 'Starter', 1600, 130, 2500, NULL, 0, 0, 0,
-                   10, 1, CURRENT_TIMESTAMP)
+           VALUES ('starter', 'Starter', 1600, 130, 2500, NULL, false, false, 0,
+                   10, true, CURRENT_TIMESTAMP)
            ON CONFLICT (id) DO NOTHING""",
         """INSERT INTO subscription_plans
             (id, display_name, price_cents, message_credits_monthly,
              integration_credits_monthly, message_credits_daily_cap,
              rollover_message_credits, rollover_integration_credits,
              rollover_max_pct, sort_order, active, created_at)
-           VALUES ('builder', 'Builder', 4000, 320, 12500, NULL, 0, 0, 0,
-                   20, 1, CURRENT_TIMESTAMP)
+           VALUES ('builder', 'Builder', 4000, 320, 12500, NULL, false, false, 0,
+                   20, true, CURRENT_TIMESTAMP)
            ON CONFLICT (id) DO NOTHING""",
         """INSERT INTO subscription_plans
             (id, display_name, price_cents, message_credits_monthly,
              integration_credits_monthly, message_credits_daily_cap,
              rollover_message_credits, rollover_integration_credits,
              rollover_max_pct, sort_order, active, created_at)
-           VALUES ('pro', 'Pro', 8000, 650, 25000, NULL, 0, 0, 0,
-                   30, 1, CURRENT_TIMESTAMP)
+           VALUES ('pro', 'Pro', 8000, 650, 25000, NULL, false, false, 0,
+                   30, true, CURRENT_TIMESTAMP)
            ON CONFLICT (id) DO NOTHING""",
         """INSERT INTO subscription_plans
             (id, display_name, price_cents, message_credits_monthly,
              integration_credits_monthly, message_credits_daily_cap,
              rollover_message_credits, rollover_integration_credits,
              rollover_max_pct, sort_order, active, created_at)
-           VALUES ('elite', 'Elite', 16000, 1500, 60000, NULL, 1, 1, 50,
-                   40, 1, CURRENT_TIMESTAMP)
+           VALUES ('elite', 'Elite', 16000, 1500, 60000, NULL, true, true, 50,
+                   40, true, CURRENT_TIMESTAMP)
            ON CONFLICT (id) DO NOTHING""",
     ]
     # Each migration statement runs in its OWN transaction so a failure

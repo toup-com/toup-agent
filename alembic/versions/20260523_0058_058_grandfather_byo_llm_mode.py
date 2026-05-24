@@ -1,8 +1,19 @@
 """Grandfather BYO (`llm_mode='manual'`) users into the bundle proxy.
 
-Revision ID: 057
-Revises: 056
+Revision ID: 058
+Revises: 057
 Create Date: 2026-05-23
+
+Renamed from `057` → `058` on 2026-05-24 after the discovery that a
+sibling migration (`057_agent_configs_subagent_spawning_flag.py`) had
+already claimed the `057` revision id. Alembic refused to upgrade
+through the duplicate-head state, logging `Multiple head revisions are
+present` on every boot — so neither migration ever ran via
+`alembic upgrade head`. Both columns landed via `init_db()`'s
+`_alter_statements` (the agent self-heal path), but the alembic_version
+table stayed pinned at 056. Re-linking this revision to 058 makes the
+chain linear again so future deploys advance the version pointer
+cleanly.
 
 Onboarding v2 removes the binary "Toup bundle / Bring-your-own" choice
 from the LLM step. Going forward every user is on the platform-owned
@@ -43,13 +54,13 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision = "057"
-down_revision = "056"
+revision = "058"
+down_revision = "057"
 branch_labels = None
 depends_on = None
 
 
-logger = logging.getLogger("alembic.057")
+logger = logging.getLogger("alembic.058")
 
 
 def upgrade() -> None:
@@ -62,7 +73,7 @@ def upgrade() -> None:
         # Platform DBs always have this table; agent (per-tenant) DBs
         # don't. Skipping is correct — agent DBs never carry the
         # llm_mode column the platform's webhook handlers do.
-        logger.info("[alembic.057] agent_configs absent; skipping (platform-only table)")
+        logger.info("[alembic.058] agent_configs absent; skipping (platform-only table)")
         return
 
     existing_cols = {c["name"] for c in insp.get_columns("agent_configs")}
@@ -91,12 +102,12 @@ def upgrade() -> None:
         "SELECT COUNT(*) FROM agent_configs WHERE llm_mode = 'manual'"
     )).scalar() or 0
     if pre:
-        logger.info("[alembic.057] coercing %d BYO users to bundle", pre)
+        logger.info("[alembic.058] coercing %d BYO users to bundle", pre)
         conn.execute(sa.text(
             "UPDATE agent_configs SET llm_mode = 'bundle' WHERE llm_mode = 'manual'"
         ))
     else:
-        logger.info("[alembic.057] no BYO users to coerce")
+        logger.info("[alembic.058] no BYO users to coerce")
 
 
 def downgrade() -> None:
@@ -111,7 +122,7 @@ def downgrade() -> None:
     existing_cols = {c["name"] for c in insp.get_columns("agent_configs")}
     if "llm_mode_pre_v2" not in existing_cols:
         # Nothing to restore from.
-        logger.warning("[alembic.057] llm_mode_pre_v2 column absent; cannot reverse coerce")
+        logger.warning("[alembic.058] llm_mode_pre_v2 column absent; cannot reverse coerce")
         return
 
     # Restore every row's pre-v2 value. Rows whose pre_v2 is NULL stay
@@ -121,7 +132,7 @@ def downgrade() -> None:
         "UPDATE agent_configs SET llm_mode = llm_mode_pre_v2 "
         "WHERE llm_mode_pre_v2 IS NOT NULL"
     )).rowcount
-    logger.info("[alembic.057] restored llm_mode for %s rows", restored)
+    logger.info("[alembic.058] restored llm_mode for %s rows", restored)
 
     # Deliberately NOT dropping the llm_mode_pre_v2 column here. It's
     # cheap (20 chars per row), serves as forensic evidence, and
