@@ -40,6 +40,36 @@ async def provision(
     if not agent_config:
         raise HTTPException(400, "Agent config not found. Complete setup first.")
 
+    # Onboarding-v2 hotfix: credit-system users (those with a row in
+    # credit_balances — Free or paid tier) should have
+    # bundle_status='active' + a valid connect_token / llm_token_hash
+    # by the time we get here. Activate them if they aren't already.
+    # Legacy bundle-only users (no credit_balances row, llm_mode='bundle'
+    # but bundle_status='none' because Stripe hasn't confirmed yet) are
+    # NOT touched — the 402 gate below correctly blocks them per the
+    # 2026-04-27 Arshia incident.
+    try:
+        from app.db.models import CreditBalance
+        on_credit_system = (await db.execute(
+            select(CreditBalance.user_id).where(
+                CreditBalance.user_id == current_user.id
+            )
+        )).scalar_one_or_none() is not None
+        if on_credit_system:
+            from app.services.free_tier_activation import activate_free_tier
+            # force_env_push=False — the recreate=True call below
+            # handles the env refresh, so a redundant bridge push
+            # would just be ~200ms wasted plus an extra failure point.
+            await activate_free_tier(
+                db, str(current_user.id), force_env_push=False,
+            )
+            await db.refresh(agent_config)
+    except Exception as _e:
+        logger.warning(
+            "[PROVISION] free-tier activation skipped for user %s: %s",
+            str(current_user.id)[:8], _e,
+        )
+
     # Defense-in-depth: bundle users must have an active subscription before
     # we'll provision a container. Without this gate, a frontend bug or a
     # direct API call could create a paid agent without a paid subscription
@@ -93,8 +123,16 @@ async def provision(
             )
 
     try:
+        # recreate=True is the load-bearing fix for the onboarding-v2
+        # Free-tier path: the container may have been provisioned at
+        # prewarm time with LLM_MODE=manual + empty TOUP_TOKEN, then
+        # activate_free_tier flipped the DB to bundle/active. Without
+        # `recreate=True`, provision_container's idempotency early-
+        # returns on the existing container and the agent process keeps
+        # running with stale env → every LLM call surfaces as "Error:
+        # Something went wrong" in chat.
         container = await docker_host_service.provision_container(
-            db, current_user.id, agent_config
+            db, current_user.id, agent_config, recreate=True,
         )
 
         # ── Sync Soul identity to newly provisioned agent ──
