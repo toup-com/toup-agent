@@ -241,17 +241,46 @@ async def _read_subagent_flag_for_user(user_id: str) -> bool:
             # Self-hosted or misconfigured tenant: no callback target.
             # Fail closed — the env-var path is the only enable lever.
             return False
+        # Try the configured base first; if it returns non-JSON (e.g.
+        # the SPA's index.html because the tenant's PLATFORM_API_URL
+        # was set without the /api suffix), retry with /api inserted.
+        # Caught live 2026-05-24 for nariman where the tenant container
+        # had PLATFORM_API_URL=https://toup.ai/api in its OS env but
+        # settings.platform_api_url resolved to https://toup.ai at
+        # runtime (origin still under investigation). Either layout has
+        # to work, so the helper tries both.
+        candidates = [f"{platform_url}/agent/runtime-flags"]
+        if not platform_url.rstrip("/").endswith("/api"):
+            candidates.append(f"{platform_url}/api/agent/runtime-flags")
         async with httpx.AsyncClient(timeout=5.0) as c:
-            r = await c.get(
-                f"{platform_url}/agent/runtime-flags",
-                headers={
-                    "X-Agent-Key": agent_key,
-                    "X-Agent-User-Id": user_id,
-                },
-            )
-        if r.status_code != 200:
-            return False
-        return bool(r.json().get("subagent_spawning_enabled", False))
+            for url in candidates:
+                try:
+                    r = await c.get(
+                        url,
+                        headers={
+                            "X-Agent-Key": agent_key,
+                            "X-Agent-User-Id": user_id,
+                        },
+                    )
+                except Exception:
+                    continue
+                if r.status_code != 200:
+                    continue
+                # Guard against SPA HTML fallback that returns 200 on
+                # any path — only trust JSON content.
+                ctype = (r.headers.get("content-type") or "").lower()
+                if "application/json" not in ctype:
+                    logger.warning(
+                        "[subagent.flag] non-JSON response from %s (ctype=%s) — "
+                        "PLATFORM_API_URL likely missing /api suffix",
+                        url, ctype,
+                    )
+                    continue
+                try:
+                    return bool(r.json().get("subagent_spawning_enabled", False))
+                except Exception:
+                    continue
+        return False
     except Exception:
         return False
 

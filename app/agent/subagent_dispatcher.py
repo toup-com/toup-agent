@@ -371,14 +371,36 @@ async def _read_subagent_flag_for_user(user_id: str) -> bool:
         agent_key = (getattr(_settings, "agent_api_key", "") or "").strip()
         if not platform_url or not agent_key:
             return False
+        # See tool_executor._read_subagent_flag_for_user — same defensive
+        # both-URL-variants behaviour to absorb a tenant whose
+        # PLATFORM_API_URL resolves without the /api suffix.
+        candidates = [f"{platform_url}/agent/runtime-flags"]
+        if not platform_url.rstrip("/").endswith("/api"):
+            candidates.append(f"{platform_url}/api/agent/runtime-flags")
         async with httpx.AsyncClient(timeout=5.0) as c:
-            r = await c.get(
-                f"{platform_url}/agent/runtime-flags",
-                headers={"X-Agent-Key": agent_key, "X-Agent-User-Id": user_id},
-            )
-        if r.status_code != 200:
-            return False
-        return bool(r.json().get("subagent_spawning_enabled", False))
+            for url in candidates:
+                try:
+                    r = await c.get(
+                        url,
+                        headers={"X-Agent-Key": agent_key, "X-Agent-User-Id": user_id},
+                    )
+                except Exception:
+                    continue
+                if r.status_code != 200:
+                    continue
+                ctype = (r.headers.get("content-type") or "").lower()
+                if "application/json" not in ctype:
+                    logger.warning(
+                        "[subagent.flag] non-JSON response from %s (ctype=%s) — "
+                        "PLATFORM_API_URL likely missing /api suffix",
+                        url, ctype,
+                    )
+                    continue
+                try:
+                    return bool(r.json().get("subagent_spawning_enabled", False))
+                except Exception:
+                    continue
+        return False
     except Exception:
         return False
 
