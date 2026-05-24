@@ -171,14 +171,37 @@ def archive_project(project_id: str) -> bool:
     return True
 
 
-def provision_tenant(prefix: str) -> tuple[str, str]:
+def _sanitize_for_project_name(raw: str, max_len: int = 30) -> str:
+    """Reduce a free-form display name to alphanumerics + hyphens so it
+    survives the OpenAI Admin API's project-name validator and is still
+    readable in the dashboard. Trims to `max_len` and strips any
+    leading/trailing hyphens left after substitution.
+    """
+    import re
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "-", raw or "")
+    cleaned = cleaned.strip("-")[:max_len].rstrip("-")
+    return cleaned
+
+
+def provision_tenant(
+    prefix: str,
+    user_name: Optional[str] = None,
+) -> tuple[str, str]:
     """Create project + service-account key for a tenant. Convenience wrapper
     used by bundle-activation paths.
 
     Returns (project_id, api_key_value). On any failure raises RuntimeError
     (or OpenAIAdminUnavailable if the admin key isn't configured).
+
+    `user_name` is interpolated into the project name when present, so the
+    operator's OpenAI dashboard shows e.g. `toup-NARIMAN-842ce50a`
+    instead of an opaque `toup-tenant-842ce50a`. Falls back to the legacy
+    `toup-tenant-<prefix>` form when the name is missing or sanitises to
+    an empty string. Prefix stays in the name in either case so support
+    can grep by user_id.
     """
-    project_name = f"toup-tenant-{prefix}"
+    safe_name = _sanitize_for_project_name(user_name) if user_name else ""
+    project_name = f"toup-{safe_name}-{prefix}" if safe_name else f"toup-tenant-{prefix}"
     project_id = create_project(project_name)
     try:
         api_key = create_project_api_key(project_id, key_name="agent")

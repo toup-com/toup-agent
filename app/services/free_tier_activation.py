@@ -119,13 +119,25 @@ async def activate_free_tier(
     # in the OpenAI dashboard (operator screenshot 2026-05-24 showed
     # `toup-tenant-*` projects stopped being created post-credit-system).
     #
+    # Pass the user's display name through so the OpenAI dashboard
+    # shows `toup-<NAME>-<prefix>` instead of the legacy opaque
+    # `toup-tenant-<prefix>`. Name lookup is best-effort — if the User
+    # row is missing or unnamed, the helper falls back to the legacy
+    # naming.
+    #
     # Idempotent — early-returns if cfg.bundle_openai_project_id is
     # already set. Failures swallow & log; the proxy's master-key
     # fallback keeps the agent working even if OpenAI Admin API is
     # unavailable.
     try:
+        from app.db.models import User
+        u = await db.get(User, user_id)
+        user_name = (u.name if u else None) or None
+    except Exception:
+        user_name = None
+    try:
         from app.api.billing import _provision_openai_project_if_needed
-        _provision_openai_project_if_needed(cfg)
+        _provision_openai_project_if_needed(cfg, user_name=user_name)
     except Exception as e:
         logger.warning(
             "free_tier_activation: OpenAI project auto-provisioning failed "

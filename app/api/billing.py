@@ -224,10 +224,19 @@ async def _sync_active_subscription_to_db(
         )
 
 
-def _provision_openai_project_if_needed(config: AgentConfig) -> None:
+def _provision_openai_project_if_needed(
+    config: AgentConfig,
+    user_name: Optional[str] = None,
+) -> None:
     """Idempotent: if config has no bundle_openai_project_id yet, call the
     OpenAI Admin API to create a per-user project + service-account key, and
     write both onto the AgentConfig (caller commits).
+
+    `user_name`, when passed, is interpolated into the OpenAI project name
+    so the operator's dashboard shows `toup-<NAME>-<prefix>` instead of an
+    opaque `toup-tenant-<prefix>`. Callers that have the User row handy
+    should pass it; callers that don't (or are running before the User
+    row is fully hydrated) can omit it and accept the legacy naming.
 
     Failures are logged + swallowed — bundle activation must NOT fail because
     of a transient OpenAI outage. The proxy's outbound logic falls back to
@@ -240,7 +249,7 @@ def _provision_openai_project_if_needed(config: AgentConfig) -> None:
             provision_tenant, OpenAIAdminUnavailable,
         )
         prefix = (config.user_id or "")[:8] or "unknown"
-        project_id, api_key = provision_tenant(prefix)
+        project_id, api_key = provision_tenant(prefix, user_name=user_name)
         config.bundle_openai_project_id = project_id
         config.bundle_openai_api_key = api_key
         logger.info(
