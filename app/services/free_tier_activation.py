@@ -119,25 +119,30 @@ async def activate_free_tier(
     # in the OpenAI dashboard (operator screenshot 2026-05-24 showed
     # `toup-tenant-*` projects stopped being created post-credit-system).
     #
-    # Pass the user's display name through so the OpenAI dashboard
-    # shows `toup-<NAME>-<prefix>` instead of the legacy opaque
-    # `toup-tenant-<prefix>`. Name lookup is best-effort — if the User
-    # row is missing or unnamed, the helper falls back to the legacy
-    # naming.
+    # Pass the AGENT name through so the OpenAI dashboard shows
+    # `toup-<AGENT>-<prefix>` (e.g. `toup-Aria-9a7f2fe9`) — that's the
+    # persona behind the project's API calls and is the more meaningful
+    # identifier when scanning the project list. Falls back to the user's
+    # display name if no agent_name is set yet (e.g. activation runs
+    # before Soul step), then to the legacy `toup-tenant-<prefix>`.
     #
     # Idempotent — early-returns if cfg.bundle_openai_project_id is
     # already set. Failures swallow & log; the proxy's master-key
     # fallback keeps the agent working even if OpenAI Admin API is
     # unavailable.
+    project_label: Optional[str] = None
     try:
-        from app.db.models import User
-        u = await db.get(User, user_id)
-        user_name = (u.name if u else None) or None
+        if cfg.agent_name:
+            project_label = cfg.agent_name
+        else:
+            from app.db.models import User
+            u = await db.get(User, user_id)
+            project_label = (u.name if u else None) or None
     except Exception:
-        user_name = None
+        project_label = None
     try:
         from app.api.billing import _provision_openai_project_if_needed
-        _provision_openai_project_if_needed(cfg, user_name=user_name)
+        _provision_openai_project_if_needed(cfg, user_name=project_label)
     except Exception as e:
         logger.warning(
             "free_tier_activation: OpenAI project auto-provisioning failed "

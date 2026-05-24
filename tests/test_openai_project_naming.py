@@ -86,17 +86,26 @@ def test_billing_helper_accepts_user_name_kwarg():
     )
 
 
-def test_free_tier_activation_looks_up_user_name():
-    """activate_free_tier must read the User row to find the display
-    name and forward it through. Without this, every Free signup gets
-    the legacy unnamed project label even though the operator asked
-    for the named form.
+def test_free_tier_activation_prefers_agent_name_over_user_name():
+    """activate_free_tier must prefer the AGENT name (e.g. 'Aria') over
+    the user's display name (e.g. 'NARIMAN') when labelling the OpenAI
+    project. The OpenAI project represents the agent's API consumption,
+    so the persona name is the more meaningful identifier when scanning
+    the operator's dashboard. Falls back to the user's display name when
+    the agent_name is missing (e.g. activation runs before Soul step).
     """
     from app.services import free_tier_activation
     src = inspect.getsource(free_tier_activation.activate_free_tier)
-    assert "from app.db.models import User" in src
-    assert "user_name=user_name" in src, (
-        "activate_free_tier must pass user_name to "
+    # Both lookup branches must remain in source.
+    assert "cfg.agent_name" in src, (
+        "activate_free_tier must check cfg.agent_name first."
+    )
+    assert "from app.db.models import User" in src, (
+        "activate_free_tier must still fall back to User.name when "
+        "agent_name is missing."
+    )
+    assert "user_name=project_label" in src, (
+        "The resolved label must be forwarded to "
         "_provision_openai_project_if_needed so the OpenAI dashboard "
-        "shows readable per-user project names."
+        "shows readable per-agent project names."
     )
