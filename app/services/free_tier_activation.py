@@ -111,6 +111,28 @@ async def activate_free_tier(
         if cfg.llm_mode != "bundle":
             cfg.llm_mode = "bundle"
 
+    # Per-user OpenAI project auto-provisioning. The paid-bundle path
+    # has called this since the β architecture shipped (see
+    # billing.py::_provision_openai_project_if_needed), but Free signups
+    # were skipping it — every fresh Free user's OpenAI calls fell back
+    # to the platform master key, with no per-project usage attribution
+    # in the OpenAI dashboard (operator screenshot 2026-05-24 showed
+    # `toup-tenant-*` projects stopped being created post-credit-system).
+    #
+    # Idempotent — early-returns if cfg.bundle_openai_project_id is
+    # already set. Failures swallow & log; the proxy's master-key
+    # fallback keeps the agent working even if OpenAI Admin API is
+    # unavailable.
+    try:
+        from app.api.billing import _provision_openai_project_if_needed
+        _provision_openai_project_if_needed(cfg)
+    except Exception as e:
+        logger.warning(
+            "free_tier_activation: OpenAI project auto-provisioning failed "
+            "user=%s err=%s — falling back to platform master key",
+            str(user_id)[:8], e,
+        )
+
     await db.commit()
     await db.refresh(cfg)
 

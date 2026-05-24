@@ -178,11 +178,28 @@ async def _poll_health(agent_url: str, attempts: int, interval_s: float) -> int:
 # for a high-risk schema migration extends the cap; default of 5 is fine
 # for routine deploys.
 
-_CANARY_BOOT_GATE_S = 30.0          # consecutive-OK gate must clear in this long
-_CANARY_BOOT_INTERVAL_S = 5.0       # poll cadence during boot gate
+_CANARY_BOOT_GATE_S = 75.0          # consecutive-OK gate must clear in this long
+_CANARY_BOOT_INTERVAL_S = 3.0       # poll cadence during boot gate
 _CANARY_REQUIRED_OK = 3             # consecutive 200s to pass boot gate
 _CANARY_STABILITY_HOLD_S = 60.0     # additional sustained-healthy window
 _CANARY_STABILITY_INTERVAL_S = 10.0 # poll cadence during stability hold
+
+# Why 75s/3s: the post-upgrade /agent/health observation needs to
+# survive a Caddy reconfigure race the bridge does after returning
+# from /upgrade. Even though the bridge confirms its OWN 3-pass
+# health check before returning 200, the platform's separate observer
+# polls through Caddy which can briefly route to the draining old
+# slot. 4 production rollouts on 2026-05-24 (74d636db, ece2c2e2,
+# 540cf51e + the originating PR's rollout) aborted with "1/3
+# consecutive 200s within 30s" while the agent itself responded to
+# direct /agent/health curls with sub-100ms 200s right before and
+# after the window. The fix is to widen the gate enough that any
+# brief mid-swap drop doesn't kill the run:
+#   - boot gate window 30 → 75s (caddy reconfigure + first 3 polls)
+#   - poll cadence 5 → 3s (so 3 consecutive 200s lands in ~9s of
+#     steady state, not ~15s)
+# Total worst case: 75s of boot-gate polling before fail (was 30s).
+# Stability hold (60s) and hard cap unchanged.
 
 
 async def _observe_canary_signal(

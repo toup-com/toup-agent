@@ -353,6 +353,36 @@ async def count_subagent_spawns_24h(
 # ──────────────────────────────────────────────────────────────────────
 
 
+async def _read_subagent_flag_for_user(user_id: str) -> bool:
+    """Per-user spawn-enabled flag, fetched from the platform DB via
+    HTTP. Mirrors ``tool_executor._read_subagent_flag_for_user`` (PR
+    #100) so the dispatcher gate can honour the same per-user override
+    as the outer ``_tool_spawn`` gate. Kept inline (not imported) to
+    avoid a tool_executor → subagent_orchestrator → subagent_dispatcher
+    → tool_executor import cycle. Fail-closed on any error — spawn
+    stays gated rather than accidentally letting through under the
+    global env-var-off default."""
+    if not user_id:
+        return False
+    try:
+        from app.config import settings as _settings
+        import httpx
+        platform_url = (getattr(_settings, "platform_api_url", "") or "").rstrip("/")
+        agent_key = (getattr(_settings, "agent_api_key", "") or "").strip()
+        if not platform_url or not agent_key:
+            return False
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(
+                f"{platform_url}/agent/runtime-flags",
+                headers={"X-Agent-Key": agent_key, "X-Agent-User-Id": user_id},
+            )
+        if r.status_code != 200:
+            return False
+        return bool(r.json().get("subagent_spawning_enabled", False))
+    except Exception:
+        return False
+
+
 async def pre_spawn_checks(
     db: AsyncSession,
     *,
@@ -382,15 +412,23 @@ async def pre_spawn_checks(
     """
     from app.config import settings
 
-    # 1. Kill switch
+    # 1. Kill switch — env-var first, per-user flag as fallback.
+    # tool_executor._tool_spawn already did this two-step check before
+    # calling into the orchestrator (PR #100), but the dispatcher used
+    # to only check the env var — so a tenant whose per-user flag was
+    # flipped via the admin endpoint would pass the outer gate, enter
+    # Path A, then hit DISABLED here. Caught live 2026-05-24 for
+    # mrvviinn@gmail.com after their per-user flag was set TRUE.
+    # Mirror the outer fallback so both gates agree.
     if not settings.subagent_spawning_enabled:
-        return SpawnRejection(
-            error_code=REJECTION_CODES.DISABLED,
-            message=(
-                "Sub-agent spawning is disabled in this environment. "
-                "Operator must flip SUBAGENT_SPAWNING_ENABLED=true."
-            ),
-        )
+        if not await _read_subagent_flag_for_user(user_id):
+            return SpawnRejection(
+                error_code=REJECTION_CODES.DISABLED,
+                message=(
+                    "Sub-agent spawning is disabled in this environment. "
+                    "Operator must flip SUBAGENT_SPAWNING_ENABLED=true."
+                ),
+            )
 
     # 2. Empty task
     if not (task or "").strip():

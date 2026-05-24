@@ -257,11 +257,21 @@ _AGENT_KEYWORDS = {
     "process", "kill process", "stop process", "list processes",
     "session", "sessions", "history", "conversation",
     "lane", "lanes",
+    # Sub-agent vocabulary — caught 2026-05-24 when "spin up 3 sub-agents
+    # in parallel" classified as web intent (research/news beat the lone
+    # "agent" match) and spawn was filtered out. These keywords give the
+    # agent intent enough weight to win on explicit spawn phrasings.
+    "sub-agent", "subagent", "sub agents", "sub-agents",
+    "spin up", "fire off", "kick off", "in parallel",
 }
 
 _AGENT_PATTERNS_RE = re.compile(
     r'\b(?:spawn|kill|stop|list|show)\s+(?:a\s+)?(?:agent|process|subprocess|task|session|lane)\b'
-    r'|\b(?:background|parallel)\s+(?:task|process|job)\b',
+    r'|\b(?:background|parallel)\s+(?:task|process|job)\b'
+    # "spin up N sub-agents" / "spawn 3 agents" — explicit fan-out
+    # phrasing that the original regex missed.
+    r'|\b(?:spin\s+up|fire\s+off|kick\s+off|spawn)\s+\d*\s*(?:sub[\-\s]?agents?|agents?|workers?|tasks?)\b'
+    r'|\b(?:in\s+parallel|simultaneously)\b.*\b(?:agent|task|research|job)\b',
     re.IGNORECASE,
 )
 
@@ -497,6 +507,16 @@ _ALWAYS_INCLUDED_TOOLS = frozenset({
     "navigate_to",  # Page transfers — needed in any intent
     "recall_day",   # Past-day questions can fall under any category
     "memory_search",  # "what do you remember about X" can hit any intent
+    # spawn is a meta-affordance: any sufficiently expensive turn — even a
+    # "research" prompt that classifies as web intent — may want to be
+    # backgrounded into a sub-agent. Hiding spawn from non-agent intents
+    # forces the LLM to do the work inline and lie to the user that it
+    # "doesn't have a sub-agent spawning tool" (caught 2026-05-24 when
+    # "Spin up 3 sub-agents to research…" scored web > agent and spawn
+    # was filtered out). spawn's runtime gate still applies (the kill
+    # switch + per-tenant subagent_spawning_enabled flag), so making it
+    # always-visible to the LLM doesn't bypass the rollout controls.
+    "spawn",
 })
 
 

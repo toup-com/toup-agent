@@ -597,6 +597,38 @@ async def proxy_chat(
     body["model"] = model  # rewrite so the upstream call uses the real id
     is_stream = body.get("stream", False)
 
+    # Defensive dedup of tool names. Anthropic 400s the whole turn with
+    # "tools: Tool names must be unique." if the agent's tools array has
+    # a name collision. The agent assembles tools from core + skills +
+    # (optional) MCP without dedup, so a skill that registers a name
+    # already in core, or any MCP collision, kills the turn end-to-end
+    # (user sees "Please try rephrasing your message"). The root cause
+    # still wants fixing in the agent's tool_defs, but dedup here keeps
+    # tenants unblocked + WARN-logs the offending name so we can patch
+    # the offender. Last-write-wins is arbitrary; first-wins is safer
+    # because core tools come first in the agent's assembly order.
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        seen: set[str] = set()
+        deduped: list[dict] = []
+        dups: list[str] = []
+        for t in tools:
+            name = t.get("name") if isinstance(t, dict) else None
+            if not isinstance(name, str) or not name:
+                deduped.append(t)
+                continue
+            if name in seen:
+                dups.append(name)
+                continue
+            seen.add(name)
+            deduped.append(t)
+        if dups:
+            logger.warning(
+                "[LLM-PROXY] dedup'd %d duplicate tool name(s) for user=%s model=%s: %s",
+                len(dups), config.user_id[:8], model, sorted(set(dups)),
+            )
+            body["tools"] = deduped
+
     # Surface the resolved upstream model id back to the agent so the UI can
     # show the real provider model (e.g. "claude-opus-4-1-20250805") instead
     # of the Toup-internal alias (e.g. "claude-opus-4-7"). Read by the agent's

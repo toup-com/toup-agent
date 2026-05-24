@@ -121,6 +121,27 @@ def test_provision_does_not_gate_activation_on_credit_balance_existence():
     )
 
 
+def test_activate_free_tier_provisions_openai_project():
+    """Every Free signup must get their own OpenAI project + service-account
+    key — same per-user attribution the paid-bundle path has always given.
+
+    Regression for the 2026-05-24 finding: post-credit-system rollout, only
+    paid Stripe-active users had `_provision_openai_project_if_needed`
+    wired in (billing.py + vps.py webhook handlers). Free signups were
+    silently using the platform master OpenAI key with no per-project
+    usage attribution in the operator's OpenAI dashboard.
+
+    The activation service is the single funnel point for the Free path,
+    so the provisioning must happen here.
+    """
+    src = inspect.getsource(free_tier_activation.activate_free_tier)
+    assert "_provision_openai_project_if_needed" in src, (
+        "activate_free_tier must call _provision_openai_project_if_needed "
+        "so Free signups get a per-user OpenAI project + key, matching "
+        "what paid users get on Stripe activation."
+    )
+
+
 def test_provision_skips_activation_for_paid_plan_awaiting_stripe():
     """The 402 gate from the 2026-04-27 Arshia incident MUST still
     fire for users with a paid plan selected (credit_balances.plan_id
