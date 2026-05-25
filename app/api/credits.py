@@ -578,7 +578,7 @@ async def admin_credit_audit(
         routing has drifted)
 
     This is the FIRST endpoint to hit when the operator sees a user
-    showing 30/30 credits despite active chat usage. The output
+    showing 100/100 credits despite active chat usage. The output
     distinguishes the four common failure modes:
 
       A. AgentConfig.agent_api_key is empty → tenant agent boot env

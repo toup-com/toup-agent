@@ -28,8 +28,8 @@ async def credit_user(test_user_id: str):
     """Return the user_id along with a freshly-seeded CreditBalance.
 
     The credit_service.get_or_create_balance call lazy-creates the
-    free-tier row with 30 message + 120 integration credits, so the
-    fixture just primes it once.
+    free-tier row with 100 message + 500 integration credits (post
+    mig-059), so the fixture just primes it once.
     """
     from app.db import async_session_maker
     from app.services.credit_service import credit_service
@@ -146,11 +146,13 @@ async def test_try_charge_idempotent(credit_user, monkeypatch):
 async def test_try_charge_denies_when_enforced_and_insufficient(credit_user, monkeypatch):
     """Enforcement ON + amount > remaining → denied with insufficient_message_credits.
 
-    Free tier has a daily_cap of 5 — draining the monthly bucket via
-    repeated small charges would trip DAILY_CAP_EXCEEDED first, masking
-    the INSUFFICIENT_MESSAGE branch we're trying to exercise. Charge a
-    single amount > monthly_remaining instead so the amount-vs-remaining
-    check fires before the daily-cap check.
+    Free tier has a daily_cap (15 post-mig-059) lower than the monthly
+    allotment (100), so draining the monthly bucket via repeated small
+    charges would trip DAILY_CAP_EXCEEDED first, masking the INSUFFICIENT
+    branch we're exercising. The check order in try_charge is
+    insufficient → daily_cap (line ~376 → 378), so charging a single
+    amount strictly greater than monthly_remaining fires INSUFFICIENT
+    even when that amount also exceeds the daily cap.
     """
     from app.config import settings
     from app.db import async_session_maker
@@ -161,9 +163,10 @@ async def test_try_charge_denies_when_enforced_and_insufficient(credit_user, mon
     monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
 
     async with async_session_maker() as db:
-        # Try to spend more than the entire monthly grant (30 credits).
+        # Try to spend more than the entire monthly grant (100 credits
+        # on the post-mig-059 free tier).
         result = await credit_service.try_charge(
-            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("31"),
+            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("101"),
             idempotency_key="should-deny",
         )
         await db.commit()
@@ -172,7 +175,7 @@ async def test_try_charge_denies_when_enforced_and_insufficient(credit_user, mon
 
 
 async def test_try_charge_daily_cap_enforced(credit_user, monkeypatch):
-    """Free tier daily_cap = 5 → spending 6 in one day is denied."""
+    """Free tier daily_cap = 15 (post-mig-059) → spending 16 in one day is denied."""
     from app.config import settings
     from app.db import async_session_maker
     from app.db.models import LEDGER_CHAT_MESSAGE
@@ -183,12 +186,12 @@ async def test_try_charge_daily_cap_enforced(credit_user, monkeypatch):
 
     async with async_session_maker() as db:
         await credit_service.try_charge(
-            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("4.5"),
+            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("14.5"),
             idempotency_key="d-a",
         )
         await db.commit()
     async with async_session_maker() as db:
-        # 4.5 already, plus 1.0 = 5.5 > daily cap of 5
+        # 14.5 already, plus 1.0 = 15.5 > daily cap of 15
         result = await credit_service.try_charge(
             db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("1.0"),
             idempotency_key="d-b",
@@ -284,5 +287,6 @@ async def test_apply_plan_change_to_paid_tier(credit_user):
         await db.commit()
     b = await _balance(credit_user)
     assert b.plan_id == "builder"
-    # Daily cap drops away on paid tiers (None or higher).
-    assert b.message_credits_daily_cap is None or Decimal(b.message_credits_daily_cap) > Decimal("5")
+    # Daily cap drops away on paid tiers (None or higher than the
+    # free-tier 15 post mig-059).
+    assert b.message_credits_daily_cap is None or Decimal(b.message_credits_daily_cap) > Decimal("15")

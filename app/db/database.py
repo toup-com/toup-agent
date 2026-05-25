@@ -674,31 +674,32 @@ async def init_db():
              hetzner_server_type='cpx41', vcpu=8, ram_gb=16, storage_gb=240, price_cents=4500, name='Pro'""",
         # Remove ALL plans except the 3 user-facing tiers
         "DELETE FROM vps_plans WHERE id NOT IN ('starter', 'standard', 'pro')",
-        # ── Credit-system subscription_plans (mirror of alembic 053) ──
+        # ── Credit-system subscription_plans (free-tier reflects mig 059) ──
         # READ FIRST in MEMORY.md — agents/tests boot via init_db, NOT
         # alembic. Without this seed, credit_service.get_or_create_balance
         # raises "subscription_plans 'free' row missing — alembic 053
         # not applied?" the first time any deduction fires. Tests that
         # exercise the credit system silently 500 because the test
-        # fixture never seeds plans. Same numbers as
-        # alembic/versions/20260521_0053_053_credit_system_tables.py
-        # `_PLAN_SEED` — keep the two in sync.
+        # fixture never seeds plans.
+        #
+        # Free-tier numbers reflect alembic 059 (post-bump):
+        # 100 msg / 500 int / 15 day-cap (was 30/120/5 from mig 053).
+        # On Postgres production, mig 059's UPDATE is authoritative for
+        # the existing row; this seed only fires on fresh DBs (CI test
+        # fixture, brand-new tenant Postgres) where DO NOTHING is a
+        # no-op once any row exists.
+        #
         # rollover_message_credits / rollover_integration_credits / active
-        # are BOOLEAN columns (alembic 053 schema, see _PLAN_SEED there).
-        # Previously these literals were `0`/`1` integers, which Postgres
-        # refuses to coerce to bool ("column ... is of type boolean but
-        # expression is of type integer"). Every boot logged
-        # `[init_db] seed skipped` for all 5 rows — harmless when the
-        # alembic seed had already run, but loud and misleading. Use
-        # `false`/`true` so the seed actually inserts on fresh DBs
-        # without an applied alembic 053 (i.e. the CI test fixture
-        # path).
+        # are BOOLEAN columns. Use `false`/`true` literals — Postgres
+        # refuses to coerce integer `0`/`1` to bool with a typed CHECK
+        # constraint ("column ... is of type boolean but expression is
+        # of type integer"). Previous literal regression: PR #119.
         """INSERT INTO subscription_plans
             (id, display_name, price_cents, message_credits_monthly,
              integration_credits_monthly, message_credits_daily_cap,
              rollover_message_credits, rollover_integration_credits,
              rollover_max_pct, sort_order, active, created_at)
-           VALUES ('free', 'Free', 0, 30, 120, 5, false, false, 0, 0, true,
+           VALUES ('free', 'Free', 0, 100, 500, 15, false, false, 0, 0, true,
                    CURRENT_TIMESTAMP)
            ON CONFLICT (id) DO NOTHING""",
         """INSERT INTO subscription_plans

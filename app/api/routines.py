@@ -1098,7 +1098,7 @@ async def force_run(routine_id: str):
         _kind_enabled_or_404(routine.kind)
 
         # Free-tier 60s run-now cooldown — prevents a credit-poor user
-        # from button-mashing a routine to drain their free 30 message
+        # from button-mashing a routine to drain their free 100 message
         # credits in a few seconds. Paid tiers have no cooldown (they
         # paid for the work). last_run_at is updated by the runner on
         # every successful or attempted fire; comparing now()-60s
