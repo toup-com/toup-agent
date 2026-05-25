@@ -735,3 +735,316 @@ async def test_reconcile_does_not_resume_batching_phase():
         "resume guard must block non-canary_observing phases — "
         "this fails if the resume path were to fire on phase!='canary_observing'"
     )
+
+
+# ─── Orphan auto-quarantine (BridgeContainerNotFound) ──────────────
+#
+# Background: 2026-05-25 — Telegram showed 5 tenants per rollout firing
+# the same "no container on bridge (orphan). Manual cleanup may be
+# needed" warning. The platform DB had `managed_containers.status =
+# 'running'` for prefixes the bridge had no record of; every rollout
+# re-included the zombie rows in the candidate set, hit 404, and
+# re-fired the warning. PR fixes this by flipping
+# `status='running' → 'orphan'` when whois corroborates the 404
+# (`confirmed_orphan=True`), so the next rollout's `_running_tenants`
+# query skips the row. Unconfirmed 404s (whois timeout / disagreement)
+# alert only — we don't auto-evict on ambiguous signal.
+
+
+async def _seed_orphan_quarantine_fixtures(*, container_status: str = "running"):
+    """Create a User + AgentConfig + Rollout + ManagedContainer for the
+    orphan-quarantine tests. Returns (rollout, container) detached from
+    any session — they're refetched inside `_upgrade_one`'s own session,
+    which is how the production path works.
+    """
+    import uuid as _uuid
+    from datetime import datetime, timedelta
+    from app.db import async_session_maker
+    from app.db.models import (
+        User, AgentConfig, ManagedContainer, Rollout,
+    )
+    from app.services.auth_service import get_password_hash
+
+    user_id = str(_uuid.uuid4())
+    async with async_session_maker() as db:
+        u = User(
+            id=user_id,
+            email=f"orphan-{user_id[:8]}@example.com",
+            hashed_password=get_password_hash("test1234abcd"),
+            name=f"Orphan {user_id[:6]}",
+        )
+        db.add(u)
+        await db.flush()
+
+        cfg = AgentConfig(
+            user_id=user_id,
+            hosting_mode="managed",
+            agent_name="Test",
+            llm_mode=None,
+        )
+        db.add(cfg)
+
+        rollout = Rollout(
+            image_tag="ghcr.io/toup-com/toup-agent:newtag00",
+            status="running",
+            trigger="ci",
+            canary_wait_minutes=5,
+            started_at=datetime.utcnow() - timedelta(minutes=1),
+        )
+        db.add(rollout)
+
+        mc = ManagedContainer(
+            id=str(_uuid.uuid4()),
+            user_id=user_id,
+            container_id=f"docker-{user_id[:8]}",
+            container_name=f"toup-agent-{user_id[:8]}",
+            host_port=9000 + (hash(user_id) % 900),
+            db_name=f"toup_agent_{user_id[:8]}",
+            status=container_status,
+            image_tag="ghcr.io/toup-com/toup-agent:oldtag00",
+        )
+        db.add(mc)
+        await db.commit()
+        await db.refresh(rollout)
+        await db.refresh(mc)
+        # Detach for the next session opened by _upgrade_one.
+        db.expunge(rollout)
+        db.expunge(mc)
+
+    return rollout, mc
+
+
+@pytest.mark.asyncio
+async def test_upgrade_one_quarantines_confirmed_orphan():
+    """Confirmed orphan (whois 404) flips ManagedContainer.status to
+    'orphan' so `_running_tenants` excludes it on the next rollout.
+    """
+    from sqlalchemy import select
+    from app.db import async_session_maker
+    from app.db.models import ManagedContainer, RolloutAttempt
+    from app.services import rollout_service
+    from app.services.docker_host_service import BridgeContainerNotFound
+
+    rollout, container = await _seed_orphan_quarantine_fixtures()
+
+    async def fake_upgrade(*args, **kwargs):
+        raise BridgeContainerNotFound(
+            prefix=container.user_id[:8],
+            raw='{"detail":"no such tenant"}',
+            confirmed_orphan=True,
+        )
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_telegram(level, message):
+        sent.append((level, message))
+
+    with patch.object(rollout_service, "upgrade_tenant_image", fake_upgrade), \
+         patch.object(rollout_service, "_send_telegram", fake_telegram):
+        attempt = await rollout_service._upgrade_one(
+            None, rollout, container, "ghcr.io/toup-com/toup-agent:newtag00",
+        )
+
+    assert attempt.status == "failed"
+    assert "orphan tenant" in (attempt.error or "")
+
+    async with async_session_maker() as db:
+        refreshed = (await db.execute(
+            select(ManagedContainer).where(ManagedContainer.id == container.id)
+        )).scalar_one()
+        assert refreshed.status == "orphan", (
+            "confirmed orphan must flip status running → orphan so "
+            "_running_tenants excludes the zombie row on the next rollout"
+        )
+        assert "auto-quarantined" in (refreshed.error_message or "")
+        # Attempt row persisted with status='failed'.
+        rows = (await db.execute(
+            select(RolloutAttempt).where(RolloutAttempt.rollout_id == rollout.id)
+        )).scalars().all()
+        assert len(rows) == 1 and rows[0].status == "failed"
+
+    assert any("auto-quarantined" in m for _, m in sent), (
+        f"expected auto-quarantine alert, got: {sent!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_one_does_not_quarantine_unconfirmed_orphan():
+    """Unconfirmed orphan (whois 0 / 200 / 5xx) only alerts — must not
+    evict the ManagedContainer row, so a transient bridge hiccup can't
+    silently quarantine a real tenant.
+    """
+    from sqlalchemy import select
+    from app.db import async_session_maker
+    from app.db.models import ManagedContainer
+    from app.services import rollout_service
+    from app.services.docker_host_service import BridgeContainerNotFound
+
+    rollout, container = await _seed_orphan_quarantine_fixtures()
+
+    async def fake_upgrade(*args, **kwargs):
+        raise BridgeContainerNotFound(
+            prefix=container.user_id[:8],
+            raw='{"detail":"no such tenant"}',
+            confirmed_orphan=False,
+        )
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_telegram(level, message):
+        sent.append((level, message))
+
+    with patch.object(rollout_service, "upgrade_tenant_image", fake_upgrade), \
+         patch.object(rollout_service, "_send_telegram", fake_telegram):
+        attempt = await rollout_service._upgrade_one(
+            None, rollout, container, "ghcr.io/toup-com/toup-agent:newtag00",
+        )
+
+    assert attempt.status == "failed"
+
+    async with async_session_maker() as db:
+        refreshed = (await db.execute(
+            select(ManagedContainer).where(ManagedContainer.id == container.id)
+        )).scalar_one()
+        assert refreshed.status == "running", (
+            "unconfirmed orphan must NOT auto-evict a real tenant — "
+            "a transient bridge 404 on /upgrade with whois timeout would "
+            "otherwise silently quarantine a working container"
+        )
+
+    assert any("unconfirmed" in m for _, m in sent), (
+        f"expected unconfirmed-orphan alert, got: {sent!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_one_skips_quarantine_when_status_already_changed():
+    """If a concurrent path already moved the ManagedContainer off
+    'running' (e.g. operator manually marked it 'stopped'), the orphan
+    handler must not overwrite that state.
+    """
+    from sqlalchemy import select
+    from app.db import async_session_maker
+    from app.db.models import ManagedContainer
+    from app.services import rollout_service
+    from app.services.docker_host_service import BridgeContainerNotFound
+
+    rollout, container = await _seed_orphan_quarantine_fixtures()
+
+    # Race: between rollout candidate selection and the bridge call,
+    # an operator marks the container stopped via the admin API.
+    async with async_session_maker() as db:
+        mc_now = (await db.execute(
+            select(ManagedContainer).where(ManagedContainer.id == container.id)
+        )).scalar_one()
+        mc_now.status = "stopped"
+        await db.commit()
+
+    async def fake_upgrade(*args, **kwargs):
+        raise BridgeContainerNotFound(
+            prefix=container.user_id[:8],
+            raw="", confirmed_orphan=True,
+        )
+
+    async def fake_telegram(level, message):
+        pass
+
+    with patch.object(rollout_service, "upgrade_tenant_image", fake_upgrade), \
+         patch.object(rollout_service, "_send_telegram", fake_telegram):
+        await rollout_service._upgrade_one(
+            None, rollout, container, "ghcr.io/toup-com/toup-agent:newtag00",
+        )
+
+    async with async_session_maker() as db:
+        refreshed = (await db.execute(
+            select(ManagedContainer).where(ManagedContainer.id == container.id)
+        )).scalar_one()
+        assert refreshed.status == "stopped", (
+            "must only quarantine rows that are still 'running' — "
+            "overwriting 'stopped' would clobber operator intent"
+        )
+
+
+# ─── whois corroboration in upgrade_tenant_image ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_upgrade_tenant_image_sets_confirmed_orphan_on_legacy_404_with_whois_404():
+    """Legacy /upgrade returns 404 + whois returns 404 → exception carries
+    confirmed_orphan=True. This is the gate the rollout service uses to
+    decide whether to auto-quarantine the ManagedContainer row.
+    """
+    from app.config import settings as _settings
+    from app.services import docker_host_service as dhs
+
+    # Force legacy path
+    _orig_flag = getattr(_settings, "use_blue_green_rollouts", False)
+    _settings.use_blue_green_rollouts = False
+
+    class _Resp:
+        def __init__(self, code: int, text: str = ""):
+            self.status_code = code
+            self.text = text
+
+        def json(self): return {}
+        def raise_for_status(self): pass
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, path, json=None): return _Resp(404, '{"detail":"no container"}')
+        async def get(self, path):
+            assert path.endswith("/whois")
+            return _Resp(404, '{"detail":"unknown tenant"}')
+
+    try:
+        with patch.object(dhs, "_bridge_client", lambda *_a, **_k: _FakeClient()):
+            with pytest.raises(dhs.BridgeContainerNotFound) as exc_info:
+                await dhs.upgrade_tenant_image(
+                    db=AsyncMock(),
+                    user_id="9ef741e3-aaaa-bbbb-cccc-dddddddddddd",
+                    image_tag="ghcr.io/toup-com/toup-agent:newtag00",
+                )
+        assert exc_info.value.confirmed_orphan is True
+    finally:
+        _settings.use_blue_green_rollouts = _orig_flag
+
+
+@pytest.mark.asyncio
+async def test_upgrade_tenant_image_unconfirmed_when_whois_errors():
+    """Legacy /upgrade returns 404 but whois call raises → confirmed_orphan
+    is False. We must not quarantine when the bridge can't corroborate.
+    """
+    from app.config import settings as _settings
+    from app.services import docker_host_service as dhs
+
+    _orig_flag = getattr(_settings, "use_blue_green_rollouts", False)
+    _settings.use_blue_green_rollouts = False
+
+    class _Resp:
+        def __init__(self, code: int, text: str = ""):
+            self.status_code = code
+            self.text = text
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, path, json=None): return _Resp(404, "")
+        async def get(self, path):
+            raise RuntimeError("simulated bridge connect error")
+
+    try:
+        with patch.object(dhs, "_bridge_client", lambda *_a, **_k: _FakeClient()):
+            with pytest.raises(dhs.BridgeContainerNotFound) as exc_info:
+                await dhs.upgrade_tenant_image(
+                    db=AsyncMock(),
+                    user_id="9ef741e3-aaaa-bbbb-cccc-dddddddddddd",
+                    image_tag="ghcr.io/toup-com/toup-agent:newtag00",
+                )
+        assert exc_info.value.confirmed_orphan is False, (
+            "whois transport error must NOT be treated as a confirmed "
+            "orphan — a momentarily-unreachable bridge would otherwise "
+            "auto-quarantine real tenants"
+        )
+    finally:
+        _settings.use_blue_green_rollouts = _orig_flag

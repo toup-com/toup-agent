@@ -744,12 +744,8 @@ async def upgrade_tenant_image(
             # /upgrade so canary doesn't false-abort with
             # "orphan tenant" when the real issue is bridge capability.
             # Self-heals once the bridge is updated.
-            try:
-                whois = await client.get(f"/v1/tenants/{prefix}/whois")
-                tenant_exists = whois.status_code == 200
-            except Exception:
-                tenant_exists = False
-            if tenant_exists:
+            whois_status = await _whois_status(client, prefix)
+            if whois_status == 200:
                 logger.warning(
                     "[rollout] bridge has no /blue-green-upgrade route; "
                     "falling back to legacy /upgrade for tenant=%s",
@@ -759,19 +755,32 @@ async def upgrade_tenant_image(
                 body.pop("drain_timeout_s", None)
                 r = await client.post(f"/v1/tenants/{prefix}/upgrade", json=body)
                 if r.status_code == 404:
-                    # Now it's a real "container not found" — surface it
-                    raise BridgeContainerNotFound(prefix=prefix, raw=r.text[:200])
+                    # Now it's a real "container not found" — surface it.
+                    # Whois disagreed (200), so don't claim it's a confirmed
+                    # orphan; the caller will alert without quarantining.
+                    raise BridgeContainerNotFound(
+                        prefix=prefix, raw=r.text[:200], confirmed_orphan=False,
+                    )
             else:
-                # Tenant really has no container on the bridge — orphan.
-                raise BridgeContainerNotFound(prefix=prefix, raw=r.text[:200])
+                # Whois 404 = bridge agrees no such tenant → confirmed orphan.
+                # Whois exception / other status = bridge ambiguous; alert
+                # but don't quarantine.
+                raise BridgeContainerNotFound(
+                    prefix=prefix,
+                    raw=r.text[:200],
+                    confirmed_orphan=(whois_status == 404),
+                )
         elif r.status_code == 404:
-            # Tenant has no container on the bridge — orphan. The bridge
-            # legitimately can't upgrade what doesn't exist; the rollout
-            # service should record the attempt as failed and SKIP the
-            # rollback (a rollback would just hit 422 since we have no
-            # valid prior_tag for an orphan). Surfaced as
-            # BridgeContainerNotFound so callers can branch cleanly.
-            raise BridgeContainerNotFound(prefix=prefix, raw=r.text[:200])
+            # Legacy /upgrade returned 404. Corroborate with /whois before
+            # claiming a confirmed orphan — a transient bridge hiccup that
+            # only affects /upgrade would otherwise auto-quarantine real
+            # tenants when the caller acts on `confirmed_orphan`.
+            whois_status = await _whois_status(client, prefix)
+            raise BridgeContainerNotFound(
+                prefix=prefix,
+                raw=r.text[:200],
+                confirmed_orphan=(whois_status == 404),
+            )
         if r.status_code == 503:
             try:
                 detail = r.json().get("detail", {})
@@ -820,16 +829,46 @@ class BridgeContainerNotFound(RuntimeError):
     because there's nothing to roll back to. Caller should mark the
     attempt failed and skip the rollback path.
 
+    ``confirmed_orphan`` is True only when the bridge ``/whois`` endpoint
+    also returned 404 for this prefix — i.e. two independent bridge
+    endpoints agreed the tenant doesn't exist. The rollout service uses
+    this to gate auto-quarantine of the platform-side ``ManagedContainer``
+    row: a confirmed orphan flips ``status='running' → 'orphan'`` so
+    subsequent rollouts skip it (eliminating the per-rollout alert
+    spam observed for tenants 9ef741e3 / 6d560209 / 4930493b / 6fefba0a
+    on 2026-05-24..25); an unconfirmed orphan (whois timed out or returned
+    a different status) only alerts so a transient bridge hiccup can't
+    auto-evict real tenants.
+
     Caught 2026-05-10: tenant 9ef741e3 produced 422 on every rollback
     because the rollout service was sending image_tag="unknown" (the
     sentinel for missing prior_tag) which fails Pydantic validation
     on the bridge.
     """
 
-    def __init__(self, prefix: str, raw: str = ""):
+    def __init__(self, prefix: str, raw: str = "", confirmed_orphan: bool = False):
         self.prefix = prefix
         self.raw = raw
+        self.confirmed_orphan = confirmed_orphan
         super().__init__(f"bridge container not found for prefix={prefix}: {raw}")
+
+
+async def _whois_status(client, prefix: str) -> int:
+    """Return the HTTP status code from the bridge's ``/whois`` endpoint,
+    or 0 if the request itself failed (DNS, connect, timeout, etc.).
+
+    Used to corroborate 404s from /upgrade / /blue-green-upgrade before
+    claiming a tenant is a confirmed orphan. We only treat a tenant as a
+    confirmed orphan when whois ALSO returns 404 — anything else (200 =
+    tenant exists, 0 = bridge unreachable, 5xx = bridge errored) leaves
+    confirmed_orphan=False so callers don't quarantine on ambiguous signal.
+    """
+    try:
+        r = await client.get(f"/v1/tenants/{prefix}/whois")
+        return r.status_code
+    except Exception as e:  # noqa: BLE001 — any HTTP/transport error
+        logger.warning("[rollout] whois probe failed for %s: %s", prefix, e)
+        return 0
 
 
 # ─── Post-provision soul sync (unchanged from Phase 2) ────────────

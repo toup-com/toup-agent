@@ -320,7 +320,7 @@ async def _upgrade_one(
             attempt.completed_at = datetime.utcnow()
             await db.commit()
             return attempt
-        except BridgeContainerNotFound:
+        except BridgeContainerNotFound as orphan_exc:
             # Orphan tenant — bridge has no container for this prefix.
             # Rollback would just hit 422 (we have no valid prior_tag for
             # an orphan), so don't try it. Mark the attempt failed and
@@ -329,17 +329,59 @@ async def _upgrade_one(
             # tenant 9ef741e3 — it was producing critical alerts on
             # every rollout because of the dual upgrade-then-rollback
             # 422 path.
+            #
+            # 2026-05-25: also auto-quarantine the ManagedContainer row
+            # when whois corroborates the 404 (`confirmed_orphan=True`).
+            # Without this, every rollout re-includes the same zombie
+            # rows in the candidate set and re-fires the same warning
+            # — observed for 5+ tenants on tag 3ffa202ff51e (4/9 ok)
+            # and again on f0346bd431c9. Flipping status to 'orphan'
+            # makes `_running_tenants` skip the row on future rollouts;
+            # if the user ever re-provisions, `provision_container`
+            # flips status back to 'running'.
             attempt.status = "failed"
             attempt.error = "bridge: container not found (orphan tenant)"
             attempt.duration_ms = int((time.time() - t0) * 1000)
             attempt.completed_at = datetime.utcnow()
+
+            quarantined = False
+            if orphan_exc.confirmed_orphan:
+                mc = (await db.execute(
+                    select(ManagedContainer).where(
+                        ManagedContainer.id == container.id
+                    )
+                )).scalar_one_or_none()
+                if mc is not None and mc.status == "running":
+                    mc.status = "orphan"
+                    mc.error_message = (
+                        f"auto-quarantined by rollout {rollout.id} at "
+                        f"{datetime.utcnow().isoformat()}Z — bridge 404 on "
+                        f"/upgrade AND /whois (prefix={container.user_id[:8]})"
+                    )[:500]
+                    quarantined = True
             await db.commit()
-            await _send_telegram(
-                "warning",
-                f"Tenant <code>{container.user_id[:8]}</code> skipped — no container "
-                f"on bridge (orphan). Manual cleanup may be needed but no "
-                f"in-flight users are affected.",
-            )
+
+            if quarantined:
+                await _send_telegram(
+                    "warning",
+                    f"Tenant <code>{container.user_id[:8]}</code> auto-quarantined "
+                    f"— bridge has no container for this prefix (confirmed via "
+                    f"/whois). managed_containers row flipped "
+                    f"<code>running</code>→<code>orphan</code>; future rollouts "
+                    f"will skip until re-provision. No in-flight users were "
+                    f"affected.",
+                )
+            else:
+                # Unconfirmed (whois timed out / disagreed) — keep the legacy
+                # wording. Operator decides whether to investigate; we won't
+                # auto-evict on ambiguous signal.
+                await _send_telegram(
+                    "warning",
+                    f"Tenant <code>{container.user_id[:8]}</code> skipped — no "
+                    f"container on bridge (orphan, unconfirmed by /whois). "
+                    f"Manual cleanup may be needed but no in-flight users are "
+                    f"affected.",
+                )
             return attempt
         except BridgeUpgradeUnhealthy as e:
             attempt.status = "failed"
