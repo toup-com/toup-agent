@@ -123,6 +123,98 @@ def test_archive_project_returns_false_when_admin_key_missing():
     assert result is False
 
 
+def test_list_project_service_accounts_returns_data():
+    from app.services import openai_admin_service as svc
+    with patch.object(svc.settings, "openai_admin_api_key", "sk-admin-FAKE"):
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.get.return_value = (
+                _mock_response(200, {
+                    "object": "list",
+                    "data": [{"id": "svc_acct_aaa"}, {"id": "svc_acct_bbb"}],
+                    "has_more": False,
+                })
+            )
+            out = svc.list_project_service_accounts("proj_abc")
+    assert [sa["id"] for sa in out] == ["svc_acct_aaa", "svc_acct_bbb"]
+
+
+def test_list_project_service_accounts_returns_empty_on_project_archived():
+    """Already-archived projects return 400 project_archived on every key
+    op. The cascade calls this as a best-effort pre-revoke — an empty
+    list must be the safe behavior so archive_project can still run."""
+    from app.services import openai_admin_service as svc
+    with patch.object(svc.settings, "openai_admin_api_key", "sk-admin-FAKE"):
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.get.return_value = (
+                _mock_response(400, {
+                    "error": {"code": "project_archived", "message": "archived"},
+                })
+            )
+            out = svc.list_project_service_accounts("proj_already_archived")
+    assert out == []
+
+
+def test_list_project_service_accounts_empty_when_admin_key_missing():
+    from app.services import openai_admin_service as svc
+    with patch.object(svc.settings, "openai_admin_api_key", None):
+        assert svc.list_project_service_accounts("proj_x") == []
+
+
+def test_delete_project_service_account_true_on_success():
+    from app.services import openai_admin_service as svc
+    with patch.object(svc.settings, "openai_admin_api_key", "sk-admin-FAKE"):
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.delete.return_value = (
+                _mock_response(200, {"deleted": True})
+            )
+            ok = svc.delete_project_service_account("proj_abc", "svc_acct_aaa")
+    assert ok is True
+
+
+def test_delete_project_service_account_idempotent_on_404():
+    from app.services import openai_admin_service as svc
+    with patch.object(svc.settings, "openai_admin_api_key", "sk-admin-FAKE"):
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.delete.return_value = (
+                _mock_response(404, {"error": {"message": "gone"}})
+            )
+            ok = svc.delete_project_service_account("proj_abc", "svc_acct_gone")
+    assert ok is True
+
+
+def test_delete_project_service_account_false_on_4xx():
+    from app.services import openai_admin_service as svc
+    with patch.object(svc.settings, "openai_admin_api_key", "sk-admin-FAKE"):
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.delete.return_value = (
+                _mock_response(400, {"error": {"code": "project_archived"}})
+            )
+            ok = svc.delete_project_service_account("proj_archived", "svc_acct_x")
+    assert ok is False
+
+
+def test_revoke_all_project_service_accounts_counts_deletes_and_failures():
+    """Two SAs on the project: one deletes cleanly, one returns False.
+    Loop must continue past the failure and return (1, 1)."""
+    from app.services import openai_admin_service as svc
+    with patch.object(svc, "list_project_service_accounts",
+                      return_value=[{"id": "svc_ok"}, {"id": "svc_bad"}]):
+        with patch.object(
+            svc, "delete_project_service_account",
+            side_effect=lambda pid, sa_id: sa_id == "svc_ok",
+        ):
+            deleted, failed = svc.revoke_all_project_service_accounts("proj_x")
+    assert (deleted, failed) == (1, 1)
+
+
+def test_revoke_all_project_service_accounts_empty_on_no_accounts():
+    """The common case for a never-provisioned or already-archived
+    project: list returns [], so (0, 0)."""
+    from app.services import openai_admin_service as svc
+    with patch.object(svc, "list_project_service_accounts", return_value=[]):
+        assert svc.revoke_all_project_service_accounts("proj_x") == (0, 0)
+
+
 def test_provision_tenant_archives_project_on_api_key_failure():
     """If service-account creation fails after project creation, the orphan
     project must be archived to keep operator's OpenAI dashboard clean."""

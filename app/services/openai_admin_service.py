@@ -132,6 +132,114 @@ def create_project_api_key(project_id: str, key_name: str = "agent") -> str:
     return api_key_value
 
 
+def list_project_service_accounts(project_id: str) -> list[dict]:
+    """Return the list of service accounts on a project (or [] when none /
+    project is already archived / admin key unset).
+
+    Soft-fail: callers use this only to enumerate keys to revoke; an empty
+    list is the safe degenerate behavior. Pagination is handled — we set
+    `limit=100` (OpenAI max) and follow `has_more` cursors. We provision
+    one SA per tenant so a single page is the expected case, but we walk
+    the full list defensively in case operator-provisioned SAs exist.
+    """
+    try:
+        headers = _admin_headers()
+    except OpenAIAdminUnavailable:
+        return []
+
+    accounts: list[dict] = []
+    after: Optional[str] = None
+    with httpx.Client(timeout=_TIMEOUT_S) as client:
+        for _ in range(10):  # hard cap: 10 pages × 100 = 1k SAs is plenty
+            params: dict[str, str] = {"limit": "100"}
+            if after:
+                params["after"] = after
+            resp = client.get(
+                f"{_ORG_BASE}/projects/{project_id}/service_accounts",
+                headers=headers,
+                params=params,
+            )
+            if resp.status_code == 404:
+                return accounts
+            if resp.status_code >= 400:
+                # 400 project_archived is the common case for an already-
+                # archived project — log at info, not warning, so retry
+                # cascades don't spam the logs.
+                level = logging.INFO if resp.status_code == 400 else logging.WARNING
+                logger.log(
+                    level,
+                    "[openai-admin] list_project_service_accounts %s "
+                    "non-2xx %d: %s",
+                    project_id, resp.status_code, resp.text[:300],
+                )
+                return accounts
+            body = resp.json() or {}
+            data = body.get("data") or []
+            accounts.extend(data)
+            if not body.get("has_more"):
+                break
+            after = body.get("last_id") or (data[-1].get("id") if data else None)
+            if not after:
+                break
+    return accounts
+
+
+def delete_project_service_account(project_id: str, sa_id: str) -> bool:
+    """Delete one service account from a project. Cascade-removes its
+    api_key. Returns True on 2xx or 404 (idempotent). Returns False on
+    any other failure — caller logs + continues.
+    """
+    try:
+        headers = _admin_headers()
+    except OpenAIAdminUnavailable:
+        return False
+
+    with httpx.Client(timeout=_TIMEOUT_S) as client:
+        resp = client.delete(
+            f"{_ORG_BASE}/projects/{project_id}/service_accounts/{sa_id}",
+            headers=headers,
+        )
+    if resp.status_code == 404:
+        return True
+    if resp.status_code >= 400:
+        logger.warning(
+            "[openai-admin] delete_project_service_account %s/%s failed: "
+            "HTTP %d %s",
+            project_id, sa_id, resp.status_code, resp.text[:300],
+        )
+        return False
+    return True
+
+
+def revoke_all_project_service_accounts(project_id: str) -> tuple[int, int]:
+    """List + delete every service account on a project. Returns
+    (deleted_count, failed_count).
+
+    Called by the user-deletion cascade BEFORE `archive_project` so the
+    API-key rows flip to the operator's "Inactive" filter in the OpenAI
+    dashboard. After archive, every key operation returns 400
+    `project_archived` and the keys are stuck visible in the "Active"
+    filter forever — that's the bug this function exists to avoid.
+
+    Soft-fail throughout: an empty list (project already archived,
+    nothing to revoke, admin key missing) returns (0, 0). Per-key
+    delete failures are counted in `failed` but don't abort the loop.
+    """
+    accounts = list_project_service_accounts(project_id)
+    deleted = 0
+    failed = 0
+    for sa in accounts:
+        sa_id = sa.get("id")
+        if not sa_id:
+            failed += 1
+            continue
+        if delete_project_service_account(project_id, sa_id):
+            deleted += 1
+        else:
+            failed += 1
+    return deleted, failed
+
+
 def archive_project(project_id: str) -> bool:
     """Archive an OpenAI project. Cascade-revokes all of its service-account
     keys and stops billing for that project. Idempotent — archiving an
@@ -139,6 +247,12 @@ def archive_project(project_id: str) -> bool:
 
     Used by admin user-delete to wipe per-user OpenAI state alongside the
     platform DB and Stripe customer cascade.
+
+    Callers SHOULD pre-call `revoke_all_project_service_accounts` first —
+    OpenAI's UI keeps key rows under the "Active" filter for archived
+    projects unless the SAs were deleted before archive (the underlying
+    keys are functionally disabled either way, but operator dashboards
+    accumulate visual clutter without the pre-revoke).
     """
     try:
         headers = _admin_headers()

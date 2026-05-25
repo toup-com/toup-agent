@@ -310,12 +310,50 @@ async def delete_user_completely(
         openai_project_id = None
     if openai_project_id:
         try:
-            from app.services.openai_admin_service import archive_project
-            archive_project(openai_project_id)
-            openai_archived = True
+            from app.services.openai_admin_service import (
+                archive_project,
+                revoke_all_project_service_accounts,
+            )
+            # Pre-revoke service-account keys WHILE the project is still
+            # active. After archive, OpenAI rejects every key operation
+            # with 400 project_archived, leaving the keys forever pinned
+            # under the operator's "Active" filter in the OpenAI dashboard
+            # (functionally disabled, but visually misleading and
+            # cluttered as users accumulate). Best-effort: failures here
+            # are logged but do not abort the cascade — the subsequent
+            # archive still functionally disables the keys.
+            try:
+                revoked, failed_revoke = revoke_all_project_service_accounts(
+                    openai_project_id,
+                )
+                if revoked or failed_revoke:
+                    logger.info(
+                        "[DELETE-USER] OpenAI key pre-revoke for %s: "
+                        "deleted=%d failed=%d",
+                        openai_project_id, revoked, failed_revoke,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[DELETE-USER] OpenAI key pre-revoke crashed for %s "
+                    "(user=%s) — archive will still disable keys "
+                    "functionally, UI may show Active label: %s",
+                    openai_project_id, prefix, e,
+                )
+            # Capture archive_project's return value — it returns False
+            # on any non-2xx (admin key unset, transient 4xx/5xx) WITHOUT
+            # raising, and the previous code discarded that signal and
+            # always wrote openai_archived=True. Now the audit row
+            # reflects the actual OpenAI outcome.
+            openai_archived = bool(archive_project(openai_project_id))
+            if not openai_archived:
+                logger.warning(
+                    "[DELETE-USER] OpenAI archive_project returned False "
+                    "for %s (user=%s) — orphan project may remain",
+                    openai_project_id, prefix,
+                )
         except Exception as e:
             logger.warning(
-                "[DELETE-USER] OpenAI project archive failed for %s "
+                "[DELETE-USER] OpenAI project archive raised for %s "
                 "(user=%s) — orphan project may remain: %s",
                 openai_project_id, prefix, e,
             )

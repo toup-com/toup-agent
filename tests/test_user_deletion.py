@@ -102,7 +102,9 @@ def patch_externals(monkeypatch):
         "container_destroyed_for": [],
         "container_should_fail": False,
         "openai_archived": [],
-        "openai_should_fail": False,
+        "openai_should_fail": False,           # raises (network / unexpected)
+        "openai_should_return_false": False,   # returns False (soft-fail HTTP 4xx/5xx)
+        "openai_revoked_for": [],
     }
 
     def fake_delete_customer(cid: str) -> bool:
@@ -120,11 +122,26 @@ def patch_externals(monkeypatch):
             raise RuntimeError("simulated bridge failure")
         state["container_destroyed_for"].append(user_id)
 
-    def fake_archive_project(project_id: str):
+    def fake_archive_project(project_id: str) -> bool:
+        # The real archive_project returns False on any non-2xx WITHOUT
+        # raising; only network-level errors propagate as exceptions. We
+        # mirror both paths so the cascade's return-value capture is
+        # actually exercised by these tests.
         if state["openai_should_fail"]:
             raise RuntimeError("simulated openai failure")
+        if state["openai_should_return_false"]:
+            return False
         state["openai_archived"].append(project_id)
+        return True
 
+    def fake_revoke_all_project_service_accounts(project_id: str) -> tuple[int, int]:
+        state["openai_revoked_for"].append(project_id)
+        return (0, 0)  # nothing to revoke in the test fakes
+
+    monkeypatch.setattr(
+        "app.services.openai_admin_service.revoke_all_project_service_accounts",
+        fake_revoke_all_project_service_accounts,
+    )
     monkeypatch.setattr(
         "app.services.stripe_service.delete_customer", fake_delete_customer,
     )
@@ -309,6 +326,60 @@ async def test_soft_fails_on_openai_archive_failure(patch_externals) -> None:
     # Stripe + container still succeeded.
     assert audit.stripe_cleared is True
     assert audit.container_destroyed is True
+
+
+@pytest.mark.asyncio
+async def test_soft_fails_when_archive_returns_false_without_raising(
+    patch_externals,
+) -> None:
+    """Regression: the production cascade used to ignore archive_project's
+    return value and always record openai_archived=True if no exception
+    raised. archive_project returns False on HTTP 4xx/5xx WITHOUT raising
+    (admin key unset, transient errors). The audit row must now reflect
+    that genuine False, not over-report success.
+    """
+    user_id, _ = await _create_user(
+        stripe_customer_id="cus_test_ddd",
+        openai_project_id="proj_returns_false",
+    )
+    patch_externals["openai_should_return_false"] = True
+
+    async with async_session_maker() as db:
+        user = (await db.execute(select(User).where(User.id == user_id))).scalar_one()
+        receipt = await delete_user_completely(
+            db, user, actor=DeletionActor.SELF,
+        )
+
+    assert await _read_user(user_id) is None
+    audit = await _read_audit_for(user_id)
+    assert audit.status == "succeeded"
+    # The load-bearing assertion: False, not True.
+    assert audit.openai_archived is False
+    assert receipt.openai_archived is False
+    # Stripe + container still succeeded.
+    assert audit.stripe_cleared is True
+    assert audit.container_destroyed is True
+
+
+@pytest.mark.asyncio
+async def test_pre_revoke_called_before_archive(patch_externals) -> None:
+    """Cascade must call revoke_all_project_service_accounts BEFORE
+    archive_project so the operator's OpenAI dashboard sees keys flip
+    to Inactive. After archive, OpenAI rejects every key operation with
+    400 project_archived, so order matters.
+    """
+    user_id, _ = await _create_user(
+        stripe_customer_id="cus_test_eee",
+        openai_project_id="proj_revoke_then_archive",
+    )
+
+    async with async_session_maker() as db:
+        user = (await db.execute(select(User).where(User.id == user_id))).scalar_one()
+        await delete_user_completely(db, user, actor=DeletionActor.SELF)
+
+    # Both steps must have hit the same project id, in the right order.
+    assert patch_externals["openai_revoked_for"] == ["proj_revoke_then_archive"]
+    assert patch_externals["openai_archived"] == ["proj_revoke_then_archive"]
 
 
 # ── Actor recording ─────────────────────────────────────────────────
