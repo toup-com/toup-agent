@@ -193,18 +193,25 @@ def provision_tenant(
     Returns (project_id, api_key_value). On any failure raises RuntimeError
     (or OpenAIAdminUnavailable if the admin key isn't configured).
 
-    `user_name` is interpolated into the project name when present, so the
-    operator's OpenAI dashboard shows e.g. `toup-NARIMAN-842ce50a`
-    instead of an opaque `toup-tenant-842ce50a`. Falls back to the legacy
-    `toup-tenant-<prefix>` form when the name is missing or sanitises to
-    an empty string. Prefix stays in the name in either case so support
-    can grep by user_id.
+    `user_name` is interpolated into both the project name and the
+    service-account key name when present, so the operator's OpenAI
+    dashboard shows e.g. project `toup-NARIMAN-842ce50a` with Name
+    column `NARIMAN` (instead of opaque project `toup-tenant-842ce50a`
+    with Name column `agent`). Falls back to the legacy
+    `toup-tenant-<prefix>` / `agent` forms when the name is missing or
+    sanitises to an empty string. Prefix stays in the project name in
+    either case so support can grep by user_id.
     """
     safe_name = _sanitize_for_project_name(user_name) if user_name else ""
     project_name = f"toup-{safe_name}-{prefix}" if safe_name else f"toup-tenant-{prefix}"
+    # OpenAI's service-account key name is the "Name" column the operator
+    # sees in the API-keys list. Use the user's agent name so each key is
+    # visually attributable at a glance; fall back to "agent" when no
+    # name is available.
+    key_name = safe_name or "agent"
     project_id = create_project(project_name)
     try:
-        api_key = create_project_api_key(project_id, key_name="agent")
+        api_key = create_project_api_key(project_id, key_name=key_name)
     except Exception:
         # Best-effort: if api-key creation fails, archive the project so we
         # don't leave an orphan project pile up in the operator's dashboard.
