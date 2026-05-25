@@ -197,6 +197,17 @@ SUBAGENT_DISABLED_TOOLS: frozenset[str] = frozenset({
     "triggers__create",
     "triggers__update",
     "triggers__delete",
+    # Extension tools route through the user's Chrome side panel via a
+    # WebSocket round-trip. They're meant for foreground UX where the
+    # user's tab provides DOM context. For a background sub-agent doing
+    # research, every request bounces user→server→user→server, adding
+    # multi-second latency per call vs. the agent's native HTTP fetch.
+    # Caught live 2026-05-25: nariman's research sub-agent spent ~3m on
+    # work the native web_search/web_fetch pair finishes in ~30s. Force
+    # sub-agents to the direct path. (User-facing turns keep them.)
+    "extension_search",
+    "extension_read",
+    "extension_research",
 })
 
 

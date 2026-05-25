@@ -67,6 +67,20 @@ _JOB_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _SESSION_WS_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "tool_executor_session_workspace", default=None,
 )
+# Per-call disabled-tool set. Lives in a ContextVar (not instance attr)
+# because the same ToolExecutor singleton is shared between the parent
+# agent_runner.run() and any sub-agents the parent spawns. A sub-agent
+# whose profile is SUBAGENT overwrites user_disabled_tools to include
+# `spawn` (no grandchildren), and that overwrite used to leak back into
+# the parent — the parent's next spawn() call then surfaced
+# "Tool 'spawn' has been disabled by the user" mid-batch. Caught live
+# 2026-05-25 for nariman: parent kicked off 3 spawns; sub-agent 1
+# raced its profile-disable write between parent calls 2 and 3.
+# ContextVars are per-asyncio-task, so the sub-agent task's mutation
+# is isolated from the parent task.
+_DISABLED_TOOLS_CTX: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
+    "tool_executor_disabled_tools", default=frozenset(),
+)
 
 # Per-tool output limits (bytes)
 TOOL_OUTPUT_LIMITS: Dict[str, int] = {
@@ -325,8 +339,10 @@ class ToolExecutor:
         # Background process tracking {proc_id: {...}}
         self._processes: Dict[str, Dict[str, Any]] = {}
         self._proc_counter: int = 0
-        # Per-user disabled tools (loaded from AgentConfig)
-        self.user_disabled_tools: Set[str] = set()
+        # NOTE: user_disabled_tools is a property backed by
+        # _DISABLED_TOOLS_CTX. Do NOT assign a plain set here — that
+        # would shadow the property and reintroduce the cross-task
+        # leak (see 2026-05-25 mid-batch spawn-disabled bug).
         # Accumulated attachments from generate_* tools (one list per agent run).
         # agent_runner drains this after each tool call to emit WS events, and
         # at assistant-message persistence to set Message.attachments. Cleared there.
@@ -360,6 +376,22 @@ class ToolExecutor:
     @property
     def _session_workspace(self) -> Optional[str]:
         return _SESSION_WS_CTX.get()
+
+    @property
+    def user_disabled_tools(self) -> frozenset:
+        """Per-task disabled tools. Backed by ContextVar so a sub-agent
+        task's profile-disable set (which includes 'spawn') does not
+        leak into the parent task's instance state. Returns a
+        frozenset so accidental .add() raises rather than mutating
+        the shared default. agent_runner assigns this via the setter
+        (sets the ContextVar) once per run()."""
+        return _DISABLED_TOOLS_CTX.get()
+
+    @user_disabled_tools.setter
+    def user_disabled_tools(self, value) -> None:
+        # Coerce to frozenset so callers can't hand us a mutable set
+        # and expect later .add() calls to propagate via the property.
+        _DISABLED_TOOLS_CTX.set(frozenset(value or ()))
 
     def set_chat_id(self, chat_id: Optional[int]):
         """Set the current Telegram chat ID for send_file/send_photo tools."""
