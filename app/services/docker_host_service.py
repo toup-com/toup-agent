@@ -704,7 +704,7 @@ async def update_container_env(
 
 
 async def upgrade_tenant_image(
-    db: AsyncSession,
+    db: Optional[AsyncSession],
     user_id: str,
     image_tag: str,
     rollout_id: Optional[str] = None,
@@ -720,6 +720,17 @@ async def upgrade_tenant_image(
 
     Called by rollout_service.py. Raises on failure; caller decides
     rollback strategy.
+
+    The ``db`` parameter is OPTIONAL. When None, this function opens
+    a fresh narrow session for the post-call ManagedContainer.image_tag
+    update — callers should pass None to avoid holding their own
+    session across the bridge call. The held-session-across-network
+    pattern caused the 547-min stall on rollout ed53f0d89a11
+    (2026-05-25): when the bridge stopped responding, each hung
+    attempt held a DB connection, and the reconciler's own pool was
+    starved on the Supabase pooler so it couldn't mark the rollout
+    orphan. Passing a real db is supported for backward compatibility
+    with tests.
     """
     prefix = user_id[:8]
     use_blue_green = bool(getattr(settings, "use_blue_green_rollouts", False))
@@ -799,14 +810,25 @@ async def upgrade_tenant_image(
         r.raise_for_status()
         data = r.json()
 
-    # Platform-side record-keeping: update ManagedContainer.image_tag
-    result = await db.execute(
-        select(ManagedContainer).where(ManagedContainer.user_id == user_id)
-    )
-    container = result.scalar_one_or_none()
-    if container:
-        container.image_tag = image_tag
-        await db.commit()
+    # Platform-side record-keeping: update ManagedContainer.image_tag.
+    # Use the caller's session when provided (legacy tests do); otherwise
+    # open a fresh narrow session so the caller doesn't need to hold one
+    # across the bridge call above.
+    async def _persist_image_tag(session: AsyncSession) -> None:
+        result = await session.execute(
+            select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+        )
+        container = result.scalar_one_or_none()
+        if container:
+            container.image_tag = image_tag
+            await session.commit()
+
+    if db is not None:
+        await _persist_image_tag(db)
+    else:
+        from app.db.database import async_session_maker
+        async with async_session_maker() as own_db:
+            await _persist_image_tag(own_db)
 
     return data
 

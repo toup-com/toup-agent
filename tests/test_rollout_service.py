@@ -1232,3 +1232,94 @@ async def test_upgrade_one_hard_timeout_releases_db_session():
             "completed_at must be stamped on timeout — otherwise the "
             "reconciler's heartbeat-stale check might not fire correctly"
         )
+
+
+# ─── Narrow-session invariant (no DB held across bridge call) ──────
+#
+# Direct regression for the pool-exhaustion class that contributed to
+# the 547-min stall. Prove that `_upgrade_one` does NOT hold a DB
+# session while `upgrade_tenant_image` is running — even a long-running
+# bridge call must not lock up a connection.
+
+
+@pytest.mark.asyncio
+async def test_upgrade_one_releases_db_session_during_bridge_call():
+    """Concurrent DB access must succeed WHILE the bridge call is
+    in-flight. If `_upgrade_one` still held a session across the
+    bridge call, this test would time out (the concurrent query
+    would block on pool exhaustion in the narrow-pool case, or at
+    minimum the session lifecycle would be observable from outside).
+
+    The test fakes a bridge call that pauses for a controllable window,
+    while a parallel coroutine runs queries against the same DB. Both
+    must complete normally.
+    """
+    import asyncio as _asyncio
+    from sqlalchemy import select
+    from app.db import async_session_maker
+    from app.db.models import RolloutAttempt
+    from app.services import rollout_service
+
+    rollout, container = await _seed_orphan_quarantine_fixtures()
+
+    bridge_started = _asyncio.Event()
+    bridge_release = _asyncio.Event()
+    concurrent_query_done = _asyncio.Event()
+
+    async def fake_bridge_upgrade(*args, **kwargs):
+        bridge_started.set()
+        # Hold here until the concurrent query completes. If the
+        # orchestrator held a DB session, the concurrent query would
+        # block (in a tight pool) or at minimum we couldn't prove the
+        # session was released. The fact that the concurrent query
+        # completes BEFORE we return proves the session is free.
+        await concurrent_query_done.wait()
+        bridge_release.set()
+        return {"health_checks_passed": 3, "duration_ms": 50}
+
+    async def concurrent_db_reader():
+        await bridge_started.wait()
+        async with async_session_maker() as db:
+            count = (await db.execute(
+                select(RolloutAttempt).where(
+                    RolloutAttempt.rollout_id == rollout.id
+                )
+            )).scalars().all()
+            # The 'upgrading' row must be visible — proves _upgrade_one
+            # already wrote+committed+CLOSED its session before the
+            # bridge call.
+            assert len(count) == 1, (
+                f"expected 1 attempt row visible mid-bridge-call, got {len(count)}"
+            )
+            assert count[0].status == "upgrading", (
+                f"expected attempt status='upgrading' (write committed before "
+                f"bridge call), got {count[0].status!r}"
+            )
+        concurrent_query_done.set()
+
+    async def fake_telegram(level, message):
+        pass
+
+    with patch.object(rollout_service, "upgrade_tenant_image", fake_bridge_upgrade), \
+         patch.object(rollout_service, "_send_telegram", fake_telegram):
+        upgrade_task = _asyncio.create_task(rollout_service._upgrade_one(
+            None, rollout, container, "ghcr.io/toup-com/toup-agent:newtag00",
+        ))
+        reader_task = _asyncio.create_task(concurrent_db_reader())
+        # Both must finish within a reasonable budget. If the
+        # orchestrator's session blocks the reader, the test deadlocks.
+        try:
+            attempt, _ = await _asyncio.wait_for(
+                _asyncio.gather(upgrade_task, reader_task), timeout=10.0,
+            )
+        except _asyncio.TimeoutError:
+            pytest.fail(
+                "DEADLOCK: concurrent DB read could not complete while "
+                "_upgrade_one's bridge call was in-flight. This means "
+                "the orchestrator still holds a session across the "
+                "bridge call — exactly the pattern that contributed "
+                "to the 547-min stall."
+            )
+
+    assert attempt.status == "ok"
+    assert bridge_release.is_set(), "bridge call must have completed normally"

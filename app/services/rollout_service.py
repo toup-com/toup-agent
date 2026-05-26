@@ -277,18 +277,29 @@ async def _observe_canary_signal(
 
 
 async def _upgrade_one(
-    _shared_db: AsyncSession,  # kept for signature compat; NOT used for writes
+    _shared_db: Optional[AsyncSession],  # signature compat; ignored
     rollout: Rollout,
     container: ManagedContainer,
     new_tag: str,
 ) -> RolloutAttempt:
     """Upgrade a single tenant to new_tag; record the attempt.
 
-    IMPORTANT: opens its OWN AsyncSession. When called via asyncio.gather for
-    parallel batch upgrades, multiple invocations share nothing — no SQLAlchemy
-    session race. The passed `_shared_db` is the orchestrator's session and is
-    intentionally ignored for writes; we only use the in-memory `rollout` and
-    `container` objects from it (detached read-only snapshots).
+    Each DB write happens in its OWN narrow session — opened, used for
+    one statement-group, committed, closed. NO DB session is held
+    across the bridge call. This eliminates the held-session-across-
+    network anti-pattern that contributed to the 547-min stall on
+    rollout ed53f0d89a11 (2026-05-25): when the bridge stopped
+    responding, each hung attempt held a DB connection, and the
+    reconciler's own pool was starved on the Supabase pooler so it
+    couldn't mark the rollout orphan.
+
+    The session lifecycle now looks like:
+      1. Open → write attempt='upgrading' → close.
+      2. Bridge call (no session held), wrapped in asyncio.wait_for.
+      3. Open → write outcome → close.
+      4. Telegram alert (no session).
+      5. If rollback needed: bridge call again (no session), then
+         open → write rollback outcome → close.
 
     Returns the RolloutAttempt row with status in
     {'ok', 'failed', 'rolled_back', 'rollback_failed'}.
@@ -296,7 +307,13 @@ async def _upgrade_one(
     Never raises — failures are captured in the attempt's error field.
     """
     prior_tag = container.image_tag or "unknown"
+    t0 = time.time()
 
+    # Hard per-attempt timeout — defense in depth above httpx's own
+    # timeout. See PR #127 for the 547-min stall context.
+    hard_timeout_s = (settings.bridge_upgrade_timeout_s or 180) + 30
+
+    # ── Step 1: narrow session — write attempt='upgrading' ──
     async with async_session_maker() as db:
         attempt = RolloutAttempt(
             rollout_id=rollout.id,
@@ -308,86 +325,64 @@ async def _upgrade_one(
         db.add(attempt)
         await db.commit()
         await db.refresh(attempt)
+        attempt_id = attempt.id
 
-        t0 = time.time()
-        # Hard per-attempt timeout — defense in depth above httpx's own
-        # timeout. Real-world failure observed 2026-05-25 → 2026-05-26
-        # (rollout ed53f0d89a11): 5 parallel attempts hung in
-        # `status='upgrading'` for 547 MINUTES before the reconciler
-        # caught it, despite `bridge_upgrade_timeout_s=180`. Likely
-        # cause: bridge accepted the TCP/TLS connection but never
-        # responded, AND the held DB sessions starved the reconciler's
-        # own DB queries on the Supabase pooler so its 3-min idle check
-        # couldn't fire either.
-        #
-        # `asyncio.wait_for` is a layer above httpx that always fires:
-        # on timeout it cancels the underlying coroutine, releasing
-        # the DB session, marking the attempt failed, and letting the
-        # rollout move on. The grace (+30s) lets httpx time out cleanly
-        # first when it's working; this is the second-chance net.
-        hard_timeout_s = (settings.bridge_upgrade_timeout_s or 180) + 30
-        try:
-            result = await asyncio.wait_for(
-                upgrade_tenant_image(
-                    db, container.user_id, new_tag, rollout_id=rollout.id,
-                ),
-                timeout=hard_timeout_s,
-            )
+    # ── Step 2: bridge call WITHOUT holding any DB session ──
+    bridge_outcome: str
+    bridge_result: Optional[dict] = None
+    bridge_error: Optional[str] = None
+    orphan_exc: Optional[BridgeContainerNotFound] = None
+    unhealthy_exc: Optional[BridgeUpgradeUnhealthy] = None
+    try:
+        bridge_result = await asyncio.wait_for(
+            upgrade_tenant_image(
+                None, container.user_id, new_tag, rollout_id=rollout.id,
+            ),
+            timeout=hard_timeout_s,
+        )
+        bridge_outcome = "ok"
+    except asyncio.TimeoutError:
+        bridge_outcome = "timeout"
+        bridge_error = (
+            f"hard timeout exceeded ({hard_timeout_s}s) — bridge or "
+            f"platform unresponsive; tenant state unknown"
+        )
+    except BridgeContainerNotFound as e:
+        bridge_outcome = "container_not_found"
+        orphan_exc = e
+    except BridgeUpgradeUnhealthy as e:
+        bridge_outcome = "unhealthy"
+        unhealthy_exc = e
+    except Exception as e:
+        bridge_outcome = "other_error"
+        bridge_error = f"{type(e).__name__}: {str(e)[:1000]}"
+
+    duration_ms = int((time.time() - t0) * 1000)
+
+    # ── Step 3: narrow session — record bridge outcome ──
+    quarantined = False
+    needs_rollback = False
+    async with async_session_maker() as db:
+        attempt = (await db.execute(
+            select(RolloutAttempt).where(RolloutAttempt.id == attempt_id)
+        )).scalar_one()
+        attempt.duration_ms = duration_ms
+
+        if bridge_outcome == "ok":
             attempt.status = "ok"
-            attempt.health_checks_passed = result.get("health_checks_passed", 0)
-            attempt.duration_ms = result.get("duration_ms") or int((time.time() - t0) * 1000)
+            attempt.health_checks_passed = (bridge_result or {}).get("health_checks_passed", 0)
+            attempt.duration_ms = (bridge_result or {}).get("duration_ms") or duration_ms
             attempt.completed_at = datetime.utcnow()
             await db.commit()
             return attempt
-        except asyncio.TimeoutError:
-            # Bridge or platform hung past the hard cap. Don't attempt a
-            # rollback — we don't know what state the tenant is in (the
-            # bridge may have started the upgrade and only the response
-            # is stuck). Mark failed, alert, move on. Same posture as
-            # BridgeContainerNotFound: rolling back into uncertain state
-            # is worse than leaving the operator a clear signal.
-            attempt.status = "failed"
-            attempt.error = (
-                f"hard timeout exceeded ({hard_timeout_s}s) — bridge or "
-                f"platform unresponsive; tenant state unknown"
-            )
-            attempt.duration_ms = int((time.time() - t0) * 1000)
-            attempt.completed_at = datetime.utcnow()
-            await db.commit()
-            await _send_telegram(
-                "warning",
-                f"Tenant <code>{container.user_id[:8]}</code> upgrade "
-                f"<b>hard-timed out</b> after {hard_timeout_s}s — bridge "
-                f"unresponsive. No rollback attempted (state unknown). "
-                f"Rollout continues with remaining tenants.",
-            )
-            return attempt
-        except BridgeContainerNotFound as orphan_exc:
-            # Orphan tenant — bridge has no container for this prefix.
-            # Rollback would just hit 422 (we have no valid prior_tag for
-            # an orphan), so don't try it. Mark the attempt failed and
-            # send a single warning instead of a critical
-            # "AND rollback failed" alarm. Caught 2026-05-10 for
-            # tenant 9ef741e3 — it was producing critical alerts on
-            # every rollout because of the dual upgrade-then-rollback
-            # 422 path.
-            #
-            # 2026-05-25: also auto-quarantine the ManagedContainer row
-            # when whois corroborates the 404 (`confirmed_orphan=True`).
-            # Without this, every rollout re-includes the same zombie
-            # rows in the candidate set and re-fires the same warning
-            # — observed for 5+ tenants on tag 3ffa202ff51e (4/9 ok)
-            # and again on f0346bd431c9. Flipping status to 'orphan'
-            # makes `_running_tenants` skip the row on future rollouts;
-            # if the user ever re-provisions, `provision_container`
-            # flips status back to 'running'.
+
+        if bridge_outcome == "container_not_found":
             attempt.status = "failed"
             attempt.error = "bridge: container not found (orphan tenant)"
-            attempt.duration_ms = int((time.time() - t0) * 1000)
             attempt.completed_at = datetime.utcnow()
-
-            quarantined = False
-            if orphan_exc.confirmed_orphan:
+            # Auto-quarantine when whois corroborates the 404
+            # (`confirmed_orphan=True`). See PR #123.
+            if orphan_exc is not None and orphan_exc.confirmed_orphan:
                 mc = (await db.execute(
                     select(ManagedContainer).where(
                         ManagedContainer.id == container.id
@@ -403,86 +398,124 @@ async def _upgrade_one(
                     quarantined = True
             await db.commit()
 
-            if quarantined:
-                await _send_telegram(
-                    "warning",
-                    f"Tenant <code>{container.user_id[:8]}</code> auto-quarantined "
-                    f"— bridge has no container for this prefix (confirmed via "
-                    f"/whois). managed_containers row flipped "
-                    f"<code>running</code>→<code>orphan</code>; future rollouts "
-                    f"will skip until re-provision. No in-flight users were "
-                    f"affected.",
-                )
-            else:
-                # Unconfirmed (whois timed out / disagreed) — keep the legacy
-                # wording. Operator decides whether to investigate; we won't
-                # auto-evict on ambiguous signal.
-                await _send_telegram(
-                    "warning",
-                    f"Tenant <code>{container.user_id[:8]}</code> skipped — no "
-                    f"container on bridge (orphan, unconfirmed by /whois). "
-                    f"Manual cleanup may be needed but no in-flight users are "
-                    f"affected.",
-                )
-            return attempt
-        except BridgeUpgradeUnhealthy as e:
+        elif bridge_outcome == "timeout":
             attempt.status = "failed"
-            attempt.error = f"unhealthy after upgrade: {e.detail}"[:1000]
-            attempt.health_checks_passed = e.detail.get("health_checks_passed", 0)
-            attempt.duration_ms = int((time.time() - t0) * 1000)
-            await db.commit()
-        except Exception as e:
-            attempt.status = "failed"
-            attempt.error = f"{type(e).__name__}: {str(e)[:1000]}"
-            attempt.duration_ms = int((time.time() - t0) * 1000)
+            attempt.error = bridge_error
+            attempt.completed_at = datetime.utcnow()
             await db.commit()
 
-        # Refuse to roll back without a real prior tag. `prior_tag` is
-        # set to the literal "unknown" sentinel when ManagedContainer
-        # has no recorded image_tag — sending that to the bridge fails
-        # the Pydantic image_tag validator (422) AND wastes a slot in
-        # the alert spam. Same fix family as BridgeContainerNotFound
-        # above; this catches the case where the container DOES exist
-        # but our DB never recorded what it's running.
-        if prior_tag == "unknown" or not prior_tag.startswith("ghcr.io/toup-com/toup-agent:"):
+        elif bridge_outcome == "unhealthy":
             attempt.status = "failed"
+            assert unhealthy_exc is not None
+            attempt.error = f"unhealthy after upgrade: {unhealthy_exc.detail}"[:1000]
+            attempt.health_checks_passed = unhealthy_exc.detail.get("health_checks_passed", 0)
+            await db.commit()
+            needs_rollback = True
+
+        else:  # other_error
+            attempt.status = "failed"
+            attempt.error = bridge_error
+            await db.commit()
+            needs_rollback = True
+
+    # ── Step 4: alerts for terminal outcomes (no DB session held) ──
+    if bridge_outcome == "container_not_found":
+        if quarantined:
+            await _send_telegram(
+                "warning",
+                f"Tenant <code>{container.user_id[:8]}</code> auto-quarantined "
+                f"— bridge has no container for this prefix (confirmed via "
+                f"/whois). managed_containers row flipped "
+                f"<code>running</code>→<code>orphan</code>; future rollouts "
+                f"will skip until re-provision. No in-flight users were "
+                f"affected.",
+            )
+        else:
+            await _send_telegram(
+                "warning",
+                f"Tenant <code>{container.user_id[:8]}</code> skipped — no "
+                f"container on bridge (orphan, unconfirmed by /whois). "
+                f"Manual cleanup may be needed but no in-flight users are "
+                f"affected.",
+            )
+        return attempt
+
+    if bridge_outcome == "timeout":
+        await _send_telegram(
+            "warning",
+            f"Tenant <code>{container.user_id[:8]}</code> upgrade "
+            f"<b>hard-timed out</b> after {hard_timeout_s}s — bridge "
+            f"unresponsive. No rollback attempted (state unknown). "
+            f"Rollout continues with remaining tenants.",
+        )
+        return attempt
+
+    if not needs_rollback:
+        return attempt
+
+    # ── Step 5: refuse rollback if prior_tag is invalid ──
+    if prior_tag == "unknown" or not prior_tag.startswith("ghcr.io/toup-com/toup-agent:"):
+        async with async_session_maker() as db:
+            attempt = (await db.execute(
+                select(RolloutAttempt).where(RolloutAttempt.id == attempt_id)
+            )).scalar_one()
             attempt.error = (attempt.error or "") + (
                 f" | rollback skipped: prior_tag={prior_tag!r} not a valid"
                 f" GHCR tag — DB record missing or malformed"
             )
             attempt.completed_at = datetime.utcnow()
             await db.commit()
-            await _send_telegram(
-                "warning",
-                f"Tenant <code>{container.user_id[:8]}</code> failed upgrade to "
-                f"<code>{new_tag}</code> — rollback skipped (no valid prior tag).",
-            )
-            return attempt
-
-        # Failed — attempt rollback
-        try:
-            await upgrade_tenant_image(
-                db, container.user_id, prior_tag, rollout_id=rollout.id,
-            )
-            attempt.status = "rolled_back"
-            attempt.completed_at = datetime.utcnow()
-            await db.commit()
-            await _send_telegram(
-                "warning",
-                f"Tenant <code>{container.user_id[:8]}</code> failed upgrade to "
-                f"<code>{new_tag}</code> — rolled back to <code>{prior_tag}</code>",
-            )
-        except Exception as e:
-            attempt.status = "rollback_failed"
-            attempt.error = (attempt.error or "") + f" | ROLLBACK FAILED: {str(e)[:500]}"
-            attempt.completed_at = datetime.utcnow()
-            await db.commit()
-            await _send_telegram(
-                "critical",
-                f"Tenant <code>{container.user_id[:8]}</code> upgrade AND rollback "
-                f"failed — manual intervention needed. Error: {str(e)[:200]}",
-            )
+        await _send_telegram(
+            "warning",
+            f"Tenant <code>{container.user_id[:8]}</code> failed upgrade to "
+            f"<code>{new_tag}</code> — rollback skipped (no valid prior tag).",
+        )
         return attempt
+
+    # ── Step 6: rollback bridge call WITHOUT holding any DB session ──
+    rollback_outcome: str
+    rollback_error: Optional[str] = None
+    try:
+        await asyncio.wait_for(
+            upgrade_tenant_image(
+                None, container.user_id, prior_tag, rollout_id=rollout.id,
+            ),
+            timeout=hard_timeout_s,
+        )
+        rollback_outcome = "rolled_back"
+    except asyncio.TimeoutError:
+        rollback_outcome = "rollback_failed"
+        rollback_error = f"rollback hard-timed out after {hard_timeout_s}s"
+    except Exception as e:
+        rollback_outcome = "rollback_failed"
+        rollback_error = f"{type(e).__name__}: {str(e)[:500]}"
+
+    # ── Step 7: narrow session — record rollback outcome ──
+    async with async_session_maker() as db:
+        attempt = (await db.execute(
+            select(RolloutAttempt).where(RolloutAttempt.id == attempt_id)
+        )).scalar_one()
+        if rollback_outcome == "rolled_back":
+            attempt.status = "rolled_back"
+        else:
+            attempt.status = "rollback_failed"
+            attempt.error = (attempt.error or "") + f" | ROLLBACK FAILED: {rollback_error}"
+        attempt.completed_at = datetime.utcnow()
+        await db.commit()
+
+    if rollback_outcome == "rolled_back":
+        await _send_telegram(
+            "warning",
+            f"Tenant <code>{container.user_id[:8]}</code> failed upgrade to "
+            f"<code>{new_tag}</code> — rolled back to <code>{prior_tag}</code>",
+        )
+    else:
+        await _send_telegram(
+            "critical",
+            f"Tenant <code>{container.user_id[:8]}</code> upgrade AND rollback "
+            f"failed — manual intervention needed. Error: {(rollback_error or '')[:200]}",
+        )
+    return attempt
 
 
 # ─── Main orchestration loop ──────────────────────────────────────
