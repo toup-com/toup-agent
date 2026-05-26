@@ -155,7 +155,7 @@ async def test_synthetic_test_fire_succeeds_without_mcp():
         provider_state_json={},
     )
     events = [
-        SimpleNamespace(id="ev-1", event_dedupe_id=f"test:{uuid.uuid4().hex}"),
+        SimpleNamespace(id="ev-1", idempotency_key=f"test:{uuid.uuid4().hex}"),
     ]
 
     result = await handler.execute(trigger, events, db=MagicMock())
@@ -190,7 +190,7 @@ async def test_synthetic_test_fire_survives_broadcast_failure():
         config_json={"delivery_channels": ["website", "telegram"]},
         provider_state_json={},
     )
-    events = [SimpleNamespace(id="ev-x", event_dedupe_id="test:abcd")]
+    events = [SimpleNamespace(id="ev-x", idempotency_key="test:abcd")]
 
     result = await handler.execute(trigger, events, db=MagicMock())
     assert result.status == "test_success"
@@ -210,7 +210,7 @@ async def test_synthetic_test_fire_fails_loud_if_writer_breaks():
         action="summarize_and_post", name=None,
         filter_json=None, config_json={}, provider_state_json={},
     )
-    events = [SimpleNamespace(id="ev-q", event_dedupe_id="test:q")]
+    events = [SimpleNamespace(id="ev-q", idempotency_key="test:q")]
     result = await handler.execute(trigger, events, db=MagicMock())
     assert result.status == "failed"
     assert result.per_event_status == {"ev-q": "failed"}

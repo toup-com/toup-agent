@@ -117,7 +117,7 @@ class _FetchedEmail:
 def _synthetic_test_email(event_id: str, gmail_id: str) -> _FetchedEmail:
     """Build an in-memory `_FetchedEmail` for a test-fire event.
 
-    Test events have ``event_dedupe_id = "test:<uuid>"`` and aren't
+    Test events have ``idempotency_key = "test:<uuid>"`` and aren't
     real Gmail messages — fetching them via MCP returns 404. Instead
     we synthesise a realistic email envelope so the rest of the
     pipeline (filter eval → summarise/notify/forward → Day-as-Chat
@@ -267,7 +267,7 @@ class EmailReceivedHandler:
         db: AsyncSession,
     ) -> TriggerResult:
         # ── 0. Synthetic test-fire short-circuit ──────────────────────
-        # When EVERY event in the batch is synthetic (event_dedupe_id
+        # When EVERY event in the batch is synthetic (idempotency_key
         # starts with "test:"), bypass the LLM / MCP / broadcast chain
         # entirely and write a deterministic "wiring works" message
         # straight to Day-as-Chat. The Test button's job is to answer
@@ -277,8 +277,21 @@ class EmailReceivedHandler:
         # previously test fires went through call_system_llm and
         # silently failed when OpenAI was rate-limited / down / mis-keyed,
         # producing the misleading "5 fires, all Failed" UI state.
+        #
+        # PR #49 cutover: events are now ``BuildJob`` rows directly, not
+        # the legacy ``TriggerEvent`` shape. The legacy
+        # ``event_dedupe_id`` column maps 1:1 to ``BuildJob.idempotency_key``
+        # (see ``app/api/triggers_inbound.py::_idempotent_insert`` and
+        # ``app/api/triggers.py`` test-fire path — both write the Gmail
+        # message id, or the synthetic "test:<uuid>", into
+        # ``idempotency_key``). Reading ``event_dedupe_id`` on a BuildJob
+        # raises ``AttributeError`` — that was the
+        # ``all_retries_exhausted: AttributeError("'BuildJob' object has
+        # no attribute 'event_dedupe_id'")`` failure surfaced in
+        # production Gmail trigger fires.
         if events and all(
-            (ev.event_dedupe_id or "").startswith("test:") for ev in events
+            (getattr(ev, "idempotency_key", None) or "").startswith("test:")
+            for ev in events
         ):
             return await self._do_test_fire(trigger, events, db)
 
@@ -596,16 +609,32 @@ class EmailReceivedHandler:
         errors: dict[str, str] = {}
 
         for ev in events:
-            payload = ev.external_payload if hasattr(ev, "external_payload") else {}
-            # The inbound endpoint stores the payload on the row via
-            # `external_payload` — but our DB column is named
-            # event_dedupe_id (the gmail message id). Either source
-            # works; prefer the explicit payload, fall back to dedupe.
-            gmail_id = ""
-            if isinstance(payload, dict):
-                gmail_id = str(payload.get("gmail_message_id") or "").strip()
-            if not gmail_id:
-                gmail_id = (ev.event_dedupe_id or "").strip()
+            # PR #49 cutover: ``ev`` is a ``BuildJob`` row, not the
+            # legacy ``TriggerEvent`` shape. The Gmail message id lives
+            # in ``BuildJob.idempotency_key`` — set by both
+            # ``triggers_inbound._idempotent_insert`` (production Pub/Sub
+            # path) and ``triggers.py`` test-fire (`test:<uuid>` synthetic
+            # path). ``external_payload`` was the legacy carrier and was
+            # dropped during the cutover; ``config_json`` is the new
+            # opaque-per-row carrier but the inbound endpoint doesn't
+            # populate it for trigger fires (idempotency_key is enough).
+            #
+            # Reading ``ev.external_payload`` or ``ev.event_dedupe_id``
+            # on a BuildJob raises ``AttributeError`` — which surfaced as
+            # ``all_retries_exhausted: AttributeError(...)`` on every
+            # Gmail trigger fire in production until this fix.
+            gmail_id = (
+                str(getattr(ev, "idempotency_key", None) or "")
+            ).strip()
+            # Defensive: config_json may carry an explicit
+            # ``gmail_message_id`` in the future (e.g., if the inbound
+            # endpoint starts persisting external_payload there). Prefer
+            # that when present.
+            cfg = getattr(ev, "config_json", None)
+            if isinstance(cfg, dict):
+                explicit = str(cfg.get("gmail_message_id") or "").strip()
+                if explicit:
+                    gmail_id = explicit
             if not gmail_id:
                 errors[ev.id] = "no_gmail_id"
                 continue

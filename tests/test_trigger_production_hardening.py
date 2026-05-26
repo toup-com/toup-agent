@@ -477,7 +477,7 @@ async def test_handler_stamps_observability_timestamps_on_success():
         action="summarize_and_post", name="x",
         filter_json=None, config_json={}, provider_state_json={},
     )
-    events = [SimpleNamespace(id="ev-1", event_dedupe_id="test:abc")]
+    events = [SimpleNamespace(id="ev-1", idempotency_key="test:abc")]
 
     result = await handler.execute(trigger, events, db=MagicMock())
     ps = result.new_provider_state or {}
@@ -498,7 +498,7 @@ async def test_handler_stamps_observability_timestamps_on_failure():
         action="summarize_and_post", name="x",
         filter_json=None, config_json={}, provider_state_json={},
     )
-    events = [SimpleNamespace(id="ev-1", event_dedupe_id="test:q")]
+    events = [SimpleNamespace(id="ev-1", idempotency_key="test:q")]
     result = await handler.execute(trigger, events, db=MagicMock())
     ps = result.new_provider_state or {}
     assert "last_handler_completed_at" in ps
