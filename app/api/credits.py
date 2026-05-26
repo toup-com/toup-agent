@@ -216,6 +216,14 @@ class AgentDeductResponse(BaseModel):
     enforcement_enabled: bool
     reason: Optional[str] = None
     idempotent_hit: bool = False
+    # Plan + period metadata — lets the agent's CreditReporter stamp
+    # last_known_plan_id / last_known_period_end on every deduct cycle
+    # so build_exhausted_response shows the real renewal date instead
+    # of the "now + 30 days" fallback. Optional for backward compat
+    # with older agent builds that don't read these fields.
+    plan_id: Optional[str] = None
+    plan_display_name: Optional[str] = None
+    period_end: Optional[datetime] = None
 
 
 @router.post("/agent-deduct", response_model=AgentDeductResponse)
@@ -279,6 +287,9 @@ async def agent_deduct(
         underlying_cost_cents=body.underlying_cost_cents,
         metadata={"surface": "agent_direct", "operation_type": op},
     )
+    # Read the balance view AFTER try_charge committed so plan +
+    # period_end reflect any lazy monthly-renewal that just landed.
+    view = await credit_service.get_balance_view(db, body.user_id)
     await db.commit()
 
     from app.config import settings as _settings
@@ -290,6 +301,9 @@ async def agent_deduct(
         enforcement_enabled=bool(getattr(_settings, "credit_enforcement_enabled", False)),
         reason=result.reason,
         idempotent_hit=result.idempotent_hit,
+        plan_id=view.plan_id,
+        plan_display_name=view.plan_display_name,
+        period_end=view.period_end,
     )
 
 

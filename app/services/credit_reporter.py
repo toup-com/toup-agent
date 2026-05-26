@@ -446,17 +446,36 @@ async def report_llm_usage(
             outcome.enforcement_enabled, outcome.reason or "-",
         )
 
-    # Update in-process state for the next call's pre-flight short-
-    # circuit. Period_end / plan / timezone come from /credits/status
-    # which the LLM service refreshes opportunistically; the deduct
-    # response alone doesn't include them.
-    _state.record_deduct(outcome)
+    # The /agent-deduct response now carries plan_id / plan_display_name /
+    # period_end on every call so the agent's CreditState always has the
+    # real Stripe renewal date. Pre-platform-change, period_end stayed
+    # None until /credits/status fired opportunistically — which meant
+    # the very FIRST exhausted card after a cold boot rendered with the
+    # "now + 30 days" fallback even for a Builder user whose actual
+    # renewal was 4 days away. Parsing here removes that gap. Fields are
+    # optional for backward compat with older platform builds that don't
+    # populate them yet.
+    deduct_period_end: Optional[datetime] = None
+    pe_raw = data.get("period_end")
+    if isinstance(pe_raw, str) and pe_raw:
+        try:
+            deduct_period_end = datetime.fromisoformat(
+                pe_raw.replace("Z", "+00:00")
+            )
+        except Exception:
+            deduct_period_end = None
+    _state.record_deduct(
+        outcome,
+        period_end=deduct_period_end,
+        plan_id=data.get("plan_id"),
+        plan_display_name=data.get("plan_display_name"),
+    )
 
-    if outcome.exhausted:
-        # Refresh balance metadata so build_exhausted_response can
-        # construct accurate timestamps. Best-effort; failure here is
-        # not fatal — we still surface the message with sensible
-        # defaults.
+    if outcome.exhausted and deduct_period_end is None:
+        # Older platform build that didn't return period_end in the
+        # deduct response — fall back to the /credits/status round-trip
+        # so the rendered card still shows accurate timestamps. Best-
+        # effort; failure here is not fatal.
         await _refresh_status_metadata(user_id)
 
     return outcome

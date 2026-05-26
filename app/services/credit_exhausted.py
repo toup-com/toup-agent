@@ -116,17 +116,42 @@ def _humanize_delta(delta: timedelta) -> str:
     return f"in {minutes} minute{'s' if minutes != 1 else ''}"
 
 
+def _format_remaining(balance: Optional[float | Decimal]) -> Optional[str]:
+    """Render a balance as a short, honest display string ("6.9", "0.4")
+    or None when we don't have a balance to show. Hides the cents on
+    whole-number balances so "100.0" displays as "100"."""
+    if balance is None:
+        return None
+    try:
+        b = float(balance)
+    except (TypeError, ValueError):
+        return None
+    if b <= 0:
+        return None
+    if abs(b - round(b)) < 0.05:
+        return str(int(round(b)))
+    return f"{b:.1f}"
+
+
 def format_message_text(
     reason: str,
     monthly_reset_at: datetime,
     daily_reset_at: Optional[datetime],
     plan_id: str,
     now: Optional[datetime] = None,
+    balance_after: Optional[float | Decimal] = None,
 ) -> str:
     """Plain-text copy for the channel renderer.
 
     The web chat card overrides this with a live countdown; Telegram /
     voice use this string as-is.
+
+    `balance_after` distinguishes two flavors of INSUFFICIENT:
+      * balance > 0 — user has SOME credits but not enough for this
+        request (multi-turn agent loop overshoots remaining). Copy
+        honestly shows the remaining amount instead of lying about
+        "used all".
+      * balance == 0 (or unknown) — user truly out, original copy.
     """
     now = now or datetime.now(timezone.utc)
     if monthly_reset_at.tzinfo is None:
@@ -152,6 +177,18 @@ def format_message_text(
     if reason in (REASON_INSUFFICIENT_MESSAGE, REASON_INSUFFICIENT_INTEGRATION):
         delta_txt = _humanize_delta(monthly_reset_at - now)
         bucket_word = "message" if reason == REASON_INSUFFICIENT_MESSAGE else "integration"
+        remaining_txt = _format_remaining(balance_after)
+        if remaining_txt is not None:
+            # Honest "partial balance" copy — user has some credits left
+            # but the next request needs more than they have. A multi-
+            # turn agent task can run several LLM calls per user message
+            # so the threshold is per-task, not per-message.
+            return (
+                f"Your remaining {remaining_txt} {bucket_word} "
+                f"credit{'s' if remaining_txt != '1' else ''} aren't enough "
+                f"to complete this request. They renew {delta_txt}. "
+                f"Upgrade your plan to keep going now — visit /pricing."
+            )
         return (
             f"You've used all your {bucket_word} credits for this "
             f"period. They renew {delta_txt}. Upgrade your plan to "
@@ -222,6 +259,7 @@ def build_exhausted_response(
         daily_reset_at=daily_reset_at,
         plan_id=plan_id,
         now=now,
+        balance_after=balance_after,
     )
 
     return ExhaustedResponse(
