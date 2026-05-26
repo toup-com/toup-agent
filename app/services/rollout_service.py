@@ -310,15 +310,57 @@ async def _upgrade_one(
         await db.refresh(attempt)
 
         t0 = time.time()
+        # Hard per-attempt timeout — defense in depth above httpx's own
+        # timeout. Real-world failure observed 2026-05-25 → 2026-05-26
+        # (rollout ed53f0d89a11): 5 parallel attempts hung in
+        # `status='upgrading'` for 547 MINUTES before the reconciler
+        # caught it, despite `bridge_upgrade_timeout_s=180`. Likely
+        # cause: bridge accepted the TCP/TLS connection but never
+        # responded, AND the held DB sessions starved the reconciler's
+        # own DB queries on the Supabase pooler so its 3-min idle check
+        # couldn't fire either.
+        #
+        # `asyncio.wait_for` is a layer above httpx that always fires:
+        # on timeout it cancels the underlying coroutine, releasing
+        # the DB session, marking the attempt failed, and letting the
+        # rollout move on. The grace (+30s) lets httpx time out cleanly
+        # first when it's working; this is the second-chance net.
+        hard_timeout_s = (settings.bridge_upgrade_timeout_s or 180) + 30
         try:
-            result = await upgrade_tenant_image(
-                db, container.user_id, new_tag, rollout_id=rollout.id,
+            result = await asyncio.wait_for(
+                upgrade_tenant_image(
+                    db, container.user_id, new_tag, rollout_id=rollout.id,
+                ),
+                timeout=hard_timeout_s,
             )
             attempt.status = "ok"
             attempt.health_checks_passed = result.get("health_checks_passed", 0)
             attempt.duration_ms = result.get("duration_ms") or int((time.time() - t0) * 1000)
             attempt.completed_at = datetime.utcnow()
             await db.commit()
+            return attempt
+        except asyncio.TimeoutError:
+            # Bridge or platform hung past the hard cap. Don't attempt a
+            # rollback — we don't know what state the tenant is in (the
+            # bridge may have started the upgrade and only the response
+            # is stuck). Mark failed, alert, move on. Same posture as
+            # BridgeContainerNotFound: rolling back into uncertain state
+            # is worse than leaving the operator a clear signal.
+            attempt.status = "failed"
+            attempt.error = (
+                f"hard timeout exceeded ({hard_timeout_s}s) — bridge or "
+                f"platform unresponsive; tenant state unknown"
+            )
+            attempt.duration_ms = int((time.time() - t0) * 1000)
+            attempt.completed_at = datetime.utcnow()
+            await db.commit()
+            await _send_telegram(
+                "warning",
+                f"Tenant <code>{container.user_id[:8]}</code> upgrade "
+                f"<b>hard-timed out</b> after {hard_timeout_s}s — bridge "
+                f"unresponsive. No rollback attempted (state unknown). "
+                f"Rollout continues with remaining tenants.",
+            )
             return attempt
         except BridgeContainerNotFound as orphan_exc:
             # Orphan tenant — bridge has no container for this prefix.
@@ -579,7 +621,41 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
     for i in range(0, len(rest), batch_size):
         batch = rest[i : i + batch_size]
         tasks = [_upgrade_one(db, rollout, c, rollout.image_tag) for c in batch]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+        # Mid-batch heartbeat: with `bridge_upgrade_timeout_s=180` and the
+        # hard_timeout_s=210 cap in `_upgrade_one`, a single batch can
+        # legitimately take up to ~3.5 min. Without a mid-batch heartbeat,
+        # the reconciler's 3-min idle threshold false-positives every slow
+        # batch and aborts healthy rollouts. Stamp every 60s while
+        # `asyncio.gather` is in flight; on batch finish, cancel the
+        # heartbeat and stamp once more for the natural per-batch beat.
+        # Uses its OWN session so a starved orchestrator pool doesn't
+        # silence the heartbeat that's meant to detect that very state.
+        async def _batch_heartbeat(rollout_id: str) -> None:
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    async with async_session_maker() as hb_db:
+                        await hb_db.execute(
+                            Rollout.__table__.update()
+                            .where(Rollout.id == rollout_id)
+                            .values(last_progress_at=datetime.utcnow())
+                        )
+                        await hb_db.commit()
+                except Exception as hb_err:
+                    logger.warning(
+                        "[ROLLOUT] mid-batch heartbeat failed (non-fatal): %s",
+                        hb_err,
+                    )
+
+        hb_task = asyncio.create_task(_batch_heartbeat(rollout.id))
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+        finally:
+            hb_task.cancel()
+            try:
+                await hb_task
+            except (asyncio.CancelledError, Exception):
+                pass
         for r in results:
             if r.status == "ok":
                 total_ok += 1

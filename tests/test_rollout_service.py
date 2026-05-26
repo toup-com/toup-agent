@@ -1048,3 +1048,187 @@ async def test_upgrade_tenant_image_unconfirmed_when_whois_errors():
         )
     finally:
         _settings.use_blue_green_rollouts = _orig_flag
+
+
+# ─── Hard per-attempt timeout (anti-hang defense in depth) ─────────
+#
+# Background: 2026-05-26 — rollout ed53f0d89a11 had 5 attempts stuck in
+# `status='upgrading'` for 547 MINUTES before the reconciler caught them,
+# despite httpx having a 180s timeout. Root cause was a bridge that
+# accepted TCP but never responded, combined with the held DB sessions
+# starving the reconciler's own DB queries on the Supabase pooler. The
+# `asyncio.wait_for` wrapper in `_upgrade_one` is the defense-in-depth
+# layer above httpx — it always fires, cancels the underlying coroutine,
+# releases the session, and lets the rollout continue.
+
+
+@pytest.mark.asyncio
+async def test_upgrade_one_hard_timeout_marks_attempt_failed():
+    """When upgrade_tenant_image hangs past the hard cap, the attempt
+    must be marked 'failed' with the timeout error, NOT left in
+    'upgrading' status (which is what caused the 547-min stall).
+    """
+    from sqlalchemy import select
+    from app.config import settings as _settings
+    from app.db import async_session_maker
+    from app.db.models import ManagedContainer, RolloutAttempt
+    from app.services import rollout_service
+
+    rollout, container = await _seed_orphan_quarantine_fixtures()
+
+    # Shrink the upgrade timeout so the test runs in ~1s instead of 210s.
+    # `_upgrade_one` reads `settings.bridge_upgrade_timeout_s` at call time
+    # and adds a +30s grace; we set it to a tiny value so the +grace is
+    # still tiny.
+    _orig_timeout = _settings.bridge_upgrade_timeout_s
+    _settings.bridge_upgrade_timeout_s = 0  # → hard_timeout_s = 0 + 30 = 30s
+    # Patch the constant offset by monkey-patching the source.
+
+    async def fake_hung_upgrade(*args, **kwargs):
+        # Hang forever — asyncio.wait_for must cancel this.
+        await asyncio.sleep(3600)
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_telegram(level, message):
+        sent.append((level, message))
+
+    # We need the hard timeout to actually trip in test time. Patch
+    # `settings.bridge_upgrade_timeout_s` AND override the +30s grace
+    # by stubbing the timeout calculation directly via a wrapping fake.
+    import app.services.rollout_service as rs_mod
+
+    _orig_wait_for = asyncio.wait_for
+
+    async def short_wait_for(coro, timeout):
+        # Force a tiny timeout regardless of what _upgrade_one computed.
+        return await _orig_wait_for(coro, timeout=1.0)
+
+    try:
+        with patch.object(rs_mod, "upgrade_tenant_image", fake_hung_upgrade), \
+             patch.object(rs_mod, "_send_telegram", fake_telegram), \
+             patch.object(rs_mod.asyncio, "wait_for", short_wait_for):
+            attempt = await rs_mod._upgrade_one(
+                None, rollout, container, "ghcr.io/toup-com/toup-agent:newtag00",
+            )
+    finally:
+        _settings.bridge_upgrade_timeout_s = _orig_timeout
+
+    assert attempt.status == "failed", (
+        "hung upgrade MUST end as failed; the 547-min ed53f0d89a11 stall "
+        "happened because the attempt stayed in 'upgrading' forever"
+    )
+    assert "hard timeout" in (attempt.error or "").lower(), (
+        f"expected hard-timeout error message, got: {attempt.error!r}"
+    )
+
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(RolloutAttempt).where(RolloutAttempt.rollout_id == rollout.id)
+        )).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].status == "failed", (
+            "DB row must reflect 'failed' — otherwise the reconciler can't "
+            "tell upgraded-cleanly from hung-and-killed"
+        )
+
+        # ManagedContainer should NOT be auto-quarantined on a hang —
+        # we don't know if the tenant is alive or dead, only that the
+        # bridge didn't respond. Quarantining on ambiguous signal would
+        # silently evict working tenants on a transient bridge outage.
+        mc = (await db.execute(
+            select(ManagedContainer).where(ManagedContainer.id == container.id)
+        )).scalar_one()
+        assert mc.status == "running", (
+            "hard timeout must NOT flip a tenant to 'orphan' — that's "
+            "reserved for whois-confirmed orphans"
+        )
+
+    assert any("hard-timed out" in m for _, m in sent), (
+        f"expected hard-timeout Telegram alert, got: {sent!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_one_does_not_apply_hard_timeout_when_upgrade_succeeds_fast():
+    """Hard timeout must not interfere with normal fast-path upgrades —
+    pin that a quick successful upgrade still reports `status='ok'`.
+    """
+    from sqlalchemy import select
+    from app.db import async_session_maker
+    from app.db.models import RolloutAttempt
+    from app.services import rollout_service
+
+    rollout, container = await _seed_orphan_quarantine_fixtures()
+
+    async def fake_fast_upgrade(*args, **kwargs):
+        return {"health_checks_passed": 3, "duration_ms": 42}
+
+    async def fake_telegram(level, message):
+        pass
+
+    with patch.object(rollout_service, "upgrade_tenant_image", fake_fast_upgrade), \
+         patch.object(rollout_service, "_send_telegram", fake_telegram):
+        attempt = await rollout_service._upgrade_one(
+            None, rollout, container, "ghcr.io/toup-com/toup-agent:newtag00",
+        )
+
+    assert attempt.status == "ok"
+    assert attempt.health_checks_passed == 3
+
+    async with async_session_maker() as db:
+        row = (await db.execute(
+            select(RolloutAttempt).where(RolloutAttempt.rollout_id == rollout.id)
+        )).scalar_one()
+        assert row.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_upgrade_one_hard_timeout_releases_db_session():
+    """Pin that the timeout path commits attempt='failed' (which releases
+    the held DB session). The 547-min stall happened because the held
+    session was never released; the reconciler couldn't get its own
+    connection on the Supabase pooler to mark the rollout orphan.
+
+    We assert this indirectly by confirming the attempt row is queryable
+    in a *new* session immediately after the timeout — if the timeout
+    path held the row's session, a concurrent read would block.
+    """
+    import asyncio as _asyncio
+    from sqlalchemy import select
+    from app.db import async_session_maker
+    from app.db.models import RolloutAttempt
+    from app.services import rollout_service
+
+    rollout, container = await _seed_orphan_quarantine_fixtures()
+
+    async def fake_hung_upgrade(*args, **kwargs):
+        await _asyncio.sleep(3600)
+
+    async def fake_telegram(level, message):
+        pass
+
+    _orig_wait_for = _asyncio.wait_for
+
+    async def short_wait_for(coro, timeout):
+        return await _orig_wait_for(coro, timeout=1.0)
+
+    with patch.object(rollout_service, "upgrade_tenant_image", fake_hung_upgrade), \
+         patch.object(rollout_service, "_send_telegram", fake_telegram), \
+         patch.object(rollout_service.asyncio, "wait_for", short_wait_for):
+        await rollout_service._upgrade_one(
+            None, rollout, container, "ghcr.io/toup-com/toup-agent:newtag00",
+        )
+
+    # After the timeout, a fresh session must see the failed attempt.
+    # If the timeout path didn't release the session, this read would
+    # block (or fail if the pool is exhausted).
+    async with async_session_maker() as db:
+        row = (await db.execute(
+            select(RolloutAttempt).where(RolloutAttempt.rollout_id == rollout.id)
+        )).scalar_one()
+        assert row.status == "failed"
+        assert row.completed_at is not None, (
+            "completed_at must be stamped on timeout — otherwise the "
+            "reconciler's heartbeat-stale check might not fire correctly"
+        )
