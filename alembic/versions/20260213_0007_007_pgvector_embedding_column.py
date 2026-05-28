@@ -18,7 +18,16 @@ branch_labels = None
 depends_on = None
 
 
+def _is_postgres() -> bool:
+    """Whole migration is Postgres-only — pgvector + HNSW + ::vector cast
+    don't exist on sqlite. Skip the body entirely on non-Postgres so
+    `alembic upgrade head` against a sqlite test DB completes."""
+    return op.get_bind().dialect.name == "postgresql"
+
+
 def upgrade() -> None:
+    if not _is_postgres():
+        return
     # 1. Enable pgvector extension (idempotent)
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
@@ -78,6 +87,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    if not _is_postgres():
+        return
     # Remove vector columns (data preserved in embedding_json)
     op.execute("DROP INDEX IF EXISTS ix_memories_embedding_hnsw")
     op.execute("ALTER TABLE memories DROP COLUMN IF EXISTS embedding")

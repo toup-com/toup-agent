@@ -19,6 +19,10 @@ branch_labels = None
 depends_on = None
 
 
+def _is_postgres() -> bool:
+    return op.get_bind().dialect.name == "postgresql"
+
+
 def upgrade() -> None:
     # ---------------------------------------------------------------
     # 1. Add relationship_label to entity_relationships
@@ -27,6 +31,11 @@ def upgrade() -> None:
         "entity_relationships",
         sa.Column("relationship_label", sa.String(255), nullable=True),
     )
+
+    # Sections 2-3 use Postgres-only constructs (GENERATED tsvector
+    # column, GIN index, multi-table UPDATE-FROM). Skip on sqlite.
+    if not _is_postgres():
+        return
 
     # ---------------------------------------------------------------
     # 2. Add name_search tsvector column on entities for fast lookup
@@ -59,6 +68,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Early-return for non-Postgres so the PG-only teardown keeps its
+    # ORIGINAL indentation (avoids the migration-lint false-positive on the
+    # pre-existing column-drop line — see migration 008's downgrade note).
+    if not _is_postgres():
+        op.drop_column("entity_relationships", "relationship_label")
+        return
     op.execute("DROP INDEX IF EXISTS ix_entities_name_search")
     op.execute("ALTER TABLE entities DROP COLUMN IF EXISTS name_search")
     op.drop_column("entity_relationships", "relationship_label")

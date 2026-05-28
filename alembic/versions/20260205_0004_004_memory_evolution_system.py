@@ -22,6 +22,13 @@ branch_labels = None
 depends_on = None
 
 
+def _is_postgres() -> bool:
+    """True when the current connection is Postgres. Used to skip
+    Postgres-only DDL/DML when `alembic upgrade head` runs against
+    sqlite (local dev, CI sanity checks)."""
+    return op.get_bind().dialect.name == "postgresql"
+
+
 def upgrade() -> None:
     # Add canonical_content column
     op.add_column('memories', sa.Column('canonical_content', sa.Text(), nullable=True))
@@ -57,12 +64,14 @@ def upgrade() -> None:
         WHERE canonical_content IS NULL
     """)
     
-    # Create initial history entries for existing memories (as JSON text)
-    op.execute("""
-        UPDATE memories 
-        SET history_json = '[{"date": "' || to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') || '", "content": "' || REPLACE(REPLACE(content, '"', '\\"'), E'\\n', '\\n') || '", "source": "' || COALESCE(source_type, 'manual') || '", "action": "created"}]'
-        WHERE history_json IS NULL
-    """)
+    # Create initial history entries for existing memories (as JSON text).
+    # Uses `to_char` and E-string escapes — Postgres-only.
+    if _is_postgres():
+        op.execute("""
+            UPDATE memories
+            SET history_json = '[{"date": "' || to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') || '", "content": "' || REPLACE(REPLACE(content, '"', '\\"'), E'\\n', '\\n') || '", "source": "' || COALESCE(source_type, 'manual') || '", "action": "created"}]'
+            WHERE history_json IS NULL
+        """)
     
     # Initialize merged_from_json as empty array
     op.execute("""

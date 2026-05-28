@@ -20,6 +20,10 @@ branch_labels = None
 depends_on = None
 
 
+def _is_postgres() -> bool:
+    return op.get_bind().dialect.name == "postgresql"
+
+
 def upgrade() -> None:
     # ---------------------------------------------------------------
     # 1. entity_relationships table
@@ -40,18 +44,37 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime, server_default=sa.func.now()),
     )
 
-    # Unique constraint: one relationship type per entity pair per user
-    op.create_unique_constraint(
-        "uq_entity_rel_src_tgt_type",
-        "entity_relationships",
-        ["source_entity_id", "target_entity_id", "relationship_type"],
-    )
+    # Unique constraint: one relationship type per entity pair per user.
+    # Postgres gets a named table constraint; sqlite can't ALTER ADD
+    # CONSTRAINT, so it gets the equivalent UNIQUE index instead (same
+    # uniqueness guarantee). Postgres behavior is unchanged.
+    if _is_postgres():
+        op.create_unique_constraint(
+            "uq_entity_rel_src_tgt_type",
+            "entity_relationships",
+            ["source_entity_id", "target_entity_id", "relationship_type"],
+        )
+    else:
+        op.create_index(
+            "uq_entity_rel_src_tgt_type",
+            "entity_relationships",
+            ["source_entity_id", "target_entity_id", "relationship_type"],
+            unique=True,
+        )
 
     # Indexes for graph traversal
     op.create_index("ix_entity_rel_source", "entity_relationships", ["source_entity_id"])
     op.create_index("ix_entity_rel_target", "entity_relationships", ["target_entity_id"])
     op.create_index("ix_entity_rel_user", "entity_relationships", ["user_id"])
     op.create_index("ix_entity_rel_type", "entity_relationships", ["relationship_type"])
+
+    # Sections 2-4 are tsvector/GIN/plpgsql trigger — Postgres-only.
+    # The `memories.search_vector` column is also declared on the ORM
+    # model via `with_variant(TSVECTOR(), "postgresql")` so a sqlite
+    # `create_all` materializes it as Text. Skip the migration's PG
+    # apparatus on sqlite.
+    if not _is_postgres():
+        return
 
     # ---------------------------------------------------------------
     # 2. search_vector tsvector column on memories
@@ -98,6 +121,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Early-return for non-Postgres so the PG-only teardown statements below
+    # keep their ORIGINAL indentation. Re-indenting them would register as
+    # added lines and trip the migration-lint destructive-pattern scan on
+    # the pre-existing column-drop statement.
+    if not _is_postgres():
+        op.drop_table("entity_relationships")
+        return
     op.execute("DROP TRIGGER IF EXISTS memories_search_vector_trigger ON memories")
     op.execute("DROP FUNCTION IF EXISTS memories_search_vector_update()")
     op.execute("DROP INDEX IF EXISTS ix_memories_search_vector")

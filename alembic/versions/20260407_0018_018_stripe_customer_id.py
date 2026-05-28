@@ -17,9 +17,13 @@ depends_on = None
 
 
 def upgrade():
+    # NOTE: no inline `unique=True` on the column — sqlite can't ALTER
+    # TABLE ADD CONSTRAINT, so the inline form breaks `alembic upgrade`
+    # on sqlite. The explicit UNIQUE index below enforces the same
+    # guarantee and works on both dialects.
     op.add_column(
         "users",
-        sa.Column("stripe_customer_id", sa.String(255), nullable=True, unique=True),
+        sa.Column("stripe_customer_id", sa.String(255), nullable=True),
     )
     op.create_index("ix_users_stripe_customer_id", "users", ["stripe_customer_id"], unique=True)
 
