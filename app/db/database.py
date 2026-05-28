@@ -742,19 +742,79 @@ async def init_db():
     # aborted". This was the root cause of the 2026-04-28 incident
     # where preferred_provider + rollouts.phase columns silently failed
     # to land on production despite being in the loop.
-    from sqlalchemy import text
+    from sqlalchemy import text, inspect as _sa_inspect
+    _is_sqlite = engine.dialect.name == "sqlite"
     for stmt in _alter_statements:
         try:
-            async with engine.begin() as conn:
-                await conn.execute(text(stmt))
+            if _is_sqlite:
+                # sqlite doesn't support `ADD COLUMN IF NOT EXISTS` — rewrite
+                # by inspecting existing columns and skipping if present.
+                # Format we emit everywhere is:
+                #   ALTER TABLE <tbl> ADD COLUMN IF NOT EXISTS <col> <type...>
+                _rewritten = _rewrite_alter_for_sqlite(stmt)
+                if _rewritten is None:
+                    # Non-ALTER statement (or shape we can't rewrite); on sqlite
+                    # we skip it rather than emit invalid SQL.
+                    continue
+                _tbl, _col, _tail = _rewritten
+                async with engine.begin() as conn:
+                    _cols = await conn.run_sync(
+                        lambda sc, t=_tbl: {c["name"] for c in _sa_inspect(sc).get_columns(t)}
+                        if t in _sa_inspect(sc).get_table_names() else None
+                    )
+                    if _cols is None:
+                        # Table doesn't exist in this run_mode partition; skip.
+                        continue
+                    if _col in _cols:
+                        continue
+                    # Drop sqlite-incompatible type modifiers (JSONB → JSON,
+                    # `UNIQUE` inline constraints, etc.) so the ADD COLUMN parses.
+                    _tail_sqlite = _sqlite_safe_column_type(_tail)
+                    await conn.execute(text(f'ALTER TABLE {_tbl} ADD COLUMN {_col} {_tail_sqlite}'))
+            else:
+                async with engine.begin() as conn:
+                    await conn.execute(text(stmt))
         except Exception as _e:
             _logger.warning("[init_db] alter skipped: %s — %s", stmt[:80], str(_e)[:200])
     for stmt in _seed_statements:
         try:
+            if _is_sqlite and "ON CONFLICT" in stmt:
+                # sqlite supports ON CONFLICT clause as of 3.24, but the (id)
+                # specifier requires a UNIQUE constraint on the column — which
+                # ORM-created tables have via PRIMARY KEY. Run as-is; skip on
+                # parse failure.
+                pass
             async with engine.begin() as conn:
                 await conn.execute(text(stmt))
         except Exception as _e:
             _logger.warning("[init_db] seed skipped: %s — %s", stmt[:80], str(_e)[:200])
+
+
+def _rewrite_alter_for_sqlite(stmt: str):
+    """Parse `ALTER TABLE <tbl> ADD COLUMN IF NOT EXISTS <col> <tail>`
+    and return (tbl, col, tail). Returns None on shape mismatch."""
+    import re
+    m = re.match(
+        r"\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)\s+(.+?)\s*$",
+        stmt,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return None
+    return m.group(1), m.group(2), m.group(3)
+
+
+def _sqlite_safe_column_type(tail: str) -> str:
+    """Best-effort rewrite of a Postgres column-type spec for sqlite.
+
+    - JSONB → JSON (sqlite has no JSONB; JSON is a text alias)
+    - inline UNIQUE constraint → dropped (sqlite ALTER TABLE ADD COLUMN
+      doesn't accept inline UNIQUE)
+    """
+    import re
+    tail = re.sub(r"\bJSONB\b", "JSON", tail, flags=re.IGNORECASE)
+    tail = re.sub(r"\s+UNIQUE\b", "", tail, flags=re.IGNORECASE)
+    return tail
 
 
 async def drop_db():

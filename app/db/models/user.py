@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional, List
 import uuid
 
-from sqlalchemy import String, DateTime, Boolean, Index, JSON
+from sqlalchemy import String, DateTime, Boolean, JSON
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
@@ -93,14 +93,14 @@ class User(Base):
     identities: Mapped[List["Identity"]] = relationship("Identity", back_populates="user")
     soul_config: Mapped[Optional["SoulConfig"]] = relationship("SoulConfig", back_populates="user", uselist=False)
 
-    __table_args__ = (
-        # Enforce a single canary user. Postgres partial unique index: only
-        # rows WHERE is_canary=true participate in the uniqueness check, so
-        # the default false-for-everyone state stays conflict-free.
-        Index(
-            "uq_users_is_canary_partial",
-            "is_canary",
-            unique=True,
-            postgresql_where="is_canary = true",
-        ),
-    )
+    # NOTE: The partial unique index `uq_users_is_canary_partial` lives
+    # only in alembic migration 0022 (Postgres-specific via `postgresql_where`).
+    # We deliberately do NOT declare it in `__table_args__` because
+    # SQLAlchemy's `Base.metadata.create_all` (used by the test conftest and
+    # by `init_db()` on sqlite) ignores `postgresql_where` and emits a
+    # TOTAL unique index on `is_canary` — every test that creates a second
+    # user (default `is_canary=False` × 2) then fails with
+    # `UNIQUE constraint failed: users.is_canary`. Production Postgres still
+    # gets the partial index from the migration; sqlite test runs get no
+    # index, which is the right behavior (canary uniqueness is irrelevant
+    # in a single-tenant test DB).

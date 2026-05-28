@@ -35,45 +35,25 @@ build_active_tasks_block = _ats.build_active_tasks_block
 
 
 async def _make_engine():
+    """Local engine with schema built from the live ORM model.
+
+    Previously this function carried a hand-written CREATE TABLE for
+    `users`/`messages`/`memories` that drifted from the ORM model every
+    time a column was added (most recently `email_verified_at` from mig
+    055). Rebuilding from `Base.metadata.create_all(tables=[...])`
+    auto-syncs the test schema to whatever the ORM declares.
+    """
+    from app.db.models.base import Base
+    from app.db.models.user import User as _U
+    from app.db.models.memory import Memory as _M
+    from app.db.models.conversation import Message as _Msg
+
     engine = create_async_engine("sqlite+aiosqlite://", connect_args={"check_same_thread": False})
     async with engine.begin() as conn:
-        for stmt in [
-            """CREATE TABLE IF NOT EXISTS users (
-                id VARCHAR(36) PRIMARY KEY, email VARCHAR(255) UNIQUE,
-                hashed_password VARCHAR(255),
-                name VARCHAR(255), password_changed_at TIMESTAMP,
-                role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
-                updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
-                is_canary BOOLEAN DEFAULT 0
-            )""",
-            """CREATE TABLE IF NOT EXISTS messages (
-                id VARCHAR(50) PRIMARY KEY, conversation_id VARCHAR(36),
-                day_chat_id VARCHAR(36), role VARCHAR(20), content TEXT,
-                created_at TIMESTAMP, tokens_prompt INTEGER,
-                tokens_completion INTEGER, model_used VARCHAR(50),
-                memories_retrieved_json TEXT, processing_time_ms INTEGER,
-                metadata_json TEXT, embedding_json TEXT, embedding BLOB
-            )""",
-            """CREATE TABLE IF NOT EXISTS memories (
-                id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36),
-                brain_type VARCHAR(20) DEFAULT 'user', content TEXT,
-                summary VARCHAR(500), category VARCHAR(20), memory_type VARCHAR(20),
-                embedding_json TEXT, importance FLOAT DEFAULT 0.5,
-                confidence FLOAT DEFAULT 1.0, strength FLOAT DEFAULT 1.0,
-                memory_level VARCHAR(20) DEFAULT 'episodic',
-                emotional_salience FLOAT DEFAULT 0.5,
-                last_reinforced_at TIMESTAMP, consolidation_count INTEGER DEFAULT 0,
-                decay_rate FLOAT DEFAULT 0.1, created_at TIMESTAMP, updated_at TIMESTAMP,
-                last_accessed_at TIMESTAMP, access_count INTEGER DEFAULT 0,
-                source_message_id VARCHAR(36), source_type VARCHAR(50) DEFAULT 'conversation',
-                metadata_json TEXT, tags_json TEXT, canonical_content TEXT,
-                history_json TEXT, merged_from_json TEXT, superseded_by VARCHAR(36),
-                is_active BOOLEAN DEFAULT 1, is_deleted BOOLEAN DEFAULT 0, deleted_at TIMESTAMP,
-                embedding BLOB, search_vector TEXT
-            )""",
-        ]:
-            await conn.run_sync(lambda c, s=stmt: c.execute(text(s)))
+        await conn.run_sync(
+            Base.metadata.create_all,
+            tables=[_U.__table__, _M.__table__, _Msg.__table__],
+        )
     return engine
 
 

@@ -32,6 +32,24 @@ from typing import Any, AsyncIterator, Callable
 # the ENVIRONMENT env var.
 os.environ.setdefault("ENVIRONMENT", "test")
 
+# Default to a shared-cache in-memory sqlite when no DATABASE_URL is set.
+# Why shared-cache: the StaticPool already gives single-connection schema
+# sharing inside one engine, but if anything in the app code path
+# instantiates a second sqlite engine (e.g. a test helper that does its
+# own create_async_engine), `sqlite:///:memory:` gives each engine its
+# OWN in-memory DB. The `file::memory:?cache=shared&uri=true` form lets
+# multiple connections — even from different engines — attach to the
+# SAME named in-memory DB. Defensive measure; current code paths only
+# build one engine, but new code is one wrong import away from a
+# silent schema-drift bug that's painful to diagnose.
+os.environ.setdefault(
+    "DATABASE_URL",
+    # `file::memory:?cache=shared` keeps the DB in memory (no file written
+    # to disk) but lets multiple connections — even from different engines
+    # — attach to the SAME named in-memory DB.
+    "sqlite+aiosqlite:///file::memory:?cache=shared&uri=true",
+)
+
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI

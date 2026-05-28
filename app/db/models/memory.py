@@ -54,8 +54,12 @@ class Memory(Base):
     # Native pgvector column
     embedding = Column(Vector(), nullable=True) if Vector else None
 
-    # Full-text search vector (auto-updated by PostgreSQL trigger)
-    search_vector = Column(TSVECTOR, nullable=True)
+    # Full-text search vector (auto-updated by PostgreSQL trigger).
+    # `with_variant(TSVECTOR(), "postgresql")` keeps the prod schema as
+    # tsvector while letting SQLite test runs compile the column as Text.
+    # The trigger that maintains it is Postgres-only — on sqlite the
+    # column is just inert ballast.
+    search_vector = Column(Text().with_variant(TSVECTOR(), "postgresql"), nullable=True)
 
     # Importance and confidence
     importance: Mapped[float] = mapped_column(Float, default=0.5)

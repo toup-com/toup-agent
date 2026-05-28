@@ -1096,6 +1096,7 @@ async def test_upgrade_one_hard_timeout_marks_attempt_failed():
     # We need the hard timeout to actually trip in test time. Patch
     # `settings.bridge_upgrade_timeout_s` AND override the +30s grace
     # by stubbing the timeout calculation directly via a wrapping fake.
+    import asyncio
     import app.services.rollout_service as rs_mod
 
     _orig_wait_for = asyncio.wait_for
