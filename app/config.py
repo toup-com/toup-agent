@@ -89,8 +89,17 @@ class Settings(BaseSettings):
     deepseek_api_key: Optional[str] = None
 
     # Agent Runtime
-    agent_model: str = "claude-opus-4-7"  # Primary agent model
-    agent_fallback_model: str = "gpt-5.5"  # Fallback if primary model fails (cross-provider)
+    # Default to an OpenAI model: bundle users authenticate Anthropic via the
+    # platform's shared Claude account, and when that account runs out of
+    # credit EVERY bundle user calling Claude gets a hard 400 ("credit balance
+    # too low") — a single-point-of-failure outage (2026-05-29: new users
+    # couldn't even say "hi"). OpenAI calls instead use each user's OWN
+    # per-tenant project key (provisioned at signup, isolated billing), so an
+    # OpenAI default has no shared-account dependency. Anthropic models remain
+    # fully available as an explicit per-user `agent_config.agent_model`
+    # choice once the platform Claude account is funded.
+    agent_model: str = "gpt-5.5"  # Primary agent model (OpenAI — per-tenant key)
+    agent_fallback_model: str = "gpt-4o"  # Distinct OpenAI fallback if primary fails
     # Auto-builder Planner/Builder model overrides. None means "share the
     # agent's default model" — both phases use `agent_model` unless an
     # operator deliberately splits them. See model_resolver.app_builder_*_model().

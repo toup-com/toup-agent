@@ -37,8 +37,14 @@ logger = logging.getLogger(__name__)
 # Module-private. The ONLY literal model strings outside data tables.
 # Settings + per-tenant overrides take precedence; these are the
 # last-resort fallback when nothing else is configured.
-_CANONICAL_AGENT_MODEL = "claude-opus-4-7"
-_CANONICAL_FALLBACK_MODEL = "gpt-5.5"
+# Canonical default is OpenAI: bundle Anthropic calls share one platform
+# Claude account (single point of failure when its credit runs out), while
+# OpenAI calls use each user's own per-tenant project key. See the
+# `agent_model` comment in config.py for the 2026-05-29 incident.
+# `_CANONICAL_ANTHROPIC_MODEL` stays Claude — it's the explicit-Claude
+# fallback, only reached when a user/operator deliberately picks Anthropic.
+_CANONICAL_AGENT_MODEL = "gpt-5.5"
+_CANONICAL_FALLBACK_MODEL = "gpt-4o"
 _CANONICAL_ANTHROPIC_MODEL = "claude-opus-4-7"
 _CANONICAL_OPENAI_MODEL = "gpt-5.5"
 

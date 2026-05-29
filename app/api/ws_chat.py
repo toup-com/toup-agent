@@ -56,6 +56,21 @@ def _friendly_error(exc: Exception) -> str:
             "• Set a different API key in Settings"
         )
 
+    # ── Anthropic API console billing exhausted ──────────────────────────
+    # The platform's shared Claude account (bundle mode) returns a hard 400:
+    #   "Your credit balance is too low to access the Anthropic API. Please
+    #    go to Plans & Billing to upgrade or purchase credits."
+    # This is a PLATFORM-side outage — the bundle user can't fix it, and
+    # pointing them at OpenAI billing (the old behavior) is doubly wrong:
+    # wrong provider AND wrong actor. Match this BEFORE the generic
+    # credit/billing branch so it doesn't fall through to the OpenAI copy.
+    if "anthropic api" in msg_lower or ("plans & billing" in msg_lower) or ("credit balance is too low" in msg_lower):
+        return (
+            "The AI service is temporarily unavailable (the platform's Claude "
+            "access needs attention). We've been alerted — please try again "
+            "shortly, or switch your model in Settings to keep working now."
+        )
+
     # ── OpenAI quota / billing exhausted (must check before generic 429) ──
     if any(kw in msg_lower for kw in ("insufficient_quota", "billing", "credit", "balance", "exceeded your current")) or ("quota" in msg_lower and "openai" in msg_lower):
         return (
