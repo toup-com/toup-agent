@@ -317,17 +317,23 @@ def _b64url_decode(s: str) -> bytes:
     return _base64.urlsafe_b64decode((s + pad).encode("ascii"))
 
 
-def _sign_signin_state(*, mode: str, redirect: Optional[str]) -> str:
-    """Mint a state token carrying (mode, redirect, nonce, iat).
+def _sign_signin_state(*, mode: str, redirect: Optional[str], platform: str = "web") -> str:
+    """Mint a state token carrying (mode, redirect, platform, nonce, iat).
 
     Format: `<body_b64>.<sig_b64>`. Same shape as
     services/oauth_state.py uses for the connector flow — distinct
     payload keys so a cross-flow replay is rejected by the
-    `kind` field check on verify."""
+    `kind` field check on verify.
+
+    `platform` selects the post-callback redirect target: "web" lands on
+    the SPA at /auth/google/complete, "native" deep-links back into the
+    mobile app via the toup:// scheme. It only picks the redirect — it
+    never grants auth — so it's safe even though the app passes it."""
     payload = {
         "kind": "auth_signin",
         "mode": (mode or "signup").strip().lower()[:16],
         "redirect": (redirect or "").strip()[:512] or None,
+        "platform": "native" if (platform or "web").strip().lower() == "native" else "web",
         "nonce": _secrets.token_urlsafe(16),
         "iat": int(_time.time()),
     }
@@ -422,6 +428,7 @@ async def google_auth_start(
     request: Request,
     mode: str = "signup",
     redirect: Optional[str] = None,
+    platform: str = "web",
 ):
     """Begin the Google OAuth flow. Redirects to Google's consent screen.
 
@@ -445,7 +452,7 @@ async def google_auth_start(
     import urllib.parse
 
     client_id, _ = await _google_auth_credentials()
-    signed_state = _sign_signin_state(mode=mode, redirect=redirect)
+    signed_state = _sign_signin_state(mode=mode, redirect=redirect, platform=platform)
 
     params = {
         "client_id": client_id,
@@ -468,13 +475,45 @@ async def google_auth_start(
     return {"authorize_url": authorize_url}
 
 
-def _frontend_complete_url(*, token: str, is_new: bool, redirect: Optional[str], error: Optional[str] = None) -> str:
+# Deep link the mobile app registers (CFBundleURLSchemes: "toup" in the
+# app's Info.plist). The callback redirects here — instead of the web
+# SPA — when the sign-in was started with platform=native, so
+# ASWebAuthenticationSession on the device catches the redirect and hands
+# the JWT (in the fragment) back to the app.
+_NATIVE_AUTH_COMPLETE_URL = "toup://auth/google/complete"
+
+
+def _peek_state_platform(state: Optional[str]) -> str:
+    """Best-effort read of `platform` from an UNVERIFIED state token.
+
+    The early error branches (provider cancel, missing code, bad state)
+    bail before the signature is verified, but still need to pick the
+    right redirect target so the mobile session catches the bounce-back.
+    `platform` only selects web-URL vs toup:// — it never grants auth —
+    so reading it pre-verification is safe. Defaults to "web"."""
+    if not state or "." not in state:
+        return "web"
+    try:
+        body_b64 = state.rsplit(".", 1)[0]
+        payload = _json.loads(_b64url_decode(body_b64).decode("utf-8"))
+        return "native" if (payload.get("platform") or "web") == "native" else "web"
+    except Exception:
+        return "web"
+
+
+def _frontend_complete_url(*, token: str, is_new: bool, redirect: Optional[str], error: Optional[str] = None, platform: str = "web") -> str:
     """Build the post-callback redirect URL. The JWT lives in the URL
     fragment so it stays out of HTTP logs / referer headers (the
-    fragment isn't sent to the server on the GET that loads the page)."""
+    fragment isn't sent to the server on the GET that loads the page).
+
+    When `platform == "native"` the landing is the app's toup:// deep
+    link rather than the web SPA, so the mobile auth session resolves."""
     import urllib.parse
-    base = (settings.app_public_base_url or "https://toup.ai").rstrip("/")
-    landing = f"{base}/auth/google/complete"
+    if (platform or "web") == "native":
+        landing = _NATIVE_AUTH_COMPLETE_URL
+    else:
+        base = (settings.app_public_base_url or "https://toup.ai").rstrip("/")
+        landing = f"{base}/auth/google/complete"
     parts: list[str] = []
     if token:
         parts.append(f"token={urllib.parse.quote(token)}")
@@ -533,18 +572,26 @@ async def google_auth_callback(
     """
     import httpx
 
+    # Pick the redirect target (web SPA vs toup:// deep link) up front so
+    # even the pre-verification error branches bounce back to the right
+    # place. Re-derived authoritatively from the verified payload below.
+    platform = _peek_state_platform(state)
+
+    def _dest(**kw):
+        return _frontend_complete_url(platform=platform, **kw)
+
     # Provider-side error — user clicked "Cancel" on Google's screen.
     if error:
         return Response(
             status_code=307,
-            headers={"Location": _frontend_complete_url(
+            headers={"Location": _dest(
                 token="", is_new=False, redirect=None, error=error,
             )},
         )
     if not code or not state:
         return Response(
             status_code=307,
-            headers={"Location": _frontend_complete_url(
+            headers={"Location": _dest(
                 token="", is_new=False, redirect=None,
                 error="missing_code_or_state",
             )},
@@ -559,12 +606,15 @@ async def google_auth_callback(
         logger.warning("[google-auth] state verification failed: %s", e.detail)
         return Response(
             status_code=307,
-            headers={"Location": _frontend_complete_url(
+            headers={"Location": _dest(
                 token="", is_new=False, redirect=None,
                 error=str(e.detail or "invalid_state"),
             )},
         )
     caller_redirect = payload.get("redirect")
+    # Authoritative platform from the verified state (overrides the
+    # best-effort peek above; `_dest` closes over this name).
+    platform = "native" if payload.get("platform") == "native" else "web"
 
     # Exchange code → tokens.
     try:
@@ -587,7 +637,7 @@ async def google_auth_callback(
             )
             return Response(
                 status_code=307,
-                headers={"Location": _frontend_complete_url(
+                headers={"Location": _dest(
                     token="", is_new=False, redirect=caller_redirect,
                     error="token_exchange_failed",
                 )},
@@ -597,7 +647,7 @@ async def google_auth_callback(
         logger.exception("[google-auth] token exchange exception")
         return Response(
             status_code=307,
-            headers={"Location": _frontend_complete_url(
+            headers={"Location": _dest(
                 token="", is_new=False, redirect=caller_redirect,
                 error="token_exchange_failed",
             )},
@@ -607,7 +657,7 @@ async def google_auth_callback(
     if not access_token:
         return Response(
             status_code=307,
-            headers={"Location": _frontend_complete_url(
+            headers={"Location": _dest(
                 token="", is_new=False, redirect=caller_redirect,
                 error="no_access_token",
             )},
@@ -627,7 +677,7 @@ async def google_auth_callback(
             )
             return Response(
                 status_code=307,
-                headers={"Location": _frontend_complete_url(
+                headers={"Location": _dest(
                     token="", is_new=False, redirect=caller_redirect,
                     error="userinfo_failed",
                 )},
@@ -637,7 +687,7 @@ async def google_auth_callback(
         logger.exception("[google-auth] userinfo exception")
         return Response(
             status_code=307,
-            headers={"Location": _frontend_complete_url(
+            headers={"Location": _dest(
                 token="", is_new=False, redirect=caller_redirect,
                 error="userinfo_failed",
             )},
@@ -647,7 +697,7 @@ async def google_auth_callback(
     if not email:
         return Response(
             status_code=307,
-            headers={"Location": _frontend_complete_url(
+            headers={"Location": _dest(
                 token="", is_new=False, redirect=caller_redirect,
                 error="no_email",
             )},
@@ -704,7 +754,7 @@ async def google_auth_callback(
     if not user.is_active:
         return Response(
             status_code=307,
-            headers={"Location": _frontend_complete_url(
+            headers={"Location": _dest(
                 token="", is_new=False, redirect=caller_redirect,
                 error="account_disabled",
             )},
@@ -729,7 +779,7 @@ async def google_auth_callback(
         samesite="none", path="/",
     )
 
-    redirect_url = _frontend_complete_url(
+    redirect_url = _dest(
         token=jwt_token, is_new=is_new, redirect=caller_redirect,
     )
     return Response(
