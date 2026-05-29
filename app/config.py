@@ -100,6 +100,17 @@ class Settings(BaseSettings):
     # choice once the platform Claude account is funded.
     agent_model: str = "gpt-5.5"  # Primary agent model (OpenAI — per-tenant key)
     agent_fallback_model: str = "gpt-4o"  # Distinct OpenAI fallback if primary fails
+    # Anthropic provider master switch. DEACTIVATED platform-wide on
+    # 2026-05-29: bundle Anthropic calls share ONE platform Claude account
+    # and it ran out of credit, hard-400ing every bundle user's Claude call
+    # ("credit balance too low"). Until that account is funded, we run
+    # OpenAI-only (each user has their own isolated per-tenant OpenAI key).
+    # When False: the model router never picks Claude, /api/models hides
+    # Anthropic models, and the LLM proxy rejects Claude requests as a hard
+    # backstop. Re-enable by setting env ANTHROPIC_ENABLED=true once the
+    # platform Claude account has credit again. See model_router +
+    # llm_proxy._route_chat for the enforcement points.
+    anthropic_enabled: bool = False
     # Auto-builder Planner/Builder model overrides. None means "share the
     # agent's default model" — both phases use `agent_model` unless an
     # operator deliberately splits them. See model_resolver.app_builder_*_model().

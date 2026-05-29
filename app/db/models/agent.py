@@ -214,19 +214,11 @@ class AgentConfig(Base):
     # User's preferred LLM provider for bundle mode (anthropic | openai).
     # Routes which model the model_router picks when no explicit override.
     # Bundle subscribers can flip this from /agent/settings without code
-    # changes — useful for "I want my agent on GPT" preferences. Default
-    # 'anthropic' matches today's behavior.
+    # changes. Default 'openai' as of 2026-05-29 — each user has their own
+    # per-tenant OpenAI key, whereas Anthropic rides one shared platform
+    # account that became a single point of failure. (Was 'anthropic'.)
     preferred_provider: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="anthropic", server_default="anthropic"
-    )
-
-    # User's preferred LLM provider for bundle mode (anthropic | openai).
-    # Routes which model the model_router picks when no explicit override.
-    # Bundle subscribers can flip this from /agent/settings without code
-    # changes — useful for "I want my agent on GPT" preferences. Default
-    # 'anthropic' matches today's behavior.
-    preferred_provider: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="anthropic", server_default="anthropic"
+        String(20), nullable=False, default="openai", server_default="openai"
     )
 
     # LLM Bundle subscription

@@ -86,10 +86,16 @@ async def list_models() -> JSONResponse:
     )
     from app.agent.model_providers import get_provider_registry
 
+    from app.config import settings as _settings
+    anthropic_on = getattr(_settings, "anthropic_enabled", True)
+
     registry = get_provider_registry()
-    anthropic = registry.get_provider("anthropic")
+    anthropic = registry.get_provider("anthropic") if anthropic_on else None
     openai = registry.get_provider("openai")
 
+    # When Anthropic is deactivated platform-wide, omit Claude models from
+    # the picker entirely so users can't select a model that the proxy will
+    # reject. The default/fallback are already OpenAI (settings).
     payload = {
         "default": default_model(),
         "fallback": default_fallback_model(),

@@ -495,6 +495,28 @@ def _route_chat(model: str, config: AgentConfig) -> tuple[LLMBackend, str]:
 
     # Anthropic models
     if m.startswith("claude"):
+        # Hard backstop for the platform-wide Anthropic deactivation
+        # (settings.anthropic_enabled=False). The router + preferred_provider
+        # data fix mean no well-behaved agent should send a Claude model, so
+        # this only catches stragglers (e.g. a stale tenant container whose
+        # auto-router still defaults to Claude). We can't transparently serve
+        # OpenAI here — the caller used the Anthropic SDK and expects Anthropic
+        # response framing, and there is no OpenAI→Anthropic response converter
+        # — so we reject cleanly instead of hitting the unfunded shared Claude
+        # account. The agent surfaces this as a "temporarily unavailable" 5xx.
+        if not getattr(settings, "anthropic_enabled", True):
+            logger.warning(
+                "[LLM-PROXY] anthropic disabled — rejecting Claude request "
+                "model=%s. Agent should be on an OpenAI model (check "
+                "agent_configs.preferred_provider).",
+                model,
+            )
+            raise HTTPException(
+                503,
+                "Anthropic is temporarily disabled on this platform; "
+                "this request targeted a Claude model. Your agent should "
+                "use an OpenAI model — try again or pick GPT in Settings.",
+            )
         key = settings.platform_anthropic_api_key
         if not key:
             raise HTTPException(500, "Platform Anthropic key not configured")

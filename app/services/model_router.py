@@ -76,17 +76,44 @@ def classify_request(
     from app.services.key_provider import keys
     from app.config import settings
 
-    # Bundle mode: trust preferred_provider, fall back to anthropic
+    anthropic_on = getattr(settings, "anthropic_enabled", True)
+
+    def _openai_model() -> str:
+        """A guaranteed-OpenAI model id. Uses the resolver's
+        default_openai_model() which returns the agent default when it's
+        already OpenAI (e.g. gpt-5.5) and otherwise falls back to the
+        canonical OpenAI model — never a Claude id, even if both the
+        configured default AND fallback happen to be Claude (e.g. a dev
+        env with AGENT_MODEL pinned to Claude)."""
+        from app.services.model_resolver import default_openai_model
+        return default_openai_model()
+
+    # Anthropic deactivated platform-wide → always OpenAI, regardless of
+    # preferred_provider / available keys. This is the router-level half of
+    # the kill switch (the proxy enforces the other half as a hard backstop).
+    if not anthropic_on:
+        model = _openai_model()
+        reason = f"anthropic disabled → openai {model}"
+        logger.info(f"[ROUTER] {reason}")
+        return RoutingDecision(
+            tier="default", model=model, label=model, confidence=1.0, reason=reason,
+        )
+
+    # Bundle mode: trust preferred_provider. Default to OPENAI now (was
+    # anthropic) — each user has their own per-tenant OpenAI key, whereas
+    # Anthropic rides one shared platform account. Only an explicit
+    # preferred=anthropic opts into Claude.
     if settings.llm_mode == "bundle" and settings.toup_token:
-        choice = (preferred_provider or "anthropic").lower()
-        if choice == "openai":
-            model = default_fallback_model()
-            label = model
-            reason = f"bundle mode + preferred=openai → {model}"
-        else:
-            model = default_model()
+        choice = (preferred_provider or "openai").lower()
+        if choice == "anthropic":
+            from app.services.model_resolver import default_anthropic_model
+            model = default_anthropic_model()
             label = model
             reason = f"bundle mode + preferred=anthropic → {model}"
+        else:
+            model = _openai_model()
+            label = model
+            reason = f"bundle mode + preferred=openai → {model}"
         logger.info(f"[ROUTER] {reason}")
         return RoutingDecision(
             tier="default", model=model, label=label, confidence=1.0, reason=reason,
