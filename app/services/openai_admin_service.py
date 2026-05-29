@@ -49,11 +49,57 @@ logger = logging.getLogger(__name__)
 _ORG_BASE = "https://api.openai.com/v1/organization"
 _TIMEOUT_S = 15
 
+# Transient-failure retry policy for the project + key creation POSTs.
+# Without this, a single OpenAI Admin API blip (502/503/timeout) at signup
+# left the user with NO per-tenant key — silently degrading them onto the
+# shared platform master key (the exact shared-account SPOF we're trying to
+# eliminate). 2 attempts total (1 retry), short backoff so we don't block
+# the activation path for long. 429/5xx + connection/timeout are retried;
+# 4xx (other than 429) are NOT — those are deterministic and won't recover.
+_MAX_ATTEMPTS = 2
+_RETRY_BACKOFF_S = 0.75
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
 
 class OpenAIAdminUnavailable(RuntimeError):
     """Raised when settings.openai_admin_api_key is missing. Callers should
     log + fall back to platform master-key flow without failing user
     activation."""
+
+
+def _post_with_retry(client: httpx.Client, url: str, headers: dict, json_body: dict) -> httpx.Response:
+    """POST with a small retry budget for transient OpenAI Admin API failures.
+
+    Retries on 429/5xx and on connection/timeout errors; returns the last
+    response for deterministic 4xx (caller maps to RuntimeError). Network
+    errors on the final attempt propagate so the caller's try/except records
+    them. Backoff is short + bounded — this runs on the signup activation
+    path and must not stall onboarding.
+    """
+    import time
+    last_resp: Optional[httpx.Response] = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            resp = client.post(url, headers=headers, json=json_body)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            if attempt < _MAX_ATTEMPTS - 1:
+                logger.warning(
+                    "[openai-admin] transient network error on %s (attempt %d/%d): %s — retrying",
+                    url, attempt + 1, _MAX_ATTEMPTS, e,
+                )
+                time.sleep(_RETRY_BACKOFF_S * (attempt + 1))
+                continue
+            raise
+        last_resp = resp
+        if resp.status_code in _RETRYABLE_STATUS and attempt < _MAX_ATTEMPTS - 1:
+            logger.warning(
+                "[openai-admin] retryable HTTP %d on %s (attempt %d/%d) — retrying",
+                resp.status_code, url, attempt + 1, _MAX_ATTEMPTS,
+            )
+            time.sleep(_RETRY_BACKOFF_S * (attempt + 1))
+            continue
+        return resp
+    return last_resp  # exhausted retries on a retryable status
 
 
 def _admin_headers() -> dict[str, str]:
@@ -77,10 +123,8 @@ def create_project(name: str) -> str:
     """
     headers = _admin_headers()
     with httpx.Client(timeout=_TIMEOUT_S) as client:
-        resp = client.post(
-            f"{_ORG_BASE}/projects",
-            headers=headers,
-            json={"name": name},
+        resp = _post_with_retry(
+            client, f"{_ORG_BASE}/projects", headers, {"name": name},
         )
     if resp.status_code >= 400:
         raise RuntimeError(
@@ -108,10 +152,9 @@ def create_project_api_key(project_id: str, key_name: str = "agent") -> str:
     """
     headers = _admin_headers()
     with httpx.Client(timeout=_TIMEOUT_S) as client:
-        resp = client.post(
-            f"{_ORG_BASE}/projects/{project_id}/service_accounts",
-            headers=headers,
-            json={"name": key_name},
+        resp = _post_with_retry(
+            client, f"{_ORG_BASE}/projects/{project_id}/service_accounts",
+            headers, {"name": key_name},
         )
     if resp.status_code >= 400:
         raise RuntimeError(

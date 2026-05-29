@@ -55,6 +55,38 @@ def test_create_project_raises_when_admin_key_missing():
             svc.create_project("toup-tenant-x")
 
 
+def test_create_project_retries_transient_503_then_succeeds():
+    """A transient 503 must be retried, not surfaced as a hard failure —
+    this is what stops a single OpenAI Admin API blip at signup from
+    silently degrading the user onto the shared master key."""
+    from app.services import openai_admin_service as svc
+    post = MagicMock(side_effect=[
+        _mock_response(503, {"error": {"message": "upstream"}}),
+        _mock_response(200, {"id": "proj_retry_ok", "name": "toup-x"}),
+    ])
+    with patch.object(svc.settings, "openai_admin_api_key", "sk-admin-FAKE"), \
+         patch("time.sleep", lambda *_: None):
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.post = post
+            result = svc.create_project("toup-x")
+    assert result == "proj_retry_ok"
+    assert post.call_count == 2  # retried once
+
+
+def test_create_project_does_not_retry_deterministic_400():
+    """4xx (other than 429) is deterministic — retrying wastes time and
+    won't recover. Must surface immediately as a RuntimeError."""
+    from app.services import openai_admin_service as svc
+    post = MagicMock(return_value=_mock_response(400, {"error": {"message": "bad name"}}))
+    with patch.object(svc.settings, "openai_admin_api_key", "sk-admin-FAKE"), \
+         patch("time.sleep", lambda *_: None):
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.post = post
+            with pytest.raises(RuntimeError, match="HTTP 400"):
+                svc.create_project("toup-x")
+    assert post.call_count == 1  # NOT retried
+
+
 def test_create_project_raises_on_http_error():
     from app.services import openai_admin_service as svc
     with patch.object(svc.settings, "openai_admin_api_key", "sk-admin-FAKE"):

@@ -532,6 +532,24 @@ async def admin_rehydrate_balance(
     }
 
 
+@admin_router.post("/backfill-openai-projects")
+async def admin_backfill_openai_projects(
+    limit: int = Query(200, ge=1, le=1000),
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Provision a per-tenant OpenAI project for every active-bundle user
+    that doesn't have one yet.
+
+    On-demand twin of the platform-boot reconciler. Run this after an
+    OpenAI Admin API outage to cure any users who were left on the shared
+    master key, so every user ends up on their OWN isolated per-tenant key.
+    Idempotent + safe to re-run.
+    """
+    from app.api.billing import backfill_missing_openai_projects
+    return await backfill_missing_openai_projects(db, limit=limit)
+
+
 class FlatFeeUpdate(BaseModel):
     fee_key: str
     credits: float

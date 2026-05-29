@@ -257,17 +257,74 @@ def _provision_openai_project_if_needed(
             project_id, config.user_id,
         )
     except OpenAIAdminUnavailable as e:
+        # Distinctive marker so this is greppable/alertable — if it fires in
+        # prod, OPENAI_ADMIN_API_KEY is unset and NO new user gets a per-tenant
+        # key (every bundle user silently rides the shared master key).
         logger.warning(
-            "OpenAI admin not configured; bundle for user %s falls back to "
-            "master key: %s",
+            "[OPENAI-PROVISION-MISS] admin key not configured; user %s falls "
+            "back to shared master key: %s",
             config.user_id, e,
         )
     except Exception as e:
         logger.warning(
-            "OpenAI auto-provisioning failed for user %s — proxy will fall "
-            "back to master key. Error: %s",
+            "[OPENAI-PROVISION-MISS] auto-provisioning failed for user %s — "
+            "proxy falls back to shared master key; backfill reconciler will "
+            "retry. Error: %s",
             config.user_id, e,
         )
+
+
+async def backfill_missing_openai_projects(
+    db: AsyncSession,
+    *,
+    limit: int = 200,
+) -> dict:
+    """Provision a per-tenant OpenAI project for every active-bundle user
+    that doesn't have one yet.
+
+    This is the reconciler that makes "every user has their own key" an
+    eventually-consistent guarantee instead of a best-effort hope: a
+    transient OpenAI Admin API failure at signup leaves the user on the
+    shared master key, and this sweep cures it. Runs on platform boot
+    (bounded; ~0 candidates in steady state) and via the admin endpoint.
+
+    Idempotent + safe to re-run: only touches rows where
+    `bundle_openai_project_id IS NULL`, and `_provision_openai_project_if_needed`
+    itself early-returns if a project already exists. Per-user failures are
+    counted and logged, never raised — one bad row must not abort the sweep.
+    """
+    from app.db.models import User
+
+    rows = (await db.execute(
+        select(AgentConfig).where(
+            AgentConfig.bundle_status.in_(("active", "cancelling")),
+            AgentConfig.bundle_openai_project_id.is_(None),
+        ).limit(limit)
+    )).scalars().all()
+
+    provisioned = 0
+    failed = 0
+    for cfg in rows:
+        label: Optional[str] = cfg.agent_name or None
+        if not label:
+            try:
+                u = await db.get(User, cfg.user_id)
+                label = (u.name if u else None) or None
+            except Exception:
+                label = None
+        _provision_openai_project_if_needed(cfg, user_name=label)
+        if cfg.bundle_openai_project_id and cfg.bundle_openai_api_key:
+            provisioned += 1
+        else:
+            failed += 1
+
+    if provisioned:
+        await db.commit()
+
+    summary = {"candidates": len(rows), "provisioned": provisioned, "failed": failed}
+    if rows:
+        logger.info("[openai-backfill] %s", summary)
+    return summary
 
 
 async def _ensure_stripe_customer(user, db: AsyncSession) -> str:
