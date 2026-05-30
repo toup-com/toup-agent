@@ -227,7 +227,32 @@ async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedCont
         db.add(container)
     container.container_name = container_name
     container.host_port = int(host_port)
-    container.image_tag = settings.docker_agent_image
+    # Stamp the REAL image_tag the pool container is actually running —
+    # NOT settings.docker_agent_image which is the "toup-agent:latest"
+    # sentinel ("intentionally a safe sentinel, not a deployable tag" per
+    # docker_host_service docstring). Pre-fix every pool-claimed user got
+    # the sentinel in the DB, which (a) made `_latest_known_good_image_tag`
+    # signals divergent from reality, (b) confused the rollout reconciler
+    # into orphan-quarantining containers that were actually fine on the
+    # bridge, and (c) propagated through provision_container's fallback so
+    # new signups got "image=toup-agent:latest, container_id=None" rows —
+    # the user-couldn't-chat root cause for the 2026-05-30 Nariman signup.
+    # The bridge already runs pool members on its `current_image_tag` (kept
+    # in sync via notify_pool_image_refresh on every successful rollout),
+    # so the last-known-good rollout SHA IS the running image. If no
+    # rollout has ever completed we still fall back to the sentinel as a
+    # last resort + emit a loud WARN so the backfill can cure it.
+    from app.services.docker_host_service import _latest_known_good_image_tag
+    real_image_tag = await _latest_known_good_image_tag(db)
+    if real_image_tag:
+        container.image_tag = real_image_tag
+    else:
+        logger.warning(
+            "[POOL-IMAGE-MISS] no known-good rollout — stamping sentinel "
+            "for user=%s; backfill will re-provision on next platform boot",
+            user_id[:8],
+        )
+        container.image_tag = settings.docker_agent_image
     container.status = "running"
     container.started_at = datetime.utcnow()
     container.error_message = None

@@ -33,6 +33,7 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -360,6 +361,29 @@ async def provision_container(
         image_tag = existing.pin_image_tag
     else:
         image_tag = await _latest_known_good_image_tag(db) or settings.docker_agent_image
+        # The sentinel ("toup-agent:latest" / any ":latest" tag) is
+        # NOT a deployable tag — the rollout pipeline only publishes
+        # SHA tags. Falling through to it produced the 2026-04-26
+        # Alireza incident (bridge 404 because the local sentinel
+        # isn't published to GHCR) AND the 2026-05-30 Nariman signup
+        # incident (container_id=None, user couldn't chat). Refuse to
+        # ship a bare ":latest" — caller must wait for a rollout to
+        # complete, or pass an explicit override_image_tag.
+        if image_tag.endswith(":latest"):
+            logger.error(
+                "[CONTAINER-SENTINEL-REFUSE] refusing to provision user=%s "
+                "with sentinel image %r — no completed rollout has been "
+                "recorded. Trigger a rollout or pass override_image_tag.",
+                user_id[:8], image_tag,
+            )
+            raise HTTPException(
+                503,
+                detail=(
+                    "Agent container can't be provisioned right now — "
+                    "the platform has no known-good image SHA to deploy. "
+                    "An operator must complete a rollout first."
+                ),
+            )
     body = {
         "prefix": prefix,
         "user_id": user_id,
@@ -474,6 +498,70 @@ async def provision_container(
         _sync_soul_after_start(user_id, data["agent_url"], data["agent_api_key"])
     )
     return container
+
+
+async def backfill_sentinel_image_containers(
+    db: AsyncSession,
+    *,
+    limit: int = 200,
+) -> dict:
+    """Re-provision any managed_container that's stuck on the sentinel image
+    ("toup-agent:latest" / any bare `:latest` tag) or has a NULL
+    container_id — both of which indicate the user was bound via the pool
+    fast-path before that bug was fixed and currently CAN'T chat (DB lies
+    about the image, no real bridge-tracked container_id).
+
+    Runs on platform boot as the eventually-consistent guarantee behind
+    "every signup gets a real GHCR image" — cures any stragglers from
+    before the pool_service fix or from a transient
+    `_latest_known_good_image_tag` miss. Bounded + ~0 candidates in steady
+    state so it's a cheap query on most boots.
+
+    Idempotent: only touches rows that match the broken-state predicate;
+    successful re-provision moves them off the predicate so subsequent
+    boots find nothing to fix.
+    """
+    rows = (await db.execute(
+        select(ManagedContainer).where(
+            (ManagedContainer.image_tag.endswith(":latest"))
+            | (ManagedContainer.container_id.is_(None))
+        ).limit(limit)
+    )).scalars().all()
+
+    fixed = 0
+    failed = 0
+    skipped = 0
+    for mc in rows:
+        # Skip rows whose user has no AgentConfig (e.g., deleted user with
+        # a dangling container row) — provision_container would just bail.
+        cfg = (await db.execute(
+            select(AgentConfig).where(AgentConfig.user_id == mc.user_id)
+        )).scalar_one_or_none()
+        if cfg is None:
+            skipped += 1
+            continue
+        try:
+            new_mc = await provision_container(db, mc.user_id, recreate=True)
+            await db.commit()
+            if new_mc.container_id and not new_mc.image_tag.endswith(":latest"):
+                fixed += 1
+            else:
+                failed += 1
+        except Exception as e:
+            await db.rollback()
+            logger.warning(
+                "[container-backfill] re-provision failed for user=%s: %s",
+                mc.user_id[:8], e,
+            )
+            failed += 1
+
+    summary = {
+        "candidates": len(rows), "fixed": fixed,
+        "failed": failed, "skipped_no_agent_config": skipped,
+    }
+    if rows:
+        logger.info("[container-backfill] %s", summary)
+    return summary
 
 
 async def stop_container(db: AsyncSession, user_id: str) -> Optional[ManagedContainer]:
