@@ -14,10 +14,15 @@ enforcement layers:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 os.environ.setdefault("ENVIRONMENT", "test")
 
 import pytest
+
+_AGENT_RUNNER_SRC = (
+    Path(__file__).resolve().parent.parent / "app/agent/agent_runner.py"
+).read_text(encoding="utf-8")
 
 
 def _set_anthropic(monkeypatch, enabled: bool):
@@ -61,6 +66,35 @@ def test_router_explicit_anthropic_still_works_when_enabled(monkeypatch):
     monkeypatch.setattr(settings, "toup_token", "toup_ct_test", raising=False)
     d = model_router.classify_request("hi", preferred_provider="anthropic")
     assert is_claude_model(d.model), f"explicit anthropic should pick Claude, got {d.model!r}"
+
+
+def test_agent_runner_coerces_explicit_claude_when_disabled():
+    """The mobile-app incident (2026-05-30): a client sending an EXPLICIT
+    Claude model (the app's hardcoded "claude-opus-4-6" default) skips the
+    auto-router branch entirely, so the router-level kill switch never fires
+    and the request hits the proxy 503 — surfacing to the user as
+    "Claude access needs attention". agent_runner must enforce the kill
+    switch on the explicit-override path too: coerce a Claude model to the
+    OpenAI default when anthropic_enabled is False, so already-shipped
+    mobile binaries keep chatting with no app update.
+
+    Source-level guard — agent_runner.run is too dependency-heavy to invoke
+    directly, so we pin the enforcement so a refactor can't silently drop it.
+    """
+    assert "anthropic_enabled" in _AGENT_RUNNER_SRC, (
+        "agent_runner must consult settings.anthropic_enabled on the explicit-"
+        "model path, not only inside classify_request"
+    )
+    # The coercion must run on active_model AFTER the explicit-override branch
+    # assigns it, and must pick an OpenAI model.
+    assert "default_openai_model" in _AGENT_RUNNER_SRC, (
+        "agent_runner must coerce a disabled-Anthropic Claude model to the "
+        "OpenAI default"
+    )
+    assert "coercing explicit Claude" in _AGENT_RUNNER_SRC, (
+        "missing the loud WARN marker for the coercion path — it must be "
+        "visible/alertable so we can see which clients still send Claude"
+    )
 
 
 def test_proxy_rejects_claude_when_anthropic_disabled(monkeypatch):

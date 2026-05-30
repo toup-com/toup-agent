@@ -895,6 +895,25 @@ class AgentRunner:
         else:
             active_model = model_override
 
+        # Kill-switch enforcement for EXPLICIT client models. The auto-router
+        # (classify_request, above) already forces OpenAI when Anthropic is
+        # disabled, but an explicit `model_override` (e.g. the mobile app's
+        # hardcoded "claude-opus-4-6" default, baked into every already-shipped
+        # binary) skips that branch entirely and would otherwise hit the proxy's
+        # 503 backstop — surfacing to the user as a scary "Claude access needs
+        # attention" error instead of just working. Coerce it to the OpenAI
+        # default here so existing installs keep chatting with no app update.
+        if _is_claude_model(active_model) and not getattr(settings, "anthropic_enabled", True):
+            from app.services.model_resolver import default_openai_model as _default_openai_model
+            _coerced = _default_openai_model()
+            logger.warning(
+                "[AGENT] anthropic disabled — coercing explicit Claude model %r → %r "
+                "(channel=%s). Client sent a Claude model directly, bypassing the "
+                "auto-router; update the client default to 'auto'.",
+                active_model, _coerced, channel,
+            )
+            active_model = _coerced
+
         active_llm = self.anthropic if _is_claude_model(active_model) else self.llm
 
         # ── Filter tools by query intent ──────────────────────────────
