@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
 from app.api.auth import get_current_user
 
@@ -92,6 +93,32 @@ async def qr_status(_user=Depends(get_current_user)):
     """
     channel = _require_active_channel()
     return channel.get_pairing_status()
+
+
+class PairCodeRequest(BaseModel):
+    """Body for ``POST /api/whatsapp/qr/pair-code``."""
+
+    phone: str = Field(..., min_length=8, max_length=20, description="User's WhatsApp number in E.164 (with or without leading '+').")
+
+
+@router.post("/pair-code")
+async def qr_pair_code(payload: PairCodeRequest, _user=Depends(get_current_user)):
+    """Mint an 8-character WhatsApp pairing code for single-device linking.
+
+    The mobile app cannot scan its own QR, so we use Baileys'
+    ``requestPairingCode`` path instead. The returned code is what the
+    user types into WhatsApp → Settings → Linked Devices → "Link a
+    Device" → "Link with phone number instead." After they confirm,
+    ``/qr/status`` reports ``session_status="linked"`` exactly as the
+    QR flow would.
+    """
+    channel = _require_active_channel()
+    try:
+        code = await channel.request_pairing_code(payload.phone)
+    except Exception as exc:
+        logger.exception("[WHATSAPP-QR] pair_code.failed")
+        raise HTTPException(status_code=502, detail=f"Pairing-code request failed: {str(exc)[:200]}")
+    return {"ok": True, "pairing_code": code, "phone": payload.phone}
 
 
 @router.post("/logout")

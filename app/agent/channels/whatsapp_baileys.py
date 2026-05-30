@@ -673,6 +673,32 @@ class BaileysWhatsAppChannel(BaseChannel):
         except Exception:
             logger.exception("[WHATSAPP-BAILEYS] pair_start.failed")
 
+    async def request_pairing_code(self, phone: str) -> str:
+        """Mint an 8-character pairing code for single-device WhatsApp
+        linking (no QR). The user enters the returned code in their own
+        WhatsApp app under Linked Devices → "Link with phone number
+        instead." Used by the mobile onboarding flow where the user
+        can't scan their own screen.
+
+        Same teardown semantics as ``kick_pair()`` — wipes any existing
+        session before requesting the code. After this returns,
+        ``get_pairing_status()`` reports "linking" until the user
+        confirms in WhatsApp; clients poll it for completion.
+        """
+        if self._http is None:
+            raise RuntimeError("Baileys sidecar HTTP client not initialised")
+        resp = await self._http.post("/pair/code", json={"phone": phone})
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("ok"):
+            raise RuntimeError(body.get("error") or "Pairing-code request failed")
+        self._session_status = "linking"
+        self._connected = False
+        self._self_e164 = None
+        self._latest_qr_data_url = None
+        self._latest_qr_at = None
+        return str(body.get("pairing_code") or "")
+
     async def force_logout(self) -> None:
         """User clicked "Disconnect" in Settings."""
         if self._http is not None:

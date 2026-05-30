@@ -667,6 +667,59 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+// Pairing-code linking (single-device WhatsApp on a phone). Same teardown
+// as /pair/start, but instead of waiting for a QR we ask Baileys for an
+// 8-character code the user enters in WhatsApp → Linked Devices →
+// "Link with phone number instead." Body: `{ "phone": "+14155552671" }`.
+// Returns `{ ok, pairing_code, phone }`. After this fires, /pair/status
+// will still flip session_status to "linked" once the user confirms in
+// their WhatsApp app — clients poll the same endpoint for completion.
+async function handlePairCode(req, res) {
+  log('pair.code_request');
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch (e) {
+    sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+    return;
+  }
+  // Normalise phone → E.164 digits (Baileys.requestPairingCode wants
+  // digits only, no leading + or separators).
+  const raw = (payload.phone || '').toString();
+  let digits = raw.replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (!digits || digits.length < 8 || digits.length > 15) {
+    sendJson(res, 400, { ok: false, error: 'phone (E.164 digits) required' });
+    return;
+  }
+  try {
+    if (sock) {
+      try { sock.end(undefined); } catch {}
+      sock = null;
+    }
+    wipeAuthDir();
+    sessionStatus = 'linking';
+    connected = false;
+    selfE164 = null;
+    selfJid = null;
+    latestQrString = null;
+    latestQrPngDataUrl = null;
+    latestQrAt = null;
+    const { sock: s, saveCreds } = await createSocket();
+    wireSocket(s, saveCreds);
+    sock = s;
+    // requestPairingCode must run BEFORE Baileys emits a QR string;
+    // calling it on a fresh socket switches the pairing channel to
+    // code-mode and returns the 8-char code synchronously.
+    const code = await s.requestPairingCode(digits);
+    log('pair.code_minted', { phone_digits_len: digits.length, code_len: (code || '').length });
+    sendJson(res, 200, { ok: true, pairing_code: code, phone: `+${digits}` });
+  } catch (e) {
+    error('pair.code_failed', { err: String(e) });
+    sendJson(res, 500, { ok: false, error: String(e) });
+  }
+}
+
 async function handlePairStart(req, res) {
   log('pair.start');
   // Tear down any existing socket + wipe auth so we always emit a
@@ -861,6 +914,7 @@ const server = http.createServer(async (req, res) => {
   try {
     switch (route) {
       case 'POST /pair/start':   return await handlePairStart(req, res);
+      case 'POST /pair/code':    return await handlePairCode(req, res);
       case 'POST /pair/logout':  return await handlePairLogout(req, res);
       case 'GET /pair/status':   return handlePairStatus(req, res);
       case 'POST /messages/send': return await handleSend(req, res);
