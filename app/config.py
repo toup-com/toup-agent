@@ -444,6 +444,16 @@ class Settings(BaseSettings):
     # production-correct behavior; self-hosters without pool endpoints
     # can still set USE_CONTAINER_POOL=false explicitly to opt out.
     use_container_pool: bool = True
+    # Periodic reconciler that re-runs `backfill_sentinel_image_containers`
+    # so a signup that lands in the broken state (container_id NULL or the
+    # ":latest" sentinel image — both mean "no real bridge container, user
+    # can't chat") self-heals within minutes instead of waiting for the next
+    # platform redeploy. The pool fast-path's bridge claim response carries no
+    # container_id, so EVERY pool-claimed signup is born with container_id
+    # NULL; before this loop the boot-only backfill left such users stuck for
+    # hours (2026-05-31: mrvviinn@gmail.com signed up post-boot and couldn't
+    # talk to their agent at all). 0 disables the loop.
+    container_reconciler_interval_s: int = 180
     # Phase B — Blue-green tenant rollouts. When True,
     # `docker_host_service.upgrade_tenant_image` calls the bridge's
     # `/v1/tenants/<prefix>/blue-green-upgrade` (zero-WS-drop) instead

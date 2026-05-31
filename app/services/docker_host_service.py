@@ -564,6 +564,42 @@ async def backfill_sentinel_image_containers(
     return summary
 
 
+async def container_reconciler_loop() -> None:
+    """Long-running background task — re-runs `backfill_sentinel_image_containers`
+    on an interval so a signup that lands in the broken state (container_id
+    NULL or a ":latest" sentinel image) self-heals within minutes.
+
+    Why this exists: the pool fast-path's bridge `/v1/pool/claim` response
+    carries no container_id, so every pool-claimed signup is born with
+    container_id NULL and CAN'T chat until re-provisioned. The backfill cured
+    this only at platform boot, which left users who signed up between deploys
+    stuck for hours (2026-05-31: mrvviinn@gmail.com signed up post-boot and had
+    no reachable agent at all). Same durability pattern as
+    rollout_service.rollout_reconciler_loop: asyncio.create_task dies on a
+    Railway redeploy → the DB row is the durable signal → the reconciler
+    retries on its next tick. Each tick opens its own narrow session and never
+    lets an exception kill the loop.
+    """
+    interval = int(getattr(settings, "container_reconciler_interval_s", 180) or 0)
+    if interval <= 0:
+        logger.info("[container-reconciler] disabled (interval<=0)")
+        return
+    logger.info("[container-reconciler] started (tick=%ss)", interval)
+    from app.db.database import async_session_maker
+    while True:
+        # Sleep first: the boot path already runs one backfill before this
+        # loop starts, so an immediate tick would be redundant churn.
+        await asyncio.sleep(interval)
+        try:
+            async with async_session_maker() as db:
+                summary = await backfill_sentinel_image_containers(db)
+            if summary.get("fixed") or summary.get("failed"):
+                logger.info("[container-reconciler] tick: %s", summary)
+        except Exception:
+            # Never let a tick exception kill the loop — log and keep going.
+            logger.exception("[container-reconciler] tick failed; will retry")
+
+
 async def stop_container(db: AsyncSession, user_id: str) -> Optional[ManagedContainer]:
     """Stop a tenant container via the bridge.
 

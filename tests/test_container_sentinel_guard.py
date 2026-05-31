@@ -21,6 +21,7 @@ silently regress.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -99,3 +100,50 @@ def test_boot_runs_container_backfill():
     # And the OpenAI backfill must still be wired (PR #149) — guard
     # against an accidental removal during this PR's edit.
     assert "backfill_missing_openai_projects" in _PLATFORM_MAIN_SRC
+
+
+def test_container_reconciler_loop_exists():
+    """The boot-only backfill left signups that broke between deploys stuck
+    for hours (2026-05-31 mrvviinn incident — pool fast-path leaves
+    container_id NULL → no reachable agent). A periodic reconciler must exist
+    to self-heal them within minutes."""
+    from app.services import docker_host_service as svc
+    assert hasattr(svc, "container_reconciler_loop"), (
+        "container_reconciler_loop must exist as the periodic self-heal task"
+    )
+
+
+async def _run_disabled_loop():
+    from app.services import docker_host_service as svc
+    from app.config import settings
+    # interval<=0 must short-circuit and return rather than loop forever.
+    orig = getattr(settings, "container_reconciler_interval_s", 180)
+    try:
+        settings.container_reconciler_interval_s = 0
+        await asyncio.wait_for(svc.container_reconciler_loop(), timeout=2.0)
+    finally:
+        settings.container_reconciler_interval_s = orig
+
+
+def test_container_reconciler_disabled_returns_immediately():
+    """interval<=0 disables the loop — it must return, not block/raise."""
+    import asyncio as _aio
+    _aio.run(_run_disabled_loop())
+
+
+def test_boot_wires_periodic_reconciler():
+    """platform_main must start AND cancel the periodic reconciler task."""
+    assert "container_reconciler_loop" in _PLATFORM_MAIN_SRC, (
+        "platform_main.py must start container_reconciler_loop on boot"
+    )
+    assert "container_reconciler_task.cancel()" in _PLATFORM_MAIN_SRC, (
+        "platform_main.py must cancel the reconciler task on shutdown"
+    )
+
+
+def test_reconciler_interval_is_configurable():
+    """The interval must be a config knob (0 disables) — not hardcoded."""
+    from app.config import settings
+    assert hasattr(settings, "container_reconciler_interval_s"), (
+        "settings.container_reconciler_interval_s must exist"
+    )
