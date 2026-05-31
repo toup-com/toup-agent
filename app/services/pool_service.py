@@ -363,6 +363,56 @@ async def release_pool_member(prefix: Optional[str] = None, user_id: Optional[st
         return False
 
 
+async def _verify_and_heal_pool_claim(
+    user_id: str,
+    *,
+    budget_s: float = 30.0,
+    interval_s: float = 3.0,
+) -> None:
+    """Background guard for a just-completed pool claim.
+
+    The pool fast-path's bridge `/v1/pool/claim` response carries no
+    container_id and the platform never verifies the bound member is
+    actually reachable at the tenant agent_url — so a stale pool member, a
+    missing Caddy route, or a half-finished bind leaves the user with a row
+    that says status='running' but an agent they can't reach (the 2026-05
+    "new user can't talk to his agent" class). The 180s container reconciler
+    eventually heals this, but a brand-new user shouldn't eat a multi-minute
+    dead window on their very first message.
+
+    This polls the agent's real `/agent/health` for a short budget (pool
+    members are pre-warmed, so a healthy one passes in a few seconds). If it
+    never comes up, we re-provision via the reliable slow path
+    (`provision_container(recreate=True)` — the same call the reconciler/
+    backfill use, which creates a real `toup-agent-{prefix}` container AND
+    records container_id). Fire-and-forget: never raises into the caller, so
+    it can't affect the signup request. The reconciler remains the durable
+    backstop for the case where a platform redeploy kills this task mid-flight.
+    """
+    try:
+        from app.services.prewarm_service import _is_agent_actually_healthy
+        deadline = asyncio.get_event_loop().time() + budget_s
+        while asyncio.get_event_loop().time() < deadline:
+            if await _is_agent_actually_healthy(user_id):
+                return  # pool member is genuinely reachable — fast path won
+            await asyncio.sleep(interval_s)
+        logger.warning(
+            "[pool-heal] pool claim for user=%s never became reachable in %.0fs "
+            "— re-provisioning via slow path (recreate=True)",
+            user_id[:8], budget_s,
+        )
+        from app.db.database import async_session_maker
+        from app.services.docker_host_service import provision_container
+        async with async_session_maker() as heal_db:
+            await provision_container(heal_db, user_id, recreate=True)
+            await heal_db.commit()
+        logger.info("[pool-heal] re-provisioned user=%s to a reachable container", user_id[:8])
+    except Exception:
+        # Never let the guard crash — the periodic container reconciler is the
+        # durable backstop if this fails or a redeploy kills it mid-flight.
+        logger.exception("[pool-heal] verify-and-heal failed for user=%s", user_id[:8])
+
+
 async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
     """Try the pool first; fall back to schedule_prewarm.
 
@@ -371,10 +421,22 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
     Returns True on any successful claim/prewarm-schedule, False if
     everything failed (caller logs and continues — registration
     itself doesn't depend on this).
+
+    On a successful pool claim we additionally spawn a fire-and-forget
+    `_verify_and_heal_pool_claim` guard so a member that's stale/unreachable
+    self-heals within ~30s instead of leaving a brand-new user stuck on their
+    first message (see that function). Registration latency is unaffected —
+    the guard runs in the background.
     """
     try:
         c = await claim_for_user(db, user_id)
         if c is not None:
+            try:
+                asyncio.create_task(_verify_and_heal_pool_claim(user_id))
+            except Exception:
+                # create_task should never fail in an async context, but if it
+                # somehow does, the periodic reconciler still covers us.
+                logger.warning("[pool_service] could not spawn pool-heal guard for %s", user_id[:8])
             return True
     except Exception:
         logger.exception("[pool_service] claim_for_user raised; falling through to prewarm")
