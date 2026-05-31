@@ -175,6 +175,54 @@ async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedCont
         logger.warning("[pool_service] No AgentConfig for user %s — skipping claim", user_id[:8])
         return None
 
+    # ── Credential guarantee (production invariant) ──────────────────────
+    # NEVER bind a managed bundle container whose AgentConfig still lacks LLM
+    # credentials. _build_bind_payload forwards `connect_token` / `llm_mode`
+    # ONLY when truthy, so a config still on the signup defaults
+    # (bundle_status='none', connect_token=NULL, llm_mode='manual') would bind
+    # a container with an EMPTY TOUP_TOKEN — and the user's FIRST chat message
+    # then 401s at the LLM proxy → "Your API key is invalid" (the 2026-05-30
+    # new-signup incident). This is the single chokepoint EVERY container-claim
+    # path funnels through (auth.register, Google web + native callback, the
+    # agent-setup prewarm endpoint, and any future caller), so minting here
+    # makes "the bind always carries a valid token" an invariant rather than a
+    # property of each individual call site.
+    #
+    # Idempotent: activate_free_tier early-returns for already-active users
+    # (the explicit signup-path calls already ran for the common case, so this
+    # is usually a cheap no-op). Paid users awaiting their Stripe webhook are
+    # skipped — their creds are minted by the webhook and they can't chat until
+    # they pay anyway (mirrors the same guard in agent_setup.provision).
+    # force_env_push=False because the bind below injects the token directly —
+    # no recreate, the warm-pool fast path is preserved.
+    if agent_config.bundle_status not in ("active", "cancelling"):
+        try:
+            from app.db.models import CreditBalance
+            cb = (await db.execute(
+                select(CreditBalance).where(CreditBalance.user_id == user_id)
+            )).scalar_one_or_none()
+            is_paid_awaiting_stripe = bool(cb and cb.plan_id and cb.plan_id != "free")
+            if not is_paid_awaiting_stripe:
+                from app.services.free_tier_activation import activate_free_tier
+                await activate_free_tier(db, str(user_id), force_env_push=False)
+                agent_config = (await db.execute(
+                    select(AgentConfig).where(AgentConfig.user_id == user_id)
+                )).scalar_one_or_none()
+                if agent_config is None:
+                    logger.warning(
+                        "[pool_service] AgentConfig vanished after activation for %s",
+                        user_id[:8],
+                    )
+                    return None
+        except Exception as _ae:
+            # Never let activation failure abort the claim — log loudly so the
+            # backfill/reconciler (PR #149/#151/#153) can cure a tokenless bind.
+            logger.warning(
+                "[pool_service] pre-claim free-tier activation failed for %s: %s "
+                "— bind may lack TOUP_TOKEN; reconciler will re-converge",
+                user_id[:8], _ae,
+            )
+
     payload = await _build_bind_payload(db, user_id, agent_config)
 
     # Call bridge FIRST — only persist the ManagedContainer row once

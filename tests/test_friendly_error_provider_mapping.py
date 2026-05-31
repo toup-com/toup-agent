@@ -84,3 +84,33 @@ def test_default_model_resolves_to_openai_when_no_overrides(monkeypatch):
     assert model_resolver.is_openai_model(resolved), (
         f"expected an OpenAI default, got {resolved!r}"
     )
+
+
+def test_bundle_auth_gate_shows_still_finishing_setup():
+    """A brand-new signup whose container is reachable a hair before LLM
+    activation lands gets the proxy's 'Missing token'/'Invalid token' (401)
+    or 'Bundle subscription is not active' (403). _friendly_error must surface
+    the honest, recoverable 'still finishing setup' state — NOT the misleading
+    'Your API key is invalid' dead-end (the user has no key to fix)."""
+    from app.api.ws_chat import _friendly_error
+    for raw in (
+        "proxy 401: Missing token",
+        "proxy 401: Invalid token",
+        "proxy 403: Bundle subscription is not active",
+    ):
+        msg = _friendly_error(_Err(raw))
+        assert "finishing setup" in msg.lower(), f"expected setup copy for {raw!r}, got {msg!r}"
+        assert "api key is invalid" not in msg.lower()
+
+
+def test_genuine_byok_bad_key_still_maps_to_invalid_key():
+    """The bundle-auth-gate branch must NOT swallow a real BYOK bad-key 401 —
+    that should still tell the user to fix their key in Settings."""
+    from app.api.ws_chat import _friendly_error
+
+    class _AuthErr(Exception):
+        status_code = 401
+
+    msg = _friendly_error(_AuthErr("authentication_error: invalid x-api-key"))
+    assert "api key is invalid" in msg.lower()
+    assert "finishing setup" not in msg.lower()

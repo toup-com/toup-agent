@@ -236,6 +236,24 @@ async def register(
                 dirty = True
             if dirty:
                 await db.commit()
+            # Mint the free-tier bundle LLM credentials (connect_token,
+            # llm_token_hash, bundle_status='active', per-tenant OpenAI key)
+            # BEFORE the pool claim. claim_for_user copies these into the
+            # bridge bind payload (_build_bind_payload → TOUP_TOKEN /
+            # LLM_MODE), so the container boots already authenticated to the
+            # LLM proxy — no recreate, pool fast-path preserved. Without this
+            # the freshly-claimed container has an empty TOUP_TOKEN and the
+            # user's FIRST chat message 401s at the proxy → "Your API key is
+            # invalid." Its own try/except so a provisioning hiccup never
+            # skips the warm-pool claim below.
+            try:
+                from app.services.free_tier_activation import activate_free_tier
+                await activate_free_tier(db, str(user.id), force_env_push=False)
+            except Exception as _ae:
+                logger.warning(
+                    "[REGISTER] free-tier activation failed for user %s: %s",
+                    str(user.id)[:8], _ae,
+                )
             # Phase A.2 (never-sleep plan): prefer pool claim — sub-
             # second bind to a pre-booted container vs ~15s cold-boot
             # via schedule_prewarm. claim_or_prewarm internally falls
@@ -744,6 +762,21 @@ async def google_auth_callback(
                     dirty = True
                 if dirty:
                     await db.commit()
+                # Mint the free-tier bundle LLM credentials BEFORE the pool
+                # claim so the bridge bind injects TOUP_TOKEN / LLM_MODE on
+                # the container's first boot and the user's FIRST chat message
+                # authenticates to the LLM proxy. Without this a new Gmail
+                # signup's first "hi" 401s → "Your API key is invalid." Runs
+                # only inside this is_new branch, so an existing user's chosen
+                # llm_mode (e.g. BYOK) is never clobbered on later logins.
+                try:
+                    from app.services.free_tier_activation import activate_free_tier
+                    await activate_free_tier(db, str(user.id), force_env_push=False)
+                except Exception as _ae:
+                    logger.warning(
+                        "[google-auth] free-tier activation failed user=%s: %s",
+                        str(user.id)[:8], _ae,
+                    )
                 await claim_or_prewarm(db, str(user.id))
             except Exception as e:
                 logger.warning(

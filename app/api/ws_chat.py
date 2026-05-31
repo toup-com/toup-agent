@@ -88,6 +88,26 @@ def _friendly_error(exc: Exception) -> str:
     if status == 529 or "overloaded" in msg_lower:
         return "The AI service is temporarily overloaded. Please try again in a few seconds."
 
+    # ── Agent not finished provisioning yet (bundle proxy auth gate) ──
+    # The platform LLM proxy returns these EXACT signatures when a bundle
+    # agent's credentials aren't bound yet: "Missing token" / "Invalid token"
+    # (no llm_token_hash match -> 401) or "Bundle subscription is not active"
+    # (bundle_status != active -> 403). For a brand-new signup whose container
+    # is reachable a hair before activation lands, the OLD code mapped the 401
+    # to "Your API key is invalid" - a misleading dead-end (the user has no
+    # API key to fix). Surface the honest, recoverable state instead. These
+    # strings are bundle-proxy-specific, so a genuine BYOK bad key still falls
+    # through to the "invalid key" branch below.
+    if (
+        "missing token" in msg_lower
+        or "invalid token" in msg_lower
+        or "bundle subscription is not active" in msg_lower
+    ):
+        return (
+            "Your agent is still finishing setup - give it a few seconds and "
+            "send your message again. If this keeps happening, reload the page."
+        )
+
     # ── Auth errors — distinguish invalid key from expired token ──
     if status == 401 or "authentication" in msg_lower or "unauthorized" in msg_lower:
         if "expired" in msg_lower or "oauth" in msg_lower:
