@@ -83,6 +83,10 @@ class CreditStatusResponse(BaseModel):
     period_start: datetime
     period_end: datetime
     enforcement_enabled: bool
+    # Admins have no usage limits — never charged, never gated (see
+    # credit_service._is_unlimited_user). The frontend uses this to suppress
+    # the low-balance pill / exhausted card and render "Unlimited".
+    unlimited: bool = False
 
 
 class LedgerRow(BaseModel):
@@ -129,7 +133,9 @@ async def get_credit_status(
 ) -> CreditStatusResponse:
     """Workspace credit panel data — what the sidebar drawer renders."""
     view = await credit_service.get_balance_view(db, current_user.id)
+    from app.services.credit_service import _is_unlimited_user
     return CreditStatusResponse(
+        unlimited=_is_unlimited_user(current_user),
         plan_id=view.plan_id,
         plan_display_name=view.plan_display_name,
         message=BucketStatus(

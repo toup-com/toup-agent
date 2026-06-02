@@ -198,6 +198,14 @@ REASON_DAILY_CAP_EXCEEDED = "daily_cap_exceeded"
 REASON_EMAIL_NOT_VERIFIED = "email_not_verified"
 
 
+def _is_unlimited_user(user) -> bool:
+    """True iff this user has NO usage limits — admins. Such users are never
+    denied at the credit gate and never deducted (their balance row is left
+    untouched), so an operator/owner account can use the platform freely.
+    Centralized so try_charge, reserve, and the /status view all agree."""
+    return user is not None and getattr(user, "role", None) == "admin"
+
+
 def _email_verification_required(user) -> bool:
     """True iff this user must verify email before being charged. F13."""
     if not getattr(settings, "require_email_verification_for_credits", False):
@@ -366,11 +374,18 @@ class CreditService:
         # Email-verified gate (F13).
         deny_reason: Optional[str] = None
         user = await db.get(User, user_id)
-        if _email_verification_required(user):
+        # Admin accounts are UNLIMITED — never denied, never deducted. The
+        # balance row is left untouched (we still write a zero-amount ledger
+        # row for an audit trail). Centralized via _is_unlimited so try_charge,
+        # reserve, and the /status view all agree. See [[admin-unlimited-credits]].
+        is_unlimited = _is_unlimited_user(user)
+        if is_unlimited:
+            deny_reason = None
+        elif _email_verification_required(user):
             deny_reason = REASON_EMAIL_NOT_VERIFIED
 
         # Insufficient balance check.
-        if deny_reason is not None:
+        if deny_reason is not None or is_unlimited:
             pass
         elif bucket == BUCKET_MESSAGE:
             if amount_q > Decimal(balance.message_credits_remaining):
@@ -420,7 +435,8 @@ class CreditService:
                 reason=deny_reason, ledger_id=ledger.id,
             )
 
-        will_deduct = (deny_reason is None) or (not enforcement)
+        # Unlimited (admin) charges never deduct — the row stays put.
+        will_deduct = ((deny_reason is None) or (not enforcement)) and not is_unlimited
         if will_deduct:
             _apply_delta(balance, bucket, -amount_q)
             actual_amount = -amount_q
@@ -436,6 +452,7 @@ class CreditService:
             metadata_json={
                 **(metadata or {}),
                 **({"shadow_would_deny": deny_reason} if (deny_reason and not enforcement) else {}),
+                **({"admin_unlimited": True} if is_unlimited else {}),
             } or None,
         )
         try:
@@ -488,7 +505,11 @@ class CreditService:
 
         enforcement = getattr(settings, "credit_enforcement_enabled", False)
         remaining = _bucket_remaining(balance, bucket)
-        if enforcement and amount_q > remaining:
+        # Admins are UNLIMITED — never gated, never deducted. Reserve a
+        # zero-amount hold so the row exists for settle() (which clamps actual
+        # to estimated=0 → the whole reserve/settle cycle is a balance no-op).
+        is_unlimited = _is_unlimited_user(await db.get(User, user_id))
+        if enforcement and not is_unlimited and amount_q > remaining:
             return ReservationResult(
                 reservation_id="", estimated_amount=amount_q, balance_after=remaining,
                 success=False,
@@ -496,20 +517,23 @@ class CreditService:
                         else REASON_INSUFFICIENT_INTEGRATION),
             )
 
-        _apply_delta(balance, bucket, -amount_q)
+        deducted = Decimal("0") if is_unlimited else amount_q
+        _apply_delta(balance, bucket, -deducted)
         now = datetime.utcnow()
         reservation_id = str(uuid.uuid4())
         db.add(CreditReservation(
             id=reservation_id, user_id=user_id, event_type=event_type, bucket=bucket,
-            estimated_amount=amount_q, status=RESERVATION_OPEN,
-            idempotency_key=idempotency_key, event_id=event_id, metadata_json=metadata,
+            estimated_amount=deducted, status=RESERVATION_OPEN,
+            idempotency_key=idempotency_key, event_id=event_id,
+            metadata_json={**(metadata or {}), **({"admin_unlimited": True} if is_unlimited else {})} or None,
             expires_at=now + timedelta(seconds=ttl_seconds),
         ))
         db.add(CreditLedger(
             user_id=user_id, event_type=LEDGER_RESERVATION, bucket=bucket,
-            amount=-amount_q, balance_after=_bucket_remaining(balance, bucket),
+            amount=-deducted, balance_after=_bucket_remaining(balance, bucket),
             reservation_id=reservation_id, idempotency_key=idempotency_key,
-            event_id=event_id, metadata_json={"action": "reserve", **(metadata or {})},
+            event_id=event_id, metadata_json={"action": "reserve", **(metadata or {}),
+                                              **({"admin_unlimited": True} if is_unlimited else {})},
         ))
         await db.flush()
         return ReservationResult(

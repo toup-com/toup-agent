@@ -290,3 +290,83 @@ async def test_apply_plan_change_to_paid_tier(credit_user):
     # Daily cap drops away on paid tiers (None or higher than the
     # free-tier 15 post mig-059).
     assert b.message_credits_daily_cap is None or Decimal(b.message_credits_daily_cap) > Decimal("15")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# admin = unlimited (never denied, never deducted)
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def _make_admin(user_id: str) -> None:
+    from app.db import async_session_maker
+    from app.db.models import User
+    async with async_session_maker() as db:
+        u = await db.get(User, user_id)
+        u.role = "admin"
+        await db.commit()
+
+
+async def test_admin_try_charge_never_denied_never_deducted(credit_user, monkeypatch):
+    """An admin charging MORE than their entire balance, with enforcement ON,
+    must SUCCEED and leave the balance completely untouched (no limit)."""
+    from app.config import settings
+    from app.db import async_session_maker
+    from app.db.models import LEDGER_CHAT_MESSAGE
+    from app.services.credit_service import BUCKET_MESSAGE, credit_service
+    monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
+    await _make_admin(credit_user)
+
+    before = Decimal((await _balance(credit_user)).message_credits_remaining)
+    async with async_session_maker() as db:
+        # 9999 ≫ the 100-credit free grant — a non-admin would be denied.
+        result = await credit_service.try_charge(
+            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("9999"),
+            idempotency_key="admin-unlimited-1",
+        )
+        await db.commit()
+    assert result.success is True, "admin must never be denied"
+    after = Decimal((await _balance(credit_user)).message_credits_remaining)
+    assert after == before, "admin charge must NOT deduct — balance unchanged"
+
+
+async def test_admin_daily_cap_does_not_apply(credit_user, monkeypatch):
+    """The daily cap must not gate an admin either."""
+    from app.config import settings
+    from app.db import async_session_maker
+    from app.db.models import LEDGER_CHAT_MESSAGE
+    from app.services.credit_service import BUCKET_MESSAGE, credit_service
+    monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
+    await _make_admin(credit_user)
+    async with async_session_maker() as db:
+        # Way over the 15/day free cap — non-admin would hit DAILY_CAP_EXCEEDED.
+        result = await credit_service.try_charge(
+            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("50"),
+            idempotency_key="admin-daily-1",
+        )
+        await db.commit()
+    assert result.success is True
+
+
+async def test_admin_reserve_settle_is_balance_noop(credit_user, monkeypatch):
+    """reserve + settle for an admin must not move the balance at all."""
+    from app.config import settings
+    from app.db import async_session_maker
+    from app.services.credit_service import BUCKET_MESSAGE, credit_service
+    monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
+    await _make_admin(credit_user)
+
+    before = Decimal((await _balance(credit_user)).message_credits_remaining)
+    async with async_session_maker() as db:
+        r = await credit_service.reserve(
+            db, credit_user, "auto_builder", BUCKET_MESSAGE, Decimal("10"),
+            idempotency_key="admin-res-1",
+        )
+        await db.commit()
+    assert r.success
+    held = Decimal((await _balance(credit_user)).message_credits_remaining)
+    assert held == before, "admin reserve must not hold/deduct credits"
+    async with async_session_maker() as db:
+        await credit_service.settle(db, r.reservation_id, Decimal("6"))
+        await db.commit()
+    final = Decimal((await _balance(credit_user)).message_credits_remaining)
+    assert final == before, "admin reserve+settle must be a balance no-op"
