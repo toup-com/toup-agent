@@ -209,6 +209,49 @@ def _should_try_next_client(err: BaseException) -> bool:
     return False
 
 
+_RESOLVED_COOKIEFILE: str | None = None
+_COOKIES_RESOLVED = False
+
+
+def _resolve_cookiefile() -> str | None:
+    """Path to a Netscape cookies.txt for yt-dlp, if configured.
+
+    Cookies from a logged-in YouTube session let yt-dlp pass YouTube's
+    "Sign in to confirm you're not a bot" challenge that otherwise blocks
+    extraction on flagged cloud (Railway) egress IPs. Two ways to supply:
+      - YT_DLP_COOKIES_PATH: absolute path to a cookies.txt on disk.
+      - YT_DLP_COOKIES_B64: base64 of a cookies.txt — easiest on Railway
+        (set it as an env var, no file mounting). Decoded once to a temp file.
+    Memoized; a Railway var change restarts the process, re-resolving.
+    """
+    global _RESOLVED_COOKIEFILE, _COOKIES_RESOLVED
+    if _COOKIES_RESOLVED:
+        return _RESOLVED_COOKIEFILE
+    import os
+    import base64
+    import tempfile
+    path = os.environ.get("YT_DLP_COOKIES_PATH")
+    if path and os.path.exists(path):
+        _RESOLVED_COOKIEFILE = path
+    else:
+        b64 = os.environ.get("YT_DLP_COOKIES_B64")
+        if b64:
+            try:
+                data = base64.b64decode(b64)
+                fd, tmp = tempfile.mkstemp(prefix="yt_cookies_", suffix=".txt")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                _RESOLVED_COOKIEFILE = tmp
+                logger.info("[media_proxy] cookies loaded from YT_DLP_COOKIES_B64 (%d bytes)", len(data))
+            except Exception as e:
+                logger.warning("[media_proxy] failed to decode YT_DLP_COOKIES_B64: %s", e)
+                _RESOLVED_COOKIEFILE = None
+        else:
+            _RESOLVED_COOKIEFILE = None
+    _COOKIES_RESOLVED = True
+    return _RESOLVED_COOKIEFILE
+
+
 def _extract_audio(video_id: str) -> dict:
     """Blocking extract; callers must run in a thread / executor.
 
@@ -228,7 +271,7 @@ def _extract_audio(video_id: str) -> dict:
     import yt_dlp
     import os
 
-    cookiefile = os.environ.get("YT_DLP_COOKIES_PATH") or None
+    cookiefile = _resolve_cookiefile()
     last_err: BaseException | None = None
 
     for client in _PLAYER_CLIENTS:
