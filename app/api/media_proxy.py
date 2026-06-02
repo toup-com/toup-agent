@@ -385,6 +385,28 @@ def _tenant_stream_sem(user_id: str) -> asyncio.Semaphore:
     return sem
 
 
+# AVFoundation fetches a track via SEVERAL HTTP range requests as it buffers.
+# Without caching, every one of those re-ran yt-dlp (~1-5s) AND could resolve a
+# different signed URL / format — so playback stalled (and sometimes corrupted)
+# every few seconds. Cache the extraction result per video_id so all range
+# requests for a track reuse ONE stable upstream URL; only the first request
+# pays the extraction cost. yt-dlp's signed URLs are ~6h valid; we evict 60s
+# before expiry. In-process (per-replica) — fine for this; a track is served
+# by whichever replica the client is pinned to for the life of the stream.
+_audio_url_cache: dict[str, dict] = {}
+
+
+def _cached_extract(video_id: str) -> dict:
+    now = int(time.time())
+    ent = _audio_url_cache.get(video_id)
+    if ent and int(ent.get("expires_at", 0)) - 60 > now:
+        return ent
+    result = _extract_audio(video_id)
+    if "error" not in result:
+        _audio_url_cache[video_id] = result
+    return result
+
+
 @router.get("/{video_id}/audio_stream")
 async def stream_audio(
     video_id: str,
@@ -420,7 +442,7 @@ async def stream_audio(
 
     try:
         result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, _extract_audio, video_id),
+            asyncio.get_event_loop().run_in_executor(None, _cached_extract, video_id),
             timeout=_AUDIO_EXTRACT_TIMEOUT_SECS,
         )
     except asyncio.TimeoutError:
