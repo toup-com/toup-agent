@@ -42,6 +42,8 @@ from app.api.llm_setup import router as llm_setup_router
 from app.api.files import router as files_router
 # Chrome extension pairing + WS bridge
 from app.api.extension import router as extension_router
+# Media proxy — YouTube stream/audio extraction + audio_stream proxy
+from app.api.media_proxy import router as media_proxy_router
 
 # Global start time for uptime tracking
 _app_start_time = None
@@ -489,6 +491,8 @@ app.include_router(llm_setup_router, prefix=settings.api_prefix)
 app.include_router(files_router, prefix=settings.api_prefix)
 # Chrome extension — pairing routes (platform) + /ws/extension (agent)
 app.include_router(extension_router, prefix=settings.api_prefix)
+# Media proxy — /media/{id}/audio_url + /media/{id}/audio_stream (mobile player)
+app.include_router(media_proxy_router, prefix=settings.api_prefix)
 
 
 

@@ -21,10 +21,12 @@ import logging
 import time
 from urllib.parse import parse_qs, urlparse
 
-from fastapi import APIRouter, Depends
-from fastapi.responses import JSONResponse
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.auth import get_current_user
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -349,3 +351,141 @@ async def get_audio_url(
     if "error" in result:
         return JSONResponse(status_code=502, content=result)
     return result
+
+
+# ── Audio stream PROXY for native background playback ─────────────────────
+#
+# Why this exists: `/audio_url` returns a raw googlevideo.com URL that
+# yt-dlp signs to the SERVER's egress IP. The phone fetching it directly
+# gets HTTP 403 (signature is for a different IP), which is why the mobile
+# hybrid player's foreground→background handoff to react-native-track-player
+# was disabled. This route fetches those bytes server-side (our IP matches
+# the signature) and pipes them to the device, so the native player can
+# play audio that survives app-background / screen-lock.
+#
+# Range requests are forwarded so AVFoundation can seek + progressively
+# download. Auth is bearer (TrackPlayer sends Authorization via per-track
+# headers — same mobile JWT as every other call).
+
+_STREAM_CHUNK_BYTES = 64 * 1024
+_STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+
+# Per-tenant in-process concurrency gate. Effective global cap is
+# N × replicas until a shared (Redis) limiter lands — see config.py
+# `audio_stream_max_concurrent_per_tenant`. Bounds how many full-song
+# proxy streams a single account can hold open server-side at once.
+_audio_stream_sems: dict[str, asyncio.Semaphore] = {}
+
+
+def _tenant_stream_sem(user_id: str) -> asyncio.Semaphore:
+    sem = _audio_stream_sems.get(user_id)
+    if sem is None:
+        sem = asyncio.Semaphore(settings.audio_stream_max_concurrent_per_tenant)
+        _audio_stream_sems[user_id] = sem
+    return sem
+
+
+@router.get("/{video_id}/audio_stream")
+async def stream_audio(
+    video_id: str,
+    request: Request,
+    current_user=Depends(get_current_user),
+):
+    """Proxy a YouTube video's audio bytes through the server.
+
+    See the module-level comment above for why a proxy (not a redirect) is
+    required. Returns 200 (full) or 206 (range) with the audio bytes;
+    429 if the tenant is over its concurrent-stream cap; 502/504 on
+    extraction or upstream failure.
+    """
+    user_id = str(getattr(current_user, "id", None) or current_user)
+    sem = _tenant_stream_sem(user_id)
+    # Non-blocking acquire: an over-cap client fails fast instead of
+    # queueing behind a worker while holding an upstream connection.
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=0.05)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=429, detail="too_many_concurrent_streams")
+
+    # The semaphore is now held. It MUST be released on every exit path:
+    # extraction failure, upstream failure, or — on the happy path — when
+    # the streaming generator finishes / the client disconnects (finally).
+    released = False
+
+    def _release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            sem.release()
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _extract_audio, video_id),
+            timeout=_AUDIO_EXTRACT_TIMEOUT_SECS,
+        )
+    except asyncio.TimeoutError:
+        _release()
+        logger.warning("[media_proxy] audio_stream extract timeout video_id=%s", video_id)
+        return JSONResponse(status_code=504, content={"error": "extraction_timeout"})
+    except Exception as e:
+        _release()
+        logger.warning("[media_proxy] audio_stream extract failed video_id=%s: %s", video_id, e)
+        return JSONResponse(status_code=502, content={"error": "extraction_failed", "detail": str(e)})
+
+    if "error" in result:
+        _release()
+        return JSONResponse(status_code=502, content=result)
+
+    upstream_url = result["url"]
+    mime = result.get("mime_type") or "audio/mp4"
+
+    # Forward the client's Range header so AVFoundation can seek; googlevideo
+    # honours it and replies 206 + Content-Range.
+    upstream_headers = {"User-Agent": "Mozilla/5.0"}
+    range_header = request.headers.get("range")
+    if range_header:
+        upstream_headers["Range"] = range_header
+
+    client = httpx.AsyncClient(timeout=_STREAM_TIMEOUT, follow_redirects=True)
+    try:
+        upstream_req = client.build_request("GET", upstream_url, headers=upstream_headers)
+        upstream = await client.send(upstream_req, stream=True)
+    except Exception as e:
+        await client.aclose()
+        _release()
+        logger.warning("[media_proxy] audio_stream upstream-connect failed video_id=%s: %s", video_id, e)
+        return JSONResponse(status_code=502, content={"error": "upstream_fetch_failed", "detail": str(e)})
+
+    if upstream.status_code >= 400:
+        status = upstream.status_code
+        await upstream.aclose()
+        await client.aclose()
+        _release()
+        # 403 here would mean the signed URL rejected OUR IP too (rare —
+        # usually a stale extraction); surface as a 502 to the client.
+        logger.warning("[media_proxy] audio_stream upstream status=%s video_id=%s", status, video_id)
+        return JSONResponse(status_code=502, content={"error": "upstream_status", "status": status})
+
+    # Curate response headers: pass through what the client needs to seek,
+    # force the audio mime, and never let the device cache the proxied
+    # bytes (the underlying signed URL rotates ~6h).
+    resp_headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
+    for h in ("content-length", "content-range"):
+        if h in upstream.headers:
+            resp_headers[h.title()] = upstream.headers[h]
+
+    async def _body():
+        try:
+            async for chunk in upstream.aiter_bytes(_STREAM_CHUNK_BYTES):
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+            _release()
+
+    return StreamingResponse(
+        _body(),
+        status_code=upstream.status_code,  # 200 (full) or 206 (range)
+        headers=resp_headers,
+        media_type=mime,
+    )
