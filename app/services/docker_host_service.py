@@ -1129,6 +1129,8 @@ async def _sync_soul_after_start(
         return
 
     try:
+        _owner_name = None
+        _owner_email = None
         async with async_session_maker() as db:
             result = await db.execute(
                 select(SoulConfig).where(SoulConfig.user_id == user_id)
@@ -1136,6 +1138,19 @@ async def _sync_soul_after_start(
             soul = result.scalar_one_or_none()
             if not soul:
                 return
+            # Owner identity — pushed alongside the soul so a recreated
+            # container (whose env body omits user_name) doesn't regress to
+            # the "Agent Owner" stub greeting. Captured as plain strings
+            # before the session closes.
+            try:
+                from app.db.models import User as _User
+                _owner = (await db.execute(
+                    select(_User).where(_User.id == user_id)
+                )).scalar_one_or_none()
+                _owner_name = (getattr(_owner, "name", None) or None)
+                _owner_email = (getattr(_owner, "email", None) or None)
+            except Exception:
+                _owner_name = _owner_email = None
 
         async with _httpx.AsyncClient(timeout=15) as client:
             resp = await client.put(
@@ -1149,6 +1164,8 @@ async def _sync_soul_after_start(
                         "agent_name": soul.name,
                         "agent_color": soul.color,
                     },
+                    "owner_name": _owner_name,
+                    "owner_email": _owner_email,
                 },
                 headers={"X-Agent-Key": agent_api_key},
             )

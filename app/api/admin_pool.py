@@ -245,6 +245,51 @@ async def admin_bind(
         # lazily by ws_chat.py's stub-user path on first chat. Logging
         # only so an operator can spot DB-down conditions.
 
+    # 2b-2. Reset the agent IDENTITY in the local AgentConfig row to match
+    #       THIS bind. The agent runtime reads its display name solely from
+    #       AgentConfig.agent_name (agent_runner._build_system_prompt) and
+    #       renders a clean "you don't have a name yet" when it's empty — it
+    #       never invents one. So a claimed/refreshed container must carry
+    #       only the current owner's chosen name: we write agent_name/
+    #       agent_color from the bind payload, and CLEAR a stale agent_name
+    #       when the payload doesn't carry one (a fresh signup hasn't picked
+    #       a name yet at claim time). This kills the "wrong agent name shows
+    #       first, then flips to the chosen one" symptom — a freshly-claimed
+    #       container can no longer surface a leftover/leaked name; the user's
+    #       Soul choice arrives via /api/soul/sync. Savepoint-guarded because
+    #       very old tenant DBs may predate the agent_configs table.
+    try:
+        from app.db.database import async_session_maker as _sm2
+        from app.db.models import AgentConfig as _AgentConfig
+        from sqlalchemy import select
+        _bound_agent_name = (filtered.get("agent_name") or "").strip() or None
+        _bound_agent_color = (filtered.get("agent_color") or "").strip() or None
+        async with _sm2() as _adb:
+            async with _adb.begin_nested():
+                _ac = (await _adb.execute(
+                    select(_AgentConfig).where(_AgentConfig.user_id == user_id)
+                )).scalar_one_or_none()
+                if _ac is not None:
+                    # Only overwrite the name (incl. clearing a stale one).
+                    # Color is only set when provided (no point clearing it).
+                    if _ac.agent_name != _bound_agent_name:
+                        _ac.agent_name = _bound_agent_name
+                    if _bound_agent_color and _ac.agent_color != _bound_agent_color:
+                        _ac.agent_color = _bound_agent_color
+                elif _bound_agent_name or _bound_agent_color:
+                    _adb.add(_AgentConfig(
+                        user_id=user_id,
+                        agent_name=_bound_agent_name,
+                        agent_color=_bound_agent_color,
+                    ))
+            await _adb.commit()
+            logger.info(
+                "[admin/bind] Local AgentConfig identity reset for %s (name=%r)",
+                user_id[:8], _bound_agent_name,
+            )
+    except Exception as e:
+        logger.warning("[admin/bind] AgentConfig identity reset failed (non-fatal): %s", e)
+
     # 2c. Refresh the LLM key cache. OpenAI/Anthropic clients are
     #     constructed once at agent boot and cached on KeyProvider's
     #     version counter; without bumping that counter the LLM

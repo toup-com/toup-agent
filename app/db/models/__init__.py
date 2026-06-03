@@ -23,7 +23,7 @@ from .user_session import UserSession
 from .identity import Identity
 
 # Conversation & Messages
-from .conversation import Conversation, Message
+from .conversation import Conversation, Message, ProcessedMessage
 
 # Day-as-Chat (day-level conversation container + telemetry + migrations)
 from .day_chat import DayChat, ContextBudgetLog, MigrationStatus
@@ -127,7 +127,7 @@ __all__ = [
     "UserRole", "IdentityType", "DocumentType", "MediaType",
     # Models
     "User", "UserSession", "Identity",
-    "Conversation", "Message",
+    "Conversation", "Message", "ProcessedMessage",
     "Memory", "memory_relationships", "BrainStats", "MemoryEvent", "RetrievalEvent",
     "Entity", "EntityLink", "EntityRelationship",
     "Document", "DocumentChunk", "Media",

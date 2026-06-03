@@ -272,6 +272,11 @@ async def _save_soul_impl(
                     "agent_name": req.name,
                     "agent_color": req.color,
                 },
+                # Correct the owner identity in the same sync that sets the
+                # agent name — fixes "Hey Agent Owner" on the pool-claim path
+                # even when the bridge doesn't forward user_name to /admin/bind.
+                owner_name=getattr(current_user, "name", None),
+                owner_email=getattr(current_user, "email", None),
             )
             if vps_synced:
                 # Best-effort timestamp update — failure here doesn't
@@ -296,6 +301,8 @@ async def _sync_soul_to_vps(
     user_id: str, name: str, compiled_text: str,
     deactivate_agent_soul_memories: bool = False,
     agent_config_updates: Optional[dict] = None,
+    owner_name: Optional[str] = None,
+    owner_email: Optional[str] = None,
 ) -> bool:
     """Sync compiled soul + related data to the user's VPS agent.
 
@@ -303,6 +310,15 @@ async def _sync_soul_to_vps(
     - Upsert Identity(type='soul') record
     - Optionally deactivate old agent_soul memories
     - Optionally update AgentConfig fields (name, color, onboarding)
+    - Upsert the owner User row's real name/email (so the agent stops
+      greeting "Hey Agent Owner" — see the receiver's section 4)
+
+    owner_name/owner_email are threaded so the user-initiated soul save
+    (which the receiver proved reaches the agent — the agent name updates)
+    ALSO corrects the owner identity. Without this the pool-claimed
+    container kept its stub User(name="Agent Owner") even after the user
+    set their soul, because the recreate/bind env body omits user_name.
+    Robust even if the bridge fails to forward user_name into /admin/bind.
 
     Returns True on success, False on failure. Never raises.
     """
@@ -319,6 +335,8 @@ async def _sync_soul_to_vps(
                 "compiled_text": compiled_text,
                 "deactivate_agent_soul_memories": deactivate_agent_soul_memories,
                 "agent_config_updates": agent_config_updates,
+                "owner_name": owner_name,
+                "owner_email": owner_email,
             },
             headers={"X-Agent-Key": agent_api_key},
             timeout=15.0,
@@ -340,6 +358,13 @@ class SoulSyncRequest(BaseModel):
     compiled_text: str
     deactivate_agent_soul_memories: bool = False
     agent_config_updates: Optional[dict] = None
+    # Owner identity — the human's real (Gmail) name/email. Threaded so a
+    # (re)provisioned tenant container, which boots with a stub
+    # User(name="Agent Owner"), gets the real owner name and stops greeting
+    # "Hey Agent Owner". The recreate env body omits user_name, so this
+    # soul-sync channel is the durable correction after any recreate.
+    owner_name: Optional[str] = None
+    owner_email: Optional[str] = None
 
 
 @router.put("/sync")
@@ -445,6 +470,43 @@ async def sync_soul(
                         )
         except Exception as e:
             logger.warning(f"[SOUL] Failed to update AgentConfig on VPS (table may not exist): {e}")
+
+    # 4. Upsert the owner User row's real name/email. A (re)provisioned
+    #    container boots with a stub User(name="Agent Owner") and the
+    #    recreate env body never carries user_name, so without this the
+    #    agent keeps greeting "Hey Agent Owner" after any recreate (e.g. the
+    #    verify-and-heal path). Savepoint-guarded so a failure can't poison
+    #    the identity/memory writes above.
+    if req.owner_name or req.owner_email:
+        try:
+            async with db.begin_nested():
+                u = (await db.execute(
+                    select(User).where(User.id == req.user_id)
+                )).scalar_one_or_none()
+                _name = (req.owner_name or "").strip()
+                _email = (req.owner_email or "").strip()
+                if u:
+                    changed = False
+                    # Only overwrite with a real value; never clobber a real
+                    # name back to the stub.
+                    if _name and _name != "Agent Owner" and u.name != _name:
+                        u.name = _name
+                        changed = True
+                    if _email and not _email.endswith("@agent.local") and u.email != _email:
+                        u.email = _email
+                        changed = True
+                    if changed:
+                        logger.info(f"[SOUL] Owner User row updated on VPS for {req.user_id[:8]}")
+                elif _name:
+                    db.add(User(
+                        id=req.user_id,
+                        email=(_email or f"{req.user_id[:8]}@agent.local"),
+                        hashed_password="",
+                        name=_name,
+                    ))
+                    logger.info(f"[SOUL] Owner User row created on VPS for {req.user_id[:8]}")
+        except Exception as e:
+            logger.warning(f"[SOUL] Failed to upsert owner User row on VPS: {e}")
 
     await db.commit()
     logger.info(f"[SOUL] Synced soul identity for user {req.user_id}: {req.name}")

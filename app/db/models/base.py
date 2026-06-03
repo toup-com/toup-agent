@@ -61,6 +61,8 @@ AGENT_ONLY_TABLES: set[str] = {
     # Conversation & messages (agent stores all chat data)
     "conversations",
     "messages",
+    # Durable exactly-once ledger for inbound chat (see ProcessedMessage).
+    "processed_messages",
     # Memory system
     "memories",
     "memory_relationships",

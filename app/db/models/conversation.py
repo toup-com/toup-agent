@@ -148,3 +148,43 @@ class Message(Base):
     __table_args__ = (
         Index("ix_messages_day_chat_created", "day_chat_id", "created_at"),
     )
+
+
+class ProcessedMessage(Base):
+    """Durable exactly-once ledger for inbound chat messages.
+
+    Why this exists (the 2026-06 replay-loop credit burn):
+    A brand-new user's FIRST message is sent with ``session_id=null`` (the
+    agent creates the session on receipt), so it bypasses the session-gated
+    DB replay check in ``ws_chat``. The in-process dedup guard there only
+    survives within ONE process for a short TTL — but during the
+    post-onboarding boot window the agent container is swapped (pool claim /
+    blue-green upgrade), wiping that in-memory state. The client then
+    replays its queued, un-acked first message on every reconnect/refresh,
+    and each replay spawned a fresh session + a fresh LLM call + a fresh
+    credit charge → an at-least-once loop the user watched burn credit.
+
+    This table makes the first dispatch claim ``(user_id, client_msg_id)``
+    ATOMICALLY before the agent runs: the primary key is a deterministic
+    ``uuid5(NAMESPACE_OID, "toup-msg:{user_id}:{client_msg_id}")`` — the same
+    derivation the session-gated path already uses for ``messages.id`` — so a
+    replay collides on INSERT and is dropped *before* it can trigger a second
+    LLM call or charge. Exactly-once survives container restarts and
+    reconnects because the claim lives in the tenant DB, not memory.
+
+    Agent-only table created by ``init_db()``'s ``create_all`` (agents boot
+    via ``init_db``, NOT alembic), so recycled pool DBs self-provision it on
+    their next boot. No FK on ``user_id`` — the ledger is a pure dedup marker
+    and must never block on the parent row's existence/visibility.
+    """
+    __tablename__ = "processed_messages"
+
+    # Deterministic uuid5(NAMESPACE_OID, "toup-msg:{user_id}:{client_msg_id}").
+    id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    client_msg_id: Mapped[str] = mapped_column(String(100))
+    # The session the first dispatch created/used, stamped opportunistically
+    # once known. Nullable: the very first message claims the ledger before a
+    # session exists.
+    session_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

@@ -152,6 +152,39 @@ def _friendly_error(exc: Exception) -> str:
 _user_ws_queues: Dict[str, List[asyncio.Queue]] = {}
 
 
+# ── Session-independent duplicate-message guard ──────────────────────────
+# A brand-new user's FIRST message is sent with session_id=null (the agent
+# creates the session). The DB-backed replay check further down requires a
+# session/conversation row, so it is SKIPPED for that first message. During
+# the post-onboarding boot window the WS drops and the client REPLAYS its
+# queued (un-acked) message on reconnect — to the SAME agent container
+# process — producing two agent turns → duplicate replies (the 2026-06
+# "HI → two greetings" incident). This in-process guard dedupes by
+# (user_id, client_msg_id) regardless of session_id, dropping the replay
+# BEFORE dispatch rather than after the fact. TTL-bounded + size-capped; the
+# realistic replay arrives within seconds on the same process, so an
+# in-process guard is sufficient and complements (does not replace) the
+# DB-level idempotency used once a session exists.
+_recent_client_msgs: Dict[str, float] = {}  # "user_id:client_msg_id" → expiry (monotonic)
+_RECENT_MSG_TTL_S = 180.0
+_RECENT_MSG_MAX = 4096
+
+
+def _dedup_seen_client_msg(key: str) -> bool:
+    """Return True if `key` was already dispatched recently (a duplicate);
+    otherwise record it with a TTL and return False. Bounded + self-pruning."""
+    import time as _t
+    now = _t.monotonic()
+    if len(_recent_client_msgs) > _RECENT_MSG_MAX:
+        for _k in [k for k, exp in _recent_client_msgs.items() if exp <= now]:
+            _recent_client_msgs.pop(_k, None)
+    exp = _recent_client_msgs.get(key)
+    if exp is not None and exp > now:
+        return True
+    _recent_client_msgs[key] = now + _RECENT_MSG_TTL_S
+    return False
+
+
 async def _resolve_day_chat_id_for_now(db_session, user_id: str, tz_override: str = None):
     """Thin wrapper around the shared helper. See app.db.message_helpers."""
     from app.db.message_helpers import resolve_day_chat_id_for_now
@@ -1583,6 +1616,107 @@ async def ws_chat(
                 # Terminal activity: show user message
                 _tprint(f"\n{_CYAN_BOLD} user {_RESET} {text}")
 
+                # ── Session-independent duplicate guard (runs BEFORE the
+                # session-gated DB replay check below) ───────────────────────
+                # Drops the new-user FIRST-message reconnect-replay, which
+                # carries session_id=null and would otherwise bypass all
+                # idempotency and spawn a second agent turn. Same agent process
+                # handles the reconnect, so an in-process guard is sufficient.
+                _client_msg_id_top = msg.get("client_msg_id")
+                if _client_msg_id_top and not _is_system_action:
+                    if _dedup_seen_client_msg(f"{user_id}:{_client_msg_id_top}"):
+                        logger.info(
+                            "[WS] Duplicate dropped client_msg_id=%s session_id=%s user=%s — replay/double-send",
+                            _client_msg_id_top, session_id, user_id[:8],
+                        )
+                        try:
+                            await websocket.send_json({
+                                "type": "user_message_persisted",
+                                "client_msg_id": _client_msg_id_top,
+                                "session_id": session_id,
+                                "duplicate": True,
+                            })
+                        except Exception:
+                            pass
+                        continue
+
+                # ── Durable, session-independent exactly-once gate ───────────
+                # The in-process guard above only survives within ONE process
+                # for _RECENT_MSG_TTL_S. During the post-onboarding boot window
+                # the agent container is swapped (pool claim / blue-green),
+                # wiping that in-memory dict — so the client's reconnect-replay
+                # of its queued FIRST message (session_id=null, which bypasses
+                # the session-gated DB check below) was re-dispatched on every
+                # refresh: a fresh session + a fresh LLM call + a fresh credit
+                # charge each time (the 2026-06 replay-loop credit burn). This
+                # DB-backed ledger claims (user_id, client_msg_id) ATOMICALLY
+                # before dispatch — the PK is uuid5(user_id, client_msg_id), the
+                # same derivation the session-gated path uses for messages.id —
+                # so a replay collides on INSERT and is dropped (acked as a
+                # duplicate) and can NEVER trigger a second LLM call or charge.
+                # Durable across container restarts (it lives in the tenant DB).
+                # FAILS OPEN if the ledger table is missing on an un-migrated
+                # tenant; the in-process guard + session-gated check still apply.
+                if _client_msg_id_top and not _is_system_action:
+                    import uuid as _uuid_pm
+                    from sqlalchemy.exc import IntegrityError as _IntegrityError
+                    _pm_id = str(_uuid_pm.uuid5(
+                        _uuid_pm.NAMESPACE_OID,
+                        f"toup-msg:{user_id}:{_client_msg_id_top}",
+                    ))
+                    _pm_replay = False
+                    try:
+                        from app.db.database import async_session_maker
+                        from app.db.models import ProcessedMessage
+                        async with async_session_maker() as _pm_db:
+                            _pm_db.add(ProcessedMessage(
+                                id=_pm_id,
+                                user_id=user_id,
+                                client_msg_id=_client_msg_id_top,
+                                session_id=session_id,
+                            ))
+                            try:
+                                await _pm_db.commit()
+                            except _IntegrityError:
+                                await _pm_db.rollback()
+                                _pm_replay = True
+                    except Exception as _pm_err:
+                        # Ledger unavailable (e.g. table not yet created on an
+                        # un-migrated tenant, or a transient DB error): fail OPEN
+                        # so real messages are never blocked. Failing CLOSED would
+                        # drop legitimate messages on any DB blip — strictly worse
+                        # than the narrow window this leaves (a transient ledger
+                        # error coinciding with a cross-container replay, where the
+                        # in-process guard is also wiped). Logged at error level so
+                        # ops can see ledger unavailability on this critical path.
+                        logger.error("[WS] exactly-once ledger unavailable, failing open: %s", _pm_err)
+                    # NOTE (exactly-once contract): this ledger is the SOLE
+                    # per-message guard against a second LLM call / credit charge
+                    # on replay — the credit gate's own idempotency key is per
+                    # LLM call (uuid4), not per message, so it cannot dedupe a
+                    # re-dispatch on its own. The claim is intentionally NOT
+                    # released if dispatch later fails: a genuinely-failed first
+                    # turn is left claimed (the user resends with a fresh
+                    # client_msg_id) rather than auto-retried, because we cannot
+                    # prove from the error path that no charge occurred (a
+                    # tool-only turn can charge yet stream no text). No credit is
+                    # lost — the charge is post-LLM-success.
+                    if _pm_replay:
+                        logger.info(
+                            "[WS] Duplicate dropped (durable ledger) client_msg_id=%s session_id=%s user=%s — replay",
+                            _client_msg_id_top, session_id, user_id[:8],
+                        )
+                        try:
+                            await websocket.send_json({
+                                "type": "user_message_persisted",
+                                "client_msg_id": _client_msg_id_top,
+                                "session_id": session_id,
+                                "duplicate": True,
+                            })
+                        except Exception:
+                            pass
+                        continue
+
                 # ── Pre-save user message so it survives stream failures ──
                 # Skip if no session_id yet (first message — agent_runner creates session)
                 # Skip for system actions (customize_app) — no user message to save
@@ -2099,6 +2233,13 @@ async def ws_chat(
                         # the DB-backed render appear as two separate
                         # messages with identical content.
                         "asst_message_id": response.asst_message_id,
+                        # Echo the client_msg_id so the frontend can clear its
+                        # localStorage pending-replay entry on the happy path —
+                        # critical for the FIRST message (session_id=null), whose
+                        # success ack is otherwise gated behind `if session_id`
+                        # below and never sent, leaving the entry to replay on
+                        # every refresh (the replay-loop credit burn).
+                        "client_msg_id": _client_msg_id_top,
                     }
                     # Day-as-Chat: include day_chat_id so frontend can group by day
                     if getattr(response, 'day_chat_id', None):
