@@ -363,6 +363,22 @@ class AnthropicService:
                 )
             
             except anthropic.APIStatusError as e:
+                # Bundle 401 self-heal (see openai_agent_service for rationale):
+                # the first message can race /admin/bind so the cached client
+                # carries the stale GENERIC toup_token → proxy 401. Reload
+                # identity+token, rebuild client, retry once. Bundle-only,
+                # first-attempt-only so a real BYOK bad key fails fast.
+                if e.status_code == 401 and attempt == 0 and (getattr(settings, "llm_mode", "") == "bundle"):
+                    try:
+                        from app.services import runtime_identity as _ri
+                        _ri.reload()
+                        _ri.apply_to_settings(_ri.all_runtime_fields())
+                    except Exception as _re:
+                        logger.warning(f"[ANTHROPIC] identity reload on 401 failed: {_re}")
+                    self._keys.refresh()
+                    self._ensure_client()
+                    logger.info("[ANTHROPIC] bundle 401 — reloaded identity+token, retrying once")
+                    continue
                 # Retry on 429 (rate limit) and 529 (overloaded)
                 if e.status_code in (429, 529) and attempt < max_retries - 1:
                     wait = 2 ** (attempt + 1)  # 2s, 4s
@@ -542,6 +558,18 @@ class AnthropicService:
                 return  # Success — exit retry loop
 
             except anthropic.APIStatusError as e:
+                # Bundle 401 self-heal — see create_message above.
+                if e.status_code == 401 and attempt == 0 and (getattr(settings, "llm_mode", "") == "bundle"):
+                    try:
+                        from app.services import runtime_identity as _ri
+                        _ri.reload()
+                        _ri.apply_to_settings(_ri.all_runtime_fields())
+                    except Exception as _re:
+                        logger.warning(f"[ANTHROPIC] identity reload on 401 failed: {_re}")
+                    self._keys.refresh()
+                    self._ensure_client()
+                    logger.info("[ANTHROPIC] bundle stream 401 — reloaded identity+token, retrying once")
+                    continue
                 if e.status_code in (429, 529) and attempt < max_retries - 1:
                     wait = 2 ** (attempt + 1)
                     logger.warning(f"Anthropic stream {e.status_code} {type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")

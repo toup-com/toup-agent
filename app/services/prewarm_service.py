@@ -273,7 +273,21 @@ async def _is_agent_actually_healthy(user_id: str) -> bool:
                 return False
             data = resp.json()
             boot = data.get("boot_progress", {}) or {}
-            return bool(boot.get("ready", False))
+            if not bool(boot.get("ready", False)):
+                return False
+            # Bind-aware readiness (agent /agent/health Change 3). A GENERIC,
+            # not-yet-bound pool container reports boot.ready=true but is NOT
+            # ready for THIS user — its first message would 401 on a stale
+            # token. Require it to be bound to the claiming user. Backward-
+            # compatible: an OLD agent image omits these fields, so we keep
+            # trusting `ready` alone (no false re-provisions mid-rollout).
+            if "is_bound" in data:
+                if not data.get("is_bound"):
+                    return False
+                _bound_uid = data.get("bound_user_id")
+                if _bound_uid not in (None, user_id):
+                    return False
+            return True
     except Exception as e:
         logger.info(
             "[PREWARM-RECONCILER] user=%s health-check failed (will re-fire): %s",

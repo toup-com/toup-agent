@@ -442,6 +442,32 @@ async def _verify_and_heal_pool_claim(
         deadline = asyncio.get_event_loop().time() + budget_s
         while asyncio.get_event_loop().time() < deadline:
             if await _is_agent_actually_healthy(user_id):
+                # Bound + reachable (Change 4 made the health check bind-aware).
+                # Re-fire the owner/soul sync now that the bind is CONFIRMED:
+                # the onboarding soul-save may have raced the bind (fired while
+                # the container was still GENERIC), leaving the agent's local
+                # owner User row as the stub → "Hey Agent Owner". This
+                # deterministic post-bind push corrects owner_name/email +
+                # agent_name/color regardless of whether the bridge forwarded
+                # user_name into /admin/bind. Fire-and-forget; never blocks.
+                try:
+                    from sqlalchemy import select as _select
+                    from app.db.models import AgentConfig as _AC
+                    from app.db.database import async_session_maker as _sm
+                    from app.services.docker_host_service import _sync_soul_after_start
+                    async with _sm() as _sdb:
+                        _cfg = (await _sdb.execute(
+                            _select(_AC).where(_AC.user_id == user_id)
+                        )).scalar_one_or_none()
+                    if _cfg and _cfg.agent_url and _cfg.agent_api_key:
+                        asyncio.create_task(
+                            _sync_soul_after_start(user_id, _cfg.agent_url, _cfg.agent_api_key)
+                        )
+                except Exception:
+                    logger.exception(
+                        "[pool-heal] post-bind owner soul re-sync schedule failed user=%s",
+                        user_id[:8],
+                    )
                 return  # pool member is genuinely reachable — fast path won
             await asyncio.sleep(interval_s)
         logger.warning(

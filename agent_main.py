@@ -1718,6 +1718,20 @@ async def agent_health():
     except Exception:
         whatsapp_status = {"configured": False, "started": False, "qr_supported": False}
 
+    # Pool-bind state — lets the platform distinguish a GENERIC, not-yet-bound
+    # warm container (which still reports boot_progress.ready=true) from one
+    # actually bound to a user with credentials applied. Without this the
+    # platform declared a claim "ready" on mere reachability, so the user's
+    # first message raced /admin/bind and 401'd ("Your API key is invalid").
+    # Readiness must require is_bound AND bound_user_id == the claiming user.
+    try:
+        from app.services import runtime_identity as _ri
+        _is_bound = _ri.is_bound()
+        _bound_uid = _ri.get_user_id()
+        _pool_generic = _ri.is_pool_generic()
+    except Exception:
+        _is_bound, _bound_uid, _pool_generic = None, None, None
+
     return {
         "status": "healthy",
         "version": _agent_version,
@@ -1728,6 +1742,9 @@ async def agent_health():
         # advertised a stale model after a settings.agent_model bump.
         "agent_model": default_model(),
         "boot_progress": _boot_progress,
+        "is_bound": _is_bound,
+        "bound_user_id": _bound_uid,
+        "pool_generic": _pool_generic,
         "channels": {
             "telegram": "enabled" if settings.telegram_bot_token else "disabled",
             "discord": "enabled" if settings.discord_bot_token else "disabled",

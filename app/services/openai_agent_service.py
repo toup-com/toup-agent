@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, Dict, Any, List, Optional
 
-from openai import AsyncOpenAI, RateLimitError, APIConnectionError
+from openai import AsyncOpenAI, RateLimitError, APIConnectionError, AuthenticationError
 
 from app.config import settings
 
@@ -272,6 +272,28 @@ class OpenAIAgentService:
                 )
                 return  # Success, no retry
 
+            except AuthenticationError:
+                # Bundle 401 self-heal. A pool container's first message can
+                # race /admin/bind: the cached client still carries the GENERIC
+                # lobby toup_token, so the platform proxy 401s ("Your API key is
+                # invalid"). Reload runtime identity (re-read runtime.json the
+                # bind wrote), remap connect_token→settings.toup_token, bump the
+                # key version (Change 1 makes refresh() detect it), rebuild the
+                # client with the fresh token, and retry ONCE. Bundle-only and
+                # first-attempt-only so a genuine BYOK bad key fails fast and
+                # surfaces the "finishing setup" friendly message instead.
+                if attempt == 0 and (getattr(settings, "llm_mode", "") == "bundle"):
+                    try:
+                        from app.services import runtime_identity as _ri
+                        _ri.reload()
+                        _ri.apply_to_settings(_ri.all_runtime_fields())
+                    except Exception as _re:
+                        logger.warning(f"[OPENAI] identity reload on 401 failed: {_re}")
+                    self._keys.refresh()
+                    self._ensure_client()
+                    logger.info("[OPENAI] bundle 401 — reloaded identity+token, retrying once")
+                    continue
+                raise
             except RateLimitError:
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt

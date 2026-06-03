@@ -180,3 +180,59 @@ def test_sync_soul_to_vps_payload_carries_owner_identity(monkeypatch):
     ))
     assert captured["json"]["owner_name"] is None
     assert captured["json"]["owner_email"] is None
+
+
+# ── Instant-wakeup: bind must rebuild the LLM client (the "API key invalid" fix) ──
+
+def test_key_provider_version_bumps_on_toup_token_change():
+    """THE 401 fix (Change 1). A pool container boots GENERIC with an empty/
+    lobby toup_token; /admin/bind maps the user's connect_token -> settings.
+    toup_token then calls keys.refresh(). If refresh() doesn't treat a
+    toup_token change as a key change, the version never moves, the cached
+    bundle LLM client keeps the STALE token, and the user's FIRST message
+    401s ('Your API key is invalid'). The version MUST bump on a toup_token
+    (or llm_mode) change so the client is rebuilt with the fresh token."""
+    from app.config import settings as _s
+    from app.services.key_provider import KeyProvider
+
+    _orig_tok = getattr(_s, "toup_token", None)
+    _orig_mode = getattr(_s, "llm_mode", None)
+    try:
+        kp = KeyProvider()
+        object.__setattr__(_s, "llm_mode", "bundle")
+        object.__setattr__(_s, "toup_token", "")
+        kp.refresh()
+        v0 = kp.version  # baseline after first load
+
+        # /admin/bind applies the user's connect_token:
+        object.__setattr__(_s, "toup_token", "tk_user_abc123")
+        kp.refresh()
+        assert kp.version == v0 + 1, "toup_token change must bump the key version"
+
+        # Idempotent: an unchanged token must NOT bump (no needless rebuilds).
+        kp.refresh()
+        assert kp.version == v0 + 1
+
+        # A different token bumps again (e.g. re-bind / rotation).
+        object.__setattr__(_s, "toup_token", "tk_user_def456")
+        kp.refresh()
+        assert kp.version == v0 + 2
+
+        # llm_mode flip (manual<->bundle) also bumps so the client rebuilds.
+        object.__setattr__(_s, "llm_mode", "manual")
+        kp.refresh()
+        assert kp.version == v0 + 3
+    finally:
+        object.__setattr__(_s, "toup_token", _orig_tok)
+        object.__setattr__(_s, "llm_mode", _orig_mode)
+
+
+def test_agent_health_exposes_bind_state_contract():
+    """Change 3 contract: /agent/health must surface bind state so the
+    platform readiness check can require bound-to-THIS-user (not just
+    boot.ready, which a generic warm container also reports). We assert the
+    runtime_identity primitives the health endpoint reads exist."""
+    from app.services import runtime_identity as ri
+    assert hasattr(ri, "is_bound") and callable(ri.is_bound)
+    assert hasattr(ri, "get_user_id") and callable(ri.get_user_id)
+    assert hasattr(ri, "is_pool_generic") and callable(ri.is_pool_generic)
