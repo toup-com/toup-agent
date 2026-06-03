@@ -362,6 +362,39 @@ def _extract_audio(video_id: str) -> dict:
     }
 
 
+# video_id -> (result_dict, cache_until_epoch). Caches SUCCESSFUL extractions
+# so the lock-screen handoff is instant: AVFoundation fires a range probe, the
+# real request, and seeks — each previously triggered a fresh ~2-3s yt-dlp
+# call. With the cache they reuse one extraction, and the mobile pre-warm
+# (media_play → /audio_url) fills it BEFORE the user locks, so the byte-pump
+# skips extraction entirely. Safe now that extraction + byte-pump share one
+# stable egress IP (the Tailscale exit node): the signed googlevideo URL stays
+# valid for the same IP on reuse — the rotating-Railway-IP 403 that forced the
+# earlier cache revert (commit 4039597a) can't happen through the proxy.
+_EXTRACT_CACHE: dict[str, tuple[dict, float]] = {}
+_EXTRACT_CACHE_TTL_CAP = 3600.0  # never serve an extraction older than 1h
+
+
+def _cached_extract(video_id: str) -> dict:
+    """`_extract_audio` with a short-lived per-video cache. Blocking; run in an
+    executor like the underlying call. Only successful results are cached."""
+    now = time.time()
+    hit = _EXTRACT_CACHE.get(video_id)
+    if hit and hit[1] > now:
+        logger.info("[media_proxy] extract cache HIT video_id=%s", video_id)
+        return hit[0]
+    result = _extract_audio(video_id)
+    if "error" not in result and result.get("url"):
+        cache_until = now + _EXTRACT_CACHE_TTL_CAP
+        exp = result.get("expires_at") or 0
+        if exp:
+            # Stop serving 5 min before the signed URL itself expires.
+            cache_until = min(cache_until, float(exp) - 300.0)
+        if cache_until > now:
+            _EXTRACT_CACHE[video_id] = (result, cache_until)
+    return result
+
+
 @router.get("/{video_id}/audio_url")
 async def get_audio_url(
     video_id: str,
@@ -390,7 +423,7 @@ async def get_audio_url(
     """
     try:
         result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, _extract_audio, video_id),
+            asyncio.get_event_loop().run_in_executor(None, _cached_extract, video_id),
             timeout=_AUDIO_EXTRACT_TIMEOUT_SECS,
         )
     except asyncio.TimeoutError:
@@ -488,7 +521,7 @@ async def stream_audio(
 
     try:
         result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, _extract_audio, video_id),
+            asyncio.get_event_loop().run_in_executor(None, _cached_extract, video_id),
             timeout=_AUDIO_EXTRACT_TIMEOUT_SECS,
         )
     except asyncio.TimeoutError:
