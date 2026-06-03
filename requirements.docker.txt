@@ -66,3 +66,9 @@ patchright>=1.0.0
 
 # WebSocket client (for agent tunnel proxy)
 websockets>=12.0
+
+# Media extraction (YouTube audio for the mobile background player). The prod
+# image installs ONLY this file (Dockerfile prod_deps stage); yt-dlp ran via a
+# cached build layer but was absent from this list, so a clean rebuild would
+# drop it and break /api/media extraction. Pin it explicitly.
+yt-dlp>=2025.1.0

@@ -288,6 +288,10 @@ def _extract_audio(video_id: str) -> dict:
         }
         if cookiefile:
             opts["cookiefile"] = cookiefile
+        # Route extraction through a residential proxy when configured — this
+        # is the reliable defense against YouTube's datacenter-IP bot challenge.
+        if settings.yt_dlp_proxy:
+            opts["proxy"] = settings.yt_dlp_proxy
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -496,7 +500,15 @@ async def stream_audio(
     if range_header:
         upstream_headers["Range"] = range_header
 
-    client = httpx.AsyncClient(timeout=_STREAM_TIMEOUT, follow_redirects=True)
+    # googlevideo signs the stream URL to the IP that EXTRACTED it. If
+    # extraction went through the residential proxy, the byte-pump must use the
+    # same proxy or googlevideo 403s the mismatched IP. When no proxy is set,
+    # extraction + fetch are both Railway-direct, which also matches.
+    client = httpx.AsyncClient(
+        timeout=_STREAM_TIMEOUT,
+        follow_redirects=True,
+        proxy=settings.yt_dlp_proxy or None,
+    )
     try:
         upstream_req = client.build_request("GET", upstream_url, headers=upstream_headers)
         upstream = await client.send(upstream_req, stream=True)

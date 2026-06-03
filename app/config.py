@@ -728,6 +728,18 @@ class Settings(BaseSettings):
     # docs/skills/radio-mode/proxy-handoff-design.md §3.3.
     yt_dlp_cookies_b64: Optional[str] = None
 
+    # Optional residential/rotating proxy for yt-dlp. YouTube's bot challenge
+    # ("Sign in to confirm you're not a bot") fires on datacenter egress IPs
+    # (Railway) and is the root cause of mobile background-audio extraction
+    # failing. Routing yt-dlp through a residential IP removes that signal.
+    # Format: http(s)://user:pass@host:port or socks5://...  Set env YT_DLP_PROXY.
+    # IMPORTANT: googlevideo signs the stream URL to the extracting IP, so the
+    # /audio_stream byte-pump must use the SAME proxy (see media_proxy.py) or
+    # the fetch 403s. Leave unset to extract direct (works only when YouTube
+    # isn't blocking the server IP). Cookies (yt_dlp_cookies_b64) are the
+    # cheaper alternative — no per-GB proxy bandwidth — but need refresh.
+    yt_dlp_proxy: Optional[str] = None
+
     # ── Platform fixed costs (admin ROI dashboard) ───────────────
     # Recurring monthly costs that don't scale with user count: subscriptions
     # we pay regardless of usage, plus infrastructure. These flow into the
