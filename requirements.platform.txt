@@ -83,7 +83,14 @@ cohere>=5.0.0
 patchright>=1.0.0
 
 # Media extraction (YouTube stream/audio_url endpoints in app/api/media_proxy.py)
-yt-dlp>=2025.1.0
+# >=2025.5.22 is the floor required by the bgutil PO-token plugin below.
+yt-dlp>=2025.5.22
+
+# PO-token provider plugin (auto-discovered by yt-dlp). Fetches GVS "proof of
+# origin" tokens from the bgutil-pot Railway service so yt-dlp's web clients
+# get past YouTube's datacenter-IP bot challenge — the free alternative to a
+# residential proxy. Inert unless BGUTIL_POT_BASE_URL is set; see media_proxy.py.
+bgutil-ytdlp-pot-provider
 
 # MCP server (mounted at /api/mcp by platform_main). Required by the
 # T0c-T1h connector arc — without this the MCP transport import fails
