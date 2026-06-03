@@ -176,13 +176,13 @@ def _pick_artwork(info: dict) -> str:
 #
 # Web/mweb deliberately omitted: they're the first to be bot-flagged and
 # rarely succeed when the others fail. Adding them just burns latency.
-_PLAYER_CLIENTS = ("tv_embedded", "android_music", "ios", "android")
-
-# Clients that consume a GVS PO token. When a bgutil provider is configured
-# (settings.bgutil_pot_base_url) these are tried FIRST: on a datacenter IP
-# the tokenless clients above get bot-blocked, but a web client armed with a
-# fresh proof-of-origin token slips past. Order = empirical reliability.
-_POT_PLAYER_CLIENTS = ("web_safari", "web", "mweb")
+# Order matters. android_music (YouTube Music) and tv_embedded reliably
+# return iOS-native m4a/AAC audio-only formats (itag 140) with NO JS runtime
+# needed for signature/nsig solving — exactly what the RN-track-player lock
+# screen plays. The web clients are deliberately NOT here: post-SABR they
+# expose no usable audio-only stream and only serve Opus/WebM, which iOS
+# AVFoundation can't decode. android/ios stay as gvs-PO-token fallbacks.
+_PLAYER_CLIENTS = ("android_music", "tv_embedded", "android", "ios")
 
 
 def _should_try_next_client(err: BaseException) -> bool:
@@ -279,16 +279,14 @@ def _extract_audio(video_id: str) -> dict:
 
     cookiefile = _resolve_cookiefile()
     pot_base = (settings.bgutil_pot_base_url or "").strip()
-    # With a PO-token provider up, lead with the web clients it can arm; they
-    # beat the datacenter-IP bot challenge that blocks the tokenless clients.
-    clients = (_POT_PLAYER_CLIENTS + _PLAYER_CLIENTS) if pot_base else _PLAYER_CLIENTS
     last_err: BaseException | None = None
 
-    for client in clients:
+    for client in _PLAYER_CLIENTS:
         extractor_args: dict = {"youtube": {"player_client": [client]}}
-        # Point the bgutil plugin at the provider so yt-dlp fetches a fresh
-        # GVS proof-of-origin token for the web clients. Harmless for the
-        # tokenless clients (they just ignore it).
+        # Arm the bgutil PO-token provider. No-op for android_music/tv_embedded
+        # (they don't request a token), but if YouTube's bot challenge fires on
+        # the server IP the android/ios gvs clients fetch a proof-of-origin
+        # token from it and slip past — the free anti-bot defense.
         if pot_base:
             extractor_args["youtubepot-bgutilhttp"] = {"base_url": [pot_base]}
         opts: dict = {
