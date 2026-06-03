@@ -740,6 +740,14 @@ class Settings(BaseSettings):
     # cheaper alternative — no per-GB proxy bandwidth — but need refresh.
     yt_dlp_proxy: Optional[str] = None
 
+    # Base URL of the bgutil PO-token provider (the `bgutil-pot` Railway
+    # service, reachable on the private network). When set, yt-dlp's web
+    # clients fetch a GVS "proof of origin" token from it — the free,
+    # no-bandwidth-cost way past YouTube's datacenter-IP bot challenge (vs.
+    # yt_dlp_proxy, which fixes the same block but meters every audio byte).
+    # Format: http://bgutil-pot.railway.internal:4416  Set env BGUTIL_POT_BASE_URL.
+    bgutil_pot_base_url: str = ""
+
     # ── Platform fixed costs (admin ROI dashboard) ───────────────
     # Recurring monthly costs that don't scale with user count: subscriptions
     # we pay regardless of usage, plus infrastructure. These flow into the

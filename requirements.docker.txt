@@ -71,4 +71,11 @@ websockets>=12.0
 # image installs ONLY this file (Dockerfile prod_deps stage); yt-dlp ran via a
 # cached build layer but was absent from this list, so a clean rebuild would
 # drop it and break /api/media extraction. Pin it explicitly.
-yt-dlp>=2025.1.0
+# >=2025.5.22 is required by the bgutil PO-token plugin below.
+yt-dlp>=2025.5.22
+
+# PO-token provider plugin (auto-discovered by yt-dlp). Fetches GVS "proof of
+# origin" tokens from the bgutil-pot Railway service so yt-dlp's web clients
+# get past YouTube's datacenter-IP bot challenge — the free alternative to a
+# residential proxy. Inert unless BGUTIL_POT_BASE_URL is set; see media_proxy.py.
+bgutil-ytdlp-pot-provider

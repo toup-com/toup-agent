@@ -178,6 +178,12 @@ def _pick_artwork(info: dict) -> str:
 # rarely succeed when the others fail. Adding them just burns latency.
 _PLAYER_CLIENTS = ("tv_embedded", "android_music", "ios", "android")
 
+# Clients that consume a GVS PO token. When a bgutil provider is configured
+# (settings.bgutil_pot_base_url) these are tried FIRST: on a datacenter IP
+# the tokenless clients above get bot-blocked, but a web client armed with a
+# fresh proof-of-origin token slips past. Order = empirical reliability.
+_POT_PLAYER_CLIENTS = ("web_safari", "web", "mweb")
+
 
 def _should_try_next_client(err: BaseException) -> bool:
     """Should this error fall through to the next client in the chain?
@@ -272,9 +278,19 @@ def _extract_audio(video_id: str) -> dict:
     import os
 
     cookiefile = _resolve_cookiefile()
+    pot_base = (settings.bgutil_pot_base_url or "").strip()
+    # With a PO-token provider up, lead with the web clients it can arm; they
+    # beat the datacenter-IP bot challenge that blocks the tokenless clients.
+    clients = (_POT_PLAYER_CLIENTS + _PLAYER_CLIENTS) if pot_base else _PLAYER_CLIENTS
     last_err: BaseException | None = None
 
-    for client in _PLAYER_CLIENTS:
+    for client in clients:
+        extractor_args: dict = {"youtube": {"player_client": [client]}}
+        # Point the bgutil plugin at the provider so yt-dlp fetches a fresh
+        # GVS proof-of-origin token for the web clients. Harmless for the
+        # tokenless clients (they just ignore it).
+        if pot_base:
+            extractor_args["youtubepot-bgutilhttp"] = {"base_url": [pot_base]}
         opts: dict = {
             "quiet": True,
             "no_warnings": True,
@@ -284,7 +300,7 @@ def _extract_audio(video_id: str) -> dict:
             # unavailable.
             "format": "bestaudio[ext=m4a]/bestaudio/best",
             "socket_timeout": 10,
-            "extractor_args": {"youtube": {"player_client": [client]}},
+            "extractor_args": extractor_args,
         }
         if cookiefile:
             opts["cookiefile"] = cookiefile
