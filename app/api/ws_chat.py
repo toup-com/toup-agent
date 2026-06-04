@@ -628,6 +628,7 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         thumbnail_url=(seed_meta.thumbnail_url if seed_meta else ""),
         video_type=(seed_meta.video_type if seed_meta else ""),
         reason="toggle_seed",
+        upcoming=_upcoming_tracks(sess),
     )
     print(
         f"[radio] iframe_force_sync from=unknown to={seed_video_id} reason=toggle_on",
@@ -779,6 +780,24 @@ def _video_type_source(video_type: str) -> str:
     return "other" if video_type else "unknown"
 
 
+def _upcoming_tracks(sess, n: int = 2) -> list:
+    """The next `n` station tracks the playlist will pop, as lightweight dicts
+    for the mobile pre-load queue (instant lock-screen skip / auto-advance).
+    Reads straight from the in-memory playlist at the current cursor — no fetch."""
+    out = []
+    try:
+        for t in sess.playlist[sess.playlist_cursor:sess.playlist_cursor + n]:
+            out.append({
+                "video_id": t.video_id,
+                "title": t.display_title(),
+                "artist": t.artist,
+                "thumbnail_url": t.thumbnail_url,
+            })
+    except Exception:
+        pass
+    return out
+
+
 async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str, record: bool) -> None:
     """Broadcast a media_play for `track` plus a radio_state update. `record`
     is False for skip_prev and history-step-forward (track already in tape)."""
@@ -791,6 +810,7 @@ async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str,
         artist=track.artist,
         thumbnail_url=track.thumbnail_url,
         video_type=track.video_type,
+        upcoming=_upcoming_tracks(sess),
     )
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
