@@ -599,6 +599,11 @@ class Settings(BaseSettings):
     # default host.
     google_auth_callback_url: str = ""
 
+    # Sign in with Apple (Guideline 4.8): the audience the identity
+    # token must carry. For native iOS Sign in with Apple this is the
+    # app's bundle id; override via APPLE_CLIENT_ID for a web Service ID.
+    apple_client_id: str = "ai.toup.app"
+
     # ── VPS Provisioning (AWS + Stripe) ──────────────────────
     aws_access_key_id: Optional[str] = None        # Set via AWS_ACCESS_KEY_ID
     aws_secret_access_key: Optional[str] = None    # Set via AWS_SECRET_ACCESS_KEY

@@ -883,6 +883,114 @@ async def login(credentials: UserLogin, request: Request, response: Response, db
     return Token(access_token=token)
 
 
+# ── Sign in with Apple (native, iOS) ─────────────────────────────
+# Guideline 4.8: the privacy-preserving login required because the app
+# also offers Google Sign-In. The iOS client runs AppleAuthentication
+# .signInAsync() and POSTs the resulting identity_token here; we verify
+# it against Apple's JWKS, link/create the user by email (mirroring the
+# Google flow), and return a Toup JWT. No web redirect (native exchange).
+class AppleAuthRequest(BaseModel):
+    identity_token: str
+    authorization_code: Optional[str] = None
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+
+
+class AppleAuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    is_new: bool = False
+
+
+@router.post("/apple", response_model=AppleAuthResponse)
+async def apple_auth(
+    body: AppleAuthRequest,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Sign in with Apple. Verify Apple's identity token, link/create the
+    user by email, return a Toup JWT (Guideline 4.8)."""
+    import secrets as _secrets
+    from app.services.apple_auth import (
+        verify_apple_identity_token, AppleTokenError,
+    )
+
+    try:
+        claims = verify_apple_identity_token(
+            body.identity_token, settings.apple_client_id,
+        )
+    except AppleTokenError as e:
+        logger.warning("[apple-auth] token verification failed: %s", e)
+        raise HTTPException(status_code=401, detail="Apple sign-in verification failed.")
+
+    # Apple includes the email in the identity token when the user grants
+    # it (a private-relay address for Hide-My-Email); fall back to the
+    # email the client forwarded from the first-authorization credential.
+    email = (claims.get("email") or body.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Apple did not provide an email address.")
+    ev = claims.get("email_verified")
+    email_verified = (ev is True) or (str(ev).lower() == "true")
+
+    existing = await get_user_by_email(db, email)
+    is_new = False
+    if existing is not None:
+        user = existing
+    else:
+        # OAuth signup — random unguessable password (no /login until the
+        # user sets one via password-change). Mirrors the Google path.
+        random_password = _secrets.token_urlsafe(48)
+        user = await create_user(
+            db, email=email, password=random_password, name=(body.full_name or None),
+        )
+        is_new = True
+        if email_verified:
+            user.email_verified_at = datetime.utcnow()
+            await db.commit()
+            await db.refresh(user)
+        # New signup: mint free-tier LLM credentials + prewarm so the
+        # first chat authenticates to the LLM proxy (mirrors Google flow).
+        try:
+            from app.services.free_tier_activation import activate_free_tier
+            await activate_free_tier(db, str(user.id), force_env_push=False)
+        except Exception as _ae:
+            logger.warning("[apple-auth] free-tier activation failed user=%s: %s", str(user.id)[:8], _ae)
+        if settings.prewarm_on_soul_save:
+            try:
+                from app.api.agent_setup import _get_or_create_config
+                from app.services.pool_service import claim_or_prewarm
+                config = await _get_or_create_config(str(user.id), db)
+                dirty = False
+                if config.hosting_mode in (None, "self-hosted"):
+                    config.hosting_mode = "managed"
+                    dirty = True
+                if not config.whatsapp_mode:
+                    config.whatsapp_mode = "qr_link"
+                    dirty = True
+                if dirty:
+                    await db.commit()
+                await claim_or_prewarm(db, str(user.id))
+            except Exception as e:
+                logger.warning("[apple-auth] prewarm/claim failed user=%s: %s", str(user.id)[:8], e)
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="This account has been disabled.")
+
+    token = create_access_token(user.id)
+    try:
+        await record_login_session(db, user.id, token, request)
+    except Exception:
+        logger.exception("[apple-auth] record_login_session failed")
+
+    response.set_cookie(
+        key=SSO_COOKIE_NAME, value=token, domain=SSO_COOKIE_DOMAIN,
+        max_age=SSO_COOKIE_MAX_AGE, httponly=True, secure=True,
+        samesite="none", path="/",
+    )
+    return AppleAuthResponse(access_token=token, is_new=is_new)
+
+
 # ── Profile ──────────────────────────────────────────────────────
 
 @router.get("/me", response_model=UserResponse)
