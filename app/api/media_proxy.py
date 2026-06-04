@@ -7,9 +7,11 @@ Two routes:
 
 - `GET /media/stream/{video_id}` — combined video+audio mp4, used by
   cast-to-TV. Uses `format: best[ext=mp4]/best`.
-- `GET /media/{video_id}/audio_url` — audio-only stream used by the
-  mobile hybrid player for background playback. Uses
-  `format: bestaudio[ext=m4a]/bestaudio/best`. ToS posture: extracting
+- `GET /media/{video_id}/audio_url` — stream used by the mobile hybrid
+  player for background/lock-screen playback. Uses
+  `format: 18/22/bestaudio[ext=m4a]/bestaudio/best` — itag 18 (progressive
+  360p+AAC) first because iOS AVPlayer can't play YouTube's now-fragmented
+  audio-only DASH; see the _PLAYER_CLIENTS note. ToS posture: extracting
   direct audio URLs and playing them outside YouTube's player violates
   YouTube ToS §5.B; the product team accepted the tail risk in exchange
   for the video-when-visible / audio-when-not UX. See SKILL.md in the
@@ -176,13 +178,24 @@ def _pick_artwork(info: dict) -> str:
 #
 # Web/mweb deliberately omitted: they're the first to be bot-flagged and
 # rarely succeed when the others fail. Adding them just burns latency.
-# Order matters. android_music (YouTube Music) and tv_embedded reliably
-# return iOS-native m4a/AAC audio-only formats (itag 140) with NO JS runtime
-# needed for signature/nsig solving — exactly what the RN-track-player lock
-# screen plays. The web clients are deliberately NOT here: post-SABR they
-# expose no usable audio-only stream and only serve Opus/WebM, which iOS
-# AVFoundation can't decode. android/ios stay as gvs-PO-token fallbacks.
-_PLAYER_CLIENTS = ("android_music", "tv_embedded", "android", "ios")
+#
+# Order matters; `android` leads because it's the only client that still
+# yields a stream iOS AVFoundation can play. Hard-won 2026-06-03:
+#  - android_music / tv_embedded are now "unsupported client" in current
+#    yt-dlp (silently skipped) — they used to give progressive itag-140 m4a.
+#  - Every remaining client now serves AUDIO-ONLY (itag 140) as a *fragmented*
+#    DASH MP4 (tiny moov + sidx + moof/mdat). AVPlayer CANNOT play fragmented
+#    MP4 over a plain progressive HTTP URL → SwiftAudioEx PlaybackError 4,
+#    silent lock screen. (The foreground iframe is unaffected — it's WebKit.)
+#  - The ONE progressive container YouTube still serves is itag 18 (360p
+#    H.264 + AAC, single faststart moov, no fragments). It carries video we
+#    don't show, but the audio decodes natively on the lock screen. The
+#    `format` selector below grabs 18 first; the m4a fall-backs remain only so
+#    extraction still *succeeds* for non-iOS callers / videos without itag 18.
+#  - web clients need a GVS PO token (bgutil plugin) we don't have installed,
+#    and even with it would only expose the unplayable fragmented audio. Kept
+#    as last-ditch fallbacks; they normally just error through.
+_PLAYER_CLIENTS = ("android", "ios", "web_safari", "web")
 
 
 def _should_try_next_client(err: BaseException) -> bool:
@@ -293,10 +306,15 @@ def _extract_audio(video_id: str) -> dict:
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
-            # Prefer m4a/aac — iOS AVFoundation decodes it natively. Fall
-            # back to any bestaudio (usually webm/opus) only if m4a is
-            # unavailable.
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            # itag 18 first: the only PROGRESSIVE (non-fragmented, faststart
+            # moov) container YouTube still serves, and the only thing iOS
+            # AVPlayer can play off a plain HTTP URL. It carries 360p video we
+            # never show — but YouTube now delivers audio-only itag 140 as
+            # fragmented DASH, which AVPlayer rejects (PlaybackError 4, silent
+            # lock screen). The m4a/bestaudio tail keeps extraction succeeding
+            # for non-iOS callers and the rare video with no itag 18. See the
+            # _PLAYER_CLIENTS note. Changed 2026-06-03.
+            "format": "18/22/bestaudio[ext=m4a]/bestaudio/best",
             "socket_timeout": 10,
             "extractor_args": extractor_args,
         }
