@@ -221,8 +221,8 @@ class Settings(BaseSettings):
     # ── Email verification (F13) + Gmail Workspace SMTP ──
     email_provider: str = "resend"
     resend_api_key: str = ""
-    email_from_address: str = "Toup <noreply@toup.ai>"
-    email_from_reply_to: str = "support@toup.ai"
+    email_from_address: str = "Toup <mrhx@toup.ai>"
+    email_from_reply_to: str = "mrhx@toup.ai"
     app_public_base_url: str = "https://toup.ai"
     aws_ses_region: str = "us-east-1"
     aws_ses_access_key_id: str = ""
