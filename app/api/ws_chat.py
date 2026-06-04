@@ -559,12 +559,37 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         })
         return
 
+    # Resolve the seed to its YT Music "Song" (ATV) id BEFORE building the
+    # station. Mobile's fast-path seeds the session with a RAW scraped YouTube
+    # videoId (a lyric video / OMV / random upload), and YT Music's
+    # get_watch_playlist only returns a same-mood station when fed a proper ATV
+    # seed — fed a non-music id it returns a generic, unrelated mix (the
+    # "radio plays unrelated songs" bug). Apply the same ATV discipline already
+    # used for queue tracks (find_topic_version) to the SEED. Pure superset:
+    # any miss/empty-title/exception falls back to the raw seed, so the web
+    # client (whose seed is already a clean id) is unaffected. Seed-only — the
+    # user still hears `seed_video_id`; only the station QUEUE derives from ATV.
+    atv_seed = seed_video_id
+    try:
+        from app.agent.radio.playlist import StationTrack as _ST, find_topic_version as _ftv
+        _probe = _ST(video_id=seed_video_id, title=(seed_title or seed_intent), artist="")
+        _resolved = await _ftv(_probe)
+        if _resolved and _resolved.video_id:
+            atv_seed = _resolved.video_id
+            print(
+                f"[radio] seed_atv_resolved raw={seed_video_id} atv={atv_seed} "
+                f"title={(seed_title or seed_intent)!r}",
+                flush=True,
+            )
+    except Exception as _se:
+        print(f"[radio] seed_atv_resolve_failed seed={seed_video_id} err={_se}", flush=True)
+
     # Build the YT Music station BEFORE we mark the session enabled — if YT
     # Music rejects the seed (non-music, region-locked, etc.) we don't want
     # the UI pinned ON with no queue behind it. We also get back the seed's
     # own metadata from the watch-playlist's index 0 — used below to drive
     # the authoritative iframe swap on toggle-on (Rule 9).
-    seed_meta, station = await build_station(seed_video_id, limit=50)
+    seed_meta, station = await build_station(atv_seed, limit=50)
     if not station:
         print(
             f"[radio] toggle REJECT build_station returned empty "
