@@ -20,12 +20,15 @@ Two routes:
 
 import asyncio
 import logging
+import os
+import shutil
+import subprocess
 import time
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.api.auth import get_current_user
 from app.config import settings
@@ -413,6 +416,194 @@ def _cached_extract(video_id: str) -> dict:
     return result
 
 
+# ── Audio-only remux cache (fast first-play + skip) ───────────────────────
+# itag 18 — the only progressive container iOS plays off a plain URL — carries
+# 360p VIDEO we never show. In song mode AVPlayer still buffers the interleaved
+# video to reach the audio, so ~2-3MB must arrive over the ~1MB/s residential
+# proxy before a track starts → the ~5s cold-load measured on device for EVERY
+# track (first play AND manual skip; the RNTP queue prebuffer only pre-rolls
+# near a track's natural end, not on a mid-track skip).
+#
+# Fix: remux the small audio-only itag 140 (single-URL AAC m4a, ~3.6MB) into a
+# PROGRESSIVE faststart m4a once, cache it on local disk, and serve THAT from
+# /audio_stream. Result: audio-only (~25x less data) AND served from local disk
+# (no googlevideo round-trip / proxy on playback) → sub-second starts. The cold
+# remux (download ~3.6MB + ffmpeg -c:a copy) is ~5s, hidden by the mobile
+# pre-warm (media_play → /audio_url) during the agent turn / current track.
+# Fail-open: any ffmpeg/extraction/remux miss → /audio_stream falls back to the
+# itag-18 proxy (today's behaviour), never a regression. Mobile-only: the web
+# plays via the YouTube iframe and never hits /audio_stream.
+_AUDIO_CACHE_DIR = os.environ.get("AUDIO_REMUX_CACHE_DIR", "/tmp/toup_audio_remux")
+_AUDIO_CACHE_MAX_FILES = 80
+_remux_inflight: set[str] = set()
+_remux_inflight_lock = asyncio.Lock()
+_FFMPEG_OK: bool | None = None
+
+
+def _ffmpeg_available() -> bool:
+    global _FFMPEG_OK
+    if _FFMPEG_OK is None:
+        _FFMPEG_OK = shutil.which("ffmpeg") is not None
+        if not _FFMPEG_OK:
+            logger.warning("[media_proxy] ffmpeg not found — audio remux disabled (itag-18 proxy only)")
+    return _FFMPEG_OK
+
+
+def _remuxed_path(video_id: str) -> str:
+    return os.path.join(_AUDIO_CACHE_DIR, f"{video_id}.m4a")
+
+
+def _remuxed_ready(video_id: str) -> str | None:
+    p = _remuxed_path(video_id)
+    try:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            return p
+    except OSError:
+        pass
+    return None
+
+
+def _safe_unlink(p: str) -> None:
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+
+
+def _extract_audio_only_url(video_id: str) -> str | None:
+    """Resolve the small audio-only (itag 140 / bestaudio m4a) SINGLE url,
+    reusing _extract_audio's multi-client + cookies + proxy + PO-token
+    discipline. Returns None if every client misses or only offers fragmented
+    audio (which ffmpeg-from-URL can't read in one shot). Blocking."""
+    import yt_dlp
+
+    cookiefile = _resolve_cookiefile()
+    pot_base = (settings.bgutil_pot_base_url or "").strip()
+    for client in _PLAYER_CLIENTS:
+        extractor_args: dict = {"youtube": {"player_client": [client]}}
+        if pot_base:
+            extractor_args["youtubepot-bgutilhttp"] = {"base_url": [pot_base]}
+        opts: dict = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "format": "140/bestaudio[ext=m4a]/bestaudio",
+            "socket_timeout": 10,
+            "extractor_args": extractor_args,
+        }
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
+        if settings.yt_dlp_proxy:
+            opts["proxy"] = settings.yt_dlp_proxy
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(
+                    f"https://www.youtube.com/watch?v={video_id}", download=False
+                )
+        except Exception as e:
+            if _should_try_next_client(e):
+                continue
+            return None
+        if info and info.get("url") and not info.get("fragments"):
+            return info["url"]
+    return None
+
+
+def _do_remux(video_id: str) -> str | None:
+    """Blocking: extract the audio-only URL → ffmpeg remux to a progressive
+    faststart m4a on local disk. Returns the cached path, or None so the caller
+    falls back to the itag-18 proxy. Idempotent. Run in an executor."""
+    ready = _remuxed_ready(video_id)
+    if ready:
+        return ready
+    if not _ffmpeg_available():
+        return None
+    url = _extract_audio_only_url(video_id)
+    if not url:
+        logger.warning("[media_proxy] remux: no single-url audio for video_id=%s", video_id)
+        return None
+    try:
+        os.makedirs(_AUDIO_CACHE_DIR, exist_ok=True)
+    except OSError:
+        return None
+    out = _remuxed_path(video_id)
+    tmp = f"{out}.{os.getpid()}.tmp"
+    env = dict(os.environ)
+    if settings.yt_dlp_proxy:
+        # ffmpeg fetches the signed URL itself; it MUST egress through the same
+        # proxy that signed it (googlevideo binds the URL to that IP).
+        env["http_proxy"] = settings.yt_dlp_proxy
+        env["https_proxy"] = settings.yt_dlp_proxy
+    cmd = [
+        "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+        "-user_agent", "Mozilla/5.0",
+        "-i", url,
+        "-vn", "-c:a", "copy", "-movflags", "+faststart",
+        "-f", "mp4", tmp,
+    ]
+    t0 = time.time()
+    try:
+        proc = subprocess.run(cmd, env=env, timeout=90, capture_output=True)
+    except Exception as e:
+        logger.warning("[media_proxy] remux ffmpeg error video_id=%s: %s", video_id, e)
+        _safe_unlink(tmp)
+        return None
+    if proc.returncode != 0 or not (os.path.exists(tmp) and os.path.getsize(tmp) > 0):
+        logger.warning(
+            "[media_proxy] remux failed video_id=%s rc=%s err=%s",
+            video_id, proc.returncode, (proc.stderr or b"")[:200],
+        )
+        _safe_unlink(tmp)
+        return None
+    try:
+        os.replace(tmp, out)  # atomic publish
+    except OSError:
+        _safe_unlink(tmp)
+        return None
+    logger.info(
+        "[media_proxy] remux ok video_id=%s %.2fs size=%d",
+        video_id, time.time() - t0, os.path.getsize(out),
+    )
+    _prune_audio_cache()
+    return out
+
+
+def _prune_audio_cache() -> None:
+    """Keep the newest _AUDIO_CACHE_MAX_FILES remuxed files; drop older ones."""
+    try:
+        entries = [
+            os.path.join(_AUDIO_CACHE_DIR, f)
+            for f in os.listdir(_AUDIO_CACHE_DIR)
+            if f.endswith(".m4a")
+        ]
+    except OSError:
+        return
+    if len(entries) <= _AUDIO_CACHE_MAX_FILES:
+        return
+    try:
+        entries.sort(key=lambda p: os.path.getmtime(p))
+    except OSError:
+        return
+    for p in entries[: len(entries) - _AUDIO_CACHE_MAX_FILES]:
+        _safe_unlink(p)
+
+
+async def _ensure_remux_bg(video_id: str) -> None:
+    """Fire-and-forget background remux (pre-warm). No-op if already cached or
+    in flight on this process."""
+    if not video_id or _remuxed_ready(video_id) or not _ffmpeg_available():
+        return
+    async with _remux_inflight_lock:
+        if video_id in _remux_inflight:
+            return
+        _remux_inflight.add(video_id)
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
+    finally:
+        async with _remux_inflight_lock:
+            _remux_inflight.discard(video_id)
+
+
 @router.get("/{video_id}/audio_url")
 async def get_audio_url(
     video_id: str,
@@ -462,6 +653,11 @@ async def get_audio_url(
 
     if "error" in result:
         return JSONResponse(status_code=502, content=result)
+    # Pre-warm the audio-only remux in the background so the native
+    # /audio_stream play (and the next ⏭) serves it from local disk → fast.
+    # Mobile pre-warms the current track + upcoming via this endpoint at
+    # media_play, so the remux is usually cached before playback/skip asks.
+    asyncio.create_task(_ensure_remux_bg(video_id))
     return result
 
 
@@ -536,6 +732,24 @@ async def stream_audio(
         if not released:
             released = True
             sem.release()
+
+    # FAST PATH: serve the cached audio-only remux straight off local disk —
+    # audio-only (~25x less data than itag-18) and no googlevideo/proxy round-
+    # trip on playback → sub-second starts for first play AND skip. FileResponse
+    # honours Range (206) for AVFoundation seeks. A local-file serve holds no
+    # upstream connection, so release the stream semaphore immediately.
+    rpath = _remuxed_ready(video_id)
+    if rpath:
+        _release()
+        logger.info("[media_proxy] audio_stream remux HIT video_id=%s", video_id)
+        return FileResponse(
+            rpath,
+            media_type="audio/mp4",
+            headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
+        )
+    # Not cached on this replica yet — kick off the remux for next time (the
+    # next ⏭ / replay), and serve the itag-18 proxy this once (fail-open).
+    asyncio.create_task(_ensure_remux_bg(video_id))
 
     try:
         result = await asyncio.wait_for(
