@@ -109,3 +109,8 @@ fastmcp==2.11.3
 # yaml at module load; missing this brings down anything that
 # downstream-imports the registry (oauth router, dispatcher, mcp wiring).
 PyYAML>=6.0
+
+# Radio station builder runs on the platform too: agents POST their YT-Music
+# calls to /api/internal/radio/yt so they go out through the platform proxy
+# (their own datacenter IP is YT-anti-bot-blocked). See app/api/internal_radio.py.
+ytmusicapi>=1.10.0

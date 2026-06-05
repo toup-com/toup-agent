@@ -45,6 +45,69 @@ def _ytmusic():
     return YTMusic()
 
 
+def _yt_remote(
+    op: str,
+    *,
+    video_id: str = "",
+    query: str = "",
+    filter: str = "",
+    limit: int = 0,
+):
+    """Run a ytmusicapi call on the PLATFORM (which has a working residential
+    proxy) instead of locally, and return the raw result.
+
+    Why: tenant agents run on Contabo VPS IPs that YT Music anti-bot-blocks,
+    and agent containers have NO egress proxy (YT_DLP_PROXY isn't in
+    AgentEnvContract), so a local get_watch_playlist/search comes back empty →
+    `station_unavailable`. The platform does all other YouTube egress through
+    the proxy already; this routes the radio calls the same way.
+
+    Returns the raw result on success, or None to signal "fall back to the
+    local call" — i.e. when we're NOT an agent (platform/monolith run their
+    own proxied client directly), when the agent isn't wired to the platform,
+    or on any RPC error. Fail-open: the worst case is exactly today's
+    behaviour, so this can never regress web or a working agent.
+    """
+    try:
+        from app.config import settings
+    except Exception:
+        return None
+    if getattr(settings, "run_mode", "") != "agent":
+        return None  # platform/monolith: caller runs _ytmusic() directly (proxied here)
+    base = (getattr(settings, "platform_api_url", "") or "").rstrip("/")
+    key = getattr(settings, "agent_api_key", "") or ""
+    uid = getattr(settings, "user_id", "") or ""
+    if not (base and key and uid):
+        return None
+    body = {"user_id": uid, "op": op}
+    if video_id:
+        body["video_id"] = video_id
+    if query:
+        body["query"] = query
+    if filter:
+        body["filter"] = filter
+    if limit:
+        body["limit"] = limit
+    try:
+        import httpx
+        resp = httpx.post(
+            f"{base}/internal/radio/yt",
+            headers={"X-Agent-Key": key},
+            json=body,
+            timeout=20.0,
+        )
+    except Exception as e:
+        print(f"[radio/playlist] yt_remote op={op} err={type(e).__name__}: {e} — local fallback", flush=True)
+        return None
+    if resp.status_code != 200:
+        print(f"[radio/playlist] yt_remote op={op} http={resp.status_code} — local fallback", flush=True)
+        return None
+    try:
+        return resp.json().get("result")
+    except Exception:
+        return None
+
+
 @dataclass
 class StationTrack:
     video_id: str
@@ -128,6 +191,9 @@ async def build_station(
         return None, []
 
     def _fetch() -> dict:
+        remote = _yt_remote("get_watch_playlist", video_id=seed, limit=limit)
+        if remote is not None:
+            return remote
         ytm = _ytmusic()
         return ytm.get_watch_playlist(videoId=seed, limit=limit)
 
@@ -199,6 +265,9 @@ async def find_topic_version(
         return None
 
     def _search() -> list:
+        remote = _yt_remote("search", query=q, filter="songs", limit=5)
+        if remote is not None:
+            return remote
         ytm = _ytmusic()
         return ytm.search(q, filter="songs", limit=5) or []
 
@@ -275,6 +344,9 @@ async def find_music_video(
         return None
 
     def _search() -> list:
+        remote = _yt_remote("search", query=q, filter="videos", limit=10)
+        if remote is not None:
+            return remote
         ytm = _ytmusic()
         return ytm.search(q, filter="videos", limit=10) or []
 
