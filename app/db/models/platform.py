@@ -67,7 +67,10 @@ class ManagedContainer(Base):
     __tablename__ = "managed_containers"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, unique=True)
+    # ON DELETE CASCADE: account deletion removes the container row; the
+    # container reconciler / provision path can re-create it during the
+    # delete window, so CASCADE keeps DELETE FROM users atomic (mig 060).
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True)
     container_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)  # Docker container ID
     container_name: Mapped[str] = mapped_column(String(100), nullable=False)
     host_port: Mapped[int] = mapped_column(Integer, nullable=False)  # Mapped port on Docker host
@@ -215,6 +218,9 @@ class PlatformSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
     )
+    # ON DELETE SET NULL: this is an audit reference, not user-owned data —
+    # deleting the admin who last touched a global setting must not be
+    # blocked, and must not delete the setting. (mig 060)
     updated_by_user_id: Mapped[Optional[str]] = mapped_column(
-        String(36), ForeignKey("users.id"), nullable=True,
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
     )

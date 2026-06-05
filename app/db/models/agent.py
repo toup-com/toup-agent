@@ -111,7 +111,10 @@ class ExtensionDevice(Base):
     __tablename__ = "extension_devices"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    # ON DELETE CASCADE: account deletion must remove the user's devices even
+    # though the extension may re-create this row via a concurrent /pair or
+    # /suggest poll during the delete cascade (see mig 060).
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     # Short user-supplied name from pair flow, e.g. "MacBook · Chrome".
     device_name: Mapped[str] = mapped_column(String(200), nullable=False)
     # Free-form version string the extension self-reports on pair.
@@ -174,7 +177,12 @@ class AgentConfig(Base):
     __tablename__ = "agent_configs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), unique=True, nullable=False)
+    # ON DELETE CASCADE: the account-deletion cascade wipes this row, but
+    # several get-or-create-config endpoints (toup_code /code/status, soul,
+    # agent_setup) re-create it from a still-open session DURING deletion,
+    # which previously left a row that blocked DELETE FROM users with a FK
+    # violation. CASCADE makes the user delete atomic + race-proof (mig 060).
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
 
     # Step 1: Machine / Hosting
     hosting_mode: Mapped[str] = mapped_column(String(20), default="self-hosted")

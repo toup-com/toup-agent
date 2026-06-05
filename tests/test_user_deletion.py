@@ -442,3 +442,31 @@ async def test_audit_row_persists_before_external_calls(patch_externals) -> None
     assert audit.completed_at is not None
     # initiated < completed by definition of succeeded path.
     assert audit.initiated_at <= audit.completed_at
+
+
+# ── Regression: user-referencing FKs must declare ON DELETE behaviour ────────
+# Root cause of the 2026-06-05 "Could not delete your account" bug: the cascade
+# wipes agent_configs, commits, then a still-open session re-creates it via a
+# get-or-create-config endpoint BEFORE `DELETE FROM users` runs — and the FK
+# had no ON DELETE action, so the user-row delete hit a ForeignKeyViolation.
+# Fix (mig 060): user-owned tables CASCADE; audit-reference columns SET NULL,
+# making the user delete atomic + race-proof at the DB level. These assertions
+# lock the ORM contract so a future model edit can't silently drop it.
+def test_user_fk_ondelete_contract():
+    from app.db.models import (
+        AgentConfig, ManagedContainer, ExtensionDevice, PlatformSetting, Rollout,
+    )
+
+    def _ondelete(model, column):
+        for fk in model.__table__.foreign_keys:
+            if fk.parent.name == column and "users.id" in str(fk.target_fullname):
+                return (fk.ondelete or "").upper()
+        raise AssertionError(f"no users.id FK on {model.__name__}.{column}")
+
+    # user-owned data → cascade-deleted with the user (immune to re-creation)
+    assert _ondelete(AgentConfig, "user_id") == "CASCADE"
+    assert _ondelete(ManagedContainer, "user_id") == "CASCADE"
+    assert _ondelete(ExtensionDevice, "user_id") == "CASCADE"
+    # audit references → nulled, never block deleting an admin
+    assert _ondelete(PlatformSetting, "updated_by_user_id") == "SET NULL"
+    assert _ondelete(Rollout, "triggered_by") == "SET NULL"

@@ -74,8 +74,10 @@ class Rollout(Base):
     trigger: Mapped[str] = mapped_column(String(32), nullable=False)
 
     # User ID for manual triggers; NULL for CI-driven rollouts.
+    # ON DELETE SET NULL: audit reference — deleting the admin who triggered a
+    # rollout must not be blocked, and must keep the rollout history. (mig 060)
     triggered_by: Mapped[Optional[str]] = mapped_column(
-        String(36), ForeignKey("users.id"), nullable=True
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
 
     # 8-char user_id prefix of the canary tenant for this rollout. Captured
