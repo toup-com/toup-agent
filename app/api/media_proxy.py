@@ -527,27 +527,45 @@ def _do_remux(video_id: str) -> str | None:
     except OSError:
         return None
     out = _remuxed_path(video_id)
-    tmp = f"{out}.{os.getpid()}.tmp"
-    env = dict(os.environ)
-    if settings.yt_dlp_proxy:
-        # ffmpeg fetches the signed URL itself; it MUST egress through the same
-        # proxy that signed it (googlevideo binds the URL to that IP).
-        env["http_proxy"] = settings.yt_dlp_proxy
-        env["https_proxy"] = settings.yt_dlp_proxy
+    pid = os.getpid()
+    src = f"{out}.{pid}.src"   # downloaded itag-140 (possibly fragmented mp4)
+    tmp = f"{out}.{pid}.tmp"   # remuxed progressive output
+    t0 = time.time()
+    # Download the audio through the SAME proxy that signed the URL (googlevideo
+    # binds the URL to that egress IP). httpx-through-proxy is the proven path
+    # (same client /audio_stream uses); decoupling the fetch from ffmpeg avoids
+    # ffmpeg's finicky https-proxy handling.
+    try:
+        with httpx.Client(
+            proxy=settings.yt_dlp_proxy or None, timeout=60.0, follow_redirects=True
+        ) as dl:
+            with dl.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as r:
+                if r.status_code >= 400:
+                    logger.warning("[media_proxy] remux download status=%s video_id=%s", r.status_code, video_id)
+                    return None
+                with open(src, "wb") as f:
+                    for chunk in r.iter_bytes(65536):
+                        f.write(chunk)
+    except Exception as e:
+        logger.warning("[media_proxy] remux download error video_id=%s: %s", video_id, e)
+        _safe_unlink(src)
+        return None
+    # Remux the LOCAL file to a progressive faststart m4a (moov at front, no
+    # video). -c:a copy = no re-encode, fast. No proxy needed (local input).
     cmd = [
         "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
-        "-user_agent", "Mozilla/5.0",
-        "-i", url,
+        "-i", src,
         "-vn", "-c:a", "copy", "-movflags", "+faststart",
         "-f", "mp4", tmp,
     ]
-    t0 = time.time()
     try:
-        proc = subprocess.run(cmd, env=env, timeout=90, capture_output=True)
+        proc = subprocess.run(cmd, timeout=60, capture_output=True)
     except Exception as e:
         logger.warning("[media_proxy] remux ffmpeg error video_id=%s: %s", video_id, e)
+        _safe_unlink(src)
         _safe_unlink(tmp)
         return None
+    _safe_unlink(src)
     if proc.returncode != 0 or not (os.path.exists(tmp) and os.path.getsize(tmp) > 0):
         logger.warning(
             "[media_proxy] remux failed video_id=%s rc=%s err=%s",
