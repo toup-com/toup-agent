@@ -20,6 +20,31 @@ from typing import List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _ytmusic():
+    """YTMusic client routed through the same egress proxy as yt-dlp.
+
+    YT Music's unauthenticated API anti-bot-blocks / rate-limits the agent's
+    datacenter IP, so `get_watch_playlist` / `search` return empty FROM THE VPS
+    (→ the radio toggle is rejected with `station_unavailable`) even when the
+    seed is a perfectly valid Song id — the exact same call from a residential
+    IP returns a full 50-track station. Route these requests through
+    `settings.yt_dlp_proxy` (the residential Tailscale exit node already used
+    for audio extraction in media_proxy.py) so YT Music sees a non-datacenter
+    IP. Falls back to a direct client when no proxy is configured (dev/local),
+    so behaviour off-VPS — and the web's existing flow — is unchanged.
+    """
+    from ytmusicapi import YTMusic
+    proxy = None
+    try:
+        from app.config import settings
+        proxy = settings.yt_dlp_proxy
+    except Exception:
+        proxy = None
+    if proxy:
+        return YTMusic(proxies={"http": proxy, "https": proxy})
+    return YTMusic()
+
+
 @dataclass
 class StationTrack:
     video_id: str
@@ -103,7 +128,7 @@ async def build_station(
         return None, []
 
     def _fetch() -> dict:
-        ytm = YTMusic()
+        ytm = _ytmusic()
         return ytm.get_watch_playlist(videoId=seed, limit=limit)
 
     try:
@@ -174,7 +199,7 @@ async def find_topic_version(
         return None
 
     def _search() -> list:
-        ytm = YTMusic()
+        ytm = _ytmusic()
         return ytm.search(q, filter="songs", limit=5) or []
 
     try:
@@ -250,7 +275,7 @@ async def find_music_video(
         return None
 
     def _search() -> list:
-        ytm = YTMusic()
+        ytm = _ytmusic()
         return ytm.search(q, filter="videos", limit=10) or []
 
     try:
