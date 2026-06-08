@@ -879,27 +879,30 @@ async def stream_audio(
             return resp
         # cached file vanished / 0 bytes (pruned mid-flight) → fall through.
 
-    # MISS: build the audio-only remux NOW and serve THAT, instead of proxying
-    # the big itag-18 (video+audio, ~11.8MB) all the way to the phone. The server
-    # pulls itag-18 over its fast link + ffmpeg-strips the video, then sends the
-    # phone a ~4x-smaller audio-only file with a correct Content-Length — which
-    # both starts playback far sooner AND stops AVFoundation re-fetching the whole
-    # file in a loop (the cold-path thrash seen on device). This removes the
-    # 2-replica cache split + warm-timing dependency: every miss self-heals into
-    # a fast, consistent audio-only serve. The build is deduped, and we release
-    # the per-tenant semaphore first — a build holds no stream slot and the cap
-    # is only 5, which AVFoundation's parallel connections would otherwise trip.
-    # On build failure / budget timeout → fall open to the itag-18 proxy below.
-    if _ffmpeg_available():
+    # MISS. Two callers, two needs:
+    #  • The mobile PREFETCH (?prefetch=1) downloads the NEXT track to the phone's
+    #    disk DURING the current song — it has time to spare, so build-and-wait
+    #    and hand it the small audio-only file (cheap to store, instant to play
+    #    from local disk on the next ⏭). This is what makes skip truly instant.
+    #  • An IMMEDIATE play (first song, or a skip the prefetch didn't cover) wants
+    #    the FIRST BYTE fast — blocking on the full build is a regression (the
+    #    old itag-18 proxy streamed bytes right away). So DON'T wait: serve the
+    #    itag-18 proxy progressively now and build the remux in the background so
+    #    the prefetch / next request HITs the small file.
+    # The build is deduped (one per video) and we release the per-tenant
+    # semaphore before waiting — a build holds no stream slot, and the cap is
+    # only 5 which AVFoundation's parallel connections would otherwise trip.
+    prefetch = (request.query_params.get("prefetch") or "").lower() in ("1", "true", "yes")
+    if _ffmpeg_available() and prefetch:
         _release()
         built = await _remux_now(video_id, budget=_REMUX_SYNC_BUDGET_SECS)
         if built:
             resp = _local_audio_response(built, request.headers.get("range"))
             if resp is not None:
-                logger.info("[media_proxy] audio_stream remux BUILT video_id=%s", video_id)
+                logger.info("[media_proxy] audio_stream remux BUILT (prefetch) video_id=%s", video_id)
                 return resp
-    # ffmpeg unavailable / build failed or timed out — serve the itag-18 proxy
-    # this once (fail-open); the background build (still running) HITs next time.
+    # Immediate play (or prefetch build failed) — background-build for next time
+    # and serve the itag-18 proxy progressively now (fast first byte, fail-open).
     asyncio.create_task(_ensure_remux_bg(video_id))
 
     try:
