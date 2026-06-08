@@ -1,5 +1,6 @@
 """Authentication endpoints"""
 
+import asyncio
 import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
@@ -32,6 +33,39 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 security = HTTPBearer(auto_error=False)
+
+# Fire-and-forget background tasks (e.g. the warm-pool claim on OAuth signup).
+# Strong refs are held here so the event loop can't GC a still-running task; the
+# done-callback discards them on completion.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _bg_pool_claim_on_signup(user_id: str) -> None:
+    """Warm-pool claim for a fresh OAuth signup, run OFF the request path.
+
+    The Google callback used to ``await`` this inline, adding ~2s (the mTLS
+    bridge claim) to the redirect the user waits on. The claim only has to land
+    before the user's FIRST chat message — comfortably after they walk through
+    onboarding — so we run it on its own DB session in the background. The
+    inline free-tier credential mint is already committed before this is
+    scheduled, so the bind still injects TOUP_TOKEN on first boot.
+    """
+    try:
+        from app.db import async_session_maker
+        from app.services.pool_service import claim_or_prewarm
+        async with async_session_maker() as bg_db:
+            await claim_or_prewarm(bg_db, user_id)
+    except Exception as e:
+        logger.warning(
+            "[google-auth] background prewarm/claim failed user=%s: %s",
+            user_id[:8], e,
+        )
 
 # SSO cookie config
 SSO_COOKIE_NAME = "hex_sso_token"
@@ -751,7 +785,6 @@ async def google_auth_callback(
         if settings.prewarm_on_soul_save:
             try:
                 from app.api.agent_setup import _get_or_create_config
-                from app.services.pool_service import claim_or_prewarm
                 config = await _get_or_create_config(str(user.id), db)
                 dirty = False
                 if config.hosting_mode in (None, "self-hosted"):
@@ -777,7 +810,12 @@ async def google_auth_callback(
                         "[google-auth] free-tier activation failed user=%s: %s",
                         str(user.id)[:8], _ae,
                     )
-                await claim_or_prewarm(db, str(user.id))
+                # Persist the inline config + minted creds, then hand the SLOW
+                # bridge claim to the background so it doesn't add ~2s to the
+                # OAuth redirect the user is waiting on. The claim reads the
+                # now-committed creds on its own session and is idempotent.
+                await db.commit()
+                _spawn_background(_bg_pool_claim_on_signup(str(user.id)))
             except Exception as e:
                 logger.warning(
                     "[google-auth] prewarm/claim failed user=%s: %s",
