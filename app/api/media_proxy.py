@@ -21,6 +21,7 @@ Two routes:
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -28,7 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.auth import get_current_user
 from app.config import settings
@@ -473,6 +474,25 @@ def _safe_unlink(p: str) -> None:
         pass
 
 
+def _ensure_cache_dir() -> bool:
+    """Create the remux cache dir world-writable and confirm THIS process can
+    write it. Returns False (→ caller fails open to the itag-18 proxy) when it
+    can't — the usual cause is the dir pre-created by a different uid: a root
+    `railway ssh` repro run leaves it root-owned while the app runs as `toup`,
+    so the app's open("wb") then trips Errno 13. Sticky world-writable (1777)
+    lets either uid populate it without locking the other out."""
+    d = _AUDIO_CACHE_DIR
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return False
+    try:
+        os.chmod(d, 0o1777)  # best-effort; no-op if we don't own it
+    except OSError:
+        pass
+    return os.access(d, os.W_OK | os.X_OK)
+
+
 def _do_remux(video_id: str) -> str | None:
     """Blocking: extract the audio-only URL → ffmpeg remux to a progressive
     faststart m4a on local disk. Returns the cached path, or None so the caller
@@ -492,14 +512,20 @@ def _do_remux(video_id: str) -> str | None:
         logger.warning("[media_proxy] remux: extract miss for video_id=%s", video_id)
         return None
     url = result["url"]
-    try:
-        os.makedirs(_AUDIO_CACHE_DIR, exist_ok=True)
-    except OSError:
+    if not _ensure_cache_dir():
+        logger.warning(
+            "[media_proxy] remux: cache dir not writable (%s) — itag-18 proxy only",
+            _AUDIO_CACHE_DIR,
+        )
         return None
     out = _remuxed_path(video_id)
     pid = os.getpid()
-    src = f"{out}.{pid}.src"   # downloaded itag-140 (possibly fragmented mp4)
-    tmp = f"{out}.{pid}.tmp"   # remuxed progressive output
+    src = f"{out}.{pid}.src"   # downloaded itag-18 (progressive video+audio mp4)
+    tmp = f"{out}.{pid}.tmp"   # remuxed progressive audio-only output
+    # Clear any stale temp from a crashed prior run so open("wb") never trips on
+    # a leftover we can't overwrite (best-effort).
+    _safe_unlink(src)
+    _safe_unlink(tmp)
     t0 = time.time()
     # Download the audio through the SAME proxy that signed the URL (googlevideo
     # binds the URL to that egress IP). httpx-through-proxy is the proven path
@@ -666,6 +692,35 @@ async def get_audio_url(
 _STREAM_CHUNK_BYTES = 64 * 1024
 _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 
+
+def _parse_byte_range(range_header: str | None, file_size: int):
+    """Parse a single HTTP byte-range request against a known file size.
+
+    Returns an inclusive (start, end) tuple, or None when the header is
+    absent / malformed / multi-range / unsatisfiable — in which case the caller
+    serves a plain 200 with the full body. AVFoundation only ever sends a single
+    `bytes=START-` or `bytes=START-END` (and an initial `bytes=0-1` probe)."""
+    if not range_header or file_size <= 0:
+        return None
+    m = re.match(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$", range_header)
+    if not m:
+        return None  # multi-range or garbage → full file
+    s, e = m.group(1), m.group(2)
+    if s == "" and e == "":
+        return None
+    if s == "":
+        # suffix form: last N bytes
+        n = int(e)
+        if n <= 0:
+            return None
+        start, end = max(0, file_size - n), file_size - 1
+    else:
+        start = int(s)
+        end = int(e) if e != "" else file_size - 1
+    if start >= file_size or start > end:
+        return None
+    return start, min(end, file_size - 1)
+
 # Per-tenant in-process concurrency gate. Effective global cap is
 # N × replicas until a shared (Redis) limiter lands — see config.py
 # `audio_stream_max_concurrent_per_tenant`. Bounds how many full-song
@@ -723,18 +778,74 @@ async def stream_audio(
 
     # FAST PATH: serve the cached audio-only remux straight off local disk —
     # audio-only (~25x less data than itag-18) and no googlevideo/proxy round-
-    # trip on playback → sub-second starts for first play AND skip. FileResponse
-    # honours Range (206) for AVFoundation seeks. A local-file serve holds no
-    # upstream connection, so release the stream semaphore immediately.
+    # trip on playback → sub-second starts for first play AND skip. A local-file
+    # serve holds no upstream connection, so release the stream semaphore
+    # immediately. We HAND-ROLL HTTP Range (206) here: Starlette 0.35.1's
+    # FileResponse silently ignores the Range header and returns 200 + the whole
+    # file — but we advertise Accept-Ranges: bytes, so AVFoundation's seek/range
+    # request landed on the wrong bytes at offset 0 → SwiftAudioEx PlaybackError
+    # 1 and NO audio on every remux-served track (root-caused on device
+    # 2026-06-08). 206 with a correct Content-Range fixes it.
     rpath = _remuxed_ready(video_id)
     if rpath:
-        _release()
-        logger.info("[media_proxy] audio_stream remux HIT video_id=%s", video_id)
-        return FileResponse(
-            rpath,
-            media_type="audio/mp4",
-            headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
-        )
+        try:
+            file_size = os.path.getsize(rpath)
+        except OSError:
+            file_size = 0
+        if file_size > 0:
+            _release()
+            base_headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
+            rng = _parse_byte_range(request.headers.get("range"), file_size)
+            if rng:
+                start, end = rng
+                length = end - start + 1
+                logger.info(
+                    "[media_proxy] audio_stream remux HIT 206 video_id=%s %d-%d/%d",
+                    video_id, start, end, file_size,
+                )
+
+                def _slice():
+                    with open(rpath, "rb") as fh:
+                        fh.seek(start)
+                        remaining = length
+                        while remaining > 0:
+                            chunk = fh.read(min(_STREAM_CHUNK_BYTES, remaining))
+                            if not chunk:
+                                break
+                            remaining -= len(chunk)
+                            yield chunk
+
+                return StreamingResponse(
+                    _slice(),
+                    status_code=206,
+                    media_type="audio/mp4",
+                    headers={
+                        **base_headers,
+                        "Content-Range": f"bytes {start}-{end}/{file_size}",
+                        "Content-Length": str(length),
+                    },
+                )
+            logger.info(
+                "[media_proxy] audio_stream remux HIT 200 video_id=%s size=%d",
+                video_id, file_size,
+            )
+
+            def _full():
+                with open(rpath, "rb") as fh:
+                    while True:
+                        chunk = fh.read(_STREAM_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        yield chunk
+
+            return StreamingResponse(
+                _full(),
+                status_code=200,
+                media_type="audio/mp4",
+                headers={**base_headers, "Content-Length": str(file_size)},
+            )
+        # cached file vanished / 0 bytes (pruned mid-flight) → fall through to the
+        # cold itag-18 proxy below; the semaphore is still held (released there).
     # Not cached on this replica yet — kick off the remux for next time (the
     # next ⏭ / replay), and serve the itag-18 proxy this once (fail-open).
     asyncio.create_task(_ensure_remux_bg(video_id))
