@@ -439,8 +439,16 @@ def _cached_extract(video_id: str) -> dict:
 # regression. Mobile-only: web plays via the YouTube iframe, never /audio_stream.
 _AUDIO_CACHE_DIR = os.environ.get("AUDIO_REMUX_CACHE_DIR", "/tmp/toup_audio_remux")
 _AUDIO_CACHE_MAX_FILES = 80
-_remux_inflight: set[str] = set()
+# In-flight remux builds keyed by video_id, so the prewarm (/audio_url), a
+# concurrent /audio_stream miss, AND AVFoundation's parallel connections all
+# await ONE build instead of each downloading+ffmpeg'ing the same track.
+_remux_tasks: dict[str, "asyncio.Task[str | None]"] = {}
 _remux_inflight_lock = asyncio.Lock()
+# How long an /audio_stream MISS waits for the build before falling open to the
+# itag-18 proxy. Builds are ~2-3s (itag-18 download over the fast server link +
+# ffmpeg -c:a copy); the prewarm usually finishes it earlier. 15s covers long
+# tracks without hanging the request.
+_REMUX_SYNC_BUDGET_SECS = float(os.environ.get("AUDIO_REMUX_SYNC_BUDGET_SECS", "15"))
 _FFMPEG_OK: bool | None = None
 
 
@@ -602,20 +610,44 @@ def _prune_audio_cache() -> None:
         _safe_unlink(p)
 
 
-async def _ensure_remux_bg(video_id: str) -> None:
-    """Fire-and-forget background remux (pre-warm). No-op if already cached or
-    in flight on this process."""
-    if not video_id or _remuxed_ready(video_id) or not _ffmpeg_available():
-        return
+async def _remux_now(video_id: str, budget: float) -> str | None:
+    """Build (or join an in-flight build of) the audio-only remux and return its
+    local path — or None if ffmpeg is unavailable, the build failed, or it didn't
+    finish within `budget`. Concurrent callers for the same video share ONE build
+    task (deduped under the lock), so the prewarm, the /audio_stream miss, and
+    AVFoundation's parallel connections never trigger duplicate downloads. A
+    timeout does NOT cancel the build (asyncio.shield) — it keeps running so the
+    very next request HITs the finished file."""
+    ready = _remuxed_ready(video_id)
+    if ready:
+        return ready
+    if not video_id or not _ffmpeg_available():
+        return None
     async with _remux_inflight_lock:
-        if video_id in _remux_inflight:
-            return
-        _remux_inflight.add(video_id)
+        # Drop finished tasks so the map stays small over a long session.
+        for k in [k for k, t in _remux_tasks.items() if t.done()]:
+            _remux_tasks.pop(k, None)
+        task = _remux_tasks.get(video_id)
+        if task is None:
+            task = asyncio.ensure_future(
+                asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
+            )
+            _remux_tasks[video_id] = task
     try:
-        await asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
-    finally:
-        async with _remux_inflight_lock:
-            _remux_inflight.discard(video_id)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+    except asyncio.TimeoutError:
+        return None
+    except Exception:
+        return None
+
+
+async def _ensure_remux_bg(video_id: str) -> None:
+    """Fire-and-forget background pre-warm (from /audio_url at media_play). Builds
+    with a generous budget so the remux is ready before the play/skip asks."""
+    try:
+        await _remux_now(video_id, budget=120.0)
+    except Exception:
+        pass
 
 
 @router.get("/{video_id}/audio_url")
@@ -721,6 +753,63 @@ def _parse_byte_range(range_header: str | None, file_size: int):
         return None
     return start, min(end, file_size - 1)
 
+
+def _local_audio_response(rpath: str, range_header: str | None):
+    """Range-aware (206) / full (200) StreamingResponse for a cached local audio
+    file, or None if the file vanished / is empty (caller falls through). A
+    correct Content-Length is what stops AVFoundation re-requesting the whole
+    file in a loop. Hand-rolled because Starlette 0.35.1's FileResponse ignores
+    Range (returns 200 + whole file) while we advertise Accept-Ranges → seeks
+    land on the wrong bytes → PlaybackError 1."""
+    try:
+        file_size = os.path.getsize(rpath)
+    except OSError:
+        file_size = 0
+    if file_size <= 0:
+        return None
+    base = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
+    rng = _parse_byte_range(range_header, file_size)
+    if rng:
+        start, end = rng
+        length = end - start + 1
+
+        def _slice():
+            with open(rpath, "rb") as fh:
+                fh.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = fh.read(min(_STREAM_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        return StreamingResponse(
+            _slice(),
+            status_code=206,
+            media_type="audio/mp4",
+            headers={
+                **base,
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Content-Length": str(length),
+            },
+        )
+
+    def _full():
+        with open(rpath, "rb") as fh:
+            while True:
+                chunk = fh.read(_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(
+        _full(),
+        status_code=200,
+        media_type="audio/mp4",
+        headers={**base, "Content-Length": str(file_size)},
+    )
+
 # Per-tenant in-process concurrency gate. Effective global cap is
 # N × replicas until a shared (Redis) limiter lands — see config.py
 # `audio_stream_max_concurrent_per_tenant`. Bounds how many full-song
@@ -777,77 +866,40 @@ async def stream_audio(
             sem.release()
 
     # FAST PATH: serve the cached audio-only remux straight off local disk —
-    # audio-only (~25x less data than itag-18) and no googlevideo/proxy round-
-    # trip on playback → sub-second starts for first play AND skip. A local-file
-    # serve holds no upstream connection, so release the stream semaphore
-    # immediately. We HAND-ROLL HTTP Range (206) here: Starlette 0.35.1's
-    # FileResponse silently ignores the Range header and returns 200 + the whole
-    # file — but we advertise Accept-Ranges: bytes, so AVFoundation's seek/range
-    # request landed on the wrong bytes at offset 0 → SwiftAudioEx PlaybackError
-    # 1 and NO audio on every remux-served track (root-caused on device
-    # 2026-06-08). 206 with a correct Content-Range fixes it.
+    # ~4x smaller than itag-18 and no googlevideo/proxy round-trip on playback.
+    # A local-file serve holds no upstream connection, so release the stream
+    # semaphore. (See _local_audio_response for the Range/206 detail that fixed
+    # the PlaybackError-1-no-audio bug, root-caused on device 2026-06-08.)
     rpath = _remuxed_ready(video_id)
     if rpath:
-        try:
-            file_size = os.path.getsize(rpath)
-        except OSError:
-            file_size = 0
-        if file_size > 0:
+        resp = _local_audio_response(rpath, request.headers.get("range"))
+        if resp is not None:
             _release()
-            base_headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
-            rng = _parse_byte_range(request.headers.get("range"), file_size)
-            if rng:
-                start, end = rng
-                length = end - start + 1
-                logger.info(
-                    "[media_proxy] audio_stream remux HIT 206 video_id=%s %d-%d/%d",
-                    video_id, start, end, file_size,
-                )
+            logger.info("[media_proxy] audio_stream remux HIT video_id=%s", video_id)
+            return resp
+        # cached file vanished / 0 bytes (pruned mid-flight) → fall through.
 
-                def _slice():
-                    with open(rpath, "rb") as fh:
-                        fh.seek(start)
-                        remaining = length
-                        while remaining > 0:
-                            chunk = fh.read(min(_STREAM_CHUNK_BYTES, remaining))
-                            if not chunk:
-                                break
-                            remaining -= len(chunk)
-                            yield chunk
-
-                return StreamingResponse(
-                    _slice(),
-                    status_code=206,
-                    media_type="audio/mp4",
-                    headers={
-                        **base_headers,
-                        "Content-Range": f"bytes {start}-{end}/{file_size}",
-                        "Content-Length": str(length),
-                    },
-                )
-            logger.info(
-                "[media_proxy] audio_stream remux HIT 200 video_id=%s size=%d",
-                video_id, file_size,
-            )
-
-            def _full():
-                with open(rpath, "rb") as fh:
-                    while True:
-                        chunk = fh.read(_STREAM_CHUNK_BYTES)
-                        if not chunk:
-                            break
-                        yield chunk
-
-            return StreamingResponse(
-                _full(),
-                status_code=200,
-                media_type="audio/mp4",
-                headers={**base_headers, "Content-Length": str(file_size)},
-            )
-        # cached file vanished / 0 bytes (pruned mid-flight) → fall through to the
-        # cold itag-18 proxy below; the semaphore is still held (released there).
-    # Not cached on this replica yet — kick off the remux for next time (the
-    # next ⏭ / replay), and serve the itag-18 proxy this once (fail-open).
+    # MISS: build the audio-only remux NOW and serve THAT, instead of proxying
+    # the big itag-18 (video+audio, ~11.8MB) all the way to the phone. The server
+    # pulls itag-18 over its fast link + ffmpeg-strips the video, then sends the
+    # phone a ~4x-smaller audio-only file with a correct Content-Length — which
+    # both starts playback far sooner AND stops AVFoundation re-fetching the whole
+    # file in a loop (the cold-path thrash seen on device). This removes the
+    # 2-replica cache split + warm-timing dependency: every miss self-heals into
+    # a fast, consistent audio-only serve. The build is deduped, and we release
+    # the per-tenant semaphore first — a build holds no stream slot and the cap
+    # is only 5, which AVFoundation's parallel connections would otherwise trip.
+    # On build failure / budget timeout → fall open to the itag-18 proxy below.
+    if _ffmpeg_available():
+        _release()
+        built = await _remux_now(video_id, budget=_REMUX_SYNC_BUDGET_SECS)
+        if built:
+            resp = _local_audio_response(built, request.headers.get("range"))
+            if resp is not None:
+                logger.info("[media_proxy] audio_stream remux BUILT video_id=%s", video_id)
+                return resp
+    # ffmpeg unavailable / build failed or timed out — serve the itag-18 proxy
+    # this once (fail-open); the background build (still running) HITs next time.
     asyncio.create_task(_ensure_remux_bg(video_id))
 
     try:
