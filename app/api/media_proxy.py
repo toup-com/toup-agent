@@ -469,9 +469,122 @@ def _get_build_sem() -> "asyncio.Semaphore":
 
 async def _bounded_build(video_id: str) -> str | None:
     """Run _do_remux under the global build-concurrency cap so concurrent prefetch
-    builds can't saturate the residential proxy uplink and starve live playback."""
+    builds can't saturate the residential proxy uplink and starve live playback.
+    On success, persist the result into the SHARED Postgres cache so other
+    replicas (and future restarts) serve it without re-fetching through the proxy."""
     async with _get_build_sem():
-        return await asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
+        path = await asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
+    if path:
+        await _pg_cache_store_from_local(video_id, path)
+    return path
+
+
+# ── Shared remux cache (Postgres L2) ──────────────────────────────────────
+# Per-replica /tmp is the L1 cache; this Postgres table is the SHARED L2, so a
+# track is built ONCE across ALL replicas (and survives restarts), not once per
+# replica per boot. The first replica to need a track builds it (a single proxy
+# fetch) and stores the finished bytes here; every other replica/user pulls them
+# from PG — no proxy hit, no YouTube throttle. Fail-open everywhere: any PG error
+# or slowness degrades to today's behaviour (build through the proxy).
+_PG_CACHE_MAX_ROWS = int(os.environ.get("AUDIO_REMUX_PG_MAX_ROWS", "300"))
+_PG_CACHE_OP_TIMEOUT = float(os.environ.get("AUDIO_REMUX_PG_OP_TIMEOUT", "6"))
+_pg_cache_ready = False
+_pg_cache_disabled = False
+
+
+async def _pg_cache_ensure() -> bool:
+    """Create the cache table once (idempotent). Disables itself on hard failure
+    so we never repeatedly hammer a broken DB from the audio hot path."""
+    global _pg_cache_ready, _pg_cache_disabled
+    if _pg_cache_ready:
+        return True
+    if _pg_cache_disabled:
+        return False
+    try:
+        from app.db.database import async_session_maker
+        from sqlalchemy import text
+        async with async_session_maker() as s:
+            await s.execute(text(
+                "CREATE TABLE IF NOT EXISTS audio_remux_cache ("
+                "video_id TEXT PRIMARY KEY, data BYTEA NOT NULL, size INTEGER NOT NULL, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "last_access TIMESTAMPTZ NOT NULL DEFAULT now())"
+            ))
+            await s.commit()
+        _pg_cache_ready = True
+        return True
+    except Exception as e:
+        logger.warning("[media_proxy] pg cache ensure failed — disabling: %s", e)
+        _pg_cache_disabled = True
+        return False
+
+
+async def _pg_cache_pull_to_local(video_id: str) -> str | None:
+    """If the remux is in the shared PG cache, write it to local disk and return
+    the path (avoids a cold rebuild through the proxy on a replica that didn't
+    build it). None on miss/error/timeout → caller builds."""
+    async def _do():
+        if not await _pg_cache_ensure():
+            return None
+        from app.db.database import async_session_maker
+        from sqlalchemy import text
+        async with async_session_maker() as s:
+            row = (await s.execute(
+                text("UPDATE audio_remux_cache SET last_access = now() WHERE video_id = :v RETURNING data"),
+                {"v": video_id},
+            )).first()
+            await s.commit()
+        if not row or not row[0]:
+            return None
+        data = bytes(row[0])
+        if not data or not _ensure_cache_dir():
+            return None
+        out = _remuxed_path(video_id)
+        tmp = f"{out}.{os.getpid()}.pg"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out)
+        logger.info("[media_proxy] pg cache HIT video_id=%s size=%d", video_id, len(data))
+        return out
+    try:
+        return await asyncio.wait_for(_do(), timeout=_PG_CACHE_OP_TIMEOUT)
+    except Exception as e:
+        logger.warning("[media_proxy] pg cache pull failed video_id=%s: %s", video_id, e)
+        return None
+
+
+async def _pg_cache_store_from_local(video_id: str, path: str) -> None:
+    """Persist a freshly-built remux into the shared PG cache (best-effort) and
+    evict the least-recently-used rows beyond the cap."""
+    async def _do():
+        if not await _pg_cache_ensure():
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return
+        if not data:
+            return
+        from app.db.database import async_session_maker
+        from sqlalchemy import text
+        async with async_session_maker() as s:
+            await s.execute(
+                text("INSERT INTO audio_remux_cache (video_id, data, size) VALUES (:v, :d, :n) "
+                     "ON CONFLICT (video_id) DO UPDATE SET last_access = now()"),
+                {"v": video_id, "d": data, "n": len(data)},
+            )
+            await s.execute(
+                text("DELETE FROM audio_remux_cache WHERE video_id IN ("
+                     "SELECT video_id FROM audio_remux_cache ORDER BY last_access DESC OFFSET :keep)"),
+                {"keep": _PG_CACHE_MAX_ROWS},
+            )
+            await s.commit()
+        logger.info("[media_proxy] pg cache STORE video_id=%s size=%d", video_id, len(data))
+    try:
+        await asyncio.wait_for(_do(), timeout=_PG_CACHE_OP_TIMEOUT * 2)
+    except Exception as e:
+        logger.warning("[media_proxy] pg cache store failed video_id=%s: %s", video_id, e)
 
 
 _FFMPEG_OK: bool | None = None
@@ -648,6 +761,11 @@ async def _remux_now(video_id: str, budget: float) -> str | None:
         return ready
     if not video_id or not _ffmpeg_available():
         return None
+    # Shared L2: another replica may have already built this — pull it from PG
+    # (no proxy fetch) instead of rebuilding.
+    pulled = await _pg_cache_pull_to_local(video_id)
+    if pulled:
+        return pulled
     async with _remux_inflight_lock:
         # Drop finished tasks so the map stays small over a long session.
         for k in [k for k, t in _remux_tasks.items() if t.done()]:
@@ -894,6 +1012,11 @@ async def stream_audio(
     # semaphore. (See _local_audio_response for the Range/206 detail that fixed
     # the PlaybackError-1-no-audio bug, root-caused on device 2026-06-08.)
     rpath = _remuxed_ready(video_id)
+    if not rpath:
+        # Shared L2: if any replica/user already built this song, pull it from
+        # Postgres to local disk and serve it — no proxy fetch, no throttle. This
+        # is what makes the FIRST song (and uncovered skips) fast on repeat plays.
+        rpath = await _pg_cache_pull_to_local(video_id)
     if rpath:
         resp = _local_audio_response(rpath, request.headers.get("range"))
         if resp is not None:
