@@ -805,10 +805,12 @@ def _video_type_source(video_type: str) -> str:
     return "other" if video_type else "unknown"
 
 
-def _upcoming_tracks(sess, n: int = 2) -> list:
+def _upcoming_tracks(sess, n: int = 5) -> list:
     """The next `n` station tracks the playlist will pop, as lightweight dicts
-    for the mobile pre-load queue (instant lock-screen skip / auto-advance).
-    Reads straight from the in-memory playlist at the current cursor — no fetch."""
+    for the mobile pre-load queue. Mobile prefetches + queues these to local
+    disk so even rapid back-to-back skips hop to an already-downloaded file
+    (instant) instead of round-tripping. n=5 covers a burst of ~4 fast skips;
+    it's just IDs+titles from the in-memory playlist, so it's ~free to send."""
     out = []
     try:
         for t in sess.playlist[sess.playlist_cursor:sess.playlist_cursor + n]:
