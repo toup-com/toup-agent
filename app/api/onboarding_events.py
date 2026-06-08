@@ -137,7 +137,14 @@ class FreeTierActivateResponse(BaseModel):
     env_error: Optional[str] = None
 
 
-@events_router.post("/activate-free-tier", response_model=FreeTierActivateResponse)
+# Path carries the `/events/` segment to match the sibling routes above
+# (/events/step-completed, /events/plan-selected) and EVERY client: mobile
+# (api.ts activateFreeTier), web LlmRoute/InstallRoute. Without it the full path
+# was /api/onboarding/activate-free-tier while clients POST
+# /api/onboarding/events/activate-free-tier → 405 Method Not Allowed. Fixed
+# backend-side (not the clients) because already-shipped mobile binaries hardcode
+# the /events/ path and can't be patched in flight.
+@events_router.post("/events/activate-free-tier", response_model=FreeTierActivateResponse)
 async def post_activate_free_tier(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),

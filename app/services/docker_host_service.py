@@ -540,6 +540,27 @@ async def backfill_sentinel_image_containers(
         if cfg is None:
             skipped += 1
             continue
+        # A healthy warm pool claim legitimately has container_id=NULL until the
+        # claim path records it (the bridge only began returning container_id in
+        # 2026-06). Do NOT cold-rebuild such a row merely because the id is NULL —
+        # that destroys the warm container and pays a full cold boot, AND drops it
+        # onto the cold-provision path that races identity sync (the
+        # warm-claim-abandoned → "Agent Owner" / unnamed-agent bug). The
+        # sentinel-image arm still forces an unconditional rebuild (the original
+        # purpose); a NULL-id-ONLY match is health-gated and skipped when the agent
+        # is actually reachable — `_verify_and_heal_pool_claim` owns claim health,
+        # and A2 backfills the id on the next fresh claim.
+        image_is_sentinel = (mc.image_tag or "").endswith(":latest")
+        if not image_is_sentinel and mc.container_id is None:
+            try:
+                from app.services.prewarm_service import _is_agent_actually_healthy
+                if await _is_agent_actually_healthy(mc.user_id):
+                    skipped += 1
+                    continue
+            except Exception:
+                # Health probe itself failed → fall through and re-provision so a
+                # genuinely-broken row still self-heals (safe default).
+                pass
         try:
             new_mc = await provision_container(db, mc.user_id, recreate=True)
             await db.commit()
@@ -1131,26 +1152,42 @@ async def _sync_soul_after_start(
     try:
         _owner_name = None
         _owner_email = None
-        async with async_session_maker() as db:
-            result = await db.execute(
-                select(SoulConfig).where(SoulConfig.user_id == user_id)
+        # Poll for the SoulConfig instead of giving up on the first read. The
+        # container can be (re)provisioned BEFORE the user finishes the Soul step
+        # — most importantly when the container-backfill reconciler cold-rebuilds
+        # a freshly-claimed container mid-onboarding. A single read + early-return
+        # then permanently regresses the agent to the "Agent Owner" stub greeting
+        # AND an unnamed agent (sidebar shows generic "agent" not the chosen name),
+        # because this HTTP push is the cold path's ONLY identity carrier. Retry
+        # briefly so a soul-save that races the (re)provision still lands.
+        soul = None
+        for _soul_attempt in range(8):
+            async with async_session_maker() as db:
+                soul = (await db.execute(
+                    select(SoulConfig).where(SoulConfig.user_id == user_id)
+                )).scalar_one_or_none()
+            if soul:
+                break
+            await asyncio.sleep(3)
+        if not soul:
+            logger.warning(
+                "[SOUL] no SoulConfig after retries for %s — skipping identity sync",
+                user_id[:8],
             )
-            soul = result.scalar_one_or_none()
-            if not soul:
-                return
-            # Owner identity — pushed alongside the soul so a recreated
-            # container (whose env body omits user_name) doesn't regress to
-            # the "Agent Owner" stub greeting. Captured as plain strings
-            # before the session closes.
-            try:
-                from app.db.models import User as _User
+            return
+        # Owner identity — pushed alongside the soul so a recreated container
+        # (whose env body omits user_name) doesn't regress to the "Agent Owner"
+        # stub greeting. Captured as plain strings before the session closes.
+        try:
+            from app.db.models import User as _User
+            async with async_session_maker() as db:
                 _owner = (await db.execute(
                     select(_User).where(_User.id == user_id)
                 )).scalar_one_or_none()
                 _owner_name = (getattr(_owner, "name", None) or None)
                 _owner_email = (getattr(_owner, "email", None) or None)
-            except Exception:
-                _owner_name = _owner_email = None
+        except Exception:
+            _owner_name = _owner_email = None
 
         async with _httpx.AsyncClient(timeout=15) as client:
             resp = await client.put(

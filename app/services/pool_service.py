@@ -275,6 +275,15 @@ async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedCont
         db.add(container)
     container.container_name = container_name
     container.host_port = int(host_port)
+    # Persist the bridge's real docker container_id (added to the claim
+    # response 2026-06). Without this the row is born container_id=NULL and the
+    # container-backfill reconciler (predicate `container_id IS NULL`,
+    # docker_host_service.backfill_sentinel_image_containers) COLD-REBUILDS this
+    # perfectly-healthy warm container ~one reconciler tick later — the
+    # warm-claim-abandoned-then-cold-build latency bug. `.get` tolerates an old
+    # bridge image that doesn't yet return the field (stays NULL, A3 health-gates
+    # the rebuild as the safety net).
+    container.container_id = data.get("container_id")
     # Stamp the REAL image_tag the pool container is actually running —
     # NOT settings.docker_agent_image which is the "toup-agent:latest"
     # sentinel ("intentionally a safe sentinel, not a deployable tag" per

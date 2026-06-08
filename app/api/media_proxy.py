@@ -424,15 +424,18 @@ def _cached_extract(video_id: str) -> dict:
 # track (first play AND manual skip; the RNTP queue prebuffer only pre-rolls
 # near a track's natural end, not on a mid-track skip).
 #
-# Fix: remux the small audio-only itag 140 (single-URL AAC m4a, ~3.6MB) into a
-# PROGRESSIVE faststart m4a once, cache it on local disk, and serve THAT from
-# /audio_stream. Result: audio-only (~25x less data) AND served from local disk
-# (no googlevideo round-trip / proxy on playback) → sub-second starts. The cold
-# remux (download ~3.6MB + ffmpeg -c:a copy) is ~5s, hidden by the mobile
-# pre-warm (media_play → /audio_url) during the agent turn / current track.
-# Fail-open: any ffmpeg/extraction/remux miss → /audio_stream falls back to the
-# itag-18 proxy (today's behaviour), never a regression. Mobile-only: the web
-# plays via the YouTube iframe and never hits /audio_stream.
+# Fix: once per video, download the UN-THROTTLED itag-18 (the same extraction
+# the proxy already uses — android/ios client + POT pulls at ~2-5 MB/s) and
+# ffmpeg-strip the video into a PROGRESSIVE faststart audio-only m4a, cached on
+# local disk; /audio_stream then serves THAT. Result: audio-only (~25x less data)
+# AND served from local disk (no googlevideo round-trip / proxy on playback) →
+# sub-second starts. The cold remux (download itag-18 + ffmpeg -c:a copy) is a
+# few seconds, hidden by the mobile pre-warm (media_play → /audio_url) during the
+# agent turn / current track. (We do NOT source the audio-only itag-140: from
+# the default client its `n` challenge is unsolved so YouTube throttles it to
+# ~32 KB/s — a full pull is ~111s.) Fail-open: any ffmpeg/extraction/remux miss
+# → /audio_stream falls back to the itag-18 proxy (today's behaviour), never a
+# regression. Mobile-only: web plays via the YouTube iframe, never /audio_stream.
 _AUDIO_CACHE_DIR = os.environ.get("AUDIO_REMUX_CACHE_DIR", "/tmp/toup_audio_remux")
 _AUDIO_CACHE_MAX_FILES = 80
 _remux_inflight: set[str] = set()
@@ -470,45 +473,6 @@ def _safe_unlink(p: str) -> None:
         pass
 
 
-def _extract_audio_only_url(video_id: str) -> str | None:
-    """Resolve the small audio-only (itag 140 / bestaudio m4a) SINGLE url,
-    reusing _extract_audio's multi-client + cookies + proxy + PO-token
-    discipline. Returns None if every client misses or only offers fragmented
-    audio (which ffmpeg-from-URL can't read in one shot). Blocking."""
-    import yt_dlp
-
-    cookiefile = _resolve_cookiefile()
-    pot_base = (settings.bgutil_pot_base_url or "").strip()
-    for client in _PLAYER_CLIENTS:
-        extractor_args: dict = {"youtube": {"player_client": [client]}}
-        if pot_base:
-            extractor_args["youtubepot-bgutilhttp"] = {"base_url": [pot_base]}
-        opts: dict = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "format": "140/bestaudio[ext=m4a]/bestaudio",
-            "socket_timeout": 10,
-            "extractor_args": extractor_args,
-        }
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
-        if settings.yt_dlp_proxy:
-            opts["proxy"] = settings.yt_dlp_proxy
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(
-                    f"https://www.youtube.com/watch?v={video_id}", download=False
-                )
-        except Exception as e:
-            if _should_try_next_client(e):
-                continue
-            return None
-        if info and info.get("url") and not info.get("fragments"):
-            return info["url"]
-    return None
-
-
 def _do_remux(video_id: str) -> str | None:
     """Blocking: extract the audio-only URL → ffmpeg remux to a progressive
     faststart m4a on local disk. Returns the cached path, or None so the caller
@@ -518,10 +482,16 @@ def _do_remux(video_id: str) -> str | None:
         return ready
     if not _ffmpeg_available():
         return None
-    url = _extract_audio_only_url(video_id)
-    if not url:
-        logger.warning("[media_proxy] remux: no single-url audio for video_id=%s", video_id)
+    # Source the UN-THROTTLED itag-18 (android/ios client + POT, ~2-5 MB/s) via
+    # the same extraction the proxy already uses — then ffmpeg strips the video.
+    # We do NOT use the audio-only itag-140: from the default client it has no
+    # solved `n` challenge so YouTube throttles it to ~32 KB/s (a full pull is
+    # ~111s). itag-18 is bigger but downloads in seconds, so the remux is fast.
+    result = _cached_extract(video_id)
+    if "error" in result or not result.get("url"):
+        logger.warning("[media_proxy] remux: extract miss for video_id=%s", video_id)
         return None
+    url = result["url"]
     try:
         os.makedirs(_AUDIO_CACHE_DIR, exist_ok=True)
     except OSError:
