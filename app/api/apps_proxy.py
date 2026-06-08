@@ -5,6 +5,7 @@ App data (built apps, build jobs) lives on the user's VPS.
 The platform is a passthrough proxy only.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -657,25 +658,42 @@ async def get_server_info(current_user=Depends(get_current_user), db: AsyncSessi
 
 @router.get("/capabilities")
 async def get_capabilities(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """Fetch all loaded tools and skills from the VPS agent."""
+    """Fetch all loaded tools and skills from the VPS agent.
+
+    A cold/recycling agent container can be briefly unreachable. Returning an
+    empty body on that transient miss made the /agent dashboard flap between
+    refreshes — the real skills/tools would vanish, then reappear, reshuffling
+    the cards. So we retry once, and on a genuine failure return
+    ``unavailable: True`` (NOT empty data) so the client keeps its last-known
+    capabilities instead of rendering an empty agent. ``no agent deployed`` is a
+    distinct, legitimate empty (no ``unavailable`` flag).
+    """
     agent_info = await _get_agent(current_user.id, db)
     if not agent_info:
         return JSONResponse(content={"core_tools": [], "skills": [], "total_tools": 0})
     agent_url, key, _ = agent_info
     # TKT-LAT-007 (wave 3): shared agent_http client.
     from app.services.agent_http import get_agent_http_client
-    try:
-        client = get_agent_http_client()
-        resp = await client.get(
-            f"{agent_url}/agent/capabilities",
-            headers={"X-Agent-Key": key},
-            timeout=10.0,
-        )
-        if resp.status_code == 200:
-            return JSONResponse(content=resp.json())
-    except Exception as e:
-        logger.warning("Capabilities proxy failed: %s", e)
-    return JSONResponse(content={"core_tools": [], "skills": [], "total_tools": 0})
+    client = get_agent_http_client()
+    last_err: Optional[str] = None
+    for attempt in range(2):
+        try:
+            resp = await client.get(
+                f"{agent_url}/agent/capabilities",
+                headers={"X-Agent-Key": key},
+                timeout=12.0,
+            )
+            if resp.status_code == 200:
+                return JSONResponse(content=resp.json())
+            last_err = f"HTTP {resp.status_code}"
+        except Exception as e:  # noqa: BLE001 — any transport error is transient here
+            last_err = str(e)
+        if attempt == 0:
+            await asyncio.sleep(1.0)  # give a cold container a moment to warm
+    logger.warning("Capabilities proxy failed after retry: %s", last_err)
+    return JSONResponse(
+        content={"core_tools": [], "skills": [], "total_tools": 0, "unavailable": True}
+    )
 
 
 # ── App endpoints ───────────────────────────────────────────
