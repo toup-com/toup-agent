@@ -26,6 +26,7 @@ Callers:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import secrets
@@ -142,7 +143,14 @@ async def activate_free_tier(
         project_label = None
     try:
         from app.api.billing import _provision_openai_project_if_needed
-        _provision_openai_project_if_needed(cfg, user_name=project_label)
+        # _provision_openai_project_if_needed is SYNC and makes blocking OpenAI
+        # Admin-API round-trips (create project + service-account key, ~3-6s on
+        # a fresh user). Run it in a worker thread so it never stalls the event
+        # loop — this runs on the signup hot path, where blocking the loop
+        # serializes every concurrent request behind it.
+        await asyncio.to_thread(
+            _provision_openai_project_if_needed, cfg, user_name=project_label,
+        )
     except Exception as e:
         logger.warning(
             "free_tier_activation: OpenAI project auto-provisioning failed "

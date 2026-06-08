@@ -46,24 +46,35 @@ def _spawn_background(coro) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _bg_pool_claim_on_signup(user_id: str) -> None:
-    """Warm-pool claim for a fresh OAuth signup, run OFF the request path.
+async def _bg_finalize_signup(user_id: str) -> None:
+    """Finish a fresh OAuth signup OFF the request path: mint the free-tier
+    bundle creds, then claim the warm pool.
 
-    The Google callback used to ``await`` this inline, adding ~2s (the mTLS
-    bridge claim) to the redirect the user waits on. The claim only has to land
-    before the user's FIRST chat message — comfortably after they walk through
-    onboarding — so we run it on its own DB session in the background. The
-    inline free-tier credential mint is already committed before this is
-    scheduled, so the bind still injects TOUP_TOKEN on first boot.
+    Both used to run inline in the Google callback. The free-tier activation in
+    particular provisions a per-user OpenAI project via a SLOW synchronous
+    Admin-API call (~3-6s) — pure dead weight on the redirect the user waits on.
+    Neither has to finish before that redirect: the first chat message is ~30s
+    out (after onboarding), and the onboarding flow re-activates the free tier
+    as a backstop. Runs on its own DB session, with activation BEFORE the claim
+    so the bridge bind still injects TOUP_TOKEN on first boot. Idempotent;
+    failures only log.
     """
     try:
         from app.db import async_session_maker
+        from app.services.free_tier_activation import activate_free_tier
         from app.services.pool_service import claim_or_prewarm
         async with async_session_maker() as bg_db:
+            try:
+                await activate_free_tier(bg_db, user_id, force_env_push=False)
+            except Exception as ae:
+                logger.warning(
+                    "[google-auth] bg free-tier activation failed user=%s: %s",
+                    user_id[:8], ae,
+                )
             await claim_or_prewarm(bg_db, user_id)
     except Exception as e:
         logger.warning(
-            "[google-auth] background prewarm/claim failed user=%s: %s",
+            "[google-auth] background finalize failed user=%s: %s",
             user_id[:8], e,
         )
 
@@ -795,27 +806,15 @@ async def google_auth_callback(
                     dirty = True
                 if dirty:
                     await db.commit()
-                # Mint the free-tier bundle LLM credentials BEFORE the pool
-                # claim so the bridge bind injects TOUP_TOKEN / LLM_MODE on
-                # the container's first boot and the user's FIRST chat message
-                # authenticates to the LLM proxy. Without this a new Gmail
-                # signup's first "hi" 401s → "Your API key is invalid." Runs
-                # only inside this is_new branch, so an existing user's chosen
-                # llm_mode (e.g. BYOK) is never clobbered on later logins.
-                try:
-                    from app.services.free_tier_activation import activate_free_tier
-                    await activate_free_tier(db, str(user.id), force_env_push=False)
-                except Exception as _ae:
-                    logger.warning(
-                        "[google-auth] free-tier activation failed user=%s: %s",
-                        str(user.id)[:8], _ae,
-                    )
-                # Persist the inline config + minted creds, then hand the SLOW
-                # bridge claim to the background so it doesn't add ~2s to the
-                # OAuth redirect the user is waiting on. The claim reads the
-                # now-committed creds on its own session and is idempotent.
-                await db.commit()
-                _spawn_background(_bg_pool_claim_on_signup(str(user.id)))
+                # Hand the free-tier activation AND the bridge claim to the
+                # background so neither blocks the OAuth redirect. Activation
+                # mints the bundle creds and provisions a per-user OpenAI project
+                # (a slow sync Admin-API call, ~3-6s) — none of which the user
+                # waits on: the first chat message is ~30s out (post-onboarding),
+                # the finalize runs activation BEFORE the claim so the bind still
+                # injects TOUP_TOKEN, and the onboarding flow re-activates the
+                # free tier as a backstop.
+                _spawn_background(_bg_finalize_signup(str(user.id)))
             except Exception as e:
                 logger.warning(
                     "[google-auth] prewarm/claim failed user=%s: %s",
