@@ -449,6 +449,31 @@ _remux_inflight_lock = asyncio.Lock()
 # ffmpeg -c:a copy); the prewarm usually finishes it earlier. 15s covers long
 # tracks without hanging the request.
 _REMUX_SYNC_BUDGET_SECS = float(os.environ.get("AUDIO_REMUX_SYNC_BUDGET_SECS", "15"))
+# Cap concurrent remux BUILDS. Each build pulls ~11.8MB of itag-18 through the
+# residential proxy (the user's Mac), whose uplink is the bottleneck. The mobile
+# prefetch window fires several builds at once; left unbounded they saturate the
+# uplink → the song the user is actually listening to stalls (PlaybackError 4 /
+# silence) and every build crawls. Bounding to 2 keeps the uplink available for
+# live playback while still warming the window. Created lazily so it binds to the
+# running loop.
+_REMUX_BUILD_CONCURRENCY = int(os.environ.get("AUDIO_REMUX_BUILD_CONCURRENCY", "2"))
+_build_sem: "asyncio.Semaphore | None" = None
+
+
+def _get_build_sem() -> "asyncio.Semaphore":
+    global _build_sem
+    if _build_sem is None:
+        _build_sem = asyncio.Semaphore(_REMUX_BUILD_CONCURRENCY)
+    return _build_sem
+
+
+async def _bounded_build(video_id: str) -> str | None:
+    """Run _do_remux under the global build-concurrency cap so concurrent prefetch
+    builds can't saturate the residential proxy uplink and starve live playback."""
+    async with _get_build_sem():
+        return await asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
+
+
 _FFMPEG_OK: bool | None = None
 
 
@@ -629,9 +654,7 @@ async def _remux_now(video_id: str, budget: float) -> str | None:
             _remux_tasks.pop(k, None)
         task = _remux_tasks.get(video_id)
         if task is None:
-            task = asyncio.ensure_future(
-                asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
-            )
+            task = asyncio.ensure_future(_bounded_build(video_id))
             _remux_tasks[video_id] = task
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=budget)
