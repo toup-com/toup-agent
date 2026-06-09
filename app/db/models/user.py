@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional, List
 import uuid
 
-from sqlalchemy import String, DateTime, Boolean, JSON
+from sqlalchemy import String, DateTime, Boolean, JSON, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
@@ -60,6 +60,13 @@ class User(Base):
     # Throttle resends — /auth/send-verification refuses with 429 if a
     # send already happened in the last 60s.
     email_verification_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # Sign in with Apple refresh token, Fernet-encrypted (credential_crypto).
+    # Captured at sign-in by exchanging the one-time authorization_code so
+    # account deletion can revoke the Apple grant (Guideline 5.1.1(v)).
+    # NULL for email/Google users and for Apple sign-ins that happened
+    # before the SIWA signing key was configured. Migration 061.
+    apple_refresh_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Account-level notification opt-in toggles. JSONB lets us add new
     # toggles (eg. weekly_digest, mention_emails) without an ALTER per

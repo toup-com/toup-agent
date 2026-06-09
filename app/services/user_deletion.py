@@ -360,6 +360,30 @@ async def delete_user_completely(
             openai_archived = False
     # else: openai_archived stays None (n/a)
 
+    # ── Sign in with Apple token revocation (SOFT-FAIL) ────────────────
+    # Guideline 5.1.1(v): if the user signed in with Apple, revoke their
+    # Apple grant before the row is wiped. Read + revoke now, while the
+    # encrypted refresh token still exists on the row. Soft-fail — Apple
+    # being unreachable, or the SIWA key being unset, must not block the
+    # user-data deletion. NULL token (email/Google users) → no-op.
+    try:
+        from app.services.apple_auth import revoke_token, siwa_revocation_configured
+        if siwa_revocation_configured():
+            from app.db.models import User
+            row = await db.execute(
+                select(User.apple_refresh_token).where(User.id == user_id)
+            )
+            enc = row.scalar_one_or_none()
+            if enc:
+                from app.services.credential_crypto import decrypt_str
+                ok = await revoke_token(decrypt_str(enc))
+                logger.info("[DELETE-USER] Apple token revoke for %s: %s", prefix, ok)
+    except Exception as e:
+        logger.warning(
+            "[DELETE-USER] Apple token revoke raised for %s — continuing: %s",
+            prefix, e,
+        )
+
     # ── Txn 2: wipe agent + platform tables (savepointed) ──────────────
     # Each _safe_exec wraps in begin_nested() so a missing table doesn't
     # poison the outer transaction. Failure of any one table is logged

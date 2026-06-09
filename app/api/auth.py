@@ -1027,6 +1027,28 @@ async def apple_auth(
     if not user.is_active:
         raise HTTPException(status_code=403, detail="This account has been disabled.")
 
+    # Capture an Apple refresh token so account deletion can revoke the
+    # grant (Guideline 5.1.1(v)). The authorization_code is one-time and
+    # short-lived, so we must exchange it now. Best-effort: a failure here
+    # (or an unconfigured SIWA key) must never block sign-in.
+    if body.authorization_code:
+        try:
+            from app.services.apple_auth import (
+                exchange_authorization_code, siwa_revocation_configured,
+            )
+            if siwa_revocation_configured():
+                tokens = await exchange_authorization_code(body.authorization_code)
+                refresh = (tokens or {}).get("refresh_token")
+                if refresh:
+                    from app.services.credential_crypto import encrypt_str
+                    user.apple_refresh_token = encrypt_str(refresh)
+                    await db.commit()
+        except Exception as e:
+            logger.warning(
+                "[apple-auth] refresh-token capture failed user=%s: %s",
+                str(user.id)[:8], e,
+            )
+
     token = create_access_token(user.id)
     try:
         await record_login_session(db, user.id, token, request)

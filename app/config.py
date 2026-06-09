@@ -604,6 +604,19 @@ class Settings(BaseSettings):
     # app's bundle id; override via APPLE_CLIENT_ID for a web Service ID.
     apple_client_id: str = "ai.toup.app"
 
+    # Sign in with Apple — token revocation (Guideline 5.1.1(v)). When a
+    # user deletes their account we must revoke their Apple tokens via
+    # Apple's REST API (auth/token + auth/revoke), which requires a
+    # client_secret JWT signed with a "Sign in with Apple" key (.p8)
+    # created in the Apple Developer portal (Keys → enable Sign in with
+    # Apple, scoped to the primary App ID). These are SEPARATE from the
+    # App Store Connect API key. If any is unset, the exchange/revoke
+    # calls no-op and we log a warning — so deploying this code before
+    # the key exists is safe (sign-in is unaffected).
+    apple_team_id: str = ""        # Set via APPLE_TEAM_ID (10-char, e.g. 5W2R26Z4H7)
+    apple_key_id: str = ""         # Set via APPLE_KEY_ID — the Sign in with Apple key's Key ID
+    apple_private_key: str = ""    # Set via APPLE_PRIVATE_KEY — the .p8 PEM contents (literal \n tolerated)
+
     # ── VPS Provisioning (AWS + Stripe) ──────────────────────
     aws_access_key_id: Optional[str] = None        # Set via AWS_ACCESS_KEY_ID
     aws_secret_access_key: Optional[str] = None    # Set via AWS_SECRET_ACCESS_KEY
