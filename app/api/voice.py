@@ -47,6 +47,31 @@ async def _get_user_openai_key(user_id: str, db: AsyncSession) -> Optional[str]:
     return result.scalar_one_or_none()
 
 
+# Whisper only accepts these containers; anything else 400s. The temp-file
+# extension MUST match the actual bytes, because downstream we hand Whisper a
+# filename + content-type derived from that extension. The web client uploads
+# webm; mobile uploads m4a (AAC). Hard-coding .webm here makes Whisper try to
+# demux mobile's AAC as webm → "Whisper API returned 400" on every dictation.
+_WHISPER_EXTS = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".oga", ".ogg", ".wav", ".webm"}
+_CONTENT_TYPE_EXT = {
+    "audio/webm": ".webm", "audio/ogg": ".ogg", "audio/oga": ".oga",
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
+    "audio/m4a": ".m4a", "audio/x-m4a": ".m4a",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/flac": ".flac",
+}
+
+
+def _audio_suffix(upload: UploadFile) -> str:
+    """Pick a Whisper-supported file extension from the upload, never trusting
+    a single source: filename first, then content-type, then webm as the
+    last-resort default (matches the web client)."""
+    ext = os.path.splitext(upload.filename or "")[1].lower()
+    if ext in _WHISPER_EXTS:
+        return ext
+    content_type = (upload.content_type or "").split(";")[0].strip().lower()
+    return _CONTENT_TYPE_EXT.get(content_type, ".webm")
+
+
 @router.post("/transcribe")
 async def transcribe_audio(
     audio: UploadFile = File(...),
@@ -59,10 +84,14 @@ async def transcribe_audio(
 
     user_key = await _get_user_openai_key(current_user.id, db)
 
-    tmp_path = f"/tmp/voice_{current_user.id}_{int(time.time())}.webm"
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="ERROR: Empty audio upload.")
+
+    tmp_path = f"/tmp/voice_{current_user.id}_{int(time.time())}{_audio_suffix(audio)}"
     try:
         with open(tmp_path, "wb") as f:
-            f.write(await audio.read())
+            f.write(data)
         text = await transcribe_voice(tmp_path, language=language, api_key=user_key)
         if text.startswith("ERROR:"):
             raise HTTPException(status_code=400, detail=text)
