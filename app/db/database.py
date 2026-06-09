@@ -284,6 +284,12 @@ async def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_token VARCHAR(64)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_sent_at TIMESTAMP",
+        # Mig 061 (Sign in with Apple). Tenant DBs are migrated by THIS list,
+        # not alembic — without it, an agent on the new image whose User model
+        # has `apple_refresh_token` 500s on every User query (sessions, ws/chat
+        # → "Connection lost") against its pre-mig tenant DB. Mirror it here so
+        # every agent boot/recycle self-heals.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_refresh_token TEXT",
         # ── Agent configs ──
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_mode VARCHAR(20) DEFAULT 'manual'",
         # Mig 057 (onboarding-v2 PR 2) — backfill column preserves the
