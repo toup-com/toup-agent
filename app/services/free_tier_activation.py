@@ -51,6 +51,62 @@ class ActivationResult:
     env_error: Optional[str] = None
 
 
+def _schedule_openai_project_provision(user_id: str) -> None:
+    """Fire-and-forget: create the user's per-tenant OpenAI project off the
+    request critical path. Keeps signup/activation from blocking on the OpenAI
+    Admin API (the per-tenant key is non-load-bearing — the proxy falls back to
+    the platform master key until it lands)."""
+    import asyncio
+    try:
+        asyncio.create_task(_run_openai_project_provision(user_id))
+    except RuntimeError:
+        # No running event loop (e.g. a sync management context) — skip; the
+        # backfill reconciler will provision the project on its next pass.
+        logger.warning(
+            "free_tier_activation: no event loop to schedule OpenAI provisioning "
+            "user=%s — backfill reconciler will cover it", str(user_id)[:8],
+        )
+
+
+async def _run_openai_project_provision(user_id: str) -> None:
+    """Background entry point for `_schedule_openai_project_provision`. Opens its
+    OWN session (the request's is closed once the endpoint returns) and runs the
+    blocking Admin-API call in a thread so it never stalls the event loop.
+    Best-effort — the master-key fallback + backfill reconciler cover failures."""
+    import asyncio
+    from app.db.database import async_session_maker
+    try:
+        async with async_session_maker() as db:
+            cfg = (await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == user_id)
+            )).scalar_one_or_none()
+            if cfg is None or (cfg.bundle_openai_project_id and cfg.bundle_openai_api_key):
+                return
+            # Prefer the agent persona name for the OpenAI dashboard label
+            # (toup-<AGENT>-<prefix>), falling back to the user's display name.
+            project_label: Optional[str] = None
+            try:
+                if cfg.agent_name:
+                    project_label = cfg.agent_name
+                else:
+                    from app.db.models import User
+                    u = await db.get(User, user_id)
+                    project_label = (u.name if u else None) or None
+            except Exception:
+                project_label = None
+            from app.api.billing import _provision_openai_project_if_needed
+            await asyncio.to_thread(
+                _provision_openai_project_if_needed, cfg, user_name=project_label
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning(
+            "free_tier_activation: background OpenAI project provisioning failed "
+            "user=%s err=%s — proxy uses master key; reconciler will retry",
+            str(user_id)[:8], e,
+        )
+
+
 async def activate_free_tier(
     db: AsyncSession,
     user_id: str,
@@ -112,54 +168,22 @@ async def activate_free_tier(
         if cfg.llm_mode != "bundle":
             cfg.llm_mode = "bundle"
 
-    # Per-user OpenAI project auto-provisioning. The paid-bundle path
-    # has called this since the β architecture shipped (see
-    # billing.py::_provision_openai_project_if_needed), but Free signups
-    # were skipping it — every fresh Free user's OpenAI calls fell back
-    # to the platform master key, with no per-project usage attribution
-    # in the OpenAI dashboard (operator screenshot 2026-05-24 showed
-    # `toup-tenant-*` projects stopped being created post-credit-system).
-    #
-    # Pass the AGENT name through so the OpenAI dashboard shows
-    # `toup-<AGENT>-<prefix>` (e.g. `toup-Aria-9a7f2fe9`) — that's the
-    # persona behind the project's API calls and is the more meaningful
-    # identifier when scanning the project list. Falls back to the user's
-    # display name if no agent_name is set yet (e.g. activation runs
-    # before Soul step), then to the legacy `toup-tenant-<prefix>`.
-    #
-    # Idempotent — early-returns if cfg.bundle_openai_project_id is
-    # already set. Failures swallow & log; the proxy's master-key
-    # fallback keeps the agent working even if OpenAI Admin API is
-    # unavailable.
-    project_label: Optional[str] = None
-    try:
-        if cfg.agent_name:
-            project_label = cfg.agent_name
-        else:
-            from app.db.models import User
-            u = await db.get(User, user_id)
-            project_label = (u.name if u else None) or None
-    except Exception:
-        project_label = None
-    try:
-        from app.api.billing import _provision_openai_project_if_needed
-        # _provision_openai_project_if_needed is SYNC and makes blocking OpenAI
-        # Admin-API round-trips (create project + service-account key, ~3-6s on
-        # a fresh user). Run it in a worker thread so it never stalls the event
-        # loop — this runs on the signup hot path, where blocking the loop
-        # serializes every concurrent request behind it.
-        await asyncio.to_thread(
-            _provision_openai_project_if_needed, cfg, user_name=project_label,
-        )
-    except Exception as e:
-        logger.warning(
-            "free_tier_activation: OpenAI project auto-provisioning failed "
-            "user=%s err=%s — falling back to platform master key",
-            str(user_id)[:8], e,
-        )
-
     await db.commit()
     await db.refresh(cfg)
+
+    # Per-user OpenAI project auto-provisioning, scheduled OFF the request path.
+    # _provision_openai_project_if_needed makes SYNCHRONOUS, blocking calls to
+    # OpenAI's Admin API (create project + service-account key) — several
+    # seconds that used to land squarely in the signup critical path, so a new
+    # user watched a spinner for it. The per-tenant project is NOT load-bearing:
+    # until it lands the proxy uses the platform master key (documented fallback
+    # in billing._provision_openai_project_if_needed) and the backfill
+    # reconciler cures any config that never got one. The load-bearing
+    # connect_token / bundle_status above is already committed synchronously, so
+    # the user's first chat still authenticates immediately. Idempotent +
+    # guarded so we never spawn the work when the project already exists.
+    if not (cfg.bundle_openai_project_id and cfg.bundle_openai_api_key):
+        _schedule_openai_project_provision(str(user_id))
 
     env_pushed = False
     env_error: Optional[str] = None
