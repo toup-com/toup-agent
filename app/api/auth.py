@@ -978,8 +978,21 @@ async def apple_auth(
         # OAuth signup — random unguessable password (no /login until the
         # user sets one via password-change). Mirrors the Google path.
         random_password = _secrets.token_urlsafe(48)
+        # Apple sends `fullName` ONLY on the very first authorization for an
+        # (Apple ID, app) pair; every later sign-in — and any signup after a
+        # prior failed/reset attempt (e.g. the pre-PLA-acceptance failures) —
+        # returns it empty. Mirror the Google path (_pick_google_display_name)
+        # and fall back to the email local-part so the User row's `name` never
+        # lands empty. An empty name doesn't just show the raw email in the
+        # sidebar/avatar — it also makes the Soul→VPS owner-name sync
+        # (soul.py: owner_name=current_user.name) push None, which is what
+        # surfaces as the agent calling its owner "Agent"/"Owner".
+        _apple_name = (body.full_name or "").strip()
+        if not _apple_name:
+            _local = (email or "").split("@", 1)[0].strip()
+            _apple_name = _local[:64] if _local else "User"
         user = await create_user(
-            db, email=email, password=random_password, name=(body.full_name or None),
+            db, email=email, password=random_password, name=_apple_name,
         )
         is_new = True
         if email_verified:
