@@ -114,6 +114,15 @@ let selfJid = null;
 let latestQrString = null;
 let latestQrPngDataUrl = null;
 let latestQrAt = null;                   // ISO timestamp
+// Diagnostics + race-guard for the pairing-code flow. `lastPairError` captures
+// the reason a socket closed (401/conflict/428/429 = WhatsApp anti-abuse; 515 =
+// expected pair-success restart) so /pair/status can surface WHY a code failed
+// to link. `pairingInProgress` is true between code-mint and connection:open and
+// stops a transient close from silently recreating the socket — which would mint
+// a fresh pairing ref the user's already-typed code can't match (orphan race).
+let lastPairError = null;
+let pairingInProgress = false;
+let pairingTimer = null;
 let inboundCount = 0;
 let lastInboundAt = null;
 let lastSendAt = null;
@@ -370,6 +379,8 @@ function wireSocket(s, saveCreds) {
     }
 
     if (connection === 'open') {
+      pairingInProgress = false;
+      if (pairingTimer) { clearTimeout(pairingTimer); pairingTimer = null; }
       connected = true;
       sessionStatus = 'linked';
       latestQrString = null;
@@ -401,7 +412,12 @@ function wireSocket(s, saveCreds) {
         lastDisconnect?.error?.output?.statusCode ||
         lastDisconnect?.error?.status ||
         null;
-      log('connection.close', { status, message: String(lastDisconnect?.error || '') });
+      const closeMsg = String(lastDisconnect?.error || '').slice(0, 300);
+      log('connection.close', { status, message: closeMsg });
+      // Record the close reason so /pair/status can surface WHY a pairing
+      // failed. during_pairing + a non-515 status (401/conflict/428/429) is the
+      // anti-abuse signature; 515 is the expected pair-success restart.
+      lastPairError = { status, message: closeMsg, during_pairing: pairingInProgress, at: new Date().toISOString() };
 
       // Drop the socket reference — every reconnect path below will
       // reassign it via createSocket(). Forgetting to clear this was
@@ -413,9 +429,12 @@ function wireSocket(s, saveCreds) {
 
       // 515 — Baileys signals "stream-errored, restart required" right
       // after pair-success. The auth dir is now populated; closing
-      // and recreating completes the link.
+      // and recreating completes the link. Creds are saved by now, so the
+      // pairing window is over — clear the guard and reconnect normally.
       if (status === 515) {
         log('connection.restart_required');
+        pairingInProgress = false;
+        if (pairingTimer) { clearTimeout(pairingTimer); pairingTimer = null; }
         if (!restarting) {
           restarting = true;
           try {
@@ -426,6 +445,20 @@ function wireSocket(s, saveCreds) {
             restarting = false;
           }
         }
+        return;
+      }
+
+      // A non-515 close DURING an active pairing-code attempt means WhatsApp
+      // rejected/dropped the companion registration (anti-abuse) or a transient
+      // blip hit mid-entry. Do NOT silently recreate — that mints a fresh
+      // pairing ref the user's already-typed code can't match (orphan race).
+      // Surface it via lastPairError; the user requests a fresh code.
+      if (pairingInProgress) {
+        pairingInProgress = false;
+        if (pairingTimer) { clearTimeout(pairingTimer); pairingTimer = null; }
+        sessionStatus = (status === DisconnectReason.loggedOut || status === 401) ? 'logged_out' : 'not_linked';
+        warn('pairing_aborted', { status, message: closeMsg });
+        emitEvent({ type: 'pairing_failed', status });
         return;
       }
 
@@ -692,6 +725,12 @@ async function handlePairCode(req, res) {
     sendJson(res, 400, { ok: false, error: 'phone (E.164 digits) required' });
     return;
   }
+  // Open the pairing window: guards the socket against the orphan-recreate race
+  // until the link completes (connection:open), a 515 restart, or a 150s timeout.
+  pairingInProgress = true;
+  lastPairError = null;
+  if (pairingTimer) clearTimeout(pairingTimer);
+  pairingTimer = setTimeout(() => { pairingInProgress = false; }, 150000);
   try {
     if (sock) {
       try { sock.end(undefined); } catch {}
@@ -814,6 +853,8 @@ function handlePairStatus(req, res) {
     self_e164: selfE164,
     qr_data_url: latestQrPngDataUrl,
     qr_emitted_at: latestQrAt,
+    pairing_in_progress: pairingInProgress,
+    last_pair_error: lastPairError,
   });
 }
 
