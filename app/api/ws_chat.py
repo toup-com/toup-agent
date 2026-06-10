@@ -501,8 +501,15 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
 
     channel = (msg.get("channel") or "").strip().lower()
     enabled = bool(msg.get("enabled"))
+    # `_auto`: this enable was triggered server-side right after a fast-path
+    # "play me X" (default-radio), NOT by a user tapping the toggle. The seed is
+    # ALREADY playing from the fast-path media_play, so we must NOT re-broadcast
+    # it (a second media_play would cold-reload the in-flight track → restart).
+    # We still build the station + flip the toggle ON; the queue prefetches from
+    # the first auto-advance onward.
+    auto = bool(msg.get("_auto"))
 
-    print(f"[radio] toggle entry user={user_id[:8]} channel={channel!r} enabled={enabled} msg={msg}", flush=True)
+    print(f"[radio] toggle entry user={user_id[:8]} channel={channel!r} enabled={enabled} auto={auto} msg={msg}", flush=True)
 
     if not RadioSessionManager.is_channel_allowed(channel):
         print(f"[radio] toggle REJECT channel_not_supported channel={channel!r}", flush=True)
@@ -640,31 +647,36 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
     # unrelated iframe track ends. Net: radio does nothing until manual
     # playback. Broadcast media_play for the seed so loadVideoById runs and
     # iframe ↔ session sync by construction.
-    already_iframe_synced = (
-        sess.current_track_id == seed_video_id and top is None
-    )
-    print(
-        f"[radio] toggle_seed_playback seed={seed_video_id} source=toggle_on "
-        f"already_playing={already_iframe_synced}",
-        flush=True,
-    )
-    from app.agent.radio.player import broadcast_radio_track
-    seed_title_full = (seed_meta.title if seed_meta else seed_title) or "Now Playing"
-    await broadcast_radio_track(
-        user_id=user_id,
-        video_id=seed_video_id,
-        title=seed_title_full,
-        channel=channel,
-        artist=(seed_meta.artist if seed_meta else ""),
-        thumbnail_url=(seed_meta.thumbnail_url if seed_meta else ""),
-        video_type=(seed_meta.video_type if seed_meta else ""),
-        reason="toggle_seed",
-        upcoming=_upcoming_tracks(sess),
-    )
-    print(
-        f"[radio] iframe_force_sync from=unknown to={seed_video_id} reason=toggle_on",
-        flush=True,
-    )
+    # Seed playback re-broadcast — USER toggles only. For _auto (default-radio
+    # after a fast-path play) the seed is already playing; skip it to avoid a
+    # cold-reload race. The session already binds current_track_id=seed (enable),
+    # so the seed's media_ended still auto-advances correctly.
+    if not auto:
+        already_iframe_synced = (
+            sess.current_track_id == seed_video_id and top is None
+        )
+        print(
+            f"[radio] toggle_seed_playback seed={seed_video_id} source=toggle_on "
+            f"already_playing={already_iframe_synced}",
+            flush=True,
+        )
+        from app.agent.radio.player import broadcast_radio_track
+        seed_title_full = (seed_meta.title if seed_meta else seed_title) or "Now Playing"
+        await broadcast_radio_track(
+            user_id=user_id,
+            video_id=seed_video_id,
+            title=seed_title_full,
+            channel=channel,
+            artist=(seed_meta.artist if seed_meta else ""),
+            thumbnail_url=(seed_meta.thumbnail_url if seed_meta else ""),
+            video_type=(seed_meta.video_type if seed_meta else ""),
+            reason="toggle_seed",
+            upcoming=_upcoming_tracks(sess),
+        )
+        print(
+            f"[radio] iframe_force_sync from=unknown to={seed_video_id} reason=toggle_on",
+            flush=True,
+        )
 
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
@@ -2094,6 +2106,25 @@ async def ws_chat(
                                 await broadcast_to_user(user_id, _sess.to_broadcast_dict())
                     except Exception as _re:
                         logger.warning("[radio] seed-record failed: %s", _re)
+
+                # Mobile default: a "play me X" search starts RADIO mode, not a
+                # one-off play. Mobile chat uses channel 'mobile', but its radio
+                # session lives on the allow-listed 'app' channel the app
+                # subscribes to. Fire-and-forget: the song already plays via the
+                # fast-path; build the station + flip the toggle ON in the
+                # background. `_auto` skips re-broadcasting the seed (already
+                # playing → no cold-reload race). Web (channel 'web') is untouched.
+                if _fast_result and channel == "mobile":
+                    _ameta = _fast_result[1] or {}
+                    if _ameta.get("video_id"):
+                        asyncio.create_task(_handle_radio_toggle(user_id, {
+                            "channel": "app",
+                            "enabled": True,
+                            "video_id": _ameta.get("video_id", ""),
+                            "title": _ameta.get("title", "") or "Now Playing",
+                            "seed_intent": text.strip(),
+                            "_auto": True,
+                        }))
 
                 # Task intent detection — detect imperative task requests in regular chat
                 _chat_task_job_id = None
