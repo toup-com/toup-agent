@@ -589,7 +589,13 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
     # the UI pinned ON with no queue behind it. We also get back the seed's
     # own metadata from the watch-playlist's index 0 — used below to drive
     # the authoritative iframe swap on toggle-on (Rule 9).
-    seed_meta, station = await build_station(atv_seed, limit=50)
+    seed_meta, station = await build_station(
+        atv_seed,
+        limit=50,
+        # Seed the search-based fallback (regional / non-catalog tracks have no
+        # YT Music Song-radio) — the title alone is usually "Artist - Title".
+        seed_title=(seed_title or seed_intent or ""),
+    )
     if not station:
         print(
             f"[radio] toggle REJECT build_station returned empty "

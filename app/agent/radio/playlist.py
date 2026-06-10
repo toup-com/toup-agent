@@ -167,6 +167,9 @@ def _parse_track(raw: dict) -> Optional[StationTrack]:
 async def build_station(
     seed_video_id: str,
     limit: int = 50,
+    *,
+    seed_title: str = "",
+    seed_artist: str = "",
 ) -> Tuple[Optional[StationTrack], List[StationTrack]]:
     """Return (seed_meta, station) for `seed_video_id` from YT Music Song Radio.
 
@@ -175,7 +178,10 @@ async def build_station(
       video_type the frontend needs for the toggle-on authoritative play
       broadcast. `None` if the response doesn't include the seed.
     - `station` excludes the seed and filters entries missing `videoId` / `title`.
-    - Returns `(None, [])` if YT Music rejects the seed — caller decides fallback.
+    - If YT Music has no Song-radio for the seed (regional / non-catalog tracks
+      return a 200 with empty `tracks`), falls back to a search-based station
+      built from `seed_title`/`seed_artist` — see `_build_station_fallback`. Only
+      `(None, [])` when even the fallback can't find anything; caller rejects then.
 
     Runs `get_watch_playlist` in a thread since ytmusicapi uses blocking
     requests and we're in asyncio land.
@@ -205,9 +211,11 @@ async def build_station(
             f"err={type(e).__name__}: {e}",
             flush=True,
         )
-        return None, []
+        # Don't reject yet — a search-based station may still recover (the seed
+        # often carries a usable title even when get_watch_playlist throws).
+        raw = {}
 
-    tracks_raw = raw.get("tracks") or []
+    tracks_raw = (raw or {}).get("tracks") or []
     seed_meta: Optional[StationTrack] = None
     station: List[StationTrack] = []
     skipped = 0
@@ -226,10 +234,100 @@ async def build_station(
     print(
         f"[radio/playlist] built seed={seed} tracks={len(station)} "
         f"seed_meta={'yes' if seed_meta else 'no'} "
-        f"skipped_invalid={skipped} playlistId={raw.get('playlistId')!r}",
+        f"skipped_invalid={skipped} playlistId={(raw or {}).get('playlistId')!r}",
         flush=True,
     )
-    return seed_meta, station
+    if station:
+        return seed_meta, station
+    # YT Music had no Song-radio for this seed (regional / non-catalog track →
+    # 200 with empty tracks, or the fetch threw above). Recover with a search-
+    # based station rather than rejecting the toggle. Reached ONLY on today's
+    # empty path, so it can never regress a station that already builds.
+    return await _build_station_fallback(seed, seed_title, seed_artist, limit)
+
+
+async def _build_station_fallback(
+    seed: str,
+    title: str,
+    artist: str,
+    limit: int,
+) -> Tuple[Optional[StationTrack], List[StationTrack]]:
+    """Recover a queue when get_watch_playlist has no Song-radio for `seed`.
+
+    YT Music returns an empty `tracks` list for seeds outside its catalog —
+    regional music (e.g. Persian tracks) and plain YouTube uploads — which today
+    hard-rejects the radio toggle. Instead, search YT Music for the song by its
+    title/artist, re-seed a real station from the top catalog hit (a catalog id
+    almost always HAS a watch-playlist even when the seed doesn't), and fall back
+    to the search results themselves as the queue.
+
+    Reuses `_yt_remote('search')` / `_ytmusic()` — the SAME proxied egress as
+    get_watch_playlist (no new anti-bot surface, no new dependency). Returns
+    (None, station): seed_meta is intentionally None so the caller keeps the
+    user's real now-playing title/art (the seed isn't in YT Music's catalog, so
+    we have no authoritative metadata for it, and the toggle broadcast plays
+    `seed_video_id` regardless — see ws_chat radio toggle). `(None, [])` only
+    when search is also empty, preserving today's `station_unavailable` reject.
+    """
+    q = f"{title} {artist}".strip()
+    if not q:
+        return None, []
+
+    def _search() -> list:
+        remote = _yt_remote("search", query=q, filter="songs", limit=8)
+        if remote is not None:
+            return remote
+        return _ytmusic().search(q, filter="songs", limit=8) or []
+
+    try:
+        results = await asyncio.wait_for(asyncio.to_thread(_search), timeout=8.0)
+    except Exception as e:
+        print(
+            f"[radio/playlist] fallback search failed q={q!r} "
+            f"err={type(e).__name__}: {e}",
+            flush=True,
+        )
+        return None, []
+
+    parsed = [
+        p for p in (_parse_track(r or {}) for r in (results or []))
+        if p and p.video_id != seed
+    ]
+    if not parsed:
+        print(f"[radio/playlist] fallback no search hits q={q!r}", flush=True)
+        return None, []
+
+    # Fallback A: re-seed a genuine station from the top catalog hit.
+    top = parsed[0]
+
+    def _reseed() -> dict:
+        remote = _yt_remote("get_watch_playlist", video_id=top.video_id, limit=limit)
+        if remote is not None:
+            return remote
+        return _ytmusic().get_watch_playlist(videoId=top.video_id, limit=limit)
+
+    try:
+        raw = await asyncio.wait_for(asyncio.to_thread(_reseed), timeout=8.0)
+    except Exception:
+        raw = {}
+    reseeded = [
+        p for p in (_parse_track(t or {}) for t in ((raw or {}).get("tracks") or []))
+        if p and p.video_id != seed
+    ]
+    if reseeded:
+        print(
+            f"[radio/playlist] fallback reseed ok q={q!r} via={top.video_id} "
+            f"tracks={len(reseeded)}",
+            flush=True,
+        )
+        return None, reseeded
+
+    # Fallback B: use the search results themselves as the queue.
+    print(
+        f"[radio/playlist] fallback search-as-queue q={q!r} tracks={len(parsed)}",
+        flush=True,
+    )
+    return None, parsed
 
 
 # "MUSIC_VIDEO_TYPE_ATV" is YT Music's enum for audio-only tracks (the
