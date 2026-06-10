@@ -708,16 +708,53 @@ async function handlePairCode(req, res) {
     const { sock: s, saveCreds } = await createSocket();
     wireSocket(s, saveCreds);
     sock = s;
-    // requestPairingCode must run BEFORE Baileys emits a QR string;
-    // calling it on a fresh socket switches the pairing channel to
-    // code-mode and returns the 8-char code synchronously.
-    const code = await s.requestPairingCode(digits);
+    // requestPairingCode sends an `iq` node, so the WebSocket must be OPEN
+    // and past the noise handshake first. Calling it synchronously on a
+    // fresh socket (as we used to) raced the connection — sendNode threw
+    // before the WS opened, surfacing as a 500 here / 502 upstream. Baileys
+    // emits the first connection.update carrying a `qr` only AFTER the
+    // handshake for an unregistered socket, so we use that as the
+    // "socket ready" signal and request the code then. (We never render the
+    // QR in code-mode — it's purely the readiness trigger.)
+    const code = await requestPairingCodeWhenReady(s, digits);
     log('pair.code_minted', { phone_digits_len: digits.length, code_len: (code || '').length });
     sendJson(res, 200, { ok: true, pairing_code: code, phone: `+${digits}` });
   } catch (e) {
     error('pair.code_failed', { err: String(e) });
     sendJson(res, 500, { ok: false, error: String(e) });
   }
+}
+
+// Request an 8-char pairing code, but only once the socket is ready to send
+// it. `requestPairingCode` sends an `iq` node over the WebSocket, so it needs
+// the WS open + noise handshake complete. For an unregistered socket Baileys
+// emits the first `connection.update` carrying a `qr` exactly at that point,
+// so we hook that as the readiness signal. Bounded below the agent→sidecar
+// (10s) and platform→agent (10s) proxy timeouts so a stall fails fast and the
+// caller can retry, rather than tripping an upstream gateway timeout.
+function requestPairingCodeWhenReady(s, digits, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      try { if (typeof s.ev.off === 'function') s.ev.off('connection.update', onUpdate); } catch {}
+    };
+    const finish = (fn, arg) => { if (settled) return; settled = true; cleanup(); fn(arg); };
+    const onUpdate = async (u) => {
+      if (settled || !u) return;
+      if (u.qr) {
+        try { finish(resolve, await s.requestPairingCode(digits)); }
+        catch (e) { finish(reject, e instanceof Error ? e : new Error(String(e))); }
+      } else if (u.connection === 'close') {
+        finish(reject, new Error('socket closed before pairing code could be requested'));
+      }
+    };
+    const timer = setTimeout(
+      () => finish(reject, new Error('timed out waiting for socket to be ready for pairing code')),
+      timeoutMs,
+    );
+    s.ev.on('connection.update', onUpdate);
+  });
 }
 
 async function handlePairStart(req, res) {
