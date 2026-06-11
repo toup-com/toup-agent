@@ -72,9 +72,16 @@ const RAW_ALLOWLIST = process.env.WHATSAPP_BAILEYS_ALLOWLIST || '';
 // was the actual root cause of "agent linked but ignores all
 // messages" reports. Override path via env for local/dev.
 const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || '/app/workspace/.whatsapp_auth';
-const BROWSER_NAME = process.env.WHATSAPP_BROWSER_NAME || 'Toup';
+// The browser tuple MUST be a canonical OS/browser pair. WhatsApp's
+// pairing-code validator rejects non-canonical companion_platform_display
+// labels (ours rendered as "Chrome (Toup)") with a server-side failure
+// AFTER the code is minted — the phone shows "Couldn't link device" while
+// QR linking tolerates the same tuple (Baileys #2560). Values below mirror
+// Baileys' own Browsers.macOS('Chrome'); the only cost is the entry in the
+// user's Linked Devices list reads "Chrome (Mac OS)" instead of "Toup".
+const BROWSER_NAME = process.env.WHATSAPP_BROWSER_NAME || 'Mac OS';
 const BROWSER_PLATFORM = process.env.WHATSAPP_BROWSER_PLATFORM || 'Chrome';
-const BROWSER_VERSION = process.env.WHATSAPP_BROWSER_VERSION || '1.0.0';
+const BROWSER_VERSION = process.env.WHATSAPP_BROWSER_VERSION || '14.4.1';
 const LOG_LEVEL = process.env.WHATSAPP_LOG_LEVEL || 'info';
 
 // ── Logger ──────────────────────────────────────────────────────────
@@ -123,6 +130,17 @@ let latestQrAt = null;                   // ISO timestamp
 let lastPairError = null;
 let pairingInProgress = false;
 let pairingTimer = null;
+// Set when the 515 pair-success restart begins; cleared on connection:open or
+// the next close. A 401 in that window is WhatsApp rejecting the just-entered
+// code at login — pollers must still see it as a pairing failure even though
+// the mint-window guard is already off.
+let postPairProbation = false;
+// Monotonic socket generation. Every path that installs a new socket claims
+// `++sockGen` BEFORE its async createSocket() and re-checks before assigning;
+// a stale installer discards its socket instead of overwriting a newer one.
+// Two live sockets = WhatsApp sees a second registration and kills the
+// pairing ref the user is mid-typing.
+let sockGen = 0;
 let inboundCount = 0;
 let lastInboundAt = null;
 let lastSendAt = null;
@@ -353,6 +371,13 @@ async function createSocket() {
   return { sock: newSock, saveCreds };
 }
 
+// End a socket that lost the install race to a newer generation, without
+// letting its close event reach the shared connection.update handler.
+function discardSocket(s) {
+  try { s.ev.removeAllListeners('connection.update'); } catch { /* already gone */ }
+  try { s.end(undefined); } catch { /* already gone */ }
+}
+
 /**
  * Wire all event handlers on a freshly-created socket. Runs the 515
  * restart dance internally so the caller doesn't see it.
@@ -381,6 +406,8 @@ function wireSocket(s, saveCreds) {
     if (connection === 'open') {
       pairingInProgress = false;
       if (pairingTimer) { clearTimeout(pairingTimer); pairingTimer = null; }
+      postPairProbation = false;
+      lastPairError = null;  // clean link — stale diagnostics would read as failure to pollers
       connected = true;
       sessionStatus = 'linked';
       latestQrString = null;
@@ -416,8 +443,18 @@ function wireSocket(s, saveCreds) {
       log('connection.close', { status, message: closeMsg });
       // Record the close reason so /pair/status can surface WHY a pairing
       // failed. during_pairing + a non-515 status (401/conflict/428/429) is the
-      // anti-abuse signature; 515 is the expected pair-success restart.
-      lastPairError = { status, message: closeMsg, during_pairing: pairingInProgress, at: new Date().toISOString() };
+      // anti-abuse signature. 515 is the expected pair-SUCCESS restart — never
+      // record it, or clients polling last_pair_error would read a successful
+      // link as a failure.
+      if (status !== 515) {
+        lastPairError = {
+          status,
+          message: closeMsg,
+          during_pairing: pairingInProgress || postPairProbation,
+          at: new Date().toISOString(),
+        };
+        postPairProbation = false;
+      }
 
       // Drop the socket reference — every reconnect path below will
       // reassign it via createSocket(). Forgetting to clear this was
@@ -433,14 +470,34 @@ function wireSocket(s, saveCreds) {
       // pairing window is over — clear the guard and reconnect normally.
       if (status === 515) {
         log('connection.restart_required');
+        if (pairingInProgress) postPairProbation = true;
         pairingInProgress = false;
         if (pairingTimer) { clearTimeout(pairingTimer); pairingTimer = null; }
         if (!restarting) {
           restarting = true;
+          const gen = ++sockGen;
           try {
             const { sock: next, saveCreds: nextSave } = await createSocket();
+            if (gen !== sockGen) { discardSocket(next); return; }
             wireSocket(next, nextSave);
             sock = next;
+          } catch (e) {
+            // A throw here is an unhandled rejection inside an async listener —
+            // fatal to the process on Node 20, and the Python adapter never
+            // respawns a dead sidecar. Retry once like the generic path.
+            error('restart_failed', { err: String(e) });
+            setTimeout(async () => {
+              if (sock) return;
+              const retryGen = ++sockGen;
+              try {
+                const { sock: next, saveCreds: nextSave } = await createSocket();
+                if (retryGen !== sockGen) { discardSocket(next); return; }
+                wireSocket(next, nextSave);
+                sock = next;
+              } catch (e2) {
+                error('restart_retry_failed', { err: String(e2) });
+              }
+            }, 5000);
           } finally {
             restarting = false;
           }
@@ -484,8 +541,10 @@ function wireSocket(s, saveCreds) {
       sessionStatus = 'linking';
       latestQrString = null;
       latestQrPngDataUrl = null;
+      const gen = ++sockGen;
       try {
         const { sock: next, saveCreds: nextSave } = await createSocket();
+        if (gen !== sockGen) { discardSocket(next); return; }
         wireSocket(next, nextSave);
         sock = next;
       } catch (e) {
@@ -494,8 +553,10 @@ function wireSocket(s, saveCreds) {
         // tight-loop on a fundamentally broken environment.
         setTimeout(async () => {
           if (sock) return;
+          const retryGen = ++sockGen;
           try {
             const { sock: next, saveCreds: nextSave } = await createSocket();
+            if (retryGen !== sockGen) { discardSocket(next); return; }
             wireSocket(next, nextSave);
             sock = next;
           } catch (e2) {
@@ -660,8 +721,10 @@ async function boot() {
   if (hasCreds) {
     log('boot.resuming');
     sessionStatus = 'linking';  // until connection.open
+    const gen = ++sockGen;
     try {
       const { sock: s, saveCreds } = await createSocket();
+      if (gen !== sockGen) { discardSocket(s); return; }
       wireSocket(s, saveCreds);
       sock = s;
     } catch (e) {
@@ -725,17 +788,27 @@ async function handlePairCode(req, res) {
     sendJson(res, 400, { ok: false, error: 'phone (E.164 digits) required' });
     return;
   }
+  // Tear down any previous socket BEFORE opening the pairing window.
+  // Baileys end() emits connection.update close SYNCHRONOUSLY; with the
+  // guard already armed, that intentional close used to trip the
+  // pairing-abort branch, disarm the guard, and leave the real pairing
+  // window unguarded (observed as during_pairing:false on genuine
+  // rejections). Detaching listeners first keeps the old socket's close
+  // out of the handler entirely — it must not pollute lastPairError or
+  // spawn a competing reconnect socket.
+  if (sock) {
+    try { sock.ev.removeAllListeners('connection.update'); } catch {}
+    try { sock.end(undefined); } catch {}
+    sock = null;
+  }
   // Open the pairing window: guards the socket against the orphan-recreate race
   // until the link completes (connection:open), a 515 restart, or a 150s timeout.
   pairingInProgress = true;
+  postPairProbation = false;
   lastPairError = null;
   if (pairingTimer) clearTimeout(pairingTimer);
   pairingTimer = setTimeout(() => { pairingInProgress = false; }, 150000);
   try {
-    if (sock) {
-      try { sock.end(undefined); } catch {}
-      sock = null;
-    }
     wipeAuthDir();
     sessionStatus = 'linking';
     connected = false;
@@ -744,7 +817,12 @@ async function handlePairCode(req, res) {
     latestQrString = null;
     latestQrPngDataUrl = null;
     latestQrAt = null;
+    const gen = ++sockGen;
     const { sock: s, saveCreds } = await createSocket();
+    if (gen !== sockGen) {
+      discardSocket(s);
+      throw new Error('superseded by a newer pairing attempt');
+    }
     wireSocket(s, saveCreds);
     sock = s;
     // requestPairingCode sends an `iq` node, so the WebSocket must be OPEN
@@ -759,6 +837,10 @@ async function handlePairCode(req, res) {
     log('pair.code_minted', { phone_digits_len: digits.length, code_len: (code || '').length });
     sendJson(res, 200, { ok: true, pairing_code: code, phone: `+${digits}` });
   } catch (e) {
+    // The window must not outlive a failed mint — a lingering guard would
+    // misclassify later closes (incl. a fallback QR flow's) as pairing aborts.
+    pairingInProgress = false;
+    if (pairingTimer) { clearTimeout(pairingTimer); pairingTimer = null; }
     error('pair.code_failed', { err: String(e) });
     sendJson(res, 500, { ok: false, error: String(e) });
   }
@@ -800,11 +882,23 @@ async function handlePairStart(req, res) {
   log('pair.start');
   // Tear down any existing socket + wipe auth so we always emit a
   // fresh QR. Idempotent — calling while already linking is a no-op.
+  // Listeners detached first: end() emits close synchronously, and the
+  // old socket's close handler would otherwise race us with its own
+  // reconnect createSocket() (zombie second socket).
   try {
     if (sock) {
+      try { sock.ev.removeAllListeners('connection.update'); } catch {}
       try { sock.end(undefined); } catch {}
       sock = null;
     }
+    // Starting the QR flow is an explicit mode switch: end any pairing-code
+    // window and clear its diagnostics, so QR closes take the auto-rebuild
+    // path and pollers don't read a stale code failure during a healthy QR
+    // attempt.
+    pairingInProgress = false;
+    if (pairingTimer) { clearTimeout(pairingTimer); pairingTimer = null; }
+    postPairProbation = false;
+    lastPairError = null;
     wipeAuthDir();
     sessionStatus = 'linking';
     connected = false;
@@ -813,7 +907,13 @@ async function handlePairStart(req, res) {
     latestQrString = null;
     latestQrPngDataUrl = null;
     latestQrAt = null;
+    const gen = ++sockGen;
     const { sock: s, saveCreds } = await createSocket();
+    if (gen !== sockGen) {
+      discardSocket(s);
+      sendJson(res, 500, { ok: false, error: 'superseded by a newer pairing attempt' });
+      return;
+    }
     wireSocket(s, saveCreds);
     sock = s;
     sendJson(res, 200, { ok: true });
@@ -827,10 +927,19 @@ async function handlePairLogout(req, res) {
   log('pair.logout');
   try {
     if (sock) {
+      // Detach first: logout() ends with a synthetic 401 ("Intentional
+      // Logout") that would otherwise be recorded into lastPairError and
+      // trigger the logged_out close branch for a deliberate disconnect.
+      try { sock.ev.removeAllListeners('connection.update'); } catch {}
       try { await sock.logout(); } catch {}
       try { sock.end(undefined); } catch {}
       sock = null;
     }
+    ++sockGen;  // invalidate any in-flight reconnect installer
+    pairingInProgress = false;
+    if (pairingTimer) { clearTimeout(pairingTimer); pairingTimer = null; }
+    postPairProbation = false;
+    lastPairError = null;
     wipeAuthDir();
     sessionStatus = 'not_linked';
     connected = false;

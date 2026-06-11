@@ -9,7 +9,7 @@
     "start": "node sidecar.mjs"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.18",
+    "@whiskeysockets/baileys": "6.7.23",
     "pino": "9.5.0",
     "qrcode": "1.5.4"
   },
