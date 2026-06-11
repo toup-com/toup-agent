@@ -118,6 +118,7 @@ function rememberOutbound(id) {
   }
 }
 let selfJid = null;
+let selfLid = null;  // our LID identity (creds.me.lid) — self-chat keys arrive in LID form
 let latestQrString = null;
 let latestQrPngDataUrl = null;
 let latestQrAt = null;                   // ISO timestamp
@@ -202,6 +203,20 @@ function e164ToJid(e164) {
   if (!e164) return '';
   const digits = e164.replace(/\D/g, '');
   return digits ? `${digits}@s.whatsapp.net` : '';
+}
+
+/**
+ * Same WhatsApp user? Compares the user part of two JIDs ignoring the
+ * `:device` suffix, requiring the same server. Needed because chat keys
+ * carry device suffixes ("123:47@lid") while creds store the bare
+ * identity ("123@lid") — exact string equality silently misses.
+ */
+function sameWaUser(jidA, jidB) {
+  if (!jidA || !jidB) return false;
+  const [userA, serverA] = String(jidA).split('@', 2);
+  const [userB, serverB] = String(jidB).split('@', 2);
+  if (!serverA || serverA !== serverB) return false;
+  return userA.split(':', 1)[0] === userB.split(':', 1)[0];
 }
 
 /** Convert "15555550100@s.whatsapp.net" → "+15555550100". */
@@ -412,9 +427,14 @@ function wireSocket(s, saveCreds) {
       sessionStatus = 'linked';
       latestQrString = null;
       latestQrPngDataUrl = null;
-      // After socket open, our own JID is on the user creds.
+      // After socket open, our own JID is on the user creds. Post-LID-
+      // migration accounts ALSO carry our LID identity (creds.me.lid,
+      // set by Baileys at pair time) — chat keys for "Message Yourself"
+      // arrive in LID form on those accounts, so self-chat detection
+      // needs both.
       try {
         selfJid = s.user?.id || null;
+        selfLid = s.user?.lid || null;
         selfE164 = jidToE164(selfJid || '') || null;
       } catch {
         // ignore
@@ -524,6 +544,7 @@ function wireSocket(s, saveCreds) {
         wipeAuthDir();
         selfE164 = null;
         selfJid = null;
+        selfLid = null;
         warn('logged_out — auth dir wiped, awaiting fresh pair');
         emitEvent({ type: 'logged_out' });
         return;
@@ -607,12 +628,24 @@ function wireSocket(s, saveCreds) {
         // fromMe messages (user replying to a contact from their primary
         // phone) we still ignore: those aren't directed at the agent.
         if (m.key?.fromMe) {
-          const remoteE164 = jidToE164(m.key?.remoteJid || '')
-            || jidToE164(m.key?.remoteJidAlt || '')
-            || (lidToPhone.get(m.key?.remoteJid || '') || '')
-            || (lidToPhone.get(m.key?.remoteJidAlt || '') || '');
-          const selfChat = !!(selfE164 && remoteE164 && remoteE164 === selfE164);
-          if (!selfChat) continue;
+          // Self-chat = the CHAT is our own thread. Compare remoteJid
+          // against both of our identities (PN jid and LID jid) with
+          // device-suffix-insensitive matching — LID-migrated accounts
+          // (the norm since 2025) deliver "Message Yourself" with a
+          // remoteJid of `<lid>@lid`, which the old exact-string
+          // lidToPhone lookup missed (observed 2026-06-11: every
+          // self-chat message silently dropped, inbound_count stayed 0).
+          const rj = m.key?.remoteJid || '';
+          const remoteE164 = jidToE164(rj)
+            || (lidToPhone.get(rj) || '');
+          const selfChat =
+            sameWaUser(rj, selfJid || '') ||
+            sameWaUser(rj, selfLid || '') ||
+            !!(selfE164 && remoteE164 && remoteE164 === selfE164);
+          if (!selfChat) {
+            log('inbound.skipped_foreign_fromme', { remoteJid: rj });
+            continue;
+          }
           log('inbound.self_chat', { id: m.key.id, self: selfE164 });
         }
         if (m.key?.remoteJid?.endsWith('@broadcast')) continue;
@@ -653,6 +686,11 @@ function wireSocket(s, saveCreds) {
             const e = jidToE164(j);
             if (e) { fromE164 = e; fromJid = j; break; }
           }
+        }
+        // Self-chat: the sender is us by definition — don't depend on
+        // the LID cache resolving our own chat key.
+        if (!fromE164 && m.key?.fromMe && selfE164) {
+          fromE164 = selfE164;
         }
         const messageId = m.key?.id || '';
         const timestampMs = (m.messageTimestamp ? Number(m.messageTimestamp) * 1000 : Date.now());
@@ -814,6 +852,7 @@ async function handlePairCode(req, res) {
     connected = false;
     selfE164 = null;
     selfJid = null;
+    selfLid = null;
     latestQrString = null;
     latestQrPngDataUrl = null;
     latestQrAt = null;
@@ -904,6 +943,7 @@ async function handlePairStart(req, res) {
     connected = false;
     selfE164 = null;
     selfJid = null;
+    selfLid = null;
     latestQrString = null;
     latestQrPngDataUrl = null;
     latestQrAt = null;
@@ -945,6 +985,7 @@ async function handlePairLogout(req, res) {
     connected = false;
     selfE164 = null;
     selfJid = null;
+    selfLid = null;
     latestQrString = null;
     latestQrPngDataUrl = null;
     latestQrAt = null;
@@ -1027,10 +1068,13 @@ async function handleSend(req, res) {
   // same green bubble — the user can't tell who said what. Wrap the
   // agent's reply with a clear bold header so it visually stands out
   // even though we can't influence the bubble colour itself.
-  const isSelfChat = !!(selfE164 && (
-    jidToE164(jid) === selfE164 ||
-    (lidToPhone.get(jid) || '') === selfE164
-  ));
+  const isSelfChat =
+    sameWaUser(jid, selfJid || '') ||
+    sameWaUser(jid, selfLid || '') ||
+    !!(selfE164 && (
+      jidToE164(jid) === selfE164 ||
+      (lidToPhone.get(jid) || '') === selfE164
+    ));
   const outboundText = isSelfChat ? `*🤖 ${displayName}*\n${text}` : text;
   log('send.dispatch', { jid, jid_source: jidSource, len: outboundText.length, self_chat: isSelfChat, display_name: isSelfChat ? displayName : undefined });
   try {
