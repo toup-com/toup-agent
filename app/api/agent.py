@@ -441,16 +441,41 @@ async def refresh_connector_tools(request: Request):
             detail="Invalid agent key",
         )
 
-    # Reach the cache via app.state. The agent's lifespan wires it
-    # there at boot if MCP discovery succeeded. If it's missing,
-    # the agent is in a degraded mode (no MCP client) — return 200
-    # with tool_count=0 so the platform's call site doesn't treat
-    # missing-cache as a failure (the platform already logs WARN on
-    # any non-200; a 200 with zero tools accurately reflects the
-    # agent's state).
+    # Reach the cache via app.state. The lifespan wires it at boot for
+    # dedicated containers; /admin/bind wires it for pool containers.
+    # A missing cache here means the container was bound before the
+    # bind-time bootstrap existed (or that bootstrap errored) — and
+    # since this endpoint already authenticated against
+    # settings.agent_api_key, the key the lifespan gate was missing is
+    # NOW present. Self-heal on the spot instead of masking the gap
+    # with a no_cache 200: this turns every post-OAuth notify into an
+    # automatic repair path. Only when construction is genuinely
+    # impossible do we still answer no_cache (200, so the platform's
+    # call site doesn't treat a degraded agent as a transport failure).
     cache = getattr(request.app.state, "mcp_tools_cache", None)
     if cache is None:
-        return RefreshToolsResponse(status="no_cache", tool_count=0)
+        from app.agent.mcp_bootstrap import ensure_mcp_initialized
+
+        result = await ensure_mcp_initialized(request.app)
+        cache = getattr(request.app.state, "mcp_tools_cache", None)
+        if cache is None:
+            return RefreshToolsResponse(
+                status=f"no_cache_{result}", tool_count=0
+            )
+        # ensure_mcp_initialized already awaited the first refresh;
+        # don't refetch again below (the platform's 3s first attempt
+        # is tight enough as it is). cached_at == 0 means that fetch
+        # failed — say so in the status instead of reporting a clean
+        # "initialized" with zero tools (the platform logs the body,
+        # and a silent-success here is the exact masking pattern that
+        # hid the original no-tools incident).
+        if cache.cached_at == 0:
+            return RefreshToolsResponse(
+                status="initialized_refresh_failed", tool_count=0
+            )
+        return RefreshToolsResponse(
+            status="initialized", tool_count=len(cache.tools)
+        )
 
     # Force an immediate refetch (bypasses TTL). Lock inside the cache
     # coalesces concurrent platform notifications.

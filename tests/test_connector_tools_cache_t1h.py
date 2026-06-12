@@ -365,17 +365,205 @@ async def test_e3_put_with_correct_key_refreshes_and_returns_count(
 async def test_e4_put_with_no_cache_returns_no_cache_status(
     agent_client_no_cache,
 ):
-    """Agent has no MCP client (degraded boot): endpoint returns 200
-    with status='no_cache' so the platform doesn't treat missing-cache
-    as a failure."""
-    r = await agent_client_no_cache.put(
-        "/api/agent/refresh-tools",
-        headers={"X-Agent-Key": settings.agent_api_key},
-    )
+    """Agent has no MCP cache AND the bootstrap can't construct one
+    (platform_api_url missing): endpoint still answers 200 with a
+    no_cache_* status so the platform doesn't treat a degraded agent
+    as a transport failure."""
+    import app.agent.mcp_bootstrap as mcp_bootstrap
+
+    mcp_bootstrap._init_lock = None  # fresh lock for this event loop
+    prev_url = settings.platform_api_url
+    settings.platform_api_url = ""
+    try:
+        r = await agent_client_no_cache.put(
+            "/api/agent/refresh-tools",
+            headers={"X-Agent-Key": settings.agent_api_key},
+        )
+    finally:
+        settings.platform_api_url = prev_url
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "no_cache"
+    assert body["status"] == "no_cache_not_configured"
     assert body["tool_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_e7_put_with_no_cache_self_heals_when_configured(agent_mode):
+    """The pool-claim repair path: a container bound after boot has
+    agent_api_key in settings but no cache (the lifespan gate was
+    skipped in lobby mode). The endpoint must construct + wire the
+    cache on the spot and report the fetched tools — NOT mask the gap
+    with no_cache (which is exactly how every pool-claimed agent lost
+    its gmail__ tools in production)."""
+    pytest.importorskip("fastmcp")
+    import app.agent.mcp_bootstrap as mcp_bootstrap
+
+    mcp_bootstrap._init_lock = None  # fresh lock for this event loop
+    app = _build_agent_app(cache=None)
+    mock_client = _make_mock_client([[_make_tool("gmail__list_messages")]])
+    transport = ASGITransport(app=app)
+    with patch("fastmcp.Client", return_value=mock_client):
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as http:
+            r = await http.put(
+                "/api/agent/refresh-tools",
+                headers={"X-Agent-Key": settings.agent_api_key},
+            )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "initialized"
+    assert body["tool_count"] == 1
+    cache = getattr(app.state, "mcp_tools_cache", None)
+    assert cache is not None
+    assert cache.tools == ["gmail__list_messages"]
+    app.state.mcp_refresh_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_e7b_self_heal_reports_failed_first_fetch(agent_mode):
+    """Construction succeeds but the first MCP fetch fails: the body
+    must say so ('initialized_refresh_failed'), not report a clean
+    'initialized' with zero tools — a silent-success here is the same
+    masking pattern that hid the original incident from the platform's
+    refresh_tenant_tools logs."""
+    pytest.importorskip("fastmcp")
+    import app.agent.mcp_bootstrap as mcp_bootstrap
+
+    mcp_bootstrap._init_lock = None  # fresh lock for this event loop
+    app = _build_agent_app(cache=None)
+    failing_client = MagicMock()
+    failing_client.__aenter__ = AsyncMock(return_value=failing_client)
+    failing_client.__aexit__ = AsyncMock(return_value=None)
+    failing_client.list_tools = AsyncMock(side_effect=RuntimeError("down"))
+    transport = ASGITransport(app=app)
+    with patch("fastmcp.Client", return_value=failing_client):
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as http:
+            r = await http.put(
+                "/api/agent/refresh-tools",
+                headers={"X-Agent-Key": settings.agent_api_key},
+            )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "initialized_refresh_failed"
+    assert body["tool_count"] == 0
+    # Cache IS wired (the periodic loop will recover) — only the
+    # first fetch failed.
+    assert app.state.mcp_tools_cache is not None
+    app.state.mcp_refresh_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_e8_ensure_mcp_initialized_is_idempotent(agent_mode):
+    """Second call (bind racing a refresh-tools PUT, or a re-bind) is
+    a no-op — no second client construction, same cache object."""
+    pytest.importorskip("fastmcp")
+    import app.agent.mcp_bootstrap as mcp_bootstrap
+    from app.agent.mcp_bootstrap import ensure_mcp_initialized
+
+    mcp_bootstrap._init_lock = None  # fresh lock for this event loop
+    app = _build_agent_app(cache=None)
+    mock_client = _make_mock_client([[_make_tool("gmail__list_messages")]])
+    with patch("fastmcp.Client", return_value=mock_client) as client_ctor:
+        first = await ensure_mcp_initialized(app)
+        cache_obj = app.state.mcp_tools_cache
+        second = await ensure_mcp_initialized(app)
+    assert first == "initialized"
+    assert second == "already"
+    assert app.state.mcp_tools_cache is cache_obj
+    assert client_ctor.call_count == 1
+    app.state.mcp_refresh_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_e9_ensure_mcp_initialized_unbound_lobby_is_noop():
+    """A still-unbound lobby container (no agent_api_key) must not
+    construct a client — bind supplies the key later."""
+    from app.agent.mcp_bootstrap import ensure_mcp_initialized
+
+    prev_key = settings.agent_api_key
+    settings.agent_api_key = ""
+    app = _build_agent_app(cache=None)
+    try:
+        result = await ensure_mcp_initialized(app)
+    finally:
+        settings.agent_api_key = prev_key
+    assert result == "not_configured"
+    assert getattr(app.state, "mcp_tools_cache", None) is None
+
+
+@pytest.mark.asyncio
+async def test_e10_admin_bind_bootstraps_mcp(monkeypatch):
+    """THE production fix: POST /admin/bind on a lobby container must
+    leave the MCP cache constructed and wired (step 2d). Before this,
+    a pool-claimed agent lived its whole life with zero connector
+    tools while the platform showed the user's OAuth as Connected.
+    Also asserts the second bind is a no-op (same cache object)."""
+    pytest.importorskip("fastmcp")
+    import os
+
+    import app.agent.mcp_bootstrap as mcp_bootstrap
+    from app.api.admin_pool import router as admin_router
+
+    mcp_bootstrap._init_lock = None  # fresh lock for this event loop
+    monkeypatch.setenv("POOL_ADMIN_TOKEN", "pool-secret")
+
+    app = FastAPI()
+    app.include_router(admin_router)
+
+    mock_client = _make_mock_client([[_make_tool("gmail__list_messages")]])
+    payload = {"user_id": "u-bind-test", "agent_api_key": "bind_key_abc"}
+
+    prev_settings = {
+        "user_id": settings.user_id,
+        "agent_api_key": settings.agent_api_key,
+    }
+    prev_env = {k: os.environ.get(k) for k in ("USER_ID", "AGENT_API_KEY")}
+    transport = ASGITransport(app=app)
+    try:
+        # runtime.json lives at /etc/toup-agent in containers — not
+        # writable here, and not what this test is about.
+        with patch("app.services.runtime_identity.write_runtime"), patch(
+            "fastmcp.Client", return_value=mock_client
+        ):
+            async with AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as http:
+                r1 = await http.post(
+                    "/admin/bind",
+                    json=payload,
+                    headers={"X-Pool-Admin-Token": "pool-secret"},
+                )
+                assert r1.status_code == 200
+                assert r1.json()["ok"] is True
+                cache = getattr(app.state, "mcp_tools_cache", None)
+                assert cache is not None, (
+                    "bind must bootstrap the MCP cache — its absence is "
+                    "the zero-connector-tools production bug"
+                )
+                r2 = await http.post(
+                    "/admin/bind",
+                    json=payload,
+                    headers={"X-Pool-Admin-Token": "pool-secret"},
+                )
+                assert r2.status_code == 200
+                assert app.state.mcp_tools_cache is cache
+    finally:
+        for k, v in prev_settings.items():
+            object.__setattr__(settings, k, v)
+        for k, v in prev_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        task = getattr(app.state, "mcp_refresh_task", None)
+        if task:
+            task.cancel()
+        task = getattr(app.state, "mcp_initial_refresh_task", None)
+        if task:
+            task.cancel()
 
 
 @pytest.mark.asyncio

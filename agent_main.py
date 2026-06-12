@@ -493,6 +493,7 @@ async def lifespan(app: FastAPI):
     subagent_manager = None
     skill_loader = None
     agent_runner = None
+    tool_executor = None
     app_manager = None
 
     try:
@@ -915,139 +916,23 @@ async def lifespan(app: FastAPI):
     print("🔌 Hook bus started")
 
     # ── MCP Client (connect to Platform MCP server) ──────────
-    # T1g: re-add X-Agent-Key + X-Toup-Channel auth via httpx.Auth so
-    # the platform's T0c middleware can resolve the user_id and T1f's
-    # connector_mcp filter can scope the per-user tool list. Channel
-    # is injected per-call from a ContextVar set by the tool_executor;
-    # boot-time list_tools calls default to "web".
-    #
-    # T1h: wrap the client in MCPToolsCache so list_tools() round-trips
-    # are bounded by a 60s TTL. The tool_executor reads the sync attrs
-    # the cache maintains; the periodic refresh task keeps them warm;
-    # PUT /api/agent/refresh-tools (this module's app) forces an
-    # immediate refetch when the platform pushes a connect/disconnect.
-    mcp_client = None
-    mcp_tools_cache = None
-    if settings.platform_api_url and settings.agent_api_key:
-        try:
-            from fastmcp import Client as MCPClient
-            from app.agent.mcp_client_auth import AgentMCPAuth
-            from app.agent.mcp_tools_cache import (
-                MCPToolsCache,
-                periodic_refresh_loop,
-            )
-
-            # Platform mounts FastMCP at /api/mcp with inner path=/mcp,
-            # so the streamable-HTTP endpoint is /api/mcp/mcp. Tests at
-            # backend/tests/test_mcp_auth.py:370+ use the trailing-slash
-            # form because their httpx test transport short-circuits the
-            # 307 in-process. In production the trailing slash triggers
-            # FastAPI's redirect_slashes → 307 to `http://` (the
-            # redirect URL is built without honoring X-Forwarded-Proto)
-            # → Cloudflare/Caddy 301 back to https → method downgrades
-            # POST → GET → MCP rejects the GET with 400. Dropping the
-            # trailing slash hits the canonical route directly and
-            # avoids the entire redirect chain. /api/mcp on its own
-            # still 404s before MCPAuthMiddleware ever runs.
-            mcp_url = f"{settings.platform_api_url.rstrip('/')}/mcp/mcp"
-            mcp_client = MCPClient(
-                mcp_url,
-                auth=AgentMCPAuth(settings.agent_api_key),
-            )
-            mcp_tools_cache = MCPToolsCache(mcp_client)
-
-            # Boot-time discovery — primes the cache so the first turn
-            # doesn't pay a TTL miss. Errors are swallowed; the
-            # periodic refresh task will retry every 60s. We log the
-            # full traceback because a persistent failure here (URL
-            # drift, auth-key mismatch, platform unreachable) silently
-            # strips every connector tool from the agent — and we lost
-            # a day of "no Gmail tool" once because the print() above
-            # only showed the exception's str(), not its type or stack.
-            #
-            # TKT-LAT-017: when `agent_defer_boot_init` is on, schedule
-            # this refresh as a background task instead of awaiting it.
-            # uvicorn can then start serving immediately; the periodic
-            # refresh task (60-s loop) covers retry if this one fails.
-            # The wiring of tool_executor.mcp_* below is fine to do
-            # against an empty cache — the executor reads cache.tools
-            # at call time, not at wire time, so the first chat turn
-            # that lands before the refresh completes simply sees an
-            # empty MCP tool list (same observable behavior as a slow
-            # MCP discovery on the old blocking path).
-            async def _boot_refresh_mcp() -> None:
-                import time as _t
-                _t0 = _t.monotonic()
-                try:
-                    await mcp_tools_cache.refresh()
-                    _ms = int((_t.monotonic() - _t0) * 1000)
-                    print(
-                        f"🔗 MCP connected ({len(mcp_tools_cache.tools)} tools) "
-                        f"at {mcp_url}: {mcp_tools_cache.tools} "
-                        f"[PERF] boot_mcp_refresh_ms={_ms}"
-                    )
-                except Exception as e:
-                    import traceback
-                    print(
-                        f"⚠️ MCP tool discovery failed at {mcp_url} "
-                        f"({type(e).__name__}: {e}) — connector tools will be "
-                        f"unavailable until next refresh succeeds:\n"
-                        f"{traceback.format_exc()}"
-                    )
-
-            if settings.agent_defer_boot_init:
-                asyncio.create_task(
-                    _boot_refresh_mcp(), name="lat017-mcp-refresh"
-                )
-                print("[PERF] boot_deferred=mcp_refresh")
-            else:
-                await _boot_refresh_mcp()
-
-            # Wire the cache into the executor BEFORE starting the
-            # periodic loop — the loop refreshes the cache, which the
-            # executor reads via the same attributes T1g already
-            # consumes.
-            if tool_executor:
-                tool_executor.mcp_client = mcp_client
-                tool_executor.mcp_tools_cache = mcp_tools_cache
-                tool_executor.mcp_tools = mcp_tools_cache.tools
-                tool_executor.mcp_tool_defs = mcp_tools_cache.tool_defs
-
-            # Same client, late-bound into the routine runner. The runner
-            # was constructed earlier in lifespan (before MCP existed) so
-            # handlers got `_mcp_client=None` at first; this gives them
-            # the real client just before any cron trigger can fire (the
-            # earliest a routine could fire is the user's tz-local wake
-            # time, which is far in the future for a freshly-booted
-            # container).
-            if routine_runner is not None:
-                routine_runner.set_mcp_client(mcp_client)
-                # Also wire the AgentRunner so generic `agent_task`
-                # routines can use the agent's tool-using turn pipeline.
-                # `agent_runner` exists at this point in lifespan (it was
-                # constructed alongside cron_service in the earlier block).
-                if agent_runner is not None:
-                    routine_runner.set_agent_runner(agent_runner)
-            # Same hand-off for the trigger runner — handlers fetch
-            # Gmail messages via MCP, so they need the client wired
-            # before any inbound event can be dispatched in earnest.
-            if trigger_runner is not None:
-                trigger_runner.set_mcp_client(mcp_client)
-
-            # Periodic refresh task — keeps the sync snapshot fresh
-            # without every turn paying the cache-miss cost. Stored on
-            # app.state so a graceful shutdown can cancel it.
-            app.state.mcp_refresh_task = asyncio.create_task(
-                periodic_refresh_loop(mcp_tools_cache),
-                name="mcp_tools_periodic_refresh",
-            )
-            # Expose the cache on app.state so the refresh-tools
-            # endpoint can reach it without re-importing globals.
-            app.state.mcp_tools_cache = mcp_tools_cache
-        except ImportError:
-            print("⚠️ fastmcp not installed — MCP client disabled")
-        except Exception as e:
-            print(f"⚠️ MCP client error: {e}")
+    # Extracted to app/agent/mcp_bootstrap.ensure_mcp_initialized so
+    # POST /admin/bind and PUT /api/agent/refresh-tools can run the
+    # same bootstrap on pool containers. Those boot in lobby mode
+    # WITHOUT agent_api_key, so this lifespan call is a no-op for them
+    # ("not_configured") — historically that meant they NEVER got
+    # connector tools (gmail__* …) while the platform showed the OAuth
+    # identity as Connected. The T1g auth + T1h cache notes moved into
+    # that module. Runner refs go on app.state so the bootstrap can
+    # wire them no matter which caller runs first.
+    app.state.tool_executor = tool_executor
+    app.state.agent_runner = agent_runner
+    app.state.routine_runner = routine_runner
+    app.state.trigger_runner = trigger_runner
+    from app.agent.mcp_bootstrap import ensure_mcp_initialized
+    await ensure_mcp_initialized(
+        app, defer_initial_refresh=bool(settings.agent_defer_boot_init)
+    )
 
     _boot_progress.update(percent=85, phase="hooks")
     # ── Discord Channel ───────────────────────────────────────

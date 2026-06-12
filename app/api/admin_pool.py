@@ -306,6 +306,24 @@ async def admin_bind(
     except Exception as e:
         logger.warning("[admin/bind] LLM key refresh failed (non-fatal): %s", e)
 
+    # 2d. Bootstrap the MCP connector-tools client. A pool container
+    #     boots in lobby mode without agent_api_key, so the lifespan's
+    #     MCP init was a no-op — this bind just supplied the key.
+    #     Without this call the container never registers a single
+    #     connector tool (gmail__*, calendar__*, …): users see the
+    #     integration "Connected" while the agent, offered no gmail__
+    #     tools, improvises with the browser-extension tools and tells
+    #     them to pair the desktop Chrome extension. Deferred refresh
+    #     keeps bind fast; the 60s periodic loop is the retry net.
+    try:
+        from app.agent.mcp_bootstrap import ensure_mcp_initialized
+        mcp_status = await ensure_mcp_initialized(
+            request.app, defer_initial_refresh=True
+        )
+        logger.info("[admin/bind] MCP bootstrap: %s", mcp_status)
+    except Exception as e:
+        logger.warning("[admin/bind] MCP bootstrap failed (non-fatal): %s", e)
+
     # 3. Wake any lazy channel adapters. Best-effort — adapter init
     #    can take seconds (Telegram getMe, WhatsApp QR pairing) and we
     #    want /admin/bind to return fast. The wake_lazy_channels module
