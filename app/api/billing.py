@@ -382,6 +382,16 @@ async def create_subscription(
     user = user_result.scalar_one()
     customer_id = await _ensure_stripe_customer(user, db)
 
+    # Reconciliation (§3b): refuse a web subscription when the user already has
+    # an active Apple sub. Gated BEFORE any Stripe charge — strictly safe.
+    from app.services.credit_service import credit_service
+    if await credit_service.active_paid_source(db, current_user.id) == "apple":
+        raise HTTPException(409, detail={
+            "code": "subscription_exists_other_platform",
+            "message": "You already have a subscription via the iOS app. "
+                       "Manage it in Settings → Subscriptions.",
+        })
+
     country = _resolve_user_country(user, request)
     price_id = _bundle_price_id_for_country(country)
     if not price_id:

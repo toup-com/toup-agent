@@ -61,6 +61,9 @@ from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleA
 # Credits (free-for-everyone billing — docs/credits/design.md)
 from .credit import (
     SubscriptionPlan, CreditBalance, CreditLedger, CreditReservation,
+    AppleSubscription,
+    APPLE_SUB_ACTIVE, APPLE_SUB_EXPIRED, APPLE_SUB_BILLING_RETRY,
+    APPLE_SUB_GRACE, APPLE_SUB_REVOKED,
     BUCKET_MESSAGE, BUCKET_INTEGRATION,
     LEDGER_CHAT_MESSAGE, LEDGER_ROUTINE_RUN, LEDGER_TRIGGER_RUN, LEDGER_BUILD_STEP,
     LEDGER_TOOL_CALL, LEDGER_BROWSER_ACTION, LEDGER_DOC_GEN,
@@ -158,4 +161,8 @@ __all__ = [
     "EVENT_REVOCATION_PROVIDER_SUCCEEDED", "EVENT_REVOCATION_PROVIDER_FAILED",
     "EVENT_HEALTH_PROBE_SUCCEEDED", "EVENT_HEALTH_PROBE_FAILED",
     "EVENT_FORCE_QUARANTINED", "EVENT_FORCE_RELEASED",
+    "SubscriptionPlan", "CreditBalance", "CreditLedger", "CreditReservation",
+    "AppleSubscription",
+    "APPLE_SUB_ACTIVE", "APPLE_SUB_EXPIRED", "APPLE_SUB_BILLING_RETRY",
+    "APPLE_SUB_GRACE", "APPLE_SUB_REVOKED",
 ]

@@ -70,6 +70,14 @@ class CreditBalance(Base):
         Numeric(12, 2), nullable=False, default=0, server_default="0",
     )
     message_credits_daily_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
+    # Where the user's CURRENT paid plan came from. NULL or 'stripe' ⇒ the
+    # monthly period renews on the clock (today's behaviour). 'apple' ⇒
+    # renewal is webhook-driven ONLY — the time-driven renew_period() guard
+    # returns False so the hourly cron can't grant an unpaid Apple month;
+    # Apple's DID_RENEW is the only legitimate renewal trigger. No
+    # server_default: existing rows backfill to NULL, which the renewal guard
+    # treats identically to today (inertness proof, mig-063 §3c).
+    plan_source: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     day_anchor_local_date: Mapped[str] = mapped_column(String(10), nullable=False)
     period_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     period_end: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -165,4 +173,55 @@ class CreditReservation(Base):
     __table_args__ = (
         Index("ix_credit_reservations_user_status", "user_id", "status"),
         Index("ix_credit_reservations_idempotency", "user_id", "idempotency_key", unique=True),
+    )
+
+
+# Apple subscription lifecycle states (App Store Server Notifications V2).
+APPLE_SUB_ACTIVE = "active"
+APPLE_SUB_EXPIRED = "expired"
+APPLE_SUB_BILLING_RETRY = "billing_retry"
+APPLE_SUB_GRACE = "grace"
+APPLE_SUB_REVOKED = "revoked"
+
+
+class AppleSubscription(Base):
+    """Lifecycle mirror for an Apple auto-renewable subscription.
+
+    One row per ``original_transaction_id`` (UNIQUE) — Apple keeps that id
+    stable across renewals and upgrades within a subscription group, so every
+    V2 notification and every verify call lands on the SAME row. It is the join
+    key from a notification back to a Toup user (subs get a real table; only the
+    consumable refund path greps credit_ledger).
+
+    Credit grants/period windows live on ``credit_balances``; this table is the
+    support-facing mirror of Apple's current state + the dedup anchor
+    (``last_notification_uuid``) that protects the non-idempotent
+    ``apply_plan_change`` from replayed notifications.
+    """
+    __tablename__ = "apple_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+    )
+    original_transaction_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    product_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    plan_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    # active | expired | billing_retry | grace | revoked
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    expires_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    auto_renew_status: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Pending downgrade target (renewalInfo.autoRenewProductId) — applied at
+    # the next DID_RENEW.
+    auto_renew_product_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    environment: Mapped[str] = mapped_column(String(16), nullable=False)  # Production | Sandbox
+    last_notification_uuid: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow,
+    )
+
+    __table_args__ = (
+        Index("uq_apple_sub_orig_txn", "original_transaction_id", unique=True),
+        Index("ix_apple_sub_user", "user_id"),
     )

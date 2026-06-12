@@ -91,6 +91,14 @@ class CreditStatusResponse(BaseModel):
     # credit_service._is_unlimited_user). The frontend uses this to suppress
     # the low-balance pill / exhausted card and render "Unlimited".
     unlimited: bool = False
+    # Subscription source for the mobile billing UI:
+    #   'iap'  → Apple auto-renewable sub (manage in iOS Settings)
+    #   'web'  → Stripe sub or legacy paid (manage at toup.ai/account)
+    #   'free' → no paid plan
+    # All additive/optional so older clients ignore them.
+    plan_source: Optional[str] = None
+    subscription_product_id: Optional[str] = None
+    subscription_renews_at: Optional[datetime] = None
 
 
 class LedgerRow(BaseModel):
@@ -157,6 +165,9 @@ async def get_credit_status(
         period_end=view.period_end,
         enforcement_enabled=view.enforcement_enabled,
         purchased_credits_remaining=float(view.purchased_credits_remaining),
+        plan_source=view.plan_source,
+        subscription_product_id=view.subscription_product_id,
+        subscription_renews_at=view.subscription_renews_at,
     )
 
 
@@ -437,6 +448,16 @@ async def create_credit_checkout(
 
     if plan_id == "free":
         raise HTTPException(400, "The free tier doesn't require checkout.")
+
+    # Reconciliation (§3b): refuse a web subscription when the user already has
+    # an active Apple sub. Gated at SESSION CREATION — before any Stripe charge,
+    # so it's strictly safe (no money moved). Symmetric to the Apple-side 409.
+    if await credit_service.active_paid_source(db, current_user.id) == "apple":
+        raise HTTPException(409, detail={
+            "code": "subscription_exists_other_platform",
+            "message": "You already have a subscription via the iOS app. "
+                       "Manage it in Settings → Subscriptions.",
+        })
 
     plan = await db.get(SubscriptionPlan, plan_id)
     if plan is None:

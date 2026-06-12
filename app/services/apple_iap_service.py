@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -47,6 +48,18 @@ PRODUCT_CREDITS: dict[str, Decimal] = {
     "ai.toup.app.credits.medium": Decimal("1200"),
     "ai.toup.app.credits.large":  Decimal("2800"),
     "ai.toup.app.credits.xl":     Decimal("7500"),
+}
+
+
+# Auto-renewable subscription products → the subscription_plans row id they map
+# to. Apple reuses the SAME plan rows Stripe uses (no new plan rows). This map
+# is intentionally DISJOINT from PRODUCT_CREDITS (consumables): a product id
+# belongs to exactly one map, and the notification handler branches on which.
+APPLE_SUB_PRODUCT_TO_PLAN: dict[str, str] = {
+    "ai.toup.app.sub.starter": "starter",
+    "ai.toup.app.sub.builder": "builder",
+    "ai.toup.app.sub.pro":     "pro",
+    "ai.toup.app.sub.elite":   "elite",
 }
 
 
@@ -68,6 +81,16 @@ class VerifiedTransaction:
     product_id: str
     environment: str
     credits: Decimal
+
+
+@dataclass
+class VerifiedSubscription:
+    transaction_id: str
+    original_transaction_id: str
+    product_id: str
+    environment: str
+    expires_date: Optional[datetime]
+    plan_id: str
 
 
 def iap_configured() -> bool:
@@ -260,6 +283,92 @@ async def verify_transaction(
     )
 
 
+def ms_to_datetime(ms: Optional[int]) -> Optional[datetime]:
+    """Apple delivers all dates as epoch MILLISECONDS. Convert to a naive UTC
+    ``datetime`` (matching how credit_balances stores period bounds)."""
+    if ms is None:
+        return None
+    return datetime.utcfromtimestamp(int(ms) / 1000)
+
+
+async def verify_subscription_transaction(
+    transaction_id: str, environment_hint: str,
+) -> VerifiedSubscription:
+    """Fetch + verify a StoreKit AUTO-RENEWABLE SUBSCRIPTION transaction.
+
+    Mirrors :func:`verify_transaction` (same dual-env fetch + JWS chain
+    verification + bundle assertion) but asserts the decoded ``type`` is
+    AUTO_RENEWABLE_SUBSCRIPTION (not CONSUMABLE), resolves the product to its
+    plan via :data:`APPLE_SUB_PRODUCT_TO_PLAN`, and returns the subscription's
+    ``expires_date`` + ``plan_id`` instead of a credit amount.
+    """
+    if not iap_configured():
+        raise IapVerificationError("IAP not configured on server")
+    if not transaction_id:
+        raise IapVerificationError("missing transaction_id")
+
+    from appstoreserverlibrary.models.Environment import Environment
+
+    primary = _env_from_hint(environment_hint)
+    tried = [primary]
+    if primary == Environment.SANDBOX:
+        tried.append(Environment.PRODUCTION)
+    elif primary == Environment.PRODUCTION:
+        tried.append(Environment.SANDBOX)
+
+    signed: Optional[str] = None
+    used_env = primary
+    for env in tried:
+        signed = await asyncio.to_thread(
+            _fetch_signed_transaction, env, transaction_id,
+        )
+        if signed:
+            used_env = env
+            break
+    if not signed:
+        raise IapVerificationError(
+            f"transaction {transaction_id} not found in any environment"
+        )
+
+    decoded = await asyncio.to_thread(
+        _verify_and_decode_transaction, used_env, signed,
+    )
+
+    decoded_bundle = getattr(decoded, "bundleId", None)
+    if decoded_bundle != settings.apple_iap_bundle_id:
+        raise IapVerificationError(
+            f"bundle mismatch: {decoded_bundle!r} != {settings.apple_iap_bundle_id!r}"
+        )
+
+    product_id = getattr(decoded, "productId", None)
+    if product_id not in APPLE_SUB_PRODUCT_TO_PLAN:
+        raise IapVerificationError(f"unknown subscription product: {product_id!r}")
+
+    # Must be an auto-renewable subscription — never activate a plan for a
+    # consumable / NC transaction.
+    from appstoreserverlibrary.models.Type import Type
+
+    ptype = getattr(decoded, "type", None)
+    if ptype is not None and ptype != Type.AUTO_RENEWABLE_SUBSCRIPTION:
+        raise IapVerificationError(
+            f"product {product_id!r} is not an auto-renewable subscription ({ptype})"
+        )
+
+    original_txn = getattr(decoded, "originalTransactionId", None)
+    if not original_txn:
+        # The lifecycle anchor is mandatory for subscriptions.
+        raise IapVerificationError("subscription transaction missing originalTransactionId")
+
+    return VerifiedSubscription(
+        transaction_id=str(getattr(decoded, "transactionId", transaction_id)),
+        original_transaction_id=str(original_txn),
+        product_id=product_id,
+        environment=getattr(used_env, "value", str(used_env)),
+        expires_date=ms_to_datetime(getattr(decoded, "expiresDate", None)),
+        plan_id=APPLE_SUB_PRODUCT_TO_PLAN[product_id],
+    )
+
+
 def _verify_and_decode_transaction(environment, signed_transaction: str):
     from appstoreserverlibrary.signed_data_verifier import VerificationException
 
@@ -270,6 +379,24 @@ def _verify_and_decode_transaction(environment, signed_transaction: str):
         raise IapVerificationError(f"signed transaction verification failed: {e}") from e
     except Exception as e:
         raise IapVerificationError(f"signed transaction decode failed: {e}") from e
+
+
+def _verify_and_decode_renewal_info(environment, signed_renewal_info: str):
+    """Verify + decode a notification's ``signedRenewalInfo`` JWS.
+
+    Returns the library's ``JWSRenewalInfoDecodedPayload`` (autoRenewStatus,
+    autoRenewProductId, gracePeriodExpiresDate, expirationIntent, …). Same
+    chain verification path as the transaction decode.
+    """
+    from appstoreserverlibrary.signed_data_verifier import VerificationException
+
+    verifier = _build_verifier(environment)
+    try:
+        return verifier.verify_and_decode_renewal_info(signed_renewal_info)
+    except VerificationException as e:
+        raise IapVerificationError(f"signed renewal info verification failed: {e}") from e
+    except Exception as e:
+        raise IapVerificationError(f"signed renewal info decode failed: {e}") from e
 
 
 async def verify_and_decode_notification(signed_payload: str):

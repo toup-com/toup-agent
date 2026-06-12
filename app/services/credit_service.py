@@ -57,8 +57,16 @@ from app.db.models import (
     LEDGER_PERIOD_RENEWAL, LEDGER_PLAN_GRANT, LEDGER_REFUND, LEDGER_RESERVATION,
     LEDGER_SETTLEMENT,
     RESERVATION_OPEN, RESERVATION_REFUNDED, RESERVATION_SETTLED,
-    CreditBalance, CreditLedger, CreditReservation, SubscriptionPlan, User,
+    APPLE_SUB_ACTIVE,
+    AppleSubscription, CreditBalance, CreditLedger, CreditReservation,
+    SubscriptionPlan, User,
 )
+
+
+# Plan-source markers stamped on credit_balances.plan_source. NULL/'stripe' ⇒
+# time-driven renewal (today); 'apple' ⇒ webhook-driven renewal only.
+PLAN_SOURCE_APPLE = "apple"
+PLAN_SOURCE_STRIPE = "stripe"
 
 
 logger = logging.getLogger(__name__)
@@ -192,6 +200,11 @@ class BalanceView:
     period_end: datetime
     enforcement_enabled: bool
     purchased_credits_remaining: Decimal = Decimal("0")
+    # Mobile contract (mig-063 §6): 'iap' (apple) | 'web' (stripe/NULL paid) |
+    # 'free'. NOT the raw stored plan_source.
+    plan_source: Optional[str] = None
+    subscription_product_id: Optional[str] = None
+    subscription_renews_at: Optional[datetime] = None
 
 
 REASON_INSUFFICIENT_MESSAGE = "insufficient_message_credits"
@@ -449,6 +462,32 @@ class CreditService:
     async def get_balance_view(self, db: AsyncSession, user_id: str) -> BalanceView:
         balance = await self.get_or_create_balance(db, user_id)
         plan = await db.get(SubscriptionPlan, balance.plan_id)
+
+        # Map the stored plan_source to the mobile contract:
+        #   apple            → 'iap'
+        #   stripe/NULL paid → 'web'
+        #   free             → 'free'
+        raw_source = getattr(balance, "plan_source", None)
+        if balance.plan_id == "free":
+            mapped_source: Optional[str] = "free"
+        elif raw_source == PLAN_SOURCE_APPLE:
+            mapped_source = "iap"
+        else:  # 'stripe' or NULL (legacy paid) → web
+            mapped_source = "web"
+
+        sub_product_id: Optional[str] = None
+        sub_renews_at: Optional[datetime] = None
+        if raw_source == PLAN_SOURCE_APPLE:
+            apple_sub = (await db.execute(
+                select(AppleSubscription)
+                .where(AppleSubscription.user_id == user_id)
+                .where(AppleSubscription.status == APPLE_SUB_ACTIVE)
+                .order_by(AppleSubscription.updated_at.desc())
+            )).scalars().first()
+            if apple_sub is not None:
+                sub_product_id = apple_sub.product_id
+                sub_renews_at = apple_sub.expires_date
+
         return BalanceView(
             plan_id=balance.plan_id,
             plan_display_name=plan.display_name if plan else balance.plan_id,
@@ -468,6 +507,9 @@ class CreditService:
             purchased_credits_remaining=Decimal(
                 getattr(balance, "purchased_credits_remaining", 0) or 0
             ),
+            plan_source=mapped_source,
+            subscription_product_id=sub_product_id,
+            subscription_renews_at=sub_renews_at,
         )
 
     async def try_charge(
@@ -923,8 +965,124 @@ class CreditService:
         balance.message_credits_daily_cap = new_plan.message_credits_daily_cap
         await db.flush()
 
-    async def renew_period(self, db: AsyncSession, user_id: str) -> bool:
+    # ── Apple subscription reconciliation + lifecycle ────────────────────
+
+    async def active_paid_source(
+        self, db: AsyncSession, user_id: str,
+    ) -> Optional[str]:
+        """Return ``'stripe'`` | ``'apple'`` | ``None`` — the source of the
+        user's CURRENT paid (non-free) plan, or None when on the free tier.
+
+        Reads ``plan_source`` only when ``plan_id != 'free'``. The ``or
+        'stripe'`` fallback is load-bearing: a pre-migration paid Stripe user
+        has ``plan_source = NULL`` and must read as 'stripe' for the
+        RECONCILIATION exclusivity check — while still being treated as NULL
+        ("time-driven renewal OK") by the renewal guard. The two reads of NULL
+        are deliberately different and both correct (mig-063 §3).
+        """
         balance = await self._lock_balance(db, user_id)
+        if balance.plan_id == "free":
+            return None
+        return balance.plan_source or PLAN_SOURCE_STRIPE
+
+    async def activate_subscription(
+        self, db: AsyncSession, user_id: str, plan_id: str, source: str,
+        period_end: datetime,
+    ) -> None:
+        """First/again paid, or an immediate upgrade — stamp the plan + source
+        + the externally-driven period window.
+
+        Reuses the proration-aware tier math in :meth:`apply_plan_change` (the
+        same entrypoint Stripe uses), so free→starter grants the full monthly
+        allotment at ratio≈1.0 and a mid-period pro→elite upgrade prorates
+        correctly. The ONLY additions are stamping ``plan_source`` and
+        overriding the period window to the external (Apple) ``period_end`` so
+        the renewal guard's clock matches Apple's. Idempotency is the caller's
+        responsibility (per-original_transaction_id on verify, per-
+        notificationUUID on notifications) since ``apply_plan_change`` is not
+        idempotent.
+        """
+        await self.apply_plan_change(db, user_id, plan_id, reason=f"{source}:activate")
+        balance = await self._lock_balance(db, user_id)
+        balance.plan_source = source
+        balance.period_start = datetime.utcnow()
+        balance.period_end = period_end
+        await db.flush()
+
+    async def _apple_renew(
+        self, db: AsyncSession, user_id: str, plan_id: str, period_end: datetime,
+    ) -> None:
+        """Apple DID_RENEW: re-grant the monthly allotment and bump the period
+        to Apple's new ``expiresDate``.
+
+        If the renewed product differs from the stored plan (a pending
+        downgrade landing at renewal) apply the plan change first, then run the
+        shared unguarded renewal body, then override the period window to
+        Apple's clock. Only ever invoked from the notificationUUID-deduped
+        handler, so the non-idempotent calls below are contained.
+        """
+        balance = await self._lock_balance(db, user_id)
+        if balance.plan_id != plan_id:
+            await self.apply_plan_change(db, user_id, plan_id, reason="apple:renew_plan_change")
+            balance = await self._lock_balance(db, user_id)
+        # Force the renewal grant even if the clock hasn't caught up to the old
+        # period_end yet (Apple's DID_RENEW is authoritative for the renewal).
+        balance.period_end = datetime.utcnow()
+        await self._renew_period_unguarded(db, user_id, balance=balance)
+        balance.plan_source = PLAN_SOURCE_APPLE
+        balance.period_start = datetime.utcnow()
+        balance.period_end = period_end
+        await db.flush()
+
+    async def downgrade_to_free(
+        self, db: AsyncSession, user_id: str, reason: str,
+    ) -> None:
+        """Apple lapse/refund/revoke: return the user to the free tier.
+
+        Setting ``plan_source`` back to NULL returns the row to the default
+        (free) regime — future behaviour is identical to a never-subscribed
+        user. Mirrors the Stripe→free path's OUTCOME. The non-expiring
+        purchased (consumable) wallet is untouched — bought credits never
+        expire.
+        """
+        await self.apply_plan_change(db, user_id, "free", reason=reason)
+        balance = await self._lock_balance(db, user_id)
+        balance.plan_source = None
+        await db.flush()
+
+    async def renew_period(self, db: AsyncSession, user_id: str) -> bool:
+        """Time-driven monthly renewal (the hourly cron's entrypoint).
+
+        Guards the Apple regime: an ``plan_source == 'apple'`` balance renews
+        ONLY on Apple's DID_RENEW notification (via :meth:`_apple_renew`), never
+        on the clock — a clock-driven renewal here would grant an unpaid month.
+        For NULL/'stripe' rows this is byte-for-byte identical to before: the
+        guard falls through and the shared :meth:`_renew_period_unguarded` body
+        runs exactly as it did. The guard lives in EXACTLY one place; both this
+        path (after the guard) and ``_apple_renew`` call the unguarded body so
+        the grant logic is shared.
+        """
+        balance = await self._lock_balance(db, user_id)
+        if (balance.plan_source or None) == PLAN_SOURCE_APPLE:
+            # Apple subs renew ONLY on DID_RENEW. The Apple notification handler
+            # calls _apple_renew() → _renew_period_unguarded() directly.
+            return False
+        return await self._renew_period_unguarded(db, user_id, balance=balance)
+
+    async def _renew_period_unguarded(
+        self, db: AsyncSession, user_id: str, *,
+        balance: Optional[CreditBalance] = None,
+    ) -> bool:
+        """The renewal grant body, with NO plan_source guard.
+
+        Carries the exact pre-Apple semantics: re-grant the monthly allotment
+        (plus capped rollover), reset the daily counter, advance the period by
+        30 days. Callers that have already locked the balance pass it in to
+        avoid a second lock; ``_apple_renew`` overrides the period window after
+        this returns so the renewal lands on Apple's expiresDate.
+        """
+        if balance is None:
+            balance = await self._lock_balance(db, user_id)
         now = datetime.utcnow()
         if now < balance.period_end:
             return False
