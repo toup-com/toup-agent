@@ -29,6 +29,12 @@ python-jose[cryptography]==3.3.0
 # webhooks_gmail_pubsub router mount. Missing here = container
 # crashes at import = uvicorn never binds = healthcheck 503 for 5 min.
 pyjwt[crypto]>=2.8.0
+# StoreKit In-App Purchase — Apple's official App Store Server library, used by
+# app/services/apple_iap_service.py for receipt/subscription validation. MUST be
+# in THIS file (the platform image installs from requirements.platform.txt, not
+# requirements.txt) or the /api/iap/apple/* endpoints ImportError -> 500 once an
+# IAP key is configured.
+app-store-server-library==3.1.2
 passlib[bcrypt]==1.7.4
 pydantic[email]>=2.7.2,<3.0.0
 pydantic-settings>=2.5.2

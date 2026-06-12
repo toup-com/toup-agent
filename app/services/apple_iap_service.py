@@ -93,8 +93,21 @@ class VerifiedSubscription:
     plan_id: str
 
 
+def _library_available() -> bool:
+    """True iff Apple's app-store-server-library is importable.
+
+    Defensive: the library installs via requirements.platform.txt. If a build ever
+    ships without it, every verify call would ImportError -> HTTP 500. Folding this
+    into iap_configured() degrades that to a clean 503 (inert) matching the
+    "purchases temporarily unavailable" contract, never a hard error.
+    """
+    import importlib.util
+    return importlib.util.find_spec("appstoreserverlibrary") is not None
+
+
 def iap_configured() -> bool:
-    """True iff the IAP key (key_id + issuer_id + private_key) is fully set.
+    """True iff the IAP key (key_id + issuer_id + private_key) is fully set AND
+    Apple's server library is importable.
 
     Mirrors apple_auth.siwa_revocation_configured(): when any piece is missing
     the module is provably inert and the endpoint returns 503.
@@ -103,6 +116,7 @@ def iap_configured() -> bool:
         (settings.apple_iap_key_id or "").strip()
         and (settings.apple_iap_issuer_id or "").strip()
         and (settings.apple_iap_private_key or "").strip()
+        and _library_available()
     )
 
 
