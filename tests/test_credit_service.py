@@ -370,3 +370,157 @@ async def test_admin_reserve_settle_is_balance_noop(credit_user, monkeypatch):
         await db.commit()
     final = Decimal((await _balance(credit_user)).message_credits_remaining)
     assert final == before, "admin reserve+settle must be a balance no-op"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Daily-reset day-anchor — forward-only (timezone backward-move bug)
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def _set_anchor(user_id: str, anchor: str) -> None:
+    from app.db import async_session_maker, CreditBalance
+    async with async_session_maker() as db:
+        bal = await db.get(CreditBalance, user_id)
+        bal.day_anchor_local_date = anchor
+        await db.commit()
+
+
+async def test_daily_reset_skipped_when_local_day_moves_backward(credit_user, monkeypatch):
+    """The anchor is seeded from UTC at signup (timezone NULL); once a
+    west-of-UTC timezone lands, today_iso can be the PREVIOUS calendar
+    day. _reset_daily_if_needed must NOT zero used_today then — doing so
+    wipes counted spend mid-period and lets any user evade the daily cap
+    by moving their clock/timezone backward."""
+    from app.config import settings
+    from app.db import async_session_maker
+    from app.db.models import LEDGER_CHAT_MESSAGE
+    from app.services.credit_service import BUCKET_MESSAGE, credit_service
+    monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
+
+    async with async_session_maker() as db:
+        await credit_service.try_charge(
+            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("5.0"),
+            idempotency_key="anchor-1",
+        )
+        await db.commit()
+    assert Decimal((await _balance(credit_user)).message_credits_used_today) == Decimal("5.0")
+
+    # Anchor sits in the FUTURE relative to "today" (UTC-seeded while the
+    # user's real local date is earlier). The next charge must NOT reset.
+    await _set_anchor(credit_user, "2999-01-02")
+    async with async_session_maker() as db:
+        await credit_service.try_charge(
+            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("1.0"),
+            idempotency_key="anchor-2",
+        )
+        await db.commit()
+
+    bal = await _balance(credit_user)
+    assert Decimal(bal.message_credits_used_today) == Decimal("6.0"), (
+        "used_today was wiped by a backward day-anchor reset"
+    )
+    assert bal.day_anchor_local_date == "2999-01-02", "anchor must not roll backward"
+
+
+async def test_daily_reset_fires_when_local_day_moves_forward(credit_user, monkeypatch):
+    """A genuine forward day-change (anchor in the past) still zeroes the
+    daily counter — the legitimate reset path must keep working."""
+    from app.config import settings
+    from app.db import async_session_maker
+    from app.db.models import LEDGER_CHAT_MESSAGE
+    from app.services.credit_service import BUCKET_MESSAGE, credit_service
+    monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
+
+    async with async_session_maker() as db:
+        await credit_service.try_charge(
+            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("5.0"),
+            idempotency_key="fwd-1",
+        )
+        await db.commit()
+    await _set_anchor(credit_user, "2000-01-01")  # far past → new day
+    async with async_session_maker() as db:
+        await credit_service.try_charge(
+            db, credit_user, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, Decimal("1.0"),
+            idempotency_key="fwd-2",
+        )
+        await db.commit()
+
+    bal = await _balance(credit_user)
+    # Reset zeroed the 5.0, then the 1.0 charge re-counted.
+    assert Decimal(bal.message_credits_used_today) == Decimal("1.0")
+    assert bal.day_anchor_local_date != "2000-01-01", "anchor must roll forward to today"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# /agent-deduct bundle-mode guard — no double-charge
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def _seed_agent_config(user_id: str, llm_mode: str, agent_key: str) -> None:
+    from app.db import AgentConfig, async_session_maker
+    async with async_session_maker() as db:
+        db.add(AgentConfig(
+            user_id=user_id,
+            hosting_mode="managed",
+            llm_mode=llm_mode,
+            bundle_status="active" if llm_mode == "bundle" else "none",
+            agent_api_key=agent_key,
+            setup_step=4,
+            setup_type="auto",
+            setup_completed=True,
+        ))
+        await db.commit()
+
+
+async def test_agent_deduct_bundle_mode_does_not_charge(credit_user, monkeypatch):
+    """Bundle-mode agents route every call through the proxy, which already
+    deducts. /agent-deduct must NOT charge again — it was the first call of
+    every session being billed twice (the production double-debit)."""
+    from app.config import settings
+    from app.db import async_session_maker
+    from app.api.credits import agent_deduct, AgentDeductRequest
+    monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
+    await _seed_agent_config(credit_user, "bundle", "ak_bundle")
+
+    before = Decimal((await _balance(credit_user)).message_credits_remaining)
+    async with async_session_maker() as db:
+        resp = await agent_deduct(
+            AgentDeductRequest(
+                user_id=credit_user, model="gpt-5.5", provider="openai",
+                input_tokens=20_000, output_tokens=2_000,
+                idempotency_key=f"{credit_user}:sess-1",
+            ),
+            x_agent_key="ak_bundle",
+            db=db,
+        )
+    after = Decimal((await _balance(credit_user)).message_credits_remaining)
+    assert resp.amount_charged == 0.0
+    assert resp.idempotent_hit is True
+    assert after == before, "bundle-mode agent-deduct must not move the balance"
+
+
+async def test_agent_deduct_manual_mode_still_charges(credit_user, monkeypatch):
+    """Manual-mode (BYOK) agents bypass the proxy — /agent-deduct is their
+    ONLY metering surface and must keep charging."""
+    from app.config import settings
+    from app.db import async_session_maker
+    from app.api.credits import agent_deduct, AgentDeductRequest
+    monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
+    await _seed_agent_config(credit_user, "manual", "ak_manual")
+
+    before = Decimal((await _balance(credit_user)).message_credits_remaining)
+    async with async_session_maker() as db:
+        resp = await agent_deduct(
+            AgentDeductRequest(
+                # Kept under the free 15/day cap so this asserts charging,
+                # not cap-denial (20k/2k would compute to ~16 credits).
+                user_id=credit_user, model="gpt-5.5", provider="openai",
+                input_tokens=2_000, output_tokens=500,
+                idempotency_key=f"{credit_user}:sess-1",
+            ),
+            x_agent_key="ak_manual",
+            db=db,
+        )
+    after = Decimal((await _balance(credit_user)).message_credits_remaining)
+    assert resp.amount_charged > 0.0
+    assert after < before, "manual-mode agent-deduct must still meter usage"

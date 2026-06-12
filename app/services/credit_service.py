@@ -709,7 +709,19 @@ class CreditService:
     async def _reset_daily_if_needed(self, db: AsyncSession, balance: CreditBalance, user_id: str) -> None:
         user = await db.get(User, user_id)
         today_iso = _local_day_iso(user.timezone if user else None)
-        if balance.day_anchor_local_date == today_iso:
+        anchor = balance.day_anchor_local_date
+        # Reset ONLY when the local day moves FORWARD past the anchor.
+        # The anchor can legitimately sit AHEAD of today_iso: at signup
+        # the user's timezone is NULL, so the anchor is seeded from the
+        # UTC date (_local_day_iso falls back to UTC); once the app later
+        # learns a west-of-UTC timezone, today_iso can be the *previous*
+        # calendar day. The old `!= today_iso` check then zeroed
+        # used_today the moment the timezone landed — wiping a day's
+        # counted spend mid-period and, worse, handing every user a
+        # cap-evasion lever (move the clock/timezone backward → daily
+        # counter resets → cap re-opens). ISO "YYYY-MM-DD" sorts
+        # chronologically, so a lexical compare is a correct date compare.
+        if anchor is not None and today_iso <= anchor:
             return
         was = Decimal(balance.message_credits_used_today)
         balance.message_credits_used_today = Decimal("0")

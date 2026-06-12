@@ -251,6 +251,7 @@ async def agent_deduct(
     from app.services.credit_service import (
         tokens_to_credits as _tokens_to_credits,
         BUCKET_MESSAGE as _BUCKET_MESSAGE,
+        REASON_INSUFFICIENT_MESSAGE as _REASON_INSUFFICIENT_MESSAGE,
     )
     from app.db.models import LEDGER_CHAT_MESSAGE as _LEDGER_CHAT_MESSAGE
 
@@ -279,6 +280,46 @@ async def agent_deduct(
             success=True, bucket=_BUCKET_MESSAGE, amount_charged=0.0,
             balance_after=0.0, enforcement_enabled=False,
             reason="system_op_exempt",
+        )
+
+    # Bundle-mode guard — DO NOT double-charge.
+    #
+    # This endpoint exists for MANUAL-mode agents that talk direct to
+    # OpenAI/Anthropic and bypass the proxy (see the section header
+    # above). A BUNDLE-mode agent routes every LLM call through
+    # /api/llm/chat, where the proxy's _log_event hook already deducts
+    # via credit_service.try_charge (idempotency_key=event.id). But the
+    # agent's openai_agent_service/anthropic_service ALSO POST here after
+    # every completion, with idempotency_key=prompt_cache_key — a
+    # per-SESSION constant ("{user_id}:{session_id}"). That key never
+    # collides with the proxy's per-event UUID, so the FIRST call of every
+    # bundle session was charged TWICE (later calls idempotent-hit the
+    # per-session key and were free). Measured: a 13–36% overcharge on
+    # every bundle user; it drained a fresh free demo account in one
+    # session. cfg.llm_mode is the platform's authoritative bundle signal
+    # (free_tier_activation/billing set it). Skip the charge but return the
+    # real balance/enforcement so the agent's CreditState stays accurate
+    # for its pre-flight short-circuit — the deduction already happened at
+    # the proxy. Idempotent-hit=True tells the agent "already counted".
+    if (cfg.llm_mode or "").strip().lower() == "bundle":
+        view = await credit_service.get_balance_view(db, body.user_id)
+        # Commit any lazy balance creation get_balance_view may have done
+        # (brand-new user with no row yet). No charge is ever written here.
+        await db.commit()
+        remaining = float(view.message_credits_remaining)
+        enforcement = bool(view.enforcement_enabled)
+        sufficient = (not enforcement) or remaining > 0
+        return AgentDeductResponse(
+            success=sufficient,
+            bucket=_BUCKET_MESSAGE,
+            amount_charged=0.0,
+            balance_after=remaining,
+            enforcement_enabled=enforcement,
+            reason=None if sufficient else _REASON_INSUFFICIENT_MESSAGE,
+            idempotent_hit=True,
+            plan_id=view.plan_id,
+            plan_display_name=view.plan_display_name,
+            period_end=view.period_end,
         )
 
     credits = _tokens_to_credits(body.model, body.input_tokens, body.output_tokens)
