@@ -83,6 +83,10 @@ class CreditStatusResponse(BaseModel):
     period_start: datetime
     period_end: datetime
     enforcement_enabled: bool
+    # Non-expiring credits bought via StoreKit IAP. message.remaining already
+    # INCLUDES this (it's the spendable total); this field is the purchased
+    # slice on its own so the client can render "X bought" separately.
+    purchased_credits_remaining: float = 0.0
     # Admins have no usage limits — never charged, never gated (see
     # credit_service._is_unlimited_user). The frontend uses this to suppress
     # the low-balance pill / exhausted card and render "Unlimited".
@@ -152,6 +156,7 @@ async def get_credit_status(
         period_start=view.period_start,
         period_end=view.period_end,
         enforcement_enabled=view.enforcement_enabled,
+        purchased_credits_remaining=float(view.purchased_credits_remaining),
     )
 
 

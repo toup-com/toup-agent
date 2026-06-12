@@ -90,6 +90,13 @@ cohere>=5.0.0
 # Anthropic
 anthropic>=0.30.0
 
+# StoreKit In-App Purchase — Apple's official App Store Server library.
+# Used by app/services/apple_iap_service.py to (a) call the App Store
+# Server API (get_transaction_info) and (b) verify+decode the signed
+# JWS transaction/notification payloads against Apple's root CA chain
+# (certs live in app/services/apple_root_certs/). Pinned to a recent 3.x.
+app-store-server-library==3.1.2
+
 # Testing
 pytest==7.4.4
 pytest-asyncio==0.23.3

@@ -53,8 +53,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.models import (
     BUCKET_INTEGRATION, BUCKET_MESSAGE,
-    LEDGER_DAILY_RESET, LEDGER_MANUAL_ADJUST, LEDGER_PERIOD_RENEWAL,
-    LEDGER_PLAN_GRANT, LEDGER_REFUND, LEDGER_RESERVATION, LEDGER_SETTLEMENT,
+    LEDGER_DAILY_RESET, LEDGER_IAP_PURCHASE, LEDGER_MANUAL_ADJUST,
+    LEDGER_PERIOD_RENEWAL, LEDGER_PLAN_GRANT, LEDGER_REFUND, LEDGER_RESERVATION,
+    LEDGER_SETTLEMENT,
     RESERVATION_OPEN, RESERVATION_REFUNDED, RESERVATION_SETTLED,
     CreditBalance, CreditLedger, CreditReservation, SubscriptionPlan, User,
 )
@@ -181,7 +182,7 @@ class ReservationResult:
 class BalanceView:
     plan_id: str
     plan_display_name: str
-    message_credits_remaining: Decimal
+    message_credits_remaining: Decimal  # spendable total = plan wallet + purchased wallet
     message_credits_monthly: Decimal
     message_credits_used_today: Decimal
     message_credits_daily_cap: Optional[Decimal]
@@ -190,12 +191,60 @@ class BalanceView:
     period_start: datetime
     period_end: datetime
     enforcement_enabled: bool
+    purchased_credits_remaining: Decimal = Decimal("0")
 
 
 REASON_INSUFFICIENT_MESSAGE = "insufficient_message_credits"
 REASON_INSUFFICIENT_INTEGRATION = "insufficient_integration_credits"
 REASON_DAILY_CAP_EXCEEDED = "daily_cap_exceeded"
 REASON_EMAIL_NOT_VERIFIED = "email_not_verified"
+
+
+def _split_message_charge(
+    plan_remaining: Decimal,
+    purchased_remaining: Decimal,
+    used_today: Decimal,
+    daily_cap: Optional[Decimal],
+    amount: Decimal,
+) -> tuple[Decimal, Decimal, bool, Optional[str]]:
+    """Decide how a MESSAGE-bucket charge splits across the two wallets.
+
+    Plan credits are spent first (and are the ONLY thing the daily cap
+    limits). Purchased (StoreKit IAP) credits cover any overflow and
+    bypass the daily cap entirely.
+
+    Returns ``(from_plan, from_purchased, feasible, reason)``.
+
+    INVARIANT — when ``purchased_remaining == 0`` this reduces EXACTLY to
+    the pre-IAP behaviour: ``from_plan = min(amount, plan_remaining,
+    cap_room)``, ``from_purchased = 0``, feasible iff ``amount <=
+    plan_remaining`` AND ``amount <= cap_room``, with insufficient-vs-cap
+    reason precedence matching the old try_charge gate (insufficient
+    checked first, then daily-cap).
+    """
+    cap_room = (
+        None if daily_cap is None
+        else max(Decimal("0"), daily_cap - used_today)
+    )
+    if cap_room is None:
+        from_plan = min(amount, plan_remaining)
+    else:
+        from_plan = min(amount, plan_remaining, cap_room)
+    if from_plan < 0:
+        from_plan = Decimal("0")
+    from_purchased = amount - from_plan
+    feasible = from_purchased <= purchased_remaining
+    reason: Optional[str] = None
+    if not feasible:
+        # Precedence mirrors the legacy gate: a true shortfall (no amount of
+        # cap headroom would help) reports insufficient; otherwise it's the
+        # daily cap that's blocking. With purchased_remaining == 0 this
+        # collapses to: amount > plan_remaining → insufficient, else cap.
+        if amount > plan_remaining + purchased_remaining:
+            reason = REASON_INSUFFICIENT_MESSAGE
+        else:
+            reason = REASON_DAILY_CAP_EXCEEDED
+    return from_plan, from_purchased, feasible, reason
 
 
 def _is_unlimited_user(user) -> bool:
@@ -239,27 +288,108 @@ def _local_day_iso(user_timezone: Optional[str], now: Optional[datetime] = None)
 
 def _bucket_remaining(balance: CreditBalance, bucket: str) -> Decimal:
     if bucket == BUCKET_MESSAGE:
-        return Decimal(balance.message_credits_remaining)
+        # Spendable MESSAGE total = plan wallet + non-expiring purchased wallet.
+        return Decimal(balance.message_credits_remaining) + Decimal(
+            getattr(balance, "purchased_credits_remaining", 0) or 0
+        )
     if bucket == BUCKET_INTEGRATION:
         return Decimal(balance.integration_credits_remaining)
     raise ValueError(f"unknown bucket {bucket!r}")
 
 
-def _apply_delta(balance: CreditBalance, bucket: str, delta: Decimal) -> None:
+def _apply_delta(
+    balance: CreditBalance, bucket: str, delta: Decimal,
+) -> Optional[tuple[Decimal, Decimal]]:
+    """Mutate a wallet by ``delta``. Returns the (from_plan, from_purchased)
+    split for MESSAGE-bucket charges (delta < 0); None otherwise.
+
+    delta >= 0 on MESSAGE adds to the PLAN wallet only (grants / renewals /
+    plan refunds). delta < 0 (a charge of ``-delta``) drains plan first then
+    the purchased wallet per :func:`_split_message_charge`; only the plan
+    portion advances the daily-used counter so purchased spend bypasses the
+    cap. Feasibility is enforced by callers BEFORE this runs.
+    """
     if bucket == BUCKET_MESSAGE:
-        balance.message_credits_remaining = _q(
-            Decimal(balance.message_credits_remaining) + delta, _BALANCE_QUANTUM,
-        )
-        if delta < 0:
-            balance.message_credits_used_today = _q(
-                Decimal(balance.message_credits_used_today) + (-delta), _BALANCE_QUANTUM,
+        if delta >= 0:
+            balance.message_credits_remaining = _q(
+                Decimal(balance.message_credits_remaining) + delta, _BALANCE_QUANTUM,
             )
+            return None
+        amount = -delta
+        from_plan, from_purchased, _feasible, _reason = _split_message_charge(
+            Decimal(balance.message_credits_remaining),
+            Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0),
+            Decimal(balance.message_credits_used_today),
+            (Decimal(balance.message_credits_daily_cap)
+             if balance.message_credits_daily_cap is not None else None),
+            amount,
+        )
+        balance.message_credits_remaining = _q(
+            Decimal(balance.message_credits_remaining) - from_plan, _BALANCE_QUANTUM,
+        )
+        balance.purchased_credits_remaining = _q(
+            Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0) - from_purchased,
+            _BALANCE_QUANTUM,
+        )
+        # Only plan spend counts against the daily cap.
+        balance.message_credits_used_today = _q(
+            Decimal(balance.message_credits_used_today) + from_plan, _BALANCE_QUANTUM,
+        )
+        return from_plan, from_purchased
     elif bucket == BUCKET_INTEGRATION:
         balance.integration_credits_remaining = _q(
             Decimal(balance.integration_credits_remaining) + delta, _BALANCE_QUANTUM,
         )
+        return None
     else:
         raise ValueError(f"unknown bucket {bucket!r}")
+
+
+def _restore_message_refund(
+    balance: CreditBalance, refund: Decimal, purchased_drained: Decimal,
+) -> None:
+    """Restore a MESSAGE-bucket reservation refund, purchased wallet FIRST.
+
+    ``purchased_drained`` is how much of the original hold came out of the
+    purchased wallet (from the reservation's stored split). We refund up to
+    that amount back to purchased, the remainder to plan, and roll back the
+    daily-used counter by the plan portion only — the exact inverse of how
+    :func:`_apply_delta` charged it, so reserve+settle conserves credits and
+    leaves the cap accounting consistent.
+    """
+    if refund <= 0:
+        return
+    pur_restore = min(refund, max(Decimal("0"), purchased_drained))
+    plan_restore = refund - pur_restore
+    balance.purchased_credits_remaining = _q(
+        Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0) + pur_restore,
+        _BALANCE_QUANTUM,
+    )
+    if plan_restore > 0:
+        balance.message_credits_remaining = _q(
+            Decimal(balance.message_credits_remaining) + plan_restore, _BALANCE_QUANTUM,
+        )
+        balance.message_credits_used_today = _q(
+            max(Decimal("0"), Decimal(balance.message_credits_used_today) - plan_restore),
+            _BALANCE_QUANTUM,
+        )
+
+
+def _reservation_purchased_drained(reservation: CreditReservation) -> Decimal:
+    """How much of a reservation's hold came from the purchased wallet.
+
+    Reads the {"split": {"purchased": ...}} that reserve() stamped. Returns
+    0 for pre-IAP reservations (no split key) and admin/zero holds — those
+    refund entirely to plan, which is the pre-IAP behaviour.
+    """
+    meta = reservation.metadata_json or {}
+    split = meta.get("split") if isinstance(meta, dict) else None
+    if not isinstance(split, dict):
+        return Decimal("0")
+    try:
+        return Decimal(str(split.get("purchased", "0")))
+    except Exception:
+        return Decimal("0")
 
 
 class CreditService:
@@ -322,7 +452,9 @@ class CreditService:
         return BalanceView(
             plan_id=balance.plan_id,
             plan_display_name=plan.display_name if plan else balance.plan_id,
-            message_credits_remaining=Decimal(balance.message_credits_remaining),
+            # Spendable MESSAGE total = plan wallet + purchased wallet, so
+            # /status reports what the user can actually spend.
+            message_credits_remaining=_bucket_remaining(balance, BUCKET_MESSAGE),
             message_credits_monthly=Decimal(plan.message_credits_monthly) if plan else Decimal("0"),
             message_credits_used_today=Decimal(balance.message_credits_used_today),
             message_credits_daily_cap=(
@@ -333,6 +465,9 @@ class CreditService:
             integration_credits_monthly=Decimal(plan.integration_credits_monthly) if plan else Decimal("0"),
             period_start=balance.period_start, period_end=balance.period_end,
             enforcement_enabled=getattr(settings, "credit_enforcement_enabled", False),
+            purchased_credits_remaining=Decimal(
+                getattr(balance, "purchased_credits_remaining", 0) or 0
+            ),
         )
 
     async def try_charge(
@@ -388,12 +523,21 @@ class CreditService:
         if deny_reason is not None or is_unlimited:
             pass
         elif bucket == BUCKET_MESSAGE:
-            if amount_q > Decimal(balance.message_credits_remaining):
-                deny_reason = REASON_INSUFFICIENT_MESSAGE
-            elif balance.message_credits_daily_cap is not None:
-                projected_today = Decimal(balance.message_credits_used_today) + amount_q
-                if projected_today > Decimal(balance.message_credits_daily_cap):
-                    deny_reason = REASON_DAILY_CAP_EXCEEDED
+            # _split_message_charge re-derives feasibility + reason from the
+            # SAME state _apply_delta will read inside this locked txn, so the
+            # gate and the application below agree exactly. With no purchased
+            # credits this is byte-for-byte the legacy insufficient-then-cap
+            # gate.
+            _fp, _fpur, _feasible, _split_reason = _split_message_charge(
+                Decimal(balance.message_credits_remaining),
+                Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0),
+                Decimal(balance.message_credits_used_today),
+                (Decimal(balance.message_credits_daily_cap)
+                 if balance.message_credits_daily_cap is not None else None),
+                amount_q,
+            )
+            if not _feasible:
+                deny_reason = _split_reason
         elif bucket == BUCKET_INTEGRATION:
             if amount_q > Decimal(balance.integration_credits_remaining):
                 deny_reason = REASON_INSUFFICIENT_INTEGRATION
@@ -518,14 +662,22 @@ class CreditService:
             )
 
         deducted = Decimal("0") if is_unlimited else amount_q
-        _apply_delta(balance, bucket, -deducted)
+        split = _apply_delta(balance, bucket, -deducted)
         now = datetime.utcnow()
         reservation_id = str(uuid.uuid4())
+        # For MESSAGE reservations, persist how the hold split across the
+        # plan vs purchased wallets so settle()/refund() can restore the
+        # purchased portion first (conserving the user's paid credits).
+        split_meta = (
+            {"split": {"plan": str(split[0]), "purchased": str(split[1])}}
+            if split is not None else {}
+        )
         db.add(CreditReservation(
             id=reservation_id, user_id=user_id, event_type=event_type, bucket=bucket,
             estimated_amount=deducted, status=RESERVATION_OPEN,
             idempotency_key=idempotency_key, event_id=event_id,
-            metadata_json={**(metadata or {}), **({"admin_unlimited": True} if is_unlimited else {})} or None,
+            metadata_json={**(metadata or {}), **split_meta,
+                           **({"admin_unlimited": True} if is_unlimited else {})} or None,
             expires_at=now + timedelta(seconds=ttl_seconds),
         ))
         db.add(CreditLedger(
@@ -561,7 +713,14 @@ class CreditService:
         balance = await self._lock_balance(db, reservation.user_id)
         refund = estimated_q - actual_q
         if refund > 0:
-            _apply_delta(balance, reservation.bucket, refund)
+            if reservation.bucket == BUCKET_MESSAGE:
+                # Restore the purchased portion first (up to what was drained
+                # from the purchased wallet), remainder to plan.
+                _restore_message_refund(
+                    balance, refund, _reservation_purchased_drained(reservation),
+                )
+            else:
+                _apply_delta(balance, reservation.bucket, refund)
             db.add(CreditLedger(
                 user_id=reservation.user_id, event_type=LEDGER_REFUND, bucket=reservation.bucket,
                 amount=refund, balance_after=_bucket_remaining(balance, reservation.bucket),
@@ -586,7 +745,12 @@ class CreditService:
             return
         balance = await self._lock_balance(db, reservation.user_id)
         amount = Decimal(reservation.estimated_amount)
-        _apply_delta(balance, reservation.bucket, amount)
+        if reservation.bucket == BUCKET_MESSAGE:
+            _restore_message_refund(
+                balance, amount, _reservation_purchased_drained(reservation),
+            )
+        else:
+            _apply_delta(balance, reservation.bucket, amount)
         db.add(CreditLedger(
             user_id=reservation.user_id, event_type=LEDGER_REFUND, bucket=reservation.bucket,
             amount=amount, balance_after=_bucket_remaining(balance, reservation.bucket),
@@ -610,6 +774,108 @@ class CreditService:
         ))
         await db.flush()
         return _bucket_remaining(balance, bucket)
+
+    async def grant_purchased(
+        self, db: AsyncSession, user_id: str, amount: Decimal | float | int, *,
+        event_type: str = LEDGER_IAP_PURCHASE, idempotency_key: str,
+        metadata: Optional[dict] = None,
+    ) -> tuple[Decimal, bool]:
+        """Mint non-expiring purchased credits into the MESSAGE wallet.
+
+        Idempotent on ``(user_id, idempotency_key)`` — keyed on the StoreKit
+        transaction id so a replay returns the SAME balance without granting
+        again. Returns ``(message_bucket_remaining_after, already_redeemed)``
+        where the balance is the spendable MESSAGE total (plan + purchased).
+
+        The amount lands in the purchased wallet only; the ledger row is
+        written against the MESSAGE bucket with balance_after = the spendable
+        total, matching how every other MESSAGE row is recorded.
+        """
+        amount_q = _q(amount, _BALANCE_QUANTUM)
+        if amount_q <= 0:
+            raise ValueError("grant_purchased requires positive amount")
+        balance = await self._lock_balance(db, user_id)
+
+        # Idempotency short-circuit: a prior grant with this key wins.
+        prior = await db.execute(
+            select(CreditLedger).where(
+                CreditLedger.user_id == user_id,
+                CreditLedger.idempotency_key == idempotency_key,
+            )
+        )
+        existing = prior.scalar_one_or_none()
+        if existing is not None:
+            return Decimal(existing.balance_after), True
+
+        balance.purchased_credits_remaining = _q(
+            Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0) + amount_q,
+            _BALANCE_QUANTUM,
+        )
+        ledger = CreditLedger(
+            user_id=user_id, event_type=event_type, bucket=BUCKET_MESSAGE,
+            amount=amount_q, balance_after=_bucket_remaining(balance, BUCKET_MESSAGE),
+            idempotency_key=idempotency_key, metadata_json=metadata,
+        )
+        try:
+            db.add(ledger)
+            await db.flush()
+        except IntegrityError:
+            # Concurrent replay raced us to the unique (user_id, key) index.
+            await db.rollback()
+            balance = await self._lock_balance(db, user_id)
+            prior = await db.execute(
+                select(CreditLedger).where(
+                    CreditLedger.user_id == user_id,
+                    CreditLedger.idempotency_key == idempotency_key,
+                )
+            )
+            existing = prior.scalar_one_or_none()
+            if existing is not None:
+                return Decimal(existing.balance_after), True
+            raise
+        return _bucket_remaining(balance, BUCKET_MESSAGE), False
+
+    async def clawback_purchased(
+        self, db: AsyncSession, user_id: str, amount: Decimal | float | int, *,
+        idempotency_key: str, metadata: Optional[dict] = None,
+    ) -> Decimal:
+        """Reverse a purchased-credit grant (refund / chargeback).
+
+        Subtracts from the purchased wallet, FLOORED at 0 so a user who has
+        already spent the credits can't go negative. Idempotent on its own
+        ``idempotency_key`` (use ``<transaction_id>:refund``). Returns the
+        spendable MESSAGE total after the clawback.
+        """
+        amount_q = _q(amount, _BALANCE_QUANTUM)
+        balance = await self._lock_balance(db, user_id)
+
+        prior = await db.execute(
+            select(CreditLedger).where(
+                CreditLedger.user_id == user_id,
+                CreditLedger.idempotency_key == idempotency_key,
+            )
+        )
+        if prior.scalar_one_or_none() is not None:
+            return _bucket_remaining(balance, BUCKET_MESSAGE)
+
+        current = Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0)
+        removed = min(current, max(Decimal("0"), amount_q))
+        balance.purchased_credits_remaining = _q(current - removed, _BALANCE_QUANTUM)
+        ledger = CreditLedger(
+            user_id=user_id, event_type=LEDGER_REFUND, bucket=BUCKET_MESSAGE,
+            amount=-removed, balance_after=_bucket_remaining(balance, BUCKET_MESSAGE),
+            idempotency_key=idempotency_key,
+            metadata_json={"reason": "iap_refund", "requested": str(amount_q),
+                           "clawed_back": str(removed), **(metadata or {})},
+        )
+        try:
+            db.add(ledger)
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            balance = await self._lock_balance(db, user_id)
+            return _bucket_remaining(balance, BUCKET_MESSAGE)
+        return _bucket_remaining(balance, BUCKET_MESSAGE)
 
     async def apply_plan_change(
         self, db: AsyncSession, user_id: str, new_plan_id: str, *,
@@ -677,6 +943,8 @@ class CreditService:
 
         balance.message_credits_remaining = _q(Decimal(plan.message_credits_monthly) + msg_carry, _BALANCE_QUANTUM)
         balance.integration_credits_remaining = _q(Decimal(plan.integration_credits_monthly) + int_carry, _BALANCE_QUANTUM)
+        # purchased_credits_remaining is intentionally NOT reset — bought
+        # credits never expire and carry across every monthly renewal.
         balance.message_credits_used_today = Decimal("0")
         balance.message_credits_daily_cap = plan.message_credits_daily_cap
         balance.period_start = balance.period_end

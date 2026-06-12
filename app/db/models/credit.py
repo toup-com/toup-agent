@@ -62,6 +62,13 @@ class CreditBalance(Base):
     message_credits_remaining: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     integration_credits_remaining: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     message_credits_used_today: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    # Non-expiring wallet of credits bought via StoreKit IAP consumable
+    # packs. Spent on the MESSAGE bucket AFTER plan credits, bypasses the
+    # daily cap, and intentionally SURVIVES monthly renewal (renew_period
+    # never touches this). server_default="0" backfills existing rows.
+    purchased_credits_remaining: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, default=0, server_default="0",
+    )
     message_credits_daily_cap: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
     day_anchor_local_date: Mapped[str] = mapped_column(String(10), nullable=False)
     period_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -88,6 +95,7 @@ LEDGER_PLAN_CHANGE = "plan_change"
 LEDGER_DAILY_RESET = "daily_reset"
 LEDGER_PERIOD_RENEWAL = "period_renewal"
 LEDGER_MANUAL_ADJUST = "manual_adjust"
+LEDGER_IAP_PURCHASE = "iap_purchase"  # StoreKit consumable credit-pack grant
 
 BUCKET_MESSAGE = "message"
 BUCKET_INTEGRATION = "integration"

@@ -617,6 +617,21 @@ class Settings(BaseSettings):
     apple_key_id: str = ""         # Set via APPLE_KEY_ID — the Sign in with Apple key's Key ID
     apple_private_key: str = ""    # Set via APPLE_PRIVATE_KEY — the .p8 PEM contents (literal \n tolerated)
 
+    # StoreKit In-App Purchase — consumable credit-pack receipt validation
+    # (App Store Server API + App Store Server Notifications V2). These come
+    # from an "In-App Purchase" key created in App Store Connect → Users and
+    # Access → Integrations → In-App Purchase (a .p8 + Key ID + Issuer ID),
+    # which is SEPARATE from both the Sign in with Apple key above AND the
+    # generic App Store Connect API key. If any of key_id / issuer_id /
+    # private_key is unset, apple_iap_service.iap_configured() returns False
+    # and the /iap/apple/verify endpoint returns 503 — so deploying this code
+    # before the key exists is safe and provably inert.
+    apple_iap_key_id: str = ""        # Set via APPLE_IAP_KEY_ID — the IAP key's Key ID
+    apple_iap_issuer_id: str = ""     # Set via APPLE_IAP_ISSUER_ID — issuer id from the key page
+    apple_iap_private_key: str = ""   # Set via APPLE_IAP_PRIVATE_KEY — the .p8 PEM (literal \n tolerated)
+    apple_iap_bundle_id: str = "ai.toup.app"   # Set via APPLE_IAP_BUNDLE_ID
+    apple_iap_app_apple_id: str = "6774296172"  # Set via APPLE_IAP_APP_APPLE_ID — numeric ASC app id (notification verification)
+
     # ── VPS Provisioning (AWS + Stripe) ──────────────────────
     aws_access_key_id: Optional[str] = None        # Set via AWS_ACCESS_KEY_ID
     aws_secret_access_key: Optional[str] = None    # Set via AWS_SECRET_ACCESS_KEY
