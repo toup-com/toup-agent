@@ -121,6 +121,12 @@ class StationTrack:
     # Biggest thumbnail URL (album art for ATV tracks, frame cap for OMV).
     # Displayed in the frontend Song-mode overlay.
     thumbnail_url: str = ""
+    # Which display_mode this track has already been variant-resolved for
+    # ("song"/"video"), or "" if not yet resolved. Set by the upcoming-window
+    # pre-resolver in ws_chat so the `upcoming` hint the mobile client prebuffers
+    # carries the SAME video_id the pop will play (no ATV/OMV swap divergence).
+    # "" means "resolve me"; a value == the current mode means "already correct".
+    variant_resolved_mode: str = ""
 
     def display_title(self) -> str:
         # "Artist — Title" for logs / debug. Frontend uses title directly.

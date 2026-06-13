@@ -662,6 +662,10 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         )
         from app.agent.radio.player import broadcast_radio_track
         seed_title_full = (seed_meta.title if seed_meta else seed_title) or "Now Playing"
+        # Pre-resolve the variant for the upcoming window BEFORE shipping it so mobile
+        # prebuffers the exact ids the station will play. The seed audio is already
+        # playing, so this delay is invisible to the user.
+        await _resolve_upcoming_variants(sess)
         await broadcast_radio_track(
             user_id=user_id,
             video_id=seed_video_id,
@@ -765,7 +769,12 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
     # before Song/Video existed. Once the user clicks the Song/Video pill,
     # subsequent auto-advanced tracks are reshaped to match their pick.
     # See Rule 9 in docs/skills/radio-mode/SKILL.md.
-    if sess.display_mode_user_override:
+    # Skip the pop-time swap when the upcoming-window pre-resolver already
+    # resolved this track for the current mode (the common path) — it's already
+    # the right variant, and re-searching could pick a DIFFERENT id than the one
+    # we already shipped in `upcoming` (re-introducing the desync). Falls through
+    # to the inline swap only for tracks the pre-resolver didn't reach in time.
+    if sess.display_mode_user_override and next_track.variant_resolved_mode != effective_mode:
         # Song-mode Topic lookup — swap to ATV when the popped track is an
         # OMV and the user is in Song mode (needs clean audio variant).
         if effective_mode == "song" and next_track.video_type == "MUSIC_VIDEO_TYPE_OMV":
@@ -798,6 +807,11 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
                     flush=True,
                 )
                 next_track = mv
+
+    # Mark the track we're about to play as resolved for this mode so the
+    # upcoming-window pre-resolver treats it as settled and `upcoming`==pop holds.
+    if sess.display_mode_user_override:
+        next_track.variant_resolved_mode = effective_mode
 
     mgr.record_auto_play(sess, next_track, source=trigger)
     print(
@@ -843,10 +857,101 @@ def _upcoming_tracks(sess, n: int = 5) -> list:
     return out
 
 
+# Resolve a few more than we ship so a rapid skip burst stays on pre-resolved
+# (correct-variant) tracks, and cap the wall-time so a slow YT Music search never
+# stalls a media_play broadcast.
+_VARIANT_RESOLVE_WINDOW = 8
+_VARIANT_RESOLVE_BUDGET = 2.0  # seconds
+
+
+async def _resolve_upcoming_variants(sess, n: int = _VARIANT_RESOLVE_WINDOW) -> None:
+    """Pre-resolve the Song/Video variant of the next `n` station tracks IN PLACE,
+    so the `upcoming` window shipped to mobile carries the SAME video_ids the pop
+    will actually play.
+
+    Why: the pop-time swap (below) replaces an OMV track with its ATV "Song"
+    variant (and vice-versa) — a DIFFERENT video_id — but `_upcoming_tracks`
+    ships the raw pre-swap ids. The mobile client prebuffers those raw ids, then
+    the backend plays the swapped id → the card's title/artwork desync from the
+    audio and the skip cold-loads (2026-06-13 bug). Resolving the window ahead of
+    time and writing the resolved track back into the playlist makes upcoming and
+    pop agree by construction; the pop-time swap then no-ops on resolved tracks.
+
+    Web-safe: web ignores `upcoming`, and the popped/broadcast video_id is
+    unchanged (still the ATV in song mode) — this only moves WHEN the swap is
+    computed (window-entry instead of pop-time) and caches it per track+mode.
+    No-op unless the user has an explicit display-mode override (matches the
+    pop-time swap gate). Cached via StationTrack.variant_resolved_mode, run
+    concurrently, and bounded by _VARIANT_RESOLVE_BUDGET so it can't stall audio:
+    anything not resolved in time ships raw this frame and resolves on a later one.
+    """
+    # Mobile ('app') is the only client that prebuffers `upcoming`; gating here
+    # keeps web/telegram/discord/slack byte-identical to before (they skip this
+    # entirely and fall back to the unchanged pop-time swap).
+    if getattr(sess, "channel", None) != "app":
+        return
+    if not getattr(sess, "display_mode_user_override", False):
+        return
+    mode = sess.display_mode
+    targets = []  # snapshot video_ids — the cursor may advance while we await
+    for t in sess.playlist[sess.playlist_cursor:sess.playlist_cursor + n]:
+        if t.video_id in sess.played_track_ids or t.variant_resolved_mode == mode:
+            continue
+        targets.append(t.video_id)
+    if not targets:
+        return
+    from app.agent.radio.playlist import find_topic_version, find_music_video
+
+    def _find_in_queue(vid):
+        for j in range(sess.playlist_cursor, len(sess.playlist)):
+            if sess.playlist[j].video_id == vid:
+                return j
+        return None
+
+    async def _resolve_one(vid: str) -> None:
+        idx = _find_in_queue(vid)
+        if idx is None:
+            return
+        tr = sess.playlist[idx]
+        if tr.variant_resolved_mode == mode:
+            return
+        alt = None
+        if mode == "song" and tr.video_type == "MUSIC_VIDEO_TYPE_OMV":
+            alt = await find_topic_version(tr)
+        elif mode == "video" and tr.video_type == "MUSIC_VIDEO_TYPE_ATV":
+            alt = await find_music_video(tr)
+        idx = _find_in_queue(vid)  # re-find: the awaited search may have raced a pop
+        if idx is None:
+            return
+        if alt is not None and alt.video_id != vid:
+            alt.variant_resolved_mode = mode
+            sess.playlist[idx] = alt
+            print(
+                f"[radio] upcoming_variant_resolved mode={mode} from={vid} to={alt.video_id} "
+                f"title={alt.title!r}",
+                flush=True,
+            )
+        else:
+            # No swap needed/available — accept the current variant and mark it so
+            # we don't search it again every frame (keeps upcoming==pop consistent).
+            sess.playlist[idx].variant_resolved_mode = mode
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*[_resolve_one(v) for v in targets], return_exceptions=True),
+            timeout=_VARIANT_RESOLVE_BUDGET,
+        )
+    except asyncio.TimeoutError:
+        pass  # ship what's resolved; the rest resolve on a later frame
+
+
 async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str, record: bool) -> None:
     """Broadcast a media_play for `track` plus a radio_state update. `record`
     is False for skip_prev and history-step-forward (track already in tape)."""
     from app.agent.radio.player import broadcast_radio_track
+    # Keep `upcoming` in lockstep with what the pop will actually play: resolve the
+    # window's variants (cached, time-bounded) before shipping the prebuffer hints.
+    await _resolve_upcoming_variants(sess)
     await broadcast_radio_track(
         user_id=user_id,
         video_id=track.video_id,
