@@ -1,7 +1,7 @@
 from pydantic_settings import BaseSettings
 from pydantic import model_validator
 from functools import lru_cache
-from typing import Optional
+from typing import List, Optional
 
 
 class Settings(BaseSettings):
@@ -249,6 +249,36 @@ class Settings(BaseSettings):
     # the canary is happy. Reminders are text-only (no LLM, no MCP) and
     # safe to enable broadly, but staged rollout is still the right call.
     routines_reminders_enabled: bool = False
+
+    # ── Maintenance / support agent (app.support) ────────────────────
+    # Master switch. Off ⇒ every /api/support route 503s. Dark-launched.
+    support_agent_enabled: bool = False
+    # Model for support classify/route/diagnose/implement LLM calls. None ⇒
+    # the platform default (settings.agent_model, gpt-5.5). Never pin Claude
+    # while Anthropic is deactivated.
+    support_agent_model: Optional[str] = None
+    # Intake size cap (chars) — 413 above this.
+    support_intake_max_chars: int = 8000
+    # Concurrency cap for diagnosis context-gathering fan-out (file IO /
+    # any per-subsystem analysis) — keeps us under provider/IO limits.
+    support_diagnose_concurrency: int = 3
+    support_diagnose_max_files: int = 6
+    support_diagnose_max_file_lines: int = 160
+    # IMPLEMENTATION gate (separate from approval). Off by default so the
+    # diagnosis+approval loop can ship before the autonomous code-writer is
+    # trusted, and so it stays inert where there's no git checkout / gh
+    # (e.g. the Railway platform-api). Flip on in an ops runner that has a
+    # repo checkout + gh credentials.
+    support_implement_enabled: bool = False
+    support_auto_implement_on_approve: bool = True
+    support_open_pr: bool = True
+    support_pr_base_branch: str = "main"
+    # Repo checkout the implementer operates on. None ⇒ inferred from the
+    # running module (the deployed image — usually NOT a git repo).
+    support_repo_dir: Optional[str] = None
+    # Verification commands run on the fix branch before opening a PR.
+    # None ⇒ a safe default import check (see implementer._verify).
+    support_verify_commands: Optional[List[str]] = None
 
     # Phase C — CronService deprecation switch (2026-05-14, `ecb348a`'s
     # follow-up). The legacy CronJob/CronService system is being replaced

@@ -58,6 +58,9 @@ from .soul_config import SoulConfig
 # Platform (VPS, invites, billing)
 from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent, PlatformSetting
 
+# Maintenance / support agent (platform-only — admin maintenance system)
+from .support import SupportIssue, SupportIssueEvent
+
 # Credits (free-for-everyone billing — docs/credits/design.md)
 from .credit import (
     SubscriptionPlan, CreditBalance, CreditLedger, CreditReservation,
@@ -165,4 +168,6 @@ __all__ = [
     "AppleSubscription",
     "APPLE_SUB_ACTIVE", "APPLE_SUB_EXPIRED", "APPLE_SUB_BILLING_RETRY",
     "APPLE_SUB_GRACE", "APPLE_SUB_REVOKED",
+    # Maintenance / support agent
+    "SupportIssue", "SupportIssueEvent",
 ]

@@ -150,6 +150,11 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # don't log into agent containers — agent_api_key auth is used
     # there instead), so the table only exists on the platform side.
     "user_sessions",
+    # Maintenance / support agent: ingests user-reported problems,
+    # diagnoses against docs/skills, and (after admin approval) opens a
+    # fix PR. Operator/admin tool — never lives on tenant agent DBs.
+    "support_issues",
+    "support_issue_events",
 }
 
 SHARED_TABLES: set[str] = {

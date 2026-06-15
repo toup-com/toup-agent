@@ -1,0 +1,138 @@
+"""DB access for the support agent: issues, status transitions, audit events.
+
+Thin async helpers over SupportIssue / SupportIssueEvent. Every status
+change goes through ``set_status`` which also writes an audit event, so the
+event trail is never out of sync with the issue state.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import select, desc
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models.support import SupportIssue, SupportIssueEvent
+from app.support.enums import SupportEventType
+
+
+async def create_issue(
+    db: AsyncSession,
+    *,
+    raw_report: str,
+    channel: str = "api",
+    reporter_user_id: Optional[str] = None,
+    reporter_email: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    repro_info: Optional[str] = None,
+    symptom: Optional[str] = None,
+    severity: str = "medium",
+    status: str = "intake",
+) -> SupportIssue:
+    issue = SupportIssue(
+        raw_report=raw_report,
+        channel=channel,
+        reporter_user_id=reporter_user_id,
+        reporter_email=reporter_email,
+        tenant_id=tenant_id,
+        repro_info=repro_info,
+        symptom=symptom or (raw_report[:200] if raw_report else None),
+        severity=severity,
+        status=status,
+    )
+    db.add(issue)
+    await db.flush()  # populate issue.id
+    await add_event(
+        db, issue.id, SupportEventType.CREATED, actor="user",
+        actor_user_id=reporter_user_id,
+        message=f"Issue intake via {channel}",
+        detail={"severity": severity},
+    )
+    await db.commit()
+    await db.refresh(issue)
+    return issue
+
+
+async def get_issue(db: AsyncSession, issue_id: str) -> Optional[SupportIssue]:
+    return await db.get(SupportIssue, issue_id)
+
+
+async def list_issues(
+    db: AsyncSession,
+    *,
+    status: Optional[str] = None,
+    classification: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list:
+    stmt = select(SupportIssue)
+    if status:
+        stmt = stmt.where(SupportIssue.status == status)
+    if classification:
+        stmt = stmt.where(SupportIssue.classification == classification)
+    stmt = stmt.order_by(desc(SupportIssue.created_at)).limit(limit).offset(offset)
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def list_events(db: AsyncSession, issue_id: str) -> list:
+    stmt = (
+        select(SupportIssueEvent)
+        .where(SupportIssueEvent.issue_id == issue_id)
+        .order_by(SupportIssueEvent.created_at)
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def add_event(
+    db: AsyncSession,
+    issue_id: str,
+    event_type,  # SupportEventType | str
+    *,
+    actor: str = "system",
+    actor_user_id: Optional[str] = None,
+    message: Optional[str] = None,
+    detail: Optional[dict] = None,
+) -> SupportIssueEvent:
+    ev = SupportIssueEvent(
+        issue_id=issue_id,
+        event_type=event_type.value if isinstance(event_type, SupportEventType) else str(event_type),
+        actor=actor,
+        actor_user_id=actor_user_id,
+        message=message,
+        detail=detail,
+    )
+    db.add(ev)
+    await db.flush()
+    return ev
+
+
+async def set_status(
+    db: AsyncSession,
+    issue: SupportIssue,
+    new_status,  # SupportIssueStatus | str
+    *,
+    event_type=SupportEventType.NOTE,
+    actor: str = "system",
+    actor_user_id: Optional[str] = None,
+    message: Optional[str] = None,
+    detail: Optional[dict] = None,
+    commit: bool = True,
+) -> SupportIssue:
+    """Transition status + write an audit event in one shot."""
+    status_str = new_status.value if hasattr(new_status, "value") else str(new_status)
+    prev = issue.status
+    issue.status = status_str
+    issue.updated_at = datetime.utcnow()
+    db.add(issue)
+    payload = {"from": prev, "to": status_str}
+    if detail:
+        payload.update(detail)
+    await add_event(
+        db, issue.id, event_type, actor=actor, actor_user_id=actor_user_id,
+        message=message or f"{prev} → {status_str}", detail=payload,
+    )
+    if commit:
+        await db.commit()
+        await db.refresh(issue)
+    return issue
