@@ -475,6 +475,10 @@ async def _bounded_build(video_id: str) -> str | None:
     async with _get_build_sem():
         path = await asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
     if path:
+        # R2 is the durable, uncapped, Mac-independent store; Postgres L2 stays as
+        # a fallback during rollout (both fail-open). Once R2 is proven, the PG
+        # blob store can be retired (it only exists to dodge the residential proxy).
+        await _r2_store_from_local(video_id, path)
         await _pg_cache_store_from_local(video_id, path)
     return path
 
@@ -585,6 +589,128 @@ async def _pg_cache_store_from_local(video_id: str, path: str) -> None:
         await asyncio.wait_for(_do(), timeout=_PG_CACHE_OP_TIMEOUT * 2)
     except Exception as e:
         logger.warning("[media_proxy] pg cache store failed video_id=%s: %s", video_id, e)
+
+
+# ── Shared remux cache (Cloudflare R2 L2) ─────────────────────────────────
+# Same role as the Postgres L2 above, but stores the finished audio-only m4a in
+# Cloudflare R2 (S3-compatible, $0 egress, uncapped). THIS is what lets repeat
+# playback serve WITHOUT the user's Mac/residential proxy and removes the
+# 300-row Postgres cap — a track built once plays forever, Mac off. boto3 is
+# sync, so wrap calls in an executor (mirrors services/aws_service.py). Fully
+# fail-open + flag-gated: a no-op until r2_audio_enabled + the four R2_* creds
+# are set, and every error returns None / no-ops so playback degrades to the PG
+# L2 then the itag-18 proxy. We serve by pulling the object to local /tmp and
+# reusing the PROVEN _local_audio_response Range/206 path — NOT a redirect —
+# so iOS lock-screen/background AVPlayer behaviour is byte-identical to today.
+_R2_OP_TIMEOUT = float(os.environ.get("AUDIO_R2_OP_TIMEOUT", "8"))
+_r2_client = None
+_r2_disabled = False
+
+
+def _r2_ready() -> bool:
+    return bool(
+        settings.r2_audio_enabled
+        and settings.r2_account_id
+        and settings.r2_bucket
+        and settings.r2_access_key_id
+        and settings.r2_secret_access_key
+    )
+
+
+def _get_r2_client():
+    """Lazily build a boto3 S3 client pointed at the R2 endpoint. None if R2 is
+    unconfigured or client init fails (caller then falls back to the PG L2)."""
+    global _r2_client, _r2_disabled
+    if _r2_disabled or not _r2_ready():
+        return None
+    if _r2_client is not None:
+        return _r2_client
+    try:
+        import boto3
+        from botocore.config import Config
+        _r2_client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{settings.r2_account_id}.r2.cloudflarestorage.com",
+            aws_access_key_id=settings.r2_access_key_id,
+            aws_secret_access_key=settings.r2_secret_access_key,
+            region_name="auto",
+            config=Config(signature_version="s3v4", retries={"max_attempts": 2, "mode": "standard"}),
+        )
+        logger.info("[media_proxy] R2 audio cache ENABLED bucket=%s", settings.r2_bucket)
+        return _r2_client
+    except Exception as e:
+        logger.warning("[media_proxy] R2 client init failed — disabling R2: %s", e)
+        _r2_disabled = True
+        return None
+
+
+def _r2_key(video_id: str) -> str:
+    return f"{video_id}.m4a"
+
+
+async def _r2_pull_to_local(video_id: str) -> str | None:
+    """If the remux is in R2, download it to local disk and return the path.
+    None on miss/error/timeout → caller tries the PG L2, then builds."""
+    client = _get_r2_client()
+    if client is None or not _ensure_cache_dir():
+        return None
+    out = _remuxed_path(video_id)
+    tmp = f"{out}.{os.getpid()}.r2"
+
+    def _do() -> str | None:
+        try:
+            client.download_file(settings.r2_bucket, _r2_key(video_id), tmp)
+        except Exception:
+            return None  # miss (404) or transfer error → fall back to PG L2
+        try:
+            if os.path.getsize(tmp) <= 0:
+                os.remove(tmp)
+                return None
+        except OSError:
+            return None
+        os.replace(tmp, out)
+        return out
+
+    try:
+        path = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _do), timeout=_R2_OP_TIMEOUT
+        )
+        if path:
+            logger.info("[media_proxy] R2 cache HIT video_id=%s", video_id)
+        return path
+    except Exception as e:
+        logger.warning("[media_proxy] R2 pull failed video_id=%s: %s", video_id, e)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return None
+
+
+async def _r2_store_from_local(video_id: str, path: str) -> None:
+    """Upload a freshly-built remux to R2 (best-effort, fail-open). Long immutable
+    Cache-Control so any future CDN fronting can cache it forever."""
+    client = _get_r2_client()
+    if client is None:
+        return
+
+    def _do() -> None:
+        client.upload_file(
+            path, settings.r2_bucket, _r2_key(video_id),
+            ExtraArgs={
+                "ContentType": "audio/mp4",
+                "CacheControl": "public, max-age=31536000, immutable",
+            },
+        )
+
+    try:
+        await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _do), timeout=_R2_OP_TIMEOUT * 2
+        )
+        logger.info("[media_proxy] R2 cache STORE video_id=%s", video_id)
+    except Exception as e:
+        logger.warning("[media_proxy] R2 store failed video_id=%s: %s", video_id, e)
 
 
 _FFMPEG_OK: bool | None = None
@@ -1012,15 +1138,24 @@ async def stream_audio(
     # semaphore. (See _local_audio_response for the Range/206 detail that fixed
     # the PlaybackError-1-no-audio bug, root-caused on device 2026-06-08.)
     rpath = _remuxed_ready(video_id)
+    from_pg_only = False
     if not rpath:
-        # Shared L2: if any replica/user already built this song, pull it from
-        # Postgres to local disk and serve it — no proxy fetch, no throttle. This
-        # is what makes the FIRST song (and uncovered skips) fast on repeat plays.
+        # Shared L2 — pull a once-built remux to local disk and serve it (no proxy
+        # fetch, no throttle, plays with the user's Mac OFF). Try R2 first (free
+        # egress, uncapped, the durable store), then the Postgres blob fallback.
+        rpath = await _r2_pull_to_local(video_id)
+    if not rpath:
         rpath = await _pg_cache_pull_to_local(video_id)
+        from_pg_only = rpath is not None
     if rpath:
         resp = _local_audio_response(rpath, request.headers.get("range"))
         if resp is not None:
             _release()
+            # Lazy backfill: a PG-only hit means this older track isn't in R2 yet.
+            # Migrate it in the background so it's Mac-independent next time and the
+            # Postgres blob store can eventually be retired (no separate job needed).
+            if from_pg_only and _r2_ready():
+                asyncio.create_task(_r2_store_from_local(video_id, rpath))
             logger.info("[media_proxy] audio_stream remux HIT video_id=%s", video_id)
             return resp
         # cached file vanished / 0 bytes (pruned mid-flight) → fall through.

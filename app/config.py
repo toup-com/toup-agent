@@ -632,6 +632,18 @@ class Settings(BaseSettings):
     apple_iap_bundle_id: str = "ai.toup.app"   # Set via APPLE_IAP_BUNDLE_ID
     apple_iap_app_apple_id: str = "6774296172"  # Set via APPLE_IAP_APP_APPLE_ID — numeric ASC app id (notification verification)
 
+    # ── Cloudflare R2 (audio serving cache, S3-compatible) ───
+    # When r2_audio_enabled + the four R2_* vars are set, the audio remux cache
+    # stores AND serves audio from R2 (free egress, uncapped) instead of leaning
+    # on the small Postgres BYTEA L2. Decouples repeat playback from the user's
+    # Mac/residential proxy entirely. Fail-open: any R2 miss/error falls back to
+    # the Postgres L2, then the itag-18 proxy — never a playback regression.
+    r2_audio_enabled: bool = False                  # AUDIO_R2: set R2_AUDIO_ENABLED=true to activate
+    r2_account_id: Optional[str] = None             # R2_ACCOUNT_ID (S3 endpoint host)
+    r2_bucket: Optional[str] = None                 # R2_BUCKET
+    r2_access_key_id: Optional[str] = None          # R2_ACCESS_KEY_ID
+    r2_secret_access_key: Optional[str] = None      # R2_SECRET_ACCESS_KEY
+
     # ── VPS Provisioning (AWS + Stripe) ──────────────────────
     aws_access_key_id: Optional[str] = None        # Set via AWS_ACCESS_KEY_ID
     aws_secret_access_key: Optional[str] = None    # Set via AWS_SECRET_ACCESS_KEY
