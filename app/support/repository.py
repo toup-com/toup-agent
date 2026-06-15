@@ -10,10 +10,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models.support import SupportIssue, SupportIssueEvent
+from app.db.models.support import SupportIssue, SupportIssueEvent, SupportAttachment
 from app.support.enums import SupportEventType
 
 
@@ -136,3 +136,65 @@ async def set_status(
         await db.commit()
         await db.refresh(issue)
     return issue
+
+
+# ── Attachments ───────────────────────────────────────────────────────
+
+async def create_attachment(
+    db: AsyncSession,
+    *,
+    issue_id: str,
+    data: bytes,
+    mime_type: str,
+    kind: str = "screenshot",
+    sha256: Optional[str] = None,
+    uploaded_by_user_id: Optional[str] = None,
+    commit: bool = True,
+) -> SupportAttachment:
+    att = SupportAttachment(
+        issue_id=issue_id,
+        data=data,
+        mime_type=mime_type,
+        size_bytes=len(data),
+        kind=kind,
+        sha256=sha256,
+        uploaded_by_user_id=uploaded_by_user_id,
+    )
+    db.add(att)
+    await db.flush()
+    await add_event(
+        db, issue_id, SupportEventType.NOTE, actor="user",
+        actor_user_id=uploaded_by_user_id,
+        message=f"Attachment uploaded ({kind}, {len(data)} bytes)",
+        detail={"attachment_id": att.id, "mime_type": mime_type, "size_bytes": len(data)},
+    )
+    if commit:
+        await db.commit()
+        await db.refresh(att)
+    return att
+
+
+async def get_attachment(db: AsyncSession, att_id: str) -> Optional[SupportAttachment]:
+    return await db.get(SupportAttachment, att_id)
+
+
+async def list_attachments(db: AsyncSession, issue_id: str) -> list:
+    stmt = (
+        select(SupportAttachment)
+        .where(SupportAttachment.issue_id == issue_id)
+        .order_by(SupportAttachment.created_at)
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def attachment_counts(db: AsyncSession, issue_ids: list) -> dict:
+    """Map issue_id -> attachment count, in one grouped query (no N+1)."""
+    if not issue_ids:
+        return {}
+    stmt = (
+        select(SupportAttachment.issue_id, func.count(SupportAttachment.id))
+        .where(SupportAttachment.issue_id.in_(issue_ids))
+        .group_by(SupportAttachment.issue_id)
+    )
+    rows = (await db.execute(stmt)).all()
+    return {iid: cnt for iid, cnt in rows}

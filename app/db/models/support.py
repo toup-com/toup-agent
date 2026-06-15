@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Optional
 import uuid
 
-from sqlalchemy import String, Text, DateTime, ForeignKey, Index, JSON
+from sqlalchemy import String, Text, DateTime, ForeignKey, Index, JSON, Integer, LargeBinary
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -120,4 +120,42 @@ class SupportIssueEvent(Base):
     # (auto-named ix_support_issue_events_issue_id).
     __table_args__ = (
         Index("ix_support_issue_events_created_at", "created_at"),
+    )
+
+
+class SupportAttachment(Base):
+    """A binary attachment (e.g. a mobile screenshot) for a SupportIssue.
+
+    Stored in the PLATFORM DB rather than the agent-side file_storage backend:
+    Message/Conversation attachments are AGENT_ONLY (per-tenant DB + agent
+    workspace disk), but a support card is platform-side admin data and the
+    Railway platform-api has ephemeral disk. Bytes live here, bounded by
+    settings.support_attachment_max_bytes; they are served ONLY through an
+    auth'd, ownership-checked endpoint (reporter or admin) — never a
+    world-readable URL and never a token in the query string. Low volume +
+    small (capped) images make DB storage appropriate; the S3Backend stub in
+    file_storage.py is the documented scale-up seam.
+    """
+
+    __tablename__ = "support_attachments"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()),
+    )
+    # CASCADE: deleting an issue removes its attachments atomically.
+    issue_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("support_issues.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    kind: Mapped[str] = mapped_column(String(24), nullable=False, default="screenshot")
+    mime_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    uploaded_by_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # issue_id is indexed via index=True on its column
+    # (auto-named ix_support_attachments_issue_id).
+    __table_args__ = (
+        Index("ix_support_attachments_created_at", "created_at"),
     )

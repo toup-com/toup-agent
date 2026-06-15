@@ -15,6 +15,7 @@ Per docs/credits/design.md F13.
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -294,6 +295,67 @@ def render_verification_email(
   <hr style="border: none; border-top: 1px solid #e4e4e7; margin: 32px 0;">
   <p style="font-size: 12px; color: #71717a;">
     If you didn't sign up for Toup, you can safely ignore this email.
+  </p>
+</body></html>
+"""
+    return subject, html, text
+
+
+def render_support_card_email(
+    *,
+    issue_id: str,
+    symptom: Optional[str],
+    severity: str,
+    channel: str,
+    classification: Optional[str],
+    reporter: Optional[str],
+    queue_url: str,
+    has_screenshot: bool,
+) -> tuple[str, str, str]:
+    """Build (subject, html, plain_text) for the 'a support card arrived' alert.
+
+    This is only the alert — handling happens in the admin queue. Keep it
+    short: who/what/severity + a link to the card.
+    """
+    sym = (symptom or "(no summary)").strip()
+    cls = classification or "pending diagnosis"
+    shot = "yes" if has_screenshot else "no"
+    subject = f"[Toup support] {severity.upper()} · {sym[:80]}"
+    text = (
+        f"A support card arrived.\n\n"
+        f"Summary:   {sym}\n"
+        f"Severity:  {severity}\n"
+        f"Channel:   {channel}\n"
+        f"Reporter:  {reporter or 'unknown'}\n"
+        f"Class:     {cls}\n"
+        f"Screenshot:{shot}\n"
+        f"Issue ID:  {issue_id}\n\n"
+        f"Review & decide in the admin queue:\n{queue_url}\n"
+    )
+    # HTML-escape user-controlled fields (symptom ← raw_report, reporter ←
+    # reporter_email, channel) before interpolating into the HTML body.
+    e_sym, e_reporter = _html.escape(sym), _html.escape(reporter or "unknown")
+    e_cls, e_channel, e_sev = _html.escape(cls), _html.escape(channel), _html.escape(severity)
+    html = f"""<!DOCTYPE html>
+<html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 480px; margin: 0 auto; padding: 32px 24px; color: #18181b; line-height: 1.5;">
+  <h1 style="font-size: 20px; margin: 0 0 8px;">A support card arrived</h1>
+  <p style="margin: 0 0 16px; color: #71717a; font-size: 13px;">Severity <b>{e_sev}</b> · {e_channel}</p>
+  <p style="font-size: 15px;">{e_sym}</p>
+  <table style="font-size: 13px; color: #3f3f46; border-collapse: collapse; margin: 12px 0;">
+    <tr><td style="padding: 2px 12px 2px 0; color:#71717a;">Reporter</td><td>{e_reporter}</td></tr>
+    <tr><td style="padding: 2px 12px 2px 0; color:#71717a;">Class</td><td>{e_cls}</td></tr>
+    <tr><td style="padding: 2px 12px 2px 0; color:#71717a;">Screenshot</td><td>{shot}</td></tr>
+    <tr><td style="padding: 2px 12px 2px 0; color:#71717a;">Issue</td><td style="font-family: monospace;">{issue_id}</td></tr>
+  </table>
+  <p style="margin: 24px 0;">
+    <a href="{queue_url}" style="display: inline-block; background: #f97316; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600;">
+      Open in admin queue
+    </a>
+  </p>
+  <hr style="border: none; border-top: 1px solid #e4e4e7; margin: 28px 0;">
+  <p style="font-size: 12px; color: #71717a;">
+    Handling happens in the queue — this is only an alert. The card already carries an
+    auto-diagnosis; approve only after review.
   </p>
 </body></html>
 """

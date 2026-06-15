@@ -279,6 +279,16 @@ class Settings(BaseSettings):
     # Verification commands run on the fix branch before opening a PR.
     # None ⇒ a safe default import check (see implementer._verify).
     support_verify_commands: Optional[List[str]] = None
+    # ── Mobile support-intake (screenshots + admin alert) ────────────
+    # Recipient of the "a support card arrived" alert. This is the
+    # NOTIFICATION TARGET — distinct from the reporter and from the admin
+    # account (nariman@toup.ai) that actually handles the queue. Configurable.
+    support_notify_email: str = "mrhx@toup.ai"
+    support_notify_enabled: bool = True
+    # Screenshot attachment limits (bytes in the platform DB). Capped small;
+    # served only via the auth'd reporter/admin endpoint.
+    support_attachment_max_bytes: int = 3_000_000  # ~3 MB
+    support_attachment_allowed_mime: List[str] = ["image/png", "image/jpeg", "image/webp"]
 
     # Phase C — CronService deprecation switch (2026-05-14, `ecb348a`'s
     # follow-up). The legacy CronJob/CronService system is being replaced

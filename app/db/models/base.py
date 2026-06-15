@@ -155,6 +155,9 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # fix PR. Operator/admin tool — never lives on tenant agent DBs.
     "support_issues",
     "support_issue_events",
+    # Support card attachments (e.g. mobile screenshots) — bytes live in the
+    # platform DB, served only via an auth'd reporter/admin endpoint.
+    "support_attachments",
 }
 
 SHARED_TABLES: set[str] = {

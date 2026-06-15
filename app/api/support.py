@@ -5,29 +5,41 @@ Intake is available to any authenticated user; everything else is admin-only
 ``settings.support_agent_enabled`` (503 when off).
 
 Routes (mounted at settings.api_prefix, e.g. /api):
-  POST /support/issues                  — intake a problem report (auth user)
-  GET  /support/issues                  — list issues (admin)
-  GET  /support/issues/{id}             — issue + audit events (admin)
-  POST /support/issues/{id}/diagnose    — (re)run classify→route→diagnose (admin)
-  POST /support/issues/{id}/decision    — APPROVAL GATE: approve|reject|request_changes (admin)
-  GET  /support/skills                  — the skills index the agent routes against (admin)
+  POST /support/issues                              — intake a problem report (auth user)
+  POST /support/issues/{id}/attachment             — upload a screenshot (reporter or admin)
+  GET  /support/issues/{id}/attachments/{att_id}   — fetch screenshot bytes (reporter or admin)
+  GET  /support/issues                              — list issues (admin)
+  GET  /support/issues/{id}                         — issue + events + attachments (admin)
+  POST /support/issues/{id}/diagnose               — (re)run classify→route→diagnose (admin)
+  POST /support/issues/{id}/decision               — APPROVAL GATE: approve|reject|request_changes (admin)
+  GET  /support/skills                             — the skills index the agent routes against (admin)
 
 The approval gate: nothing implements code until an admin POSTs
 decision=approve here. On approve (and only if implementation is enabled)
 the fix pipeline is spawned off the request path.
+
+Attachments (e.g. mobile screenshots) are stored in the platform DB and served
+ONLY through the auth'd, ownership-checked GET endpoint above (reporter who
+owns the issue, or an admin) — never a world-readable URL, never a token in a
+query string (use the Authorization header; the web admin fetches as a blob).
+On intake, a "card arrived" alert goes to settings.support_notify_email
+(default mrhx@toup.ai) — distinct from the reporter and the admin account.
 """
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.admin.deps import require_admin
 from app.api.auth import get_current_user
 from app.config import settings
 from app.db import get_db, User
+from app.services.email_service import render_support_card_email, send_email
 from app.support import repository as repo
 from app.support import pipeline, skills_index
 from app.support.enums import (
@@ -44,9 +56,64 @@ from app.support.schemas import (
     IssueDetailOut,
     IssueEventOut,
     IssueListResponse,
+    AttachmentMeta,
+    AttachmentUploadResponse,
 )
 
+logger = logging.getLogger("support.api")
+
 router = APIRouter(prefix="/support", tags=["Support"])
+
+
+def _is_admin(user: User) -> bool:
+    return getattr(user, "role", None) == "admin"
+
+
+async def _load_issue_for_user(db: AsyncSession, issue_id: str, user: User):
+    """Return the issue if the user may see it (reporter who owns it, or admin);
+    404 otherwise (no existence leak)."""
+    issue = await repo.get_issue(db, issue_id)
+    if not issue:
+        raise HTTPException(status_code=404, detail="issue not found")
+    if _is_admin(user) or issue.reporter_user_id == user.id:
+        return issue
+    raise HTTPException(status_code=404, detail="issue not found")
+
+
+async def _notify_admin_new_card(issue_id: str) -> None:
+    """Fire the 'a support card arrived' alert to the configurable notify
+    address. Own DB session (off the request path). Never raises."""
+    if not getattr(settings, "support_notify_enabled", True):
+        return
+    to_addr = getattr(settings, "support_notify_email", "mrhx@toup.ai")
+    try:
+        from app.db import async_session_maker
+        async with async_session_maker() as db:
+            issue = await repo.get_issue(db, issue_id)
+            if not issue:
+                return
+            atts = await repo.list_attachments(db, issue_id)
+            base = getattr(settings, "app_public_base_url", "https://toup.ai").rstrip("/")
+            queue_url = f"{base}/admin?tab=support&issue={issue_id}"
+            subject, html, text = render_support_card_email(
+                issue_id=issue.id,
+                symptom=issue.symptom,
+                severity=issue.severity,
+                channel=issue.channel,
+                classification=issue.classification,
+                reporter=issue.reporter_email or issue.reporter_user_id,
+                queue_url=queue_url,
+                has_screenshot=bool(atts),
+            )
+        result = await send_email(to=to_addr, subject=subject, html=html, text=text)
+        if not getattr(result, "success", False):
+            logger.warning("[support] notify email to %s failed for %s: %s",
+                           to_addr, issue_id, getattr(result, "error", "?"))
+        else:
+            logger.info("[support] notify email sent to %s for %s (%s)",
+                        to_addr, issue_id, getattr(result, "provider", "?"))
+    except Exception as e:  # pragma: no cover - defensive; alert must never break intake
+        logger.warning("[support] notify email errored for %s: %s", issue_id, e)
 
 
 def _require_enabled() -> None:
@@ -76,16 +143,91 @@ async def intake_issue(
         raw_report=body.raw_report,
         channel=body.channel or "api",
         reporter_user_id=current_user.id,
-        reporter_email=body.reporter_email or getattr(current_user, "email", None),
+        # Identity is the session user. Only an admin may report on behalf of
+        # someone else (support-desk use); non-admins can't spoof reporter_email.
+        reporter_email=(
+            body.reporter_email if (body.reporter_email and _is_admin(current_user))
+            else getattr(current_user, "email", None)
+        ),
         tenant_id=body.tenant_id,
         repro_info=body.repro_info,
         severity=body.severity.value,
     )
     # Diagnose off the request path (own DB session).
     pipeline.spawn(pipeline.run_diagnosis_pipeline(issue.id, actor_user_id=current_user.id))
+    # Alert the notify target (mrhx@toup.ai by default) that a card arrived —
+    # off the request path, never blocks/raises. Distinct from reporter + admin.
+    pipeline.spawn(_notify_admin_new_card(issue.id))
     return IntakeResponse(
         id=issue.id, status=issue.status,
         message="Report received. Diagnosis is running; an admin will review before any fix.",
+    )
+
+
+# ── Attachments (reporter who owns the issue, or admin) ───────────────
+
+@router.post("/issues/{issue_id}/attachment", response_model=AttachmentUploadResponse)
+async def upload_attachment(
+    issue_id: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> AttachmentUploadResponse:
+    """Upload a screenshot for an issue. Reporter (owns the issue) or admin.
+
+    Authenticated via the Authorization header — no token in the URL. Bytes
+    are validated (mime + size cap) and stored in the platform DB.
+    """
+    _require_enabled()
+    issue = await _load_issue_for_user(db, issue_id, current_user)
+
+    mime = (file.content_type or "").split(";")[0].strip().lower()
+    allowed = getattr(settings, "support_attachment_allowed_mime",
+                      ["image/png", "image/jpeg", "image/webp"])
+    if mime not in allowed:
+        raise HTTPException(status_code=415, detail=f"unsupported media type: {mime or 'unknown'}")
+
+    max_bytes = int(getattr(settings, "support_attachment_max_bytes", 3_000_000))
+    data = await file.read(max_bytes + 1)
+    if len(data) == 0:
+        raise HTTPException(status_code=400, detail="empty file")
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"attachment exceeds {max_bytes} bytes")
+
+    att = await repo.create_attachment(
+        db, issue_id=issue.id, data=data, mime_type=mime, kind="screenshot",
+        sha256=hashlib.sha256(data).hexdigest(),
+        uploaded_by_user_id=current_user.id,
+    )
+    return AttachmentUploadResponse(
+        id=att.id, issue_id=issue.id, mime_type=att.mime_type, size_bytes=att.size_bytes,
+    )
+
+
+@router.get("/issues/{issue_id}/attachments/{att_id}")
+async def get_attachment_bytes(
+    issue_id: str,
+    att_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Stream an attachment's bytes. Reporter (owns the issue) or admin only.
+
+    Auth via the Authorization header (the web admin fetches as a blob, so no
+    token ever appears in a URL). 404 (not 403) on cross-user access — no leak.
+    """
+    _require_enabled()
+    await _load_issue_for_user(db, issue_id, current_user)
+    att = await repo.get_attachment(db, att_id)
+    if not att or att.issue_id != issue_id:
+        raise HTTPException(status_code=404, detail="attachment not found")
+    return Response(
+        content=att.data,
+        media_type=att.mime_type,
+        headers={
+            "Content-Disposition": f'inline; filename="support-{att_id[:8]}"',
+            "Cache-Control": "private, no-store",
+        },
     )
 
 
@@ -104,7 +246,13 @@ async def list_issues(
     rows = await repo.list_issues(
         db, status=status_filter, classification=classification, limit=limit, offset=offset,
     )
-    return IssueListResponse(issues=[IssueOut.from_model(r) for r in rows], total=len(rows))
+    counts = await repo.attachment_counts(db, [r.id for r in rows])
+    out = []
+    for r in rows:
+        o = IssueOut.from_model(r)
+        o.attachment_count = counts.get(r.id, 0)
+        out.append(o)
+    return IssueListResponse(issues=out, total=len(out))
 
 
 @router.get("/issues/{issue_id}", response_model=IssueDetailOut)
@@ -118,7 +266,9 @@ async def get_issue(
     if not issue:
         raise HTTPException(status_code=404, detail="issue not found")
     events = await repo.list_events(db, issue_id)
+    atts = await repo.list_attachments(db, issue_id)
     base = IssueOut.from_model(issue).model_dump()
+    base["attachment_count"] = len(atts)
     return IssueDetailOut(
         **base,
         events=[
@@ -128,6 +278,7 @@ async def get_issue(
             )
             for e in events
         ],
+        attachments=[AttachmentMeta.from_model(a).model_dump() for a in atts],
     )
 
 

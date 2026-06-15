@@ -31,6 +31,30 @@ class DecisionRequest(BaseModel):
 
 # ── Responses ────────────────────────────────────────────────────────
 
+class AttachmentMeta(BaseModel):
+    """Attachment metadata — never the bytes. Bytes come from the auth'd
+    GET /support/issues/{id}/attachments/{att_id} endpoint."""
+    id: str
+    kind: str
+    mime_type: str
+    size_bytes: int
+    created_at: Optional[datetime]
+
+    @classmethod
+    def from_model(cls, m) -> "AttachmentMeta":
+        return cls(
+            id=m.id, kind=m.kind, mime_type=m.mime_type,
+            size_bytes=m.size_bytes, created_at=m.created_at,
+        )
+
+
+class AttachmentUploadResponse(BaseModel):
+    id: str
+    issue_id: str
+    mime_type: str
+    size_bytes: int
+
+
 class IssueEventOut(BaseModel):
     id: str
     created_at: Optional[datetime]
@@ -69,6 +93,9 @@ class IssueOut(BaseModel):
     pr_url: Optional[str]
     verification: Optional[dict]
     error: Optional[str]
+    # Populated by the endpoints (not from_model) — attachments are a
+    # separate platform-DB query.
+    attachment_count: int = 0
 
     @classmethod
     def from_model(cls, m) -> "IssueOut":
@@ -91,6 +118,7 @@ class IssueOut(BaseModel):
 
 class IssueDetailOut(IssueOut):
     events: list = Field(default_factory=list)
+    attachments: list = Field(default_factory=list)  # list[AttachmentMeta]
 
 
 class IntakeResponse(BaseModel):
