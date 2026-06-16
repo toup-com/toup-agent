@@ -176,6 +176,33 @@ def test_is_at_head_returns_true_when_db_matches_script_head():
     eng.dispose()
 
 
+def test_head_check_runs_on_its_own_connection_not_the_migration_one():
+    """Regression for the 'alembic pinned at 063' bug.
+
+    `_is_at_head` issues a SELECT (get_current_heads) which, under
+    SQLAlchemy 2.0, *autobegins* a transaction on the connection. If that
+    check shares the connection later handed to `do_run_migrations`,
+    alembic's `begin_transaction()` sees a transaction it didn't open,
+    declines to own it, and does NOT commit on exit — so closing the
+    connection rolls back the entire migration span INCLUDING the
+    alembic_version bumps. The DB then re-runs the same idempotent span
+    every boot and never advances past where it first fell behind head.
+
+    The fix: run the head check on its OWN short-lived connection, closed
+    before the migration connection opens. This test locks that in.
+    """
+    backend_dir = Path(__file__).resolve().parents[1]
+    src = (backend_dir / "alembic" / "env.py").read_text()
+    fn = src[src.index("def run_migrations_online"):]
+    # The at-head check must use a dedicated, separate connection…
+    assert "as check_conn" in fn
+    assert "_is_at_head(check_conn)" in fn
+    # …and must NOT be invoked on the connection used for migrations.
+    assert "_is_at_head(connection)" not in fn
+    # Migrations still run on a freshly opened connection.
+    assert "do_run_migrations(connection)" in fn
+
+
 def test_skip_gate_reads_env_var_at_call_time_not_import():
     """The gate must be evaluated inside run_migrations_online, not at
     module load, so operators can flip LAT_SKIP_NOOP_MIGRATIONS by

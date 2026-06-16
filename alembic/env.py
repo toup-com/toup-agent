@@ -149,25 +149,40 @@ def run_migrations_online() -> None:
     # "050")`) from being silently no-op'd.
     can_skip = skip_enabled and _is_head_invocation()
 
-    with connectable.connect() as connection:
-        if can_skip:
-            t0 = time.monotonic()
-            at_head = _is_at_head(connection)
-            elapsed_ms = int((time.monotonic() - t0) * 1000)
-            if at_head:
-                log.info(
-                    "[PERF] alembic_noop=true elapsed_ms=%d "
-                    "skipped_full_evaluation=true",
-                    elapsed_ms,
-                )
-                connectable.dispose()
-                return
+    # IMPORTANT: the head check MUST run on its own short-lived connection,
+    # fully closed before the migration connection is opened.
+    #
+    # `_is_at_head` issues a SELECT (get_current_heads), which under
+    # SQLAlchemy 2.0 *autobegins* a transaction on that connection. If we did
+    # the check on the same connection we then hand to `do_run_migrations`,
+    # alembic's `begin_transaction()` would see a transaction it did not open,
+    # decline to own it, and NOT commit on exit — so when the connection
+    # closes, SQLAlchemy rolls back the entire migration span, INCLUDING the
+    # alembic_version bumps. The DB then re-runs the same (idempotent) span on
+    # every boot and the version never advances past where it was when the DB
+    # first fell behind head. (This is exactly how prod got pinned at 063 while
+    # 064–066 "ran" as no-ops every boot.) A separate, closed connection leaves
+    # the migration connection pristine so alembic owns and commits its txn.
+    if can_skip:
+        t0 = time.monotonic()
+        with connectable.connect() as check_conn:
+            at_head = _is_at_head(check_conn)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        if at_head:
             log.info(
-                "[PERF] alembic_noop=false elapsed_ms=%d "
-                "head_check_ran_then_proceeding=true",
+                "[PERF] alembic_noop=true elapsed_ms=%d "
+                "skipped_full_evaluation=true",
                 elapsed_ms,
             )
+            connectable.dispose()
+            return
+        log.info(
+            "[PERF] alembic_noop=false elapsed_ms=%d "
+            "head_check_ran_then_proceeding=true",
+            elapsed_ms,
+        )
 
+    with connectable.connect() as connection:
         do_run_migrations(connection)
 
     connectable.dispose()
