@@ -51,6 +51,7 @@ from app.support.enums import (
 from app.support.schemas import (
     IssueIntakeRequest,
     DecisionRequest,
+    GradeRequest,
     IntakeResponse,
     IssueOut,
     IssueDetailOut,
@@ -58,6 +59,8 @@ from app.support.schemas import (
     IssueListResponse,
     AttachmentMeta,
     AttachmentUploadResponse,
+    CorpusResponse,
+    GradeTally,
 )
 
 logger = logging.getLogger("support.api")
@@ -255,6 +258,26 @@ async def list_issues(
     return IssueListResponse(issues=out, total=len(out))
 
 
+@router.get("/corpus", response_model=CorpusResponse)
+async def grading_corpus(
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> CorpusResponse:
+    """Phase-0 read-back: graded issues + the actionable-rate tally.
+
+    Computed from real DB records (not scattered notes) so the ≥80%-actionable
+    gate is a real number before deciding whether to build the autonomous-fixer
+    runner. Declared before ``/issues/{issue_id}`` so the literal path wins.
+    """
+    _require_enabled()
+    rows = await repo.list_graded(db)
+    tally = await repo.grade_tally(db)
+    return CorpusResponse(
+        issues=[IssueOut.from_model(r) for r in rows],
+        tally=GradeTally.from_dict(tally),
+    )
+
+
 @router.get("/issues/{issue_id}", response_model=IssueDetailOut)
 async def get_issue(
     issue_id: str,
@@ -355,6 +378,34 @@ async def decide(
                           detail={"decision": "approve", "notes": body.notes})
     if getattr(settings, "support_auto_implement_on_approve", True):
         pipeline.spawn(pipeline.run_implementation(issue_id, admin_user_id=admin.id))
+    return IssueOut.from_model(issue)
+
+
+# ── Admin: Phase-0 diagnosis-quality grade (SEPARATE from approval) ───
+
+@router.post("/issues/{issue_id}/grade", response_model=IssueOut)
+async def grade_issue(
+    issue_id: str,
+    body: GradeRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> IssueOut:
+    """Record a Phase-0 diagnosis-quality verdict on an issue.
+
+    ANNOTATION ONLY — this records how good the *diagnosis* was (the ≥80%-
+    actionable validation gate) and is STRICTLY SEPARATE from the approval gate:
+    it never changes the issue's status, never sets the decision columns, and
+    never spawns the implement/fix pipeline. Gradeable in ANY state — you also
+    flag a real bug that was wrongly parked here (verdict=other + a note). The
+    grade can be overwritten; each grade appends a GRADED audit event.
+    """
+    _require_enabled()
+    issue = await repo.get_issue(db, issue_id)
+    if not issue:
+        raise HTTPException(status_code=404, detail="issue not found")
+    await repo.set_grade(
+        db, issue, verdict=body.verdict.value, note=body.note, actor_user_id=admin.id,
+    )
     return IssueOut.from_model(issue)
 
 

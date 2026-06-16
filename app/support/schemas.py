@@ -7,7 +7,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from app.support.enums import AdminDecision, IssueSeverity
+from app.support.enums import AdminDecision, IssueSeverity, SupportGradeVerdict
 
 
 # ── Intake ───────────────────────────────────────────────────────────
@@ -27,6 +27,13 @@ class IssueIntakeRequest(BaseModel):
 class DecisionRequest(BaseModel):
     decision: AdminDecision
     notes: Optional[str] = Field(default=None, max_length=4000)
+
+
+class GradeRequest(BaseModel):
+    """Phase-0 diagnosis-quality grade. Annotation only — does NOT advance the
+    lifecycle or touch the approval gate (see api/support.py grade_issue)."""
+    verdict: SupportGradeVerdict
+    note: Optional[str] = Field(default=None, max_length=4000)
 
 
 # ── Responses ────────────────────────────────────────────────────────
@@ -93,6 +100,11 @@ class IssueOut(BaseModel):
     pr_url: Optional[str]
     verification: Optional[dict]
     error: Optional[str]
+    # Phase-0 diagnosis-quality grade (admin annotation; separate from decision).
+    grade_verdict: Optional[str]
+    grade_note: Optional[str]
+    graded_by_user_id: Optional[str]
+    graded_at: Optional[datetime]
     # Populated by the endpoints (not from_model) — attachments are a
     # separate platform-DB query.
     attachment_count: int = 0
@@ -113,6 +125,8 @@ class IssueOut(BaseModel):
             decision_at=m.decision_at, decision_notes=m.decision_notes,
             branch_name=m.branch_name, pr_url=m.pr_url,
             verification=m.verification, error=m.error,
+            grade_verdict=m.grade_verdict, grade_note=m.grade_note,
+            graded_by_user_id=m.graded_by_user_id, graded_at=m.graded_at,
         )
 
 
@@ -130,3 +144,26 @@ class IntakeResponse(BaseModel):
 class IssueListResponse(BaseModel):
     issues: list
     total: int
+
+
+class GradeTally(BaseModel):
+    """Phase-0 corpus tally, computed from real DB records."""
+    by_verdict: dict          # {verdict: count}
+    total_graded: int
+    actionable: int
+    actionable_rate: float    # 0.0–1.0; the ≥0.80 gate
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GradeTally":
+        return cls(
+            by_verdict=d.get("by_verdict", {}),
+            total_graded=d.get("total_graded", 0),
+            actionable=d.get("actionable", 0),
+            actionable_rate=d.get("actionable_rate", 0.0),
+        )
+
+
+class CorpusResponse(BaseModel):
+    """Phase-0 read-back: graded issues + the actionable-rate tally."""
+    issues: list              # list[IssueOut] (graded only)
+    tally: GradeTally

@@ -84,6 +84,18 @@ class SupportIssue(Base):
     verification: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # ── Phase-0 diagnosis-quality grade (admin annotation) ───────────
+    # STRICTLY SEPARATE from the approval gate above: this records how good the
+    # *diagnosis* was (the ≥80%-actionable validation gate), and NEVER changes
+    # ``status`` nor the decision/approval columns — grading is annotation, not
+    # approval. ``grade_verdict`` ∈ app.support.enums.SupportGradeVerdict;
+    # indexed for the corpus tally's grouped count. ``other`` + a note is also
+    # where the admin flags a misclassification (e.g. a real bug that parked).
+    grade_verdict: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
+    grade_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    graded_by_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    graded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=True,

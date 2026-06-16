@@ -14,7 +14,7 @@ from sqlalchemy import select, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.support import SupportIssue, SupportIssueEvent, SupportAttachment
-from app.support.enums import SupportEventType
+from app.support.enums import SupportEventType, GRADE_ACTIONABLE
 
 
 async def create_issue(
@@ -136,6 +136,75 @@ async def set_status(
         await db.commit()
         await db.refresh(issue)
     return issue
+
+
+# ── Phase-0 diagnosis-quality grading (admin annotation) ──────────────
+
+async def set_grade(
+    db: AsyncSession,
+    issue: SupportIssue,
+    *,
+    verdict: str,
+    note: Optional[str] = None,
+    actor_user_id: Optional[str] = None,
+    commit: bool = True,
+) -> SupportIssue:
+    """Record a Phase-0 diagnosis-quality grade + an audit event.
+
+    Annotation ONLY: this NEVER changes ``issue.status`` and NEVER touches the
+    decision/approval columns. Grading how good a diagnosis was is strictly
+    separate from approving a fix (which is ``set_status(..., APPROVED)`` +
+    the implement pipeline). Re-grading overwrites the verdict and appends a
+    fresh GRADED event so the history is preserved.
+    """
+    issue.grade_verdict = verdict
+    issue.grade_note = note
+    issue.graded_by_user_id = actor_user_id
+    issue.graded_at = datetime.utcnow()
+    # NB: issue.updated_at is intentionally left alone — grading is annotation,
+    # not a lifecycle change, and must not look like a state transition.
+    db.add(issue)
+    await add_event(
+        db, issue.id, SupportEventType.GRADED, actor="admin",
+        actor_user_id=actor_user_id,
+        message=f"Graded: {verdict}",
+        detail={"verdict": verdict, "note": note},
+    )
+    if commit:
+        await db.commit()
+        await db.refresh(issue)
+    return issue
+
+
+async def list_graded(db: AsyncSession, *, limit: int = 500) -> list:
+    """Graded issues only, most-recently-graded first (the Phase-0 corpus)."""
+    stmt = (
+        select(SupportIssue)
+        .where(SupportIssue.grade_verdict.isnot(None))
+        .order_by(desc(SupportIssue.graded_at))
+        .limit(limit)
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def grade_tally(db: AsyncSession) -> dict:
+    """Counts of graded issues by verdict + the actionable rate, computed from
+    real DB records (one grouped query) so the ≥80% gate is a real number."""
+    stmt = (
+        select(SupportIssue.grade_verdict, func.count(SupportIssue.id))
+        .where(SupportIssue.grade_verdict.isnot(None))
+        .group_by(SupportIssue.grade_verdict)
+    )
+    rows = (await db.execute(stmt)).all()
+    by_verdict = {v: c for v, c in rows}
+    total = sum(by_verdict.values())
+    actionable = by_verdict.get(GRADE_ACTIONABLE, 0)
+    return {
+        "by_verdict": by_verdict,
+        "total_graded": total,
+        "actionable": actionable,
+        "actionable_rate": (actionable / total) if total else 0.0,
+    }
 
 
 # ── Attachments ───────────────────────────────────────────────────────

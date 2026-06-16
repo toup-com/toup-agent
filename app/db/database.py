@@ -621,6 +621,18 @@ async def init_db():
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_conversations_system_channel_per_day "
         "ON conversations (user_id, day_chat_id, channel) "
         "WHERE channel IN ('routine', 'trigger', 'api', 'digest') AND is_active = TRUE",
+        # ── Support agent: Phase-0 diagnosis-quality grade (alembic 066) ──
+        # Mirrored here per the READ-FIRST rule: the platform-api boots via
+        # init_db, and the Dockerfile CMD runs `alembic upgrade head` only
+        # best-effort (it does NOT block uvicorn on failure). Without these,
+        # every SELECT from support_issues 500s once the ORM model references
+        # grade_verdict. support_issues is PLATFORM_ONLY, so this ALTER is a
+        # no-op on agent DBs (table absent → swallowed by the try/except below).
+        "ALTER TABLE support_issues ADD COLUMN IF NOT EXISTS grade_verdict VARCHAR(40)",
+        "ALTER TABLE support_issues ADD COLUMN IF NOT EXISTS grade_note TEXT",
+        "ALTER TABLE support_issues ADD COLUMN IF NOT EXISTS graded_by_user_id VARCHAR(36)",
+        "ALTER TABLE support_issues ADD COLUMN IF NOT EXISTS graded_at TIMESTAMP",
+        "CREATE INDEX IF NOT EXISTS ix_support_issues_grade_verdict ON support_issues (grade_verdict)",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

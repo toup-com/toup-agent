@@ -58,6 +58,27 @@ class AdminDecision(str, Enum):
     REQUEST_CHANGES = "request_changes"
 
 
+class SupportGradeVerdict(str, Enum):
+    """Phase-0 diagnosis-quality verdict, recorded by an admin.
+
+    STRICTLY SEPARATE from ``AdminDecision``/approval: a grade annotates how
+    good the *diagnosis* was (the ≥80%-actionable validation gate before the
+    autonomous-fixer runner is built). Grading NEVER advances the lifecycle and
+    NEVER triggers a fix. ``OTHER`` + a note is also where the admin flags a
+    misclassification (e.g. a real bug that got parked).
+    """
+
+    ACTIONABLE = "actionable"
+    WRONG_ROOT_CAUSE = "wrong_root_cause"
+    WRONG_FILES = "wrong_files"
+    UNSAFE_OR_VIOLATES_INVARIANT = "unsafe_or_violates_invariant"
+    OTHER = "other"
+
+
+# The single verdict that counts toward the Phase-0 ≥80%-actionable gate.
+GRADE_ACTIONABLE = SupportGradeVerdict.ACTIONABLE.value
+
+
 class IssueSeverity(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
@@ -76,4 +97,6 @@ class SupportEventType(str, Enum):
     VERIFIED = "verified"
     PR_OPENED = "pr_opened"
     FAILED = "failed"
+    # Phase-0 admin diagnosis-quality grade (annotation; never a transition).
+    GRADED = "graded"
     NOTE = "note"
