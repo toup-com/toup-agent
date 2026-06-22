@@ -83,6 +83,7 @@ patchright>=1.0.0
 fastmcp==2.11.3
 
 # Smart Fetch
+beautifulsoup4>=4.12.0   # search.py/reader.py import bs4 at module load — REQUIRED (was missing; broke smart_fetch scraping + the tool_executor _budget import chain)
 trafilatura>=2.0.0
 yt-dlp>=2025.1.0
 
