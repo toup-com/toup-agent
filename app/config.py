@@ -118,9 +118,47 @@ class Settings(BaseSettings):
     app_builder_builder_model: Optional[str] = None
     agent_max_tokens: int = 16000  # Max output tokens for agent
     agent_max_tool_iterations: int = 40  # Max tool call loops before forcing stop
+    # Max idempotent read-only tools (web_search/web_fetch/extension_*) run
+    # concurrently within a single assistant turn. Bounds outbound load so a
+    # multi-fetch turn finishes in ~max(individual) latency, not sum.
+    agent_parallel_tool_cap: int = 6
     agent_workspace_dir: str = "/app/workspace"  # Working directory for file operations
     agent_port: int = 8001  # Host-facing port (set by managed container provisioning)
     brave_api_key: Optional[str] = None  # For web search
+    # Kill-switch (default on): web_search races the primary engines
+    # (Whoogle/DuckDuckGo/Bing) concurrently over a shared client and takes the
+    # first non-empty result, so a dead or slow backend can't block the chain
+    # (Mojeek stays a last resort). Flip off to fall back to the legacy
+    # sequential priority chain.
+    search_engine_race: bool = True
+    # Kill-switch (default on): the server-side research fallback reads the
+    # top-N result pages concurrently (bounded by research_read_concurrency)
+    # instead of one-at-a-time, so a depth-N research call costs ~max(page)
+    # latency, not the sum. Flip off for the legacy sequential reads — the
+    # output bytes are identical either way.
+    research_parallel_reads: bool = True
+    research_read_concurrency: int = 6
+    # Per-tenant (one process per container) TTL+LRU caches for web search and
+    # page fetch — a repeat query/URL within the TTL returns with zero network.
+    # Kill-switches (default on); empties/no-results are never cached.
+    search_cache_enabled: bool = True
+    search_cache_ttl_s: int = 420          # 7 min
+    search_cache_max: int = 256
+    fetch_cache_enabled: bool = True
+    fetch_cache_ttl_s: int = 720           # 12 min
+    fetch_cache_max: int = 256
+    # Kill-switch (default on): dedup near-duplicate URLs, drop empty results,
+    # and BM25-rerank web_search results by relevance before the model sees them.
+    # Pure-Python (no LLM/network), so no latency cost. Off → raw engine order.
+    search_rerank_enabled: bool = True
+    # Kill-switch (default on): truncate web_search/web_fetch output ONCE to a
+    # token budget (cheap ~4 chars/token estimate) instead of the legacy double
+    # char+byte caps, and cap the AGGREGATE tokens across a parallel web batch so
+    # a multi-fetch turn can't flood the context. Off → legacy byte/char caps.
+    web_token_budget_enabled: bool = True
+    fetch_token_budget: int = 4000          # tokens per single web_fetch
+    search_token_budget: int = 2000         # tokens per web_search result block
+    web_turn_token_budget: int = 12000      # aggregate cap across one parallel web batch
     skills_dir: str = "/app/skills"  # External skills directory
 
     # Day-as-Chat context architecture (feature flag)

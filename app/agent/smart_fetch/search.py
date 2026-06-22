@@ -8,7 +8,10 @@ Queries multiple search engines — Google first (best results), then fallbacks:
   4. Mojeek (independent engine, no CAPTCHA)
 
 Whoogle is a self-hosted Google frontend that queries Google server-side
-without triggering CAPTCHAs. It's installed as part of the agent provisioning.
+without triggering CAPTCHAs. It is present only on self-hosted-VPS agents
+(see ssh_deploy_service); managed pool/containers have no Whoogle, so its
+attempt fails instantly (connection refused) and is skipped — when racing is
+enabled it never blocks the other engines either way.
 
 All engines are queried via simple HTTP requests with proper headers.
 No browser, no headless Chrome, no Playwright — just httpx.
@@ -17,13 +20,39 @@ No browser, no headless Chrome, no Playwright — just httpx.
 import asyncio
 import logging
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import httpx
 from bs4 import BeautifulSoup
 
+from app.config import settings
+from app.agent.smart_fetch._cache import TTLCache
+from app.agent.smart_fetch._rerank import rerank_filter
+
 logger = logging.getLogger(__name__)
+
+# A dead or hung local Whoogle must never stall a search. A refused connection
+# on localhost already fails instantly; this only caps the rarer "listening but
+# hung" case so the race below can't be held up by it.
+_WHOOGLE_CONNECT_TIMEOUT_S = 0.5
+
+# Per-tenant TTL+LRU cache of formatted results. Cleared on /admin/bind
+# (smart_fetch.clear_caches) so an in-place re-bind can't leak across tenants.
+_SEARCH_CACHE = TTLCache(maxsize=settings.search_cache_max, ttl_s=settings.search_cache_ttl_s)
+
+
+@asynccontextmanager
+async def _client(borrowed: Optional[httpx.AsyncClient]):
+    """Yield a shared pooled client when one is passed (race path), else a
+    short-lived own client (legacy sequential path). A borrowed client is
+    never closed here — the caller owns its lifecycle."""
+    if borrowed is not None:
+        yield borrowed
+    else:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as own:
+            yield own
 
 _HEADERS = {
     "User-Agent": (
@@ -59,18 +88,27 @@ class SearchResponse:
 WHOOGLE_URL = "http://127.0.0.1:5000"
 
 
-async def _search_google_whoogle(query: str, count: int = 10) -> SearchResponse:
+async def _search_google_whoogle(
+    query: str, count: int = 10, client: Optional[httpx.AsyncClient] = None
+) -> SearchResponse:
     """Search Google via local Whoogle instance (self-hosted, no CAPTCHA).
 
     Whoogle is installed during agent provisioning and runs on port 5000.
     It queries Google server-side, strips tracking, returns clean results.
     """
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(
+        # The sub-second connect timeout applies only on the race path (a
+        # shared client is passed there); the legacy own-client path keeps the
+        # original 15s default so flag-OFF behavior stays byte-identical.
+        get_kwargs = {}
+        if client is not None:
+            get_kwargs["timeout"] = httpx.Timeout(15.0, connect=_WHOOGLE_CONNECT_TIMEOUT_S)
+        async with _client(client) as c:
+            resp = await c.get(
                 f"{WHOOGLE_URL}/search",
                 params={"q": query},
                 headers={"User-Agent": "Mozilla/5.0"},
+                **get_kwargs,
             )
             resp.raise_for_status()
 
@@ -116,11 +154,13 @@ async def _search_google_whoogle(query: str, count: int = 10) -> SearchResponse:
 # DuckDuckGo HTML search (secondary — most reliable fallback)
 # ──────────────────────────────────────────────────────────────
 
-async def _search_duckduckgo(query: str, count: int = 10) -> SearchResponse:
+async def _search_duckduckgo(
+    query: str, count: int = 10, client: Optional[httpx.AsyncClient] = None
+) -> SearchResponse:
     """Search DuckDuckGo via HTML endpoint (no API key, no CAPTCHA)."""
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(
+        async with _client(client) as c:
+            resp = await c.get(
                 "https://html.duckduckgo.com/html/",
                 params={"q": query},
                 headers=_HEADERS,
@@ -156,11 +196,13 @@ async def _search_duckduckgo(query: str, count: int = 10) -> SearchResponse:
 # Bing search (secondary — lighter bot detection than Google)
 # ──────────────────────────────────────────────────────────────
 
-async def _search_bing(query: str, count: int = 10) -> SearchResponse:
+async def _search_bing(
+    query: str, count: int = 10, client: Optional[httpx.AsyncClient] = None
+) -> SearchResponse:
     """Search Bing via HTML scrape (no API key needed)."""
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(
+        async with _client(client) as c:
+            resp = await c.get(
                 "https://www.bing.com/search",
                 params={"q": query, "count": count},
                 headers=_HEADERS,
@@ -189,11 +231,13 @@ async def _search_bing(query: str, count: int = 10) -> SearchResponse:
 # Mojeek search (tertiary — independent engine, no tracking)
 # ──────────────────────────────────────────────────────────────
 
-async def _search_mojeek(query: str, count: int = 10) -> SearchResponse:
+async def _search_mojeek(
+    query: str, count: int = 10, client: Optional[httpx.AsyncClient] = None
+) -> SearchResponse:
     """Search Mojeek via HTML scrape (independent engine, no CAPTCHA)."""
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(
+        async with _client(client) as c:
+            resp = await c.get(
                 "https://www.mojeek.com/search",
                 params={"q": query},
                 headers=_HEADERS,
@@ -222,25 +266,124 @@ async def _search_mojeek(query: str, count: int = 10) -> SearchResponse:
 # Public API: toup_search
 # ──────────────────────────────────────────────────────────────
 
+def _format_results(results: List[SearchResult], count: int) -> str:
+    """Render results as the numbered title/url/snippet block the model sees.
+    Identical output shape for both the sequential and race paths."""
+    lines: List[str] = []
+    for i, r in enumerate(results[:count], 1):
+        lines.append(f"{i}. {r.title}")
+        lines.append(f"   {r.url}")
+        if r.snippet:
+            lines.append(f"   {r.snippet}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _ranked(results: List[SearchResult], query: str) -> List[SearchResult]:
+    """Dedup near-duplicate URLs, drop empties, and BM25-rerank by relevance to
+    the query (kill-switch ``settings.search_rerank_enabled``). Off → unchanged
+    engine order. Pure-Python and best-effort: never raises, never blocks."""
+    if not settings.search_rerank_enabled:
+        return results
+    try:
+        return rerank_filter(results, query)
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("[ToupSearch] rerank failed, using raw order: %s", exc)
+        return results
+
+
+async def _first_with_results(
+    engines, query: str, count: int, client: httpx.AsyncClient
+) -> Optional[SearchResponse]:
+    """Run ``engines`` concurrently over a shared client and return the first
+    SearchResponse that actually has results, cancelling the still-pending
+    losers. Engines that error or return empty are skipped. None if none of
+    them produced results."""
+    tasks = [asyncio.create_task(engine(query, count, client)) for engine in engines]
+    pending = set(tasks)
+    winner: Optional[SearchResponse] = None
+    try:
+        while pending and winner is None:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            # Inspect the just-completed tasks in the engines' priority order
+            # (not asyncio.wait's unordered `done` set) so that when two engines
+            # finish in the same tick the higher-priority one deterministically wins.
+            for t in (task for task in tasks if task in done):
+                if t.cancelled() or t.exception() is not None:
+                    continue
+                resp = t.result()
+                if isinstance(resp, SearchResponse) and resp.results:
+                    winner = resp
+                    break
+    finally:
+        # Cancel the still-pending losers, then await every task so cancellations
+        # settle and the exceptions of done-but-uninspected losers are retrieved
+        # (avoids "Task exception was never retrieved" log noise) before the
+        # caller closes the shared client.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return winner
+
+
+async def _toup_search_sequential(query: str, count: int = 5) -> str:
+    """Legacy behavior: try engines in priority order, first non-empty wins."""
+    engines = [_search_google_whoogle, _search_duckduckgo, _search_bing, _search_mojeek]
+    for engine in engines:
+        resp = await engine(query, count)
+        if resp.results:
+            return _format_results(_ranked(resp.results, query), count)
+    return "No search results found across all engines."
+
+
+async def _toup_search_race(query: str, count: int = 5) -> str:
+    """Race the primary engines (Whoogle/DuckDuckGo/Bing) concurrently over one
+    shared pooled client; first non-empty result wins and the losers are
+    cancelled, so a dead or slow backend can't stall the chain. Mojeek stays a
+    sequential last resort, used only if all primaries come back empty."""
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        winner = await _first_with_results(
+            [_search_google_whoogle, _search_duckduckgo, _search_bing],
+            query, count, client,
+        )
+        if winner is None:
+            resp = await _search_mojeek(query, count, client)
+            if resp.results:
+                winner = resp
+        if winner is not None and winner.results:
+            return _format_results(_ranked(winner.results, query), count)
+    return "No search results found across all engines."
+
+
 async def toup_search(query: str, count: int = 5) -> str:
     """
     Search using multiple engines. Returns formatted results.
 
-    Priority: DuckDuckGo → Bing → Mojeek.
-    Falls through to the next engine if one fails or returns no results.
+    With ``settings.search_engine_race`` on (the default; it's a kill-switch),
+    the primary engines (Whoogle, DuckDuckGo, Bing) are raced concurrently over
+    a shared client and the first non-empty result wins (losers cancelled), with
+    Mojeek as a last resort — a dead or slow Whoogle/engine can no longer block
+    the chain. Flipped off, the legacy sequential priority chain is used unchanged.
+
+    Results are served from a short-lived per-tenant TTL+LRU cache (kill-switch
+    ``settings.search_cache_enabled``); a repeat query within the TTL returns
+    with zero network calls. Empty/no-result responses are never cached.
     """
-    engines = [_search_google_whoogle, _search_duckduckgo, _search_bing, _search_mojeek]
+    key = None
+    if settings.search_cache_enabled:
+        key = (" ".join(query.split()).lower(), count)
+        cached = _SEARCH_CACHE.get(key)
+        if cached is not None:
+            logger.info("[PERF] web_search cache=hit q=%r", query[:60])
+            return cached
 
-    for engine in engines:
-        resp = await engine(query, count)
-        if resp.results:
-            lines = []
-            for i, r in enumerate(resp.results[:count], 1):
-                lines.append(f"{i}. {r.title}")
-                lines.append(f"   {r.url}")
-                if r.snippet:
-                    lines.append(f"   {r.snippet}")
-                lines.append("")
-            return "\n".join(lines)
+    if settings.search_engine_race:
+        result = await _toup_search_race(query, count)
+    else:
+        result = await _toup_search_sequential(query, count)
 
-    return "No search results found across all engines."
+    if key is not None and result and not result.startswith("No search results"):
+        _SEARCH_CACHE.set(key, result)
+        logger.info("[PERF] web_search cache=miss q=%r", query[:60])
+    return result

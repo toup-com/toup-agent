@@ -180,6 +180,15 @@ async def admin_bind(
         logger.exception("[admin/bind] apply_to_settings failed")
         raise HTTPException(status_code=500, detail=f"Settings apply failed: {e}") from e
 
+    # 1b. Identity just changed — drop any per-process smart_fetch caches so a
+    #     re-bound pool container can never serve the previous tenant's cached
+    #     search results or fetched pages (defense in depth for tenant isolation).
+    try:
+        from app.agent.smart_fetch import clear_caches
+        clear_caches()
+    except Exception:
+        logger.warning("[admin/bind] smart_fetch cache clear failed", exc_info=True)
+
     # 2. Write runtime.json (durable). After this returns, every
     #    runtime_identity.is_bound() check returns True and the lobby
     #    middleware lets traffic through.

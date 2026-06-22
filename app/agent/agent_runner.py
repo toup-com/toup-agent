@@ -56,6 +56,18 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 2
 RETRY_DELAY = 2.0  # seconds
 
+# Idempotent, read-only tools that are safe to execute concurrently when the
+# model emits several in one assistant turn. Everything NOT in this set —
+# stateful browser_* sessions, mutating tools, and any unknown/new tool —
+# stays sequential and in the model's original order (safe default).
+PARALLEL_SAFE_TOOLS: frozenset = frozenset({
+    "web_search",
+    "web_fetch",
+    "extension_search",
+    "extension_read",
+    "extension_research",
+})
+
 
 # TKT-LAT-004: process-wide TTL cache for User.timezone is implemented
 # in app/agent/_user_tz_cache.py (kept config-free so unit tests don't
@@ -1222,8 +1234,22 @@ class AgentRunner:
                 final_text = text_buf
                 break
 
-            # Execute tool calls
+            # Execute tool calls.
+            # Pre-execute idempotent read-only tools (web_search/web_fetch/
+            # extension_*) concurrently so a turn that fetches several pages
+            # finishes in ~max(individual) latency, not the sum. The
+            # sequential loop below is otherwise unchanged: it consumes the
+            # precomputed result for these tools and still awaits stateful/
+            # unknown tools inline and in the model's original order. With
+            # <2 parallel-safe calls nothing is pre-executed, so single-tool
+            # turns are byte-identical to before.
             tool_results: List[Dict[str, Any]] = []
+            _parallel_tcs = [tc for tc in pending_tool_calls if tc["name"] in PARALLEL_SAFE_TOOLS]
+            _parallel_results: Dict[str, Dict[str, Any]] = {}
+            if len(_parallel_tcs) > 1:
+                _parallel_results = await self._execute_tools_parallel(
+                    _parallel_tcs, settings.agent_parallel_tool_cap
+                )
             for tc in pending_tool_calls:
                 if cancel_check and cancel_check():
                     logger.info("[AGENT] Cancelled before tool execution")
@@ -1231,17 +1257,33 @@ class AgentRunner:
 
                 logger.info(f"[AGENT] Tool called: {tc['name']}({json.dumps(tc['input'])[:200]})")
                 all_tool_calls.append(tc)
+                # Observational only — the return value is intentionally
+                # discarded. For tools pre-executed in the parallel pass above
+                # this fires AFTER execution, so a future handler must NOT rely
+                # on BEFORE_TOOL_CALL to veto or rewrite a parallel-safe call.
                 await _hb.emit(HookEvent.BEFORE_TOOL_CALL, {"tool": tc["name"], "input": tc["input"]})
 
                 _t_tool = time.perf_counter()
                 _t_tool_started_ms = int(time.time() * 1000)
-                try:
-                    result = await self.tools.execute(tc["name"], tc["input"])
-                except Exception as e:
-                    logger.exception(f"[AGENT] Tool {tc['name']} crashed")
-                    result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
+                _pre = _parallel_results.get(tc["id"])
+                if _pre is not None:
+                    # Already executed concurrently above; reuse its result and
+                    # its real wall-clock timing so the PERF log and persisted
+                    # ToolPillRow records reflect true (overlapping) durations.
+                    result = _pre["result"]
+                    _t_tool_started_ms = _pre["started_ms"]
+                    _elapsed_ms = _pre["completed_ms"] - _pre["started_ms"]
+                    _completed_at_ms = _pre["completed_ms"]
+                else:
+                    try:
+                        result = await self.tools.execute(tc["name"], tc["input"])
+                    except Exception as e:
+                        logger.exception(f"[AGENT] Tool {tc['name']} crashed")
+                        result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
+                    _elapsed_ms = (time.perf_counter() - _t_tool) * 1000
+                    _completed_at_ms = int(time.time() * 1000)
 
-                logger.info(f"[PERF] tool_exec({tc['name']}): {(time.perf_counter() - _t_tool) * 1000:.0f}ms — {len(result)} chars")
+                logger.info(f"[PERF] tool_exec({tc['name']}): {_elapsed_ms:.0f}ms — {len(result)} chars")
                 logger.info(f"[AGENT] Tool result: {result[:200]}")
                 await _hb.emit(HookEvent.AFTER_TOOL_CALL, {"tool": tc["name"], "result_len": len(result)})
                 # Capture for the persisted ToolPillRow re-render. We
@@ -1253,7 +1295,7 @@ class AgentRunner:
                 tool_event_records.append({
                     "tool": tc["name"],
                     "started_at_ms": _t_tool_started_ms,
-                    "completed_at_ms": int(time.time() * 1000),
+                    "completed_at_ms": _completed_at_ms,
                     "summary": _record_summary,
                 })
                 if on_tool_end:
@@ -1520,7 +1562,61 @@ class AgentRunner:
             memories_extracted=0,  # extracted in background
             asst_message_id=asst_message_id,
         )
-    
+
+    async def _execute_tools_parallel(
+        self,
+        tcs: List[Dict[str, Any]],
+        cap: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Execute idempotent read-only tool calls concurrently, bounded by a
+        semaphore of size ``cap``.
+
+        Returns ``{tool_use_id: {"result", "started_ms", "completed_ms"}}``.
+        Every tool_use_id is present in the result. Exceptions are captured
+        per-task as an ``ERROR`` string (same shape the sequential path
+        produces) so one failing call never sinks the batch and every
+        tool_use still gets a result. Each call keeps its own
+        ``asyncio.wait_for(tool_timeout)`` wrapper inside ``tools.execute``.
+        """
+        sem = asyncio.Semaphore(max(1, cap))
+
+        async def _one(tc: Dict[str, Any]) -> Dict[str, Any]:
+            async with sem:
+                started_ms = int(time.time() * 1000)
+                try:
+                    result = await self.tools.execute(tc["name"], tc["input"])
+                except Exception as e:
+                    logger.exception(f"[AGENT] Tool {tc['name']} crashed (parallel)")
+                    result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
+                return {
+                    "result": result,
+                    "started_ms": started_ms,
+                    "completed_ms": int(time.time() * 1000),
+                }
+
+        gathered = await asyncio.gather(*[_one(tc) for tc in tcs])
+        results = {tc["id"]: g for tc, g in zip(tcs, gathered)}
+
+        # Ticket 6: cap the AGGREGATE token load across this parallel web batch
+        # (all PARALLEL_SAFE web tools) so a multi-fetch turn can't flood the
+        # context. web_search/web_fetch results are already per-fetch token-
+        # budgeted in tool_executor; extension_* results are only byte-capped
+        # there, so this aggregate trim is what bounds them. We bound the SUM by
+        # trimming each result to an equal share only when the total exceeds the
+        # turn budget (results under their share are left untouched).
+        if settings.web_token_budget_enabled and len(results) > 1:
+            from app.agent.smart_fetch._budget import estimate_tokens, truncate_to_tokens
+            total = sum(estimate_tokens(g["result"]) for g in results.values())
+            if total > settings.web_turn_token_budget:
+                share = max(256, settings.web_turn_token_budget // len(results))
+                for g in results.values():
+                    g["result"] = truncate_to_tokens(g["result"], share)
+                logger.info(
+                    "[PERF] web_turn_budget: %d tok > %d cap -> trimmed %d results to %d tok each",
+                    total, settings.web_turn_token_budget, len(results), share,
+                )
+        return results
+
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------

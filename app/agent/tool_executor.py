@@ -136,6 +136,11 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
 # Default if tool not in the table
 DEFAULT_OUTPUT_LIMIT = 15_000
 
+# Ticket 6: these tools truncate ONCE to a token budget (settings.*_token_budget)
+# instead of the byte cap above, when settings.web_token_budget_enabled is on.
+_TOKEN_BUDGETED_TOOLS = frozenset({"web_search", "web_fetch"})
+from app.agent.smart_fetch._budget import truncate_to_tokens  # noqa: E402  (no import cycle; smart_fetch loads at boot regardless)
+
 # Dangerous command patterns — always blocked (catastrophic)
 BLOCKED_PATTERNS = [
     r"rm\s+-rf\s+/\s*$",
@@ -543,11 +548,18 @@ class ToolExecutor:
             else:
                 return f"ERROR: Unknown tool '{tool_name}'"
 
-            # Apply per-tool output limit
-            limit = TOOL_OUTPUT_LIMITS.get(tool_name, DEFAULT_OUTPUT_LIMIT)
-            if len(result) > limit:
-                truncated_bytes = len(result) - limit
-                result = result[:limit] + f"\n\n[truncated, {truncated_bytes} more bytes]"
+            # Apply per-tool output limit. Web search/fetch truncate ONCE to a
+            # token-aware budget (Ticket 6) — replacing the legacy byte cap so
+            # content isn't double-truncated; all other tools keep the byte cap.
+            if settings.web_token_budget_enabled and tool_name in _TOKEN_BUDGETED_TOOLS:
+                budget = (settings.search_token_budget if tool_name == "web_search"
+                          else settings.fetch_token_budget)
+                result = truncate_to_tokens(result, budget)
+            else:
+                limit = TOOL_OUTPUT_LIMITS.get(tool_name, DEFAULT_OUTPUT_LIMIT)
+                if len(result) > limit:
+                    truncated_bytes = len(result) - limit
+                    result = result[:limit] + f"\n\n[truncated, {truncated_bytes} more bytes]"
 
             return result
         except Exception as exc:
@@ -1020,7 +1032,9 @@ class ToolExecutor:
     # ------------------------------------------------------------------
     async def _tool_web_search(self, inp: Dict[str, Any]) -> str:
         query = inp.get("query", "")
-        count = min(int(inp.get("count", 5)), 10)
+        # Default 8 (Ticket 7): snippets are cheap and reranked best-first, so a
+        # few more candidates improve triage before any fetch. Token-budgeted.
+        count = min(int(inp.get("count", 8)), 10)
 
         if not query:
             return "ERROR: query is required"
@@ -1115,7 +1129,14 @@ class ToolExecutor:
     # ------------------------------------------------------------------
     async def _tool_web_fetch(self, inp: Dict[str, Any]) -> str:
         url = inp.get("url", "")
-        max_chars = int(inp.get("max_chars", 10000))
+        # With token budgeting on, the single authoritative limit is the token
+        # budget applied in execute(); give the reader/browser a generous char
+        # safety cap above it so it never truncates first (no double cut). Off →
+        # legacy per-request char cap.
+        if settings.web_token_budget_enabled:
+            max_chars = settings.fetch_token_budget * 6
+        else:
+            max_chars = int(inp.get("max_chars", 10000))
 
         if not url:
             return "ERROR: url is required"
@@ -1321,14 +1342,33 @@ class ToolExecutor:
         if not urls:
             return serp or f"No results for '{query}'."
 
+        # Read the result pages concurrently (bounded by a semaphore) so a
+        # depth-N research call costs ~max(page) latency, not the sum. The
+        # per-URL formatting and the assembled output are identical to the
+        # legacy sequential path, so flipping the kill-switch changes only
+        # timing, never the bytes returned to the model.
+        sem = asyncio.Semaphore(max(1, settings.research_read_concurrency))
+
+        async def _read_one(u: str) -> str:
+            async with sem:
+                try:
+                    txt = await toup_read_page(u, per_page)
+                    return txt or "(empty)"
+                except Exception as exc:
+                    return f"(read failed: {exc})"
+
+        if settings.research_parallel_reads:
+            pages = await asyncio.gather(*[_read_one(u) for u in urls])
+        else:
+            pages = [await _read_one(u) for u in urls]
+        # 1:1 with urls (gather and the list-comp both preserve order); guard so
+        # a future refactor can't silently drop sections via zip truncation.
+        assert len(pages) == len(urls)
+
         out = [f"# Research: {query}", "", "_(extension unavailable; using server-side fetch)_", ""]
-        for i, u in enumerate(urls, 1):
+        for i, (u, txt) in enumerate(zip(urls, pages), 1):
             out.append(f"## [{i}] {u}")
-            try:
-                txt = await toup_read_page(u, per_page)
-                out.append(txt or "(empty)")
-            except Exception as exc:
-                out.append(f"(read failed: {exc})")
+            out.append(txt)
             out.append("")
             out.append("---")
             out.append("")

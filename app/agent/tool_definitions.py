@@ -235,7 +235,13 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "web_search",
             "description": (
-                "Search the web and return a list of results with titles, URLs, and snippets."
+                "Search the web; returns ranked results as title + URL + snippet "
+                "(no page bodies). Reason over the snippets FIRST — they often "
+                "answer the question outright. When a task needs several angles "
+                "(comparisons, multi-part questions), issue MULTIPLE web_search "
+                "calls in the SAME turn — they run concurrently — instead of "
+                "searching, waiting, then searching again. Only web_fetch a "
+                "result when its snippet is insufficient."
             ),
             "input_schema": {
                 "type": "object",
@@ -246,7 +252,7 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                     },
                     "count": {
                         "type": "integer",
-                        "description": "Number of results to return (default 5, max 10).",
+                        "description": "Number of results to return (default 8, max 10).",
                     },
                 },
                 "required": ["query"],
@@ -258,8 +264,13 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "web_fetch",
             "description": (
-                "Fetch a URL and extract readable text content. "
-                "Strips HTML, scripts, and styles. Good for reading articles and documentation."
+                "Fetch a URL and extract readable text (HTML/scripts/styles "
+                "stripped). Use it on-demand — only for the few results whose "
+                "search snippet wasn't enough, not for every result. When you "
+                "need several pages, call web_fetch for ALL of them in the SAME "
+                "turn: they run concurrently (≈ the time of one fetch) and the "
+                "combined output is token-budgeted, so batching is both faster "
+                "and safe. Output is truncated to a token budget automatically."
             ),
             "input_schema": {
                 "type": "object",
@@ -270,7 +281,10 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                     },
                     "max_chars": {
                         "type": "integer",
-                        "description": "Max characters to return (default 10000).",
+                        "description": (
+                            "Optional upper bound on characters returned. Usually "
+                            "omit it — output is token-budgeted automatically."
+                        ),
                     },
                 },
                 "required": ["url"],

@@ -17,7 +17,15 @@ from typing import Optional
 import httpx
 from bs4 import BeautifulSoup
 
+from app.config import settings
+from app.agent.smart_fetch._cache import TTLCache
+
 logger = logging.getLogger(__name__)
+
+# Per-tenant TTL+LRU cache of extracted page text, keyed on (requested url,
+# max_chars) and the final post-redirect url. Cleared on /admin/bind
+# (smart_fetch.clear_caches) so an in-place re-bind can't leak across tenants.
+_PAGE_CACHE = TTLCache(maxsize=settings.fetch_cache_max, ttl_s=settings.fetch_cache_ttl_s)
 
 _HEADERS = {
     "User-Agent": (
@@ -138,7 +146,19 @@ async def toup_read_page(url: str, max_chars: int = 15000) -> str:
     Returns formatted text with title and content.
     Returns empty string if the page can't be fetched or is JS-only
     (caller should fall back to browser).
+
+    Successful extractions are served from a short-lived per-tenant TTL+LRU
+    cache (kill-switch ``settings.fetch_cache_enabled``); a repeat fetch of the
+    same url within the TTL returns with zero network calls. Empty results (JS
+    pages, 403s, errors that signal a browser fallback) are never cached.
     """
+    cache_key = None
+    if settings.fetch_cache_enabled:
+        cache_key = (url.strip(), max_chars)
+        cached = _PAGE_CACHE.get(cache_key)
+        if cached is not None:
+            logger.info("[PERF] web_fetch cache=hit url=%s", url[:80])
+            return cached
     try:
         async with httpx.AsyncClient(
             timeout=20,
@@ -195,6 +215,12 @@ async def toup_read_page(url: str, max_chars: int = 15000) -> str:
         result = "\n".join(parts)
         if len(result) > max_chars:
             result = result[:max_chars] + "\n... (truncated)"
+        if cache_key is not None and result:
+            _PAGE_CACHE.set(cache_key, result)
+            final_key = (str(resp.url).strip(), max_chars)
+            if final_key != cache_key:
+                _PAGE_CACHE.set(final_key, result)  # dedup redirect chains
+            logger.info("[PERF] web_fetch cache=miss url=%s", url[:80])
         return result
 
     except httpx.HTTPStatusError as e:
