@@ -1039,7 +1039,21 @@ class ToolExecutor:
         if not query:
             return "ERROR: query is required"
 
-        # ── API-first: multi-engine search without a browser (no CAPTCHA) ──
+        # ── Primary: Brave Search API — instant (~200ms), clean JSON, the same
+        # index our browser scrapes but ~30x faster. Platform-level key (one key,
+        # all tenants). The httpx scrape below is reliably CAPTCHA/challenge-blocked
+        # on datacenter IPs (DDG 202-challenge, Bing CAPTCHA), so when the key is
+        # present this is the path that actually serves users fast.
+        if settings.brave_api_key:
+            try:
+                result = await self._brave_search_fallback(query, count)
+                if result and result.strip() != "No results found.":
+                    return result
+            except Exception as exc:
+                logger.warning("[web_search] Brave API failed: %s", exc)
+
+        # Secondary: multi-engine httpx scrape (free, no key) — fast when it works,
+        # but search engines IP-block datacenters, so this often returns empty.
         try:
             from app.agent.smart_fetch.search import toup_search
             result = await toup_search(query, count)
@@ -1047,13 +1061,6 @@ class ToolExecutor:
                 return result
         except Exception as exc:
             logger.warning("[web_search] Smart search failed: %s", exc)
-
-        # Fallback: Brave API if configured
-        if settings.brave_api_key:
-            try:
-                return await self._brave_search_fallback(query, count)
-            except Exception as exc:
-                logger.warning("[web_search] Brave fallback failed: %s", exc)
 
         # Last resort: our own headless browser searching Brave (no API key).
         # Slower (~4-6s) than the httpx engines but returns real results when
