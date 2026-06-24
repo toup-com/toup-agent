@@ -1055,12 +1055,20 @@ class ToolExecutor:
             except Exception as exc:
                 logger.warning("[web_search] Brave fallback failed: %s", exc)
 
-        # Last resort: headless browser (may trigger CAPTCHA)
-        try:
-            from app.agent.skills.builtins.app_builder.browser_api import search_formatted
-            return await search_formatted(query, count)
-        except Exception as exc:
-            logger.warning("[web_search] Browser search also failed: %s", exc)
+        # Last resort: our own headless browser searching Brave (no API key).
+        # Slower (~4-6s) than the httpx engines but returns real results when
+        # they come back empty/blocked. Kill-switch: browser_search_enabled.
+        if settings.browser_search_enabled:
+            try:
+                from app.agent.skills.builtins.app_builder.browser_api import search_formatted
+                result = await search_formatted(query, count)
+                # Exact-match the empty sentinel — a substring scan would wrongly
+                # discard a real result block whose title/snippet contains the
+                # phrase "no results".
+                if result and result.strip() != "No results found.":
+                    return result
+            except Exception as exc:
+                logger.warning("[web_search] Browser search also failed: %s", exc)
 
         return "No search results found."
 
@@ -1151,16 +1159,19 @@ class ToolExecutor:
         except Exception as exc:
             logger.warning("[web_fetch] Smart reader failed: %s", exc)
 
-        # Fallback: stealth headless browser (for JS-rendered pages)
-        try:
-            from app.agent.skills.builtins.app_builder.browser_api import read_page
-            text = await read_page(url)
-            if text and not text.startswith("(failed"):
-                if len(text) > max_chars:
-                    text = text[:max_chars] + "\n... (truncated)"
-                return text
-        except Exception as exc:
-            logger.warning("[web_fetch] Browser read_page also failed: %s", exc)
+        # Fallback: our own headless browser renders the page (JS-heavy sites,
+        # 403s, or pages the httpx reader timed out on). No API key.
+        # Kill-switch: browser_fetch_enabled.
+        if settings.browser_fetch_enabled:
+            try:
+                from app.agent.skills.builtins.app_builder.browser_api import read_page
+                text = await read_page(url)
+                if text and not text.startswith("(failed"):
+                    if len(text) > max_chars:
+                        text = text[:max_chars] + "\n... (truncated)"
+                    return text
+            except Exception as exc:
+                logger.warning("[web_fetch] Browser read_page also failed: %s", exc)
 
         return f"ERROR: Could not read {url}"
 

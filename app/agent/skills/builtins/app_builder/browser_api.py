@@ -182,18 +182,82 @@ async def read_page(url: str, timeout_ms: int = NAV_TIMEOUT_MS) -> str:
             await cleanup()
 
 
-async def search(query: str, count: int = 5) -> List[Dict[str, str]]:
-    """Search the web and extract results.
+# Engines that actually return results from a *headless* browser — validated
+# 2026-06-24 on a live agent container:
+#   Brave Search (search.brave.com) — ~22 clean results, real URLs, no API key.
+#     It's Brave's own index (the same index Claude's web search is built on),
+#     reached through our own browser instead of the paid API. Primary.
+#   Bing — returns results but wraps every URL in bing.com/ck/a redirects and
+#     renders empty <h2> titles headless; low quality, so it's not used here.
+#   Google / Startpage — CAPTCHA the headless browser; DuckDuckGo's JS site
+#     renders empty headless. All excluded; httpx DDG-HTML is the last resort.
 
-    Uses a headless stealth browser. Tries Google first, then Bing,
-    then DuckDuckGo HTML scrape (httpx, no browser) as last resort.
+BRAVE_NAV_TIMEOUT_MS = 12_000  # Brave renders in ~6s headless; leave margin
+
+# Extract {title,url,snippet} from a rendered Brave SERP. Defensive: skips
+# brave.com internal links, dedups by url, falls back to block text (minus the
+# title) when no description element is present.
+_BRAVE_EXTRACT_JS = """(count) => {
+  const out = [];
+  const seen = new Set();
+  const blocks = document.querySelectorAll('#results [data-type="web"], #results .snippet');
+  for (const el of blocks) {
+    if (out.length >= count) break;
+    const a = el.querySelector('a[href^="http"]');
+    if (!a) continue;
+    const url = a.href;
+    if (!url || url.indexOf('brave.com') !== -1 || seen.has(url)) continue;
+    seen.add(url);
+    const tEl = el.querySelector('.title, .snippet-title, h3, [class*="title"]');
+    let title = (tEl ? tEl.innerText : (a.innerText || '')).trim();
+    if (!title) continue;
+    const dEl = el.querySelector('.snippet-description, .snippet-content, .desc, p');
+    let snippet = (dEl ? dEl.innerText : '').trim();
+    if (!snippet) {
+      const full = (el.innerText || '').trim();
+      snippet = full.indexOf(title) === 0 ? full.slice(title.length).trim() : full;
+    }
+    out.push({ title: title.slice(0, 160), url: url, snippet: snippet.slice(0, 280) });
+  }
+  return out;
+}"""
+
+
+async def _brave_browser_search(query: str, count: int) -> List[Dict[str, str]]:
+    """Search Brave (search.brave.com) via the headless browser — no API key.
+
+    Brave's own index, reached through our own browser. Validated to return
+    ~22 clean results headless where Google/Startpage CAPTCHA and DuckDuckGo's
+    JS site renders empty. Never raises — returns [] on any failure.
+    """
+    cleanup = None
+    try:
+        page, cleanup = await _get_page()
+        url = f"https://search.brave.com/search?q={quote_plus(query)}&source=web"
+        await page.goto(url, wait_until="domcontentloaded", timeout=BRAVE_NAV_TIMEOUT_MS)
+        await asyncio.sleep(1.2)  # let the result list paint
+        results = await page.evaluate(_BRAVE_EXTRACT_JS, count)
+        if results:
+            logger.info("[BROWSER_API] Brave search: %d results for '%s'", len(results), query[:50])
+        return results or []
+    except Exception as exc:
+        logger.warning("[BROWSER_API] Brave browser search failed: %s", exc)
+        return []
+    finally:
+        if cleanup:
+            await cleanup()
+
+
+async def search(query: str, count: int = 5) -> List[Dict[str, str]]:
+    """Search the web with our own headless browser — no API key, no Google.
+
+    Brave Search (browser-rendered) is primary; httpx DuckDuckGo-HTML is the
+    last resort if Brave comes back empty. Google/Bing/Startpage are excluded
+    (CAPTCHA, redirect junk, or empty under headless — see notes above).
 
     Returns list of {title, url, snippet} dicts.
     """
-    results = await _google_search(query, count)
-    if results:
-        return results
-    results = await _bing_search(query, count)
+    results = await _brave_browser_search(query, count)
     if results:
         return results
     return await _ddg_html_search(query, count)

@@ -104,7 +104,15 @@ async def _httpx_duckduckgo(query: str, count: int = 5) -> str:
 
 
 async def _browser_search_backend(query: str, count: int = 5) -> str:
-    """Last resort: headless browser Google search. Slow but high quality."""
+    """Last resort: headless browser (Brave) search. Slow but high quality.
+
+    Honors the ``browser_search_enabled`` kill-switch so disabling it truly
+    stops every headless-browser search path (the tool_executor call sites are
+    gated too); off → returns "" and the caller moves on to the next backend.
+    """
+    from app.config import settings
+    if not settings.browser_search_enabled:
+        return ""
     t0 = time.time()
     try:
         from .browser_api import search_formatted

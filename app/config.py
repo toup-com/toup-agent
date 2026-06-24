@@ -159,6 +159,16 @@ class Settings(BaseSettings):
     fetch_token_budget: int = 4000          # tokens per single web_fetch
     search_token_budget: int = 2000         # tokens per web_search result block
     web_turn_token_budget: int = 12000      # aggregate cap across one parallel web batch
+    # Kill-switches (default on): the no-API-key headless-browser fallbacks.
+    # browser_search → when the fast httpx engines return "No results", race
+    # Brave Search (search.brave.com, browser-rendered, no key) for real results.
+    # browser_fetch → when httpx+trafilatura returns empty (JS-rendered page,
+    # 403, or timeout), render the page in the headless browser. Both rely on the
+    # Chromium binary mounted read-only from the host at /root/.cache/ms-playwright
+    # (host dir /opt/toup/playwright, populated by `patchright install chromium`).
+    # Off → degrade to the httpx-only paths.
+    browser_search_enabled: bool = True
+    browser_fetch_enabled: bool = True
     skills_dir: str = "/app/skills"  # External skills directory
 
     # Day-as-Chat context architecture (feature flag)
