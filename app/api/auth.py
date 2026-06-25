@@ -78,6 +78,42 @@ async def _bg_finalize_signup(user_id: str) -> None:
             user_id[:8], e,
         )
 
+
+async def _bg_apple_refresh_capture(user_id: str, authorization_code: str) -> None:
+    """Capture the Apple refresh token OFF the sign-in path.
+
+    Needed only later for account-deletion revocation (Guideline 5.1.1(v)). The
+    exchange is an httpx round-trip to Apple (up to 10s) — the user shouldn't
+    wait on it at sign-in. The one-time code is exchanged on the next loop tick,
+    well inside its lifetime. Runs on its own DB session. Best-effort; a failure
+    only means we can't proactively revoke at deletion (delete_account tolerates
+    it), so it only logs.
+    """
+    try:
+        from app.services.apple_auth import (
+            exchange_authorization_code, siwa_revocation_configured,
+        )
+        if not siwa_revocation_configured():
+            return
+        tokens = await exchange_authorization_code(authorization_code)
+        refresh = (tokens or {}).get("refresh_token")
+        if not refresh:
+            return
+        from app.db import async_session_maker
+        from app.services import get_user_by_id
+        from app.services.credential_crypto import encrypt_str
+        async with async_session_maker() as bg_db:
+            user = await get_user_by_id(bg_db, user_id)
+            if user is None:
+                return
+            user.apple_refresh_token = encrypt_str(refresh)
+            await bg_db.commit()
+    except Exception as e:
+        logger.warning(
+            "[apple-auth] background refresh-token capture failed user=%s: %s",
+            user_id[:8], e,
+        )
+
 # SSO cookie config
 SSO_COOKIE_NAME = "hex_sso_token"
 SSO_COOKIE_DOMAIN = ".toup.ai"
@@ -281,31 +317,16 @@ async def register(
                 dirty = True
             if dirty:
                 await db.commit()
-            # Mint the free-tier bundle LLM credentials (connect_token,
-            # llm_token_hash, bundle_status='active', per-tenant OpenAI key)
-            # BEFORE the pool claim. claim_for_user copies these into the
-            # bridge bind payload (_build_bind_payload → TOUP_TOKEN /
-            # LLM_MODE), so the container boots already authenticated to the
-            # LLM proxy — no recreate, pool fast-path preserved. Without this
-            # the freshly-claimed container has an empty TOUP_TOKEN and the
-            # user's FIRST chat message 401s at the proxy → "Your API key is
-            # invalid." Its own try/except so a provisioning hiccup never
-            # skips the warm-pool claim below.
-            try:
-                from app.services.free_tier_activation import activate_free_tier
-                await activate_free_tier(db, str(user.id), force_env_push=False)
-            except Exception as _ae:
-                logger.warning(
-                    "[REGISTER] free-tier activation failed for user %s: %s",
-                    str(user.id)[:8], _ae,
-                )
-            # Phase A.2 (never-sleep plan): prefer pool claim — sub-
-            # second bind to a pre-booted container vs ~15s cold-boot
-            # via schedule_prewarm. claim_or_prewarm internally falls
-            # back to the legacy prewarm path on pool-exhausted /
-            # feature-flag-off, so the slow-path safety net remains.
-            from app.services.pool_service import claim_or_prewarm
-            await claim_or_prewarm(db, str(user.id))
+            # Hand the free-tier activation AND the bridge claim to the
+            # background so neither blocks the signup response (mirrors the
+            # Google/Apple flow). Activation mints the bundle creds + provisions
+            # a per-user OpenAI project (a slow sync Admin-API call, ~3-6s) and
+            # claim_or_prewarm awaits the bridge bind (up to 30s) — none of which
+            # the user waits on: the first chat is post-onboarding,
+            # _bg_finalize_signup activates BEFORE it claims so the bind still
+            # injects TOUP_TOKEN, and onboarding re-activates the free tier as a
+            # backstop.
+            _spawn_background(_bg_finalize_signup(str(user.id)))
         except Exception as e:
             logger.warning(
                 "[REGISTER] Prewarm/claim schedule failed for user %s: %s",
@@ -999,17 +1020,17 @@ async def apple_auth(
             user.email_verified_at = datetime.utcnow()
             await db.commit()
             await db.refresh(user)
-        # New signup: mint free-tier LLM credentials + prewarm so the
-        # first chat authenticates to the LLM proxy (mirrors Google flow).
-        try:
-            from app.services.free_tier_activation import activate_free_tier
-            await activate_free_tier(db, str(user.id), force_env_push=False)
-        except Exception as _ae:
-            logger.warning("[apple-auth] free-tier activation failed user=%s: %s", str(user.id)[:8], _ae)
+        # New signup: prime managed config, then hand free-tier activation +
+        # the bridge claim to the background so neither blocks this response.
+        # Mirrors the Google flow — the inline claim_or_prewarm awaited the
+        # bridge bind for up to 30s, which is what made Sign-in-with-Apple hang
+        # before onboarding. The first chat is post-onboarding,
+        # _bg_finalize_signup activates BEFORE it claims so the bind still
+        # injects TOUP_TOKEN, and onboarding re-activates the free tier as a
+        # backstop.
         if settings.prewarm_on_soul_save:
             try:
                 from app.api.agent_setup import _get_or_create_config
-                from app.services.pool_service import claim_or_prewarm
                 config = await _get_or_create_config(str(user.id), db)
                 dirty = False
                 if config.hosting_mode in (None, "self-hosted"):
@@ -1020,34 +1041,20 @@ async def apple_auth(
                     dirty = True
                 if dirty:
                     await db.commit()
-                await claim_or_prewarm(db, str(user.id))
+                _spawn_background(_bg_finalize_signup(str(user.id)))
             except Exception as e:
                 logger.warning("[apple-auth] prewarm/claim failed user=%s: %s", str(user.id)[:8], e)
 
     if not user.is_active:
         raise HTTPException(status_code=403, detail="This account has been disabled.")
 
-    # Capture an Apple refresh token so account deletion can revoke the
-    # grant (Guideline 5.1.1(v)). The authorization_code is one-time and
-    # short-lived, so we must exchange it now. Best-effort: a failure here
-    # (or an unconfigured SIWA key) must never block sign-in.
+    # Capture an Apple refresh token so account deletion can revoke the grant
+    # (Guideline 5.1.1(v)). The refresh token is only needed LATER at deletion
+    # time — it has zero bearing on this sign-in response — so run the Apple
+    # token exchange (an httpx round-trip, up to 10s) off the path instead of
+    # awaiting it on every Sign-in-with-Apple.
     if body.authorization_code:
-        try:
-            from app.services.apple_auth import (
-                exchange_authorization_code, siwa_revocation_configured,
-            )
-            if siwa_revocation_configured():
-                tokens = await exchange_authorization_code(body.authorization_code)
-                refresh = (tokens or {}).get("refresh_token")
-                if refresh:
-                    from app.services.credential_crypto import encrypt_str
-                    user.apple_refresh_token = encrypt_str(refresh)
-                    await db.commit()
-        except Exception as e:
-            logger.warning(
-                "[apple-auth] refresh-token capture failed user=%s: %s",
-                str(user.id)[:8], e,
-            )
+        _spawn_background(_bg_apple_refresh_capture(str(user.id), body.authorization_code))
 
     token = create_access_token(user.id)
     try:
