@@ -241,7 +241,9 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "(comparisons, multi-part questions), issue MULTIPLE web_search "
                 "calls in the SAME turn — they run concurrently — instead of "
                 "searching, waiting, then searching again. Only web_fetch a "
-                "result when its snippet is insufficient."
+                "result when its snippet is insufficient. Keep it lean — a "
+                "few well-chosen queries beat a dozen near-duplicate ones; do "
+                "NOT re-search the same thing with slight rewordings."
             ),
             "input_schema": {
                 "type": "object",
@@ -270,7 +272,10 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "need several pages, call web_fetch for ALL of them in the SAME "
                 "turn: they run concurrently (≈ the time of one fetch) and the "
                 "combined output is token-budgeted, so batching is both faster "
-                "and safe. Output is truncated to a token budget automatically."
+                "and safe. Output is truncated to a token budget automatically. "
+                "Fetch sparingly: each fetch renders a full page and is slow, so "
+                "open only the 2-3 most promising results — the snippets (now "
+                "with extra passages) usually already contain the answer."
             ),
             "input_schema": {
                 "type": "object",

@@ -1083,7 +1083,11 @@ class ToolExecutor:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 "https://api.search.brave.com/res/v1/web/search",
-                params={"q": query, "count": count},
+                # extra_snippets returns up to 5 extra passages pulled from each
+                # result page — enough context that the model can often answer
+                # WITHOUT a slow web_fetch, cutting the fetch count. Harmless on
+                # plans that don't support it (the field is just absent).
+                params={"q": query, "count": count, "extra_snippets": "true"},
                 headers={
                     "Accept": "application/json",
                     "Accept-Encoding": "gzip",
@@ -1101,7 +1105,14 @@ class ToolExecutor:
         for i, r in enumerate(results[:count], 1):
             lines.append(f"{i}. {r.get('title', '')}")
             lines.append(f"   {r.get('url', '')}")
-            lines.append(f"   {r.get('description', '')}")
+            desc = r.get("description", "") or ""
+            if desc:
+                lines.append(f"   {desc}")
+            # Surface the richer passages so snippet-first reasoning has more to
+            # work with before deciding to fetch.
+            for snip in (r.get("extra_snippets") or [])[:4]:
+                if snip:
+                    lines.append(f"   {snip}")
             lines.append("")
         return "\n".join(lines)
 
