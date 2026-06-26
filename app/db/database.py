@@ -34,10 +34,29 @@ def _build_engine(database_url: str) -> AsyncEngine:
         _db_url = database_url
         _sep = "&" if "?" in _db_url else "?"
         _db_url += f"{_sep}prepared_statement_cache_size=0"
+        # Connection pooling. The platform API is a long-lived, single-bind
+        # process, so it reuses a WARM pool: NullPool re-handshaked the Supabase
+        # transaction pooler (full TCP+TLS+SCRAM round-trip) on EVERY request,
+        # flooring every endpoint — including the auth-less /health doing only
+        # SELECT 1 — at ~1.3s. Reusing connections removes that per-request
+        # handshake (the dominant latency floor). Statement caching stays
+        # disabled (connect_args + the URL param above) so it remains safe
+        # against the :6543 transaction pooler; pool_pre_ping is a single cheap
+        # round-trip on an already-WARM connection (not a fresh handshake) that
+        # guards against a stale one; pool_recycle drops connections the pooler
+        # may have closed; the bounded pool keeps the 2 replicas comfortably
+        # under the pooler's client-connection cap (and is FEWER connections
+        # than NullPool's per-request churn, not more).
+        #
+        # The agent keeps NullPool: it rebinds its DB generic→tenant on
+        # /admin/bind, and a connectionless pool keeps that swap trivially clean.
+        if settings.run_mode == "platform":
+            _pool_kwargs = {"pool_size": 10, "max_overflow": 10, "pool_recycle": 300}
+        else:
+            _pool_kwargs = {"poolclass": NullPool}
         return create_async_engine(
             _db_url,
             echo=settings.debug,
-            poolclass=NullPool,
             pool_pre_ping=True,
             connect_args={
                 "statement_cache_size": 0,
@@ -45,6 +64,7 @@ def _build_engine(database_url: str) -> AsyncEngine:
                 "command_timeout": 30,
                 "server_settings": {"statement_timeout": "30000"},
             },
+            **_pool_kwargs,
         )
     return create_async_engine(
         database_url,
