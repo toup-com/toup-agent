@@ -89,3 +89,10 @@ yt-dlp>=2025.1.0
 
 # Radio Mode — YouTube Music Song Radio (get_watch_playlist)
 ytmusicapi>=1.10.0
+
+# Phone-number → IANA timezone inference (offline, area-code aware).
+# WhatsApp / Telegram users never send a browser timezone, so the linked
+# number is the only location signal we have for scheduling reminders in
+# their real local time. Bundles its own metadata — no system tzdata or
+# network needed.
+phonenumbers>=8.13.0

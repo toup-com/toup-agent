@@ -43,6 +43,51 @@ def _as_json(obj: Any) -> str:
     return json.dumps(obj, indent=2, default=str, ensure_ascii=False)
 
 
+def _is_valid_tz(name: Optional[str]) -> bool:
+    """True if `name` is a resolvable IANA zone (e.g. 'America/Toronto')."""
+    if not name:
+        return False
+    try:
+        from zoneinfo import ZoneInfo  # py3.9+
+    except ImportError:  # pragma: no cover
+        from backports.zoneinfo import ZoneInfo  # type: ignore
+    try:
+        ZoneInfo(name)
+        return True
+    except Exception:
+        return False
+
+
+def _infer_tz_from_phone(e164: Optional[str]) -> Optional[str]:
+    """Best-effort IANA timezone from an E.164 phone number.
+
+    WhatsApp / Telegram users never send a browser timezone, so the
+    linked phone number is the only location signal we have for them —
+    without this, a reminder is impossible (the reason a real WhatsApp
+    user hit "the reminder tool isn't working"). `phonenumbers` is
+    offline and area-code aware (+1 437… → America/Toronto). Returns
+    None if the dep is missing or the number is unparseable, so the
+    caller falls back to asking the user.
+    """
+    if not e164:
+        return None
+    try:
+        import phonenumbers
+        from phonenumbers.timezone import time_zones_for_number
+        num = phonenumbers.parse(e164, None)
+        zones = [
+            z for z in time_zones_for_number(num)
+            if z and z != "Etc/Unknown"
+        ]
+        return zones[0] if zones else None
+    except Exception:
+        logger.warning(
+            "[routines_skill] phone→tz inference unavailable for %s…",
+            (e164 or "")[:5], exc_info=True,
+        )
+        return None
+
+
 def _routine_summary(r) -> Dict[str, Any]:
     """Compact dict the agent can reason over. Mirrors RoutineResponse
     minus recent_runs (the agent rarely needs them; if it does, it calls
@@ -294,6 +339,17 @@ class RoutinesSkill(Skill):
                             "type": "boolean",
                             "description": "Default true. False = create dormant.",
                         },
+                        "timezone": {
+                            "type": "string",
+                            "description": (
+                                "Optional IANA timezone, e.g. \"America/Toronto\". "
+                                "Only needed if a previous call returned "
+                                "`NEEDS_TIMEZONE`: ask the user which city/zone "
+                                "they're in, map it to the IANA name, and pass it "
+                                "here. It's saved after the first time, so you "
+                                "won't be asked again."
+                            ),
+                        },
                     },
                     "required": ["reminder_text", "when"],
                 },
@@ -458,7 +514,14 @@ class RoutinesSkill(Skill):
             "\n"
             "Routines are flag-gated. If `routines__create` returns "
             "`ERROR: Feature not available`, tell the user the feature isn't "
-            "enabled for their tenant — don't retry."
+            "enabled for their tenant — don't retry.\n"
+            "\n"
+            "If `routines__remind` returns `NEEDS_TIMEZONE`, do NOT tell the "
+            "user the reminder tool is broken — it works, it just needs their "
+            "timezone once. Ask which city or timezone they're in, convert "
+            "that to an IANA zone (e.g. Toronto → \"America/Toronto\"), and "
+            "call `routines__remind` again with the same details plus "
+            "`timezone`. It's remembered afterwards."
         )
 
     # ------------------------------------------------------------------
@@ -576,26 +639,77 @@ class RoutinesSkill(Skill):
         # `_resolve_tz` returns (ZoneInfo, fellback_to_utc_bool); we
         # surface the fallback to the agent so it can warn the user.
         user_id = str(getattr(settings, "user_id", "") or "")
+
+        # Optional tz the agent learned from the user this turn ("I'm in
+        # Toronto" → "America/Toronto"), passed back after a prior
+        # NEEDS_TIMEZONE. Reject an invalid name up front so it can't slip
+        # through and silently fall back to UTC.
+        arg_tz = (args.get("timezone") or "").strip() or None
+        if arg_tz and not _is_valid_tz(arg_tz):
+            return (
+                f"ERROR: `timezone`={arg_tz!r} isn't a valid IANA zone. Use a "
+                "name like \"America/Toronto\" or \"Europe/London\"."
+            )
+
         try:
             from app.db.database import async_session_maker
             from app.db.models import User
             from sqlalchemy import select
             user_tz_str = None
-            if user_id:
-                async with async_session_maker() as db:
+            resolved = None
+            source = "stored"
+            async with async_session_maker() as db:
+                row = None
+                if user_id:
                     row = (await db.execute(
                         select(User).where(User.id == user_id)
                     )).scalar_one_or_none()
                     user_tz_str = getattr(row, "timezone", None) if row else None
-            tz, fell_back = _resolve_tz(user_tz_str, user_id)
+
+                # Resolution chain for users with no stored tz. WhatsApp /
+                # Telegram users never send a browser tz, so without this a
+                # reminder is impossible for them. Order: stored → tz the
+                # agent passed (learned from the user) → inferred from the
+                # linked phone number. Anything resolved here is persisted
+                # once so every later time-based feature works without asking.
+                resolved = user_tz_str if _is_valid_tz(user_tz_str) else None
+                if not resolved and arg_tz:
+                    resolved, source = arg_tz, "user_provided"
+                if not resolved:
+                    inferred = _infer_tz_from_phone(
+                        getattr(settings, "whatsapp_self_e164", None)
+                    )
+                    if inferred:
+                        resolved, source = inferred, "phone_number"
+                if resolved and resolved != user_tz_str and row is not None:
+                    try:
+                        row.timezone = resolved
+                        await db.commit()
+                        logger.info(
+                            "[routines_skill.remind] self-healed tz user=%s "
+                            "source=%s tz=%s",
+                            user_id[:8], source, resolved,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[routines_skill.remind] tz persist failed",
+                            exc_info=True,
+                        )
+            tz, fell_back = _resolve_tz(resolved, user_id)
         except Exception as e:
             logger.exception("[routines_skill.remind] tz lookup failed")
             return f"ERROR: could not resolve your timezone — {e}"
         if fell_back:
+            # We have no timezone and couldn't infer one. Do NOT fail with a
+            # bare ERROR — the agent paraphrases that as "the reminder tool is
+            # broken". Tell it to ask the user and retry with `timezone`.
             return (
-                "ERROR: your account timezone isn't set. Open Account → "
-                "Timezone and pick the right one (or share location on the "
-                "account page), then ask me to set this reminder again."
+                "NEEDS_TIMEZONE: I don't know this user's timezone yet, so I "
+                "can't schedule at the right local time. Ask them which city "
+                "or timezone they're in, then call routines__remind again with "
+                "the same details plus `timezone` set to the matching IANA "
+                "zone (e.g. \"America/Toronto\"). The tool works — it just "
+                "needs the timezone once."
             )
 
         # ── Build the create payload now that tz is resolved ───────────
@@ -646,6 +760,16 @@ class RoutinesSkill(Skill):
             resp = await create_routine(req)
         except HTTPException as e:
             return f"ERROR: {e.detail}"
+        except Exception as e:
+            # A schema/DB fault must not reach the model as a raw traceback
+            # string (it gets paraphrased as "the tool is broken"). Return a
+            # clean, model-guided message instead.
+            logger.exception("[routines_skill.remind] create_routine failed")
+            return (
+                "ERROR: hit a temporary problem saving the reminder "
+                f"({type(e).__name__}). Tell the user it didn't save and you'll "
+                "try again shortly — this is a system issue, not their input."
+            )
 
         delivery_out = (
             (resp.config or {}).get("delivery_channels") if resp.config else None

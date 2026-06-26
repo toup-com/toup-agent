@@ -487,14 +487,17 @@ async def test_remind_daily_creates_cron_routine(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_remind_rejects_when_user_timezone_missing(monkeypatch):
-    """If the user's `User.timezone` is NULL, `_resolve_tz` falls back to
-    UTC. A reminder for 1pm-local would land at 1pm UTC = 9am Toronto =
-    bug. The skill must refuse to create instead of silently misfiring."""
+async def test_remind_asks_for_tz_when_missing_and_uninferable(monkeypatch):
+    """If the user's `User.timezone` is NULL and we can't infer one (no
+    linked phone number), a reminder for 1pm-local would land at 1pm UTC =
+    9am Toronto = bug. The skill must refuse to misfire — but it must do so
+    by ASKING (NEEDS_TIMEZONE), not a bare ERROR the agent paraphrases as
+    "the reminder tool is broken"."""
     from app.config import settings
     monkeypatch.setattr(settings, "routines_reminders_enabled", True)
     user_id = await _seed_user(timezone=None)  # missing tz
     monkeypatch.setattr(settings, "user_id", user_id)
+    monkeypatch.setattr(settings, "whatsapp_self_e164", None)
 
     skill = _load_skill()
     result = await skill.execute_tool(
@@ -506,5 +509,124 @@ async def test_remind_rejects_when_user_timezone_missing(monkeypatch):
         },
         _ctx(),
     )
+    assert result.startswith("NEEDS_TIMEZONE"), result
+    assert "broken" not in result.lower()
+
+
+# ── Timezone resolution for phone-channel (WhatsApp) users ───────────
+
+
+def _load_skill_module():
+    """Load the skill *module* (not just the instance) to unit-test its
+    module-level tz helpers."""
+    here = os.path.dirname(__file__)
+    skill_path = os.path.normpath(
+        os.path.join(here, "..", "app", "agent", "skills", "builtins",
+                     "routines", "skill.py")
+    )
+    spec = importlib.util.spec_from_file_location("routines_skill_mod", skill_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_is_valid_tz():
+    mod = _load_skill_module()
+    assert mod._is_valid_tz("America/Toronto") is True
+    assert mod._is_valid_tz("Europe/London") is True
+    assert mod._is_valid_tz("Not/AZone") is False
+    assert mod._is_valid_tz(None) is False
+    assert mod._is_valid_tz("") is False
+
+
+def test_infer_tz_from_phone():
+    pytest.importorskip("phonenumbers")
+    mod = _load_skill_module()
+    # +1 437 is a Toronto-area overlay code → Eastern.
+    assert mod._infer_tz_from_phone("+14378338822") == "America/Toronto"
+    assert mod._infer_tz_from_phone("+442071838750") == "Europe/London"
+    assert mod._infer_tz_from_phone(None) is None
+    assert mod._infer_tz_from_phone("") is None
+    assert mod._infer_tz_from_phone("not-a-number") is None
+
+
+@pytest.mark.asyncio
+async def test_remind_infers_tz_from_whatsapp_number(monkeypatch):
+    """A WhatsApp user has no stored tz (their phone never sends one). The
+    reminder must still succeed by inferring tz from the linked number, and
+    persist it so later calls are instant. This is the exact case behind the
+    real "the reminder tool isn't working" report."""
+    pytest.importorskip("phonenumbers")
+    from app.config import settings
+    from app.db import async_session_maker
+    from app.db.models import User
+    from sqlalchemy import select
+
+    user_id = await _seed_user(timezone=None)
+    monkeypatch.setattr(settings, "user_id", user_id)
+    monkeypatch.setattr(settings, "whatsapp_self_e164", "+14378338822")
+
+    skill = _load_skill()
+    result = await skill.execute_tool(
+        "routines__remind",
+        {"reminder_text": "wake up", "when": "once", "at_local": "08:00"},
+        _ctx(),
+    )
+    assert not result.startswith("ERROR:"), result
+    assert not result.startswith("NEEDS_TIMEZONE"), result
+    assert '"status": "created"' in result
+
+    async with async_session_maker() as db:
+        row = (
+            await db.execute(select(User).where(User.id == user_id))
+        ).scalar_one()
+        assert row.timezone == "America/Toronto"
+
+
+@pytest.mark.asyncio
+async def test_remind_accepts_agent_provided_timezone(monkeypatch):
+    """When the agent passes `timezone` (learned from the user after a
+    NEEDS_TIMEZONE ask), the reminder succeeds and the tz is persisted."""
+    from app.config import settings
+    from app.db import async_session_maker
+    from app.db.models import User
+    from sqlalchemy import select
+
+    user_id = await _seed_user(timezone=None)
+    monkeypatch.setattr(settings, "user_id", user_id)
+    monkeypatch.setattr(settings, "whatsapp_self_e164", None)
+
+    skill = _load_skill()
+    result = await skill.execute_tool(
+        "routines__remind",
+        {"reminder_text": "wake up", "when": "once", "at_local": "08:00",
+         "timezone": "Asia/Tehran"},
+        _ctx(),
+    )
+    assert '"status": "created"' in result, result
+    async with async_session_maker() as db:
+        row = (
+            await db.execute(select(User).where(User.id == user_id))
+        ).scalar_one()
+        assert row.timezone == "Asia/Tehran"
+
+
+@pytest.mark.asyncio
+async def test_remind_rejects_invalid_agent_timezone(monkeypatch):
+    """A bogus `timezone` must be rejected up front, not silently fall back
+    to UTC (which would misfire)."""
+    from app.config import settings
+
+    user_id = await _seed_user(timezone=None)
+    monkeypatch.setattr(settings, "user_id", user_id)
+
+    skill = _load_skill()
+    result = await skill.execute_tool(
+        "routines__remind",
+        {"reminder_text": "wake up", "when": "once", "at_local": "08:00",
+         "timezone": "Mars/Olympus"},
+        _ctx(),
+    )
     assert result.startswith("ERROR:")
-    assert "timezone" in result.lower()
+    assert "valid IANA" in result
