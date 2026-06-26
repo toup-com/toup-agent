@@ -280,6 +280,13 @@ class Settings(BaseSettings):
     smtp_username: str = ""
     smtp_password: str = ""
     smtp_use_tls: bool = True
+    # Gmail API (OAuth2) — send as a Google Workspace user over HTTPS.
+    # Railway blocks outbound SMTP (25/465/587), so smtp times out from the
+    # container; the Gmail REST API uses HTTPS:443 and still sends From: the
+    # authenticated Workspace address (email_from_address). Set EMAIL_PROVIDER=gmail.
+    gmail_oauth_client_id: str = ""
+    gmail_oauth_client_secret: str = ""
+    gmail_oauth_refresh_token: str = ""
     require_email_verification_for_credits: bool = False
     email_verification_required_after_iso: str = ""
 
@@ -960,6 +967,8 @@ class Settings(BaseSettings):
         "slack_app_token", "brave_api_key", "elevenlabs_api_key",
         "cohere_api_key", "agent_api_key", "toup_token",
         "stripe_secret_key", "stripe_webhook_secret",
+        "gmail_oauth_client_id", "gmail_oauth_client_secret",
+        "gmail_oauth_refresh_token",
     }
 
     @model_validator(mode="after")

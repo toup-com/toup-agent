@@ -60,6 +60,8 @@ async def send_email(
         return await _send_via_ses(to, subject, html, text, reply_to)
     if provider == "smtp":
         return await _send_via_smtp(to, subject, html, text, reply_to)
+    if provider in ("gmail", "gmail_api"):
+        return await _send_via_gmail(to, subject, html, text, reply_to)
 
     # Dev / CI fallback: log so the developer can copy the link out.
     logger.warning(
@@ -260,6 +262,95 @@ async def _send_via_smtp(
             )
         logger.exception("[email.smtp] send failed for to=%s: %s%s", to, e, hint)
         return EmailResult(success=False, provider="smtp", error=f"{e}{hint}")
+
+
+# ── Gmail API (OAuth2, HTTPS) ───────────────────────────────────────
+
+
+async def _send_via_gmail(
+    to: str, subject: str, html: str, text: Optional[str], reply_to: Optional[str],
+) -> EmailResult:
+    """Send as a Google Workspace user via the Gmail REST API over HTTPS.
+
+    Why this exists: Railway (and most PaaS) block outbound SMTP ports
+    (25/465/587) for spam control, so ``_send_via_smtp`` to Gmail times
+    out from the container. The Gmail API runs over HTTPS:443 — not
+    blocked — while still sending From: the authenticated Workspace
+    address (``email_from_address``), so recipients see mrhx@toup.ai and
+    no third-party relay is involved.
+
+    Auth: a long-lived OAuth2 refresh token (consent screen set to
+    "Internal" so it doesn't expire) scoped to ``gmail.send``. We mint a
+    short-lived access token per send — low volume, so no caching needed.
+    """
+    import base64
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    cid = (settings.gmail_oauth_client_id or "").strip()
+    csecret = (settings.gmail_oauth_client_secret or "").strip()
+    rtoken = (settings.gmail_oauth_refresh_token or "").strip()
+    if not (cid and csecret and rtoken):
+        logger.warning("[email.gmail] GMAIL_OAUTH_* not fully set — falling back to log")
+        logger.info("[email.gmail.log] to=%s subject=%r", to, subject)
+        return EmailResult(success=True, provider="gmail-logged")
+
+    # 1) Exchange the refresh token for a short-lived access token (HTTPS).
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            tok = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": cid,
+                    "client_secret": csecret,
+                    "refresh_token": rtoken,
+                    "grant_type": "refresh_token",
+                },
+            )
+        if tok.status_code >= 400:
+            # invalid_grant here = refresh token revoked/expired (re-consent needed).
+            logger.warning("[email.gmail] token HTTP %d: %s", tok.status_code, tok.text[:300])
+            return EmailResult(success=False, provider="gmail",
+                               error=f"token {tok.status_code}: {tok.text[:200]}")
+        access_token = (tok.json() or {}).get("access_token")
+        if not access_token:
+            return EmailResult(success=False, provider="gmail", error="no access_token in response")
+    except Exception as e:
+        logger.exception("[email.gmail] token fetch failed: %s", e)
+        return EmailResult(success=False, provider="gmail", error=f"token: {e}")
+
+    # 2) Build the RFC-822 message. From: should be the token owner's address
+    #    (or a configured Gmail "send mail as" alias); if it isn't, Gmail
+    #    silently substitutes the authenticated sender rather than erroring,
+    #    so a mismatch sends from the wrong address instead of failing loudly.
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = settings.email_from_address
+    msg["To"] = to
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    if text:
+        msg.attach(MIMEText(text, "plain", "utf-8"))
+    msg.attach(MIMEText(html, "html", "utf-8"))
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+
+    # 3) Send via the Gmail REST API (HTTPS:443 — not blocked by Railway).
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={"raw": raw},
+            )
+        if r.status_code >= 400:
+            logger.warning("[email.gmail] send HTTP %d for to=%s: %s", r.status_code, to, r.text[:400])
+            return EmailResult(success=False, provider="gmail", error=f"{r.status_code}: {r.text[:300]}")
+        mid = (r.json() or {}).get("id")
+        logger.info("[email.gmail] sent to=%s id=%s", to, mid)
+        return EmailResult(success=True, provider="gmail", message_id=mid)
+    except Exception as e:
+        logger.exception("[email.gmail] send failed for to=%s: %s", to, e)
+        return EmailResult(success=False, provider="gmail", error=str(e))
 
 
 # ── Verification email template ────────────────────────────────────
