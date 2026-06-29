@@ -823,6 +823,22 @@ async def init_db():
                     await conn.execute(text(stmt))
         except Exception as _e:
             _logger.warning("[init_db] alter skipped: %s — %s", stmt[:80], str(_e)[:200])
+
+    # ── Structural backstop: auto-reconcile forgotten model columns ──
+    # The explicit _alter_statements list above is the PRIMARY schema-heal
+    # mechanism and stays authoritative for column DEFAULTS, constraints,
+    # indexes and backfills. This pass is the SAFETY NET for the one failure
+    # mode that list can't prevent: a column added to a shared model whose
+    # mirror ALTER line was forgotten. That is exactly the 2026-06-29
+    # users.apple_sub incident — every agent rolled to the new image 500'd on
+    # get_user_by_id (every chat turn) with "column users.apple_sub does not
+    # exist" → ws/chat 1006 → mobile "Connection lost". Additive-only; runs
+    # against the same `engine` (so the same DB) the ALTERs above just healed.
+    try:
+        await _reconcile_missing_columns(engine, _has_pgvector, _logger)
+    except Exception as _e:
+        _logger.warning("[init_db] column reconcile skipped: %s", str(_e)[:200])
+
     for stmt in _seed_statements:
         try:
             if _is_sqlite and "ON CONFLICT" in stmt:
@@ -862,6 +878,140 @@ def _sqlite_safe_column_type(tail: str) -> str:
     tail = re.sub(r"\bJSONB\b", "JSON", tail, flags=re.IGNORECASE)
     tail = re.sub(r"\s+UNIQUE\b", "", tail, flags=re.IGNORECASE)
     return tail
+
+
+async def _reconcile_missing_columns(eng, has_pgvector: bool, logger) -> None:
+    """Auto-add any ORM-mapped column missing from its live table.
+
+    STRUCTURAL BACKSTOP for the hand-maintained ``_alter_statements`` list in
+    ``init_db()``. That list stays the primary mechanism and remains
+    authoritative for column DEFAULTS, constraints, indexes and data
+    backfills. This pass closes the ONE gap the list can't: a column added to
+    a shared model (User, AgentConfig, …) whose mirror ALTER line was
+    forgotten.
+
+    Agent DBs migrate via ``init_db()``, NOT alembic, so a forgotten line
+    means every agent rolled to that image 500s on every query that SELECTs
+    the column. The 2026-06-29 ``users.apple_sub`` incident is the canonical
+    case: ``get_user_by_id`` ran on every chat turn → ``UndefinedColumnError``
+    → ws/chat closed 1006 → mobile "Connection lost". This diff-and-ADD pass
+    makes that whole class of bug self-healing on the next boot/recycle, for
+    any future column — without anyone having to remember the mirror line.
+
+    Contract — ADDITIVE AND NON-DESTRUCTIVE:
+      * Only ever emits ``ALTER TABLE … ADD COLUMN``. Never drops a column,
+        never retypes one, never touches a row.
+      * Missing columns are added NULLABLE, type only — no DEFAULT, no
+        NOT NULL, no UNIQUE/FK, no index. A nullable add is all that's needed
+        to stop the SELECT-time 500, and (unlike a NOT NULL add) it can't fail
+        on a table that already has rows. Anything richer stays the job of an
+        explicit ``_alter_statements`` entry; this is a safety net, not a
+        migration engine.
+      * Identifiers are dialect-quoted, types dialect-compiled. Vector columns
+        are skipped when pgvector is unavailable (mirrors the create_all skip).
+        Each ADD runs in its own transaction so one failure can't poison the
+        rest. Runs against the same ``engine`` the ALTERs above just healed,
+        so it targets the same DB (generic-pool or bound tenant).
+
+    A non-empty result is logged loudly: it means a model column was added
+    without its explicit mirror, and that gap should still be closed in
+    ``_alter_statements`` (so the column gets its proper default/constraint),
+    even though the bare column is self-healed here.
+    """
+    from sqlalchemy import text, inspect as sa_inspect
+
+    dialect = eng.dialect
+    is_sqlite = dialect.name == "sqlite"
+    preparer = dialect.identifier_preparer
+    model_tables = {t.name: t for t in Base.metadata.sorted_tables}
+
+    # Reflect the columns each model table actually has right now.
+    cols_by_table: dict = {}
+    try:
+        async with eng.connect() as conn:
+            present = set(await conn.run_sync(
+                lambda sc: sa_inspect(sc).get_table_names()
+            ))
+            if is_sqlite:
+                for tname in model_tables:
+                    if tname not in present:
+                        continue
+                    cols_by_table[tname] = await conn.run_sync(
+                        lambda sc, t=tname: {c["name"] for c in sa_inspect(sc).get_columns(t)}
+                    )
+            else:
+                # One round-trip for the whole DB, then intersect with the
+                # model tables that exist in the default schema — avoids
+                # per-table reflection chatter on the cross-region platform DB.
+                rows = (await conn.execute(text(
+                    "SELECT table_name, column_name FROM information_schema.columns "
+                    "WHERE table_schema NOT IN ('pg_catalog', 'information_schema')"
+                ))).all()
+                for tname, cname in rows:
+                    if tname in model_tables and tname in present:
+                        cols_by_table.setdefault(tname, set()).add(cname)
+    except Exception as _e:
+        logger.warning("[init_db] reconcile reflection failed — skipping: %s", str(_e)[:200])
+        return
+
+    pending = []  # (table_name, column_name, ddl)
+    for tname, have in cols_by_table.items():
+        if not have:
+            # A present table that reflected ZERO columns is anomalous (a
+            # reflection hiccup, not a real schema) — never act on it, or we'd
+            # try to "add everything". Skip and let create_all / the explicit
+            # list own this table.
+            logger.warning(
+                "[init_db] reconcile: table %s present but reflected 0 columns — skipping",
+                tname,
+            )
+            continue
+        have_lower = {c.lower() for c in have}
+        tbl = model_tables[tname]
+        for col in tbl.columns:
+            # Compare case-insensitively: Postgres folds unquoted identifiers to
+            # lowercase, so information_schema can report a different case than
+            # the ORM attribute even though it's the same physical column.
+            if col.name.lower() in have_lower:
+                continue
+            try:
+                type_sql = col.type.compile(dialect=dialect)
+            except Exception as _e:
+                logger.warning(
+                    "[init_db] reconcile: can't compile type for %s.%s (%s) — skipping",
+                    tname, col.name, str(_e)[:80],
+                )
+                continue
+            # Skip pgvector VECTOR / VECTOR(n) columns when the extension isn't
+            # available (create_all skipped their tables too). PREFIX test, not
+            # a substring — Postgres's native TSVECTOR (full-text search) also
+            # contains "vector" but must NEVER be skipped, and
+            # "TSVECTOR".startswith("VECTOR") is False, so it won't be.
+            if not has_pgvector and type_sql.upper().startswith("VECTOR"):
+                continue
+            qtbl = preparer.format_table(tbl)
+            qcol = preparer.quote(col.name)
+            if is_sqlite:
+                ddl = f"ALTER TABLE {qtbl} ADD COLUMN {qcol} {_sqlite_safe_column_type(type_sql)}"
+            else:
+                ddl = f"ALTER TABLE {qtbl} ADD COLUMN IF NOT EXISTS {qcol} {type_sql}"
+            pending.append((tname, col.name, ddl))
+
+    if not pending:
+        return
+
+    logger.warning(
+        "[init_db] reconcile: %d model column(s) missing from DB, auto-adding "
+        "nullable — add an explicit _alter_statements mirror for these: %s",
+        len(pending), ", ".join(f"{t}.{c}" for t, c, _ in pending),
+    )
+    for tname, cname, ddl in pending:
+        try:
+            async with eng.begin() as conn:
+                await conn.execute(text(ddl))
+            logger.warning("[init_db] reconcile: added %s.%s", tname, cname)
+        except Exception as _e:
+            logger.warning("[init_db] reconcile: FAILED %s.%s — %s", tname, cname, str(_e)[:200])
 
 
 async def drop_db():

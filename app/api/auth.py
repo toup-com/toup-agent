@@ -802,7 +802,6 @@ async def google_auth_callback(
     500 or a JSON blob the user can't read.
     """
     import httpx
-    _t0 = _time.perf_counter()
 
     # Pick the redirect target (web SPA vs toup:// deep link) up front so
     # even the pre-verification error branches bounce back to the right
@@ -989,17 +988,10 @@ async def google_auth_callback(
     # Issue a Toup JWT. Same path as the /login endpoint — record the session
     # so the per-device "Sign out" UI sees this login, but off the redirect path
     # (the get_current_user JTI grace window tolerates the brief gap).
-    _t_work = _time.perf_counter()
     jwt_token = create_access_token(user.id)
     _ua = request.headers.get("user-agent", "") if request else ""
     _ip = request.client.host if (request and request.client) else None
     _spawn_background(record_login_session_async(user.id, jwt_token, _ua, _ip))
-    logger.warning(
-        "[google-timing] work=%.0f session=%.0f handler=%.0f new=%s",
-        (_t_work - _t0) * 1000,
-        (_time.perf_counter() - _t_work) * 1000,
-        (_time.perf_counter() - _t0) * 1000, is_new,
-    )
 
     # Set the SSO cookie too, matching the /login + /register UX so
     # cross-subdomain navigation stays authenticated without the
@@ -1113,7 +1105,6 @@ async def apple_auth(
         verify_apple_identity_token, AppleTokenError,
     )
 
-    _t0 = _time.perf_counter()
     try:
         # Offload to a thread: verify does a blocking urllib JWKS fetch on a
         # cache miss (first sign-in after a deploy, then ~hourly). On the
@@ -1126,7 +1117,6 @@ async def apple_auth(
     except AppleTokenError as e:
         logger.warning("[apple-auth] token verification failed: %s", e)
         raise HTTPException(status_code=401, detail="Apple sign-in verification failed.")
-    _t_verify = _time.perf_counter()
 
     # Apple includes the email in the identity token when the user grants
     # it (a private-relay address for Hide-My-Email); fall back to the
@@ -1151,7 +1141,6 @@ async def apple_auth(
             select(_User).where(_User.apple_sub == apple_sub)
         )).scalar_one_or_none()
     email_match = await get_user_by_email(db, email)
-    _t_lookup = _time.perf_counter()
     dedupe_on = getattr(settings, "apple_sub_dedupe_enabled", False)
     if dedupe_on and sub_match is not None:
         existing = sub_match
@@ -1225,7 +1214,6 @@ async def apple_auth(
     if body.authorization_code:
         _spawn_background(_bg_apple_refresh_capture(str(user.id), body.authorization_code))
 
-    _t_branch = _time.perf_counter()
     token = create_access_token(user.id)
     # Record the login-session row off the response path (the get_current_user
     # JTI grace window tolerates the brief gap). Pre-extract ua/ip — the request
@@ -1233,13 +1221,6 @@ async def apple_auth(
     _ua = request.headers.get("user-agent", "") if request else ""
     _ip = request.client.host if (request and request.client) else None
     _spawn_background(record_login_session_async(user.id, token, _ua, _ip))
-    _t_session = _time.perf_counter()
-    logger.warning(
-        "[apple-timing] verify=%.0f lookup=%.0f branch=%.0f session=%.0f handler=%.0f new=%s",
-        (_t_verify - _t0) * 1000, (_t_lookup - _t_verify) * 1000,
-        (_t_branch - _t_lookup) * 1000, (_t_session - _t_branch) * 1000,
-        (_t_session - _t0) * 1000, is_new,
-    )
 
     response.set_cookie(
         key=SSO_COOKIE_NAME, value=token, domain=SSO_COOKIE_DOMAIN,
