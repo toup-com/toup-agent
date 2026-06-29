@@ -22,6 +22,7 @@ from app.services import (
     get_user_by_id, create_access_token, decode_access_token,
     verify_password, change_user_password,
 )
+from app.services.session_tracker import record_login_session_async
 from app.services.rate_limiter import login_rate_limiter
 from app.services.turnstile import verify_turnstile_token
 from app.services.session_tracker import (
@@ -77,6 +78,66 @@ async def _bg_finalize_signup(user_id: str) -> None:
             "[google-auth] background finalize failed user=%s: %s",
             user_id[:8], e,
         )
+
+
+async def _bg_finalize_oauth_signup(user_id: str, email_verified: bool) -> None:
+    """Finish an OAuth / Sign-in-with-Apple signup OFF the response path.
+
+    create_user inserts the User row + default identities + credit balance in
+    one fast transaction. Everything else that the JWT doesn't depend on runs
+    here instead of inline — the measured ~10s of sequential cross-region writes
+    that made signup slow:
+      * the one-time free grant (idempotent; reconcile_deferred_grants backstops)
+      * managed-config priming, free-tier activation, and the pool claim
+    All idempotent, on their own DB session, with onboarding backstops. The
+    first chat is ~30s out (post-onboarding) so none of this needs to block the
+    token. Failures only log.
+    """
+    try:
+        from app.db import async_session_maker
+        from app.services.credit_service import CreditService
+        async with async_session_maker() as bg_db:
+            # One-time free grant — provider-verified; no-op if already granted.
+            try:
+                if await CreditService().grant_initial_free_credits(
+                    bg_db, user_id, email_verified=email_verified,
+                ):
+                    await bg_db.commit()
+            except Exception as ge:
+                logger.warning("[oauth-finalize] grant failed user=%s: %s", user_id[:8], ge)
+
+            if not settings.prewarm_on_soul_save:
+                return
+            # Prime managed config (was inline before the JWT).
+            try:
+                from app.api.agent_setup import _get_or_create_config
+                config = await _get_or_create_config(user_id, bg_db)
+                dirty = False
+                if config.hosting_mode in (None, "self-hosted"):
+                    config.hosting_mode = "managed"
+                    dirty = True
+                if not config.whatsapp_mode:
+                    config.whatsapp_mode = "qr_link"
+                    dirty = True
+                if dirty:
+                    await bg_db.commit()
+            except Exception as ce:
+                logger.warning("[oauth-finalize] config prime failed user=%s: %s", user_id[:8], ce)
+            # Free-tier activation (provisions the per-user OpenAI project off the
+            # event loop) BEFORE the bridge claim so the bind still injects
+            # TOUP_TOKEN — same ordering as _bg_finalize_signup.
+            try:
+                from app.services.free_tier_activation import activate_free_tier
+                await activate_free_tier(bg_db, user_id, force_env_push=False)
+            except Exception as ae:
+                logger.warning("[oauth-finalize] activation failed user=%s: %s", user_id[:8], ae)
+            try:
+                from app.services.pool_service import claim_or_prewarm
+                await claim_or_prewarm(bg_db, user_id)
+            except Exception as pe:
+                logger.warning("[oauth-finalize] claim failed user=%s: %s", user_id[:8], pe)
+    except Exception as e:
+        logger.warning("[oauth-finalize] failed user=%s: %s", user_id[:8], e)
 
 
 async def _bg_apple_refresh_capture(user_id: str, authorization_code: str) -> None:
@@ -899,59 +960,22 @@ async def google_auth_callback(
             return Response(status_code=307, headers={"Location": _dest(
                 token="", is_new=False, redirect=caller_redirect, error="rate_limited",
             )})
-        # OAuth signup — no password is set, so create_user stores an unusable
-        # sentinel hash: the user can never /login until they set one via the
-        # password-change flow, and we skip the ~50-100ms of event-loop-blocking
-        # bcrypt that hashing a throwaway random secret would cost.
-        # Google verified the email → fold the email_verified stamp into
-        # create_user's single commit (the credit-verification gate F13 trusts
-        # this flag) instead of a separate stamp+commit+refresh round-trip.
+        # OAuth signup — insert ONLY the User row here (one fast commit) and
+        # defer identities/balance/grant/config/activation/claim to the
+        # background finalize. The measured bottleneck was ~10s of sequential
+        # cross-region writes inline; none of it has to block the redirect.
+        # create_user stores an unusable sentinel password (no /login until set)
+        # and folds email_verified_at into the single INSERT+commit.
         user = await create_user(
             db, email=email, name=display_name, email_verified=email_verified,
         )
-        await record_signup(oauth_ip)
         is_new = True
-        # Fire the (possibly deferred) one-time free grant — provider-
-        # verified, so no extra step for the user. No-op when the grant
-        # already fired at create_user (require_verified_email_for_grant off).
-        try:
-            from app.services.credit_service import CreditService
-            if await CreditService().grant_initial_free_credits(
-                db, str(user.id), email_verified=email_verified,
-            ):
-                await db.commit()
-        except Exception as _ge:
-            logger.warning("[google-auth] initial grant failed user=%s: %s", str(user.id)[:8], _ge)
-
-        # Same prewarm-on-signup behavior as the /register path so the
-        # tenant container is warming while the user finishes onboarding.
-        if settings.prewarm_on_soul_save:
-            try:
-                from app.api.agent_setup import _get_or_create_config
-                config = await _get_or_create_config(str(user.id), db)
-                dirty = False
-                if config.hosting_mode in (None, "self-hosted"):
-                    config.hosting_mode = "managed"
-                    dirty = True
-                if not config.whatsapp_mode:
-                    config.whatsapp_mode = "qr_link"
-                    dirty = True
-                if dirty:
-                    await db.commit()
-                # Hand the free-tier activation AND the bridge claim to the
-                # background so neither blocks the OAuth redirect. Activation
-                # mints the bundle creds and provisions a per-user OpenAI project
-                # (a slow sync Admin-API call, ~3-6s) — none of which the user
-                # waits on: the first chat message is ~30s out (post-onboarding),
-                # the finalize runs activation BEFORE the claim so the bind still
-                # injects TOUP_TOKEN, and the onboarding flow re-activates the
-                # free tier as a backstop.
-                _spawn_background(_bg_finalize_signup(str(user.id)))
-            except Exception as e:
-                logger.warning(
-                    "[google-auth] prewarm/claim failed user=%s: %s",
-                    str(user.id)[:8], e,
-                )
+        # Record the signup IP for the limiter + run the whole finalize fan-out
+        # (identities, balance, free grant, managed-config priming, free-tier
+        # activation, pool claim) off the redirect path. All idempotent with
+        # onboarding/reconciler backstops; the first chat is ~30s out.
+        _spawn_background(record_signup(oauth_ip))
+        _spawn_background(_bg_finalize_oauth_signup(str(user.id), email_verified))
 
     if not user.is_active:
         return Response(
@@ -962,16 +986,14 @@ async def google_auth_callback(
             )},
         )
 
-    # Issue a Toup JWT. Same path as the /login endpoint — record the
-    # session so the per-device "Sign out" UI sees this login.
+    # Issue a Toup JWT. Same path as the /login endpoint — record the session
+    # so the per-device "Sign out" UI sees this login, but off the redirect path
+    # (the get_current_user JTI grace window tolerates the brief gap).
     _t_work = _time.perf_counter()
     jwt_token = create_access_token(user.id)
-    try:
-        await record_login_session(db, user.id, jwt_token, request)
-    except Exception:
-        # Session-tracker is non-critical for the auth flow — log and
-        # continue. The user can still log out via password change.
-        logger.exception("[google-auth] record_login_session failed")
+    _ua = request.headers.get("user-agent", "") if request else ""
+    _ip = request.client.host if (request and request.client) else None
+    _spawn_background(record_login_session_async(user.id, jwt_token, _ua, _ip))
     logger.warning(
         "[google-timing] work=%.0f session=%.0f handler=%.0f new=%s",
         (_t_work - _t0) * 1000,
@@ -1105,12 +1127,6 @@ async def apple_auth(
         logger.warning("[apple-auth] token verification failed: %s", e)
         raise HTTPException(status_code=401, detail="Apple sign-in verification failed.")
     _t_verify = _time.perf_counter()
-    # INSTRUMENTATION ONLY: force a connection checkout before the real lookups
-    # so `conn` isolates pool-wait (waiting for a free DB connection under load)
-    # from query latency. ~1 cross-region RTT when the pool is uncontended.
-    from sqlalchemy import text as _sqltext
-    await db.execute(_sqltext("SELECT 1"))
-    _t_conn = _time.perf_counter()
 
     # Apple includes the email in the identity token when the user grants
     # it (a private-relay address for Hide-My-Email); fall back to the
@@ -1167,10 +1183,13 @@ async def apple_auth(
                 detail=f"Too many signups from this network. Try again in {ra} seconds.",
                 headers={"Retry-After": str(ra)},
             )
-        # OAuth signup — no password is set, so create_user stores an unusable
-        # sentinel hash (the user can't /login until they set one via
-        # password-change) instead of paying ~50-100ms of event-loop-blocking
-        # bcrypt to hash a throwaway secret. Mirrors the Google path.
+        # OAuth signup — insert ONLY the User row here (one fast commit) and
+        # defer identities/balance/grant/config/activation/claim to the
+        # background finalize. The measured bottleneck was ~10s of sequential
+        # cross-region writes inline (app us-east-1 ↔ DB us-west-2); none of it
+        # has to block the token. create_user stores an unusable sentinel
+        # password (no /login until set) and folds email_verified_at + apple_sub
+        # into the single INSERT+commit.
         # Apple sends `fullName` ONLY on the very first authorization for an
         # (Apple ID, app) pair; every later sign-in — and any signup after a
         # prior failed/reset attempt (e.g. the pre-PLA-acceptance failures) —
@@ -1184,50 +1203,16 @@ async def apple_auth(
         if not _apple_name:
             _local = (email or "").split("@", 1)[0].strip()
             _apple_name = _local[:64] if _local else "User"
-        # email_verified is folded into create_user's single commit — no
-        # separate stamp+commit+refresh round-trip on the sign-in path.
         user = await create_user(
-            db, email=email, name=_apple_name, email_verified=email_verified,
+            db, email=email, name=_apple_name,
+            email_verified=email_verified, apple_sub=apple_sub,
         )
-        await record_signup(apple_ip)
         is_new = True
-        if apple_sub:
-            user.apple_sub = apple_sub
-            await db.commit()
-        # Fire the (possibly deferred) one-time free grant — Apple-verified,
-        # zero extra step. No-op when the grant already fired at create_user.
-        try:
-            from app.services.credit_service import CreditService
-            if await CreditService().grant_initial_free_credits(
-                db, str(user.id), email_verified=email_verified,
-            ):
-                await db.commit()
-        except Exception as _ge:
-            logger.warning("[apple-auth] initial grant failed user=%s: %s", str(user.id)[:8], _ge)
-        # New signup: prime managed config, then hand free-tier activation +
-        # the bridge claim to the background so neither blocks this response.
-        # Mirrors the Google flow — the inline claim_or_prewarm awaited the
-        # bridge bind for up to 30s, which is what made Sign-in-with-Apple hang
-        # before onboarding. The first chat is post-onboarding,
-        # _bg_finalize_signup activates BEFORE it claims so the bind still
-        # injects TOUP_TOKEN, and onboarding re-activates the free tier as a
-        # backstop.
-        if settings.prewarm_on_soul_save:
-            try:
-                from app.api.agent_setup import _get_or_create_config
-                config = await _get_or_create_config(str(user.id), db)
-                dirty = False
-                if config.hosting_mode in (None, "self-hosted"):
-                    config.hosting_mode = "managed"
-                    dirty = True
-                if not config.whatsapp_mode:
-                    config.whatsapp_mode = "qr_link"
-                    dirty = True
-                if dirty:
-                    await db.commit()
-                _spawn_background(_bg_finalize_signup(str(user.id)))
-            except Exception as e:
-                logger.warning("[apple-auth] prewarm/claim failed user=%s: %s", str(user.id)[:8], e)
+        # Record the signup IP for the limiter + run the whole finalize fan-out
+        # off the response path. All idempotent with onboarding/reconciler
+        # backstops; the first chat is ~30s out so nothing here blocks the token.
+        _spawn_background(record_signup(apple_ip))
+        _spawn_background(_bg_finalize_oauth_signup(str(user.id), email_verified))
 
     if not user.is_active:
         raise HTTPException(status_code=403, detail="This account has been disabled.")
@@ -1242,16 +1227,18 @@ async def apple_auth(
 
     _t_branch = _time.perf_counter()
     token = create_access_token(user.id)
-    try:
-        await record_login_session(db, user.id, token, request)
-    except Exception:
-        logger.exception("[apple-auth] record_login_session failed")
+    # Record the login-session row off the response path (the get_current_user
+    # JTI grace window tolerates the brief gap). Pre-extract ua/ip — the request
+    # can't cross into the background task.
+    _ua = request.headers.get("user-agent", "") if request else ""
+    _ip = request.client.host if (request and request.client) else None
+    _spawn_background(record_login_session_async(user.id, token, _ua, _ip))
     _t_session = _time.perf_counter()
     logger.warning(
-        "[apple-timing] verify=%.0f conn=%.0f lookup=%.0f branch=%.0f session=%.0f handler=%.0f new=%s",
-        (_t_verify - _t0) * 1000, (_t_conn - _t_verify) * 1000,
-        (_t_lookup - _t_conn) * 1000, (_t_branch - _t_lookup) * 1000,
-        (_t_session - _t_branch) * 1000, (_t_session - _t0) * 1000, is_new,
+        "[apple-timing] verify=%.0f lookup=%.0f branch=%.0f session=%.0f handler=%.0f new=%s",
+        (_t_verify - _t0) * 1000, (_t_lookup - _t_verify) * 1000,
+        (_t_branch - _t_lookup) * 1000, (_t_session - _t_branch) * 1000,
+        (_t_session - _t0) * 1000, is_new,
     )
 
     response.set_cookie(

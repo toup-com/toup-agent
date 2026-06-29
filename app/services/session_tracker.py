@@ -172,6 +172,36 @@ async def record_login_session(
         return None
 
 
+async def record_login_session_async(
+    user_id: str, token: str, ua: str = "", ip: Optional[str] = None,
+) -> None:
+    """Background variant of record_login_session: opens its OWN DB session and
+    inserts the UserSession row, so the OAuth/Apple response doesn't wait on the
+    INSERT+commit+refresh (a cross-region round-trip). Safe to defer: the
+    get_current_user JTI check tolerates a not-yet-written row for
+    JTI_REVOCATION_GRACE_SECONDS, and the client's first authed call is well
+    inside that window. Caller pre-extracts ua/ip from the request (which can't
+    cross into a background task). Best-effort; failures only log.
+    """
+    jti = _decode_jti(token)
+    if not jti:
+        return
+    try:
+        from app.db import async_session_maker
+        async with async_session_maker() as db:
+            row = UserSession(
+                user_id=user_id,
+                jti=jti,
+                device_label=parse_device_label(ua),
+                user_agent=ua[:500] if ua else None,
+                ip_address=ip,
+            )
+            db.add(row)
+            await db.commit()
+    except Exception as e:
+        logger.warning("record_login_session_async failed: %s", e)
+
+
 async def get_session_by_jti(db: AsyncSession, jti: str) -> Optional[UserSession]:
     """Lookup helper used by get_current_user. Returns the session
     row even if revoked — the caller checks is_revoked."""

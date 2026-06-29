@@ -126,6 +126,7 @@ async def create_user(
     name: Optional[str] = None,
     *,
     email_verified: bool = False,
+    apple_sub: Optional[str] = None,
 ) -> User:
     """Create a new user with default identities.
 
@@ -135,8 +136,9 @@ async def create_user(
 
     `password=None` (OAuth / Sign-in-with-Apple) stores an unusable sentinel
     hash with no bcrypt cost; a real password is hashed off the event loop.
-    `email_verified=True` stamps email_verified_at inside this single
-    transaction so OAuth callers don't pay a separate commit+refresh.
+    `email_verified=True` stamps email_verified_at, and `apple_sub` stores the
+    stable Apple identity, both folded into this single transaction so OAuth
+    callers don't pay separate commit+refresh round-trips.
     """
     hashed = (
         await asyncio.to_thread(get_password_hash, password)
@@ -150,6 +152,8 @@ async def create_user(
     )
     if email_verified:
         user.email_verified_at = datetime.utcnow()
+    if apple_sub is not None:
+        user.apple_sub = apple_sub
     db.add(user)
     await db.flush()  # Get user.id before creating identities
 
