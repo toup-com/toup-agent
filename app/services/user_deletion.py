@@ -484,6 +484,12 @@ async def _wipe_user_data_tables(db: AsyncSession, user_id: str) -> None:
     This is the agent-monolith + platform-tables cleanup ported from
     the previous cascade_delete_user implementation, with the same
     ordering (children before parents, FK-aware).
+
+    INVARIANT: ``grant_eligibility`` is deliberately NOT wiped here and
+    carries no FK to ``users``, so neither this function nor the
+    ``DELETE FROM users`` cascade touches it. That tombstone MUST outlive
+    the account — it is what stops delete → re-signup from farming a fresh
+    free-credit grant. Do not add it to the lists below.
     """
     from app.db.models import (
         Invite, ManagedContainer, AgentConfig, VPSInstance,

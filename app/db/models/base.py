@@ -158,6 +158,13 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # Support card attachments (e.g. mobile screenshots) — bytes live in the
     # platform DB, served only via an auth'd reporter/admin endpoint.
     "support_attachments",
+    # Free-credit grant eligibility tombstone + persistent signup-attempt
+    # log. Signup, the free-credit grant, and IP rate limiting all live on
+    # the platform — agent containers neither create accounts nor grant
+    # credits — so these are platform-only (mirrors the migration guards
+    # that skip agent DBs).
+    "grant_eligibility",
+    "signup_attempts",
 }
 
 SHARED_TABLES: set[str] = {

@@ -76,6 +76,12 @@ from .credit import (
     RESERVATION_OPEN, RESERVATION_SETTLED, RESERVATION_REFUNDED, RESERVATION_EXPIRED,
 )
 
+# Free-credit grant eligibility tombstone (Sybil / multi-account resistance)
+from .grant_eligibility import GrantEligibility
+
+# Durable signup-attempt log (persistent IP rate limiting)
+from .signup_attempt import SignupAttempt
+
 # Rollouts (Phase 3 automated deployment)
 from .rollout import (
     Rollout, RolloutAttempt,
@@ -148,6 +154,7 @@ __all__ = [
     "Rollout", "RolloutAttempt",
     "ROLLOUT_STATUSES", "ROLLOUT_ATTEMPT_STATUSES", "ROLLOUT_TRIGGERS",
     "StreamingCredential", "CredentialAccessLog",
+    "GrantEligibility", "SignupAttempt",
     "DayChat", "ContextBudgetLog", "MigrationStatus",
     "DeletionAuditEvent", "SensitiveActionRedemption",
     "DELETION_STATUSES", "DELETION_ACTORS",

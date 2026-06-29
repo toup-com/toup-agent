@@ -22,7 +22,7 @@ from app.services import (
     get_user_by_id, create_access_token, decode_access_token,
     verify_password, change_user_password,
 )
-from app.services.rate_limiter import login_rate_limiter, signup_rate_limiter
+from app.services.rate_limiter import login_rate_limiter
 from app.services.turnstile import verify_turnstile_token
 from app.services.session_tracker import (
     parse_device_label, record_login_session, JTI_REVOCATION_GRACE_SECONDS,
@@ -253,9 +253,13 @@ async def register(
     client_ip = request.client.host if request.client else "unknown"
 
     # Rate-limit FIRST so we don't waste DB / Turnstile work on
-    # already-blocked IPs.
-    retry_after = signup_rate_limiter.check(client_ip)
+    # already-blocked IPs. signup_retry_after routes to the persistent
+    # (cross-replica) limiter when enabled, else the in-memory one.
+    from app.services.signup_guard import signup_retry_after, record_signup
+    retry_after = await signup_retry_after(db, client_ip)
     if retry_after:
+        from app.services.abuse_metrics import emit as _abuse_emit
+        _abuse_emit("signup_rate_limited", source="register", retry_after=retry_after)
         raise HTTPException(
             status_code=429,
             detail=f"Too many signup attempts from this network. Try again in {retry_after} seconds.",
@@ -265,13 +269,40 @@ async def register(
     # Turnstile gate — skipped when no secret configured (dev / CI).
     # Verifies BEFORE we touch the DB so a failing token never hits
     # the User uniqueness constraint.
-    if not await verify_turnstile_token(
+    #
+    # Native clients (X-Toup-Client: ios|android) can't render the web-only
+    # Turnstile widget, so when turnstile_exempt_native_clients is on they
+    # are admitted on the IP rate limiter above instead of a token. This
+    # keeps the gate CONSISTENT and intentional rather than silently 400-ing
+    # every mobile signup once TURNSTILE_SECRET_KEY is set for web. App
+    # Attest / Play Integrity is the tracked follow-up.
+    client_name = (request.headers.get("x-toup-client", "") or "").strip().lower()
+    is_native = client_name in ("ios", "android")
+    if is_native and getattr(settings, "turnstile_exempt_native_clients", True):
+        logger.info("[REGISTER] native client=%s — Turnstile exempt; IP limiter is the gate", client_name)
+    elif not await verify_turnstile_token(
         user_data.cf_turnstile_token, remote_ip=client_ip,
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="CAPTCHA verification failed. Please refresh and try again.",
         )
+
+    # Disposable/temp-mail domain block (flag-gated, fail-open). Cheap
+    # Sybil control: one throwaway-mail provider can otherwise mint
+    # unlimited free-grant accounts. Always evaluated so the would-reject
+    # rate is measurable in shadow mode BEFORE the flag is enabled.
+    from app.services.disposable_email import is_disposable_email
+    from app.services.abuse_metrics import emit as _abuse_emit
+    if is_disposable_email(user_data.email):
+        _dom = (user_data.email or "").rsplit("@", 1)[-1]
+        if getattr(settings, "disposable_email_blocklist_enabled", False):
+            _abuse_emit("disposable_rejected", domain=_dom)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Please sign up with a permanent email address.",
+            )
+        _abuse_emit("disposable_would_reject", domain=_dom)
 
     existing = await get_user_by_email(db, user_data.email)
     if existing:
@@ -282,7 +313,15 @@ async def register(
     # one bot can lock out a shared IP). Successful create is the
     # signal that consumes a slot.
     user = await create_user(db, email=user_data.email, password=user_data.password, name=user_data.name)
-    signup_rate_limiter.record(client_ip)
+    await record_signup(client_ip)
+
+    # When the grant is gated on email verification, send the one-click
+    # verification link so the user can unlock their free credits. Scheduled
+    # OFF the hot path (own session) — register stays instant and product
+    # entry is never blocked on verification. No-op when the gate is off.
+    if getattr(settings, "require_verified_email_for_grant", False):
+        from app.api.email_verification import schedule_post_register_verification
+        schedule_post_register_verification(str(user.id))
 
     # Kick off the prewarm IMMEDIATELY at signup — before the user
     # even navigates to /onboarding/welcome. Previously the prewarm
@@ -795,6 +834,16 @@ async def google_auth_callback(
     if existing is not None:
         user = existing
     else:
+        # Signup via OAuth — apply the shared signup IP cap. Only NEW-account
+        # creation consumes a slot, so returning users' logins are never
+        # rate-limited (invisible to legitimate users).
+        oauth_ip = request.client.host if request.client else "unknown"
+        from app.services.signup_guard import signup_retry_after, record_signup
+        if await signup_retry_after(db, oauth_ip):
+            logger.info("[google-auth] signup rate-limited ip=%s", oauth_ip)
+            return Response(status_code=307, headers={"Location": _dest(
+                token="", is_new=False, redirect=caller_redirect, error="rate_limited",
+            )})
         # OAuth signup — set a random unguessable password so the user
         # can never log in via /login until they explicitly set one via
         # the password-change flow. (`get_password_hash` would otherwise
@@ -804,6 +853,7 @@ async def google_auth_callback(
         user = await create_user(
             db, email=email, password=random_password, name=display_name,
         )
+        await record_signup(oauth_ip)
         is_new = True
         # Google verified the email → stamp it. The credit-verification
         # gate (F13) trusts this flag for charge eligibility.
@@ -811,6 +861,17 @@ async def google_auth_callback(
             user.email_verified_at = datetime.utcnow()
             await db.commit()
             await db.refresh(user)
+        # Fire the (possibly deferred) one-time free grant — provider-
+        # verified, so no extra step for the user. No-op when the grant
+        # already fired at create_user (require_verified_email_for_grant off).
+        try:
+            from app.services.credit_service import CreditService
+            if await CreditService().grant_initial_free_credits(
+                db, str(user.id), email_verified=email_verified,
+            ):
+                await db.commit()
+        except Exception as _ge:
+            logger.warning("[google-auth] initial grant failed user=%s: %s", str(user.id)[:8], _ge)
 
         # Same prewarm-on-signup behavior as the /register path so the
         # tenant container is warming while the user finishes onboarding.
@@ -990,12 +1051,52 @@ async def apple_auth(
         raise HTTPException(status_code=400, detail="Apple did not provide an email address.")
     ev = claims.get("email_verified")
     email_verified = (ev is True) or (str(ev).lower() == "true")
+    apple_sub = (claims.get("sub") or "").strip() or None
 
-    existing = await get_user_by_email(db, email)
+    # Dedupe on the STABLE Apple `sub` before the mutable relay email when
+    # enabled — a Hide-My-Email relay change can't fork one Apple-ID into
+    # two accounts. `sub` is stored regardless (additive backfill below).
+    # Both lookups run unconditionally so the dedupe hit-rate is measurable
+    # in shadow mode before the flag is enabled.
+    from app.db.models import User as _User
+    from app.services.abuse_metrics import emit as _abuse_emit, uidp as _abuse_uidp
+    sub_match = None
+    if apple_sub:
+        sub_match = (await db.execute(
+            select(_User).where(_User.apple_sub == apple_sub)
+        )).scalar_one_or_none()
+    email_match = await get_user_by_email(db, email)
+    dedupe_on = getattr(settings, "apple_sub_dedupe_enabled", False)
+    if dedupe_on and sub_match is not None:
+        existing = sub_match
+        if email_match is None or email_match.id != sub_match.id:
+            _abuse_emit("apple_sub_dedupe_hit", uid=_abuse_uidp(sub_match.id))
+    else:
+        existing = email_match
+        # Shadow: sub WOULD have matched an account the email lookup didn't.
+        if (not dedupe_on) and sub_match is not None and (
+            email_match is None or email_match.id != sub_match.id
+        ):
+            _abuse_emit("apple_sub_dedupe_would", uid=_abuse_uidp(sub_match.id))
     is_new = False
     if existing is not None:
         user = existing
+        # Backfill the durable identity on an account first seen via email.
+        if apple_sub and getattr(user, "apple_sub", None) is None:
+            user.apple_sub = apple_sub
+            await db.commit()
     else:
+        # Signup via Apple — apply the shared signup IP cap (new accounts
+        # only; returning sign-ins are never limited).
+        apple_ip = request.client.host if request.client else "unknown"
+        from app.services.signup_guard import signup_retry_after, record_signup
+        ra = await signup_retry_after(db, apple_ip)
+        if ra:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many signups from this network. Try again in {ra} seconds.",
+                headers={"Retry-After": str(ra)},
+            )
         # OAuth signup — random unguessable password (no /login until the
         # user sets one via password-change). Mirrors the Google path.
         random_password = _secrets.token_urlsafe(48)
@@ -1015,11 +1116,25 @@ async def apple_auth(
         user = await create_user(
             db, email=email, password=random_password, name=_apple_name,
         )
+        await record_signup(apple_ip)
         is_new = True
+        if apple_sub:
+            user.apple_sub = apple_sub
+            await db.commit()
         if email_verified:
             user.email_verified_at = datetime.utcnow()
             await db.commit()
             await db.refresh(user)
+        # Fire the (possibly deferred) one-time free grant — Apple-verified,
+        # zero extra step. No-op when the grant already fired at create_user.
+        try:
+            from app.services.credit_service import CreditService
+            if await CreditService().grant_initial_free_credits(
+                db, str(user.id), email_verified=email_verified,
+            ):
+                await db.commit()
+        except Exception as _ge:
+            logger.warning("[apple-auth] initial grant failed user=%s: %s", str(user.id)[:8], _ge)
         # New signup: prime managed config, then hand free-tier activation +
         # the bridge claim to the background so neither blocks this response.
         # Mirrors the Google flow — the inline claim_or_prewarm awaited the

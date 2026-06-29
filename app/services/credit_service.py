@@ -58,9 +58,11 @@ from app.db.models import (
     LEDGER_SETTLEMENT,
     RESERVATION_OPEN, RESERVATION_REFUNDED, RESERVATION_SETTLED,
     APPLE_SUB_ACTIVE,
-    AppleSubscription, CreditBalance, CreditLedger, CreditReservation,
+    AppleSubscription, CreditBalance, CreditLedger, CreditReservation, GrantEligibility,
     SubscriptionPlan, User,
 )
+from app.services.email_canonical import canonical_email_hash
+from app.services.abuse_metrics import emit as _emit, hp as _hp, uidp as _uidp
 
 
 # Plan-source markers stamped on credit_balances.plan_source. NULL/'stripe' ⇒
@@ -417,28 +419,202 @@ class CreditService:
         if plan is None:
             raise RuntimeError("subscription_plans 'free' row missing — alembic 053 not applied?")
         now = datetime.utcnow()
+        # Create the balance row with ZERO credits first; the one-time free
+        # grant is applied (or suppressed) below. With all gates off this is
+        # byte-for-byte equivalent to the legacy "seed with plan credits"
+        # path — the grant fires immediately. The split exists so the grant
+        # can be deduped (Phase 2) and deferred to email-verify (Phase 3)
+        # WITHOUT ever leaving a user without a balance row (the invariant
+        # the provision gate depends on).
         balance = CreditBalance(
             user_id=user_id, plan_id=plan.id,
-            message_credits_remaining=plan.message_credits_monthly,
-            integration_credits_remaining=plan.integration_credits_monthly,
+            message_credits_remaining=Decimal("0"),
+            integration_credits_remaining=Decimal("0"),
             message_credits_used_today=Decimal("0"),
             message_credits_daily_cap=plan.message_credits_daily_cap,
             day_anchor_local_date=_local_day_iso(user.timezone if user else None),
             period_start=now, period_end=now + timedelta(days=30),
         )
         db.add(balance)
+        await db.flush()
+        await self._maybe_grant_initial(db, balance, user, plan)
+        return balance
+
+    def _apply_initial_grant(
+        self, db: AsyncSession, balance: CreditBalance, plan: SubscriptionPlan,
+    ) -> None:
+        """Seed the balance with the plan's monthly allotment + write the two
+        ``initial_grant`` ledger rows. Pure local mutation; caller flushes."""
+        balance.message_credits_remaining = plan.message_credits_monthly
+        balance.integration_credits_remaining = plan.integration_credits_monthly
         db.add(CreditLedger(
-            user_id=user_id, event_type=LEDGER_PLAN_GRANT, bucket=BUCKET_MESSAGE,
+            user_id=balance.user_id, event_type=LEDGER_PLAN_GRANT, bucket=BUCKET_MESSAGE,
             amount=plan.message_credits_monthly, balance_after=plan.message_credits_monthly,
             metadata_json={"plan_id": plan.id, "reason": "initial_grant"},
         ))
         db.add(CreditLedger(
-            user_id=user_id, event_type=LEDGER_PLAN_GRANT, bucket=BUCKET_INTEGRATION,
+            user_id=balance.user_id, event_type=LEDGER_PLAN_GRANT, bucket=BUCKET_INTEGRATION,
             amount=plan.integration_credits_monthly, balance_after=plan.integration_credits_monthly,
             metadata_json={"plan_id": plan.id, "reason": "initial_grant"},
         ))
+
+    async def _claim_grant_tombstone(self, db: AsyncSession, user: Optional[User]) -> str:
+        """Try to claim the one-time grant for this user's CANONICAL identity.
+
+        Race-safe: the INSERT into grant_eligibility (PK = canonical hash)
+        is wrapped in a SAVEPOINT so a collision rolls back ONLY this insert,
+        never the in-flight user/balance creation. Two concurrent signups
+        with the same canonical email → exactly one claims; the other reads
+        the existing row.
+
+        Returns one of:
+          * "granted"    — we own the tombstone now → caller should grant.
+          * "already"    — THIS user already owns it → idempotent, no re-grant.
+          * "suppressed" — a DIFFERENT account already claimed it AND dedupe
+                           is enabled → caller must NOT grant.
+        With ``free_grant_dedupe_enabled`` OFF a cross-account collision
+        returns "granted" (legacy behavior) but is logged as would-suppress.
+        """
+        if user is None or not getattr(user, "email", None):
+            return "granted"  # no email identity to dedupe on → behave as before
+        h = canonical_email_hash(user.email)
+        uid = str(user.id)
+        try:
+            async with db.begin_nested():
+                await db.execute(
+                    GrantEligibility.__table__.insert().values(
+                        canonical_email_hash=h, granted_at=datetime.utcnow(),
+                        first_user_id=uid,
+                    )
+                )
+            _emit("tombstone_claimed", hp=_hp(h), uid=_uidp(uid))
+            return "granted"
+        except IntegrityError:
+            existing = await db.get(GrantEligibility, h)
+            owner = existing.first_user_id if existing else None
+            if owner == uid:
+                return "already"
+            if getattr(settings, "free_grant_dedupe_enabled", False):
+                _emit("grant_suppressed", hp=_hp(h), uid=_uidp(uid), owner=_uidp(owner))
+                return "suppressed"
+            # Flag OFF → still grant (legacy), but record the SHADOW decision so
+            # the suppression rate is measurable before enabling dedupe.
+            _emit("grant_suppressed_would", hp=_hp(h), uid=_uidp(uid), owner=_uidp(owner))
+            return "granted"
+
+    async def _maybe_grant_initial(
+        self, db: AsyncSession, balance: CreditBalance,
+        user: Optional[User], plan: SubscriptionPlan,
+    ) -> None:
+        """Apply the one-time free grant at balance-creation time, unless:
+
+        * Phase 3 verified-email gate is on AND the email is not yet
+          verified → DEFER (no grant, NO tombstone claim — the grant fires
+          later via ``grant_initial_free_credits`` when the user verifies /
+          when OAuth stamps email_verified_at). The balance row stays at
+          zero so the 'every user has a balance row' invariant holds.
+        * Phase 2 dedupe says this canonical identity already claimed it →
+          suppress.
+        """
+        if getattr(settings, "require_verified_email_for_grant", False) and not (
+            user is not None and user.email_verified_at is not None
+        ):
+            _emit("grant_deferred", uid=_uidp(user.id if user else None))
+            return
+        claim = await self._claim_grant_tombstone(db, user)
+        if claim in ("suppressed", "already"):
+            return  # leave the zero-credit balance row in place
+        self._apply_initial_grant(db, balance, plan)
         await db.flush()
-        return balance
+
+    async def _already_granted(self, db: AsyncSession, user_id: str) -> bool:
+        """True iff THIS user already owns a grant tombstone (i.e. its
+        one-time grant already fired). Makes grant_initial_free_credits
+        idempotent and a no-op when the grant happened at signup."""
+        row = await db.execute(
+            select(GrantEligibility.canonical_email_hash).where(
+                GrantEligibility.first_user_id == str(user_id)
+            )
+        )
+        return row.first() is not None
+
+    async def grant_initial_free_credits(
+        self, db: AsyncSession, user_id: str, *, email_verified: bool = False,
+    ) -> bool:
+        """Apply the DEFERRED one-time free grant once the email is verified.
+
+        Called from the email-verify endpoint and from the OAuth/Apple
+        handlers (provider-verified). Idempotent and safe to call from
+        multiple channels: returns False without re-granting if this user
+        already received its grant, if the grant is still gated unverified,
+        or if the canonical identity was already claimed by another account.
+        Returns True iff it granted on THIS call. Caller owns commit.
+        """
+        balance = await self.get_or_create_balance(db, user_id)
+        if await self._already_granted(db, user_id):
+            return False
+        user = await db.get(User, user_id)
+        if getattr(settings, "require_verified_email_for_grant", False):
+            verified = email_verified or (
+                user is not None and user.email_verified_at is not None
+            )
+            if not verified:
+                return False  # still deferred
+        plan = await db.get(SubscriptionPlan, balance.plan_id)
+        if plan is None:
+            return False
+        claim = await self._claim_grant_tombstone(db, user)
+        if claim in ("suppressed", "already"):
+            return False
+        self._apply_initial_grant(db, balance, plan)
+        await db.flush()
+        return True
+
+    async def reconcile_deferred_grants(self, db: AsyncSession, *, limit: int = 500) -> int:
+        """Grant anyone left in a deferred-but-now-eligible state.
+
+        Closes the gaps the per-request path can miss so no user is ever
+        permanently grant-less due to timing:
+          * verified during a window where the on-verify grant call failed;
+          * signed up while ``require_verified_email_for_grant`` was ON, then
+            the flag was turned OFF (nothing re-triggers their grant).
+
+        Candidates = balances with NO owned tombstone (i.e. never granted).
+        Each is re-run through ``grant_initial_free_credits``, which grants
+        only if eligible and still suppresses aliases / unverified-and-gated
+        users. Idempotent and safe to run on a schedule. Per-candidate commit
+        isolates failures. Returns the number actually granted.
+        """
+        rows = await db.execute(
+            select(CreditBalance.user_id)
+            .outerjoin(
+                GrantEligibility,
+                GrantEligibility.first_user_id == CreditBalance.user_id,
+            )
+            .where(GrantEligibility.canonical_email_hash.is_(None))
+            .limit(limit)
+        )
+        candidate_ids = [r[0] for r in rows.all()]
+        granted = 0
+        for uid in candidate_ids:
+            try:
+                user = await db.get(User, uid)
+                verified = user is not None and user.email_verified_at is not None
+                if await self.grant_initial_free_credits(db, uid, email_verified=verified):
+                    await db.commit()
+                    granted += 1
+                else:
+                    await db.rollback()
+            except Exception as e:  # one bad row must not abort the sweep
+                await db.rollback()
+                logger.warning(
+                    "[credits] reconcile grant failed user=%s: %s", str(uid)[:8], e,
+                )
+        logger.info(
+            "[credits] reconcile_deferred_grants: %d candidates, %d granted",
+            len(candidate_ids), granted,
+        )
+        return granted
 
     async def check_balance(
         self, db: AsyncSession, user_id: str, bucket: str,

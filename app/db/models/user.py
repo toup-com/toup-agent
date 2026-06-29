@@ -68,6 +68,14 @@ class User(Base):
     # before the SIWA signing key was configured. Migration 061.
     apple_refresh_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Stable Sign-in-with-Apple subject identifier (`sub` claim). Unique
+    # per Apple-ID per app and STABLE even when the user toggles
+    # Hide-My-Email (the relay address can change; `sub` does not). Stored
+    # so Apple sign-ins can dedupe on the durable identity instead of the
+    # mutable relay email. NULL for email/Google users and for Apple
+    # sign-ins captured before this column existed. Migration 064.
+    apple_sub: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True, index=True)
+
     # Account-level notification opt-in toggles. JSONB lets us add new
     # toggles (eg. weekly_digest, mention_emails) without an ALTER per
     # toggle. Shape: {"morning_briefing": bool, "security_alerts":

@@ -72,6 +72,53 @@ async def post_register_send_verification(
         )
 
 
+# Strong references to in-flight background sends. asyncio.create_task only
+# keeps a WEAK reference to the task, so without this the event loop can
+# garbage-collect a send mid-flight — silently stranding a password user
+# with no verification email and therefore no grant. We hold the task here
+# until it completes (add_done_callback discards it). See test_email_*.
+_PENDING_SENDS: set = set()
+
+
+def schedule_post_register_verification(user_id: str) -> None:
+    """Send the verification email OFF the signup hot path.
+
+    /auth/register must not pay an SMTP/Resend round-trip synchronously
+    (friction budget). This schedules the send on its own session — the
+    request's session closes once register returns — so the grant-unlock
+    link is on its way without adding latency to signup. Best-effort:
+    a missing event loop or send failure is logged, never raised.
+
+    The task is pinned in ``_PENDING_SENDS`` so it cannot be GC'd before
+    it finishes (the create_task weak-reference footgun).
+    """
+    import asyncio
+    try:
+        task = asyncio.create_task(_run_post_register_verification(user_id))
+    except RuntimeError:
+        logger.warning(
+            "[email_verification] no event loop to schedule post-register send for %s",
+            str(user_id)[:8],
+        )
+        return
+    _PENDING_SENDS.add(task)
+    task.add_done_callback(_PENDING_SENDS.discard)
+
+
+async def _run_post_register_verification(user_id: str) -> None:
+    from app.db.database import async_session_maker
+    try:
+        async with async_session_maker() as db:
+            user = await db.get(User, user_id)
+            if user is not None and user.email_verified_at is None:
+                await _issue_and_send_verification(db, user)
+    except Exception as e:
+        logger.warning(
+            "[email_verification] background post-register send failed for %s: %s",
+            str(user_id)[:8], e,
+        )
+
+
 @router.post("/send-verification")
 async def send_verification(
     request: Request,
@@ -119,4 +166,22 @@ async def verify_email(
     user.email_verified_at = datetime.utcnow()
     user.email_verification_token = None
     await db.commit()
+
+    # Unlock the DEFERRED one-time free grant now that the email is verified
+    # (no-op when the grant already fired at signup, e.g. require_verified_
+    # email_for_grant is off). Best-effort: a grant hiccup must not fail the
+    # verification itself.
+    try:
+        from app.services.credit_service import CreditService
+        granted = await CreditService().grant_initial_free_credits(
+            db, str(user.id), email_verified=True,
+        )
+        if granted:
+            await db.commit()
+    except Exception as e:
+        logger.warning(
+            "[email_verification] deferred grant on verify failed for %s: %s",
+            str(user.id)[:8], e,
+        )
+
     return {"verified": True, "email": user.email}

@@ -997,6 +997,30 @@ async def run_credit_period_renewal(limit: int = 500) -> dict:
     return counters
 
 
+async def run_deferred_grant_reconciliation(limit: int = 500) -> dict:
+    """Sweep up users left in a deferred-but-now-eligible free-grant state.
+
+    Backstop for the per-request grant path (CreditService): grants anyone
+    who verified during a failed-grant window, or who signed up while the
+    verify-gate was ON and the flag was later turned OFF. Idempotent — only
+    grants the eligible, suppresses aliases — so a hot rerun is safe.
+    """
+    from datetime import datetime
+    from app.db.database import async_session_maker
+    from app.services.credit_service import credit_service
+
+    started_at = datetime.utcnow()
+    granted = 0
+    async with async_session_maker() as db:
+        granted = await credit_service.reconcile_deferred_grants(db, limit=limit)
+    elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+    logger.info(
+        "[PERF] deferred_grant_reconciliation granted=%d elapsed_ms=%d",
+        granted, elapsed_ms,
+    )
+    return {"granted": granted}
+
+
 def setup_scheduler(
     decay_interval_hours: int = 6,
     consolidation_interval_hours: int = 24,
@@ -1122,6 +1146,19 @@ def setup_scheduler(
         trigger=IntervalTrigger(hours=1),
         id="credit_period_renewal",
         name="Credit Period Renewal (monthly allotment + rollover)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Deferred-grant reconciliation — backstop so no user is permanently
+    # grant-less due to flag timing or a failed on-verify grant. Idempotent;
+    # only grants the eligible. Hourly is plenty (the per-request path is the
+    # primary; this just catches the gaps).
+    scheduler.add_job(
+        run_deferred_grant_reconciliation,
+        trigger=IntervalTrigger(hours=1),
+        id="deferred_grant_reconciliation",
+        name="Deferred Free-Grant Reconciliation",
         replace_existing=True,
         misfire_grace_time=3600,
     )

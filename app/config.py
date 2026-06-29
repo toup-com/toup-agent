@@ -261,6 +261,13 @@ class Settings(BaseSettings):
 
     # ── Credit-based billing (docs/credits/design.md) ────
     credit_enforcement_enabled: bool = False
+    # Sybil resistance: when True, the one-time free-credit grant is deduped
+    # per CANONICAL email identity (Gmail dot/+alias variants AND
+    # delete→re-signup collapse to a single grant) via the grant_eligibility
+    # tombstone. Default False preserves the legacy "grant on every balance
+    # creation" behavior while STILL recording tombstones, so enabling this
+    # later is safe — the history already exists. See email_canonical.py.
+    free_grant_dedupe_enabled: bool = False
     stripe_price_id_starter: str = ""
     stripe_price_id_builder: str = ""
     stripe_price_id_pro: str = ""
@@ -289,6 +296,26 @@ class Settings(BaseSettings):
     gmail_oauth_refresh_token: str = ""
     require_email_verification_for_credits: bool = False
     email_verification_required_after_iso: str = ""
+    # Sybil resistance (grant-time gate, distinct from the spend-time gate
+    # above): when True, the one-time free GRANT is withheld until the email
+    # is verified. Account creation and product entry are NEVER blocked —
+    # only the grant is deferred. OAuth/Apple users are provider-verified so
+    # they grant instantly; password users unlock the grant by clicking the
+    # verification link (sent in the background at signup, off the hot path).
+    # Default False = grant at creation (legacy behavior).
+    require_verified_email_for_grant: bool = False
+    # Reject signups on known disposable/temp-mail domains (mailinator,
+    # guerrillamail, …). Fail-open: a broken list never blocks signup. Off
+    # by default so false-positives can be monitored before enforcing.
+    disposable_email_blocklist_enabled: bool = False
+    # Optional path to a fuller maintained disposable-domain list; extends
+    # the bundled core list. Empty = bundled list only.
+    disposable_email_domains_path: str = ""
+    # When True, Apple sign-in dedupes on the stable `sub` claim before the
+    # (mutable) relay email, so a Hide-My-Email relay change can't fork one
+    # Apple-ID into two accounts. The `sub` is STORED regardless (additive);
+    # this flag only controls whether the sub LOOKUP precedes email lookup.
+    apple_sub_dedupe_enabled: bool = False
 
     # Day recall (recall_day tool + end-of-day archival summaries)
     enable_day_recall: bool = False  # When true, exposes recall_day tool + runs hourly archival job
@@ -829,9 +856,20 @@ class Settings(BaseSettings):
     # When set, /auth/register requires a valid Turnstile token. When
     # blank, verification is skipped (dev / test path).
     turnstile_secret_key: str = ""
+    # Cloudflare Turnstile is a web-only widget that can't render in the
+    # native iOS/Android app. When True (default), native clients (identified
+    # by the X-Toup-Client header) are admitted on the signup IP rate limiter
+    # instead of a Turnstile token — so enabling TURNSTILE_SECRET_KEY to gate
+    # WEB signups doesn't silently 400 every mobile signup. App Attest /
+    # Play Integrity is the tracked follow-up to attest native clients.
+    turnstile_exempt_native_clients: bool = True
     # Signup rate limit — IP-keyed. 5 signups per hour per IP, copied
     # from the login rate limiter pattern. Disabled if either value is 0.
     signup_rate_limit_per_hour: int = 5
+    # When True, the signup IP limit is enforced via the signup_attempts
+    # table (cross-replica, survives deploys) instead of the per-process
+    # in-memory limiter. Default False = legacy in-memory behavior.
+    signup_rate_limit_persistent: bool = False
     admin_alert_telegram_token: str = ""    # Bot token for admin alerts (shared / user-facing bot)
     admin_alert_telegram_chat_id: str = ""
 
