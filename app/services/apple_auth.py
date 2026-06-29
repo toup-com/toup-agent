@@ -39,7 +39,6 @@ APPLE_REVOKE_URL = "https://appleid.apple.com/auth/revoke"
 _JWKS_TTL_SECONDS = 3600
 
 _jwks_client: Optional[PyJWKClient] = None
-_jwks_loaded_at: float = 0.0
 
 
 class AppleTokenError(Exception):
@@ -47,13 +46,33 @@ class AppleTokenError(Exception):
 
 
 def _get_jwks_client() -> PyJWKClient:
-    """Lazy-built, TTL-cached PyJWKClient for Apple's JWKS endpoint."""
-    global _jwks_client, _jwks_loaded_at
-    now = time.monotonic()
-    if _jwks_client is None or (now - _jwks_loaded_at) >= _JWKS_TTL_SECONDS:
-        _jwks_client = PyJWKClient(APPLE_JWKS_URL)
-        _jwks_loaded_at = now
+    """Process-global PyJWKClient for Apple's JWKS endpoint.
+
+    Built ONCE and reused. PyJWT's own JWK-set cache (cache_keys + lifespan)
+    governs refetch — we pass lifespan=_JWKS_TTL_SECONDS so the keys are
+    refreshed ~hourly instead of PyJWT's 300s default (the previous code
+    wrapped a 3600s rebuild around a client whose inner cache was only 300s,
+    so the wrapper TTL was dead intent and Apple was hit ~every 5 min).
+    """
+    global _jwks_client
+    if _jwks_client is None:
+        _jwks_client = PyJWKClient(
+            APPLE_JWKS_URL, cache_keys=True, lifespan=_JWKS_TTL_SECONDS,
+        )
     return _jwks_client
+
+
+def prewarm_apple_jwks() -> None:
+    """Fetch + cache Apple's JWKS so the first Sign-in-with-Apple after a
+    deploy doesn't pay the blocking network fetch. Best-effort, sync — call
+    it off the event loop (asyncio.to_thread) from app startup. The cache is
+    process-local, so every deploy starts cold; this warms it ahead of the
+    first real sign-in.
+    """
+    try:
+        _get_jwks_client().get_signing_keys()
+    except Exception as e:  # network / Apple outage — sign-in still works cold
+        logger.warning("[apple-auth] JWKS prewarm failed: %s", e)
 
 
 def verify_apple_identity_token(identity_token: str, audience: str) -> dict:

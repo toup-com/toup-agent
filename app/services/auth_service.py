@@ -1,5 +1,7 @@
 """Authentication service - JWT token handling and password hashing"""
 
+import asyncio
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 import uuid
@@ -12,17 +14,44 @@ from sqlalchemy import select, func
 from app.config import settings
 from app.db.models import User, Identity
 
+# Marks an account that has no usable password (OAuth / Sign-in-with-Apple
+# users). The "!" prefix is not a valid bcrypt hash, so verify_password
+# always returns False for it — Django uses the same convention. Lets us skip
+# the ~50-100ms of event-loop-blocking bcrypt that hashing a throwaway random
+# secret would cost on every OAuth signup.
+_UNUSABLE_PW_PREFIX = "!"
+
+
+def make_unusable_password() -> str:
+    """Return an unusable password-hash sentinel for accounts that never set a
+    password. Unguessable + unverifiable; costs ~0ms (no bcrypt)."""
+    return _UNUSABLE_PW_PREFIX + secrets.token_urlsafe(32)
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against a hash using bcrypt directly."""
-    return bcrypt.checkpw(
-        plain_password.encode("utf-8"),
-        hashed_password.encode("utf-8"),
-    )
+    """Verify a password against a hash using bcrypt directly.
+
+    CPU-bound (~50-100ms) — offload via asyncio.to_thread when calling from an
+    async path so it doesn't block the single-worker event loop. Returns False
+    (never raises) for the unusable-password sentinel and for any malformed
+    hash, so an OAuth account can't be logged into via /login.
+    """
+    if not hashed_password or hashed_password.startswith(_UNUSABLE_PW_PREFIX):
+        return False
+    try:
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed_password.encode("utf-8"),
+        )
+    except (ValueError, TypeError):
+        return False
 
 
 def get_password_hash(password: str) -> str:
-    """Hash a password using bcrypt directly."""
+    """Hash a password using bcrypt directly.
+
+    CPU-bound (~50-100ms) — offload via asyncio.to_thread from async paths.
+    """
     return bcrypt.hashpw(
         password.encode("utf-8"),
         bcrypt.gensalt(),
@@ -83,7 +112,9 @@ async def authenticate_user(
 
     if not user:
         return None
-    if not verify_password(password, user.hashed_password):
+    # Offload bcrypt off the event loop — on the single worker an inline
+    # checkpw would stall every other concurrent request for ~50-100ms.
+    if not await asyncio.to_thread(verify_password, password, user.hashed_password):
         return None
     return user
 
@@ -91,20 +122,34 @@ async def authenticate_user(
 async def create_user(
     db: AsyncSession,
     email: str,
-    password: str,
-    name: Optional[str] = None
+    password: Optional[str] = None,
+    name: Optional[str] = None,
+    *,
+    email_verified: bool = False,
 ) -> User:
     """Create a new user with default identities.
 
     Email is canonicalised to lowercase before storage so the unique
     constraint on `users.email` actually enforces "one account per
     address" rather than "one per case spelling".
+
+    `password=None` (OAuth / Sign-in-with-Apple) stores an unusable sentinel
+    hash with no bcrypt cost; a real password is hashed off the event loop.
+    `email_verified=True` stamps email_verified_at inside this single
+    transaction so OAuth callers don't pay a separate commit+refresh.
     """
+    hashed = (
+        await asyncio.to_thread(get_password_hash, password)
+        if password
+        else make_unusable_password()
+    )
     user = User(
         email=(email or "").strip().lower(),
-        hashed_password=get_password_hash(password),
+        hashed_password=hashed,
         name=name,
     )
+    if email_verified:
+        user.email_verified_at = datetime.utcnow()
     db.add(user)
     await db.flush()  # Get user.id before creating identities
 
@@ -211,7 +256,7 @@ Your name will be chosen by the user during onboarding — if you don't know you
 
 async def change_user_password(db: AsyncSession, user: User, new_password: str) -> User:
     """Change a user's password and invalidate all existing tokens."""
-    user.hashed_password = get_password_hash(new_password)
+    user.hashed_password = await asyncio.to_thread(get_password_hash, new_password)
     user.password_changed_at = datetime.utcnow()
     await db.commit()
     await db.refresh(user)

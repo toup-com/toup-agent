@@ -418,6 +418,12 @@ _GOOGLE_AUTH_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 # or Drive scopes — sign-in is read-only of the user's identity.
 _GOOGLE_AUTH_SCOPES = "openid email profile"
 
+# In-process cache of the resolved (client_id, client_secret). Avoids a
+# cross-region DB round-trip to provider_app_credentials on every /start and
+# /callback. Short TTL so admin-UI credential rotation takes effect promptly.
+_google_creds_cache: Optional[tuple[float, tuple[str, str]]] = None
+_GOOGLE_CREDS_TTL_SECONDS = 300
+
 
 def _signin_state_secret() -> bytes:
     """Same JWT secret reused for HMAC-signing the sign-in state token.
@@ -527,6 +533,11 @@ async def _google_auth_credentials() -> tuple[str, str]:
     real reason to the operator; sign-in misconfiguration is a
     client/config problem, not a server outage.
     """
+    global _google_creds_cache
+    now = _time.monotonic()
+    if _google_creds_cache and (now - _google_creds_cache[0]) < _GOOGLE_CREDS_TTL_SECONDS:
+        return _google_creds_cache[1]
+
     from app.services.provider_apps import get_provider_app_async
     app_cfg = await get_provider_app_async("google")
     cid = (app_cfg.client_id if app_cfg else "").strip()
@@ -543,6 +554,10 @@ async def _google_auth_credentials() -> tuple[str, str]:
                 "Console project's Authorized Redirect URIs."
             ),
         )
+    # Cache the resolved pair briefly so /start and /callback don't each pay a
+    # cross-region DB round-trip to provider_app_credentials. Short TTL so an
+    # operator rotating the credentials in the admin UI takes effect promptly.
+    _google_creds_cache = (now, (cid, csec))
     return cid, csec
 
 
@@ -675,6 +690,38 @@ def _pick_google_display_name(info: dict, email: str) -> str:
     return local[:64] if local else "User"
 
 
+def _decode_google_id_token(id_token: str, client_id: str) -> Optional[dict]:
+    """Read the OIDC claims (email, email_verified, name…) out of the id_token
+    Google returns in the authorization-code token-exchange response — so we
+    can skip the second sequential round-trip to the userinfo endpoint.
+
+    Signature verification is intentionally skipped: this id_token arrived
+    DIRECTLY from Google's token endpoint over a TLS connection THIS server
+    initiated (server-to-server, not relayed through the browser), so it can't
+    have been tampered with in transit — Google's own OIDC docs say validation
+    is unnecessary in exactly this case. We still sanity-check iss + aud so a
+    misrouted token can't be accepted. Returns None on any problem, and the
+    caller falls back to the userinfo endpoint.
+    """
+    if not id_token:
+        return None
+    try:
+        import jwt as _pyjwt  # PyJWT — distinct from python-jose (`jose`)
+        claims = _pyjwt.decode(
+            id_token,
+            options={"verify_signature": False, "verify_aud": False},
+        )
+    except Exception:
+        return None
+    if (claims.get("iss") or "") not in (
+        "accounts.google.com", "https://accounts.google.com",
+    ):
+        return None
+    if claims.get("aud") != client_id:
+        return None
+    return claims
+
+
 @router.get("/google/callback")
 async def google_auth_callback(
     request: Request,
@@ -776,28 +823,45 @@ async def google_auth_callback(
             )},
         )
 
-    access_token = (tokens or {}).get("access_token", "")
-    if not access_token:
-        return Response(
-            status_code=307,
-            headers={"Location": _dest(
-                token="", is_new=False, redirect=caller_redirect,
-                error="no_access_token",
-            )},
-        )
+    # Prefer the OIDC id_token already in the token response (carries
+    # email/email_verified/name for the openid+email+profile scope) — this
+    # avoids a second sequential round-trip to Google's userinfo endpoint on
+    # every sign-in (~150-400ms). Fall back to userinfo only if the id_token
+    # is absent or unusable.
+    info = _decode_google_id_token((tokens or {}).get("id_token", ""), client_id)
 
-    # Fetch userinfo (email + name).
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            info_resp = await client.get(
-                _GOOGLE_AUTH_USERINFO_URL,
-                headers={"Authorization": f"Bearer {access_token}"},
+    if not info or not info.get("email"):
+        access_token = (tokens or {}).get("access_token", "")
+        if not access_token:
+            return Response(
+                status_code=307,
+                headers={"Location": _dest(
+                    token="", is_new=False, redirect=caller_redirect,
+                    error="no_access_token",
+                )},
             )
-        if info_resp.status_code != 200:
-            logger.warning(
-                "[google-auth] userinfo %d: %s",
-                info_resp.status_code, info_resp.text[:300],
-            )
+        # Fetch userinfo (email + name).
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                info_resp = await client.get(
+                    _GOOGLE_AUTH_USERINFO_URL,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            if info_resp.status_code != 200:
+                logger.warning(
+                    "[google-auth] userinfo %d: %s",
+                    info_resp.status_code, info_resp.text[:300],
+                )
+                return Response(
+                    status_code=307,
+                    headers={"Location": _dest(
+                        token="", is_new=False, redirect=caller_redirect,
+                        error="userinfo_failed",
+                    )},
+                )
+            info = info_resp.json() or {}
+        except Exception:
+            logger.exception("[google-auth] userinfo exception")
             return Response(
                 status_code=307,
                 headers={"Location": _dest(
@@ -805,16 +869,6 @@ async def google_auth_callback(
                     error="userinfo_failed",
                 )},
             )
-        info = info_resp.json() or {}
-    except Exception:
-        logger.exception("[google-auth] userinfo exception")
-        return Response(
-            status_code=307,
-            headers={"Location": _dest(
-                token="", is_new=False, redirect=caller_redirect,
-                error="userinfo_failed",
-            )},
-        )
 
     email = (info.get("email") or "").strip().lower()
     if not email:
@@ -844,23 +898,18 @@ async def google_auth_callback(
             return Response(status_code=307, headers={"Location": _dest(
                 token="", is_new=False, redirect=caller_redirect, error="rate_limited",
             )})
-        # OAuth signup — set a random unguessable password so the user
-        # can never log in via /login until they explicitly set one via
-        # the password-change flow. (`get_password_hash` would otherwise
-        # be called with an empty string which the password verifier
-        # would reject — but defense-in-depth: random secret.)
-        random_password = _secrets.token_urlsafe(48)
+        # OAuth signup — no password is set, so create_user stores an unusable
+        # sentinel hash: the user can never /login until they set one via the
+        # password-change flow, and we skip the ~50-100ms of event-loop-blocking
+        # bcrypt that hashing a throwaway random secret would cost.
+        # Google verified the email → fold the email_verified stamp into
+        # create_user's single commit (the credit-verification gate F13 trusts
+        # this flag) instead of a separate stamp+commit+refresh round-trip.
         user = await create_user(
-            db, email=email, password=random_password, name=display_name,
+            db, email=email, name=display_name, email_verified=email_verified,
         )
         await record_signup(oauth_ip)
         is_new = True
-        # Google verified the email → stamp it. The credit-verification
-        # gate (F13) trusts this flag for charge eligibility.
-        if email_verified:
-            user.email_verified_at = datetime.utcnow()
-            await db.commit()
-            await db.refresh(user)
         # Fire the (possibly deferred) one-time free grant — provider-
         # verified, so no extra step for the user. No-op when the grant
         # already fired at create_user (require_verified_email_for_grant off).
@@ -1030,13 +1079,17 @@ async def apple_auth(
 ):
     """Sign in with Apple. Verify Apple's identity token, link/create the
     user by email, return a Toup JWT (Guideline 4.8)."""
-    import secrets as _secrets
     from app.services.apple_auth import (
         verify_apple_identity_token, AppleTokenError,
     )
 
     try:
-        claims = verify_apple_identity_token(
+        # Offload to a thread: verify does a blocking urllib JWKS fetch on a
+        # cache miss (first sign-in after a deploy, then ~hourly). On the
+        # single uvicorn worker an inline fetch would freeze EVERY concurrent
+        # request, not just this one. RS256 verify itself is sub-ms.
+        claims = await asyncio.to_thread(
+            verify_apple_identity_token,
             body.identity_token, settings.apple_client_id,
         )
     except AppleTokenError as e:
@@ -1097,9 +1150,10 @@ async def apple_auth(
                 detail=f"Too many signups from this network. Try again in {ra} seconds.",
                 headers={"Retry-After": str(ra)},
             )
-        # OAuth signup — random unguessable password (no /login until the
-        # user sets one via password-change). Mirrors the Google path.
-        random_password = _secrets.token_urlsafe(48)
+        # OAuth signup — no password is set, so create_user stores an unusable
+        # sentinel hash (the user can't /login until they set one via
+        # password-change) instead of paying ~50-100ms of event-loop-blocking
+        # bcrypt to hash a throwaway secret. Mirrors the Google path.
         # Apple sends `fullName` ONLY on the very first authorization for an
         # (Apple ID, app) pair; every later sign-in — and any signup after a
         # prior failed/reset attempt (e.g. the pre-PLA-acceptance failures) —
@@ -1113,18 +1167,16 @@ async def apple_auth(
         if not _apple_name:
             _local = (email or "").split("@", 1)[0].strip()
             _apple_name = _local[:64] if _local else "User"
+        # email_verified is folded into create_user's single commit — no
+        # separate stamp+commit+refresh round-trip on the sign-in path.
         user = await create_user(
-            db, email=email, password=random_password, name=_apple_name,
+            db, email=email, name=_apple_name, email_verified=email_verified,
         )
         await record_signup(apple_ip)
         is_new = True
         if apple_sub:
             user.apple_sub = apple_sub
             await db.commit()
-        if email_verified:
-            user.email_verified_at = datetime.utcnow()
-            await db.commit()
-            await db.refresh(user)
         # Fire the (possibly deferred) one-time free grant — Apple-verified,
         # zero extra step. No-op when the grant already fired at create_user.
         try:
@@ -1332,7 +1384,9 @@ async def change_password(
     db: AsyncSession = Depends(get_db),
 ):
     """Change own password. Requires current password. Returns new token."""
-    if not verify_password(body.current_password, current_user.hashed_password):
+    if not await asyncio.to_thread(
+        verify_password, body.current_password, current_user.hashed_password
+    ):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
 
     await change_user_password(db, current_user, body.new_password)
