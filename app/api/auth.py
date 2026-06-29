@@ -741,6 +741,7 @@ async def google_auth_callback(
     500 or a JSON blob the user can't read.
     """
     import httpx
+    _t0 = _time.perf_counter()
 
     # Pick the redirect target (web SPA vs toup:// deep link) up front so
     # even the pre-verification error branches bounce back to the right
@@ -963,6 +964,7 @@ async def google_auth_callback(
 
     # Issue a Toup JWT. Same path as the /login endpoint — record the
     # session so the per-device "Sign out" UI sees this login.
+    _t_work = _time.perf_counter()
     jwt_token = create_access_token(user.id)
     try:
         await record_login_session(db, user.id, jwt_token, request)
@@ -970,6 +972,12 @@ async def google_auth_callback(
         # Session-tracker is non-critical for the auth flow — log and
         # continue. The user can still log out via password change.
         logger.exception("[google-auth] record_login_session failed")
+    logger.warning(
+        "[google-timing] work=%.0f session=%.0f handler=%.0f new=%s",
+        (_t_work - _t0) * 1000,
+        (_time.perf_counter() - _t_work) * 1000,
+        (_time.perf_counter() - _t0) * 1000, is_new,
+    )
 
     # Set the SSO cookie too, matching the /login + /register UX so
     # cross-subdomain navigation stays authenticated without the
@@ -1083,6 +1091,7 @@ async def apple_auth(
         verify_apple_identity_token, AppleTokenError,
     )
 
+    _t0 = _time.perf_counter()
     try:
         # Offload to a thread: verify does a blocking urllib JWKS fetch on a
         # cache miss (first sign-in after a deploy, then ~hourly). On the
@@ -1095,6 +1104,13 @@ async def apple_auth(
     except AppleTokenError as e:
         logger.warning("[apple-auth] token verification failed: %s", e)
         raise HTTPException(status_code=401, detail="Apple sign-in verification failed.")
+    _t_verify = _time.perf_counter()
+    # INSTRUMENTATION ONLY: force a connection checkout before the real lookups
+    # so `conn` isolates pool-wait (waiting for a free DB connection under load)
+    # from query latency. ~1 cross-region RTT when the pool is uncontended.
+    from sqlalchemy import text as _sqltext
+    await db.execute(_sqltext("SELECT 1"))
+    _t_conn = _time.perf_counter()
 
     # Apple includes the email in the identity token when the user grants
     # it (a private-relay address for Hide-My-Email); fall back to the
@@ -1119,6 +1135,7 @@ async def apple_auth(
             select(_User).where(_User.apple_sub == apple_sub)
         )).scalar_one_or_none()
     email_match = await get_user_by_email(db, email)
+    _t_lookup = _time.perf_counter()
     dedupe_on = getattr(settings, "apple_sub_dedupe_enabled", False)
     if dedupe_on and sub_match is not None:
         existing = sub_match
@@ -1223,11 +1240,19 @@ async def apple_auth(
     if body.authorization_code:
         _spawn_background(_bg_apple_refresh_capture(str(user.id), body.authorization_code))
 
+    _t_branch = _time.perf_counter()
     token = create_access_token(user.id)
     try:
         await record_login_session(db, user.id, token, request)
     except Exception:
         logger.exception("[apple-auth] record_login_session failed")
+    _t_session = _time.perf_counter()
+    logger.warning(
+        "[apple-timing] verify=%.0f conn=%.0f lookup=%.0f branch=%.0f session=%.0f handler=%.0f new=%s",
+        (_t_verify - _t0) * 1000, (_t_conn - _t_verify) * 1000,
+        (_t_lookup - _t_conn) * 1000, (_t_branch - _t_lookup) * 1000,
+        (_t_session - _t_branch) * 1000, (_t_session - _t0) * 1000, is_new,
+    )
 
     response.set_cookie(
         key=SSO_COOKIE_NAME, value=token, domain=SSO_COOKIE_DOMAIN,
