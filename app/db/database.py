@@ -310,6 +310,15 @@ async def init_db():
         # → "Connection lost") against its pre-mig tenant DB. Mirror it here so
         # every agent boot/recycle self-heals.
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_refresh_token TEXT",
+        # Mig 068 (Sign-in-with-Apple STABLE-sub dedupe). Same self-heal reason
+        # as apple_refresh_token above: an agent rolled to a build whose User
+        # model has `apple_sub` 500s on EVERY User query (get_user_by_id →
+        # ws/chat 1006 → "Connection lost") against its pre-mig tenant DB until
+        # this ALTER runs. The 2026-06-29 incident: brand-new users couldn't chat
+        # because this line was missing when apple_sub was added — the agent
+        # crashed on the first message. (The unique index is a platform dedup
+        # concern; the column alone satisfies the agent's ORM SELECTs.)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_sub VARCHAR(255)",
         # ── Agent configs ──
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_mode VARCHAR(20) DEFAULT 'manual'",
         # Mig 057 (onboarding-v2 PR 2) — backfill column preserves the
