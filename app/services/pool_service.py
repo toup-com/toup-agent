@@ -158,7 +158,31 @@ async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedCont
         logger.info("[pool_service] use_container_pool=False — skipping claim")
         return None
 
-    # Existing container check — same idempotency the slow path has.
+    # Serialize concurrent claims for the SAME user. Two near-simultaneous
+    # claims (e.g. a ws/chat connect that finds no active agent firing within
+    # seconds of a background signup-finalize) would BOTH read existing=None
+    # below and BOTH call the bridge /v1/pool/claim — binding two pool
+    # containers with DIFFERENT agent keys. Only one survives the
+    # managed_containers.user_id unique constraint at commit, leaving the
+    # subdomain routed to one container while the DB stores the other's key, so
+    # every chat 4001s "Authentication required" (the 2026-06-30 incident). A
+    # txn-scoped advisory lock makes the loser BLOCK until the winner commits;
+    # it then sees the winner's container via the existing-check below and
+    # returns it WITHOUT a second bind. xact-scoped → auto-released on
+    # commit/rollback, safe under the :6543 transaction pooler. The open txn
+    # already spans the bridge call today, so this adds no new connection hold.
+    # Postgres-only; sqlite test paths never reach here (use_container_pool off).
+    from app.db.database import get_engine as _get_engine
+    if _get_engine().dialect.name == "postgresql":
+        from sqlalchemy import text as _text
+        await db.execute(
+            _text("SELECT pg_advisory_xact_lock(hashtext(:k)::bigint)"),
+            {"k": f"pool_claim:{user_id}"},
+        )
+
+    # Existing container check — same idempotency the slow path has. Re-read
+    # AFTER the lock so a loser that just blocked sees the winner's freshly
+    # committed row and returns it instead of double-binding.
     existing = (await db.execute(
         select(ManagedContainer).where(ManagedContainer.user_id == user_id)
     )).scalar_one_or_none()
