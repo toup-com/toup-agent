@@ -354,8 +354,13 @@ async def _sync_soul_to_vps(
 
 class SoulSyncRequest(BaseModel):
     user_id: str
-    name: str
-    compiled_text: str
+    # name/compiled_text are OPTIONAL so the platform can push an owner-only
+    # identity sync (owner_name/owner_email) for a freshly provisioned
+    # container that has no SoulConfig yet, WITHOUT carrying — and thereby
+    # wiping — the agent's existing/default soul. When both are None the soul
+    # upsert in the handler is skipped.
+    name: Optional[str] = None
+    compiled_text: Optional[str] = None
     deactivate_agent_soul_memories: bool = False
     agent_config_updates: Optional[dict] = None
     # Owner identity — the human's real (Gmail) name/email. Threaded so a
@@ -385,31 +390,36 @@ async def sync_soul(
     if not settings.agent_api_key or agent_key != settings.agent_api_key:
         raise HTTPException(401, "Invalid agent key")
 
-    # 1. Upsert Identity(type='soul') in the agent's local DB
-    id_result = await db.execute(
-        select(Identity).where(
-            and_(
-                Identity.user_id == req.user_id,
-                Identity.identity_type == "soul",
+    # 1. Upsert Identity(type='soul') in the agent's local DB — ONLY when soul
+    #    content is actually provided. An owner-only sync (a freshly
+    #    provisioned container that has no SoulConfig yet) sends
+    #    name/compiled_text=None and MUST NOT wipe the agent's existing/default
+    #    soul; it only carries owner_name/owner_email for the User upsert below.
+    if req.compiled_text is not None and req.name is not None:
+        id_result = await db.execute(
+            select(Identity).where(
+                and_(
+                    Identity.user_id == req.user_id,
+                    Identity.identity_type == "soul",
+                )
             )
         )
-    )
-    identity = id_result.scalar_one_or_none()
+        identity = id_result.scalar_one_or_none()
 
-    if identity:
-        identity.content = req.compiled_text
-        identity.name = f"{req.name} Soul"
-        identity.updated_at = datetime.utcnow()
-    else:
-        identity = Identity(
-            user_id=req.user_id,
-            identity_type="soul",
-            name=f"{req.name} Soul",
-            content=req.compiled_text,
-            priority=100,
-            is_active=True,
-        )
-        db.add(identity)
+        if identity:
+            identity.content = req.compiled_text
+            identity.name = f"{req.name} Soul"
+            identity.updated_at = datetime.utcnow()
+        else:
+            identity = Identity(
+                user_id=req.user_id,
+                identity_type="soul",
+                name=f"{req.name} Soul",
+                content=req.compiled_text,
+                priority=100,
+                is_active=True,
+            )
+            db.add(identity)
 
     # 2. Deactivate old agent_soul memories (prevents conflict with Soul config)
     memories_deactivated = 0
@@ -509,5 +519,8 @@ async def sync_soul(
             logger.warning(f"[SOUL] Failed to upsert owner User row on VPS: {e}")
 
     await db.commit()
-    logger.info(f"[SOUL] Synced soul identity for user {req.user_id}: {req.name}")
+    logger.info(
+        f"[SOUL] Synced for user {req.user_id}: "
+        f"{req.name if req.name is not None else '(owner-only)'}"
+    )
     return {"status": "ok", "memories_deactivated": memories_deactivated}

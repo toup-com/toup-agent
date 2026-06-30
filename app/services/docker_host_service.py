@@ -1169,15 +1169,13 @@ async def _sync_soul_after_start(
             if soul:
                 break
             await asyncio.sleep(3)
-        if not soul:
-            logger.warning(
-                "[SOUL] no SoulConfig after retries for %s — skipping identity sync",
-                user_id[:8],
-            )
-            return
-        # Owner identity — pushed alongside the soul so a recreated container
-        # (whose env body omits user_name) doesn't regress to the "Agent Owner"
-        # stub greeting. Captured as plain strings before the session closes.
+
+        # Owner identity — pushed REGARDLESS of whether a SoulConfig exists yet.
+        # A freshly (re)provisioned container boots with a stub
+        # User(name="Agent Owner"); coupling this push to the Soul step meant any
+        # agent reached before onboarding (or whose container was rebuilt
+        # mid-onboarding) greeted "Agent Owner" forever. Captured as plain
+        # strings before the session closes.
         try:
             from app.db.models import User as _User
             async with async_session_maker() as db:
@@ -1189,25 +1187,43 @@ async def _sync_soul_after_start(
         except Exception:
             _owner_name = _owner_email = None
 
+        if not soul and not (_owner_name or _owner_email):
+            logger.warning(
+                "[SOUL] no SoulConfig and no owner identity for %s — skipping sync",
+                user_id[:8],
+            )
+            return
+
+        # When the soul isn't ready yet, send an OWNER-ONLY sync: name and
+        # compiled_text are omitted (the agent skips the soul upsert and keeps
+        # its existing/default soul) but the owner name still lands, so the
+        # agent stops greeting "Agent Owner". The full soul lands on the
+        # user-initiated soul-save path (soul.py:_sync_soul_to_vps) at onboarding.
+        _body = {
+            "user_id": user_id,
+            "name": soul.name if soul else None,
+            "compiled_text": soul.compiled_text if soul else None,
+            "deactivate_agent_soul_memories": False,
+            "owner_name": _owner_name,
+            "owner_email": _owner_email,
+        }
+        if soul:
+            _body["agent_config_updates"] = {
+                "agent_name": soul.name,
+                "agent_color": soul.color,
+            }
+
         async with _httpx.AsyncClient(timeout=15) as client:
             resp = await client.put(
                 f"{agent_url}/api/soul/sync",
-                json={
-                    "user_id": user_id,
-                    "name": soul.name,
-                    "compiled_text": soul.compiled_text,
-                    "deactivate_agent_soul_memories": False,
-                    "agent_config_updates": {
-                        "agent_name": soul.name,
-                        "agent_color": soul.color,
-                    },
-                    "owner_name": _owner_name,
-                    "owner_email": _owner_email,
-                },
+                json=_body,
                 headers={"X-Agent-Key": agent_api_key},
             )
             if resp.status_code == 200:
-                logger.info("[SOUL] synced for %s", user_id[:8])
+                logger.info(
+                    "[SOUL] synced for %s (%s)",
+                    user_id[:8], "soul+owner" if soul else "owner-only",
+                )
             else:
                 logger.warning("[SOUL] sync failed for %s: %s", user_id[:8], resp.status_code)
     except Exception as e:
