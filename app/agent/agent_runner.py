@@ -2078,6 +2078,13 @@ class AgentRunner:
             "The whole point of you is: the user says what they want, you make it happen."
         )
 
+        # Who owns/founded Toup — a static company fact appended to the
+        # always-on platform map so every agent can answer "who's behind
+        # Toup?" (only when asked). Distinct from identity_anchor's "who
+        # built YOU" (the agent) — see app/agent/toup_facts.py.
+        from app.agent.toup_facts import OWNER_GLOBAL_FACT
+        section_parts["platform_knowledge"] += "\n\n" + OWNER_GLOBAL_FACT
+
         # ── 1d. Self-knowledge — how YOUR memory actually works ──────
         # F7 (2026-05-08): pre-F7 the agent had no integrated picture of
         # its memory system in the prompt. When a user asked "how does
@@ -2661,6 +2668,19 @@ class AgentRunner:
             "Don't announce the time of day; just feel it."
         )
         section_parts["about_you"] = "\n".join(_about_lines)
+
+        # ── 6b. Founder recognition — only on the OWNER's own agent ────
+        # When the bound user is a Toup founder (settings.founder_emails),
+        # inject a block that makes their agent treat them as the principal
+        # rather than a customer. Gated on the per-tenant User.email, which
+        # the platform syncs in via the owner-push; if a brand-new pool
+        # container hasn't been synced yet the email is a stub and the block
+        # simply doesn't load (graceful — this is an enhancement, not a
+        # security gate). The section key is registered in prompt_profile
+        # _FULL_SECTIONS so the assembly filter keeps it.
+        from app.agent.toup_facts import is_founder_email, founder_recognition_block
+        if is_founder_email(getattr(_user_row, "email", None) if _user_row else None):
+            section_parts["owner_recognition"] = founder_recognition_block()
 
         # Per-channel formatting guidance. Hardcoded table today; channel_config
         # wire-up is a follow-up (TODO(time-channel-fix followup)). Keep values

@@ -61,6 +61,7 @@ def test_full_profile_has_every_historic_section():
         "self_knowledge",
         "platform_knowledge",
         "about_you",
+        "owner_recognition",
         "user_brain",
         "active_tasks",
         "agent_brain",

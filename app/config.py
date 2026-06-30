@@ -317,6 +317,16 @@ class Settings(BaseSettings):
     # this flag only controls whether the sub LOOKUP precedes email lookup.
     apple_sub_dedupe_enabled: bool = False
 
+    # ── Founder / company-owner identity ──
+    # Emails of Toup's owner(s). Drives the per-account "you're talking to
+    # the founder" recognition block in the agent system prompt
+    # (agent_runner._build_system_prompt → owner_recognition section). The
+    # static company fact ("Toup was founded by …") lives in
+    # app/agent/toup_facts.py; this list only gates the richer block to the
+    # owner's OWN agent. Compared case-insensitively against the bound
+    # user's email. NOT a security boundary — purely a prompt enhancement.
+    founder_emails: list[str] = ["mrhx@toup.ai"]
+
     # Day recall (recall_day tool + end-of-day archival summaries)
     enable_day_recall: bool = False  # When true, exposes recall_day tool + runs hourly archival job
 

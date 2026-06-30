@@ -76,6 +76,7 @@ _FULL_SECTIONS: tuple[str, ...] = (
     "self_knowledge",    # HOW your memory works (F7)
     "platform_knowledge",  # WHAT Toup is — pages, capabilities
     "about_you",         # User's name + local time-of-day
+    "owner_recognition", # Founder-only: this user owns Toup (gated)
     "user_brain",        # WHO the user is
     "active_tasks",      # CONTINUITY — open threads
     "agent_brain",       # Agent brain (env-flag gated)
