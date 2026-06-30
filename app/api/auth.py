@@ -1135,12 +1135,27 @@ async def apple_auth(
     # in shadow mode before the flag is enabled.
     from app.db.models import User as _User
     from app.services.abuse_metrics import emit as _abuse_emit, uidp as _abuse_uidp
-    sub_match = None
+    from sqlalchemy import or_ as _or, func as _func
+    # ONE round-trip for BOTH the stable-sub match and the email match (was two
+    # sequential SELECTs). The app (us-east-1) and DB (us-west-2) are in
+    # different regions, so every round-trip costs ~0.6-0.8s — folding the
+    # apple_sub lookup and the email lookup into a single OR-query shaves a full
+    # round-trip off every Sign-in-with-Apple. Disambiguated in Python below so
+    # the sub-vs-email dedupe semantics are byte-for-byte identical to the two
+    # separate queries (`email` is already lower-cased above; stored emails are
+    # lower-cased at create_user, so the func.lower compare matches both ways).
+    _conds = [_func.lower(_User.email) == email]
     if apple_sub:
-        sub_match = (await db.execute(
-            select(_User).where(_User.apple_sub == apple_sub)
-        )).scalar_one_or_none()
-    email_match = await get_user_by_email(db, email)
+        _conds.append(_User.apple_sub == apple_sub)
+    _candidates = (await db.execute(
+        select(_User).where(_or(*_conds))
+    )).scalars().all()
+    sub_match = next(
+        (u for u in _candidates if u.apple_sub == apple_sub), None
+    ) if apple_sub else None
+    email_match = next(
+        (u for u in _candidates if (u.email or "").lower() == email), None
+    )
     dedupe_on = getattr(settings, "apple_sub_dedupe_enabled", False)
     if dedupe_on and sub_match is not None:
         existing = sub_match
