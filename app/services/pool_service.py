@@ -63,12 +63,33 @@ async def _build_bind_payload(
     bridge's /admin/bind contract — see backend/app/api/admin_pool.py
     `_BIND_FIELDS`."""
     prefix = user_id[:8]
-    # Generate the per-tenant agent_api_key here. The bridge would
-    # do this in the slow path; for the pool path the platform owns
-    # generation so the key lands in our DB BEFORE the bind succeeds.
-    # If claim fails after this, the key is harmless (bridge never
-    # gets it).
-    agent_api_key = agent_config.agent_api_key or secrets.token_urlsafe(48)
+    # Per-tenant agent_api_key — STABLE across concurrent claims via an atomic
+    # compare-and-set. The browser's chat WebSocket authenticates with an HS256
+    # JWT signed with this key (ws_chat._validate_session_token); the agent
+    # verifies with its bound copy. If two near-simultaneous claims each read
+    # agent_api_key=NULL and minted a DIFFERENT random key, the platform DB kept
+    # one while Caddy could route to the container bound with the other — the JWT
+    # then fails signature verification on the routed agent and EVERY chat 401s
+    # "Authentication required" (the 2026-06-30 + 2026-07-01 double-bind incidents;
+    # the txn-scoped advisory lock above was meant to prevent it but doesn't hold
+    # reliably across every bind path under the :6543 pooler). The CAS below wins
+    # at the DB row-lock level with no advisory-lock/pooler caveats: exactly one
+    # racer sets the key (WHERE agent_api_key IS NULL), and both re-read the SAME
+    # winning value, so every claim for this user carries an identical key and the
+    # routed container can always verify the session JWT. Idempotent once set.
+    agent_api_key = agent_config.agent_api_key
+    if not agent_api_key:
+        from sqlalchemy import update as _sa_update
+        candidate = secrets.token_urlsafe(48)
+        await db.execute(
+            _sa_update(AgentConfig)
+            .where(AgentConfig.user_id == user_id, AgentConfig.agent_api_key.is_(None))
+            .values(agent_api_key=candidate)
+        )
+        agent_api_key = (await db.execute(
+            select(AgentConfig.agent_api_key).where(AgentConfig.user_id == user_id)
+        )).scalar_one()
+        agent_config.agent_api_key = agent_api_key
 
     # Image tag for the bridge's refill spawn after this claim. Use the
     # last successful rollout's SHA — same source the slow provision path
