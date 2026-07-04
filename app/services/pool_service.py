@@ -596,6 +596,13 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
 # never mass-provision containers for years-old abandoned accounts.
 RECLAIM_FRESH_SIGNUP_WINDOW_DAYS = 30
 
+# How stale a status='provisioning' row must be before the backstop treats it
+# as dead rather than in-flight. schedule_prewarm marks 'provisioning' BEFORE
+# its bridge call; a platform redeploy mid-flight strands the row there, and
+# claim_for_user's existing-row check then short-circuits EVERY later claim
+# for that user — a permanent dead-end unless something unsticks it.
+RECLAIM_PROVISIONING_STALE_MIN = 15
+
 
 async def _stranded_user_ids(db: AsyncSession, limit: int = 15) -> list[str]:
     """Active users whose agent container is missing or pool-orphaned.
@@ -609,21 +616,30 @@ async def _stranded_user_ids(db: AsyncSession, limit: int = 15) -> list[str]:
       * Managed-config users with a pool-bound row knocked out of
         status='running' — the rollout whois-404 quarantine (fixed in
         rollout_service._running_tenants; damaged rows persist).
-      * FRESH signups (≤30 days) whose finalize died so early the config
-        was never created or never primed off the 'self-hosted' schema
-        default (Apple signup 8dwm74…@privaterelay). Guarded: real
-        self-hosters (ssh_host set) and hosting_mode='local' users are
-        never matched, and this class requires NO container row at all.
+      * FRESH signups (≤30 days) stranded in ANY dead-end shape: config
+        never created / never primed off the 'self-hosted' schema default
+        (Apple signup 8dwm74…@privaterelay), a row in a terminal
+        non-running state (error / orphan / stopped — a schedule_prewarm
+        fallback that died leaves these, NAMED name included), or a row
+        stuck in 'provisioning' past the stale window (the legacy
+        reconcile_stuck_provisioning re-fire demonstrably never reached
+        the bridge for days). Guarded: real self-hosters (ssh_host set)
+        and hosting_mode='local' users are never matched.
 
-    Named (non-pool) containers in orphan/error states are deliberately
+    OLD named (non-pool) containers in orphan/error states are deliberately
     NOT matched — re-homing a heavy-state named tenant is an operator
-    decision (see the c47c5b4b recovery runbook).
+    decision (see the c47c5b4b recovery runbook). A ≤30-day signup has no
+    heavy state, so adopting it onto a pool slot is strictly better than
+    leaving it dead.
     """
     from datetime import timedelta
     from sqlalchemy import and_, or_
     from app.db.models import User
 
     fresh_cutoff = datetime.utcnow() - timedelta(days=RECLAIM_FRESH_SIGNUP_WINDOW_DAYS)
+    provisioning_stale_cutoff = datetime.utcnow() - timedelta(
+        minutes=RECLAIM_PROVISIONING_STALE_MIN
+    )
     config_default_unprimed = and_(
         or_(
             AgentConfig.hosting_mode.is_(None),
@@ -652,13 +668,39 @@ async def _stranded_user_ids(db: AsyncSession, limit: int = 15) -> list[str]:
                         ),
                     ),
                 ),
-                # Fresh signups whose finalize died before the config was
-                # created/primed: adopt them (config will be created and
-                # primed managed by reclaim, mirroring the signup path).
+                # Fresh signups stranded in any dead-end shape: adopt them
+                # (config is created and primed managed by reclaim,
+                # mirroring the signup path). Real self-hosters and 'local'
+                # are excluded by the config guard on the no-row class and
+                # by hosting_mode on the row classes below.
                 and_(
                     User.created_at >= fresh_cutoff,
-                    ManagedContainer.id.is_(None),
-                    or_(AgentConfig.user_id.is_(None), config_default_unprimed),
+                    or_(
+                        # finalize died before config prime, no row ever
+                        and_(
+                            ManagedContainer.id.is_(None),
+                            or_(AgentConfig.user_id.is_(None), config_default_unprimed),
+                        ),
+                        # a row in a terminal non-running state (named OR
+                        # pool — error/orphan/stopped): provisioning died
+                        and_(
+                            ManagedContainer.status.notin_(("running", "provisioning")),
+                            or_(
+                                AgentConfig.hosting_mode == "managed",
+                                config_default_unprimed,
+                            ),
+                        ),
+                        # stuck in 'provisioning' past the stale window
+                        and_(
+                            ManagedContainer.status == "provisioning",
+                            ManagedContainer.updated_at.isnot(None),
+                            ManagedContainer.updated_at < provisioning_stale_cutoff,
+                            or_(
+                                AgentConfig.hosting_mode == "managed",
+                                config_default_unprimed,
+                            ),
+                        ),
+                    ),
                 ),
             ),
         )
@@ -714,7 +756,30 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
                         dirty = True
                     if dirty:
                         await udb.commit()
-                    # Step 2: the claim (activation happens inside).
+                    # Step 2: unstick a stale 'provisioning' row. schedule_prewarm
+                    # stamps 'provisioning' before its bridge call; if that task
+                    # died (redeploy), the row wedges there forever and
+                    # claim_for_user's existing-row check short-circuits every
+                    # subsequent claim. Flip stale ones to 'error' so the claim
+                    # below proceeds; genuinely in-flight rows are skipped (the
+                    # predicate only surfaces them past the stale window, but
+                    # re-check here in case provisioning restarted meanwhile).
+                    from datetime import timedelta as _td
+                    mc = (await udb.execute(
+                        select(ManagedContainer).where(ManagedContainer.user_id == uid)
+                    )).scalar_one_or_none()
+                    if mc and mc.status == "provisioning":
+                        stale = (
+                            mc.updated_at is not None
+                            and mc.updated_at
+                            < datetime.utcnow() - _td(minutes=RECLAIM_PROVISIONING_STALE_MIN)
+                        )
+                        if not stale:
+                            continue  # in-flight — let it finish
+                        mc.status = "error"
+                        mc.error_message = "[pool-reclaim] unstuck stale provisioning"
+                        await udb.commit()
+                    # Step 3: the claim (activation happens inside).
                     c = await claim_for_user(udb, uid)
                 if c is not None:
                     summary["claimed"] += 1
