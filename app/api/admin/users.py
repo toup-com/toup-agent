@@ -1555,3 +1555,79 @@ def _invite_to_response(invite: Invite) -> InviteResponse:
         created_at=invite.created_at,
         invite_url=f"{INVITE_BASE_URL}/{invite.token}",
     )
+
+
+# ─── Duplicate-account detection (bulletproof plan J, detection-only) ──
+#
+# One person with two accounts invalidates container-level diagnosis (law
+# 5: the 2026-07-04 incident burned hours debugging a healthy agent while
+# the user's app was logged into her OTHER account). This endpoint gives
+# support/ops the probable-duplicate sets up front. Detection only — no
+# auto-merge; merging accounts is an operator decision.
+
+def _email_key(email: str) -> str:
+    """Normalize an email to its dedupe key: local part, lowercased,
+    dots/plus-suffix stripped, domain ignored (gmail/icloud variants of
+    the same person differ exactly this way)."""
+    local = (email or "").split("@", 1)[0].lower()
+    local = local.split("+", 1)[0].replace(".", "")
+    return local
+
+
+@router.get("/users/duplicates")
+async def list_probable_duplicate_accounts(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Groups of accounts that likely belong to one person. Grouped by
+    (a) identical apple_sub, (b) normalized email local-part, (c)
+    normalized full name. Returns newest-first inside each group so the
+    canonical (usually oldest) account is last."""
+    rows = (await db.execute(
+        select(User.id, User.email, User.name, User.apple_sub,
+               User.created_at, User.is_active)
+    )).all()
+
+    def _add(groups: dict, key: str, row) -> None:
+        if key:
+            groups.setdefault(key, []).append(row)
+
+    by_apple: dict = {}
+    by_email: dict = {}
+    by_name: dict = {}
+    for r in rows:
+        _add(by_apple, r.apple_sub or "", r)
+        _add(by_email, _email_key(r.email), r)
+        _add(by_name, " ".join((r.name or "").lower().split()), r)
+
+    def _emit(groups: dict, kind: str) -> list:
+        out = []
+        for key, members in groups.items():
+            if len(members) < 2:
+                continue
+            out.append({
+                "kind": kind,
+                "key": key,
+                "accounts": [
+                    {
+                        "id": str(m.id),
+                        "email": m.email,
+                        "name": m.name,
+                        "created_at": str(m.created_at),
+                        "is_active": m.is_active,
+                    }
+                    for m in sorted(members, key=lambda x: x.created_at or datetime.min,
+                                    reverse=True)
+                ],
+            })
+        return out
+
+    groups = _emit(by_apple, "apple_sub") + _emit(by_email, "email_local_part")
+    # Name collisions are the noisiest signal — only report a name group
+    # when it isn't already fully covered by an email/apple group.
+    covered = {frozenset(a["id"] for a in g["accounts"]) for g in groups}
+    for g in _emit(by_name, "full_name"):
+        if frozenset(a["id"] for a in g["accounts"]) not in covered:
+            groups.append(g)
+
+    return {"groups": groups, "count": len(groups)}

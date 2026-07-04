@@ -44,6 +44,10 @@ async def _seed(db, *, hosting="managed", ssh_host=None, active=True,
     if created_at is not None:
         u.created_at = created_at
     db.add(u)
+    # PG enforces FKs at flush; SQLAlchemy only orders inserts via
+    # relationship(), which these models don't declare — flush the user
+    # row before adding its dependents.
+    await db.flush()
     if config:
         db.add(AgentConfig(user_id=uid, hosting_mode=hosting, ssh_host=ssh_host))
     if container is not None:

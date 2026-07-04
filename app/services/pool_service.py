@@ -778,8 +778,13 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
     summary: dict = {"candidates": 0, "claimed": 0, "failed": 0}
     try:
         from app.db.database import async_session_maker
+        # Window is deliberately much larger than max_per_tick: enumeration
+        # is newest-first, so with a small window a cluster of permanently-
+        # failing fresh signups could starve older stranded users forever.
+        # 60 candidates + shuffle means starvation needs >60 simultaneously
+        # ever-failing users — at which point the failure alerts fire anyway.
         async with async_session_maker() as db:
-            candidates = await _stranded_user_ids(db, limit=max_per_tick * 3)
+            candidates = await _stranded_user_ids(db, limit=60)
         summary["candidates"] = len(candidates)
         # NO early return on empty — phase 2 (the keyless-agent sweep below)
         # must run EVERY tick regardless. The original `return summary` here
@@ -999,7 +1004,7 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
     try:
         healed = {
             k: v for k, v in summary.items()
-            if k in ("claimed", "rebound", "restarted", "keyless", "sick") and v
+            if k in ("claimed", "rebound", "restarted", "keyless", "sick", "failed") and v
         }
         if healed:
             from app.services.alerting import send_infra_alert

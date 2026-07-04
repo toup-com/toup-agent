@@ -26,6 +26,9 @@ async def _seed(uid: str) -> None:
     from app.db.models import User, AgentConfig
     async with async_session_maker() as db:
         db.add(User(id=uid, email=f"{uid[:8]}@t.local", hashed_password="", name="T"))
+        # PG enforces the users FK at flush; SQLAlchemy only orders
+        # inserts via relationship(), which these models don't declare.
+        await db.flush()
         db.add(AgentConfig(user_id=uid))
         await db.commit()
 

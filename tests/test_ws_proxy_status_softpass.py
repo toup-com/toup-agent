@@ -26,6 +26,9 @@ async def _seed_cfg(status):
     uid = str(uuid.uuid4())
     async with async_session_maker() as db:
         db.add(User(id=uid, email=f"{uid[:8]}@t.local", hashed_password="", name="T"))
+        # PG enforces the users FK at flush; SQLAlchemy only orders
+        # inserts via relationship(), which these models don't declare.
+        await db.flush()
         await db.commit()
         db.add(AgentConfig(user_id=uid, hosting_mode="managed",
                            agent_url=f"https://agent-{uid[:8]}.agents.toup.ai",
@@ -54,6 +57,9 @@ async def test_missing_key_still_blocks():
     uid = str(uuid.uuid4())
     async with async_session_maker() as db:
         db.add(User(id=uid, email=f"{uid[:8]}@t.local", hashed_password="", name="T"))
+        # PG enforces the users FK at flush; SQLAlchemy only orders
+        # inserts via relationship(), which these models don't declare.
+        await db.flush()
         await db.commit()
         db.add(AgentConfig(user_id=uid, hosting_mode="managed",
                            agent_url=f"https://agent-{uid[:8]}.agents.toup.ai",
