@@ -744,8 +744,11 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
         async with async_session_maker() as db:
             candidates = await _stranded_user_ids(db, limit=max_per_tick * 3)
         summary["candidates"] = len(candidates)
-        if not candidates:
-            return summary
+        # NO early return on empty — phase 2 (the keyless-agent sweep below)
+        # must run EVERY tick regardless. The original `return summary` here
+        # made phase 2 unreachable in the steady state (zero stranded users
+        # is the NORMAL condition), which left the 2026-07-04 keyless agents
+        # broken while this function reported all-quiet.
         # Shuffle so a persistently-failing user can't starve the rest of
         # the backlog (enumeration is newest-first within the window).
         import random

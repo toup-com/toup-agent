@@ -169,3 +169,47 @@ async def _run_seed(**kw):
     from app.db import async_session_maker
     async with async_session_maker() as db:
         return await _seed(db, **kw)
+
+
+@pytest.mark.asyncio
+async def test_keyless_sweep_runs_with_zero_stranded_candidates(monkeypatch):
+    """Steady state (no stranded users) must NOT short-circuit the keyless
+    sweep — the original early-return did, leaving restart-keyless agents
+    broken forever while reclaim reported all-quiet (2026-07-04)."""
+    from unittest.mock import AsyncMock
+    from app.services import pool_service as ps
+
+    # One healthy-looking pool user whose agent will reject its key.
+    uid = await _run_seed(container=("toup-agent-pool-77", "running"))
+    from app.db import async_session_maker
+    from sqlalchemy import update
+    from app.db.models import AgentConfig
+    async with async_session_maker() as db:
+        await db.execute(update(AgentConfig).where(AgentConfig.user_id == uid)
+                         .values(agent_url="https://agent-x.test", agent_api_key="k"))
+        await db.commit()
+
+    monkeypatch.setattr(ps.settings, "use_container_pool", True, raising=False)
+
+    class _Resp:
+        status_code = 401
+
+    class _FakeClient:
+        def __init__(self, *a, **k): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): return _Resp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+
+    fake_container = type("C", (), {"container_name": "toup-agent-pool-77"})()
+    claim = AsyncMock(return_value=fake_container)
+    monkeypatch.setattr(ps, "claim_for_user", claim)
+
+    summary = await ps.reclaim_stranded_users()
+
+    assert summary.get("candidates") == 0, "steady state: no stranded users"
+    assert summary.get("keyless") == 1, "keyless sweep must still run and detect"
+    assert summary.get("rebound") == 1
+    assert claim.await_args.kwargs.get("force") is True, "keyless heal must force past the running-row early-return"
