@@ -81,11 +81,27 @@ async def _send_telegram(level: str, message: str) -> None:
 
 
 async def _running_tenants(db: AsyncSession) -> list[ManagedContainer]:
-    """Tenants eligible for this rollout: status='running' AND pin_image_tag IS NULL."""
+    """Tenants eligible for this rollout: status='running' AND pin_image_tag IS NULL.
+
+    Pool-bound containers (`toup-agent-pool-NN`) are EXCLUDED. The bridge's
+    per-tenant `/upgrade` + `/whois` endpoints resolve `toup-agent-<prefix>`
+    by container NAME, so every pool-bound tenant 404s both — and the
+    orphan-quarantine in `_upgrade_one` then flips healthy users to
+    status='orphan' on every backend rollout (2026-07-01: f4f52f6b,
+    a5774ff4, b60f7255 quarantined minutes after b60f7255 signed up).
+    Pool members take image updates via the pool refresh/drain cycle
+    (`/v1/pool/refresh-image`), not per-tenant blue-green. NULL names are
+    kept (legacy rows predating the name column backfill).
+    """
+    from sqlalchemy import or_
     result = await db.execute(
         select(ManagedContainer).where(
             ManagedContainer.status == "running",
             ManagedContainer.pin_image_tag.is_(None),
+            or_(
+                ManagedContainer.container_name.is_(None),
+                ~ManagedContainer.container_name.like("toup-agent-pool-%"),
+            ),
         )
     )
     return list(result.scalars().all())

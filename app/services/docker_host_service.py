@@ -619,6 +619,20 @@ async def container_reconciler_loop() -> None:
         except Exception:
             # Never let a tick exception kill the loop — log and keep going.
             logger.exception("[container-reconciler] tick failed; will retry")
+        # Stranded-user backstop: managed users with NO container row (their
+        # signup finalize died — Railway redeploys kill fire-and-forget
+        # tasks) or a pool row knocked out of 'running' (rollout orphan
+        # quarantine). backfill_sentinel_image_containers can't see either
+        # class: its predicate needs an existing row with a NULL
+        # container_id or sentinel image. Own try/except + own sessions so
+        # a failure here can't affect the backfill above (and vice versa).
+        try:
+            from app.services.pool_service import reclaim_stranded_users
+            reclaim = await reclaim_stranded_users()
+            if reclaim.get("claimed") or reclaim.get("failed"):
+                logger.info("[container-reconciler] reclaim: %s", reclaim)
+        except Exception:
+            logger.exception("[container-reconciler] reclaim failed; will retry")
 
 
 async def stop_container(db: AsyncSession, user_id: str) -> Optional[ManagedContainer]:

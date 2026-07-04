@@ -587,3 +587,90 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
             user_id[:8], e,
         )
         return False
+
+
+async def _stranded_user_ids(db: AsyncSession, limit: int = 15) -> list[str]:
+    """Managed users whose agent container is missing or pool-orphaned.
+
+    Two stranded classes, both observed in production 2026-07-03/04:
+      * NO ManagedContainer row at all — the signup's fire-and-forget
+        finalize died (a Railway redeploy kills in-flight background
+        tasks; transient DB errors do too) and nothing ever retried.
+        The user gets a JWT, finishes onboarding, and sits on "Waking
+        your agent…" forever (Apple signup 8dwm74…@privaterelay).
+      * A pool-bound row knocked out of status='running' — the rollout
+        whois-404 quarantine used to flip healthy pool tenants to
+        status='orphan' (fixed in rollout_service._running_tenants, but
+        the damaged rows persist and nothing else heals them).
+
+    Named (non-pool) containers in orphan/error states are deliberately
+    NOT matched — re-homing a heavy-state named tenant is an operator
+    decision (see the c47c5b4b recovery runbook).
+    """
+    from sqlalchemy import and_, or_
+    from app.db.models import User
+    rows = await db.execute(
+        select(AgentConfig.user_id)
+        .join(User, User.id == AgentConfig.user_id)
+        .outerjoin(ManagedContainer, ManagedContainer.user_id == AgentConfig.user_id)
+        .where(
+            AgentConfig.hosting_mode == "managed",
+            User.is_active == True,  # noqa: E712
+            or_(
+                ManagedContainer.id.is_(None),
+                and_(
+                    ManagedContainer.container_name.like("toup-agent-pool-%"),
+                    ManagedContainer.status.notin_(("running", "provisioning")),
+                ),
+            ),
+        )
+        .order_by(AgentConfig.created_at.desc())
+        .limit(limit)
+    )
+    return [str(uid) for uid in rows.scalars().all()]
+
+
+async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
+    """Reconciler backstop: re-run the pool claim for stranded managed users.
+
+    Safe to re-run per user: claim_for_user takes a per-user advisory lock,
+    reuses the stable agent_api_key (CAS), and the bridge's per-user
+    idempotent claim returns the user's EXISTING container when they are
+    already bound — the platform row then flips back to status='running'
+    with the correct container/port and the Caddy route is re-asserted.
+    Truly containerless users get a fresh warm claim, exactly as at signup.
+
+    Runs enumeration and each claim in its own narrow session; never raises.
+    """
+    if not getattr(settings, "use_container_pool", False):
+        return {"skipped": "pool_disabled"}
+    summary: dict = {"candidates": 0, "claimed": 0, "failed": 0}
+    try:
+        from app.db.database import async_session_maker
+        async with async_session_maker() as db:
+            candidates = await _stranded_user_ids(db, limit=max_per_tick * 3)
+        summary["candidates"] = len(candidates)
+        if not candidates:
+            return summary
+        # Shuffle so a persistently-failing user can't starve the rest of
+        # the backlog (enumeration is newest-first within the window).
+        import random
+        random.shuffle(candidates)
+        for uid in candidates[:max_per_tick]:
+            try:
+                async with async_session_maker() as udb:
+                    c = await claim_for_user(udb, uid)
+                if c is not None:
+                    summary["claimed"] += 1
+                    logger.warning(
+                        "[pool-reclaim] healed stranded user=%s -> %s",
+                        uid[:8], c.container_name,
+                    )
+                else:
+                    summary["failed"] += 1
+            except Exception as e:
+                summary["failed"] += 1
+                logger.warning("[pool-reclaim] claim failed user=%s: %s", uid[:8], e)
+    except Exception:
+        logger.exception("[pool-reclaim] enumeration failed")
+    return summary
