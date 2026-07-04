@@ -124,3 +124,48 @@ async def test_running_tenants_excludes_pool_bound():
         "the bridge's by-name whois 404s them and the orphan quarantine "
         "breaks healthy users"
     )
+
+
+@pytest.mark.asyncio
+async def test_claim_force_bypasses_running_early_return(monkeypatch):
+    """force=True must reach the bridge even when the row says 'running' —
+    that's how a keyless-but-honest row gets its secrets re-pushed. Without
+    force, the early-return wins and no bridge call happens."""
+    from app.db import async_session_maker
+    from app.services import pool_service as ps
+
+    uid = await _run_seed(container=("toup-agent-pool-42", "running"))
+
+    monkeypatch.setattr(ps.settings, "use_container_pool", True, raising=False)
+    calls = {"n": 0}
+
+    class _BoomClient:
+        async def __aenter__(self):
+            calls["n"] += 1
+            raise RuntimeError("stop-at-bridge")  # proves we got past the guard
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(
+        "app.services.docker_host_service._bridge_client", lambda *a, **k: _BoomClient()
+    )
+
+    async with async_session_maker() as db:
+        # Without force: early-return, bridge never touched.
+        c = await ps.claim_for_user(db, uid)
+        assert c is not None and calls["n"] == 0
+
+    async with async_session_maker() as db:
+        # With force: proceeds to the bridge (our stub raises there).
+        try:
+            await ps.claim_for_user(db, uid, force=True)
+        except RuntimeError:
+            pass
+    assert calls["n"] == 1, "force=True must reach the bridge call"
+
+
+async def _run_seed(**kw):
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        return await _seed(db, **kw)

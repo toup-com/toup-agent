@@ -157,7 +157,9 @@ async def _build_bind_payload(
     return payload
 
 
-async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedContainer]:
+async def claim_for_user(
+    db: AsyncSession, user_id: str, *, force: bool = False
+) -> Optional[ManagedContainer]:
     """Claim a pool container for `user_id`. Returns the populated
     ManagedContainer row on success, None on pool-exhausted-or-disabled.
 
@@ -174,6 +176,14 @@ async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedCont
     back ourselves — the platform's signup path may not always want
     the slow path on pool failure (e.g., during a planned maintenance
     window when the pool is intentionally drained).
+
+    `force=True` skips the existing-row early-return and drives a fresh
+    bridge claim even when the row says running. Used by the reclaim
+    backstop's keyless sweep: after a container restart the agent keeps
+    its bound identity (restored from the tenant DB) but loses every
+    bind-injected secret, so the row is honest ('running') while chat
+    auth is dead — the bridge's idempotent claim path re-pushes the full
+    bind (with this payload's secrets) to the SAME container.
     """
     if not getattr(settings, "use_container_pool", False):
         logger.info("[pool_service] use_container_pool=False — skipping claim")
@@ -207,7 +217,7 @@ async def claim_for_user(db: AsyncSession, user_id: str) -> Optional[ManagedCont
     existing = (await db.execute(
         select(ManagedContainer).where(ManagedContainer.user_id == user_id)
     )).scalar_one_or_none()
-    if existing and existing.status in ("running", "provisioning"):
+    if existing and existing.status in ("running", "provisioning") and not force:
         return existing
 
     # AgentConfig must already exist (created by /api/agent-setup or
@@ -794,4 +804,77 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
                 logger.warning("[pool-reclaim] claim failed user=%s: %s", uid[:8], e)
     except Exception:
         logger.exception("[pool-reclaim] enumeration failed")
+
+    # Phase 2 — keyless-agent sweep. A pool container restart (host reboot,
+    # docker restart) restores the agent's bound identity from its tenant DB
+    # but loses every bind-injected secret (agent_api_key, TOUP_TOKEN, LLM
+    # keys), which live only in the agent process. The agent then looks
+    # perfect on /agent/health (healthy, bound, ready — no field exposes key
+    # state) while rejecting ALL chat auth: session JWTs fail signature
+    # verification and X-Agent-Key comparisons fail → every message is
+    # "Authentication required" (2026-07-04, the July-3 reboot broke ~15
+    # users this way while the fleet health sweep showed all green). The
+    # only honest detector is an AUTHENTICATED probe with the platform's
+    # stored key; on 401/403 we force a re-claim, and the bridge's
+    # idempotent claim path re-pushes the full bind to the same container.
+    # False positives are safe: a redundant /admin/bind refresh is a no-op.
+    try:
+        from app.db.database import async_session_maker
+        import httpx as _httpx
+        async with async_session_maker() as db:
+            rows = (await db.execute(
+                select(
+                    ManagedContainer.user_id,
+                    AgentConfig.agent_url,
+                    AgentConfig.agent_api_key,
+                )
+                .join(AgentConfig, AgentConfig.user_id == ManagedContainer.user_id)
+                .where(
+                    ManagedContainer.status == "running",
+                    ManagedContainer.container_name.like("toup-agent-pool-%"),
+                    AgentConfig.agent_url.isnot(None),
+                    AgentConfig.agent_api_key.isnot(None),
+                )
+            )).all()
+
+        async def _probe(uid: str, url: str, key: str, client) -> tuple:
+            try:
+                r = await client.get(
+                    f"{url}/api/sessions",
+                    params={"limit": 1},
+                    headers={"X-Agent-Key": key},
+                )
+                return (str(uid), r.status_code)
+            except Exception:
+                # Unreachable — the route layer owns that failure mode; the
+                # bridge reconciler re-asserts routes. Don't act on it here.
+                return (str(uid), None)
+
+        keyless: list = []
+        if rows:
+            async with _httpx.AsyncClient(timeout=5) as client:
+                results = await asyncio.gather(
+                    *[_probe(u, a, k, client) for u, a, k in rows]
+                )
+            keyless = [u for u, s in results if s in (401, 403)]
+        summary["keyless"] = len(keyless)
+        for uid in keyless[:max_per_tick]:
+            try:
+                async with async_session_maker() as udb:
+                    c = await claim_for_user(udb, uid, force=True)
+                if c is not None:
+                    summary["rebound"] = summary.get("rebound", 0) + 1
+                    logger.warning(
+                        "[pool-reclaim] re-bound keyless agent user=%s -> %s",
+                        uid[:8], c.container_name,
+                    )
+                else:
+                    summary["failed"] += 1
+            except Exception as e:
+                summary["failed"] += 1
+                logger.warning(
+                    "[pool-reclaim] keyless re-bind failed user=%s: %s", uid[:8], e
+                )
+    except Exception:
+        logger.exception("[pool-reclaim] keyless sweep failed")
     return summary
