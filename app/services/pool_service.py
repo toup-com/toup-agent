@@ -613,6 +613,43 @@ RECLAIM_FRESH_SIGNUP_WINDOW_DAYS = 30
 # for that user — a permanent dead-end unless something unsticks it.
 RECLAIM_PROVISIONING_STALE_MIN = 15
 
+# Authenticated-sweep strike ledger: consecutive 5xx/timeout probe failures
+# per user id. In-memory on purpose — a platform redeploy resets strikes,
+# which only delays a restart by one 180s tick. Two consecutive sick ticks
+# (≈6 min genuinely unresponsive) before restarting keeps one slow request
+# or GC pause from bouncing a healthy container.
+_PROBE_STRIKES: dict = {}
+PROBE_STRIKES_BEFORE_RESTART = 2
+# Restart at most N containers per tick — a sweep must never become a
+# restart storm (mass failures are guarded separately by the quorum check).
+RESTARTS_PER_TICK = 2
+
+
+async def _restart_sick_container(user_id: str, container_name: str) -> bool:
+    """Restart a managed container via the bridge. Pool members go through
+    the pool addon (which re-applies the persisted bind + route after the
+    restart); named tenants use the per-tenant restart (keys re-enter from
+    .env at boot). Never raises."""
+    prefix = str(user_id)[:8]
+    try:
+        from app.services.docker_host_service import _bridge_client
+        async with _bridge_client() as client:
+            if (container_name or "").startswith("toup-agent-pool-"):
+                r = await client.post(
+                    "/v1/pool/restart-member",
+                    json={"user_id": str(user_id), "prefix": prefix},
+                )
+            else:
+                r = await client.post(f"/v1/tenants/{prefix}/restart")
+            r.raise_for_status()
+        return True
+    except Exception as e:
+        logger.warning(
+            "[pool-reclaim] bridge restart failed user=%s container=%s: %s",
+            prefix, container_name, e,
+        )
+        return False
+
 
 async def _stranded_user_ids(db: AsyncSession, limit: int = 15) -> list[str]:
     """Active users whose agent container is missing or pool-orphaned.
@@ -808,19 +845,32 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
     except Exception:
         logger.exception("[pool-reclaim] enumeration failed")
 
-    # Phase 2 — keyless-agent sweep. A pool container restart (host reboot,
-    # docker restart) restores the agent's bound identity from its tenant DB
-    # but loses every bind-injected secret (agent_api_key, TOUP_TOKEN, LLM
-    # keys), which live only in the agent process. The agent then looks
-    # perfect on /agent/health (healthy, bound, ready — no field exposes key
-    # state) while rejecting ALL chat auth: session JWTs fail signature
-    # verification and X-Agent-Key comparisons fail → every message is
-    # "Authentication required" (2026-07-04, the July-3 reboot broke ~15
-    # users this way while the fleet health sweep showed all green). The
-    # only honest detector is an AUTHENTICATED probe with the platform's
-    # stored key; on 401/403 we force a re-claim, and the bridge's
-    # idempotent claim path re-pushes the full bind to the same container.
-    # False positives are safe: a redundant /admin/bind refresh is a no-op.
+    # Phase 2 — authenticated agent sweep, ALL managed containers. The only
+    # honest "can this user chat?" check is an AUTHENTICATED probe with the
+    # platform's stored key (2026-07-04: /agent/health showed green while
+    # keyless agents 401'd every message and a poisoned-DB agent 500'd every
+    # message for three days). Every running managed container is probed each
+    # tick — pool-bound AND named (the named ones are the OLDEST users and
+    # were invisible to the original pool-only sweep):
+    #
+    #   200          → healthy, clear strikes.
+    #   401/403      → keyless/desynced. Pool: force re-claim (bridge
+    #                  idempotent claim re-pushes the full bind — no-op if
+    #                  healthy). Named: restart via bridge (keys re-enter from
+    #                  .env at boot) + alert, because named 401s mean key
+    #                  drift, which should be impossible.
+    #   404/4xx      → routing problem (Caddy "unknown tenant") — the bridge
+    #                  route reconciler owns that; never restart a healthy
+    #                  agent over a missing route.
+    #   5xx/timeout  → sick agent (poisoned DB pool, wedged process). Two
+    #                  CONSECUTIVE sick ticks → restart via bridge + alert.
+    #                  Would have auto-healed tenant 3134fece days before the
+    #                  user reported it.
+    #
+    # Mass-failure guard: when the majority of probes fail at the transport
+    # layer in one tick, that's a platform-egress or host-level problem, not
+    # N individually-sick agents — no strikes are recorded (a restart storm
+    # across the fleet would turn a blip into an outage) and we alert instead.
     try:
         from app.db.database import async_session_maker
         import httpx as _httpx
@@ -828,40 +878,83 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
             rows = (await db.execute(
                 select(
                     ManagedContainer.user_id,
+                    ManagedContainer.container_name,
                     AgentConfig.agent_url,
                     AgentConfig.agent_api_key,
                 )
                 .join(AgentConfig, AgentConfig.user_id == ManagedContainer.user_id)
                 .where(
                     ManagedContainer.status == "running",
-                    ManagedContainer.container_name.like("toup-agent-pool-%"),
                     AgentConfig.agent_url.isnot(None),
                     AgentConfig.agent_api_key.isnot(None),
                 )
             )).all()
 
-        async def _probe(uid: str, url: str, key: str, client) -> tuple:
+        async def _probe(uid: str, cname: str, url: str, key: str, client) -> tuple:
             try:
                 r = await client.get(
                     f"{url}/api/sessions",
                     params={"limit": 1},
                     headers={"X-Agent-Key": key},
                 )
-                return (str(uid), r.status_code)
-            except Exception:
-                # Unreachable — the route layer owns that failure mode; the
-                # bridge reconciler re-asserts routes. Don't act on it here.
-                return (str(uid), None)
+                return (str(uid), cname or "", r.status_code, None)
+            except Exception as e:
+                return (str(uid), cname or "", None, type(e).__name__)
 
-        keyless: list = []
+        results: list = []
         if rows:
-            async with _httpx.AsyncClient(timeout=5) as client:
+            async with _httpx.AsyncClient(timeout=8) as client:
                 results = await asyncio.gather(
-                    *[_probe(u, a, k, client) for u, a, k in rows]
+                    *[_probe(u, n or "", a, k, client) for u, n, a, k in rows]
                 )
-            keyless = [u for u, s in results if s in (401, 403)]
-        summary["keyless"] = len(keyless)
-        for uid in keyless[:max_per_tick]:
+
+        transport_errors = sum(1 for _, _, s, _ in results if s is None)
+        mass_failure = bool(results) and transport_errors > len(results) / 2
+
+        keyless_pool: list = []
+        keyless_named: list = []
+        sick: list = []
+        for uid, cname, status, err in results:
+            is_pool = cname.startswith("toup-agent-pool-")
+            if status == 200:
+                _PROBE_STRIKES.pop(uid, None)
+                continue
+            if status in (401, 403):
+                _PROBE_STRIKES.pop(uid, None)
+                (keyless_pool if is_pool else keyless_named).append((uid, cname))
+                continue
+            if status is not None and status < 500:
+                # 404 etc. — routing, owned by the bridge route reconciler.
+                _PROBE_STRIKES.pop(uid, None)
+                continue
+            if mass_failure and status is None:
+                continue  # platform-egress blip; no per-agent strikes
+            strikes = _PROBE_STRIKES.get(uid, 0) + 1
+            _PROBE_STRIKES[uid] = strikes
+            if strikes >= PROBE_STRIKES_BEFORE_RESTART:
+                sick.append((uid, cname, status if status is not None else err))
+
+        summary["keyless"] = len(keyless_pool) + len(keyless_named)
+        summary["sick"] = len(sick)
+
+        if mass_failure:
+            logger.warning(
+                "[pool-reclaim] sweep quorum failed: %d/%d probes hit transport "
+                "errors — skipping strikes this tick",
+                transport_errors, len(results),
+            )
+            try:
+                from app.services.alerting import send_infra_alert
+                await send_infra_alert(
+                    "sweep-quorum", "critical",
+                    f"Agent sweep: {transport_errors}/{len(results)} probes failed "
+                    "at transport level — platform egress or agent host problem?",
+                )
+            except Exception:
+                pass
+
+        # Keyless pool members → force re-claim (full bind refresh).
+        for uid, cname in keyless_pool[:max_per_tick]:
             try:
                 async with async_session_maker() as udb:
                     c = await claim_for_user(udb, uid, force=True)
@@ -878,6 +971,43 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
                 logger.warning(
                     "[pool-reclaim] keyless re-bind failed user=%s: %s", uid[:8], e
                 )
+
+        # Keyless NAMED tenants → restart (env re-injects keys at boot).
+        for uid, cname in keyless_named[:RESTARTS_PER_TICK]:
+            ok = await _restart_sick_container(uid, cname)
+            summary["restarted"] = summary.get("restarted", 0) + (1 if ok else 0)
+            logger.warning(
+                "[pool-reclaim] named tenant 401 user=%s container=%s restart=%s",
+                uid[:8], cname, ok,
+            )
+
+        # Sick (2 consecutive 5xx/timeout ticks) → restart via bridge.
+        for uid, cname, why in sick[:RESTARTS_PER_TICK]:
+            ok = await _restart_sick_container(uid, cname)
+            _PROBE_STRIKES.pop(uid, None)
+            summary["restarted"] = summary.get("restarted", 0) + (1 if ok else 0)
+            logger.warning(
+                "[pool-reclaim] restarted sick agent user=%s container=%s "
+                "(reason=%s) ok=%s", uid[:8], cname, why, ok,
+            )
     except Exception:
-        logger.exception("[pool-reclaim] keyless sweep failed")
+        logger.exception("[pool-reclaim] authenticated sweep failed")
+
+    # Law 4: healing is good; REPEATED healing means something upstream broke.
+    # Tell the operator whenever a self-heal actually fired (rate-limited so a
+    # flapping loop can't flood the chat).
+    try:
+        healed = {
+            k: v for k, v in summary.items()
+            if k in ("claimed", "rebound", "restarted", "keyless", "sick") and v
+        }
+        if healed:
+            from app.services.alerting import send_infra_alert
+            await send_infra_alert(
+                "pool-selfheal", "warning",
+                f"Self-heal fired: {healed}. Users were healed automatically — "
+                "if this repeats, something upstream is broken.",
+            )
+    except Exception:
+        pass
     return summary

@@ -856,6 +856,13 @@ class Settings(BaseSettings):
     # 2026-05-09+), the existing OnboardingShell Welcome-mount prewarm
     # remains the only trigger. See docs/onboarding/prewarm-phase0.md.
     prewarm_on_soul_save: bool = False
+    # Signup provisioning (config prime + pool claim in the register /
+    # OAuth finalize paths). Deliberately its OWN flag: it used to ride
+    # on prewarm_on_soul_save, so flipping that prewarm experiment off
+    # would have silently stopped provisioning agents for new signups —
+    # the worst possible failure (bulletproof plan L). Default True;
+    # never couple this to an experiment flag again.
+    signup_provisioning_enabled: bool = True
     # Abandoned-onboarding reaper grace window. Containers tied to users
     # who haven't completed onboarding AND have no day_chats AND aren't
     # paying get destroyed after this many days. The agent_configs row

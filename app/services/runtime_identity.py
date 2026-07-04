@@ -116,6 +116,39 @@ def cache_token() -> int:
     return _cache_token
 
 
+def restore_at_boot() -> int:
+    """Re-apply the persisted bind payload (runtime.json) to the live
+    settings instance. Called ONCE from the agent lifespan, before any
+    traffic is served.
+
+    This closes the keyless-restart class (2026-07-04): `/admin/bind`
+    writes the full payload to runtime.json AND mutates `settings`, but
+    the settings mutation is process-local — a container restart (host
+    reboot, docker restart, OOM kill) reverts every `settings.X` read
+    (API-key middleware, session-JWT verification, LLM keys, TOUP_TOKEN)
+    to the spawn-time env values while runtime.json still holds the
+    authoritative bind. The agent then looks healthy and bound on
+    /agent/health while rejecting ALL chat auth. Re-applying at boot
+    makes bind state genuinely restart-proof instead of relying on the
+    platform's 180s reclaim sweep to notice and force a re-bind.
+
+    Returns the number of fields applied; 0 when there is no persisted
+    bind (fresh generic lobby container, or env-mode tenant whose
+    identity comes from .env and needs no restore).
+    """
+    _ensure_loaded()
+    with _lock:
+        payload = dict(_runtime or {})
+    if not payload.get("user_id"):
+        return 0
+    applied = apply_to_settings(payload)
+    logger.info(
+        "[runtime_identity] Boot restore: re-applied %d bind fields for user=%s",
+        applied, str(payload.get("user_id"))[:8],
+    )
+    return applied
+
+
 def write_runtime(payload: Dict[str, Any]) -> None:
     """Atomically write the bind payload to disk and reload.
 

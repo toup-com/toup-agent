@@ -213,3 +213,130 @@ async def test_keyless_sweep_runs_with_zero_stranded_candidates(monkeypatch):
     assert summary.get("keyless") == 1, "keyless sweep must still run and detect"
     assert summary.get("rebound") == 1
     assert claim.await_args.kwargs.get("force") is True, "keyless heal must force past the running-row early-return"
+
+
+@pytest.mark.asyncio
+async def test_sweep_probes_named_containers_and_restarts_on_401(monkeypatch):
+    """The authenticated sweep must cover NAMED containers too (the oldest
+    users were invisible to the original pool-only sweep). A named tenant
+    that 401s its own key gets a bridge restart, NOT a pool force-claim."""
+    from unittest.mock import AsyncMock
+    from app.services import pool_service as ps
+
+    uid = await _run_seed(container=(f"toup-agent-{'a1b2c3d4'}", "running"))
+    from app.db import async_session_maker
+    from sqlalchemy import update
+    from app.db.models import AgentConfig
+    async with async_session_maker() as db:
+        await db.execute(update(AgentConfig).where(AgentConfig.user_id == uid)
+                         .values(agent_url="https://agent-n.test", agent_api_key="k"))
+        await db.commit()
+
+    monkeypatch.setattr(ps.settings, "use_container_pool", True, raising=False)
+
+    class _Resp:
+        status_code = 401
+
+    class _FakeClient:
+        def __init__(self, *a, **k): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): return _Resp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+
+    claim = AsyncMock()
+    monkeypatch.setattr(ps, "claim_for_user", claim)
+    restart = AsyncMock(return_value=True)
+    monkeypatch.setattr(ps, "_restart_sick_container", restart)
+
+    summary = await ps.reclaim_stranded_users()
+
+    assert summary.get("keyless") == 1
+    claim.assert_not_awaited()
+    restart.assert_awaited_once()
+    assert summary.get("restarted") == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_restarts_sick_agent_after_two_consecutive_5xx(monkeypatch):
+    """5xx/timeout probes accumulate strikes; the SECOND consecutive sick
+    tick restarts the container (the poisoned-DB class that previously sat
+    broken for days). One sick tick alone must NOT restart."""
+    from unittest.mock import AsyncMock
+    from app.services import pool_service as ps
+
+    uid = await _run_seed(container=("toup-agent-pool-88", "running"))
+    from app.db import async_session_maker
+    from sqlalchemy import update
+    from app.db.models import AgentConfig
+    async with async_session_maker() as db:
+        await db.execute(update(AgentConfig).where(AgentConfig.user_id == uid)
+                         .values(agent_url="https://agent-s.test", agent_api_key="k"))
+        await db.commit()
+
+    monkeypatch.setattr(ps.settings, "use_container_pool", True, raising=False)
+    ps._PROBE_STRIKES.clear()
+
+    class _Resp:
+        status_code = 500
+
+    class _FakeClient:
+        def __init__(self, *a, **k): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): return _Resp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    restart = AsyncMock(return_value=True)
+    monkeypatch.setattr(ps, "_restart_sick_container", restart)
+
+    s1 = await ps.reclaim_stranded_users()
+    assert s1.get("sick", 0) == 0, "first sick tick only records a strike"
+    restart.assert_not_awaited()
+
+    s2 = await ps.reclaim_stranded_users()
+    assert s2.get("sick") == 1, "second consecutive sick tick acts"
+    restart.assert_awaited_once()
+    assert uid not in ps._PROBE_STRIKES, "strikes cleared after restart"
+
+
+@pytest.mark.asyncio
+async def test_sweep_mass_transport_failure_records_no_strikes(monkeypatch):
+    """When the majority of probes fail at the TRANSPORT level in one tick,
+    that's a platform-egress problem, not N sick agents — the sweep must
+    not accumulate strikes (a fleet-wide restart storm would turn a network
+    blip into an outage)."""
+    from unittest.mock import AsyncMock
+    from app.services import pool_service as ps
+
+    uid = await _run_seed(container=("toup-agent-pool-89", "running"))
+    from app.db import async_session_maker
+    from sqlalchemy import update
+    from app.db.models import AgentConfig
+    async with async_session_maker() as db:
+        await db.execute(update(AgentConfig).where(AgentConfig.user_id == uid)
+                         .values(agent_url="https://agent-m.test", agent_api_key="k"))
+        await db.commit()
+
+    monkeypatch.setattr(ps.settings, "use_container_pool", True, raising=False)
+    ps._PROBE_STRIKES.clear()
+
+    class _FakeClient:
+        def __init__(self, *a, **k): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): raise ConnectionError("egress down")
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    restart = AsyncMock(return_value=True)
+    monkeypatch.setattr(ps, "_restart_sick_container", restart)
+
+    await ps.reclaim_stranded_users()
+    await ps.reclaim_stranded_users()
+
+    restart.assert_not_awaited()
+    assert not ps._PROBE_STRIKES, "transport mass-failure must not strike"

@@ -363,6 +363,31 @@ async def lifespan(app: FastAPI):
     import time as _time
     _app_start_time = _time.time()
 
+    # ── Bind-state boot restore (keyless-restart fix, 2026-07-04) ──
+    # /admin/bind persists its payload to runtime.json AND mutates the
+    # live settings, but the mutation is process-local: any restart
+    # (host reboot, docker restart, OOM) reverted settings.agent_api_key
+    # / session-JWT secret / LLM keys / TOUP_TOKEN to spawn-time env
+    # values while the agent still looked healthy and bound — every
+    # chat message then failed "Authentication required" until the
+    # platform's reclaim sweep forced a re-bind (≤6 min, and only for
+    # pool containers it was watching). Re-applying the persisted bind
+    # BEFORE anything reads settings makes bind state restart-proof by
+    # design; the sweeps stay as backstops.
+    try:
+        _pre_restore_db_url = settings.database_url
+        _restored_fields = runtime_identity.restore_at_boot()
+        if _restored_fields:
+            print(f"🔐 Bind restore: re-applied {_restored_fields} fields from runtime.json")
+            if settings.database_url and settings.database_url != _pre_restore_db_url:
+                from app.db.database import rebind_database as _rebind
+                await _rebind(settings.database_url)
+                print("🔐 Bind restore: engine rebound to persisted tenant DB URL")
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "[boot-restore] failed — continuing with env identity"
+        )
+
     # ── Blue-green passive-boot gate ──────────────────────────
     # When the bridge does a blue-green upgrade, it spawns this
     # container as `toup-agent-<prefix>-bg` alongside the still-running
@@ -1207,6 +1232,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ day_chat_backfill.skipped reason=import_error error={e}")
 
+    # ── DB watchdog: detect + cure a poisoned engine in-process ──
+    # SELECT 1 every 60s on a fresh session; 2 consecutive failures →
+    # recover_engine() (rebuild + holder swap — the DB-layer effect of a
+    # docker restart, without one). Closes the 2026-07-04 class where an
+    # interrupted transaction left the agent in PendingRollbackError
+    # churn for days ("Connection lost" on every message) while
+    # /agent/health stayed green. State surfaces as db_ok/db_recoveries
+    # in /agent/health — diagnostic only, nothing gates on it.
+    try:
+        from app.services.db_watchdog import db_watchdog_loop
+        app.state.db_watchdog_task = asyncio.create_task(db_watchdog_loop())
+        print("🩺 DB watchdog started")
+    except Exception as e:
+        print(f"⚠️ DB watchdog failed to start: {e}")
+
     # One-time cleanup: remove legacy dashboard/ folder (replaced by .dashboard/)
     try:
         import os as _os
@@ -1617,11 +1657,35 @@ async def agent_health():
     except Exception:
         _is_bound, _bound_uid, _pool_generic = None, None, None
 
+    # Honest-health fields (bulletproof plan H). The 2026-07-04 arc
+    # proved "healthy" here can coexist with every chat failing:
+    # keyless agents (restart lost the bind secrets) and a poisoned DB
+    # engine (PendingRollbackError churn) were both invisible. These
+    # fields make those states visible in one glance. Diagnostic ONLY —
+    # law 1 says never gate service on a label, so nothing may branch
+    # on them except dashboards/alerts.
+    try:
+        _has_session_secret = bool(
+            settings.agent_api_key or _ri.get_agent_api_key()
+        )
+    except Exception:
+        _has_session_secret = None
+    try:
+        from app.services.db_watchdog import watchdog_state as _wd_state
+        _wd = _wd_state()
+        _db_ok = _wd.get("db_ok")
+        _db_recoveries = _wd.get("recoveries")
+    except Exception:
+        _db_ok, _db_recoveries = None, None
+
     return {
         "status": "healthy",
         "version": _agent_version,
         "mode": "agent",
         "uptime_seconds": round(uptime, 1),
+        "has_session_secret": _has_session_secret,
+        "db_ok": _db_ok,
+        "db_recoveries": _db_recoveries,
         # Reports the actual resolved default — what the runtime will use —
         # not just the raw settings field. Closes the gap where /agent/health
         # advertised a stale model after a settings.agent_model bump.

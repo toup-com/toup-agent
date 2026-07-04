@@ -106,7 +106,7 @@ async def _bg_finalize_oauth_signup(user_id: str, email_verified: bool) -> None:
             except Exception as ge:
                 logger.warning("[oauth-finalize] grant failed user=%s: %s", user_id[:8], ge)
 
-            if not settings.prewarm_on_soul_save:
+            if not settings.signup_provisioning_enabled:
                 return
             # Prime managed config (was inline before the JWT).
             try:
@@ -399,7 +399,7 @@ async def register(
     # place as a defense (schedule_prewarm short-circuits on already-
     # running/provisioning containers, so the second call is a cheap
     # no-op rather than a duplicate provision).
-    if settings.prewarm_on_soul_save:
+    if settings.signup_provisioning_enabled:
         try:
             from app.api.agent_setup import _get_or_create_config
             config = await _get_or_create_config(str(user.id), db)

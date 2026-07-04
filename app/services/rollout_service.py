@@ -55,26 +55,11 @@ async def _send_telegram(level: str, message: str) -> None:
     """Fire a Telegram alert to the infra bot (not the user-facing one).
 
     level: 'info' | 'warning' | 'critical' — rendered as emoji prefix.
+    Delegates to the canonical alerting module; rollout alerts are
+    deliberate one-shot events, so no rate limiting (min_interval_s=0).
     """
-    token = settings.infra_alert_telegram_token or settings.admin_alert_telegram_token
-    chat_id = settings.infra_alert_telegram_chat_id or settings.admin_alert_telegram_chat_id
-    if not token or not chat_id:
-        logger.info("[ROLLOUT-ALERT] no telegram config; skipping: %s", message)
-        return
-
-    prefix = {"info": "🔵", "warning": "⚠️", "critical": "🚨"}.get(level, "•")
-    body = f"{prefix} {message}"
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json={
-                "chat_id": chat_id,
-                "text": body,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            })
-    except Exception as e:
-        logger.warning("[ROLLOUT-ALERT] telegram failed: %s", e)
+    from app.services.alerting import send_infra_alert
+    await send_infra_alert("rollout", level, message, min_interval_s=0)
 
 
 # ─── Queries ───────────────────────────────────────────────────────
@@ -892,17 +877,13 @@ async def rollout_reconciler_loop() -> None:
         except Exception:
             # Never let a tick exception kill the loop. Log and keep going.
             logger.exception("[ROLLOUT-RECONCILER] tick failed; will retry")
-        # Piggy-back the prewarm reconciler on the same tick — it shares
-        # the "asyncio.create_task dies on Railway redeploy → DB row is
-        # the durable signal → reconciler retries stuck rows" pattern,
-        # and running it in the same loop avoids a second top-level task
-        # that would itself need warm-start handling. Wrapped in its own
-        # try/except so a prewarm-side failure doesn't taint rollouts.
-        try:
-            from app.services.prewarm_service import reconcile_stuck_provisioning
-            await reconcile_stuck_provisioning()
-        except Exception:
-            logger.exception("[PREWARM-RECONCILER] tick failed; will retry")
+        # NOTE (bulletproof plan M): the legacy prewarm reconciler
+        # (`reconcile_stuck_provisioning`) used to piggy-back here. It was
+        # removed — `pool_service.reclaim_stranded_users` (180s tick in the
+        # container reconciler) now owns stuck-provisioning recovery, and
+        # running two reconciliation systems against the same rows meant one
+        # could re-fire a cold provision while the other was mid pool-claim.
+        # One reconciliation system only.
         await asyncio.sleep(30)
 
 

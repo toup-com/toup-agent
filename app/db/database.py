@@ -118,6 +118,7 @@ class _SessionMakerProxy:
 engine: AsyncEngine = _build_engine(settings.database_url)
 _holder["engine"] = engine
 _holder["session_maker"] = _build_sessionmaker(engine)
+_holder["url"] = settings.database_url
 async_session_maker = _SessionMakerProxy()
 
 
@@ -160,6 +161,7 @@ async def rebind_database(new_database_url: str) -> None:
     old_engine = _holder["engine"]
     _holder["engine"] = new_engine
     _holder["session_maker"] = _build_sessionmaker(new_engine)
+    _holder["url"] = new_database_url
     engine = new_engine
     logger.info("[database] Engine rebound; disposing old engine")
     if old_engine is not None:
@@ -170,6 +172,46 @@ async def rebind_database(new_database_url: str) -> None:
             # at the OS level here is preferable to crashing the bind
             # — pool DBs have unused connections only.
             logger.warning("[database] Old engine dispose failed: %s", e)
+
+
+def current_database_url() -> str:
+    """URL the live engine was built against (tracks rebinds)."""
+    return _holder.get("url") or settings.database_url
+
+
+async def recover_engine() -> None:
+    """Replace the live engine with a freshly-built one on the SAME URL.
+
+    This is the poisoned-pool cure (2026-07-04, tenant 3134fece): an
+    interrupted transaction (blue-green cutover mid-txn, network blip)
+    can leave engine/session state in endless PendingRollbackError /
+    BEGIN-ROLLBACK churn where every DB touch fails while the process
+    itself looks healthy — before this, the only cure was a manual
+    `docker restart`. Building a new engine and swapping the holder is
+    exactly the DB-layer effect of a restart, without dropping
+    WebSockets or losing in-process bind state.
+
+    The new engine is smoke-tested (SELECT 1) BEFORE the swap: if the
+    database itself is down, we raise and keep the old engine — the
+    caller (db_watchdog) retries on its next tick.
+    """
+    global engine
+    url = current_database_url()
+    logger.warning("[database] recover_engine: rebuilding engine on current URL")
+    new_engine = _build_engine(url)
+    async with new_engine.connect() as conn:
+        from sqlalchemy import text
+        await conn.execute(text("SELECT 1"))
+
+    old_engine = _holder["engine"]
+    _holder["engine"] = new_engine
+    _holder["session_maker"] = _build_sessionmaker(new_engine)
+    engine = new_engine
+    if old_engine is not None:
+        try:
+            await old_engine.dispose()
+        except Exception as e:
+            logger.warning("[database] recover_engine: old dispose failed: %s", e)
 
 
 async def get_db() -> AsyncSession:
