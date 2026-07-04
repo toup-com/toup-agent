@@ -178,6 +178,39 @@ async def ci_start_rollout(
     return {"rollout_id": rollout.id, "status": rollout.status}
 
 
+@router.get("/ci-status")
+async def ci_rollout_status(
+    image_tag: str,
+    x_rollout_secret: Optional[str] = Header(None, alias="X-Rollout-Secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """CI poll endpoint (secret-authed like /start): newest rollout for the
+    given image_tag. Lets build-agent.yml gate on rollout COMPLETION instead
+    of mere acceptance — three consecutive rollouts on 2026-07-04 died
+    `aborted_orphan` (each killed by the platform redeploy the same push
+    triggered) and nothing noticed until an operator read the table. The
+    workflow now watches to a terminal state, retries an orphaned rollout
+    once, and alerts on anything that isn't `complete` (law 4).
+    """
+    _verify_rollout_secret(x_rollout_secret)
+    result = await db.execute(
+        select(Rollout)
+        .where(Rollout.image_tag == image_tag)
+        .order_by(Rollout.started_at.desc())
+        .limit(1)
+    )
+    r = result.scalar_one_or_none()
+    if not r:
+        return {"found": False}
+    return {
+        "found": True,
+        "rollout_id": r.id,
+        "status": r.status,
+        "phase": r.phase,
+        "started_at": str(r.started_at),
+    }
+
+
 @router.post("/manual", status_code=status.HTTP_202_ACCEPTED)
 async def admin_manual_rollout(
     req: StartRolloutReq,
