@@ -589,58 +589,100 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
         return False
 
 
-async def _stranded_user_ids(db: AsyncSession, limit: int = 15) -> list[str]:
-    """Managed users whose agent container is missing or pool-orphaned.
+# How far back the reclaim backstop will "adopt" a signup whose finalize died
+# before it even primed the AgentConfig. The died-early class only occurs AT
+# signup (a Railway redeploy killing the fire-and-forget finalize), so a
+# 30-day window covers every real case while guaranteeing the reconciler can
+# never mass-provision containers for years-old abandoned accounts.
+RECLAIM_FRESH_SIGNUP_WINDOW_DAYS = 30
 
-    Two stranded classes, both observed in production 2026-07-03/04:
-      * NO ManagedContainer row at all — the signup's fire-and-forget
-        finalize died (a Railway redeploy kills in-flight background
-        tasks; transient DB errors do too) and nothing ever retried.
-        The user gets a JWT, finishes onboarding, and sits on "Waking
-        your agent…" forever (Apple signup 8dwm74…@privaterelay).
-      * A pool-bound row knocked out of status='running' — the rollout
-        whois-404 quarantine used to flip healthy pool tenants to
-        status='orphan' (fixed in rollout_service._running_tenants, but
-        the damaged rows persist and nothing else heals them).
+
+async def _stranded_user_ids(db: AsyncSession, limit: int = 15) -> list[str]:
+    """Active users whose agent container is missing or pool-orphaned.
+
+    Stranded classes, all observed in production 2026-07-03/04:
+      * Managed-config users with NO ManagedContainer row — the signup's
+        fire-and-forget finalize died AFTER priming the config but before
+        the claim (a Railway redeploy kills in-flight background tasks).
+        11 real users were in this state, including Apple's App Store
+        review accounts.
+      * Managed-config users with a pool-bound row knocked out of
+        status='running' — the rollout whois-404 quarantine (fixed in
+        rollout_service._running_tenants; damaged rows persist).
+      * FRESH signups (≤30 days) whose finalize died so early the config
+        was never created or never primed off the 'self-hosted' schema
+        default (Apple signup 8dwm74…@privaterelay). Guarded: real
+        self-hosters (ssh_host set) and hosting_mode='local' users are
+        never matched, and this class requires NO container row at all.
 
     Named (non-pool) containers in orphan/error states are deliberately
     NOT matched — re-homing a heavy-state named tenant is an operator
     decision (see the c47c5b4b recovery runbook).
     """
+    from datetime import timedelta
     from sqlalchemy import and_, or_
     from app.db.models import User
+
+    fresh_cutoff = datetime.utcnow() - timedelta(days=RECLAIM_FRESH_SIGNUP_WINDOW_DAYS)
+    config_default_unprimed = and_(
+        or_(
+            AgentConfig.hosting_mode.is_(None),
+            and_(
+                AgentConfig.hosting_mode == "self-hosted",
+                AgentConfig.ssh_host.is_(None),
+            ),
+        ),
+    )
     rows = await db.execute(
-        select(AgentConfig.user_id)
-        .join(User, User.id == AgentConfig.user_id)
-        .outerjoin(ManagedContainer, ManagedContainer.user_id == AgentConfig.user_id)
+        select(User.id)
+        .outerjoin(AgentConfig, AgentConfig.user_id == User.id)
+        .outerjoin(ManagedContainer, ManagedContainer.user_id == User.id)
         .where(
-            AgentConfig.hosting_mode == "managed",
             User.is_active == True,  # noqa: E712
             or_(
-                ManagedContainer.id.is_(None),
+                # Managed users: heal a missing row or a non-running
+                # pool-bound row, regardless of signup age.
                 and_(
-                    ManagedContainer.container_name.like("toup-agent-pool-%"),
-                    ManagedContainer.status.notin_(("running", "provisioning")),
+                    AgentConfig.hosting_mode == "managed",
+                    or_(
+                        ManagedContainer.id.is_(None),
+                        and_(
+                            ManagedContainer.container_name.like("toup-agent-pool-%"),
+                            ManagedContainer.status.notin_(("running", "provisioning")),
+                        ),
+                    ),
+                ),
+                # Fresh signups whose finalize died before the config was
+                # created/primed: adopt them (config will be created and
+                # primed managed by reclaim, mirroring the signup path).
+                and_(
+                    User.created_at >= fresh_cutoff,
+                    ManagedContainer.id.is_(None),
+                    or_(AgentConfig.user_id.is_(None), config_default_unprimed),
                 ),
             ),
         )
-        .order_by(AgentConfig.created_at.desc())
+        .order_by(User.created_at.desc())
         .limit(limit)
     )
     return [str(uid) for uid in rows.scalars().all()]
 
 
 async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
-    """Reconciler backstop: re-run the pool claim for stranded managed users.
+    """Reconciler backstop: replay the signup finalize for stranded users.
 
-    Safe to re-run per user: claim_for_user takes a per-user advisory lock,
-    reuses the stable agent_api_key (CAS), and the bridge's per-user
-    idempotent claim returns the user's EXISTING container when they are
-    already bound — the platform row then flips back to status='running'
-    with the correct container/port and the Caddy route is re-asserted.
-    Truly containerless users get a fresh warm claim, exactly as at signup.
+    Per user: ensure the AgentConfig exists and is primed to managed (only
+    when it is still on the untouched schema default — real self-hosters
+    are excluded by the predicate), then re-run the pool claim. Safe to
+    re-run: claim_for_user takes a per-user advisory lock, reuses the
+    stable agent_api_key (CAS), and the bridge's per-user idempotent claim
+    returns the user's EXISTING container when already bound — the
+    platform row flips back to status='running' and the Caddy route is
+    re-asserted. Truly containerless users get a fresh warm claim, exactly
+    as at signup. claim_for_user's credential guarantee mints free-tier
+    creds internally, so no separate activation step is needed here.
 
-    Runs enumeration and each claim in its own narrow session; never raises.
+    Runs enumeration and each heal in its own narrow session; never raises.
     """
     if not getattr(settings, "use_container_pool", False):
         return {"skipped": "pool_disabled"}
@@ -659,6 +701,20 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
         for uid in candidates[:max_per_tick]:
             try:
                 async with async_session_maker() as udb:
+                    # Finalize replay step 1: config exists + primed. Mirrors
+                    # _bg_finalize_oauth_signup / register's prime block.
+                    from app.api.agent_setup import _get_or_create_config
+                    cfg = await _get_or_create_config(uid, udb)
+                    dirty = False
+                    if cfg.hosting_mode in (None, "self-hosted") and not cfg.ssh_host:
+                        cfg.hosting_mode = "managed"
+                        dirty = True
+                    if not cfg.whatsapp_mode:
+                        cfg.whatsapp_mode = "qr_link"
+                        dirty = True
+                    if dirty:
+                        await udb.commit()
+                    # Step 2: the claim (activation happens inside).
                     c = await claim_for_user(udb, uid)
                 if c is not None:
                     summary["claimed"] += 1

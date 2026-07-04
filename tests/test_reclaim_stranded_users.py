@@ -1,21 +1,28 @@
 """Regression for the 2026-07-03/04 "Waking your agent… forever" incident.
 
-Two production failure classes left users with no reachable agent and no
+Production failure classes that left users with no reachable agent and no
 self-heal path:
-  * A managed user with NO ManagedContainer row at all — their signup's
-    fire-and-forget finalize died (Railway redeploys kill background
-    tasks) and nothing retried (Apple signup 8dwm74…@privaterelay).
+  * A managed user with NO ManagedContainer row — their signup's
+    fire-and-forget finalize died after priming the config (Railway
+    redeploys kill background tasks) and nothing retried. 11 real users,
+    including Apple's App Store review accounts.
   * A pool-bound row flipped to status='orphan' by the rollout's
     whois-404 quarantine (pool containers are named `toup-agent-pool-NN`,
     so the bridge's by-name whois can never find them).
+  * A FRESH signup whose finalize died so early the AgentConfig was never
+    created or never primed off the 'self-hosted' schema default (Apple
+    signup 8dwm74…@privaterelay) — invisible to any config-based query.
 
 Fixes under test:
-  * pool_service._stranded_user_ids — enumerates exactly those two classes.
+  * pool_service._stranded_user_ids — enumerates exactly those classes,
+    while never matching real self-hosters (ssh_host set), 'local' users,
+    deactivated accounts, or old abandoned signups in the died-early class.
   * rollout_service._running_tenants — excludes pool-bound containers so
     rollouts can never orphan-quarantine them again.
 """
 import os
 import uuid
+from datetime import datetime, timedelta
 
 os.environ.setdefault("ENVIRONMENT", "test")
 
@@ -26,13 +33,18 @@ import pytest
 _port = itertools.count(9900)  # managed_containers.host_port is UNIQUE
 
 
-async def _seed(db, *, hosting="managed", active=True, container=None):
-    """Create user + agent_config (+ optional container). Returns user_id."""
+async def _seed(db, *, hosting="managed", ssh_host=None, active=True,
+                config=True, created_at=None, container=None):
+    """Create user (+ optional agent_config, container). Returns user_id."""
     from app.db.models import User, AgentConfig, ManagedContainer
     uid = str(uuid.uuid4())
-    db.add(User(id=uid, email=f"{uid[:8]}@t.local", hashed_password="",
-                name="T", is_active=active))
-    db.add(AgentConfig(user_id=uid, hosting_mode=hosting))
+    u = User(id=uid, email=f"{uid[:8]}@t.local", hashed_password="",
+             name="T", is_active=active)
+    if created_at is not None:
+        u.created_at = created_at
+    db.add(u)
+    if config:
+        db.add(AgentConfig(user_id=uid, hosting_mode=hosting, ssh_host=ssh_host))
     if container is not None:
         name, status = container
         db.add(ManagedContainer(id=str(uuid.uuid4()), user_id=uid,
@@ -47,22 +59,35 @@ async def test_stranded_predicate_matches_only_broken_users():
     from app.db import async_session_maker
     from app.services.pool_service import _stranded_user_ids
 
+    old = datetime.utcnow() - timedelta(days=90)
     async with async_session_maker() as db:
-        no_row = await _seed(db)                                            # stranded: no container at all
-        pool_orphan = await _seed(db, container=("toup-agent-pool-07", "orphan"))   # stranded: quarantined pool row
-        pool_running = await _seed(db, container=("toup-agent-pool-08", "running")) # healthy — leave alone
-        named_orphan = await _seed(db, container=("toup-agent-deadbeef", "orphan")) # named orphan — operator-only
-        self_hosted = await _seed(db, hosting="self-hosted")                # not ours to provision
-        inactive = await _seed(db, active=False)                            # deactivated account
+        # Stranded — must be reclaimed:
+        managed_no_row = await _seed(db)
+        pool_orphan = await _seed(db, container=("toup-agent-pool-07", "orphan"))
+        no_config_fresh = await _seed(db, config=False)
+        unprimed_fresh = await _seed(db, hosting="self-hosted")  # schema default, never primed
+
+        # Healthy or out of scope — must NOT be touched:
+        pool_running = await _seed(db, container=("toup-agent-pool-08", "running"))
+        named_orphan = await _seed(db, container=("toup-agent-deadbeef", "orphan"))
+        real_self_hoster = await _seed(db, hosting="self-hosted", ssh_host="1.2.3.4")
+        local_mode = await _seed(db, hosting="local")
+        inactive = await _seed(db, active=False)
+        no_config_old = await _seed(db, config=False, created_at=old)
 
         ids = await _stranded_user_ids(db, limit=50)
 
-    assert no_row in ids, "user with no container row must be reclaimed"
+    assert managed_no_row in ids, "managed user with no container row must be reclaimed"
     assert pool_orphan in ids, "orphaned pool row must be reclaimed"
+    assert no_config_fresh in ids, "fresh signup with no config (finalize died early) must be reclaimed"
+    assert unprimed_fresh in ids, "fresh signup stuck on the self-hosted schema default must be reclaimed"
+
     assert pool_running not in ids, "healthy pool user must not be touched"
     assert named_orphan not in ids, "named-container orphans stay manual"
-    assert self_hosted not in ids
+    assert real_self_hoster not in ids, "real self-hosters (ssh_host set) are never adopted"
+    assert local_mode not in ids, "hosting_mode='local' users are never adopted"
     assert inactive not in ids
+    assert no_config_old not in ids, "old abandoned signups must not be mass-provisioned"
 
 
 @pytest.mark.asyncio
