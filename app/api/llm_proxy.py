@@ -157,6 +157,23 @@ async def _check_budget(config: AgentConfig, provider: str, db: AsyncSession) ->
     Check budget. Returns None if OK, or an error reason string.
     Also returns the HTTP status code to use.
     """
+    # Admins are unlimited — same policy as the credit system (admins are
+    # never gated or deducted). Without this, an admin/founder/canary account
+    # still hit the per-tenant monthly OpenAI budget cap and got the
+    # misleading "Rate limit reached — too many requests" chat error once the
+    # $10 default was exhausted (2026-07-05: the chat canary, running every
+    # 5 min, tripped it and started false-alarming). One cheap role lookup.
+    try:
+        from sqlalchemy import select as _select
+        from app.db.models import User as _User
+        _role = (await db.execute(
+            _select(_User.role).where(_User.id == config.user_id)
+        )).scalar_one_or_none()
+        if _role == "admin":
+            return None
+    except Exception:
+        pass  # role lookup best-effort; fall through to normal budget checks
+
     period_start = config.bundle_period_start or config.bundle_started_at
     if not period_start:
         return None  # No period tracking yet, allow
