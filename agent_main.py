@@ -163,6 +163,26 @@ async def restart_telegram_bot():
         _telegram_bot = None
 
 
+def is_passive_boot() -> bool:
+    """True while this container is in blue-green passive boot — started with
+    TOUP_BG_PASSIVE=1 and not yet promoted (marker file absent).
+
+    Used by wake_lazy_channels to DEFER starting WhatsApp Baileys at
+    /admin/bind time: during a pool assigned-upgrade the new (green) container
+    is bound while the OLD container is still connected with the same WhatsApp
+    device credentials, and two concurrent same-device sessions can force the
+    user to re-scan the QR (gap A3, 2026-07-04). The lifespan's delayed-promote
+    starts WhatsApp ~90s later, after the old container is gone. The promote
+    calls restart_whatsapp_channel() directly (not via wake_lazy_channels), so
+    it is unaffected by this gate."""
+    try:
+        from pathlib import Path as _P
+        return (os.environ.get("TOUP_BG_PASSIVE") == "1"
+                and not _P("/app/workspace/.toup_bg_promoted").exists())
+    except Exception:
+        return False
+
+
 async def restart_whatsapp_channel():
     """Hot-restart the WhatsApp channel after config sync.
 

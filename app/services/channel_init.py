@@ -50,10 +50,19 @@ def wake_lazy_channels() -> None:
     except Exception as e:
         logger.warning("[channel_init] Telegram wake failed: %s", e)
 
-    # WhatsApp
+    # WhatsApp — but NOT during blue-green passive boot. A pool
+    # assigned-upgrade binds the new container while the old one is still
+    # connected with the same WhatsApp device creds; starting Baileys now
+    # opens a concurrent same-device session that can force a QR re-scan
+    # (gap A3, 2026-07-04). The lifespan delayed-promote starts it ~90s
+    # later, after the old container is gone.
     try:
         import agent_main as _am
-        loop.create_task(_am.restart_whatsapp_channel())
-        logger.info("[channel_init] Triggered WhatsApp wake")
+        if getattr(_am, "is_passive_boot", lambda: False)():
+            logger.info(
+                "[channel_init] passive boot — deferring WhatsApp wake to promote")
+        else:
+            loop.create_task(_am.restart_whatsapp_channel())
+            logger.info("[channel_init] Triggered WhatsApp wake")
     except Exception as e:
         logger.warning("[channel_init] WhatsApp wake failed: %s", e)

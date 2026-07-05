@@ -95,6 +95,16 @@ async def _supervisor_tick() -> None:
                     prev_failures,
                 )
                 _state["alarm_active"] = False
+                try:
+                    from app.services.alerting import send_infra_alert
+                    await send_infra_alert(
+                        "bridge-down", "info",
+                        f"Bridge RECOVERED — reachable again after {prev_failures} "
+                        "consecutive failures.",
+                        min_interval_s=0,
+                    )
+                except Exception:
+                    logger.exception("[bridge-supervisor] recovery alert failed")
             return
 
         _state["consecutive_failures"] += 1
@@ -120,6 +130,25 @@ async def _supervisor_tick() -> None:
                 n, n * BRIDGE_PROBE_INTERVAL_S, err,
             )
             _state["alarm_active"] = True
+            # PAGE the operator. The bridge is the single funnel for every pool
+            # claim, tenant restart, upgrade and route change — and its death
+            # DISABLES every self-heal loop (they all call the bridge), so
+            # nothing recovers automatically. Detection must reach a human
+            # (law 4). Before 2026-07-04 this only logged, so a 02:00 bridge
+            # OOM stayed silent until a user complained.
+            try:
+                from app.services.alerting import send_infra_alert
+                await send_infra_alert(
+                    "bridge-down", "critical",
+                    f"BRIDGE UNREACHABLE — {n} consecutive /v1/health failures "
+                    f"(~{n * BRIDGE_PROBE_INTERVAL_S}s), last_error={err}. Pool "
+                    "claims, tenant restarts, upgrades and route changes are ALL "
+                    "paused and no self-heal can run until the bridge is back. "
+                    "Check `systemctl status toup-bridge` on the Contabo box.",
+                    min_interval_s=0,
+                )
+            except Exception:
+                logger.exception("[bridge-supervisor] alert dispatch failed")
 
 
 async def supervisor_loop() -> None:
