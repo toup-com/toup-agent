@@ -61,6 +61,36 @@ from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleA
 # Maintenance / support agent (platform-only — admin maintenance system)
 from .support import SupportIssue, SupportIssueEvent, SupportAttachment
 
+# Agent-side notification outbox (agent-only — Autopilot arc PR4)
+from .agent_outbox import AgentNotifyOutbox
+
+# Autopilot approvals (agent-only — Autopilot arc PR7)
+from .autopilot import (
+    AutopilotApproval,
+    APPROVAL_KIND_QUESTION, APPROVAL_KIND_APPROVAL,
+    APPROVAL_PENDING, APPROVAL_APPROVED, APPROVAL_DENIED,
+    APPROVAL_ANSWERED, APPROVAL_CANCELLED, TERMINAL_APPROVAL_STATUSES,
+)
+
+# Proactive notifications (platform-only — Autopilot arc PR2)
+from .notification import (
+    PushDevice, NotificationQueue,
+    KNOWN_NOTIFY_KINDS, KNOWN_NQ_PRIORITIES,
+    NOTIFY_KIND_NEEDS_INPUT, NOTIFY_KIND_NEEDS_APPROVAL,
+    NOTIFY_KIND_MISSION_STARTED,
+    NOTIFY_KIND_MISSION_COMPLETED, NOTIFY_KIND_MISSION_FAILED,
+    NOTIFY_KIND_PROGRESS, NOTIFY_KIND_DIGEST, NOTIFY_KIND_GENERIC,
+    NQ_QUEUED, NQ_SENDING, NQ_SENT, NQ_SUPPRESSED, NQ_FAILED, NQ_EXPIRED,
+    NQ_PRIORITY_HIGH, NQ_PRIORITY_DEFAULT, NQ_PRIORITY_LOW,
+)
+
+# iOS Live Activities (platform-only — Autopilot phone surface)
+from .live_activity import (
+    LiveActivityDevice, LiveActivity,
+    LA_STARTED, LA_ENDED, LA_FAILED,
+    APNS_ENV_DEVELOPMENT, APNS_ENV_PRODUCTION, KNOWN_APNS_ENVIRONMENTS,
+)
+
 # Credits (free-for-everyone billing — docs/credits/design.md)
 from .credit import (
     SubscriptionPlan, CreditBalance, CreditLedger, CreditReservation,
@@ -69,7 +99,7 @@ from .credit import (
     APPLE_SUB_GRACE, APPLE_SUB_REVOKED,
     BUCKET_MESSAGE, BUCKET_INTEGRATION,
     LEDGER_CHAT_MESSAGE, LEDGER_ROUTINE_RUN, LEDGER_TRIGGER_RUN, LEDGER_BUILD_STEP,
-    LEDGER_TOOL_CALL, LEDGER_BROWSER_ACTION, LEDGER_DOC_GEN,
+    LEDGER_TOOL_CALL, LEDGER_BROWSER_ACTION, LEDGER_DOC_GEN, LEDGER_IMAGE_GEN,
     LEDGER_RESERVATION, LEDGER_SETTLEMENT, LEDGER_REFUND, LEDGER_PLAN_GRANT,
     LEDGER_PLAN_CHANGE, LEDGER_DAILY_RESET, LEDGER_PERIOD_RENEWAL, LEDGER_MANUAL_ADJUST,
     LEDGER_IAP_PURCHASE,
@@ -177,4 +207,25 @@ __all__ = [
     "APPLE_SUB_GRACE", "APPLE_SUB_REVOKED",
     # Maintenance / support agent
     "SupportIssue", "SupportIssueEvent", "SupportAttachment",
+    # Agent-side notification outbox (Autopilot arc PR4)
+    "AgentNotifyOutbox",
+    # Autopilot approvals (Autopilot arc PR7)
+    "AutopilotApproval",
+    "APPROVAL_KIND_QUESTION", "APPROVAL_KIND_APPROVAL",
+    "APPROVAL_PENDING", "APPROVAL_APPROVED", "APPROVAL_DENIED",
+    "APPROVAL_ANSWERED", "APPROVAL_CANCELLED", "TERMINAL_APPROVAL_STATUSES",
+    # Proactive notifications (Autopilot arc PR2)
+    "PushDevice", "NotificationQueue",
+    "KNOWN_NOTIFY_KINDS", "KNOWN_NQ_PRIORITIES",
+    "NOTIFY_KIND_NEEDS_INPUT", "NOTIFY_KIND_NEEDS_APPROVAL",
+    "NOTIFY_KIND_MISSION_STARTED",
+    "NOTIFY_KIND_MISSION_COMPLETED", "NOTIFY_KIND_MISSION_FAILED",
+    "NOTIFY_KIND_PROGRESS", "NOTIFY_KIND_DIGEST", "NOTIFY_KIND_GENERIC",
+    "NQ_QUEUED", "NQ_SENDING", "NQ_SENT", "NQ_SUPPRESSED", "NQ_FAILED",
+    "NQ_EXPIRED",
+    "NQ_PRIORITY_HIGH", "NQ_PRIORITY_DEFAULT", "NQ_PRIORITY_LOW",
+    # iOS Live Activities (Autopilot phone surface)
+    "LiveActivityDevice", "LiveActivity",
+    "LA_STARTED", "LA_ENDED", "LA_FAILED",
+    "APNS_ENV_DEVELOPMENT", "APNS_ENV_PRODUCTION", "KNOWN_APNS_ENVIRONMENTS",
 ]

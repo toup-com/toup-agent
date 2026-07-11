@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -373,6 +374,17 @@ async def _run_child(
             parent_job_id=parent_job_id,
         )
 
+        # Phone surface: start the lock-screen/Dynamic-Island card. The
+        # bar animates ON-DEVICE toward the job's timeout window (zero
+        # update pushes needed) — the honest ceiling for a bounded job.
+        await _notify_job_event(
+            job_id=job_id, label=label, kind="mission_started",
+            title=f"🛠 Working on: {(label or 'background task')[:150]}",
+            body=(task or "")[:200],
+            timer_end_ms=int((time.time() + min(timeout_seconds, 1800)) * 1000),
+            dedup_suffix="started",
+        )
+
         try:
             response = await asyncio.wait_for(
                 agent_runner.run(
@@ -391,9 +403,14 @@ async def _run_child(
                 timeout=timeout_seconds,
             )
             final_text = getattr(response, "text", None) or "(no output)"
-            tokens_prompt = getattr(response, "input_tokens", None)
-            tokens_completion = getattr(response, "output_tokens", None)
-            model_used = getattr(response, "model_used", None)
+            # AgentResponse field names are tokens_input/tokens_output/
+            # model — the old input_tokens/output_tokens/model_used
+            # getattrs silently returned None forever, so sub-agent token
+            # accounting and the soft budget check computed from 0 tokens
+            # (found by the Autopilot investigation, 2026-07-08).
+            tokens_prompt = getattr(response, "tokens_input", None)
+            tokens_completion = getattr(response, "tokens_output", None)
+            model_used = getattr(response, "model", None)
             outcome = "success"
 
             # Phase 9: soft credit-budget enforcement.
@@ -539,6 +556,56 @@ async def _run_child(
                 "err=%s",
                 job_id, fin_err,
             )
+
+
+async def _notify_job_event(
+    *,
+    job_id: str,
+    label: Optional[str],
+    kind: str,
+    title: str,
+    body: Optional[str] = None,
+    progress: Optional[int] = None,
+    timer_end_ms: Optional[int] = None,
+    dismiss_after_s: Optional[int] = None,
+    priority: str = "default",
+    dedup_suffix: str,
+) -> None:
+    """Phone-surface lifecycle event for a spawned job: durable outbox →
+    platform → APNs Live Activity (lock screen card + Dynamic Island),
+    which keeps working when the app is force-quit. ``urgent`` is always
+    set — spawns originate from an interactive chat turn, so the user is
+    awake and quiet hours must not defer the card. Best-effort by
+    contract: a job must never fail on notification plumbing."""
+    try:
+        from app.services.agent_notify_client import notify
+
+        data: dict[str, Any] = {
+            "route": "mission-control",
+            "mission_id": job_id,
+            "mission_title": (label or "Background task")[:80],
+            "kind": "job",
+            "urgent": True,
+        }
+        if progress is not None:
+            data["progress"] = progress
+        if timer_end_ms:
+            data["timer_end_ms"] = timer_end_ms
+        if dismiss_after_s is not None:
+            data["dismiss_after_s"] = dismiss_after_s
+        await notify(
+            event_kind=kind,
+            title=title[:200],
+            body=(body or "")[:300] or None,
+            data=data,
+            priority=priority,
+            dedup_key=f"{job_id}:{dedup_suffix}",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "[subagent_orchestrator] notify %s failed job=%s: %s",
+            kind, job_id, e,
+        )
 
 
 async def _finalize(
@@ -700,6 +767,32 @@ async def _finalize(
         outcome=outcome,
         summary_message_id=msg_id,
     )
+
+    # 6. Phone surface: end the Live Activity card. Success cards
+    # dismiss after 15 min (quick jobs shouldn't clutter the lock
+    # screen for hours); failures linger the default 4h so the user
+    # can't miss them; cancels vanish fast and quietly.
+    if outcome == "success":
+        await _notify_job_event(
+            job_id=job_id, label=label, kind="mission_completed",
+            title=f"✅ Done: {(label or 'background task')[:150]}",
+            body=(final_text or "")[:300], progress=100,
+            dismiss_after_s=900, dedup_suffix="completed",
+        )
+    elif outcome == "cancelled":
+        await _notify_job_event(
+            job_id=job_id, label=label, kind="mission_failed",
+            title=f"⏹ Stopped: {(label or 'background task')[:150]}",
+            body="Cancelled.", priority="low",
+            dismiss_after_s=60, dedup_suffix="cancelled",
+        )
+    else:  # failed | timeout | budget_exhausted
+        await _notify_job_event(
+            job_id=job_id, label=label, kind="mission_failed",
+            title=f"⚠️ Didn't finish: {(label or 'background task')[:150]}",
+            body=(error_message or outcome)[:300],
+            dedup_suffix="failed",
+        )
 
     logger.info(
         "[subagent_orchestrator] FINALIZED job=%s outcome=%s status=%s "
@@ -908,6 +1001,15 @@ async def orphan_sweep_on_boot(session_maker: Any = None) -> int:
                     )
                 except Exception:
                     pass  # already best-effort inside
+                # End the orphan's Live Activity card too — otherwise a
+                # crash strands a "Working on…" card until the 8h cap.
+                await _notify_job_event(
+                    job_id=row.id, label=label or row.title,
+                    kind="mission_failed",
+                    title=f"⚠️ Didn't finish: {(label or row.title or 'background task')[:150]}",
+                    body="The agent restarted while this task was running.",
+                    dedup_suffix="failed",
+                )
 
     if swept:
         logger.warning(

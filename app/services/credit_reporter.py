@@ -337,11 +337,24 @@ class PreflightResult:
 
 
 def _platform_endpoint(path: str) -> Optional[str]:
-    """Resolve `{platform_api_url}/{path}`. None when not configured."""
+    """Resolve `{platform_api_url}/{path}`. None when not configured.
+
+    Some tenants' platform_api_url lacks the ``/api`` suffix (the
+    agent-setup register path has normalized this for years,
+    agent_main.py). Without it every reporter call lands on the SPA
+    catch-all, which serves index.html with HTTP 200 — the JSON parse
+    then fails and the call silently no-ops (fail-open under-metering;
+    found live by the Autopilot canary, whose preflight 'succeeded'
+    with HTML). Normalize here so ALL reporter endpoints
+    (agent-deduct, agent-charge, preflight, status) reach the real API
+    on every tenant. All call sites pass bare /credits/* paths."""
     platform_url = (getattr(settings, "platform_api_url", "") or "").strip()
     if not platform_url:
         return None
-    return f"{platform_url.rstrip('/')}/{path.lstrip('/')}"
+    base = platform_url.rstrip("/")
+    if not base.endswith("/api"):
+        base = f"{base}/api"
+    return f"{base}/{path.lstrip('/')}"
 
 
 def _agent_key() -> str:
@@ -478,6 +491,100 @@ async def report_llm_usage(
         # effort; failure here is not fatal.
         await _refresh_status_metadata(user_id)
 
+    return outcome
+
+
+async def report_image_charge(
+    *,
+    user_id: str,
+    credits: float,
+    underlying_cost_cents: Optional[float] = None,
+    model: str = "gpt-image-1",
+    bucket: str = "message",
+    idempotency_key: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> DeductOutcome:
+    """POST an explicit per-image credit charge to ``/credits/agent-charge``.
+
+    Mirrors :func:`report_llm_usage` but carries an already-computed credit
+    amount (image generation is priced per image, not per token) instead of
+    token counts. Fail-open: a reporting outage never breaks image generation.
+    In bundle mode the platform proxy already charged, so the endpoint returns
+    idempotent_hit without deducting — calling this is still safe and refreshes
+    CreditState. Updates the module CreditState so raise_if_exhausted() reflects
+    the latest server view.
+    """
+    url = _platform_endpoint("/credits/agent-charge")
+    agent_key = _agent_key()
+    if url is None or not agent_key or credits <= 0:
+        return DeductOutcome(network_ok=False)
+
+    payload: dict = {
+        "user_id": user_id,
+        "event_type": "image_generation",
+        "credits": float(credits),
+        "bucket": bucket,
+        "provider": "openai",
+        "model": model,
+    }
+    if underlying_cost_cents is not None:
+        payload["underlying_cost_cents"] = float(underlying_cost_cents)
+    if idempotency_key:
+        payload["idempotency_key"] = idempotency_key
+    if metadata:
+        payload["metadata"] = metadata
+
+    try:
+        async with httpx.AsyncClient(timeout=_REPORT_TIMEOUT_S) as client:
+            resp = await client.post(url, json=payload, headers={"X-Agent-Key": agent_key})
+        if resp.status_code != 200:
+            logger.warning(
+                "[credits] agent-charge non-200 status=%d body=%s",
+                resp.status_code, resp.text[:300],
+            )
+            return DeductOutcome(network_ok=False)
+        data = resp.json() or {}
+    except httpx.TimeoutException:
+        logger.warning(
+            "[credits] agent-charge timed out (>%ss) user=%s",
+            _REPORT_TIMEOUT_S, (user_id or "?")[:8],
+        )
+        return DeductOutcome(network_ok=False)
+    except Exception:
+        logger.exception("[credits] agent-charge failed user=%s", (user_id or "?")[:8])
+        return DeductOutcome(network_ok=False)
+
+    outcome = DeductOutcome(
+        network_ok=True,
+        success=bool(data.get("success", True)),
+        enforcement_enabled=bool(data.get("enforcement_enabled", False)),
+        balance_after=float(data.get("balance_after") or 0.0),
+        reason=data.get("reason"),
+        bucket=str(data.get("bucket") or bucket),
+        amount_charged=float(data.get("amount_charged") or 0.0),
+        idempotent_hit=bool(data.get("idempotent_hit", False)),
+    )
+    if not outcome.idempotent_hit:
+        logger.info(
+            "[credits] image charged user=%s model=%s credits=%.2f "
+            "balance_after=%.2f success=%s",
+            (user_id or "?")[:8], model, float(credits),
+            outcome.balance_after, outcome.success,
+        )
+
+    deduct_period_end: Optional[datetime] = None
+    pe_raw = data.get("period_end")
+    if isinstance(pe_raw, str) and pe_raw:
+        try:
+            deduct_period_end = datetime.fromisoformat(pe_raw.replace("Z", "+00:00"))
+        except Exception:
+            deduct_period_end = None
+    _state.record_deduct(
+        outcome,
+        period_end=deduct_period_end,
+        plan_id=data.get("plan_id"),
+        plan_display_name=data.get("plan_display_name"),
+    )
     return outcome
 
 

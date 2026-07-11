@@ -20,10 +20,29 @@ from .base import Base
 # - security_alerts: critical-only (new device, password change). True
 #   so users always get the safety net unless they explicitly opt out.
 # - product_updates: marketing/changelog. False — opt-in only, CASL/CAN-SPAM friendly.
-DEFAULT_NOTIFICATION_PREFERENCES: Dict[str, bool] = {
+#
+# Autopilot / proactive push (PR2 of the Autopilot arc — values read
+# by the platform notification dispatcher at claim time):
+# - autopilot_push: OS push for mission events (needs input/approval,
+#   completed/failed). True — the whole point of handing off a mission
+#   is being told when it's done; per-mission opt-out still applies.
+# - autopilot_channel_fallback: escalate to Telegram/WhatsApp via the
+#   agent when no push device is registered/deliverable.
+# - quiet_hours: local-time window (platform copy of User.timezone)
+#   where non-urgent pushes are deferred to the window's end.
+# - daily_push_cap: frequency cap per user per local day; needs_input/
+#   needs_approval bypass the cap (they block the mission).
+#
+# NOTE: any key added here MUST also be added to the Pydantic models
+# in app/api/account.py — the PATCH endpoint whitelists known keys.
+DEFAULT_NOTIFICATION_PREFERENCES: Dict[str, Any] = {
     "morning_briefing": False,
     "security_alerts": True,
     "product_updates": False,
+    "autopilot_push": True,
+    "autopilot_channel_fallback": True,
+    "quiet_hours": {"enabled": True, "start": "22:00", "end": "08:00"},
+    "daily_push_cap": 10,
 }
 
 

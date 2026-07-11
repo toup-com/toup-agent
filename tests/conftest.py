@@ -87,6 +87,24 @@ def _build_test_app() -> FastAPI:
     # Mounted so test_llm_proxy_accepts_x_api_key_header_for_anthropic_sdk
     # can hit /api/llm/usage and verify the dual-auth-header contract.
     app.include_router(llm_proxy_router, prefix=settings.api_prefix)
+    # Mounted so test_notify_core can exercise push-device registration,
+    # the agent-notify ingest (auth + idempotency), and the extended
+    # notification-preferences contract (Autopilot arc PR2).
+    from app.api.push_devices import router as push_devices_router
+    from app.api.agent_notify import router as agent_notify_router
+    from app.api.account import router as account_router
+    app.include_router(push_devices_router, prefix=settings.api_prefix)
+    app.include_router(agent_notify_router, prefix=settings.api_prefix)
+    app.include_router(account_router, prefix=settings.api_prefix)
+    # Mounted so test_autopilot_handoff can exercise the Mission Control
+    # proxy (auth + action allowlist + no-agent 503) — Autopilot PR8.
+    from app.api.autopilot_proxy import router as autopilot_proxy_router
+    app.include_router(autopilot_proxy_router, prefix=settings.api_prefix)
+    # Mounted so test_live_activity can exercise ActivityKit token
+    # registration + per-activity token reporting (Autopilot phone
+    # surface).
+    from app.api.live_activity_devices import router as live_activity_devices_router
+    app.include_router(live_activity_devices_router, prefix=settings.api_prefix)
     return app
 
 

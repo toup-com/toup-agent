@@ -23,7 +23,7 @@ sqlite-vss==0.1.2
 sentence-transformers==2.3.1
 spacy>=3.7.5
 numpy==1.26.3
-openai>=1.0.0
+openai>=1.68.0
 tiktoken>=0.5.0  # Token counting for chat
 
 # Document Processing
@@ -65,6 +65,7 @@ pydantic-settings>=2.5.2
 # Utils
 python-dateutil==2.8.2
 httpx>=0.28.1
+h2>=4.1.0  # HTTP/2 for httpx — APNs client (app/services/apns_push.py)
 tenacity==8.2.3
 apscheduler==3.10.4  # Scheduled tasks for decay/consolidation
 timezonefinder==6.2.0  # Coords → IANA tz lookup for /auth/timezone-from-coords (account page "Share location" flow)

@@ -853,6 +853,21 @@ async def lifespan(app: FastAPI):
             print(f"⚠️ Could not start routine runner: {e}")
             routine_runner = None
 
+        # Notify-outbox flush loop (Autopilot PR4) — drains the durable
+        # agent_notify_outbox to the platform's /api/agent/notify. Plain
+        # asyncio loop (no APScheduler dependency): tolerates pre-bind
+        # lobby mode by sleeping through DB errors, and the platform
+        # dedupes on the row id so restarts can only re-send acked-lost
+        # rows, never double-notify.
+        try:
+            from app.services.agent_notify_client import notify_outbox_loop
+            app.state.notify_outbox_task = asyncio.create_task(
+                notify_outbox_loop(), name="notify-outbox-flush",
+            )
+            print("📮 Notify outbox loop started")
+        except Exception as e:
+            print(f"⚠️ Could not start notify outbox loop: {e}")
+
         # TriggerRunner — event-driven sibling. Started after RoutineRunner
         # so its restart sweep + rate-bucket warmup run before any inbound
         # webhook can dispatch. Auto-imports the email_received handler
@@ -1517,12 +1532,18 @@ app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
 app.include_router(ws_browser_router, prefix=settings.api_prefix)
-app.include_router(apps_router, prefix=settings.api_prefix)
 # Unified jobs activity feed (PR 6 of the jobs/tasks/logs arc) —
 # server-side ``GET /apps/jobs/events`` query over job_events JOIN
 # build_jobs. Replaces the dashboard's client-side flatten of
 # BuildJob.steps_json that mis-attributed every entry to the most
 # recent Auto Builder app.
+#
+# MUST be registered BEFORE apps_router: apps.py defines
+# ``GET /jobs/{job_id}`` and Starlette matches routes in
+# registration order, so registering the literal ``/jobs/events``
+# after the param route shadows it — the feed 404s as
+# ``db.get(BuildJob, "events")`` and the dashboard silently falls
+# back to the legacy client-side flatten (2026-07-08 prod bug).
 try:
     from app.api.jobs_events import router as jobs_events_router
     app.include_router(
@@ -1530,6 +1551,7 @@ try:
     )
 except ImportError as _e:
     print(f"⚠️ jobs_events router not loaded: {_e}", flush=True)
+app.include_router(apps_router, prefix=settings.api_prefix)
 # Netflix streaming (HLS)
 try:
     from app.api.ws_netflix import router as netflix_stream_router
@@ -1556,6 +1578,23 @@ app.include_router(routines_router, prefix=settings.api_prefix)
 # Gate T2: /api/triggers/* (CRUD + event history + test-fire).
 app.include_router(triggers_inbound_router, prefix=settings.api_prefix)
 app.include_router(triggers_router, prefix=settings.api_prefix)
+
+# Out-of-band notification delivery (Autopilot PR4) — the platform
+# dispatcher POSTs /api/notify/deliver when push can't reach the user;
+# Telegram/WhatsApp connections live in THIS container only.
+try:
+    from app.api.notify_deliver import router as notify_deliver_router
+    app.include_router(notify_deliver_router, prefix=settings.api_prefix)
+except ImportError as _e:
+    print(f"⚠️ notify_deliver router not loaded: {_e}", flush=True)
+
+# Autopilot approvals (Autopilot PR7) — the durable ask-the-user store;
+# Mission Control + push deep links decide through the platform proxy.
+try:
+    from app.api.autopilot import router as autopilot_router
+    app.include_router(autopilot_router, prefix=settings.api_prefix)
+except ImportError as _e:
+    print(f"⚠️ autopilot router not loaded: {_e}", flush=True)
 
 # Chrome extension — /ws/extension lives here (per-tenant agent VPS).
 # Pairing/suggest/ground routes are platform-only; mounting the whole

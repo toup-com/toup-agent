@@ -14,7 +14,7 @@ alembic==1.13.1
 
 # Embeddings & NLP
 numpy==1.26.3
-openai>=1.0.0
+openai>=1.68.0
 tiktoken>=0.5.0
 
 # Document Processing

@@ -1038,9 +1038,17 @@ def setup_scheduler(
         Configured scheduler instance
     """
     global scheduler
-    
+
     scheduler = AsyncIOScheduler()
-    
+
+    # NOTE: the proactive-notification dispatcher does NOT live here.
+    # It runs as its own asyncio loop started from platform_main's
+    # lifespan (notification_dispatcher.notification_dispatch_loop) —
+    # found live 2026-07-10: this scheduler never runs on the Railway
+    # deployment, which silently killed dispatch. Keeping it out of
+    # APScheduler also means a scheduler-start failure can't take the
+    # notification pipeline down with it.
+
     # Memory Decay - runs every N hours
     scheduler.add_job(
         run_decay_for_all_users,

@@ -67,6 +67,12 @@ _JOB_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _SESSION_WS_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "tool_executor_session_workspace", default=None,
 )
+# Inbound attachments (persisted dicts) the user sent with the current turn.
+# Lets edit_image reach "the photo I just sent" without re-decoding the WS
+# payload. Per-asyncio-task, like the other per-call context above.
+_INBOUND_MEDIA_CTX: contextvars.ContextVar[tuple] = contextvars.ContextVar(
+    "tool_executor_inbound_media", default=(),
+)
 # Per-call disabled-tool set. Lives in a ContextVar (not instance attr)
 # because the same ToolExecutor singleton is shared between the parent
 # agent_runner.run() and any sub-agents the parent spawns. A sub-agent
@@ -102,6 +108,8 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "send_file": 1_000,
     "send_photo": 1_000,
     "analyze_image": 10_000,
+    "generate_image": 1_000,
+    "edit_image": 1_000,
     "spawn": 1_000,
     "process": 10_000,
     "tts": 1_000,
@@ -383,6 +391,11 @@ class ToolExecutor:
         return _SESSION_WS_CTX.get()
 
     @property
+    def _inbound_media(self) -> list:
+        """Persisted inbound attachment dicts for the current turn (may be empty)."""
+        return list(_INBOUND_MEDIA_CTX.get() or ())
+
+    @property
     def user_disabled_tools(self) -> frozenset:
         """Per-task disabled tools. Backed by ContextVar so a sub-agent
         task's profile-disable set (which includes 'spawn') does not
@@ -401,6 +414,11 @@ class ToolExecutor:
     def set_chat_id(self, chat_id: Optional[int]):
         """Set the current Telegram chat ID for send_file/send_photo tools."""
         _CHAT_ID_CTX.set(chat_id)
+
+    def set_inbound_media(self, atts) -> None:
+        """Record the user's inbound attachments for this turn so edit_image can
+        use the most-recently-uploaded image as its edit source."""
+        _INBOUND_MEDIA_CTX.set(tuple(atts or ()))
 
     async def _resolve_chat_id(self) -> Optional[int]:
         """Get the active chat_id, falling back to the user's Telegram ID from DB."""
@@ -1924,6 +1942,339 @@ class ToolExecutor:
         except Exception as exc:
             logger.exception("analyze_image failed")
             return f"ERROR: Image analysis failed: {exc}"
+
+    # ------------------------------------------------------------------
+    # 11b. generate_image — ChatGPT (gpt-image-1) text-to-image
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_image_moderation_error(exc: Exception) -> bool:
+        """True if an images.generate failure is a content-safety/moderation
+        block. Such a block is a property of the PROMPT, not the model, so the
+        fallback model would reject it identically — we surface it instead."""
+        s = str(exc).lower()
+        return any(tok in s for tok in (
+            "moderation_blocked", "safety system", "safety_violations",
+            "content_policy", "content policy", "image_generation_user_error",
+        ))
+
+    async def _openai_generate_image(self, client, model, prompt, size, quality):
+        """Call OpenAI images.generate for `model`; return base64 PNG string.
+
+        Handles the gpt-image-1 vs dall-e-3 parameter differences:
+          * gpt-image-1 always returns b64_json and accepts low/medium/high
+            plus our square/portrait/landscape sizes.
+          * dall-e-3 needs response_format='b64_json', uses standard/hd quality
+            and 1024x1792 / 1792x1024 for portrait/landscape.
+        Raises on any failure so the caller can try the fallback model.
+        """
+        m = (model or "").lower()
+        timeout = getattr(settings, "image_gen_timeout_s", 180.0)
+        kwargs: Dict[str, Any] = {"model": model, "prompt": prompt, "n": 1, "timeout": timeout}
+        if m.startswith("dall-e"):
+            dsize = {"1024x1536": "1024x1792", "1536x1024": "1792x1024"}.get(size, "1024x1024")
+            kwargs.update(size=dsize, quality=("hd" if quality == "high" else "standard"),
+                         response_format="b64_json")
+        else:
+            kwargs.update(size=size, quality=quality)
+        result = await client.images.generate(**kwargs)
+        data = getattr(result, "data", None) or []
+        if not data:
+            raise RuntimeError("OpenAI returned no image data")
+        first = data[0]
+        b64 = getattr(first, "b64_json", None)
+        if not b64 and isinstance(first, dict):
+            b64 = first.get("b64_json")
+        if not b64:
+            raise RuntimeError("OpenAI response did not include b64_json")
+        return b64
+
+    async def _tool_generate_image(self, inp: Dict[str, Any]) -> str:
+        if not getattr(settings, "image_gen_enabled", True):
+            return "ERROR: Image generation is disabled on this platform."
+
+        prompt = (inp.get("prompt") or "").strip()
+        if not prompt:
+            return "ERROR: 'prompt' is required — describe the image to generate."
+
+        size = (inp.get("size") or getattr(settings, "image_gen_default_size", "1024x1024")).strip()
+        quality = (inp.get("quality") or getattr(settings, "image_gen_default_quality", "high")).strip().lower()
+
+        import base64
+        import uuid as _uuid
+        from app.agent.doc_generators import _safe_filename, _persist
+
+        raw_name = (inp.get("filename") or "").strip() or f"image_{_uuid.uuid4().hex[:8]}.png"
+        filename = _safe_filename(raw_name, "png")
+        if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            filename = f"{filename}.png"
+
+        # ONE client factory for both bundle (→ platform LLM proxy, which also
+        # charges) and manual/BYO (→ api.openai.com direct). See
+        # bundle_client.make_openai_client.
+        from app.services.bundle_client import make_openai_client
+        from app.services.key_provider import keys
+        client = make_openai_client(byok_key=(keys.openai or None))
+        if client is None:
+            return (
+                "ERROR: No OpenAI access is configured for image generation. "
+                "This tenant needs bundle mode or an OpenAI API key in Settings."
+            )
+
+        primary = getattr(settings, "image_gen_model", "gpt-image-1")
+        fallback = getattr(settings, "image_gen_fallback_model", "dall-e-3") or ""
+        # The bundle LLM proxy only serves gpt-image-1. A dall-e-3 fallback
+        # routed through it fails with "Unknown parameter: response_format",
+        # which then MASKS the real reason (usually a content-policy block).
+        # So the fallback model is only usable on the DIRECT path (a tenant with
+        # its own OpenAI key); in bundle mode we must not attempt it.
+        bundle_mode = not bool(keys.openai)
+        used_model = primary
+        b64 = None
+        try:
+            b64 = await self._openai_generate_image(client, primary, prompt, size, quality)
+        except Exception as primary_exc:
+            if self._is_image_moderation_error(primary_exc):
+                # A safety/moderation block is a property of the PROMPT, not the
+                # model — the fallback enforces the SAME policy, so retrying just
+                # wastes time and buries the real cause. Surface it cleanly.
+                logger.info("generate_image: prompt declined by safety filter")
+                return (
+                    "ERROR: The image request was declined by the content-safety "
+                    "filter (the wording was flagged). Rephrase the description — "
+                    "keep it plainly descriptive and avoid phrasing that could read "
+                    "as explicit — then try again."
+                )
+            logger.warning("generate_image: %s failed (%s)", primary, primary_exc)
+            if fallback and fallback != primary and not bundle_mode:
+                try:
+                    b64 = await self._openai_generate_image(client, fallback, prompt, size, quality)
+                    used_model = fallback
+                except Exception as fb_exc:
+                    logger.exception("generate_image fallback failed")
+                    return f"ERROR: Image generation failed: {str(fb_exc)[:300]}"
+            else:
+                return f"ERROR: Image generation failed: {str(primary_exc)[:300]}"
+
+        if not b64:
+            return "ERROR: Image generation returned no image data."
+        try:
+            img_bytes = base64.b64decode(b64)
+        except Exception:
+            return "ERROR: Image generation returned malformed image data."
+
+        uid = self._current_user_id or ""
+        # Persist as an attachment (delivered inline to web/mobile via the
+        # on_attachment WS event) using the same pipeline as generate_pdf/etc.
+        try:
+            att = await _persist(img_bytes, filename, "image/png", uid or self._user_scope())
+        except Exception as exc:
+            logger.exception("generate_image persist failed")
+            return f"ERROR: Could not save the generated image: {exc}"
+        # Also drop a copy into the workspace so the model can send_photo it or
+        # reference it in later tool calls. Best-effort.
+        try:
+            ws_path = self._resolve_path(filename)
+            with open(ws_path, "wb") as f:
+                f.write(img_bytes)
+        except Exception:
+            logger.debug("generate_image workspace copy skipped", exc_info=True)
+
+        # Charge credits (fail-open). Bundle users were already charged inline
+        # by the LLM proxy, so this reports as an idempotent no-op for them.
+        try:
+            from app.services.credit_service import (
+                image_generation_cost_cents, underlying_cost_to_credits,
+            )
+            from app.services.credit_reporter import report_image_charge
+            cents = image_generation_cost_cents(size, quality)
+            if uid:
+                await report_image_charge(
+                    user_id=uid,
+                    credits=float(underlying_cost_to_credits(cents)),
+                    underlying_cost_cents=float(cents),
+                    model=used_model,
+                    idempotency_key=f"image_gen:{uid}:{att.id}",
+                    metadata={"size": size, "quality": quality},
+                )
+        except Exception:
+            logger.exception("generate_image credit report failed (non-fatal)")
+
+        summary = await self._register_attachment(att)
+        return (
+            f"Image generated with {used_model} ({size}, {quality} quality) and "
+            f"delivered to the user. {summary}"
+        )
+
+    # ------------------------------------------------------------------
+    # 11c. edit_image — modify the user's uploaded image via gpt-image-1 edits
+    # ------------------------------------------------------------------
+    async def _openai_edit_image(self, client, model, image_file, prompt, size, quality):
+        """Call OpenAI images.edit for `model`; return base64 PNG string.
+
+        `image_file` is a (filename, bytes, mime) tuple the SDK forwards as
+        multipart. gpt-image-1 is the only model with a high-quality edits
+        endpoint (dall-e-3 has none), and it always returns b64_json.
+        """
+        timeout = getattr(settings, "image_gen_timeout_s", 180.0)
+        result = await client.images.edit(
+            model=model, image=image_file, prompt=prompt,
+            size=size, quality=quality, n=1, timeout=timeout,
+        )
+        data = getattr(result, "data", None) or []
+        if not data:
+            raise RuntimeError("OpenAI returned no image data")
+        first = data[0]
+        b64 = getattr(first, "b64_json", None)
+        if not b64 and isinstance(first, dict):
+            b64 = first.get("b64_json")
+        if not b64:
+            raise RuntimeError("OpenAI response did not include b64_json")
+        return b64
+
+    async def _tool_edit_image(self, inp: Dict[str, Any]) -> str:
+        if not getattr(settings, "image_edit_enabled", True):
+            return "ERROR: Image editing is disabled on this platform."
+
+        prompt = (inp.get("prompt") or "").strip()
+        if not prompt:
+            return "ERROR: 'prompt' is required — describe how to change the image."
+
+        size = (inp.get("size") or getattr(settings, "image_gen_default_size", "1024x1024")).strip()
+        quality = (inp.get("quality") or getattr(settings, "image_gen_default_quality", "high")).strip().lower()
+
+        import base64
+        import uuid as _uuid
+        from app.agent.doc_generators import _safe_filename, _persist
+
+        _EXT_MIME = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".webp": "image/webp", ".gif": "image/gif",
+        }
+
+        # ── Resolve the SOURCE image bytes ─────────────────────────────
+        src_bytes = None
+        src_name = "source.png"
+        src_mime = "image/png"
+        _img_arg = (inp.get("image") or "").strip()
+        if _img_arg:
+            # Explicit workspace-relative path or https URL (mirrors analyze_image).
+            try:
+                if _img_arg.lower().startswith(("http://", "https://")):
+                    async with httpx.AsyncClient(timeout=30) as _hc:
+                        _r = await _hc.get(_img_arg)
+                        _r.raise_for_status()
+                        src_bytes = _r.content
+                        src_mime = (_r.headers.get("content-type") or "image/png").split(";")[0]
+                    src_name = os.path.basename(_img_arg.split("?")[0]) or "source.png"
+                else:
+                    _p = self._resolve_path(_img_arg)
+                    with open(_p, "rb") as _f:
+                        src_bytes = _f.read()
+                    src_name = os.path.basename(_p)
+                    src_mime = _EXT_MIME.get(os.path.splitext(src_name)[1].lower(), "image/png")
+            except Exception as exc:
+                return f"ERROR: Could not read the image to edit ({_img_arg}): {exc}"
+        else:
+            # Default: the user's most-recently-uploaded image on this turn.
+            _inbound = [a for a in self._inbound_media
+                        if str(a.get("mime_type", "")).startswith("image/")]
+            if not _inbound:
+                return (
+                    "ERROR: No image to edit. Attach an image in the same message and "
+                    "ask again, or pass 'image' (a workspace file path or an image URL)."
+                )
+            _att = _inbound[-1]
+            try:
+                from app.services.file_storage import get_storage_backend
+                with get_storage_backend().open(_att["storage_path"]) as _f:
+                    src_bytes = _f.read()
+                src_name = _att.get("filename") or "source.png"
+                src_mime = _att.get("mime_type") or "image/png"
+            except Exception as exc:
+                logger.exception("edit_image: failed to load inbound source")
+                return f"ERROR: Could not load the uploaded image to edit: {exc}"
+
+        if not src_bytes:
+            return "ERROR: No image bytes to edit."
+
+        raw_name = (inp.get("filename") or "").strip() or f"edited_{_uuid.uuid4().hex[:8]}.png"
+        filename = _safe_filename(raw_name, "png")
+        if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            filename = f"{filename}.png"
+
+        # ONE client factory: bundle (→ platform proxy /images/edits, which also
+        # charges) or manual/BYO (→ api.openai.com direct + self-report below).
+        from app.services.bundle_client import make_openai_client
+        from app.services.key_provider import keys
+        client = make_openai_client(byok_key=(keys.openai or None))
+        if client is None:
+            return (
+                "ERROR: No OpenAI access is configured for image editing. "
+                "This tenant needs bundle mode or an OpenAI API key in Settings."
+            )
+
+        # gpt-image-1 only — dall-e-3 has no edits endpoint, so no fallback.
+        model = getattr(settings, "image_gen_model", "gpt-image-1")
+        image_file = (src_name, src_bytes, src_mime)
+        try:
+            b64 = await self._openai_edit_image(client, model, image_file, prompt, size, quality)
+        except Exception as edit_exc:
+            if self._is_image_moderation_error(edit_exc):
+                logger.info("edit_image: request declined by safety filter")
+                return (
+                    "ERROR: The edit request was declined by the content-safety filter "
+                    "(the wording was flagged). Rephrase — keep it plainly descriptive — "
+                    "and try again."
+                )
+            logger.warning("edit_image: %s failed (%s)", model, edit_exc)
+            return f"ERROR: Image edit failed: {str(edit_exc)[:300]}"
+
+        if not b64:
+            return "ERROR: Image edit returned no image data."
+        try:
+            img_bytes = base64.b64decode(b64)
+        except Exception:
+            return "ERROR: Image edit returned malformed image data."
+
+        uid = self._current_user_id or ""
+        try:
+            att = await _persist(img_bytes, filename, "image/png", uid or self._user_scope())
+        except Exception as exc:
+            logger.exception("edit_image persist failed")
+            return f"ERROR: Could not save the edited image: {exc}"
+        # Workspace copy so the model can send_photo it / re-reference it. Best-effort.
+        try:
+            ws_path = self._resolve_path(filename)
+            with open(ws_path, "wb") as f:
+                f.write(img_bytes)
+        except Exception:
+            logger.debug("edit_image workspace copy skipped", exc_info=True)
+
+        # Charge credits (fail-open). Bundle users were already charged inline by
+        # the proxy edits route, so this reports as an idempotent no-op for them.
+        try:
+            from app.services.credit_service import (
+                image_generation_cost_cents, underlying_cost_to_credits,
+            )
+            from app.services.credit_reporter import report_image_charge
+            cents = image_generation_cost_cents(size, quality)
+            if uid:
+                await report_image_charge(
+                    user_id=uid,
+                    credits=float(underlying_cost_to_credits(cents)),
+                    underlying_cost_cents=float(cents),
+                    model=model,
+                    idempotency_key=f"image_edit:{uid}:{att.id}",
+                    metadata={"size": size, "quality": quality, "op": "edit"},
+                )
+        except Exception:
+            logger.exception("edit_image credit report failed (non-fatal)")
+
+        summary = await self._register_attachment(att)
+        return (
+            f"Image edited with {model} ({size}, {quality} quality) and "
+            f"delivered to the user. {summary}"
+        )
 
     # ------------------------------------------------------------------
     # 13. process — long-running background shell process management
@@ -3906,6 +4257,54 @@ class ToolExecutor:
             return f"ERROR: {e}"
 
     # ------------------------------------------------------------------
+    # Autopilot — hand off a goal to the autonomous mission engine
+    # ------------------------------------------------------------------
+
+    async def _tool_start_mission(self, inp: Dict[str, Any]) -> str:
+        """Create an Autopilot mission (Autopilot arc PR8). Thin wrapper
+        over the same helper POST /autopilot/missions uses; denied for
+        autopilot/subagent profiles (no recursion — prompt_profile deny
+        sets)."""
+        from app.config import settings as _settings
+        from app.agent.autopilot_gate import autopilot_enabled_for
+
+        if not autopilot_enabled_for(_settings):
+            return (
+                "ERROR: Autopilot missions are not enabled on this agent yet. "
+                "Offer to do the work in this conversation instead."
+            )
+        user_id = self._current_user_id
+        if not user_id:
+            return "ERROR: no user context for this turn"
+
+        goal = (inp.get("goal") or "").strip()
+        try:
+            from app.api.autopilot import MissionCreateError, create_mission
+
+            routine = await create_mission(
+                user_id=user_id,
+                goal=goal,
+                name=(inp.get("name") or "").strip() or None,
+                budget_credits=inp.get("budget_credits"),
+                urgent=bool(inp.get("urgent")),
+            )
+        except MissionCreateError as e:
+            return f"ERROR: {e.message}"
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[start_mission] failed: %s", e)
+            return f"ERROR: could not create the mission ({type(e).__name__})"
+
+        cfg = routine.config_json or {}
+        return (
+            f"Mission created: \"{routine.name}\" (id {routine.id}).\n"
+            f"Budget: {cfg.get('budget_credits')} credits; ticks every "
+            f"{routine.schedule_interval_seconds}s while active.\n"
+            "It runs in the background from now on — Autopilot will push a "
+            "notification when it finishes or needs a decision, and the user "
+            "can watch/pause/cancel it in Mission Control (/dashboard)."
+        )
+
+    # ------------------------------------------------------------------
     # Job management — create/update dashboard jobs
     # ------------------------------------------------------------------
 
@@ -3975,6 +4374,19 @@ class ToolExecutor:
         except Exception:
             pass
 
+        # Phone surface: start the lock-screen/Dynamic-Island card via
+        # the push lane (same contract as spawned jobs — the LA lane is
+        # keyed on data.mission_id). Step counts give REAL discrete
+        # progress here, updated by _tool_update_job.
+        from app.agent.subagent_orchestrator import _notify_job_event
+        await _notify_job_event(
+            job_id=job_id, label=title, kind="mission_started",
+            title=f"🛠 Working on: {title[:150]}",
+            body=(description or "")[:200],
+            progress=0,
+            dedup_suffix="started",
+        )
+
         return _json.dumps({"job_id": job_id, "title": title, "steps": len(steps)})
 
     async def _tool_update_job(self, inp: Dict[str, Any]) -> str:
@@ -4032,9 +4444,9 @@ class ToolExecutor:
             await db.commit()
 
         # Broadcast
+        current_label = ""
         try:
             from app.api.ws_chat import broadcast_to_user
-            current_label = ""
             if steps:
                 running = [s for s in steps if s.get("status") == "running"]
                 current_label = running[0]["label"] if running else (steps[-1]["label"] if steps else "")
@@ -4049,5 +4461,32 @@ class ToolExecutor:
             })
         except Exception:
             pass
+
+        # Phone surface: advance or end the Live Activity card. Step
+        # counts give an honest discrete bar; the lane never moves it
+        # backwards.
+        from app.agent.subagent_orchestrator import _notify_job_event
+        pct = int(completed_count / len(steps) * 100) if steps else None
+        if job.status == "completed":
+            await _notify_job_event(
+                job_id=job_id, label=job.title, kind="mission_completed",
+                title=f"✅ Done: {(job.title or 'background task')[:150]}",
+                body=current_label or "Finished.",
+                progress=100, dismiss_after_s=900, dedup_suffix="completed",
+            )
+        elif job.status == "failed":
+            await _notify_job_event(
+                job_id=job_id, label=job.title, kind="mission_failed",
+                title=f"⚠️ Didn't finish: {(job.title or 'background task')[:150]}",
+                body=(error_message or "The task hit an error.")[:300],
+                dedup_suffix="failed",
+            )
+        else:
+            await _notify_job_event(
+                job_id=job_id, label=job.title, kind="progress",
+                title=f"Working on: {(job.title or 'background task')[:150]}",
+                body=current_label or None,
+                progress=pct, priority="low", dedup_suffix="progress",
+            )
 
         return _json.dumps({"ok": True, "status": job.status, "completed_steps": completed_count})

@@ -749,6 +749,44 @@ async def list_jobs(current_user=Depends(get_current_user), db: AsyncSession = D
     return await _proxy(agent_url, key, "jobs/")
 
 
+@router.get("/jobs/events")
+async def jobs_events_proxy(
+    request: Request,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Activity-feed proxy. MUST be defined before ``GET /jobs/{job_id}``
+    (Starlette matches in registration order) — otherwise ``events``
+    resolves as a job_id, the agent 404s, and the dashboard silently
+    falls back to the legacy client-side steps_json flatten this feed
+    was built to replace (2026-07-08 prod bug).
+
+    Forwards the query string verbatim: the feed's keyset pagination
+    (``limit``/``before``) lives in query params, which ``_proxy``
+    call sites don't otherwise carry.
+    """
+    from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
+
+    qs = f"?{request.url.query}" if request.url.query else ""
+    if is_agent_connected(current_user.id):
+        try:
+            result = await send_http_forward(
+                current_user.id, "GET", f"/api/apps/jobs/events{qs}",
+            )
+            if result is not None:
+                return JSONResponse(content=result)
+        except Exception:
+            pass
+
+    agent_info = await _get_agent(current_user.id, db)
+    if not agent_info:
+        # Feed is best-effort: no agent yet → empty page, not 502
+        # (mirrors list_jobs' graceful empty-list behavior).
+        return JSONResponse(content={"events": [], "next_before": None})
+    agent_url, key, _ = agent_info
+    return await _proxy(agent_url, key, f"jobs/events{qs}")
+
+
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     agent_url, key, _ = _require(await _get_agent(current_user.id, db))

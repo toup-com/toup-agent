@@ -1185,12 +1185,18 @@ async def force_run(routine_id: str):
     await _runner._fire(routine_id)
 
     async with async_session_maker() as db:
+        # Multi-fire kinds (autopilot) key fires per-instant, not per
+        # local day (RoutineRunner._fire_idempotency_key) — the daily
+        # key would miss their row. Re-read the newest fire instead;
+        # daily kinds still resolve to today's single row.
         result = await db.execute(
-            select(BuildJob).where(
+            select(BuildJob)
+            .where(
                 BuildJob.source_kind == "routine",
                 BuildJob.source_id == routine_id,
-                BuildJob.idempotency_key == local_today_key,
             )
+            .order_by(BuildJob.created_at.desc())
+            .limit(1)
         )
         run = result.scalar_one_or_none()
     if run is None:

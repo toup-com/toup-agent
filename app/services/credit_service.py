@@ -88,6 +88,32 @@ def underlying_cost_to_credits(cost_cents: float | int | Decimal) -> Decimal:
     return _q(cost_cents, _DISPLAY_QUANTUM)
 
 
+def image_generation_cost_cents(size: Optional[str], quality: Optional[str]) -> Decimal:
+    """True OpenAI cost (in cents) for one gpt-image-1 image at (size, quality).
+
+    Pulls from ``settings.image_gen_pricing_cents`` (keyed ``"<size>:<quality>"``)
+    and falls back to ``settings.image_gen_fallback_cents`` for unknown combos.
+    Both the bundle LLM proxy (which charges bundle users inline) and the
+    agent's generate_image tool (which reports the charge for manual/BYO users)
+    call this so the two paths never diverge on price.
+    """
+    size_n = (size or settings.image_gen_default_size or "1024x1024").strip().lower()
+    qual_n = (quality or settings.image_gen_default_quality or "high").strip().lower()
+    if qual_n in ("auto", "hd", "standard", ""):
+        # Map dall-e / "auto" qualities onto our low/medium/high scale so the
+        # price table always resolves. "auto" bills as high (gpt-image-1's auto
+        # skews toward high); dall-e-3 "hd"->high, "standard"->medium.
+        qual_n = {"hd": "high", "standard": "medium", "auto": "high", "": "high"}[qual_n]
+    table = settings.image_gen_pricing_cents or {}
+    cents = table.get(f"{size_n}:{qual_n}")
+    if cents is None:
+        cents = settings.image_gen_fallback_cents
+    # Return underlying cost in CENTS (Decimal, 0.1c granularity). Callers pass
+    # this as underlying_cost_cents and convert to credits via
+    # underlying_cost_to_credits() (1c = 1 credit peg).
+    return _q(cents, _DISPLAY_QUANTUM)
+
+
 def tokens_to_credits(model: str, input_tokens: int, output_tokens: int) -> Decimal:
     """Compute credit cost for an LLM call from token counts.
 

@@ -541,6 +541,104 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
+        # 11b. Generate image — ChatGPT (gpt-image-1) text-to-image
+        # ------------------------------------------------------------------
+        {
+            "name": "generate_image",
+            "description": (
+                "Generate a brand-new image from a text prompt using ChatGPT's "
+                "image model (gpt-image-1). Use this whenever the user asks you "
+                "to create, draw, design, paint, illustrate, or make a picture, "
+                "logo, icon, artwork, poster, or diagram. The image is delivered "
+                "to the user automatically as an inline attachment and also saved "
+                "to the workspace (so you can send_photo or reference it later). "
+                "Do NOT use this to describe/read an existing image — that's "
+                "analyze_image. Higher quality and larger sizes cost more credits."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "Detailed description of the image to generate. Be "
+                            "specific about subject, style, composition, colors, "
+                            "lighting, and mood for best results."
+                        ),
+                    },
+                    "size": {
+                        "type": "string",
+                        "enum": ["1024x1024", "1024x1536", "1536x1024"],
+                        "description": "Dimensions: square (1024x1024, default), portrait (1024x1536), or landscape (1536x1024).",
+                    },
+                    "quality": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Rendering quality. Higher = better but pricier. Default: high.",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional output filename ending in .png (e.g. 'logo.png').",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+        # ------------------------------------------------------------------
+        {
+            "name": "edit_image",
+            "description": (
+                "Edit / modify an EXISTING image using ChatGPT's image model "
+                "(gpt-image-1). Use this whenever the user attaches a photo (or "
+                "references one they sent) and asks you to change, modify, edit, "
+                "add, remove, replace, recolor, restyle, retouch, or transform it "
+                "— e.g. 'make the sky purple', 'remove the person in the back', "
+                "'add sunglasses', 'turn this into a watercolor'. By default it "
+                "edits the image the user most recently uploaded in the "
+                "conversation; pass `image` to target a specific workspace file or "
+                "URL. The result is delivered inline and saved to the workspace. "
+                "Do NOT use this to create a picture from scratch (that's "
+                "generate_image) or to merely describe one (that's analyze_image). "
+                "Higher quality and larger sizes cost more credits."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "What to change about the image. Describe the edit "
+                            "clearly, e.g. 'replace the background with a beach at "
+                            "sunset' or 'make the car red instead of blue'."
+                        ),
+                    },
+                    "image": {
+                        "type": "string",
+                        "description": (
+                            "Optional. A workspace file path or https image URL to "
+                            "edit. Omit to edit the user's most recently uploaded "
+                            "image on this turn."
+                        ),
+                    },
+                    "size": {
+                        "type": "string",
+                        "enum": ["1024x1024", "1024x1536", "1536x1024"],
+                        "description": "Output dimensions: square (1024x1024, default), portrait, or landscape.",
+                    },
+                    "quality": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Rendering quality. Higher = better but pricier. Default: high.",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional output filename ending in .png (e.g. 'edited.png').",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+        # ------------------------------------------------------------------
         # Spawn — background sub-agent task
         # ------------------------------------------------------------------
         {
@@ -553,11 +651,16 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "done. **After calling spawn, END YOUR TURN.** Do not wait or "
                 "poll. Do not chain more tool calls expecting the sub-agent's "
                 "result. Tell the user briefly what you've spawned, then stop. "
-                "Use for: long-running research, complex multi-step tasks, "
-                "work that would otherwise block the conversation for many "
-                "seconds. The sub-agent has tools but cannot itself spawn "
-                "further sub-agents (no grandchildren) and cannot write to "
-                "your user's memory."
+                "Use for: quick, bounded sub-tasks (a few minutes at most) "
+                "that support THIS conversation — a lookup, a comparison, a "
+                "draft the user is waiting on right now. Do NOT use spawn "
+                "when the user wants work to continue after they leave, says "
+                "things like 'while I'm away/asleep', 'keep working on it', "
+                "'in the background and keep me updated', or the work could "
+                "outlast this chat — call start_mission for those instead. "
+                "The sub-agent has tools but cannot itself spawn further "
+                "sub-agents (no grandchildren) and cannot write to your "
+                "user's memory."
             ),
             "input_schema": {
                 "type": "object",
@@ -1404,6 +1507,56 @@ def get_extended_tools():
                     },
                 },
                 "required": ["action"],
+            },
+        },
+        # ------------------------------------------------------------------
+        # Autopilot — hand off a goal to the autonomous mission engine
+        # ------------------------------------------------------------------
+        {
+            "name": "start_mission",
+            "description": (
+                "Hand a goal to Autopilot: an autonomous background engine that "
+                "keeps working on it in ticks AFTER this conversation ends — even "
+                "while the user is offline or asleep — and notifies them on their "
+                "phone when it finishes or needs a decision. Use when the user asks "
+                "you to handle something over time ('book me a dentist appointment', "
+                "'keep researching X and have a draft by morning', 'do this while I "
+                "sleep'). ALSO use start_mission — not spawn — whenever the user "
+                "asks for background work they will walk away from, wants live "
+                "progress or notifications on their phone, or the task could take "
+                "more than a few minutes: missions drive the lock-screen progress "
+                "card; spawn is only for quick sub-tasks inside this conversation. "
+                "Do NOT use for things you can finish in this turn. The "
+                "mission runs unsupervised with a credit budget; anything requiring "
+                "an outward action (sending email, purchases) will pause and ask the "
+                "user for approval. Tell the user the mission was created and that "
+                "they can watch or stop it in Mission Control."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": (
+                            "The full goal, self-contained — the mission won't see "
+                            "this conversation. Include every constraint the user "
+                            "gave (deadline, preferences, links)."
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Short display name for Mission Control (e.g. 'Dentist appointment').",
+                    },
+                    "budget_credits": {
+                        "type": "number",
+                        "description": "Optional credit budget ceiling (default 100 \u2248 $1).",
+                    },
+                    "urgent": {
+                        "type": "boolean",
+                        "description": "True only if the user explicitly wants to be woken up \u2014 urgent notifications bypass quiet hours.",
+                    },
+                },
+                "required": ["goal"],
             },
         },
         # ------------------------------------------------------------------

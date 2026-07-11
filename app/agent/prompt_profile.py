@@ -51,6 +51,7 @@ class PromptProfile(str, enum.Enum):
 
     FULL = "full"
     SUBAGENT = "subagent"
+    AUTOPILOT = "autopilot"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -115,9 +116,28 @@ _SUBAGENT_SECTIONS: tuple[str, ...] = (
 )
 
 
+# AUTOPILOT — autonomous mission ticks (Autopilot arc PR7). Richer
+# than SUBAGENT (the mission acts FOR the user, so it needs identity +
+# user context to make good choices) but stripped of foreground-only
+# surfaces (media/onboarding/vibecoding/activation). Strict subset of
+# _FULL_SECTIONS, pinned by test.
+_AUTOPILOT_SECTIONS: tuple[str, ...] = (
+    "identity",
+    "voice_rules",
+    "about_you",
+    "user_brain",
+    "active_tasks",
+    "skills",
+    "environment",
+    "runtime",
+    "formatting",
+)
+
+
 _SECTION_LISTS: dict[PromptProfile, tuple[str, ...]] = {
     PromptProfile.FULL: _FULL_SECTIONS,
     PromptProfile.SUBAGENT: _SUBAGENT_SECTIONS,
+    PromptProfile.AUTOPILOT: _AUTOPILOT_SECTIONS,
 }
 
 
@@ -151,6 +171,10 @@ def is_section_allowed(profile: PromptProfile, section_key: str) -> bool:
 _POST_BUILDER_ALLOWED: dict[PromptProfile, bool] = {
     PromptProfile.FULL: True,
     PromptProfile.SUBAGENT: False,
+    # Missions carry their own continuity (goal + note + last summary
+    # in the tick prompt) — day-chat blocks would just burn tokens on
+    # every tick.
+    PromptProfile.AUTOPILOT: False,
 }
 
 
@@ -185,6 +209,8 @@ SUBAGENT_DISABLED_TOOLS: frozenset[str] = frozenset({
     "memory_delete",
     # No grandchildren — v1 depth = 1
     "spawn",
+    # No missions from sub-agents (Autopilot PR8)
+    "start_mission",
     # Dashboard / sidebar surfaces are user-intent shapes; a sub-agent
     # creating jobs would confuse the activity feed
     "create_job",
@@ -212,9 +238,45 @@ SUBAGENT_DISABLED_TOOLS: frozenset[str] = frozenset({
 })
 
 
+# Unsupervised-action policy for autonomous mission ticks
+# (docs/autopilot/PLAN.md D3). Deny-by-default for anything that
+# mutates OUTSIDE the tenant workspace or rewires the user's
+# automations; workspace file ops / exec / research stay available —
+# that is how missions make progress. Outward mutation via CONNECTOR
+# tools is separately denied at the channel layer
+# (connector_dispatcher._MUTATES_DEFAULT_DENY_CHANNELS includes
+# "autopilot"; per-user explicit allows still override there).
+AUTOPILOT_DISABLED_TOOLS: frozenset[str] = frozenset({
+    # Brain hygiene: missions may store findings, never delete.
+    "memory_delete",
+    # Dashboard / automation mutators — user-intent surfaces.
+    "create_job",
+    "update_job",
+    "routines__create",
+    "routines__remind",
+    "routines__update",
+    "routines__delete",
+    "routines__run_now",
+    "triggers__create",
+    "triggers__update",
+    "triggers__delete",
+    # Extension tools need the user's foreground Chrome — pointless
+    # (and slow) while the user is away. Same rationale as SUBAGENT.
+    "extension_search",
+    "extension_read",
+    "extension_research",
+    # Credential vault — never unsupervised (also channel-blocked).
+    "save_streaming_credential",
+    # No mission-from-mission recursion (Autopilot PR8).
+    "start_mission",
+})
+
+
 def disabled_tools_for(profile: PromptProfile) -> frozenset[str]:
     """Default tool-disable set per profile. Merged with the user's
     own ``AgentConfig.disabled_tools`` at agent_runner.run() time."""
     if profile == PromptProfile.SUBAGENT:
         return SUBAGENT_DISABLED_TOOLS
+    if profile == PromptProfile.AUTOPILOT:
+        return AUTOPILOT_DISABLED_TOOLS
     return frozenset()

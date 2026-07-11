@@ -63,6 +63,25 @@ class Settings(BaseSettings):
     enable_scheduler: bool = True  # Set to False in multi-worker deployments
     decay_interval_hours: int = 6  # How often to run decay
     consolidation_cron_hour: int = 3  # Hour to run consolidation (3 AM)
+
+    # Proactive-notification dispatcher (Autopilot arc PR3). Runs on
+    # EVERY replica — safety comes from per-row status CAS, not from
+    # this flag. The flag is the ops kill switch.
+    notification_dispatch_enabled: bool = True
+    notification_dispatch_interval_seconds: int = 30
+    notification_receipt_delay_minutes: int = 15  # Expo says ~15 min
+    notification_max_attempts: int = 5
+
+    # APNs (direct, token-based auth) — drives iOS Live Activities for
+    # Autopilot missions (push-to-start + progress updates + end). All
+    # four must be set or Live Activity sends silently no-op (the rest
+    # of the notification pipeline is unaffected). The .p8 signing key
+    # is passed base64-encoded so it fits in a single env var.
+    apns_key_b64: Optional[str] = None      # base64(AuthKey_XXXX.p8 contents)
+    apns_key_id: Optional[str] = None       # 10-char key id from the portal
+    apns_team_id: Optional[str] = None      # Apple team id (5W2R26Z4H7)
+    apns_bundle_id: str = "ai.toup.app"     # LA topic = <bundle>.push-type.liveactivity
+    live_activity_enabled: bool = True      # ops kill switch for the LA lane
     
     # Telegram Bot
     telegram_bot_token: Optional[str] = None  # Set via TELEGRAM_BOT_TOKEN env var
@@ -411,6 +430,23 @@ class Settings(BaseSettings):
         "exactly: __HEARTBEAT_SKIP__"
     )
 
+    # Autopilot — autonomous mission engine (Autopilot arc PR6).
+    # DISTINCT from the legacy heartbeat_* block above (Telegram-only
+    # nudger) — do not merge the flags; reusing heartbeat_enabled would
+    # arm the old path. Default OFF until the PR7 action policy lands.
+    autopilot_enabled: bool = False
+    # Staged rollout: comma-separated full user ids that get Autopilot
+    # even while the master flag is off (admin/canary tenants). Baked
+    # image-wide via Dockerfile.agent; see app/agent/autopilot_gate.py.
+    autopilot_user_allowlist: str = ""
+    autopilot_default_budget_credits: int = 100   # ≈ $1 per mission
+    autopilot_base_interval_seconds: int = 300    # APScheduler tick base
+    autopilot_tick_timeout_seconds: int = 300     # asyncio.wait_for per turn
+    autopilot_max_ticks: int = 100                # per-mission safety cap
+    autopilot_backoff_cap_seconds: int = 7200     # adaptive-cadence ceiling
+    autopilot_no_progress_blocker_threshold: int = 3  # strikes → ask user
+    autopilot_platform_failclosed_threshold: int = 3  # unreachable ticks → pause
+
     # DM Pairing & Access Control
     telegram_require_pairing: bool = False  # Require /pair before using bot
     telegram_pairing_code: str = ""  # Pairing code users must provide
@@ -471,6 +507,12 @@ class Settings(BaseSettings):
     tool_timeout_overrides: dict[str, int] = {  # Per-tool timeout overrides
         "exec": 120, "web_fetch": 60, "web_search": 30,
         "browser": 120, "spawn": 300, "process": 300,
+        # gpt-image-1 generation/edit takes 30-90s (esp. high quality), which
+        # blows the 30s default and returns "Tool timed out". Give it headroom
+        # ABOVE image_gen_timeout_s (180) so the OpenAI HTTP timeout surfaces a
+        # clean error first rather than the tool wrapper killing it mid-flight.
+        "generate_image": 200,
+        "edit_image": 200,
     }
 
     # ── DM / Group Policy ────────────────────────────────────
@@ -1013,6 +1055,35 @@ class Settings(BaseSettings):
         "claude-sonnet-4-5-20250514": {"input": 0.003, "output": 0.015},
         "claude-sonnet-4-20250514": {"input": 0.003, "output": 0.015},
     }
+
+    # ── Image generation (ChatGPT / gpt-image-1) ───────────────
+    # The agent's generate_image tool and the bundle LLM proxy's images route
+    # both read these. gpt-image-1 is priced PER IMAGE (not per token) and the
+    # price depends on (size, quality). We peg 1 credit = 1 cent of true OpenAI
+    # cost, so image_gen_pricing_cents holds OpenAI's published per-image USD
+    # cost expressed in cents. Admins can tune these live via platform_settings
+    # (credit.image_price.* handled the same way as flat-fee overrides is a
+    # future extension; for now edit here or via env override).
+    image_gen_enabled: bool = True
+    image_gen_model: str = "gpt-image-1"          # "ChatGPT image"; falls back to dall-e-3 on unsupported-model errors
+    image_gen_fallback_model: str = "dall-e-3"    # used when gpt-image-1 is unavailable (org not verified, old SDK)
+    image_gen_default_size: str = "1024x1024"     # 1024x1024 | 1024x1536 (portrait) | 1536x1024 (landscape)
+    image_gen_default_quality: str = "high"       # low | medium | high  (default HIGH per product decision)
+    image_gen_timeout_s: float = 180.0            # gpt-image-1 can be slow
+    # edit_image (gpt-image-1 edits endpoint) — modify a user's uploaded image.
+    # Reuses image_gen_* pricing/size/quality/timeout. gpt-image-1 ONLY: dall-e-3
+    # has no edits endpoint, so there is no fallback model here.
+    image_edit_enabled: bool = True
+
+    # Per-image cost in CENTS, keyed "<size>:<quality>". Mirrors OpenAI's
+    # gpt-image-1 image-token pricing (approx). Unknown combos fall back to
+    # image_gen_fallback_cents. 1 cent -> 1 credit at settle time.
+    image_gen_pricing_cents: dict[str, float] = {
+        "1024x1024:low": 1.1,   "1024x1024:medium": 4.2,  "1024x1024:high": 16.7,
+        "1024x1536:low": 1.6,   "1024x1536:medium": 6.3,  "1024x1536:high": 25.0,
+        "1536x1024:low": 1.6,   "1536x1024:medium": 6.3,  "1536x1024:high": 25.0,
+    }
+    image_gen_fallback_cents: float = 17.0        # unknown size/quality -> charge ~high 1024²
 
     # Strip whitespace from API key fields on load (users often paste with spaces)
     _KEY_FIELDS = {

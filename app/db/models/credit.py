@@ -95,6 +95,7 @@ LEDGER_BUILD_STEP = "build_step"
 LEDGER_TOOL_CALL = "tool_call"
 LEDGER_BROWSER_ACTION = "browser_action"
 LEDGER_DOC_GEN = "doc_gen"
+LEDGER_IMAGE_GEN = "image_generation"  # ChatGPT (gpt-image-1) image generation, priced per-image
 LEDGER_RESERVATION = "reservation"
 LEDGER_SETTLEMENT = "settlement"
 LEDGER_REFUND = "refund"

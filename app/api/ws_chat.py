@@ -2142,9 +2142,14 @@ async def ws_chat(
 
                 # Handle media attachments (images/files from frontend)
                 _media_paths = []
+                # Persisted pointers → user Message.attachments so inbound images
+                # survive reload / show in history / other devices, and are a
+                # reusable source for the edit_image tool.
+                _inbound_attachments: list = []
                 _media_items = msg.get("media", [])
                 if _media_items and isinstance(_media_items, list):
                     import tempfile, base64 as _b64, os as _os
+                    from app.agent.doc_generators import _persist as _persist_att
                     for _mi in _media_items[:5]:  # Max 5 attachments
                         try:
                             _mtype = _mi.get("type", "image/png")
@@ -2171,11 +2176,37 @@ async def ws_chat(
                             # Sanitize filename (keep only the basename, no path traversal)
                             _fname = _os.path.basename(_fname)
                             _fpath = _os.path.join(_tmpdir, _fname)
+                            _raw = _b64.b64decode(_mdata)
                             with open(_fpath, "wb") as _wf:
-                                _wf.write(_b64.b64decode(_mdata))
+                                _wf.write(_raw)
                             _media_paths.append(_fpath)
+                            # Persist to the storage backend + record a pointer.
+                            # Best-effort: a storage hiccup must not drop the turn.
+                            try:
+                                _att = await _persist_att(_raw, _fname, _mtype, user_id)
+                                _inbound_attachments.append(_att.to_dict())
+                            except Exception as _pe:
+                                logger.warning("[WS] Failed to persist inbound attachment: %s", _pe)
                         except Exception as _me:
                             logger.warning("[WS] Failed to process media attachment: %s", _me)
+
+                # If the user message was already presaved (existing session),
+                # back-fill its attachments now that inbound media is persisted.
+                # The first-message path instead threads inbound_attachments into
+                # run() (below), which saves the user row with attachments.
+                if _inbound_attachments and _user_msg_presaved and _persisted_user_msg_id:
+                    try:
+                        from app.db.database import async_session_maker as _att_sm
+                        async with _att_sm() as _att_db:
+                            _urow = (await _att_db.execute(
+                                __import__('sqlalchemy').select(DbMessage)
+                                .where(DbMessage.id == _persisted_user_msg_id)
+                            )).scalar_one_or_none()
+                            if _urow is not None:
+                                _urow.attachments = _inbound_attachments
+                                await _att_db.commit()
+                    except Exception as _ae:
+                        logger.warning("[WS] Failed to back-fill presaved attachments: %s", _ae)
 
                 # ── Fast-path: detect play/music requests and fire media_play immediately ──
                 # Returns (modified_text, media_meta) if media was found, so agent skips play_media
@@ -2281,6 +2312,7 @@ async def ws_chat(
                     model_override=model,
                     save_user_message=not is_onboarding_msg and not _user_msg_presaved and not _is_system_action,
                     media_paths=_media_paths if _media_paths else None,
+                    inbound_attachments=_inbound_attachments if _inbound_attachments else None,
                     client_tz=client_tz,
                     app_id=app_id_from_msg,
                     force_new_session=force_new_session,

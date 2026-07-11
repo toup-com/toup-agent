@@ -12,6 +12,7 @@ right — Routines stand alone.
 """
 
 from .agent_task_handler import AgentTaskHandler
+from .autopilot_handler import AutopilotHandler
 from .base_handler import RoutineHandler, RoutineResult, RoutineStatus
 from .email_briefing_handler import EmailBriefingHandler
 from .reminder_handler import ReminderHandler
@@ -24,12 +25,15 @@ from .runner import RoutineRunner
 #   - `email_briefing` — Gmail-specialised preset (LLM + MCP)
 #   - `agent_task`     — generic prompt-driven, runs through the agent (LLM)
 #   - `reminder`       — text-only delivery, no LLM/MCP (mig 042)
+#   - `autopilot`      — autonomous mission heartbeat (Autopilot PR6)
 register_handler(EmailBriefingHandler())
 register_handler(AgentTaskHandler())
 register_handler(ReminderHandler())
+register_handler(AutopilotHandler())
 
 __all__ = [
     "AgentTaskHandler",
+    "AutopilotHandler",
     "EmailBriefingHandler",
     "ReminderHandler",
     "RoutineHandler",

@@ -14,13 +14,15 @@ Mounted under /api/account/* by platform_main.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, select
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,32 +41,93 @@ router = APIRouter(prefix="/account", tags=["Account"])
 # Notification preferences
 # =====================================================================
 
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+class QuietHours(BaseModel):
+    """Local-time DND window (user's platform-side timezone). The
+    window may cross midnight (start 22:00, end 08:00)."""
+
+    enabled: bool = True
+    start: str = "22:00"
+    end: str = "08:00"
+
+    @field_validator("start", "end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        if not _HHMM_RE.match(v):
+            raise ValueError("must be HH:MM (24h)")
+        return v
+
+
 class NotificationPreferences(BaseModel):
-    """The shape returned by GET and accepted by PATCH. All three
-    keys always present in the response (NULL on the user row is
-    backfilled from DEFAULT_NOTIFICATION_PREFERENCES on read), but
-    PATCH treats every field as optional so the frontend can flip
-    one toggle at a time."""
+    """The shape returned by GET and accepted by PATCH. All keys are
+    always present in the response (NULL on the user row is backfilled
+    from DEFAULT_NOTIFICATION_PREFERENCES on read), but PATCH treats
+    every field as optional so the frontend can flip one toggle at a
+    time. Every DEFAULT_NOTIFICATION_PREFERENCES key MUST have a field
+    here — PATCH whitelists through this model."""
 
     morning_briefing: bool
     security_alerts: bool
     product_updates: bool
+    autopilot_push: bool
+    autopilot_channel_fallback: bool
+    quiet_hours: QuietHours
+    daily_push_cap: int
 
 
 class NotificationPreferencesPatch(BaseModel):
     morning_briefing: Optional[bool] = None
     security_alerts: Optional[bool] = None
     product_updates: Optional[bool] = None
+    autopilot_push: Optional[bool] = None
+    autopilot_channel_fallback: Optional[bool] = None
+    quiet_hours: Optional[QuietHours] = None
+    daily_push_cap: Optional[int] = Field(default=None, ge=0, le=100)
 
 
-def _merged_prefs(row_value: Optional[Dict[str, Any]]) -> Dict[str, bool]:
+def _prefs_dict(raw: Any) -> Optional[Dict[str, Any]]:
+    """The JSONB value can be a dict (ORM writes) OR a JSON string
+    (extension.py writes json.dumps via raw SQL) — readers must
+    handle both (see browsing_memory.py for the same defense)."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _merged_prefs(row_value: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Merge stored prefs over the defaults so newly-added toggles
-    get their default value for users whose row predates them."""
-    merged = dict(DEFAULT_NOTIFICATION_PREFERENCES)
+    get their default value for users whose row predates them.
+    Type-checked per key against the default's type — a corrupted or
+    hand-edited row value never poisons the merged view."""
+    merged: Dict[str, Any] = {
+        k: (dict(v) if isinstance(v, dict) else v)
+        for k, v in DEFAULT_NOTIFICATION_PREFERENCES.items()
+    }
+    row_value = _prefs_dict(row_value)
     if isinstance(row_value, dict):
         for k, v in row_value.items():
-            if k in merged and isinstance(v, bool):
-                merged[k] = v
+            if k not in merged:
+                continue
+            default = DEFAULT_NOTIFICATION_PREFERENCES[k]
+            if isinstance(default, bool):
+                if isinstance(v, bool):
+                    merged[k] = v
+            elif isinstance(default, int):
+                # bool is an int subclass — exclude it explicitly.
+                if isinstance(v, int) and not isinstance(v, bool):
+                    merged[k] = max(0, min(100, v))
+            elif isinstance(default, dict):
+                if isinstance(v, dict):
+                    sub = dict(default)
+                    for sk, sv in v.items():
+                        if sk in sub and isinstance(sv, type(sub[sk])):
+                            sub[sk] = sv
+                    merged[k] = sub
     return merged
 
 
@@ -127,13 +190,31 @@ async def update_preferences(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> NotificationPreferences:
-    current = _merged_prefs(getattr(current_user, "notification_preferences", None))
+    raw = _prefs_dict(getattr(current_user, "notification_preferences", None))
+    current = _merged_prefs(raw)
     if body.morning_briefing is not None:
         current["morning_briefing"] = body.morning_briefing
     if body.security_alerts is not None:
         current["security_alerts"] = body.security_alerts
     if body.product_updates is not None:
         current["product_updates"] = body.product_updates
+    if body.autopilot_push is not None:
+        current["autopilot_push"] = body.autopilot_push
+    if body.autopilot_channel_fallback is not None:
+        current["autopilot_channel_fallback"] = body.autopilot_channel_fallback
+    if body.quiet_hours is not None:
+        current["quiet_hours"] = body.quiet_hours.model_dump()
+    if body.daily_push_cap is not None:
+        current["daily_push_cap"] = body.daily_push_cap
+    # Preserve keys OUTSIDE the whitelist instead of wiping them: the
+    # extension writes extension_memory_optout into this JSONB via raw
+    # SQL (extension.py), and the old write-whole-dict behavior erased
+    # it on every prefs PATCH. Whitelisted keys still only change
+    # through their typed fields above.
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k not in DEFAULT_NOTIFICATION_PREFERENCES:
+                current[k] = v
     current_user.notification_preferences = current
     current_user.updated_at = datetime.utcnow()
     await db.commit()

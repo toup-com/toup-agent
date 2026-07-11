@@ -370,6 +370,108 @@ async def agent_deduct(
     )
 
 
+class AgentChargeRequest(BaseModel):
+    """Posted by the tenant agent to charge an EXPLICIT per-event credit
+    amount that is NOT derived from token counts.
+
+    Used for tools priced per-event rather than per-token — today, image
+    generation (gpt-image-1), which is priced per image by (size, quality).
+    ``credits`` is the already-converted amount to deduct;
+    ``underlying_cost_cents`` is stored for audit. ``idempotency_key`` should
+    uniquely identify the event (a fresh UUID per image is fine).
+    """
+    user_id: str
+    event_type: str = "image_generation"
+    credits: float
+    bucket: str = "message"           # "message" | "integration"
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    underlying_cost_cents: Optional[float] = None
+    idempotency_key: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+@router.post("/agent-charge", response_model=AgentDeductResponse)
+async def agent_charge(
+    body: AgentChargeRequest,
+    x_agent_key: Optional[str] = Header(None, alias="X-Agent-Key"),
+    db: AsyncSession = Depends(get_db),
+) -> AgentDeductResponse:
+    """Charge an explicit per-event credit amount (image generation, etc.).
+
+    Same auth + guards as /agent-deduct: X-Agent-Key must match the claimed
+    user's AgentConfig; bundle-mode agents are NOT charged here (their cost is
+    already deducted inline by the platform LLM proxy — see
+    llm_proxy.proxy_openai_images), which prevents a double charge; admins are
+    unlimited; shadow mode records the ledger row without denying.
+    """
+    from decimal import Decimal as _Decimal
+    from app.services.credit_service import (
+        BUCKET_MESSAGE as _BUCKET_MESSAGE,
+        BUCKET_INTEGRATION as _BUCKET_INTEGRATION,
+        REASON_INSUFFICIENT_MESSAGE as _REASON_INSUFFICIENT_MESSAGE,
+    )
+
+    if not x_agent_key:
+        raise HTTPException(401, "X-Agent-Key required")
+
+    cfg = (await db.execute(
+        select(AgentConfig).where(
+            AgentConfig.user_id == body.user_id,
+            AgentConfig.agent_api_key == x_agent_key,
+        )
+    )).scalar_one_or_none()
+    if cfg is None:
+        raise HTTPException(403, "agent key mismatch")
+
+    bucket = _BUCKET_INTEGRATION if body.bucket == "integration" else _BUCKET_MESSAGE
+
+    # Bundle-mode guard — the proxy already charged this event inline, so skip
+    # the agent-side charge but return the real balance/enforcement so the
+    # agent's CreditState stays accurate. Mirrors the /agent-deduct guard.
+    if (cfg.llm_mode or "").strip().lower() == "bundle":
+        view = await credit_service.get_balance_view(db, body.user_id)
+        await db.commit()
+        remaining = float(view.message_credits_remaining)
+        enforcement = bool(view.enforcement_enabled)
+        sufficient = (not enforcement) or remaining > 0
+        return AgentDeductResponse(
+            success=sufficient, bucket=bucket, amount_charged=0.0,
+            balance_after=remaining, enforcement_enabled=enforcement,
+            reason=None if sufficient else _REASON_INSUFFICIENT_MESSAGE,
+            idempotent_hit=True,
+            plan_id=view.plan_id, plan_display_name=view.plan_display_name,
+            period_end=view.period_end,
+        )
+
+    # Floor at 0.1 credit so try_charge (rejects amount<=0) never gets a zero.
+    credits = max(_Decimal("0.1"), _Decimal(str(body.credits)))
+    result = await credit_service.try_charge(
+        db, body.user_id, body.event_type or "image_generation", bucket, credits,
+        idempotency_key=body.idempotency_key,
+        model=body.model,
+        provider=body.provider,
+        underlying_cost_cents=body.underlying_cost_cents,
+        metadata={"surface": "agent_charge", **(body.metadata or {})},
+    )
+    view = await credit_service.get_balance_view(db, body.user_id)
+    await db.commit()
+
+    from app.config import settings as _settings
+    return AgentDeductResponse(
+        success=result.success,
+        bucket=bucket,
+        amount_charged=float(credits) if result.success else 0.0,
+        balance_after=float(result.balance_after),
+        enforcement_enabled=bool(getattr(_settings, "credit_enforcement_enabled", False)),
+        reason=result.reason,
+        idempotent_hit=result.idempotent_hit,
+        plan_id=view.plan_id,
+        plan_display_name=view.plan_display_name,
+        period_end=view.period_end,
+    )
+
+
 @billing_router.get("/plans", response_model=PlansResponse)
 async def list_plans(db: AsyncSession = Depends(get_db)) -> PlansResponse:
     """Public plan catalog for the pricing page. No auth."""

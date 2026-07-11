@@ -477,7 +477,33 @@ class RoutineRunner:
             return bool(getattr(settings, "routines_reminders_enabled", master))
         if kind in ("email_briefing", "agent_task"):
             return master
+        # Autopilot missions (Autopilot arc PR6) — master flag OR the
+        # staged-rollout user allowlist (autopilot_gate).
+        if kind == "autopilot":
+            from app.agent.autopilot_gate import autopilot_enabled_for
+            return autopilot_enabled_for(settings)
         return False
+
+    @staticmethod
+    def _fire_idempotency_key(kind: str, local_date, fire_instant) -> str:
+        """Per-fire dedupe key for the BuildJob claim in ``_fire``.
+
+        Default = ``str(local_date)`` — ONE fire per routine per
+        user-local day, which is correct for briefings/reminders but a
+        structural blocker for kinds that must tick many times a day:
+        the second fire of the day hits the (source_id,
+        idempotency_key) UNIQUE and silently exits before the handler.
+
+        Multi-fire kinds (autopilot) therefore include the APScheduler
+        fire instant: retries of the SAME fire still share a key (the
+        instant is the scheduled time, not now()), while each new
+        interval fire gets a fresh one. fire_instant can be None on
+        the manual force-run path — fall back to now() so a force-run
+        always executes."""
+        if kind == "autopilot":
+            instant = fire_instant or datetime.utcnow()
+            return f"{local_date}T{instant.strftime('%H%M%S')}"
+        return str(local_date)
 
     async def _register_trigger_for(self, routine) -> str:
         """Register one routine's trigger. Returns a tag string for
@@ -820,7 +846,9 @@ class RoutineRunner:
         from app.agent.job_runner import JobRunner, TaskSpec
         from app.db.models import BuildJob
 
-        idempotency_key = str(local_date)
+        idempotency_key = self._fire_idempotency_key(
+            routine.kind, local_date, fire_instant,
+        )
         async with self._session_maker() as db:
             existing_job_id = (await db.execute(
                 select(BuildJob.id).where(

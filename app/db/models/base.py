@@ -63,6 +63,13 @@ AGENT_ONLY_TABLES: set[str] = {
     "messages",
     # Durable exactly-once ledger for inbound chat (see ProcessedMessage).
     "processed_messages",
+    # Durable agent→platform notification outbox (Autopilot PR4) —
+    # flushed to the platform's /api/agent/notify, acked rows only.
+    "agent_notify_outbox",
+    # Autopilot approvals — durable ask-the-user store (Autopilot PR7);
+    # survives WS disconnects/restarts unlike the in-memory
+    # PermissionBroker. Platform reads via the agent HTTP API only.
+    "autopilot_approvals",
     # Memory system
     "memories",
     "memory_relationships",
@@ -165,6 +172,18 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # that skip agent DBs).
     "grant_eligibility",
     "signup_attempts",
+    # Proactive notifications (Autopilot arc PR2). Expo push tokens are
+    # per-device credentials the platform owns — agent containers must
+    # never hold them (same isolation stance as connector tokens above).
+    # The queue is claimed/sent by the platform dispatcher; agents only
+    # reach it through POST /api/agent/notify.
+    "push_devices",
+    "notification_queue",
+    # iOS Live Activity push-to-start tokens + per-mission activity
+    # state (Autopilot phone surface). APNs tokens are platform-only
+    # for the same reason as Expo tokens above.
+    "live_activity_devices",
+    "live_activities",
 }
 
 SHARED_TABLES: set[str] = {

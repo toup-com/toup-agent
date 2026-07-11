@@ -26,7 +26,7 @@ alembic==1.13.1
 # Embeddings & NLP — lazy-loaded; module imports only need numpy + tiktoken
 numpy>=1.26.0
 tiktoken>=0.5.0
-openai>=1.0.0
+openai>=1.68.0
 
 # Auth & Security
 python-jose[cryptography]==3.3.0

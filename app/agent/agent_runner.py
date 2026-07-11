@@ -99,7 +99,7 @@ def _profile_name_for_log(profile) -> str:
 # `telegram` and `voice` are permanently excluded (their retention model
 # makes chat-save the wrong UX). `mobile` is excluded until the RN
 # renderer ships; CP4.4 removes `mobile` from this set.
-VAULT_TOOL_CHANNEL_BLOCK = frozenset({"telegram", "voice", "mobile"})
+VAULT_TOOL_CHANNEL_BLOCK = frozenset({"telegram", "voice", "mobile", "autopilot"})
 VAULT_TOOL_NAME = "save_streaming_credential"
 
 
@@ -346,6 +346,7 @@ class AgentRunner:
         on_credential_confirm_request: Optional[OnCredentialConfirmRequest] = None,
         on_credit_exhausted: Optional[OnCreditExhausted] = None,
         media_paths: Optional[List[str]] = None,
+        inbound_attachments: Optional[List[Dict[str, Any]]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         model_override: Optional[str] = None,
         thinking_budget: int = 0,
@@ -447,6 +448,9 @@ class AgentRunner:
         self.tools.set_user_id(user_id)
         self.tools.set_chat_id(telegram_chat_id)
         self.tools.set_channel(channel)
+        # Expose the user's inbound uploads so edit_image can use the image they
+        # just sent as its edit source (persisted by the WS handler in PR1).
+        self.tools.set_inbound_media(inbound_attachments or [])
         # Phase 8: plumb the current job_id (set by routine_runner /
         # trigger_runner / dashboard task intake) onto the tool
         # executor's ContextVar so a sub-agent spawned during this
@@ -1393,6 +1397,7 @@ class AgentRunner:
                     model=model_used,
                     processing_time_ms=int((time.time() - start) * 1000),
                     save_user_message=save_user_message,
+                    inbound_attachments=inbound_attachments,
                     client_tz=client_tz,
                     asst_message_id=asst_message_id,
                     channel=channel,
@@ -3086,6 +3091,7 @@ class AgentRunner:
         model: str,
         processing_time_ms: int,
         save_user_message: bool = True,
+        inbound_attachments: Optional[List[Dict[str, Any]]] = None,
         client_tz: Optional[str] = None,
         asst_message_id: Optional[str] = None,
         channel: Optional[str] = None,
@@ -3134,13 +3140,22 @@ class AgentRunner:
         )
 
         if save_user_message:
-            user_msg = Message(
+            _user_msg_kwargs = dict(
                 conversation_id=session_id,
                 day_chat_id=_day_chat_id,
                 role="user",
                 content=user_message,
                 channel=_msg_channel,
             )
+            # Persist inbound user attachments (images/files) onto the user
+            # row so they survive reload + appear in day-chat history and on
+            # other devices. Bytes were already written to the storage
+            # backend by the WS handler; this records the pointer. Same
+            # {id, filename, mime_type, size_bytes, storage_path, created_at}
+            # shape generate_* tools use for assistant attachments.
+            if inbound_attachments:
+                _user_msg_kwargs["attachments"] = inbound_attachments
+            user_msg = Message(**_user_msg_kwargs)
             db.add(user_msg)
             msg_count += 1
 

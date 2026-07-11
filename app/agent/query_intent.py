@@ -47,8 +47,8 @@ TOOLS_WEB: FrozenSet[str] = frozenset({
 }) | TOOLS_RECALL
 
 TOOLS_MEDIA: FrozenSet[str] = frozenset({
-    "send_file", "send_photo", "analyze_image", "tts", "play_media",
-    "tts_prefs", "canvas",
+    "send_file", "send_photo", "analyze_image", "generate_image", "edit_image",
+    "tts", "play_media", "tts_prefs", "canvas",
 }) | TOOLS_RECALL
 
 TOOLS_CODE: FrozenSet[str] = frozenset({
@@ -216,6 +216,15 @@ _MEDIA_KEYWORDS = {
     "voice", "speak", "read aloud", "tts",
     "analyze image", "describe image", "what's in this image",
     "draw", "paint", "sketch", "canvas",
+    # Image GENERATION (gpt-image-1 / generate_image tool)
+    "generate image", "generate an image", "create image", "create an image",
+    "make an image", "make me an image", "image of", "picture of",
+    "generate a picture", "create a picture", "illustration of", "render an image",
+    # Image EDITING (gpt-image-1 edits / edit_image tool)
+    "edit image", "edit this image", "edit the image", "edit this photo",
+    "edit the photo", "modify this image", "modify the image", "change the image",
+    "change this photo", "edit my photo", "edit my picture", "retouch",
+    "add to this image", "remove from this image", "make this image",
 }
 
 _MEDIA_PATTERNS_RE = re.compile(

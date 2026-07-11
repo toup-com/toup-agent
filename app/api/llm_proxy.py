@@ -206,6 +206,11 @@ async def _check_budget(config: AgentConfig, provider: str, db: AsyncSession) ->
 # ── Cost calculation ─────────────────────────────────────────────────
 
 
+# Floor a per-image charge at 0.1 credit so try_charge (which rejects amount<=0)
+# never receives a zero even if pricing is misconfigured to 0 cents.
+_MIN_IMAGE_CREDITS = Decimal("0.1")
+
+
 def _calc_cost_cents(model: str, input_tokens: int, output_tokens: int) -> int:
     """Calculate cost in cents from token counts using the pricing table."""
     pricing = settings.pricing_per_1k.get(model)
@@ -437,6 +442,32 @@ class OpenAIBackend(LLMBackend):
                     "Authorization": f"Bearer {api_key}",
                     "content-type": "application/json",
                 },
+            )
+
+    async def images(self, body: dict, api_key: str) -> httpx.Response:
+        # gpt-image-1 can take tens of seconds; use the configured image timeout.
+        timeout = getattr(settings, "image_gen_timeout_s", 180.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.post(
+                f"{self.BASE_URL}/v1/images/generations",
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+            )
+
+    async def images_edit(self, data: dict, files: list, api_key: str) -> httpx.Response:
+        # Multipart image edit (gpt-image-1 /images/edits). httpx derives the
+        # multipart boundary from `files`; do NOT set content-type ourselves or
+        # the upstream boundary breaks.
+        timeout = getattr(settings, "image_gen_timeout_s", 180.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.post(
+                f"{self.BASE_URL}/v1/images/edits",
+                data=data,
+                files=files,
+                headers={"Authorization": f"Bearer {api_key}"},
             )
 
 
@@ -912,6 +943,210 @@ async def proxy_embeddings(
     cost = max(1, int(total_tokens * 0.00002 * 100))  # text-embedding-3-small pricing
 
     await _log_event(db, config.user_id, "openai", model, "embeddings", total_tokens, 0, cost, latency)
+
+    return resp_data
+
+
+@router.post("/openai/v1/images/generations")
+async def proxy_openai_images(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Proxy an OpenAI image-generation request (gpt-image-1 / dall-e) for a
+    BUNDLE-mode agent, and charge the user per image inline.
+
+    This is the bundle counterpart of the manual-mode path: a manual/BYO agent
+    calls OpenAI directly and self-reports via /credits/agent-charge, whereas a
+    bundle agent's client is pointed at .../llm/openai/v1 (no OpenAI key of its
+    own), so image generation MUST be proxied here — and this is the one place
+    with DB access to deduct credits. The per-tenant OpenAI project key is
+    applied outbound exactly like _route_chat / proxy_embeddings.
+
+    Billing: image generation is priced PER IMAGE by (size, quality), not by
+    tokens, so we bypass _log_event's token→credit conversion and call
+    try_charge directly with the per-image cost; _log_event is still invoked
+    (0 tokens) so the LLMProxyEvent cost shows in usage/budget dashboards.
+    """
+    config = await _auth_agent(request, db)
+    body = await request.json()
+    model = body.get("model") or getattr(settings, "image_gen_model", "gpt-image-1")
+    size = body.get("size") or getattr(settings, "image_gen_default_size", "1024x1024")
+    quality = body.get("quality") or getattr(settings, "image_gen_default_quality", "high")
+    n = int(body.get("n", 1) or 1)
+
+    api_key = config.bundle_openai_api_key or settings.platform_openai_api_key
+    if not api_key:
+        raise HTTPException(500, "Platform OpenAI key not configured")
+
+    # Budget check — image cost lands on the tenant's OpenAI allocation.
+    budget_result = await _check_budget(config, "openai", db)
+    if budget_result == "monthly_exceeded":
+        raise HTTPException(429, "Monthly OpenAI budget exceeded")
+
+    start_ts = time.time()
+    try:
+        resp = await _openai.images(body, api_key)
+    except Exception as e:
+        latency = int((time.time() - start_ts) * 1000)
+        await _log_event(db, config.user_id, "openai", model, "images", 0, 0, 0, latency, status="error")
+        raise HTTPException(502, f"OpenAI image error: {e}")
+
+    latency = int((time.time() - start_ts) * 1000)
+    if resp.status_code >= 400:
+        # Surface OpenAI's error verbatim (e.g. org-not-verified for gpt-image-1)
+        # so the agent can retry with the fallback model.
+        await _log_event(db, config.user_id, "openai", model, "images", 0, 0, 0, latency, status="error")
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = {"error": resp.text[:500]}
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=detail, status_code=resp.status_code)
+
+    resp_data = resp.json()
+
+    # Per-image cost × n. Charge BEFORE returning so a bundle user can't get a
+    # free image if the response body write races. Idempotency key is a fresh
+    # UUID per request (the agent does not retry the proxy call).
+    from app.services.credit_service import (
+        credit_service, image_generation_cost_cents, underlying_cost_to_credits,
+    )
+    from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
+    cents_each = image_generation_cost_cents(size, quality)
+    total_cents = cents_each * n
+    credits = max(_MIN_IMAGE_CREDITS, underlying_cost_to_credits(total_cents))
+    charge_id = str(uuid.uuid4())
+    try:
+        await credit_service.try_charge(
+            db, config.user_id, LEDGER_IMAGE_GEN, BUCKET_MESSAGE, credits,
+            idempotency_key=charge_id, event_id=charge_id,
+            model=model, provider="openai",
+            underlying_cost_cents=total_cents,
+            metadata={"endpoint": "images", "size": size, "quality": quality, "n": n},
+        )
+    except Exception:
+        logger.exception(
+            "[credits] image try_charge failed user=%s model=%s size=%s q=%s",
+            config.user_id[:8], model, size, quality,
+        )
+    # Record the usage event (0 tokens → its internal charge is a no-op) and
+    # commit both the charge ledger row and the event together.
+    await _log_event(
+        db, config.user_id, "openai", model, "images",
+        0, 0, int(float(total_cents)), latency,
+    )
+
+    return resp_data
+
+
+@router.post("/openai/v1/images/edits")
+async def proxy_openai_image_edits(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Proxy an OpenAI image-EDIT (gpt-image-1 /images/edits) for a BUNDLE-mode
+    agent, charging per image inline. Multipart counterpart of
+    proxy_openai_images: a bundle agent's `client.images.edit()` POSTs
+    multipart/form-data here (its base_url is .../llm/openai/v1, no OpenAI key
+    of its own). Manual/BYO agents hit OpenAI directly and self-report via
+    /credits/agent-charge, so they never reach this route.
+    """
+    config = await _auth_agent(request, db)
+    form = await request.form()
+
+    def _sval(key: str, default: str) -> str:
+        v = form.get(key)
+        return v if isinstance(v, str) and v else default
+
+    model = _sval("model", getattr(settings, "image_gen_model", "gpt-image-1"))
+    size = _sval("size", getattr(settings, "image_gen_default_size", "1024x1024"))
+    quality = _sval("quality", getattr(settings, "image_gen_default_quality", "high"))
+    prompt = _sval("prompt", "")
+    try:
+        n = int(_sval("n", "1"))
+    except (TypeError, ValueError):
+        n = 1
+
+    # Collect the uploaded source image(s) + optional mask. The SDK sends the
+    # field as "image" (gpt-image-1 also accepts "image[]" for multi-image
+    # compositing). UploadFiles expose .read()/.filename/.content_type.
+    files: list = []
+    for _key in ("image", "image[]"):
+        for _uf in form.getlist(_key):
+            if hasattr(_uf, "read"):
+                files.append(("image", (
+                    getattr(_uf, "filename", None) or "image.png",
+                    await _uf.read(),
+                    getattr(_uf, "content_type", None) or "image/png",
+                )))
+    _mask = form.get("mask")
+    if _mask is not None and hasattr(_mask, "read"):
+        files.append(("mask", (
+            getattr(_mask, "filename", None) or "mask.png",
+            await _mask.read(),
+            getattr(_mask, "content_type", None) or "image/png",
+        )))
+    if not files:
+        raise HTTPException(400, "images/edits requires an 'image' file")
+
+    data = {"model": model, "prompt": prompt, "size": size, "quality": quality, "n": n}
+
+    api_key = config.bundle_openai_api_key or settings.platform_openai_api_key
+    if not api_key:
+        raise HTTPException(500, "Platform OpenAI key not configured")
+
+    budget_result = await _check_budget(config, "openai", db)
+    if budget_result == "monthly_exceeded":
+        raise HTTPException(429, "Monthly OpenAI budget exceeded")
+
+    start_ts = time.time()
+    try:
+        resp = await _openai.images_edit(data, files, api_key)
+    except Exception as e:
+        latency = int((time.time() - start_ts) * 1000)
+        await _log_event(db, config.user_id, "openai", model, "images", 0, 0, 0, latency, status="error")
+        raise HTTPException(502, f"OpenAI image edit error: {e}")
+
+    latency = int((time.time() - start_ts) * 1000)
+    if resp.status_code >= 400:
+        # Surface OpenAI's error verbatim (moderation, bad image, etc.).
+        await _log_event(db, config.user_id, "openai", model, "images", 0, 0, 0, latency, status="error")
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = {"error": resp.text[:500]}
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=detail, status_code=resp.status_code)
+
+    resp_data = resp.json()
+
+    # Per-image cost × n, charged inline before returning (same pricing table as
+    # generation). Fresh-UUID idempotency; the agent does not retry the proxy.
+    from app.services.credit_service import (
+        credit_service, image_generation_cost_cents, underlying_cost_to_credits,
+    )
+    from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
+    cents_each = image_generation_cost_cents(size, quality)
+    total_cents = cents_each * n
+    credits = max(_MIN_IMAGE_CREDITS, underlying_cost_to_credits(total_cents))
+    charge_id = str(uuid.uuid4())
+    try:
+        await credit_service.try_charge(
+            db, config.user_id, LEDGER_IMAGE_GEN, BUCKET_MESSAGE, credits,
+            idempotency_key=charge_id, event_id=charge_id,
+            model=model, provider="openai",
+            underlying_cost_cents=total_cents,
+            metadata={"endpoint": "images", "op": "edit", "size": size, "quality": quality, "n": n},
+        )
+    except Exception:
+        logger.exception(
+            "[credits] image-edit try_charge failed user=%s model=%s size=%s q=%s",
+            config.user_id[:8], model, size, quality,
+        )
+    await _log_event(
+        db, config.user_id, "openai", model, "images",
+        0, 0, int(float(total_cents)), latency,
+    )
 
     return resp_data
 

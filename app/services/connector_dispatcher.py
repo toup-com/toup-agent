@@ -97,7 +97,13 @@ _REFRESH_SKEW_SECONDS = 30
 # user-confirmation surface (no chip UI, no inline approve gate). Default-
 # deny mutating tools on those channels; per-tool channel_policy.deny in
 # the manifest is additive on top.
-_MUTATES_DEFAULT_DENY_CHANNELS = frozenset({"voice", "telegram"})
+#
+# "autopilot" (Autopilot arc PR7): autonomous mission ticks run with
+# NOBODY watching — outward mutation (gmail send, calendar write, …)
+# is default-denied. A user's explicit per-tool allow
+# (ConnectorUserPreference) still overrides, same resolution order as
+# voice/telegram.
+_MUTATES_DEFAULT_DENY_CHANNELS = frozenset({"voice", "telegram", "autopilot"})
 
 
 # ─── Per-identity refresh-coalescing locks ────────────────────────────
