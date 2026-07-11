@@ -25,6 +25,8 @@ Protocol (Browser ↔ Proxy):
     { "type": "session_id", "session_id": "..." }         — DB session ID (for chat sync)
     { "type": "speech_started" }                           — user started speaking (barge-in)
     { "type": "state", "state": "listening|thinking|speaking" }
+    { "type": "status", "stage": "authenticated|preparing|connecting_ai" }
+                                                           — pre-ready progress beacons
     { "type": "ready" }                                    — session ready, start sending audio
     { "type": "error", "message": "..." }
 """
@@ -162,12 +164,30 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
     if vps:
         agent_url, agent_api_key = vps
 
+        # Prefetch the four independent VPS reads concurrently. A cold or
+        # stalled agent container used to burn their 15s timeouts one after
+        # another (identity → agent brain → user brain → day-chats) while the
+        # client heard nothing pre-`ready`; concurrent, the wall time is the
+        # slowest single read. Processing below stays sequential so section
+        # order is unchanged. (_vps_api never raises — it returns None — but
+        # return_exceptions guards refactors.)
+        _prefetched = await asyncio.gather(
+            _vps_api(agent_url, agent_api_key, "GET", "/api/identity",
+                     params={"active_only": "true"}),
+            _vps_api(agent_url, agent_api_key, "GET", "/api/memories",
+                     params={"brain_type": "agent", "limit": 10000}),
+            _vps_api(agent_url, agent_api_key, "GET", "/api/memories",
+                     params={"brain_type": "user", "limit": 10000}),
+            _vps_api(agent_url, agent_api_key, "GET", "/api/day-chats",
+                     params={"limit": 1}),
+            return_exceptions=True,
+        )
+        identities_data, agent_mems_data, user_mems_data, dc_list_prefetch = (
+            r if not isinstance(r, BaseException) else None for r in _prefetched
+        )
+
         # 1. Load identity documents from VPS
         try:
-            identities_data = await _vps_api(
-                agent_url, agent_api_key, "GET", "/api/identity",
-                params={"active_only": "true"},
-            )
             if identities_data:
                 id_list = identities_data.get("identities", identities_data) if isinstance(identities_data, dict) else identities_data
                 if isinstance(id_list, list):
@@ -189,10 +209,6 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
 
         # 2. Load ALL agent brain memories from VPS
         try:
-            agent_mems_data = await _vps_api(
-                agent_url, agent_api_key, "GET", "/api/memories",
-                params={"brain_type": "agent", "limit": 10000},
-            )
             if agent_mems_data:
                 mems = agent_mems_data.get("memories", agent_mems_data) if isinstance(agent_mems_data, dict) else agent_mems_data
                 if isinstance(mems, list) and mems:
@@ -207,10 +223,6 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
 
         # 2b. Load ALL user brain memories from VPS
         try:
-            user_mems_data = await _vps_api(
-                agent_url, agent_api_key, "GET", "/api/memories",
-                params={"brain_type": "user", "limit": 10000},
-            )
             if user_mems_data:
                 mems = user_mems_data.get("memories", user_mems_data) if isinstance(user_mems_data, dict) else user_mems_data
                 if isinstance(mems, list) and mems:
@@ -234,11 +246,7 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
             # (handles timezone correctly — the agent resolves local_date)
             day_msgs = None
             try:
-                dc_list = await _vps_api(
-                    agent_url, agent_api_key, "GET",
-                    "/api/day-chats",
-                    params={"limit": 1},
-                )
+                dc_list = dc_list_prefetch
                 if dc_list and isinstance(dc_list, list) and dc_list:
                     today_date = dc_list[0].get("local_date")
                     if today_date:
@@ -1010,17 +1018,30 @@ async def realtime_voice_ws(
 
     logger.info("[REALTIME] Session starting for user %s", user_id[:8])
 
-    # ── 1b. Ensure user exists on VPS (for FK constraints) ────
-    try:
-        await _ensure_vps_user(user_id)
-    except Exception as e:
-        logger.warning("[REALTIME] _ensure_vps_user failed (non-fatal): %s", e)
+    async def _status(stage: str) -> None:
+        # Pre-ready progress beacons. The clients' connect watchdogs treat any
+        # frame as "pipeline engaged"; total silence reads as a dead route and
+        # fails their UI at ~20s. Best-effort — if the client is gone, the
+        # relay loop below notices immediately anyway.
+        try:
+            await websocket.send_json({"type": "status", "stage": stage})
+        except Exception:
+            pass
+
+    await _status("authenticated")
 
     # ── 2. Load OpenAI API key ────────────────────────────────
     # Fall back to the platform key (parity with /voice/transcribe + /voice/tts)
     # so managed/bundle users with no personal OpenAI key can still use live
     # voice. Realtime audio is billed to the platform key in that case.
-    openai_key = await _get_user_openai_key(user_id) or settings.openai_api_key
+    # Bounded: a stuck platform-DB pool acquisition here used to propagate as
+    # a bare 1011 close with zero frames sent — the silent-forever class.
+    try:
+        openai_key = await asyncio.wait_for(_get_user_openai_key(user_id), timeout=8.0)
+    except Exception:
+        logger.exception("[REALTIME] OpenAI key lookup failed")
+        openai_key = None
+    openai_key = openai_key or settings.openai_api_key
     if not openai_key:
         await websocket.send_json({
             "type": "error",
@@ -1029,26 +1050,56 @@ async def realtime_voice_ws(
         await websocket.close(code=4400)
         return
 
-    # ── 3. Get or create DB session for persistence ──────────
-    db_session_id = None
-    try:
-        db_session_id = await _get_or_create_voice_session(user_id, session_id)
-        logger.info("[REALTIME] DB session: %s", db_session_id[:8])
-    except Exception as e:
-        logger.exception("[REALTIME] Failed to create DB session")
-        # Try once more without session_id (fresh session)
-        try:
-            db_session_id = await _get_or_create_voice_session(user_id, None)
-            logger.info("[REALTIME] Created fresh DB session: %s", db_session_id[:8])
-        except Exception as e2:
-            logger.exception("[REALTIME] Failed to create fresh DB session")
+    # ── 3+4. Voice session + system instructions — concurrent, one budget ──
+    # These were sequential (session: up to 2 VPS calls; instructions: several
+    # more; VPS health-check before both), each VPS call with a 15s timeout —
+    # a cold/stalled agent container meant MINUTES of pre-ready silence. Run
+    # them concurrently under one 25s budget and degrade instead of stalling:
+    # voice still connects, the agent just starts with a thinner briefing.
+    await _status("preparing")
 
-    # ── 4. Build system instructions ──────────────────────────
-    try:
-        instructions = await build_realtime_instructions(user_id, onboarding=onboarding)
-        logger.info("[REALTIME] Built instructions (%d chars, onboarding=%s)", len(instructions), onboarding)
-    except Exception as e:
-        logger.exception("[REALTIME] Failed to build instructions")
+    async def _session_step() -> Optional[str]:
+        try:
+            return await _get_or_create_voice_session(user_id, session_id)
+        except Exception:
+            logger.exception("[REALTIME] Failed to create DB session")
+            try:
+                return await _get_or_create_voice_session(user_id, None)
+            except Exception:
+                logger.exception("[REALTIME] Failed to create fresh DB session")
+                return None
+
+    async def _instructions_step() -> Optional[str]:
+        try:
+            instr = await build_realtime_instructions(user_id, onboarding=onboarding)
+            logger.info("[REALTIME] Built instructions (%d chars, onboarding=%s)", len(instr), onboarding)
+            return instr
+        except Exception:
+            logger.exception("[REALTIME] Failed to build instructions")
+            return None
+
+    async def _health_step() -> None:
+        # FK safety-net health check — informational, must never block setup.
+        try:
+            await _ensure_vps_user(user_id)
+        except Exception as e:
+            logger.warning("[REALTIME] _ensure_vps_user failed (non-fatal): %s", e)
+
+    _session_t = asyncio.create_task(_session_step())
+    _instructions_t = asyncio.create_task(_instructions_step())
+    _health_t = asyncio.create_task(_health_step())
+    _done, _pending = await asyncio.wait(
+        {_session_t, _instructions_t, _health_t}, timeout=25.0,
+    )
+    for _t in _pending:
+        _t.cancel()
+    db_session_id = _session_t.result() if _session_t in _done else None
+    instructions = _instructions_t.result() if _instructions_t in _done else None
+    if db_session_id:
+        logger.info("[REALTIME] DB session: %s", db_session_id[:8])
+    if not instructions:
+        if _instructions_t in _pending:
+            logger.warning("[REALTIME] Instruction build exceeded the 25s budget — degraded instructions")
         instructions = "You are a helpful AI assistant in a voice conversation."
 
     # ── 4b. Load user's disabled tools and filter ──────────────
@@ -1093,6 +1144,7 @@ async def realtime_voice_ws(
     logger.info("[REALTIME] %d tools available for voice session", len(session_tools))
 
     # ── 5. Connect to OpenAI Realtime API ─────────────────────
+    await _status("connecting_ai")
     # Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
     voice = "coral"  # natural, expressive voice
     openai_ws = None
