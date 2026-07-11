@@ -952,7 +952,11 @@ async def _finalize_onboarding(user_id: str) -> str:
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────
-OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2025-06-03"
+# GA Realtime API (the beta interface + `OpenAI-Beta: realtime=v1` header was
+# shut down 2026-05-12 → "beta_api_shape_disabled"). GA uses the `gpt-realtime`
+# model, no beta header, and a restructured session.update (audio nested under
+# session.audio.input/output; renamed response.output_audio* events).
+OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
 
 
 @router.websocket("/ws/realtime")
@@ -1098,7 +1102,6 @@ async def realtime_voice_ws(
             OPENAI_REALTIME_URL,
             additional_headers={
                 "Authorization": f"Bearer {openai_key}",
-                "OpenAI-Beta": "realtime=v1",
             },
             max_size=10 * 1024 * 1024,  # 10MB for audio chunks
         )
@@ -1123,19 +1126,24 @@ async def realtime_voice_ws(
         session_config = {
             "type": "session.update",
             "session": {
-                "modalities": ["text", "audio"],
+                "type": "realtime",
+                "output_modalities": ["audio"],
                 "instructions": instructions,
-                "voice": voice,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1",
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.8,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 700,
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": {"model": "whisper-1"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.8,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 700,
+                        },
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": voice,
+                    },
                 },
                 "tools": session_tools,
                 "tool_choice": "auto",
@@ -1320,15 +1328,15 @@ async def realtime_voice_ws(
                 event = json.loads(raw_msg)
                 etype = event.get("type", "")
 
-                # ── Audio response chunks → browser ──
-                if etype == "response.audio.delta":
+                # ── Audio response chunks → browser (GA: response.output_audio.delta) ──
+                if etype == "response.output_audio.delta":
                     await websocket.send_json({
                         "type": "audio_delta",
                         "data": event.get("delta", ""),
                     })
 
-                # ── Assistant text transcript (partial) ──
-                elif etype == "response.audio_transcript.delta":
+                # ── Assistant text transcript (partial; GA: response.output_audio_transcript.delta) ──
+                elif etype == "response.output_audio_transcript.delta":
                     delta = event.get("delta", "")
                     response_text_accum += delta
                     await websocket.send_json({
@@ -1345,7 +1353,7 @@ async def realtime_voice_ws(
                     for item in response.get("output", []):
                         if item.get("type") == "message":
                             for content in item.get("content", []):
-                                if content.get("type") == "audio" and content.get("transcript"):
+                                if content.get("type") in ("audio", "output_audio") and content.get("transcript"):
                                     full_text = content["transcript"]
 
                     if full_text:
