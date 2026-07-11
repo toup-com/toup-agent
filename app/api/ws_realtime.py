@@ -1255,7 +1255,10 @@ async def realtime_voice_ws(
                         voice = requested if requested in VALID_VOICES else "alloy"
                         await openai_ws.send(json.dumps({
                             "type": "session.update",
-                            "session": {"voice": voice},
+                            "session": {
+                                "type": "realtime",
+                                "audio": {"output": {"voice": voice}},
+                            },
                         }))
                     # Client can also pass session_id via config
                     if "session_id" in msg and msg["session_id"] and not db_session_id:
