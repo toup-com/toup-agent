@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
+from app.config import settings
 from app.db import get_db, AgentConfig
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,11 @@ async def text_to_speech(
     """Convert text to speech using OpenAI TTS. Streams audio directly."""
     import httpx
 
-    user_key = await _get_user_openai_key(current_user.id, db)
+    # Fall back to the platform key exactly like /transcribe (voice_handler.py:58)
+    # so voice replies work for managed/bundle users who have no personal OpenAI
+    # key — the same users whose STT already rides the platform key. Without this
+    # the mobile Talk Mode is voice-in / text-out only for them.
+    user_key = await _get_user_openai_key(current_user.id, db) or settings.openai_api_key
     if not user_key:
         raise HTTPException(status_code=400, detail="OpenAI API key not configured for TTS.")
 

@@ -1013,7 +1013,10 @@ async def realtime_voice_ws(
         logger.warning("[REALTIME] _ensure_vps_user failed (non-fatal): %s", e)
 
     # ── 2. Load OpenAI API key ────────────────────────────────
-    openai_key = await _get_user_openai_key(user_id)
+    # Fall back to the platform key (parity with /voice/transcribe + /voice/tts)
+    # so managed/bundle users with no personal OpenAI key can still use live
+    # voice. Realtime audio is billed to the platform key in that case.
+    openai_key = await _get_user_openai_key(user_id) or settings.openai_api_key
     if not openai_key:
         await websocket.send_json({
             "type": "error",
