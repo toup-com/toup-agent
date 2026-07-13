@@ -62,6 +62,36 @@ def set_realtime_refs(tool_executor, agent_runner=None):
     _agent_runner = agent_runner
 
 
+# Warm-reopen context cache: user_id → (instructions, tools, monotonic_ts).
+# Single-worker deployment (intentional — singleton reconcilers), so an
+# in-process dict is correct. A reopen within the TTL puts the FULL personal
+# context on the very first session.update — zero thin-personality window;
+# _apply_full_context refreshes the entry on every session so staleness is
+# bounded to one conversation's drift, not the TTL.
+_instr_cache: dict = {}
+_INSTR_CACHE_TTL = 300.0
+
+
+def _base_voice_instructions() -> str:
+    """Instant-start stub used until the personalized context lands (seconds).
+
+    Explicitly self-aware about the loading window so the model never guesses
+    at personal facts it doesn't have yet.
+    """
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        "You are the user's personal AI assistant in a LIVE VOICE conversation.\n"
+        "- Respond naturally and conversationally; keep replies to 1-3 sentences "
+        "unless the user asks for detail.\n"
+        "- No markdown, lists, or formatting — spoken prose only.\n"
+        "- Match the user's language.\n"
+        "- Your personalized memory and tools are still loading for the first "
+        "seconds of this call; if the user asks something personal before they "
+        "arrive, say you're just waking up — never guess.\n"
+        f"- The current date and time is {now_str}."
+    )
+
+
 # ── OpenAI Realtime tool definitions ──────────────────────────────────
 # Tools that don't make sense in voice mode (voice already speaks, no need for TTS/voice chat)
 # All other tools (including Telegram message, send_file, etc.) work via the tunnel
@@ -1050,13 +1080,24 @@ async def realtime_voice_ws(
         await websocket.close(code=4400)
         return
 
-    # ── 3+4. Voice session + system instructions — concurrent, one budget ──
-    # These were sequential (session: up to 2 VPS calls; instructions: several
-    # more; VPS health-check before both), each VPS call with a 15s timeout —
-    # a cold/stalled agent container meant MINUTES of pre-ready silence. Run
-    # them concurrently under one 25s budget and degrade instead of stalling:
-    # voice still connects, the agent just starts with a thinner briefing.
+    # ── 3+4+5 fan-out: `ready` waits ONLY on the OpenAI connect ──────────
+    # The single hard prerequisite for the user to start talking is an OpenAI
+    # socket with a VAD/format config written to it. Everything personal —
+    # VPS session, instructions, tools — rides in behind and hot-swaps onto
+    # the live session via a second session.update (responses created after
+    # it use the new instructions). Warm reopens skip even that thin window
+    # via _instr_cache. Previously all of this was serialized ahead of
+    # `ready`: several seconds warm, up to 25s cold.
     await _status("preparing")
+
+    async def _connect_openai():
+        return await websockets.connect(
+            OPENAI_REALTIME_URL,
+            additional_headers={
+                "Authorization": f"Bearer {openai_key}",
+            },
+            max_size=10 * 1024 * 1024,  # 10MB for audio chunks
+        )
 
     async def _session_step() -> Optional[str]:
         try:
@@ -1078,6 +1119,44 @@ async def realtime_voice_ws(
             logger.exception("[REALTIME] Failed to build instructions")
             return None
 
+    async def _tools_step() -> list:
+        tools = REALTIME_TOOLS
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import AgentConfig
+            async with async_session_maker() as _db:
+                _ac_res = await _db.execute(
+                    select(AgentConfig).where(AgentConfig.user_id == user_id)
+                )
+                _ac = _ac_res.scalars().first()
+                if _ac and getattr(_ac, 'disabled_tools', None):
+                    _user_disabled = set(json.loads(_ac.disabled_tools))
+                    tools = [t for t in REALTIME_TOOLS if t["name"] not in _user_disabled]
+                    logger.info("[REALTIME] Filtered %d disabled tools for user %s", len(_user_disabled), user_id[:8])
+        except Exception as e:
+            logger.warning("[REALTIME] Failed to load disabled tools: %s", e)
+        if onboarding:
+            tools = list(tools)  # copy
+            tools.append({
+                "type": "function",
+                "name": "set_onboarding_phase",
+                "description": "Set the onboarding UI phase. Call with phase='color' when asking the user to pick a color.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phase": {"type": "string", "enum": ["color", "profiling", "done"]},
+                    },
+                    "required": ["phase"],
+                },
+            })
+            tools.append({
+                "type": "function",
+                "name": "finalize_onboarding",
+                "description": "Call when onboarding conversation is complete to save all profiles and finish setup. Only call after gathering: both names, color, goals, language, and personality.",
+                "parameters": {"type": "object", "properties": {}},
+            })
+        return tools
+
     async def _health_step() -> None:
         # FK safety-net health check — informational, must never block setup.
         try:
@@ -1085,80 +1164,32 @@ async def realtime_voice_ws(
         except Exception as e:
             logger.warning("[REALTIME] _ensure_vps_user failed (non-fatal): %s", e)
 
+    _t0 = time.monotonic()
+    _openai_t = asyncio.create_task(_connect_openai())
     _session_t = asyncio.create_task(_session_step())
     _instructions_t = asyncio.create_task(_instructions_step())
+    _tools_t = asyncio.create_task(_tools_step())
     _health_t = asyncio.create_task(_health_step())
-    _done, _pending = await asyncio.wait(
-        {_session_t, _instructions_t, _health_t}, timeout=25.0,
-    )
-    for _t in _pending:
-        _t.cancel()
-    db_session_id = _session_t.result() if _session_t in _done else None
-    instructions = _instructions_t.result() if _instructions_t in _done else None
-    if db_session_id:
-        logger.info("[REALTIME] DB session: %s", db_session_id[:8])
-    if not instructions:
-        if _instructions_t in _pending:
-            logger.warning("[REALTIME] Instruction build exceeded the 25s budget — degraded instructions")
-        instructions = "You are a helpful AI assistant in a voice conversation."
+    _bg_tasks = [_session_t, _instructions_t, _tools_t, _health_t]
 
-    # ── 4b. Load user's disabled tools and filter ──────────────
-    session_tools = REALTIME_TOOLS
-    try:
-        from app.db.database import async_session_maker
-        from app.db.models import AgentConfig
-        async with async_session_maker() as _db:
-            _ac_res = await _db.execute(
-                select(AgentConfig).where(AgentConfig.user_id == user_id)
-            )
-            _ac = _ac_res.scalars().first()
-            if _ac and getattr(_ac, 'disabled_tools', None):
-                _user_disabled = set(json.loads(_ac.disabled_tools))
-                session_tools = [t for t in REALTIME_TOOLS if t["name"] not in _user_disabled]
-                logger.info("[REALTIME] Filtered %d disabled tools for user %s", len(_user_disabled), user_id[:8])
-    except Exception as e:
-        logger.warning("[REALTIME] Failed to load disabled tools: %s", e)
+    def _cancel_bg() -> None:
+        # Tap-and-close must not leave tasks poking a cold agent for 25s.
+        for _t in _bg_tasks:
+            _t.cancel()
 
-    # Add onboarding-specific tools
-    if onboarding:
-        session_tools = list(session_tools)  # copy
-        session_tools.append({
-            "type": "function",
-            "name": "set_onboarding_phase",
-            "description": "Set the onboarding UI phase. Call with phase='color' when asking the user to pick a color.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "phase": {"type": "string", "enum": ["color", "profiling", "done"]},
-                },
-                "required": ["phase"],
-            },
-        })
-        session_tools.append({
-            "type": "function",
-            "name": "finalize_onboarding",
-            "description": "Call when onboarding conversation is complete to save all profiles and finish setup. Only call after gathering: both names, color, goals, language, and personality.",
-            "parameters": {"type": "object", "properties": {}},
-        })
+    db_session_id: Optional[str] = None
 
-    logger.info("[REALTIME] %d tools available for voice session", len(session_tools))
-
-    # ── 5. Connect to OpenAI Realtime API ─────────────────────
+    # ── 5. OpenAI connect — the critical path ─────────────────
     await _status("connecting_ai")
     # Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
     voice = "coral"  # natural, expressive voice
     openai_ws = None
 
     try:
-        openai_ws = await websockets.connect(
-            OPENAI_REALTIME_URL,
-            additional_headers={
-                "Authorization": f"Bearer {openai_key}",
-            },
-            max_size=10 * 1024 * 1024,  # 10MB for audio chunks
-        )
-        logger.info("[REALTIME] Connected to OpenAI Realtime API")
+        openai_ws = await _openai_t
+        logger.info("[REALTIME] Connected to OpenAI Realtime API (+%.0fms)", (time.monotonic() - _t0) * 1000)
     except Exception as e:
+        _cancel_bg()
         logger.exception("[REALTIME] Failed to connect to OpenAI")
         err_str = str(e).lower()
         is_billing = any(kw in err_str for kw in ["quota", "billing", "rate_limit", "402", "429", "credit", "balance"])
@@ -1173,18 +1204,24 @@ async def realtime_voice_ws(
         await websocket.close(code=4502)
         return
 
-    # ── 6. Configure session ──────────────────────────────────
-    try:
-        session_config = {
+    # ── 6. Configure session: cached-or-base config now, full context behind ──
+    def _session_config(instr: str, tools: list) -> dict:
+        return {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "output_modalities": ["audio"],
-                "instructions": instructions,
+                "instructions": instr,
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcm", "rate": 24000},
                         "transcription": {"model": "whisper-1"},
+                        # Filters the input buffer before VAD — documented to
+                        # reduce false speech_started triggers. far_field:
+                        # the phone is a loudspeaker at arm's length, and the
+                        # dominant false trigger is the agent's own speaker
+                        # bleed (echo) reaching the mic.
+                        "noise_reduction": {"type": "far_field"},
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.8,
@@ -1197,24 +1234,99 @@ async def realtime_voice_ws(
                         "voice": voice,
                     },
                 },
-                "tools": session_tools,
+                "tools": tools,
                 "tool_choice": "auto",
             },
         }
-        await openai_ws.send(json.dumps(session_config))
-        logger.info("[REALTIME] Session configured (voice=%s)", voice)
+
+    _cached = _instr_cache.get(user_id)
+    _cache_hit = bool(
+        _cached
+        and (time.monotonic() - _cached[2]) < _INSTR_CACHE_TTL
+        and not onboarding
+    )
+    if _cache_hit:
+        _first_instructions, _first_tools = _cached[0], _cached[1]
+    else:
+        _first_instructions, _first_tools = _base_voice_instructions(), []
+
+    try:
+        await openai_ws.send(json.dumps(_session_config(_first_instructions, _first_tools)))
+        logger.info("[REALTIME] Session configured (voice=%s, cache_hit=%s)", voice, _cache_hit)
     except Exception as e:
+        _cancel_bg()
         logger.exception("[REALTIME] Failed to configure session")
         await websocket.send_json({"type": "error", "message": str(e)})
         await openai_ws.close()
         await websocket.close()
         return
 
-    # Send ready + session_id to client
-    ready_msg = {"type": "ready"}
-    if db_session_id:
-        ready_msg["session_id"] = db_session_id
-    await websocket.send_json(ready_msg)
+    # The user can talk NOW. The VAD/format config is written to the OpenAI
+    # socket ahead of any relayed audio (same-socket FIFO), so frames the
+    # client sends immediately are processed under the right config. The
+    # session_id follows on its own frame when the VPS session lands.
+    try:
+        await websocket.send_json({"type": "ready"})
+    except Exception:
+        _cancel_bg()
+        try:
+            await openai_ws.close()
+        except Exception:
+            pass
+        return
+    logger.info("[REALTIME] ready in %.0fms (cache_hit=%s)", (time.monotonic() - _t0) * 1000, _cache_hit)
+
+    # Onboarding is the one flow where a first response on the base config
+    # would be actively wrong (the whole flow lives in the instructions) —
+    # its greet waits on this event (see audio_ready handler).
+    full_context_applied = asyncio.Event()
+    if _cache_hit:
+        full_context_applied.set()
+
+    async def _apply_full_context() -> None:
+        # shield(): a timeout here abandons the wait, not the underlying
+        # build — a late result still lands in the cache path below on the
+        # next connect. _cancel_bg reaps everything at session end.
+        instr: Optional[str] = None
+        tools: list = list(_first_tools) if _first_tools else list(REALTIME_TOOLS)
+        try:
+            instr = await asyncio.wait_for(asyncio.shield(_instructions_t), timeout=40.0)
+            tools = await asyncio.wait_for(asyncio.shield(_tools_t), timeout=10.0)
+        except Exception:
+            logger.warning("[REALTIME] Context build timed out — session continues on base config")
+        try:
+            final_instr = instr or _first_instructions
+            await openai_ws.send(json.dumps(_session_config(final_instr, tools)))
+            if instr:
+                _instr_cache[user_id] = (instr, tools, time.monotonic())
+            logger.info(
+                "[REALTIME] Full context applied at +%.0fms (%d chars, %d tools)",
+                (time.monotonic() - _t0) * 1000, len(final_instr), len(tools),
+            )
+        except Exception as e:
+            logger.warning("[REALTIME] Full-context session.update failed: %s", e)
+        finally:
+            full_context_applied.set()
+
+    _apply_t = asyncio.create_task(_apply_full_context())
+    _bg_tasks.append(_apply_t)
+
+    async def _announce_session() -> None:
+        nonlocal db_session_id
+        try:
+            sid = await asyncio.shield(_session_t)
+        except Exception:
+            sid = None
+        if sid and not db_session_id:
+            db_session_id = sid
+            logger.info("[REALTIME] DB session: %s", sid[:8])
+            try:
+                await websocket.send_json({"type": "session_id", "session_id": sid})
+            except Exception:
+                pass
+
+    _announce_t = asyncio.create_task(_announce_session())
+    _bg_tasks.append(_announce_t)
 
     # ── 6b. Auto-greet in onboarding mode ─────────────────────
     # Wait for client's "audio_ready" signal before greeting, so audio doesn't get dropped.
@@ -1349,8 +1461,23 @@ async def realtime_voice_ws(
                     # Client signals that AudioContext + mic are ready for playback
                     if onboarding_greet_pending:
                         onboarding_greet_pending = False
-                        await openai_ws.send(json.dumps({"type": "response.create"}))
-                        logger.info("[REALTIME] Onboarding: client audio ready, triggered greeting")
+
+                        # The greet must not fire on the base config — the
+                        # whole onboarding flow lives in the instructions, so
+                        # wait for the full context (bounded; on timeout greet
+                        # anyway rather than sit silent).
+                        async def _greet_when_context_ready():
+                            try:
+                                await asyncio.wait_for(full_context_applied.wait(), timeout=45.0)
+                            except asyncio.TimeoutError:
+                                logger.warning("[REALTIME] Onboarding greet fired without full context (timeout)")
+                            try:
+                                await openai_ws.send(json.dumps({"type": "response.create"}))
+                                logger.info("[REALTIME] Onboarding: client audio ready, triggered greeting")
+                            except Exception:
+                                pass
+
+                        _bg_tasks.append(asyncio.create_task(_greet_when_context_ready()))
 
                 elif msg_type == "inject_text":
                     # UI sent a text event (e.g., color selection) — inject into OpenAI conversation
@@ -1418,14 +1545,18 @@ async def realtime_voice_ws(
                             "model": turn_model,
                         })
 
-                        # Persist assistant message to DB
+                        # Persist assistant message to DB. Await the SHARED
+                        # session task (still in flight on a cold agent) —
+                        # creating a second session here would fork the
+                        # conversation into two VPS threads.
                         if not db_session_id:
                             try:
-                                db_session_id = await _get_or_create_voice_session(user_id, None)
-                                logger.info("[REALTIME] Late-created DB session for assistant: %s", db_session_id[:8])
-                                await websocket.send_json({"type": "session_id", "session_id": db_session_id})
-                            except Exception as e:
-                                logger.exception("[REALTIME] Failed late session creation for assistant")
+                                db_session_id = await asyncio.wait_for(asyncio.shield(_session_t), timeout=10.0)
+                                if db_session_id:
+                                    logger.info("[REALTIME] Late-resolved DB session for assistant: %s", db_session_id[:8])
+                                    await websocket.send_json({"type": "session_id", "session_id": db_session_id})
+                            except Exception:
+                                logger.warning("[REALTIME] Session still unresolved at assistant persist — skipping this turn")
                         if db_session_id:
                             try:
                                 await _save_voice_messages(user_id, db_session_id, "", full_text, model=turn_model)
@@ -1453,14 +1584,16 @@ async def realtime_voice_ws(
                             "type": "transcript",
                             "text": user_text,
                         })
-                        # Save user message to DB
+                        # Save user message to DB — same shared-session rule
+                        # as the assistant persist above.
                         if not db_session_id:
                             try:
-                                db_session_id = await _get_or_create_voice_session(user_id, None)
-                                logger.info("[REALTIME] Late-created DB session: %s", db_session_id[:8])
-                                await websocket.send_json({"type": "session_id", "session_id": db_session_id})
-                            except Exception as e:
-                                logger.exception("[REALTIME] Failed late session creation")
+                                db_session_id = await asyncio.wait_for(asyncio.shield(_session_t), timeout=10.0)
+                                if db_session_id:
+                                    logger.info("[REALTIME] Late-resolved DB session: %s", db_session_id[:8])
+                                    await websocket.send_json({"type": "session_id", "session_id": db_session_id})
+                            except Exception:
+                                logger.warning("[REALTIME] Session still unresolved at user persist — skipping this turn")
                         if db_session_id:
                             try:
                                 await _save_voice_messages(user_id, db_session_id, user_text, "")
@@ -1655,6 +1788,7 @@ async def realtime_voice_ws(
         )
     finally:
         logger.info("[REALTIME] Session ended for user %s", user_id[:8])
+        _cancel_bg()
         try:
             await openai_ws.close()
         except Exception:
