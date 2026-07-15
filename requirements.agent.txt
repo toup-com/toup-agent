@@ -35,6 +35,7 @@ weasyprint==61.2
 
 # Media
 pillow>=11.1.0
+pillow-heif>=0.16.0  # decode HEIC/HEIF (iPhone) for edit_image source normalization
 
 # Auth & Security
 python-jose[cryptography]==3.3.0

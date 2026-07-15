@@ -596,7 +596,11 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "'add sunglasses', 'turn this into a watercolor'. By default it "
                 "edits the image the user most recently uploaded in the "
                 "conversation; pass `image` to target a specific workspace file or "
-                "URL. The result is delivered inline and saved to the workspace. "
+                "URL. If the user references a photo they already sent (even a few "
+                "turns ago), just CALL this tool — it automatically finds their "
+                "most recently uploaded image. Do NOT ask them to re-upload first; "
+                "only ask if this returns an error saying no image is on record. "
+                "The result is delivered inline and saved to the workspace. "
                 "Do NOT use this to create a picture from scratch (that's "
                 "generate_image) or to merely describe one (that's analyze_image). "
                 "Higher quality and larger sizes cost more credits."
@@ -617,7 +621,7 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                         "description": (
                             "Optional. A workspace file path or https image URL to "
                             "edit. Omit to edit the user's most recently uploaded "
-                            "image on this turn."
+                            "image in the conversation."
                         ),
                     },
                     "size": {

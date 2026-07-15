@@ -47,6 +47,7 @@ weasyprint==61.2
 
 # Media Processing
 pillow>=11.1.0
+pillow-heif>=0.16.0  # decode HEIC/HEIF (iPhone) for edit_image source normalization
 # moviepy==1.0.3  # Optional: for video processing
 # openai-whisper==20231117  # Optional: for audio transcription
 

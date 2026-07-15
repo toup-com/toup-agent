@@ -30,6 +30,14 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Teach Pillow to decode HEIC/HEIF (iPhone photos) so edit_image can normalize a
+# genuine .heic source to PNG. Optional dep — a no-op if it's not installed.
+try:
+    from pillow_heif import register_heif_opener as _register_heif_opener
+    _register_heif_opener()
+except Exception:  # pragma: no cover - depends on optional native wheel
+    pass
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Per-call state ContextVars (Phase 8 concurrency refactor)
@@ -2131,6 +2139,84 @@ class ToolExecutor:
             raise RuntimeError("OpenAI response did not include b64_json")
         return b64
 
+    async def _recent_uploaded_image(self) -> Optional[Dict[str, Any]]:
+        """Most-recently-uploaded image attachment from conversation history.
+
+        edit_image's per-turn ``_inbound_media`` is empty when the user asks to
+        edit a photo they sent on an EARLIER turn ("edit my image" with no new
+        attachment). Inbound uploads are persisted to ``Message.attachments``
+        (WS handler / PR #246), so scan recent user messages for the newest
+        image and return its attachment dict — the same
+        ``{storage_path, filename, mime_type, ...}`` shape the inbound path
+        uses. Returns None when the user has no uploaded image on record.
+        """
+        try:
+            from app.db.database import async_session_maker
+            from app.db.models import Conversation, Message
+            from sqlalchemy import select, and_
+
+            user_id = self._current_user_id
+            stmt = select(Message)
+            if user_id:
+                # Scope to this user (the agent DB is per-tenant, but the join
+                # keeps us correct on any shared-DB deployment).
+                stmt = stmt.join(
+                    Conversation, Message.conversation_id == Conversation.id
+                ).where(Conversation.user_id == user_id)
+            stmt = (
+                stmt.where(
+                    and_(Message.role == "user", Message.attachments.isnot(None))
+                )
+                .order_by(Message.created_at.desc())
+                .limit(25)
+            )
+            async with async_session_maker() as db:
+                rows = (await db.execute(stmt)).scalars().all()
+            # rows are newest-first; within a message, the last image is the
+            # most recent — mirrors the per-turn `_inbound[-1]` selection.
+            for _m in rows:
+                imgs = [
+                    a for a in (_m.attachments or [])
+                    if isinstance(a, dict)
+                    and str(a.get("mime_type", "")).startswith("image/")
+                    and a.get("storage_path")
+                ]
+                if imgs:
+                    return imgs[-1]
+        except Exception:
+            logger.exception("edit_image: recent-image history lookup failed")
+        return None
+
+    @staticmethod
+    def _normalize_edit_source(src_bytes: bytes, src_name: str, src_mime: str):
+        """Coerce the edit source into a format gpt-image-1 /images/edits accepts
+        (png/jpeg/webp).
+
+        Older/other-client uploads can be mislabeled — e.g. the mobile picker
+        emits JPEG bytes but tagged them ``image/heic`` on old app builds — or an
+        outright unsupported type. Pillow sniffs the ACTUAL bytes (so a wrong
+        MIME label is harmless) and re-encodes to PNG. If Pillow can't decode it
+        (a genuine HEIC on an image without pillow-heif), return the source
+        unchanged and let OpenAI surface a clean error rather than crashing.
+        """
+        if (src_mime or "").lower() in ("image/png", "image/jpeg", "image/webp"):
+            return src_bytes, src_name, src_mime
+        try:
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(src_bytes)) as im:
+                im = im.convert("RGBA" if im.mode in ("RGBA", "LA", "P") else "RGB")
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+            png_name = os.path.splitext(src_name or "source")[0] + ".png"
+            return buf.getvalue(), png_name, "image/png"
+        except Exception as exc:
+            logger.warning(
+                "edit_image: could not normalize %s source (%s) — sending as-is",
+                src_mime, exc,
+            )
+            return src_bytes, src_name, src_mime
+
     async def _tool_edit_image(self, inp: Dict[str, Any]) -> str:
         if not getattr(settings, "image_edit_enabled", True):
             return "ERROR: Image editing is disabled on this platform."
@@ -2175,15 +2261,20 @@ class ToolExecutor:
             except Exception as exc:
                 return f"ERROR: Could not read the image to edit ({_img_arg}): {exc}"
         else:
-            # Default: the user's most-recently-uploaded image on this turn.
+            # Default: the user's most-recently-uploaded image. Prefer THIS
+            # turn's upload (no DB hit); otherwise fall back to the most recent
+            # image in conversation history, so "edit the photo I sent earlier"
+            # works without forcing a re-attach (inbound uploads are persisted
+            # to Message.attachments — see the WS handler / PR #246).
             _inbound = [a for a in self._inbound_media
                         if str(a.get("mime_type", "")).startswith("image/")]
-            if not _inbound:
+            _att = _inbound[-1] if _inbound else await self._recent_uploaded_image()
+            if not _att:
                 return (
-                    "ERROR: No image to edit. Attach an image in the same message and "
-                    "ask again, or pass 'image' (a workspace file path or an image URL)."
+                    "ERROR: No image to edit — you haven't sent one yet. Attach a "
+                    "photo (this turn or an earlier one), or pass 'image' (a "
+                    "workspace file path or an image URL)."
                 )
-            _att = _inbound[-1]
             try:
                 from app.services.file_storage import get_storage_backend
                 with get_storage_backend().open(_att["storage_path"]) as _f:
@@ -2191,11 +2282,15 @@ class ToolExecutor:
                 src_name = _att.get("filename") or "source.png"
                 src_mime = _att.get("mime_type") or "image/png"
             except Exception as exc:
-                logger.exception("edit_image: failed to load inbound source")
-                return f"ERROR: Could not load the uploaded image to edit: {exc}"
+                logger.exception("edit_image: failed to load source image")
+                return f"ERROR: Could not load the image to edit: {exc}"
 
         if not src_bytes:
             return "ERROR: No image bytes to edit."
+
+        # Normalize to a format gpt-image-1 /images/edits accepts so a source we
+        # successfully FOUND doesn't then fail at OpenAI on its declared type.
+        src_bytes, src_name, src_mime = self._normalize_edit_source(src_bytes, src_name, src_mime)
 
         raw_name = (inp.get("filename") or "").strip() or f"edited_{_uuid.uuid4().hex[:8]}.png"
         filename = _safe_filename(raw_name, "png")
