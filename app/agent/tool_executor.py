@@ -4536,6 +4536,21 @@ class ToolExecutor:
                 job.steps_json = _json.dumps(steps)
                 completed_count = len(steps)
 
+            # Heartbeat row — the stalled-job reaper keys "signs of
+            # life" on newest job_events.ts, so every update must
+            # leave one or long-running-but-active jobs get reaped.
+            from app.db.models import JobEvent
+            db.add(JobEvent(
+                job_id=job_id,
+                user_id=user_id,
+                kind="info",
+                level="info",
+                label=(
+                    f"Progress: {completed_count}/{len(steps)} steps"
+                    if steps else (new_status or "update")
+                )[:200],
+            ))
+
             await db.commit()
 
         # Broadcast

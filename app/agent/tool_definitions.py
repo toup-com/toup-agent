@@ -1569,10 +1569,16 @@ def get_extended_tools():
         {
             "name": "create_job",
             "description": (
-                "Create a new job (task) that appears in the user's dashboard and sidebar. "
-                "Use this whenever the user asks you to do something that will take multiple steps "
-                "or that they'd want to track progress on. The job will appear in the Jobs tab "
-                "in real-time. Set status to 'running' when you start working on it."
+                "Create a trackable job for multi-step work you are doing NOW, in this "
+                "conversation. It appears live in the user's dashboard, sidebar, and on "
+                "their phone's lock screen / Dynamic Island. Declare steps up front and "
+                "call update_job as you complete each one. CONTRACT — never end your "
+                "reply while a job you created is still 'running': before finishing, "
+                "either (a) complete the work and mark it 'completed', (b) mark it "
+                "'failed' with an error_message, or (c) hand the remaining work to "
+                "spawn or start_mission so something actually continues it. A job left "
+                "'running' when your turn ends freezes every progress surface and is "
+                "auto-failed as stalled after 30 minutes."
             ),
             "input_schema": {
                 "type": "object",

@@ -868,6 +868,18 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ Could not start notify outbox loop: {e}")
 
+        # Stalled-job reaper — fails running jobs that stopped showing
+        # signs of life so no progress surface (job card, capsule,
+        # phone Live Activity) sits on a dead percentage forever.
+        try:
+            from app.agent.job_reaper import stalled_jobs_sweep_loop
+            app.state.job_reaper_task = asyncio.create_task(
+                stalled_jobs_sweep_loop(), name="stalled-jobs-sweep",
+            )
+            print("🧹 Stalled-job reaper started")
+        except Exception as e:
+            print(f"⚠️ Could not start stalled-job reaper: {e}")
+
         # TriggerRunner — event-driven sibling. Started after RoutineRunner
         # so its restart sweep + rate-bucket warmup run before any inbound
         # webhook can dispatch. Auto-imports the email_received handler
