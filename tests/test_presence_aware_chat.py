@@ -70,3 +70,20 @@ def test_chat_turn_payloads_pass_ingest_validation():
         priority="high", dedup_key=f"{mission_id}:failed",
     )
     assert failed.event_kind == "mission_failed"
+
+
+def test_chat_turn_card_deeplinks_to_chat():
+    """A tapped 'Working on your answer' card must land in the chat
+    (where the answer lives), not Mission Control."""
+    from app.services import apns_push
+
+    p = apns_push.build_start_payload(
+        mission_id="chatturn:abc", title="Working on your answer",
+        deep_link="toup://chat", timestamp=1,
+    )
+    assert p["aps"]["attributes"]["deepLinkUrl"] == "toup://chat"
+
+    default = apns_push.build_start_payload(
+        mission_id="m-1", title="Mission", timestamp=1,
+    )
+    assert default["aps"]["attributes"]["deepLinkUrl"] == "toup://mission-control"

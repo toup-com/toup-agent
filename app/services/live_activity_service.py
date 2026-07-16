@@ -246,6 +246,10 @@ async def _send_start(
     await _preempt_device(db, device, mission_id, now)
 
     progress = _progress_fraction(row)
+    # Card-tap target: chat turns land in the conversation where the
+    # answer lives; everything else keeps Mission Control.
+    _route = (row.data_json or {}).get("route")
+    deep_link = "toup://chat" if _route == "chat" else "toup://mission-control"
     payload = apns_push.build_start_payload(
         mission_id=mission_id,
         title=_mission_title(row),
@@ -255,6 +259,7 @@ async def _send_start(
         alert_title=None if silent else row.title,
         alert_body=None if silent else row.body,
         timestamp=int(now.timestamp()),
+        deep_link=deep_link,
     )
     status, reason, _env = await _send_with_env_selfheal(
         db, device, device.push_to_start_token, payload, priority=10,

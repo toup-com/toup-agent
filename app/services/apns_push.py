@@ -172,6 +172,7 @@ def build_start_payload(
     alert_title: Optional[str] = None,
     alert_body: Optional[str] = None,
     timestamp: Optional[int] = None,
+    deep_link: str = "toup://mission-control",
 ) -> Dict[str, Any]:
     """Push-to-start payload. ``attributes.name`` carries the mission id —
     the app's onTokenReceived listener echoes it back so a reported
@@ -192,7 +193,11 @@ def build_start_payload(
         "attributes": {
             "name": mission_id,
             "progressViewTint": _PROGRESS_TINT,
-            "deepLinkUrl": "toup://mission-control",
+            # Where a card tap lands. Attributes are fixed for the
+            # activity's lifetime, so the producer picks the target at
+            # start (chat turns → the conversation, missions → Mission
+            # Control).
+            "deepLinkUrl": deep_link,
         },
         "content-state": _content_state(title, subtitle, progress, timer_end_ms),
     }
