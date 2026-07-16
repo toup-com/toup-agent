@@ -26,6 +26,8 @@ Authentication:
 import asyncio
 import json
 import logging
+import time
+import uuid
 from datetime import datetime
 import sys
 from typing import Dict, List, Optional
@@ -2297,6 +2299,15 @@ async def ws_chat(
                 # For app-channel messages, text has [CONTEXT:...] prepended — always
                 # save the original. For fast-path (music), save the modified fast text.
                 _display_text = _original_user_text if (_original_user_text != text) else (text if _fast_text else None)
+                # Presence-aware delivery (founder ask 2026-07-16): if the
+                # user force-quits mid-turn, the turn keeps running; the
+                # phone gets a Live Activity while we work and the final
+                # answer as a push when no client is connected to receive
+                # the done frame. One mission id ties start→complete.
+                _turn_mission_id = f"chatturn:{uuid.uuid4().hex[:12]}"
+                _turn_flags = {"client_gone": False, "response_persisted": False}
+                _user_text_preview = (_original_user_text or text or "")[:180]
+
                 agent_task = asyncio.create_task(_agent_runner.run(
                     user_message=_agent_text,
                     display_user_message=_display_text,
@@ -2334,20 +2345,59 @@ async def ws_chat(
                                 return
                             elif m2.get("type") == "ping":
                                 await websocket.send_json({"type": "pong"})
-                    except (WebSocketDisconnect, asyncio.CancelledError):
+                    except asyncio.CancelledError:
                         pass
+                    except WebSocketDisconnect:
+                        # Client left mid-turn (force-quit / lock). Keep
+                        # the agent running — the answer persists and is
+                        # push-delivered — and give the phone a live
+                        # "working" card so the user sees progress from
+                        # the lock screen / Dynamic Island.
+                        _turn_flags["client_gone"] = True
+                        logger.info(
+                            "[WS] client left mid-turn (%s) — continuing headless",
+                            user_id[:8],
+                        )
+                        try:
+                            from app.services.agent_notify_client import notify
+                            await notify(
+                                event_kind="mission_started",
+                                title="Working on your answer",
+                                body=_user_text_preview or None,
+                                data={
+                                    "mission_id": _turn_mission_id,
+                                    "mission_title": "Working on your answer",
+                                    "route": "chat",
+                                    "kind": "chat_turn",
+                                    "urgent": True,
+                                    "timer_end_ms": int((time.time() + 120) * 1000),
+                                },
+                                priority="default",
+                                dedup_key=f"{_turn_mission_id}:started",
+                            )
+                        except Exception:  # noqa: BLE001 — best-effort card
+                            pass
 
                 stop_task = asyncio.create_task(_wait_for_stop())
 
-                # Helper to safely send on WS (may be closed)
-                async def _safe_send(data: dict):
+                # Helper to safely send on WS (may be closed). Reports
+                # delivery: starlette/uvicorn raise more than RuntimeError
+                # on a dead socket (ConnectionClosed, ClientDisconnected…)
+                # — an uncaught send used to fall into the generic agent
+                # error handler and re-save the already-persisted answer
+                # as a duplicate '*[Response interrupted]*' row.
+                async def _safe_send(data: dict) -> bool:
                     try:
                         await websocket.send_json(data)
-                    except RuntimeError:
-                        pass  # WS already closed
+                        return True
+                    except Exception:  # noqa: BLE001 — WS closed/broken
+                        return False
 
                 try:
                     response = await agent_task
+                    # The runner has saved the assistant Message by now —
+                    # nothing after this point may re-save a partial.
+                    _turn_flags["response_persisted"] = True
                     stop_task.cancel()
                     try:
                         await stop_task  # Wait for stop task to actually finish
@@ -2468,7 +2518,47 @@ async def ws_chat(
                     # Include any build jobs triggered during this run
                     if _pending_job_cards:
                         _done_payload["build_jobs"] = list(_pending_job_cards)
-                    await _safe_send(_done_payload)
+                    _done_delivered = await _safe_send(_done_payload)
+
+                    # Presence-aware answer delivery: the done frame
+                    # failed AND no other client of this user is
+                    # connected (own queue is still registered until the
+                    # finally below, hence <= 1) → the user never saw the
+                    # answer. Push it: alert with the preview + the Live
+                    # Activity card flips to Completed. urgent bypasses
+                    # quiet hours — they asked seconds ago.
+                    if not _done_delivered and len(_user_ws_queues.get(user_id, [])) <= 1:
+                        try:
+                            from app.services.agent_notify_client import notify
+                            _answer_data = {
+                                "mission_id": _turn_mission_id,
+                                "mission_title": "Working on your answer",
+                                "route": "chat",
+                                "kind": "chat_turn",
+                                "urgent": True,
+                                "progress": 100,
+                                "dismiss_after_s": 900,
+                            }
+                            if response.session_id:
+                                _answer_data["session_id"] = response.session_id
+                            if getattr(response, "day_chat_id", None):
+                                _answer_data["day_chat_id"] = response.day_chat_id
+                            if getattr(response, "asst_message_id", None):
+                                _answer_data["message_id"] = response.asst_message_id
+                            await notify(
+                                event_kind="mission_completed",
+                                title="Answer ready",
+                                body=(response.text or "")[:180] or None,
+                                data=_answer_data,
+                                priority="high",
+                                dedup_key=f"{_turn_mission_id}:completed",
+                            )
+                            logger.info(
+                                "[WS] answer push queued for offline user %s",
+                                user_id[:8],
+                            )
+                        except Exception as _pe:  # noqa: BLE001
+                            logger.warning("[WS] answer push failed: %s", _pe)
 
                 except asyncio.CancelledError:
                     stop_task.cancel()
@@ -2512,8 +2602,32 @@ async def ws_chat(
                         except Exception:
                             pass
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
-                    # Save partial response so it's not lost on refresh
-                    _partial = "".join(_streamed_chunks).strip()
+                    # Tell a gone client's phone the turn died — the
+                    # 'working' card must not sit there forever.
+                    if _turn_flags["client_gone"]:
+                        try:
+                            from app.services.agent_notify_client import notify
+                            await notify(
+                                event_kind="mission_failed",
+                                title="Couldn't finish your answer",
+                                body="Something went wrong — open the app and ask again.",
+                                data={
+                                    "mission_id": _turn_mission_id,
+                                    "mission_title": "Working on your answer",
+                                    "route": "chat",
+                                    "kind": "chat_turn",
+                                    "urgent": True,
+                                    "dismiss_after_s": 900,
+                                },
+                                priority="high",
+                                dedup_key=f"{_turn_mission_id}:failed",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # Save partial response so it's not lost on refresh —
+                    # but never after the runner already persisted the
+                    # full answer (that's the duplicate-answer rider).
+                    _partial = "" if _turn_flags["response_persisted"] else "".join(_streamed_chunks).strip()
                     if _partial and session_id:
                         try:
                             async with async_session_maker() as _err_db:
