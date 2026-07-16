@@ -13,21 +13,64 @@ device logs, never enough to push to.
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.admin.deps import require_admin
 from app.db import get_db
-from app.db.models import LiveActivity, LiveActivityDevice, NotificationQueue
+from app.db.models import (
+    KNOWN_APNS_ENVIRONMENTS, LiveActivity, LiveActivityDevice,
+    NotificationQueue,
+)
 
 router = APIRouter(prefix="/admin/live-activity", tags=["Admin — Live Activity"])
 
 
 def _iso(dt) -> str | None:
     return dt.isoformat() if dt else None
+
+
+class RestoreDeviceRequest(BaseModel):
+    device_id: Optional[str] = None
+    environment: Optional[str] = None
+
+
+@router.post("/{user_id}/restore-device")
+async def restore_live_activity_device(
+    user_id: str,
+    body: RestoreDeviceRequest,
+    _admin=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """Un-revoke a user's Live Activity device (newest first, or a
+    specific device_id), optionally correcting its APNs environment.
+    Ops lever for the environment-mismatch revocation class — the
+    dispatcher's env self-heal fixes future sends, but a device
+    already revoked is invisible to the lane until restored."""
+    if body.environment and body.environment not in KNOWN_APNS_ENVIRONMENTS:
+        raise HTTPException(422, f"environment must be one of {sorted(KNOWN_APNS_ENVIRONMENTS)}")
+    q = select(LiveActivityDevice).where(LiveActivityDevice.user_id == user_id)
+    if body.device_id:
+        q = q.where(LiveActivityDevice.id == body.device_id)
+    q = q.order_by(LiveActivityDevice.last_seen_at.desc())
+    device = (await db.execute(q)).scalars().first()
+    if device is None:
+        raise HTTPException(404, "no device found")
+    device.revoked_at = None
+    if body.environment:
+        device.apns_environment = body.environment
+    resp = {
+        "id": device.id,
+        "token_prefix": (device.push_to_start_token or "")[:12],
+        "environment": device.apns_environment,
+        "revoked_at": None,
+    }
+    await db.commit()
+    return resp
 
 
 @router.get("/{user_id}")

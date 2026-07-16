@@ -171,6 +171,45 @@ async def _row_for(db, device_id: str, mission_id: str) -> Optional[LiveActivity
 # ── APNs send primitives ──────────────────────────────────────────
 
 
+async def _send_with_env_selfheal(
+    db, device: LiveActivityDevice, token: str, payload: Dict[str, Any],
+    *, priority: int, environment: Optional[str] = None,
+) -> Tuple[int, str, str]:
+    """Send; on a dead-token verdict retry ONCE on the flipped APNs
+    environment before letting the caller declare the token dead.
+
+    APNs returns BadDeviceToken both for genuinely dead tokens AND for
+    environment mismatches — indistinguishable from here. The mismatch
+    is real and easy to hit: a dev-provisioned build whose JS runs in
+    Release mode registers itself as 'production' while its
+    aps-environment entitlement is sandbox (seen live 2026-07-16 — the
+    founder's device got revoked and every card went silent). Success
+    on the flipped host self-heals the DEVICE row so subsequent sends
+    go straight to the right environment.
+
+    Returns (status, reason, environment_used).
+    """
+    env = environment or device.apns_environment
+    status, reason = await apns_push.send_live_activity(
+        token, payload, environment=env, priority=priority,
+    )
+    if not apns_push.is_token_dead(status, reason):
+        return status, reason, env
+    flipped = "production" if env == "development" else "development"
+    status2, reason2 = await apns_push.send_live_activity(
+        token, payload, environment=flipped, priority=priority,
+    )
+    if status2 == 200:
+        logger.info(
+            "live-activity env self-heal: device %s %s → %s",
+            device.id, env, flipped,
+        )
+        device.apns_environment = flipped
+        return status2, reason2, flipped
+    # Dead on both hosts — the original verdict stands.
+    return status, reason, env
+
+
 async def _preempt_device(
     db, device: LiveActivityDevice, keep_mission_id: str, now: datetime,
 ) -> None:
@@ -217,9 +256,8 @@ async def _send_start(
         alert_body=None if silent else row.body,
         timestamp=int(now.timestamp()),
     )
-    status, reason = await apns_push.send_live_activity(
-        device.push_to_start_token, payload,
-        environment=device.apns_environment, priority=10,
+    status, reason, _env = await _send_with_env_selfheal(
+        db, device, device.push_to_start_token, payload, priority=10,
     )
     if status == 200:
         existing = await _row_for(db, device.id, mission_id)
@@ -265,10 +303,13 @@ async def _send_to_activity(
             return {"status": "skipped", "reason": "ambiguous_shared_token"}
         token = device.push_to_start_token
 
-    status, reason = await apns_push.send_live_activity(
-        token, payload, environment=la.apns_environment, priority=priority,
+    status, reason, env_used = await _send_with_env_selfheal(
+        db, device, token, payload,
+        priority=priority, environment=la.apns_environment,
     )
     if status == 200:
+        if env_used != la.apns_environment:
+            la.apns_environment = env_used
         la.updated_at = now
         if end:
             la.status = LA_ENDED

@@ -228,7 +228,9 @@ async def _mk_user() -> str:
     return user_id
 
 
-async def _mk_la_device(user_id: str, token: str = None) -> str:
+async def _mk_la_device(
+    user_id: str, token: str = None, environment: str = "development",
+) -> str:
     from app.db import async_session_maker
 
     device_id = str(uuid.uuid4())
@@ -236,6 +238,7 @@ async def _mk_la_device(user_id: str, token: str = None) -> str:
         db.add(LiveActivityDevice(
             id=device_id, user_id=user_id,
             push_to_start_token=token or uuid.uuid4().hex + uuid.uuid4().hex,
+            apns_environment=environment,
             created_at=datetime.utcnow(),
         ))
         await db.commit()
@@ -690,3 +693,79 @@ def test_parse_progress_marker_variants():
 def test_mission_started_kind_is_known():
     from app.db.models import KNOWN_NOTIFY_KINDS
     assert "mission_started" in KNOWN_NOTIFY_KINDS
+
+
+# ── APNs environment self-heal ────────────────────────────────────
+#
+# BadDeviceToken is indistinguishable from a sandbox/production
+# mismatch. Seen live 2026-07-16: a dev-provisioned Release build
+# registered environment='production'; the first production-host send
+# got BadDeviceToken and the device was WRONGLY revoked — every card
+# after that died with no_live_activity_devices. The lane must retry
+# the flipped host before declaring a token dead, and persist the
+# heal on success.
+
+
+def _patch_apns_env_sensitive(monkeypatch, sent: list, alive_env: str):
+    """APNs double that only accepts pushes on `alive_env` — the other
+    host answers 400 BadDeviceToken (the mismatch signature)."""
+    async def fake_send(token, payload, *, environment="development", priority=10):
+        sent.append({"token": token, "environment": environment,
+                     "payload": payload, "priority": priority})
+        if environment == alive_env:
+            return 200, ""
+        return 400, "BadDeviceToken"
+
+    monkeypatch.setattr(las.apns_push, "send_live_activity", fake_send)
+    monkeypatch.setattr(settings, "apns_key_b64", "eA==")
+    monkeypatch.setattr(settings, "apns_key_id", "KEY123")
+    monkeypatch.setattr(settings, "apns_team_id", "TEAM123")
+
+
+@pytest.mark.asyncio
+async def test_env_mismatch_selfheals_and_delivers(monkeypatch):
+    sent: list = []
+    _patch_apns_env_sensitive(monkeypatch, sent, alive_env="development")
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id, environment="production")
+    row_id = await _enqueue(
+        user_id, event_kind="mission_started",
+        title="🚀 Autopilot engaged: T", priority="default",
+    )
+
+    result = await _claim_and_dispatch(row_id)
+    assert result == "sent"
+    # First try on the registered (wrong) env, retry on the flipped one.
+    assert [s["environment"] for s in sent] == ["production", "development"]
+
+    from app.db import async_session_maker
+    from sqlalchemy import select
+    async with async_session_maker() as db:
+        device = await db.get(LiveActivityDevice, device_id)
+        assert device.revoked_at is None, "mismatch must not revoke"
+        assert device.apns_environment == "development", "heal must persist"
+        rows = (await db.execute(
+            select(LiveActivity).where(LiveActivity.device_id == device_id)
+        )).scalars().all()
+        assert len(rows) == 1 and rows[0].status == LA_STARTED
+
+
+@pytest.mark.asyncio
+async def test_dead_on_both_hosts_still_revokes(monkeypatch):
+    sent: list = []
+    _patch_apns(monkeypatch, sent, status=410, reason="Unregistered")
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id, environment="development")
+    row_id = await _enqueue(
+        user_id, event_kind="mission_started",
+        title="🚀 Autopilot engaged: T", priority="default",
+    )
+
+    await _claim_and_dispatch(row_id)
+    # Tried both hosts, then revoked — a genuinely dead token must not
+    # survive via the self-heal path.
+    assert len(sent) == 2
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        device = await db.get(LiveActivityDevice, device_id)
+        assert device.revoked_at is not None
