@@ -2072,6 +2072,8 @@ class AgentRunner:
             "- 'change your name' / 'change your personality' → call `navigate_to` with path `/agent/soul`\n"
             "- 'what tools do you have' → call `navigate_to` with path `/agent/tools`\n"
             "- 'yesterday's chat' / 'what did we talk about Monday' → call `recall_day`\n"
+            "- User asks you to DO something (research / build / fix / produce — anything beyond answering a question) that you will finish IN THIS TURN → call `create_job` FIRST, then `update_job` as you complete each step\n"
+            "- 'while I'm away' / 'keep working on X' / 'keep me updated' / work that must continue after this conversation → call `start_mission`; do NOT also create_job — the mission IS the tracked task and appears in Mission Control\n"
             "- 'where's my account' / 'change password' / 'billing' → call `navigate_to` with path `/account`\n"
             "- 'show me the dashboard' / 'metrics' → call `navigate_to` with path `/dashboard`\n"
             "- 'build me an app' (then they want to see it) → app_builder, then offer `[[open_app:<slug>]]` chip\n\n"
@@ -2757,7 +2759,7 @@ class AgentRunner:
             f"- You have FULL terminal/shell access via the `exec` tool. You can run any command, install packages, write scripts, manage files, use git, curl, python, node, etc.",
             f"- You can read and write files using `read_file` and `write_file` tools.",
             f"- You can search the web using the `web_search` tool.",
-            f"- When the user asks you to do a multi-step task, use the `create_job` tool to create a trackable job. Update it with `update_job` as you complete each step.",
+            f"- When the user asks you to DO something you will finish in this turn (research, produce, fix — anything beyond answering), create a trackable job with `create_job` and advance it with `update_job` per step. For work that must CONTINUE after this conversation ('while I'm away', 'keep me updated'), use `start_mission` instead — never both for the same ask.",
         ]
         if hasattr(self, "_current_lane") and self._current_lane != "main":
             runtime_lines.append(f"- Execution lane: {self._current_lane}")

@@ -1534,7 +1534,9 @@ def get_extended_tools():
                 "mission runs unsupervised with a credit budget; anything requiring "
                 "an outward action (sending email, purchases) will pause and ask the "
                 "user for approval. Tell the user the mission was created and that "
-                "they can watch or stop it in Mission Control."
+                "they can watch or stop it in Mission Control. The mission itself "
+                "appears in Mission Control as the tracked task — do NOT also call "
+                "create_job for the same ask."
             ),
             "input_schema": {
                 "type": "object",
@@ -1578,7 +1580,9 @@ def get_extended_tools():
                 "'failed' with an error_message, or (c) hand the remaining work to "
                 "spawn or start_mission so something actually continues it. A job left "
                 "'running' when your turn ends freezes every progress surface and is "
-                "auto-failed as stalled after 30 minutes."
+                "auto-failed as stalled after 30 minutes. Never create a job for work "
+                "you are handing to start_mission — the mission appears as its own "
+                "tracked task in Mission Control."
             ),
             "input_schema": {
                 "type": "object",

@@ -744,9 +744,20 @@ async def list_jobs(current_user=Depends(get_current_user), db: AsyncSession = D
 
     agent_info = await _get_agent(current_user.id, db)
     if not agent_info:
+        # No provisioned agent ≠ agent down: an empty board is the
+        # truthful render for a user who has no agent yet.
         return JSONResponse(content=[])
     agent_url, key, _ = agent_info
-    return await _proxy(agent_url, key, "jobs/")
+    resp = await _proxy(agent_url, key, "jobs/")
+    # Degrading a FAILED fetch to [] made clients render "no tasks"
+    # while the agent was merely unreachable (founder saw an empty
+    # board during live ticks, 2026-07-16). Surface the failure so
+    # clients can show an error state instead.
+    if getattr(resp, "status_code", 200) >= 500:
+        return JSONResponse(
+            content={"detail": "agent unreachable"}, status_code=502,
+        )
+    return resp
 
 
 @router.get("/jobs/events")

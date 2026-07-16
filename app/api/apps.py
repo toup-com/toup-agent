@@ -304,12 +304,20 @@ async def list_apps() -> List[AppResponse]:
 
 
 @router.get("/jobs/")
-async def list_jobs() -> List[JobResponse]:
-    """List all build jobs for the current user."""
+async def list_jobs(include_ticks: bool = False) -> List[JobResponse]:
+    """List all build jobs for the current user.
+
+    Autopilot ticks (job_type='autopilot_tick') are engine heartbeats,
+    not user tasks — the mission itself is the visible unit (Mission
+    Control missions). Excluded by default; ``?include_ticks=true``
+    keeps them reachable for debugging."""
     user_id = _get_user_id()
     async with async_session_maker() as db:
+        where = [BuildJob.user_id == user_id]
+        if not include_ticks:
+            where.append(BuildJob.job_type != "autopilot_tick")
         result = await db.execute(
-            select(BuildJob).where(BuildJob.user_id == user_id).order_by(BuildJob.created_at.desc())
+            select(BuildJob).where(*where).order_by(BuildJob.created_at.desc())
         )
         jobs = result.scalars().all()
         return [_job_to_response(job) for job in jobs]

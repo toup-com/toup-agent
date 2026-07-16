@@ -876,11 +876,25 @@ class RoutineRunner:
             source_kind="routine",
             source_id=routine_id,
         )
+        # Autopilot ticks are engine internals — one BuildJob per ~5min
+        # heartbeat. They keep the full job lifecycle (retry, terminal
+        # mirror, observability) but get their own job_type so task
+        # surfaces can exclude them: the MISSION is the user-visible
+        # unit (Mission Control missions), not its ticks. Anonymous
+        # "Routine fire: autopilot <date>" rows confused the founder's
+        # Agent Tasks view (2026-07-16).
+        if routine.kind == "autopilot":
+            _tick_no = int((routine.last_state_json or {}).get("ticks_run", 0)) + 1
+            _job_type = "autopilot_tick"
+            _title = f"Autopilot: {routine.name or 'mission'} — tick {_tick_no}"
+        else:
+            _job_type = "routine_run"
+            _title = f"Routine fire: {routine.kind} {local_date}"
         try:
             _job = await _runner.create_job(
-                job_type="routine_run",
+                job_type=_job_type,
                 spec=_spec,
-                title=f"Routine fire: {routine.kind} {local_date}",
+                title=_title,
                 idempotency_key=idempotency_key,
             )
         except Exception as _e:
