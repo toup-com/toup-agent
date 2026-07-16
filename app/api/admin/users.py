@@ -234,6 +234,35 @@ async def list_users(
     return UserListResponse(users=users, total=len(users))
 
 
+class RoleUpdateRequest(BaseModel):
+    role: str = Field(pattern="^(admin|beta_user)$")
+
+
+@router.put("/users/{user_id}/role")
+async def set_user_role(
+    user_id: str,
+    body: RoleUpdateRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Promote/demote a user's role. Admin role implies unlimited
+    credits (credit enforcement skips role='admin'). Self-demotion is
+    refused so the last admin can't lock everyone out by accident."""
+    if user_id == admin.id and body.role != "admin":
+        raise HTTPException(status_code=400, detail="Refusing self-demotion")
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    old_role = getattr(user, "role", None)
+    user.role = body.role
+    # Build the response BEFORE commit — pgbouncer txn-mode rule.
+    resp = {"id": user.id, "email": user.email, "role": body.role, "was": old_role}
+    await db.commit()
+    logger.info("[admin] role %s → %s for %s by %s",
+                old_role, body.role, user_id[:8], admin.id[:8])
+    return resp
+
+
 async def _build_usage_for_conv_ids(
     conv_ids: list[str], db: AsyncSession, user_id: Optional[str] = None,
 ) -> list[dict]:
