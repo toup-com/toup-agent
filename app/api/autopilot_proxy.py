@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/autopilot", tags=["Autopilot Proxy"])
 
-_MISSION_ACTIONS = frozenset({"pause", "resume", "cancel"})
+_MISSION_ACTIONS = frozenset({"pause", "resume", "cancel", "budget"})
 
 
 async def _agent_info(user_id: str, db: AsyncSession) -> Tuple[str, str]:
@@ -114,9 +114,15 @@ async def mission_action_proxy(
 ):
     if action not in _MISSION_ACTIONS:
         raise HTTPException(404, "Unknown action")
+    # Forward the request body — actions like `budget` carry one
+    # ({"budget_credits": N}); pause/resume/cancel tolerate {}.
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — empty body
+        body = None
     return await _forward(
         request, current_user.id, db, f"missions/{mission_id}/{action}",
-        method="POST",
+        method="POST", body=body,
     )
 
 

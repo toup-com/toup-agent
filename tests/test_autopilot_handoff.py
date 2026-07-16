@@ -210,3 +210,94 @@ def test_proxy_mounted_on_platform_main():
     src = (Path(__file__).resolve().parent.parent / "platform_main.py").read_text()
     assert "from app.api.autopilot_proxy import router as autopilot_proxy_router" in src
     assert "autopilot_proxy_router, prefix=settings.api_prefix" in src
+
+
+# ── Missions are not routines (founder bug 2026-07-16) ────────────
+#
+# A mission IS a Routine row (kind='autopilot'), but it must never
+# surface or be managed through the generic routines API: listing it
+# there leaked the "every 5 min" heartbeat internal into the Routines
+# UI, delete could destroy a running mission's working state, and a
+# generic PATCH could clobber config_json (goal/budget) wholesale.
+
+
+@pytest.mark.asyncio
+async def test_missions_hidden_from_routines_api(monkeypatch):
+    from app.config import settings
+    from app.api.autopilot import create_mission
+
+    user_id = await _mk_user()
+    monkeypatch.setattr(settings, "user_id", user_id)
+    routine = await create_mission(user_id=user_id, goal="g", name="M")
+
+    from fastapi import FastAPI
+    from app.api.routines import router as routines_router
+
+    app = FastAPI()
+    app.include_router(routines_router, prefix="/api")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://agent") as ac:
+        listed = await ac.get("/api/routines")
+        assert listed.status_code == 200, listed.text
+        assert routine.id not in [r["id"] for r in listed.json()]
+
+        patched = await ac.patch(
+            f"/api/routines/{routine.id}", json={"enabled": False},
+        )
+        assert patched.status_code == 409
+
+        deleted = await ac.delete(f"/api/routines/{routine.id}")
+        assert deleted.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_raise_budget_unblocks_and_merges_config(monkeypatch):
+    from app.config import settings
+    from app.api.autopilot import create_mission
+    from app.db import async_session_maker
+    from sqlalchemy import update as sa_update
+
+    user_id = await _mk_user()
+    monkeypatch.setattr(settings, "user_id", user_id)
+    routine = await create_mission(
+        user_id=user_id, goal="research tools", budget_credits=100, urgent=True,
+    )
+    async with async_session_maker() as db:
+        await db.execute(
+            sa_update(Routine).where(Routine.id == routine.id).values(
+                enabled=False,
+                last_state_json={"status": "blocked",
+                                 "status_reason": "budget_exhausted",
+                                 "spent_credits": 218.4,
+                                 "progress": 78},
+            )
+        )
+        await db.commit()
+
+    transport = ASGITransport(app=_agent_api())
+    async with AsyncClient(transport=transport, base_url="http://agent") as ac:
+        # A budget below what's already spent is a no-op trap — refuse.
+        low = await ac.post(
+            f"/api/autopilot/missions/{routine.id}/budget",
+            json={"budget_credits": 50},
+        )
+        assert low.status_code == 422
+
+        res = await ac.post(
+            f"/api/autopilot/missions/{routine.id}/budget",
+            json={"budget_credits": 300},
+        )
+        body = res.json()
+        assert res.status_code == 200, res.text
+        assert body["budget_credits"] == 300
+        assert body["enabled"] is True
+        assert body["status"] == "active"
+        assert body["status_reason"] == "budget_raised"
+        assert body["progress"] == 78
+
+    # config_json MERGED, not replaced — goal/urgent survive.
+    async with async_session_maker() as db:
+        r = await db.get(Routine, routine.id)
+        assert r.config_json["goal"] == "research tools"
+        assert r.config_json["urgent"] is True
+        assert r.config_json["budget_credits"] == 300

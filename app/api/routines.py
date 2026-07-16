@@ -636,7 +636,16 @@ async def list_routines():
         async with async_session_maker() as db:
             result = await db.execute(
                 select(Routine)
-                .where(Routine.user_id == user_id)
+                .where(
+                    Routine.user_id == user_id,
+                    # Autopilot missions are IMPLEMENTED as
+                    # self-rescheduling routines, but they are not
+                    # user-managed schedules — listing them here leaked
+                    # the "every 5 min" heartbeat internal into the
+                    # Routines UI (founder bug 2026-07-16). Missions
+                    # have their own surface: /api/autopilot/missions.
+                    Routine.kind != "autopilot",
+                )
                 .order_by(Routine.created_at)
             )
             routines = list(result.scalars().all())
@@ -882,6 +891,15 @@ async def update_routine(routine_id: str, req: RoutineUpdate):
             raise HTTPException(status_code=404, detail="Routine not found")
 
         _kind_enabled_or_404(routine.kind)
+        if routine.kind == "autopilot":
+            # Missions ride the Routine table but are managed through
+            # their own lifecycle API — a generic PATCH here can clobber
+            # config_json (goal/budget) wholesale or zombie-toggle the
+            # engine's enabled flag.
+            raise HTTPException(
+                status_code=409,
+                detail="This is an Autopilot mission — manage it via /api/autopilot/missions",
+            )
 
         # Mig 042 — `schedule_changed` covers ALL shape edits (cron
         # string, schedule_kind, schedule_at, interval). Each invalidates
@@ -1060,6 +1078,13 @@ async def delete_routine(routine_id: str):
         routine = await db.get(Routine, routine_id)
         if routine is None or routine.user_id != user_id:
             raise HTTPException(status_code=404, detail="Routine not found")
+        if routine.kind == "autopilot":
+            # A generic routines delete must not silently destroy a
+            # running mission (its working state lives on this row).
+            raise HTTPException(
+                status_code=409,
+                detail="This is an Autopilot mission — cancel it via /api/autopilot/missions",
+            )
         await db.delete(routine)
         await db.commit()
 

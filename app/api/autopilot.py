@@ -168,6 +168,7 @@ class MissionOut(BaseModel):
     enabled: bool
     status: str
     status_reason: Optional[str] = None
+    progress: int = 0
     budget_credits: float
     spent_credits: float
     ticks_run: int
@@ -188,6 +189,7 @@ def _mission_out(r: Routine) -> MissionOut:
         enabled=bool(r.enabled),
         status=state.get("status", "active"),
         status_reason=state.get("status_reason"),
+        progress=int(state.get("progress", 0) or 0),
         budget_credits=float(cfg.get("budget_credits")
                              or settings.autopilot_default_budget_credits),
         spent_credits=float(state.get("spent_credits", 0.0)),
@@ -307,6 +309,51 @@ async def cancel_mission(mission_id: str) -> MissionOut:
             "next_due_at": None,
         },
     )
+
+
+class BudgetIn(BaseModel):
+    budget_credits: float = Field(ge=1, le=10000)
+
+
+@router.post("/missions/{mission_id}/budget", response_model=MissionOut)
+async def raise_mission_budget(mission_id: str, body: BudgetIn) -> MissionOut:
+    """Raise (or set) the mission's credit budget. The 'hit its budget'
+    push tells the user to do exactly this — a budget above what's
+    already spent un-blocks a budget_exhausted mission and re-enables
+    ticking, same reactivation semantics as resume."""
+    r = await _get_mission(mission_id)
+    state = dict(r.last_state_json or {})
+    spent = float(state.get("spent_credits", 0.0))
+    if body.budget_credits <= spent:
+        raise HTTPException(
+            422,
+            f"budget_credits must exceed the {spent:.1f} already spent",
+        )
+    # MERGE into config_json — never wholesale-replace (goal/urgent
+    # live there too).
+    cfg = dict(r.config_json or {})
+    cfg["budget_credits"] = body.budget_credits
+    now = datetime.utcnow()
+    values: Dict[str, Any] = {"config_json": cfg, "updated_at": now}
+    patch: Dict[str, Any] = {}
+    if state.get("status") == "blocked" and state.get("status_reason") == "budget_exhausted":
+        patch = {"status": "active", "status_reason": "budget_raised",
+                 "platform_fail_streak": 0, "next_due_at": None}
+        state.update(patch)
+        values["last_state_json"] = state
+        values["enabled"] = True
+    async with async_session_maker() as db:
+        await db.execute(
+            update(Routine).where(Routine.id == mission_id).values(**values)
+        )
+        await db.commit()
+    try:
+        from app.api import routines as routines_api
+        if routines_api._runner is not None:
+            await routines_api._runner.reload_routine(mission_id)
+    except Exception:  # noqa: BLE001 — reconcile loop is the backstop
+        pass
+    return _mission_out(await _get_mission(mission_id))
 
 
 class ApprovalOut(BaseModel):
