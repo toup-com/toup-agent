@@ -615,6 +615,14 @@ async def lifespan(app: FastAPI):
                 )
                 orphaned_jobs = result.scalars().all()
 
+                # Capture identity before commit so we can end each job's
+                # phone Live Activity after — a restart-orphaned card would
+                # otherwise linger on the lock screen showing stale
+                # progress until it expires (≤8h). Mirrors job_reaper.
+                _orphan_cards = [
+                    (job.id, job.title or "", job.user_id) for job in orphaned_jobs
+                ]
+
                 for job in orphaned_jobs:
                     job.status = "failed"
                     job.error_message = "Agent restarted during execution"
@@ -649,6 +657,22 @@ async def lifespan(app: FastAPI):
                 if orphaned_jobs:
                     await _jdb.commit()
                     print(f"🧹 Cleaned up {len(orphaned_jobs)} orphaned build job(s)")
+
+            # End each orphaned job's phone card honestly (best-effort,
+            # capped so a mass-orphan boot can't flood the outbox). Writes
+            # to the durable notify outbox — safe pre-bind; flushes later.
+            if _orphan_cards:
+                try:
+                    from app.agent.subagent_orchestrator import _notify_job_event
+                    for _jid, _title, _uid in _orphan_cards[:20]:
+                        await _notify_job_event(
+                            job_id=_jid, label=_title, kind="mission_failed",
+                            title=f"⚠️ Didn't finish: {(_title or 'background task')[:150]}",
+                            body="Stopped when the agent restarted. Ask me to pick it up again.",
+                            dismiss_after_s=900, dedup_suffix="restart_orphan",
+                        )
+                except Exception as _ne:
+                    logger.debug("[SWEEP] orphan card notify skipped: %s", _ne)
         except Exception as e:
             print(f"⚠️ Orphan job cleanup skipped: {e}")
 
