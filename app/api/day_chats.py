@@ -400,6 +400,12 @@ async def get_day_chat_messages(
                         Conversation.user_id == current_user.id,
                         Conversation.started_at >= day_start,
                         Conversation.started_at < day_end,
+                        # Autopilot tick turns were persisted raw
+                        # (AUTOPILOT_* marker blocks) before 2026-07-16;
+                        # ticks are headless now and terminal messages
+                        # arrive as channel='routine'. Hide the
+                        # historical noise without a data migration.
+                        Conversation.channel != "autopilot",
                     )
                 )
             )
@@ -461,7 +467,13 @@ async def get_day_chat_messages(
         msgs_result = await db.execute(
             select(Message, Conversation.channel)
             .join(Conversation, Message.conversation_id == Conversation.id)
-            .where(Message.day_chat_id == dc.id)
+            .where(
+                Message.day_chat_id == dc.id,
+                # Hide historical raw autopilot tick rows (see the
+                # fallback path above); mission outcomes arrive as
+                # channel='routine' and still render.
+                Conversation.channel != "autopilot",
+            )
             .order_by(Message.created_at.asc())
             .limit(limit)
         )

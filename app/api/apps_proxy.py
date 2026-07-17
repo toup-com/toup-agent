@@ -731,12 +731,22 @@ async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = D
 
 
 @router.get("/jobs/")
-async def list_jobs(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def list_jobs(
+    request: Request,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
 
+    # Forward the query string verbatim so ?include_ticks=true (debug
+    # view of hidden autopilot_tick rows) is reachable through the
+    # platform, mirroring jobs_events_proxy below.
+    qs = f"?{request.url.query}" if request.url.query else ""
     if is_agent_connected(current_user.id):
         try:
-            result = await send_http_forward(current_user.id, "GET", "/api/apps/jobs/")
+            result = await send_http_forward(
+                current_user.id, "GET", f"/api/apps/jobs/{qs}",
+            )
             if result is not None:
                 return JSONResponse(content=result)
         except Exception:
@@ -748,7 +758,7 @@ async def list_jobs(current_user=Depends(get_current_user), db: AsyncSession = D
         # truthful render for a user who has no agent yet.
         return JSONResponse(content=[])
     agent_url, key, _ = agent_info
-    resp = await _proxy(agent_url, key, "jobs/")
+    resp = await _proxy(agent_url, key, f"jobs/{qs}")
     # Degrading a FAILED fetch to [] made clients render "no tasks"
     # while the agent was merely unreachable (founder saw an empty
     # board during live ticks, 2026-07-16). Surface the failure so

@@ -104,6 +104,18 @@ ENV ROUTINES_EMAIL_BRIEFING_ENABLED=true \
 # app/agent/autopilot_gate.py.
 ENV AUTOPILOT_USER_ALLOWLIST="871bac24-c366-42b5-b224-8802c73aef3a,c47c5b4b-16d2-498c-b231-15d53d7454b9,533354ce-40c5-41b6-81a8-e87e33a08a24,e5ec1759-84ac-45bb-b2ec-bc85fa932211"
 
+# Sub-agent spawning — unified job path, image-wide default ON.
+# Every other enable lever is structurally dead for managed tenants:
+# pool binds don't carry the flag (_build_bind_payload/_BIND_FIELDS
+# lack it) and the deployed bridge AgentConfig drops it, so tenants
+# fell to the legacy Telegram-only path and web/mobile/autopilot
+# spawns errored SUBAGENT_LEGACY_TELEGRAM_ONLY (founder repro
+# 2026-07-16). The real guardrails are the dispatcher caps (depth 1,
+# 5 children/parent, 3 concurrent/user, 50 per user/24h, 900s wall
+# clock); tenant `.env` (--env-file) can still override to false,
+# and removing this line + rollout is the fleet kill switch.
+ENV SUBAGENT_SPAWNING_ENABLED=true
+
 # Agent listens on 8001 internally (mapped to unique host port)
 EXPOSE 8001
 

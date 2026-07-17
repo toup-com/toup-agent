@@ -33,6 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db import get_db
 from app.db.models import (
     AgentConfig,
@@ -167,4 +168,32 @@ async def agent_notify(
         return AgentNotifyResponse(
             status="duplicate", id=existing.scalar_one_or_none()
         )
+
+    # Progress fast lane (2026-07-16): interim Live Activity updates
+    # are worthless 30s late — the whole point is bar motion at
+    # tool-call rhythm. Best-effort inline dispatch; the status CAS is
+    # the same primitive the dispatcher loop uses, so a concurrent
+    # claim is impossible and any failure leaves the row queued for
+    # the normal loop. Alert kinds stay on the loop on purpose.
+    if body.event_kind == "progress" and settings.notification_progress_fastlane_enabled:
+        try:
+            from datetime import datetime as _dt
+
+            from app.db.models import NotificationQueue as _NQ
+            from app.services.notification_dispatcher import (
+                NQ_QUEUED, NQ_SENDING, _cas_status, _dispatch_row,
+            )
+
+            _now = _dt.utcnow()
+            claimed = await _cas_status(
+                db, new_id, NQ_QUEUED, NQ_SENDING, _now,
+                extra={"claimed_at": _now, "attempts": _NQ.attempts + 1},
+            )
+            if claimed:
+                await _dispatch_row(db, new_id, _now)
+        except Exception as _fl_err:  # noqa: BLE001 — loop picks it up
+            logger.warning(
+                "[agent_notify] progress fast lane failed (row stays "
+                "queued for the dispatch loop): %s", _fl_err,
+            )
     return AgentNotifyResponse(status="queued", id=new_id)

@@ -301,3 +301,26 @@ async def test_raise_budget_unblocks_and_merges_config(monkeypatch):
         assert r.config_json["goal"] == "research tools"
         assert r.config_json["urgent"] is True
         assert r.config_json["budget_credits"] == 300
+
+
+# ── progress serialization is bulletproof (founder NaN% bug 2026-07-16) ──
+
+
+def test_progress_int_completed_forces_100():
+    from app.api.autopilot import _progress_int
+
+    # Missions completed under pre-progress images have no key at all.
+    assert _progress_int({}, "completed") == 100
+    assert _progress_int({"progress": 40}, "completed") == 100
+
+
+def test_progress_int_clamps_and_survives_junk():
+    from app.api.autopilot import _progress_int
+
+    assert _progress_int({"progress": 45}, "active") == 45
+    assert _progress_int({"progress": "78"}, "active") == 78
+    assert _progress_int({"progress": 150}, "active") == 100
+    assert _progress_int({"progress": -3}, "active") == 0
+    assert _progress_int({"progress": "junk"}, "active") == 0
+    assert _progress_int({"progress": None}, "active") == 0
+    assert _progress_int({}, "active") == 0

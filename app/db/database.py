@@ -738,6 +738,26 @@ async def init_db():
             f"ON memories USING hnsw (embedding vector_cosine_ops) "
             f"WITH (m = 16, ef_construction = 64)"
         )
+        # Backfill: autopilot tick jobs minted before 56006150 (founder
+        # bug 2026-07-16) were job_type='routine_run' titled 'Routine
+        # fire: autopilot <date>' — they pollute the Jobs page and
+        # Mission Control's Done column, which now hide only
+        # job_type='autopilot_tick'. Both predicates self-extinguish
+        # (a flipped row no longer matches), so re-running at every
+        # boot is a free no-op — the established data-fix pattern
+        # (messages.channel, apps.source backfills above).
+        _alter_statements.extend([
+            # Authoritative: join to the parent routine, don't trust titles.
+            "UPDATE build_jobs SET job_type = 'autopilot_tick' "
+            "FROM routines r WHERE build_jobs.source_id = r.id "
+            "AND r.kind = 'autopilot' AND build_jobs.job_type = 'routine_run'",
+            # Fallback for rows whose parent routine was deleted. The
+            # trailing space keeps a future kind like 'autopilot_v2'
+            # from matching.
+            "UPDATE build_jobs SET job_type = 'autopilot_tick' "
+            "WHERE job_type = 'routine_run' "
+            "AND title LIKE 'Routine fire: autopilot %'",
+        ])
 
     # Seed VPS plans (platform-only)
     _seed_statements = []

@@ -220,11 +220,19 @@ async def delete_doc(name: str = Query(...)):
 
 
 # ── Memory files (workspace .md files) ──────────────────────────────
+#
+# Client paths resolve through workspace_files.resolve_workspace_path
+# (resolve + is_relative_to): ../ and symlink escapes never leave the
+# workspace root. Escapes get the same response as a missing path so
+# nothing outside the workspace is confirmed to exist.
 
 @router.get("/memory/{directory:path}")
 async def list_memory_dir(directory: str):
-    base = getattr(settings, "agent_workspace_dir", None) or "./workspace"
-    target = os.path.join(base, directory)
+    from app.api.workspace_files import resolve_workspace_path
+    try:
+        target = str(resolve_workspace_path(directory))
+    except HTTPException:
+        return []
     if not os.path.isdir(target):
         return []
     result = []
@@ -245,8 +253,8 @@ async def list_memory_dir(directory: str):
 
 @router.get("/memory/file/{filepath:path}")
 async def get_memory_file(filepath: str):
-    base = getattr(settings, "agent_workspace_dir", None) or "./workspace"
-    target = os.path.join(base, filepath)
+    from app.api.workspace_files import resolve_workspace_path
+    target = str(resolve_workspace_path(filepath))  # 404 on escape
     if not os.path.isfile(target):
         raise HTTPException(404, "File not found")
     with open(target, "r") as f:
@@ -288,8 +296,8 @@ async def add_memory_entry(req: dict):
     entry = req.get("entry", "")
     if not file_path or not entry:
         raise HTTPException(400, "file and entry are required")
-    base = getattr(settings, "agent_workspace_dir", None) or "./workspace"
-    target = os.path.join(base, file_path)
+    from app.api.workspace_files import resolve_workspace_path
+    target = str(resolve_workspace_path(file_path))  # write traversal guard
     os.makedirs(os.path.dirname(target), exist_ok=True)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     with open(target, "a") as f:

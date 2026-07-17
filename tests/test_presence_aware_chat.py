@@ -87,3 +87,31 @@ def test_chat_turn_card_deeplinks_to_chat():
         mission_id="m-1", title="Mission", timestamp=1,
     )
     assert default["aps"]["attributes"]["deepLinkUrl"] == "toup://mission-control"
+
+
+# ── status frames (2026-07-16 blank-response fix) ──────────────────
+
+
+def test_agent_runner_accepts_on_status():
+    """run() must accept the on_status callback — ws_chat passes it on
+    every turn; a signature regression breaks all chat."""
+    import inspect
+    from app.agent.agent_runner import AgentRunner
+
+    params = inspect.signature(AgentRunner.run).parameters
+    assert "on_status" in params
+    assert params["on_status"].default is None
+
+
+def test_ws_chat_emits_status_frames():
+    """Protocol pin: the chat WS acks every accepted message with
+    {'type':'status','stage':'received'} and relays the runner's
+    'thinking' liveness signal. Clients render the pre-token
+    indicator off these frames."""
+    import inspect
+    from app.api import ws_chat
+
+    src = inspect.getsource(ws_chat)
+    assert '{"type": "status", "stage": "received"}' in src
+    assert 'async def on_status' in src
+    assert 'on_status=on_status' in src

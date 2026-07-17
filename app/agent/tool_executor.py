@@ -922,7 +922,26 @@ class ToolExecutor:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
-            return f"Written {len(content)} bytes to {path}"
+            result = f"Written {len(content)} bytes to {path}"
+            # Workspace files are user-openable via the mobile deep link
+            # (toup://report → report overlay backed by /api/workspace/file).
+            # Hand the model the exact link so it can make the file tappable
+            # in its reply. Out-of-workspace paths get no link — the
+            # platform proxy can't serve them.
+            try:
+                ws = os.path.realpath(self._get_user_workspace())
+                real = os.path.realpath(path)
+                if real == ws or real.startswith(ws + os.sep):
+                    from urllib.parse import quote as _urlquote
+                    rel = os.path.relpath(real, ws)
+                    result += (
+                        f". The user can open this file — include this link in your reply "
+                        f"so they can tap it: [{os.path.basename(real)}]"
+                        f"(toup://report?path={_urlquote(rel)})"
+                    )
+            except Exception:
+                pass
+            return result
         except PermissionError:
             return f"ERROR: Permission denied: {path}"
     
@@ -2665,19 +2684,17 @@ class ToolExecutor:
 
         # ── Path B: legacy SubAgentManager (kill switch OFF) ─────
         # Backward compat: Telegram-only spawn keeps working until
-        # the operator flips the kill switch.
-        if not self.subagent_manager:
+        # the operator flips the kill switch. When there is no live
+        # Telegram chat the honest error is SUBAGENT_DISABLED — the
+        # blocker is the kill switch, not the channel. (2026-07-16
+        # founder repro: a mission tick with _chat_id=None got
+        # SUBAGENT_LEGACY_TELEGRAM_ONLY, which misreads as a channel
+        # problem when the fix is enabling the unified path.)
+        chat_id = self._chat_id
+        if not self.subagent_manager or not chat_id:
             return (
                 '{"error":"SUBAGENT_DISABLED","message":"Sub-agent spawning is disabled. '
                 'Operator: set SUBAGENT_SPAWNING_ENABLED=true to enable the unified job path."}'
-            )
-
-        chat_id = self._chat_id
-        if not chat_id:
-            return (
-                '{"error":"SUBAGENT_LEGACY_TELEGRAM_ONLY","message":'
-                '"Legacy spawn path requires an active Telegram chat. '
-                'Operator: set SUBAGENT_SPAWNING_ENABLED=true to spawn on web/extension/voice."}'
             )
 
         legacy_timeout = min(int(timeout or 300), 600)

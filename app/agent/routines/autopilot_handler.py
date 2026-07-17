@@ -119,6 +119,23 @@ def parse_progress_value(raw: Optional[str]) -> Optional[int]:
         return None
 
 
+def strip_tick_markers(text: str) -> str:
+    """Remove AUTOPILOT_* marker lines from a tick's final text.
+
+    The markers are an engine contract, not user content — raw
+    'AUTOPILOT_STATUS: working / AUTOPILOT_PROGRESS: 45' blocks in the
+    chat read as a malfunction (founder bug 2026-07-16). Used when the
+    final tick's text becomes the mission-complete chat message."""
+    kept = []
+    for line in (text or "").splitlines():
+        upper = line.strip().upper()
+        if upper.startswith((_STATUS_MARKER, _SUMMARY_MARKER,
+                             _NOTE_MARKER, _PROGRESS_MARKER)):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 class AutopilotHandler:
     """kind='autopilot' — one instance shared across fires (stateless;
     all state lives on the Routine row)."""
@@ -309,6 +326,37 @@ class AutopilotHandler:
         except (ImportError, AttributeError):  # pragma: no cover
             profile = None
 
+        # In-run budget ceiling (2026-07-16 hard-stop): a single tick
+        # used to be an unbounded agent run — 40 full-context LLM
+        # iterations burned 80-160 credits and missions sailed to
+        # 218/100. The runner now stops itself at the remaining
+        # mission budget. The on_usage sink observes per-call spend so
+        # a timed-out/crashed tick is still metered (those tokens were
+        # genuinely charged; before, they were invisible to the
+        # mission ledger).
+        _tick_spend = {"credits": 0.0}
+
+        async def _on_usage(model: str, tokens_in: int, tokens_out: int) -> None:
+            _tick_spend["credits"] += self._estimate_credits(
+                model, tokens_in, tokens_out,
+            )
+
+        # Interim Live Activity motion during the tick (2026-07-16:
+        # the bar used to jump 0→45→100 because progress only moved
+        # once per ~300s tick). Tool-boundary updates interpolate from
+        # the last known progress toward a one-tick advance envelope;
+        # the end-of-tick marker stays authoritative.
+        from app.agent.turn_progress import TurnProgressEmitter
+
+        _base_progress = int(state.get("progress", 0) or 0)
+        _emitter = TurnProgressEmitter(
+            mission_id=routine.id,
+            mission_title=f"Autopilot: {routine.name or 'mission'}",
+            base_progress=_base_progress,
+            ceiling=min(95, _base_progress + max(12, (100 - _base_progress) // 3)),
+            route="mission-control",
+        )
+
         run_kwargs: Dict[str, Any] = dict(
             user_message=prompt,
             user_id=routine.user_id,
@@ -318,6 +366,18 @@ class AutopilotHandler:
             # Synthetic turn — the tick prompt must never render
             # as if the user typed it (2026-05-12 bug class).
             save_user_message=False,
+            # Ticks are headless like sub-agent runs (2026-07-16): the
+            # raw reply — including the mandated AUTOPILOT_* trailer —
+            # used to persist into the day chat every ~5min. Tick-to-
+            # tick continuity rides on state['note']/last_summary in
+            # the tick prompt, not chat history; the user-facing chat
+            # message is written ONCE at terminal transitions.
+            save_assistant_message=False,
+            disable_post_processing=True,
+            credit_budget=(max(0.0, budget - spent) if budget else None),
+            on_usage=_on_usage,
+            on_tool_start=_emitter.on_tool_start,
+            on_tool_end=_emitter.on_tool_end,
         )
         if profile is not None:
             run_kwargs["prompt_profile"] = profile
@@ -331,17 +391,26 @@ class AutopilotHandler:
             return self._after_failed_turn(
                 state, now, ticks_run, "tick_timeout",
                 f"turn exceeded {timeout_s}s",
+                spent_credits=round(spent + _tick_spend["credits"], 3),
             )
         except Exception as e:  # noqa: BLE001 — mission failure is state
             return self._after_failed_turn(
                 state, now, ticks_run, type(e).__name__, str(e)[:300],
+                spent_credits=round(spent + _tick_spend["credits"], 3),
             )
 
-        # Meter the tick (self-imposed — works in shadow mode).
+        # Meter the tick. Prefer the runner's own per-call accumulation
+        # (exact same estimator, but includes fallback-model calls);
+        # fall back to the aggregate estimate for older AgentResponse
+        # shapes.
         tokens_in = int(getattr(response, "tokens_input", 0) or 0)
         tokens_out = int(getattr(response, "tokens_output", 0) or 0)
         model = getattr(response, "model", "") or ""
-        spent += self._estimate_credits(model, tokens_in, tokens_out)
+        _run_credits = float(getattr(response, "credits_spent", 0.0) or 0.0)
+        spent += (
+            _run_credits if _run_credits > 0
+            else self._estimate_credits(model, tokens_in, tokens_out)
+        )
 
         markers = parse_tick_markers(getattr(response, "text", "") or "")
         tick_status = markers.get("status", "")
@@ -355,6 +424,9 @@ class AutopilotHandler:
         progress = int(state.get("progress", 0) or 0)
         if reported is not None:
             progress = max(progress, reported)
+        # The phone already saw the interim interpolation — the stored
+        # value must never sit below what the lock screen shows.
+        progress = max(progress, _emitter.last_emitted_progress)
 
         state.update({
             "ticks_run": ticks_run,
@@ -368,11 +440,41 @@ class AutopilotHandler:
 
         if tick_status == "done":
             state["progress"] = 100
+            # Finished work is never blocked retroactively — but with
+            # the in-run ceiling the overshoot is now bounded to ~one
+            # LLM call, and we record it honestly.
+            if budget and spent > budget:
+                state["budget_overshoot"] = round(spent - budget, 1)
+            _results = strip_tick_markers(getattr(response, "text", "") or "")
+            _final_chat = (
+                f"**✅ Mission complete — {routine.name}**\n\n"
+                f"{_results or summary or 'Mission completed.'}\n\n"
+                f"_{ticks_run} check-ins · "
+                f"{spent:.0f} of {budget:.0f} credits_"
+            )
             return await self._transition(
                 routine, db, state, now, MISSION_COMPLETED, "done",
                 notify_kind="mission_completed",
                 notify_title=f"✅ “{routine.name}” is done",
                 notify_body=summary[:500] or "Mission completed.",
+                chat_content=_final_chat,
+            )
+
+        # In-run hard-stop tripped: the runner cut the tick at the
+        # remaining budget. Block immediately with the same copy as the
+        # pre-tick gate — POST /missions/{id}/budget stays the one
+        # unblock lever. Not a no-progress strike: the mission may be
+        # advancing fine, it just ran out of money.
+        if getattr(response, "stopped_reason", "") == "credit_budget":
+            return await self._transition(
+                routine, db, state, now, MISSION_BLOCKED, "budget_exhausted",
+                notify_kind="mission_failed",
+                notify_title=f"Autopilot mission “{routine.name}” hit its budget",
+                notify_body=(
+                    f"Spent {spent:.1f} of {budget:.0f} credits. Raise the "
+                    "budget in Mission Control to continue."
+                ),
+                notify_priority="high",
             )
 
         if tick_status == "blocked":
@@ -389,6 +491,7 @@ class AutopilotHandler:
                 notify_priority="high",
                 keep_enabled=True,
                 notify_data_extra={"approval_id": approval_id},
+                chat_content=f"**⏸ {routine.name} needs you**\n\n{question}",
             )
 
         # working (or missing marker — counts as a strike: the contract
@@ -409,6 +512,22 @@ class AutopilotHandler:
                 ),
                 notify_priority="high",
                 keep_enabled=True,
+            )
+
+        # Post-tick reconcile: a working tick that LANDS at/over budget
+        # blocks now — scheduling next_due and letting the next fire's
+        # pre-tick gate discover it left the mission lying 'active' for
+        # ~5 minutes (and minted one more job + notify cycle).
+        if budget and spent >= budget:
+            return await self._transition(
+                routine, db, state, now, MISSION_BLOCKED, "budget_exhausted",
+                notify_kind="mission_failed",
+                notify_title=f"Autopilot mission “{routine.name}” hit its budget",
+                notify_body=(
+                    f"Spent {spent:.1f} of {budget:.0f} credits. Raise the "
+                    "budget in Mission Control to continue."
+                ),
+                notify_priority="high",
             )
 
         # Adaptive cadence: base interval, doubled per no-progress tick,
@@ -447,7 +566,9 @@ class AutopilotHandler:
         return RoutineResult(
             status="success",
             new_watermark=state,
-            summary_message_id=getattr(response, "asst_message_id", None) or None,
+            # Working ticks post NO chat message (headless run — see
+            # save_assistant_message=False above); progress flows via
+            # the 'progress' notify + the clients' mission indicator.
             metrics={
                 "tick": ticks_run, "tick_status": tick_status or "missing",
                 "spent_credits": state["spent_credits"], "next_delay_s": delay_s,
@@ -459,10 +580,16 @@ class AutopilotHandler:
     def _after_failed_turn(
         self, state: Dict[str, Any], now: datetime, ticks_run: int,
         error_class: str, detail: str,
+        spent_credits: Optional[float] = None,
     ) -> RoutineResult:
         """A crashed/timed-out turn is a mission-state event, not a
         handler failure: count the tick (it may have spent tokens),
-        strike no-progress, back off, and keep going."""
+        strike no-progress, back off, and keep going.
+
+        ``spent_credits``: sink-observed spend including this failed
+        turn's LLM calls. Before 2026-07-16 a 300s-timeout tick added
+        NOTHING to the ledger while the platform charged every call —
+        the mission under-counted precisely on runaway ticks."""
         streak = int(state.get("no_progress_streak", 0)) + 1
         state.update({
             "ticks_run": ticks_run,
@@ -473,6 +600,8 @@ class AutopilotHandler:
                 settings.autopilot_backoff_cap_seconds,
             ))),
         })
+        if spent_credits is not None:
+            state["spent_credits"] = spent_credits
         return RoutineResult(
             status="success", new_watermark=state,
             metrics={"tick": ticks_run, "tick_status": "turn_error",
@@ -563,10 +692,17 @@ class AutopilotHandler:
         *, notify_kind: str, notify_title: str, notify_body: str,
         notify_priority: str = "default", keep_enabled: bool = False,
         notify_data_extra: Optional[Dict[str, Any]] = None,
+        chat_content: Optional[str] = None,
     ) -> RoutineResult:
         """Terminal/paused transition: stamp state, stop the tick loop
         (disable the routine unless a resume path needs it firing),
-        and notify through the durable outbox."""
+        and notify through the durable outbox.
+
+        ``chat_content``: explicit user-facing chat message for this
+        transition (mission complete → the cleaned final results).
+        When None, terminal kinds fall back to '**title**\\n\\nbody'.
+        Ticks run headless since 2026-07-16, so this single clean
+        message IS the chat record of the mission's outcome."""
         state.update({
             "status": new_status,
             "status_reason": reason,
@@ -613,6 +749,48 @@ class AutopilotHandler:
         except Exception as e:  # noqa: BLE001 — notify is best-effort here
             logger.warning("autopilot: notify failed for %s: %s", routine.id, e)
 
+        # ONE clean chat message per user-facing transition (2026-07-16:
+        # ticks are headless now, so this is the mission's entire chat
+        # footprint — no more raw AUTOPILOT_* blocks every 5 minutes).
+        # Best-effort by the same contract as notify: a chat-write
+        # failure must never lose the state transition.
+        _msg_id: Optional[str] = None
+        if notify_kind in ("mission_completed", "mission_failed", "needs_input"):
+            try:
+                from .message_writer import (
+                    broadcast_routine_message, write_routine_message,
+                )
+
+                _content = chat_content or f"**{notify_title}**\n\n{notify_body}"
+                _msg_id, _day_chat_id = await write_routine_message(
+                    db,
+                    user_id=routine.user_id,
+                    content=_content,
+                    source="autopilot",
+                    routine_id=routine.id,
+                    title=f"Mission: {routine.name or 'autopilot'}",
+                    extra_metadata={
+                        "mission_message": True,
+                        "mission_id": routine.id,
+                        "mission_status": new_status,
+                        "progress": int(state.get("progress", 0) or 0),
+                        **(notify_data_extra or {}),
+                    },
+                )
+                await broadcast_routine_message(
+                    routine.user_id,
+                    message_id=_msg_id,
+                    day_chat_id=_day_chat_id,
+                    source="autopilot",
+                    content=_content,
+                    routine_name=routine.name,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "autopilot: terminal chat message failed for %s: %s",
+                    routine.id, e,
+                )
+
         logger.info(
             "[autopilot] mission=%s → %s (%s) ticks=%s spent=%.2f",
             routine.id, new_status, reason,
@@ -621,5 +799,6 @@ class AutopilotHandler:
         return RoutineResult(
             status="success",
             new_watermark=state,
+            summary_message_id=_msg_id,
             metrics={"transition": new_status, "reason": reason},
         )

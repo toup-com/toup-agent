@@ -132,6 +132,12 @@ class AgentResponse:
     # DB id, and the day-chat reload renders the same content twice
     # (once from the live append, once from the history fetch).
     asst_message_id: str = ""
+    # Mission-budget enforcement (2026-07-16): self-metered credit
+    # estimate of this run's LLM calls (no-floor pricing), and why the
+    # loop stopped — "" for a natural finish, "credit_budget" when the
+    # in-run ceiling tripped so callers can transition honestly.
+    credits_spent: float = 0.0
+    stopped_reason: str = ""
 
 
 OnTextChunk = Callable[[str], Coroutine[Any, Any, None]]
@@ -149,6 +155,27 @@ OnCredentialConfirmRequest = Callable[[Dict[str, Any]], Coroutine[Any, Any, None
 # also emits the plaintext message through on_text_chunk so chat
 # clients without a custom card renderer still show the explanation.
 OnCreditExhausted = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
+# Emitted after every completed LLM call with (model, input_tokens,
+# output_tokens) so budget-owning callers (autopilot ticks) observe
+# spend even if the run is later cancelled or times out.
+OnUsage = Callable[[str, int, int], Coroutine[Any, Any, None]]
+# Liveness signal for chat surfaces (2026-07-16 blank-response fix):
+# emitted with "thinking" right before every LLM call so clients can
+# show a live indicator through reasoning TTFT and post-tool
+# iterations — the two dead-air windows where zero frames flow.
+OnStatus = Callable[[str], Coroutine[Any, Any, None]]
+
+
+def _credits_for_llm_call(model: str, tokens_in: int, tokens_out: int) -> float:
+    """Self-metered per-call credit estimate for the in-run budget
+    ceiling. No-floor pricing (a 40-call run floored at 0.1/call would
+    inflate the ledger ~4 credits); never raises — a pricing-table
+    hiccup must not break a chat turn."""
+    try:
+        from app.services.credit_service import tokens_to_credits_raw
+        return float(tokens_to_credits_raw(model, tokens_in, tokens_out))
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 class AgentRunner:
@@ -345,6 +372,8 @@ class AgentRunner:
         on_attachment: Optional[OnAttachment] = None,
         on_credential_confirm_request: Optional[OnCredentialConfirmRequest] = None,
         on_credit_exhausted: Optional[OnCreditExhausted] = None,
+        on_usage: Optional[OnUsage] = None,
+        on_status: Optional[OnStatus] = None,
         media_paths: Optional[List[str]] = None,
         inbound_attachments: Optional[List[Dict[str, Any]]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
@@ -387,14 +416,20 @@ class AgentRunner:
             invokes ``run()``, this label is surfaced in the
             ``subagent_task_preamble`` system-prompt section so the
             child knows the brief.
-          - ``credit_budget`` — USD/credit slice the parent allocated
-            to this child. v1 stub: the parameter is plumbed through
-            and logged; the actual enforcement hook lives on the
-            credit-billing branch and gets wired by a follow-up when
-            both branches merge to main. While unwired here, passing
-            a value still feeds the dispatcher's bookkeeping at the
-            tool-result + job-row level (Phase 4) so cost attribution
-            telemetry (Phase 6) lights up immediately.
+          - ``credit_budget`` — credit ceiling for THIS run. Enforced
+            in-loop since 2026-07-16 (mission budget hard-stop): the
+            runner self-meters every LLM call via no-floor pricing;
+            once the accumulated estimate reaches the ceiling it skips
+            any pending tool calls, stops before the next LLM call,
+            and returns ``stopped_reason="credit_budget"`` with
+            ``credits_spent`` populated. Granularity is one LLM call —
+            the breaching call completes (a wrap-up call would itself
+            cost tokens past the cap). ``None`` = no ceiling; behavior
+            is byte-identical to before.
+          - ``on_usage`` — awaited after every completed LLM call with
+            (model, input_tokens, output_tokens) so budget-owning
+            callers observe spend even if the run later times out or
+            is cancelled. Exceptions are swallowed.
         """
         # Late-import the profile module so this file's import cycle
         # stays simple. PromptProfile is a small dependency module
@@ -870,6 +905,12 @@ class AgentRunner:
         # ── Phase 2: Agent loop (no DB connection held) ──────────
         total_input = 0
         total_output = 0
+        # Mission-budget hard-stop (2026-07-16): self-metered credit
+        # estimate accumulated at every message_end; checked before
+        # tool execution and before each next LLM call when
+        # credit_budget is set. "" stopped_reason = natural finish.
+        _run_credits = 0.0
+        _stopped_reason = ""
         all_tool_calls: List[Dict[str, Any]] = []
         # Per-call records persisted alongside the assistant message so the
         # ToolPillRow chrome (frontend) can re-render days later when the
@@ -992,8 +1033,27 @@ class AgentRunner:
         )
         logger.info(f"[AGENT] Using {active_model} via {'Anthropic' if _is_claude_model(active_model) else 'OpenAI'} with {len(messages)} messages")
 
+        text_buf = ""
         for iteration in range(self.max_iterations):
             logger.info(f"[AGENT] Iteration {iteration + 1}/{self.max_iterations}")
+
+            # Budget checkpoint B: a breach discovered after tool
+            # execution must never start another LLM call. Redundant
+            # with checkpoint A today (cost only accrues at
+            # message_end) but keeps the ceiling airtight if tool
+            # flat-fees ever feed _run_credits.
+            if credit_budget is not None and _run_credits >= credit_budget:
+                logger.warning(
+                    "[AGENT] credit budget %.2f reached (spent %.2f) — "
+                    "stopping before iteration %d",
+                    credit_budget, _run_credits, iteration + 1,
+                )
+                _stopped_reason = "credit_budget"
+                final_text = (
+                    final_text or text_buf
+                    or "Stopped: this run reached its credit budget."
+                )
+                break
 
             text_buf = ""
             pending_tool_calls: List[Dict[str, Any]] = []
@@ -1018,6 +1078,16 @@ class AgentRunner:
                     # kwarg is accepted-and-ignored — cache_control
                     # already wires the prompt cache via TKT-LAT-001.
                     _cache_key = f"{user_id}:{session_id}" if user_id and session_id else None
+
+                    # Liveness: cover the dead-air from here to the first
+                    # surfaced stream event (reasoning TTFT can be many
+                    # seconds on tool-first turns). Idempotent on the
+                    # client; fires again on each post-tool iteration.
+                    if on_status:
+                        try:
+                            await on_status("thinking")
+                        except Exception:  # noqa: BLE001
+                            pass
 
                     async for event in active_llm.create_message_stream(
                         messages=messages,
@@ -1056,9 +1126,19 @@ class AgentRunner:
 
                         elif event.type == "message_end":
                             stop_reason = event.stop_reason
-                            total_input += event.usage.get("input_tokens", 0)
-                            total_output += event.usage.get("output_tokens", 0)
+                            _call_in = event.usage.get("input_tokens", 0)
+                            _call_out = event.usage.get("output_tokens", 0)
+                            total_input += _call_in
+                            total_output += _call_out
                             model_used = active_model
+                            _run_credits += _credits_for_llm_call(
+                                active_model, _call_in, _call_out,
+                            )
+                            if on_usage:
+                                try:
+                                    await on_usage(active_model, _call_in, _call_out)
+                                except Exception:  # noqa: BLE001 — sink must never kill a turn
+                                    logger.debug("[AGENT] on_usage sink failed", exc_info=True)
 
                     logger.info(
                         f"[PERF] llm_total: {(time.perf_counter() - _t_llm_start) * 1000:.0f}ms "
@@ -1191,9 +1271,19 @@ class AgentRunner:
                                         })
                                     elif event.type == "message_end":
                                         stop_reason = event.stop_reason
-                                        total_input += event.usage.get("input_tokens", 0)
-                                        total_output += event.usage.get("output_tokens", 0)
+                                        _call_in = event.usage.get("input_tokens", 0)
+                                        _call_out = event.usage.get("output_tokens", 0)
+                                        total_input += _call_in
+                                        total_output += _call_out
                                         model_used = fallback
+                                        _run_credits += _credits_for_llm_call(
+                                            fallback, _call_in, _call_out,
+                                        )
+                                        if on_usage:
+                                            try:
+                                                await on_usage(fallback, _call_in, _call_out)
+                                            except Exception:  # noqa: BLE001
+                                                logger.debug("[AGENT] on_usage sink failed", exc_info=True)
                                 break  # Fallback succeeded
                             except asyncio.CancelledError:
                                 raise
@@ -1236,6 +1326,25 @@ class AgentRunner:
             # If no tool calls, we're done
             if stop_reason != "tool_use" or not pending_tool_calls:
                 final_text = text_buf
+                break
+
+            # Budget checkpoint A (mission hard-stop, 2026-07-16): the
+            # breaching LLM call completes — one-call slip, a wrap-up
+            # call would itself spend past the cap — but its pending
+            # tool calls are skipped and the loop ends. Callers see
+            # stopped_reason="credit_budget" and transition honestly
+            # (autopilot → blocked/budget_exhausted).
+            if credit_budget is not None and _run_credits >= credit_budget:
+                logger.warning(
+                    "[AGENT] credit budget %.2f reached (spent %.2f) — "
+                    "skipping %d pending tool call(s) and stopping",
+                    credit_budget, _run_credits, len(pending_tool_calls),
+                )
+                _stopped_reason = "credit_budget"
+                final_text = (
+                    text_buf
+                    or "Stopped: this run reached its credit budget."
+                )
                 break
 
             # Execute tool calls.
@@ -1566,6 +1675,8 @@ class AgentRunner:
             processing_time_ms=elapsed,
             memories_extracted=0,  # extracted in background
             asst_message_id=asst_message_id,
+            credits_spent=round(_run_credits, 4),
+            stopped_reason=_stopped_reason,
         )
 
     async def _execute_tools_parallel(
@@ -2758,6 +2869,7 @@ class AgentRunner:
             f"- Max tool iterations: {self.max_iterations}",
             f"- You have FULL terminal/shell access via the `exec` tool. You can run any command, install packages, write scripts, manage files, use git, curl, python, node, etc.",
             f"- You can read and write files using `read_file` and `write_file` tools.",
+            f"- When you create a report or document for the user, end your reply with a markdown link [Open <name>](toup://report?path=<workspace-relative-path>) so they can tap to open it (the write_file result includes the exact link).",
             f"- You can search the web using the `web_search` tool.",
             f"- When the user asks you to DO something you will finish in this turn (research, produce, fix — anything beyond answering), create a trackable job with `create_job` and advance it with `update_job` per step. For work that must CONTINUE after this conversation ('while I'm away', 'keep me updated'), use `start_mission` instead — never both for the same ask.",
         ]

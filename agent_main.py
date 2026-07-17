@@ -49,6 +49,7 @@ from app.api.voice import router as voice_router, set_voice_refs
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.dashboard import router as dashboard_router
+from app.api.workspace_files import router as workspace_files_router
 from app.api.soul import router as soul_router
 from app.api.llm_setup import router as llm_setup_router
 from app.api.apps import router as apps_router, set_app_manager, set_app_gateway, set_app_builder_skill, set_agent_runner
@@ -1567,6 +1568,10 @@ app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
+# Workspace file listing/read for the platform proxy + mobile Workspace
+# screen. AgentAPIKeyMiddleware (added above) already gates every /api
+# route behind X-Agent-Key, so the router needs no auth dependency.
+app.include_router(workspace_files_router, prefix=settings.api_prefix)
 app.include_router(ws_browser_router, prefix=settings.api_prefix)
 # Unified jobs activity feed (PR 6 of the jobs/tasks/logs arc) —
 # server-side ``GET /apps/jobs/events`` query over job_events JOIN

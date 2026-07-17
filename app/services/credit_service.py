@@ -134,6 +134,23 @@ def tokens_to_credits(model: str, input_tokens: int, output_tokens: int) -> Deci
     return _q(credits, _DISPLAY_QUANTUM)
 
 
+def tokens_to_credits_raw(model: str, input_tokens: int, output_tokens: int) -> Decimal:
+    """``tokens_to_credits`` without the 0.1-credit floor.
+
+    For per-call accumulation inside the agent loop (mission budget
+    hard-stop, 2026-07-16): a 40-iteration run floored at 0.1/call
+    would inflate the ledger by up to 4 credits. Deduction rows keep
+    using the floored ``tokens_to_credits``."""
+    pricing = settings.pricing_per_1k.get(model)
+    if not pricing:
+        pricing = {"input": 0.003, "output": 0.015}
+    cost_usd = (
+        (Decimal(str(input_tokens)) * Decimal(str(pricing["input"])) / Decimal("1000"))
+        + (Decimal(str(output_tokens)) * Decimal(str(pricing["output"])) / Decimal("1000"))
+    )
+    return _q(cost_usd * Decimal("100"), _DISPLAY_QUANTUM)
+
+
 # Flat-fee credit costs for non-LLM chargeable events.
 FLAT_FEES: dict[str, dict] = {
     "web_search":          {"bucket": BUCKET_INTEGRATION, "credits": Decimal("1.0")},

@@ -76,3 +76,17 @@ async def test_notify_failure_never_raises(monkeypatch):
         job_id="j", label=None, kind="mission_failed",
         title="⚠️ Didn't finish: background task", dedup_suffix="failed",
     )
+
+
+@pytest.mark.asyncio
+async def test_autopilot_parent_spawns_are_not_urgent(notify_calls):
+    """Spawns fired by a mission tick must NOT bypass quiet hours —
+    a 3am autopilot spawn is background work, not an awake user."""
+    from app.agent.subagent_orchestrator import _notify_job_event
+
+    await _notify_job_event(
+        job_id="job-9", label="Night research",
+        kind="mission_started", title="🛠 Working on: Night research",
+        dedup_suffix="started", urgent=False,
+    )
+    assert notify_calls[0]["data"]["urgent"] is False

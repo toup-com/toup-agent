@@ -7,6 +7,7 @@ Protocol:
     { "type": "ping" }
 
   Server sends JSON:
+    { "type": "status", "stage": "received" | "thinking" }
     { "type": "text_chunk", "text": "..." }
     { "type": "tool_start", "tool": "..." }
     { "type": "tool_end", "tool": "...", "summary": "..." }
@@ -1889,6 +1890,18 @@ async def ws_chat(
                             pass
                         continue
 
+                # ── Instant server ack (2026-07-16 blank-response fix) ──
+                # Every accepted message — including the FIRST message of a
+                # session (session_id null, so user_message_persisted below
+                # is skipped) — gets a sub-100ms status frame. Without it
+                # the wire is silent through the whole pre-LLM pipeline +
+                # the model's reasoning, and the app shows dead air for
+                # ~10s on tool-first turns.
+                try:
+                    await websocket.send_json({"type": "status", "stage": "received"})
+                except Exception:
+                    pass
+
                 # ── Pre-save user message so it survives stream failures ──
                 # Skip if no session_id yet (first message — agent_runner creates session)
                 # Skip for system actions (customize_app) — no user message to save
@@ -2035,6 +2048,32 @@ async def ws_chat(
                 # Accumulate streamed text for partial-save on error
                 _streamed_chunks: list = []
 
+                # Presence-aware delivery (founder ask 2026-07-16): if the
+                # user force-quits mid-turn, the turn keeps running; the
+                # phone gets a Live Activity while we work and the final
+                # answer as a push when no client is connected to receive
+                # the done frame. One mission id ties start→complete.
+                # Minted BEFORE the callbacks so the interim-progress
+                # emitter can close over it.
+                _turn_mission_id = f"chatturn:{uuid.uuid4().hex[:12]}"
+                _turn_flags = {"client_gone": False, "response_persisted": False}
+
+                # Interim Live Activity progress at tool boundaries. The
+                # gate is load-bearing: progress rows silently (re)start
+                # a card, so we emit ONLY after the client is gone —
+                # otherwise every ordinary chat turn would put a card on
+                # the lock screen.
+                from app.agent.turn_progress import TurnProgressEmitter
+
+                _turn_emitter = TurnProgressEmitter(
+                    mission_id=_turn_mission_id,
+                    mission_title="Working on your answer",
+                    base_progress=5,
+                    ceiling=90,
+                    route="chat",
+                    gate=lambda: _turn_flags["client_gone"],
+                )
+
                 # Stream callbacks
                 async def on_text_chunk(chunk: str):
                     _streamed_chunks.append(chunk)
@@ -2076,6 +2115,21 @@ async def ws_chat(
                     _tprint(f"{_DIM}  ⚙ {tool_name}{_RESET}")
                     try:
                         await websocket.send_json({"type": "tool_start", "tool": tool_name})
+                    except Exception:
+                        pass
+                    # Gated on client_gone — no-op while the user watches.
+                    try:
+                        await _turn_emitter.on_tool_start(tool_name)
+                    except Exception:
+                        pass
+
+                async def on_status(stage: str):
+                    """Liveness signal during LLM dead-air (2026-07-16):
+                    the runner emits 'thinking' before every LLM call so
+                    the client can show a live indicator through
+                    reasoning TTFT and post-tool iterations."""
+                    try:
+                        await websocket.send_json({"type": "status", "stage": stage})
                     except Exception:
                         pass
 
@@ -2299,13 +2353,8 @@ async def ws_chat(
                 # For app-channel messages, text has [CONTEXT:...] prepended — always
                 # save the original. For fast-path (music), save the modified fast text.
                 _display_text = _original_user_text if (_original_user_text != text) else (text if _fast_text else None)
-                # Presence-aware delivery (founder ask 2026-07-16): if the
-                # user force-quits mid-turn, the turn keeps running; the
-                # phone gets a Live Activity while we work and the final
-                # answer as a push when no client is connected to receive
-                # the done frame. One mission id ties start→complete.
-                _turn_mission_id = f"chatturn:{uuid.uuid4().hex[:12]}"
-                _turn_flags = {"client_gone": False, "response_persisted": False}
+                # (_turn_mission_id/_turn_flags minted above, before the
+                # stream callbacks, so the progress emitter closes over them.)
                 _user_text_preview = (_original_user_text or text or "")[:180]
 
                 agent_task = asyncio.create_task(_agent_runner.run(
@@ -2320,6 +2369,7 @@ async def ws_chat(
                     on_attachment=on_attachment,
                     on_credential_confirm_request=on_credential_confirm_request,
                     on_credit_exhausted=on_credit_exhausted,
+                    on_status=on_status,
                     model_override=model,
                     save_user_message=not is_onboarding_msg and not _user_msg_presaved and not _is_system_action,
                     media_paths=_media_paths if _media_paths else None,
@@ -2377,6 +2427,11 @@ async def ws_chat(
                             )
                         except Exception:  # noqa: BLE001 — best-effort card
                             pass
+                        # The card may appear mid-turn after several tools
+                        # already ran — let the next tool boundary emit
+                        # progress immediately instead of waiting out the
+                        # throttle window.
+                        _turn_emitter.force_next()
 
                 stop_task = asyncio.create_task(_wait_for_stop())
 

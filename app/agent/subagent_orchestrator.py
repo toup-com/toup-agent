@@ -244,6 +244,7 @@ async def spawn_subagent(
             agent_runner=agent_runner,
             session_maker=session_maker,
             credit_budget=credit_budget,
+            parent_channel=channel,
         ))
         subagent_metrics.log_lifecycle(
             event="accepted",
@@ -322,6 +323,7 @@ async def _run_child(
     agent_runner: Any,
     session_maker: Any,
     credit_budget: Optional[float] = None,
+    parent_channel: Optional[str] = None,
 ) -> None:
     """Background task: flip status to running, run the child agent
     under a SUBAGENT lane slot, announce-back the result.
@@ -383,6 +385,7 @@ async def _run_child(
             body=(task or "")[:200],
             timer_end_ms=int((time.time() + min(timeout_seconds, 1800)) * 1000),
             dedup_suffix="started",
+            urgent=(parent_channel != "autopilot"),
         )
 
         try:
@@ -548,6 +551,7 @@ async def _run_child(
                 model_used=model_used,
                 started_at=started_at,
                 session_maker=session_maker,
+                parent_channel=parent_channel,
             )
         except Exception as fin_err:  # pragma: no cover — defensive
             logger.exception(
@@ -570,13 +574,17 @@ async def _notify_job_event(
     dismiss_after_s: Optional[int] = None,
     priority: str = "default",
     dedup_suffix: str,
+    urgent: bool = True,
 ) -> None:
     """Phone-surface lifecycle event for a spawned job: durable outbox →
     platform → APNs Live Activity (lock screen card + Dynamic Island),
-    which keeps working when the app is force-quit. ``urgent`` is always
-    set — spawns originate from an interactive chat turn, so the user is
-    awake and quiet hours must not defer the card. Best-effort by
-    contract: a job must never fail on notification plumbing."""
+    which keeps working when the app is force-quit. ``urgent`` defaults
+    True — spawns from an interactive chat turn mean the user is awake
+    and quiet hours must not defer the card. Callers pass urgent=False
+    for spawns whose parent is a background surface (autopilot ticks):
+    a 3am mission-tick spawn must NOT bypass quiet hours (2026-07-16).
+    Best-effort by contract: a job must never fail on notification
+    plumbing."""
     try:
         from app.services.agent_notify_client import notify
 
@@ -585,7 +593,7 @@ async def _notify_job_event(
             "mission_id": job_id,
             "mission_title": (label or "Background task")[:80],
             "kind": "job",
-            "urgent": True,
+            "urgent": urgent,
         }
         if progress is not None:
             data["progress"] = progress
@@ -623,6 +631,7 @@ async def _finalize(
     model_used: Optional[str],
     started_at: datetime,
     session_maker: Any,
+    parent_channel: Optional[str] = None,
 ) -> None:
     """Announce-back + terminal status transition."""
     from app.agent.subagent_message_writer import (
@@ -772,12 +781,14 @@ async def _finalize(
     # dismiss after 15 min (quick jobs shouldn't clutter the lock
     # screen for hours); failures linger the default 4h so the user
     # can't miss them; cancels vanish fast and quietly.
+    _urgent = parent_channel != "autopilot"
     if outcome == "success":
         await _notify_job_event(
             job_id=job_id, label=label, kind="mission_completed",
             title=f"✅ Done: {(label or 'background task')[:150]}",
             body=(final_text or "")[:300], progress=100,
             dismiss_after_s=900, dedup_suffix="completed",
+            urgent=_urgent,
         )
     elif outcome == "cancelled":
         await _notify_job_event(
@@ -785,6 +796,7 @@ async def _finalize(
             title=f"⏹ Stopped: {(label or 'background task')[:150]}",
             body="Cancelled.", priority="low",
             dismiss_after_s=60, dedup_suffix="cancelled",
+            urgent=_urgent,
         )
     else:  # failed | timeout | budget_exhausted
         await _notify_job_event(
@@ -792,6 +804,7 @@ async def _finalize(
             title=f"⚠️ Didn't finish: {(label or 'background task')[:150]}",
             body=(error_message or outcome)[:300],
             dedup_suffix="failed",
+            urgent=_urgent,
         )
 
     logger.info(

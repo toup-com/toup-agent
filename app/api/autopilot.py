@@ -179,17 +179,34 @@ class MissionOut(BaseModel):
     pending_approval_id: Optional[str] = None
 
 
+def _progress_int(state: dict, status: str) -> int:
+    """Progress as a guaranteed finite int 0-100.
+
+    completed → always 100, even for missions finished under images
+    that predate the progress field (their last_state_json has no key
+    forever, which rendered as 0% — or NaN% on unguarded clients,
+    founder bug 2026-07-16). Junk state values clamp to 0 instead of
+    500ing the whole missions list."""
+    if status == "completed":
+        return 100
+    try:
+        return max(0, min(100, int(float(state.get("progress", 0) or 0))))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _mission_out(r: Routine) -> MissionOut:
     cfg = r.config_json or {}
     state = r.last_state_json or {}
+    _status = state.get("status", "active")
     return MissionOut(
         id=r.id,
         name=r.name,
         goal=cfg.get("goal") or (r.prompt_text or ""),
         enabled=bool(r.enabled),
-        status=state.get("status", "active"),
+        status=_status,
         status_reason=state.get("status_reason"),
-        progress=int(state.get("progress", 0) or 0),
+        progress=_progress_int(state, _status),
         budget_credits=float(cfg.get("budget_credits")
                              or settings.autopilot_default_budget_credits),
         spent_credits=float(state.get("spent_credits", 0.0)),

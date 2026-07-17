@@ -183,6 +183,9 @@ def _patch_httpx(monkeypatch, response_status: int, response_body: dict | None =
         def __init__(self, status, body):
             self.status_code = status
             self._body = body or {}
+            # The helper rejects non-JSON responses (SPA index.html
+            # fallback guard, 2026-05-24) — fake the honest header.
+            self.headers = {"content-type": "application/json"}
         def json(self):
             return self._body
 
@@ -388,3 +391,35 @@ async def test_endpoint_returns_false_when_column_value_is_false():
         db=_FakeDB(),
     )
     assert resp.subagent_spawning_enabled is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 5. Disabled-path honesty (2026-07-16 founder repro)
+# ──────────────────────────────────────────────────────────────────────
+#
+# With spawning disabled and no live Telegram chat, the old code
+# returned SUBAGENT_LEGACY_TELEGRAM_ONLY — which reads as a channel
+# problem when the actual blocker is the kill switch. The honest
+# error is SUBAGENT_DISABLED with the operator hint.
+
+
+@pytest.mark.asyncio
+async def test_spawn_disabled_no_chat_reports_disabled(monkeypatch, tmp_path):
+    import app.agent.tool_executor as te_mod
+    from app.agent.tool_executor import ToolExecutor
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "subagent_spawning_enabled", False)
+
+    async def _flag_false(user_id):
+        return False
+
+    monkeypatch.setattr(te_mod, "_read_subagent_flag_for_user", _flag_false)
+
+    te = ToolExecutor(workspace=str(tmp_path), subagent_manager=object())
+    te.set_user_id("11111111-1111-1111-1111-111111111111")
+    # No Telegram chat in context (ContextVar default) — the exact
+    # shape of a web/mobile chat turn or an autopilot tick.
+    out = await te._tool_spawn({"task": "research something"})
+    assert '"SUBAGENT_DISABLED"' in out
+    assert "SUBAGENT_LEGACY_TELEGRAM_ONLY" not in out

@@ -487,3 +487,240 @@ def test_every_prompt_profile_covered_by_all_profile_maps():
         sections_for(profile)
         allows_post_builder_blocks(profile)
         disabled_tools_for(profile)
+
+
+# ── Budget hard-stop (2026-07-16): mid-tick ceiling + post-tick reconcile ──
+
+
+class BudgetFakeRunner:
+    """FakeRunner variant whose replies are full response namespaces —
+    lets tests drive credits_spent / stopped_reason, and optionally
+    feed the on_usage sink before timing out."""
+
+    def __init__(self, replies, usage_events=None, slow=False):
+        self.replies = list(replies)
+        self.usage_events = usage_events or []
+        self.slow = slow
+        self.calls = []
+
+    async def run(self, **kwargs):
+        self.calls.append(kwargs)
+        on_usage = kwargs.get("on_usage")
+        if on_usage:
+            for (model, t_in, t_out) in self.usage_events:
+                await on_usage(model, t_in, t_out)
+        if self.slow:
+            await asyncio.sleep(5)
+        return self.replies.pop(0)
+
+
+def _resp(text, *, credits=0.0, stopped=""):
+    return SimpleNamespace(
+        text=text, tokens_input=1000, tokens_output=500,
+        model="gpt-4o-mini", asst_message_id="am-1",
+        credits_spent=credits, stopped_reason=stopped,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tick_passes_remaining_budget_to_runner(notify_calls):
+    routine = await _mk_mission(
+        state={"status": "active", "spent_credits": 30.0},
+    )
+    fake = BudgetFakeRunner([_resp(
+        "AUTOPILOT_STATUS: working\nAUTOPILOT_SUMMARY: step 1 done",
+        credits=2.0,
+    )])
+    await _exec(AutopilotHandler(fake), routine)
+    assert fake.calls, "tick should have run"
+    assert fake.calls[0]["credit_budget"] == pytest.approx(20.0)
+    assert callable(fake.calls[0]["on_usage"])
+
+
+@pytest.mark.asyncio
+async def test_midtick_budget_stop_blocks_mission(notify_calls):
+    """Runner tripped its in-run ceiling → mission blocks
+    budget_exhausted immediately, spend persisted, honest push."""
+    routine = await _mk_mission(
+        state={"status": "active", "spent_credits": 10.0},
+    )
+    fake = BudgetFakeRunner([_resp(
+        "AUTOPILOT_STATUS: working\nAUTOPILOT_SUMMARY: got halfway",
+        credits=45.0, stopped="credit_budget",
+    )])
+    result = await _exec(AutopilotHandler(fake), routine)
+    wm = result.new_watermark
+    assert wm["status"] == "blocked"
+    assert wm["status_reason"] == "budget_exhausted"
+    assert wm["spent_credits"] == pytest.approx(55.0)
+    assert any(c["event_kind"] == "mission_failed" for c in notify_calls)
+
+
+@pytest.mark.asyncio
+async def test_working_tick_landing_over_budget_blocks_now(notify_calls):
+    """A working tick whose spend lands >= budget must block in the
+    same tick — not lie 'active' for 5 minutes until the next fire's
+    pre-tick gate."""
+    routine = await _mk_mission(
+        state={"status": "active", "spent_credits": 48.0},
+    )
+    fake = BudgetFakeRunner([_resp(
+        "AUTOPILOT_STATUS: working\nAUTOPILOT_SUMMARY: more findings",
+        credits=6.0,  # lands at 54 >= 50, no in-run stop
+    )])
+    result = await _exec(AutopilotHandler(fake), routine)
+    wm = result.new_watermark
+    assert wm["status"] == "blocked"
+    assert wm["status_reason"] == "budget_exhausted"
+    assert "next_due_at" not in wm or wm["next_due_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_done_over_budget_completes_with_overshoot(notify_calls):
+    """Finished work is never blocked retroactively — the overshoot is
+    recorded instead (bounded to ~one LLM call by the in-run ceiling)."""
+    routine = await _mk_mission(
+        state={"status": "active", "spent_credits": 45.0},
+    )
+    fake = BudgetFakeRunner([_resp(
+        "AUTOPILOT_STATUS: done\nAUTOPILOT_SUMMARY: report finished",
+        credits=8.0,  # lands at 53 > 50
+    )])
+    result = await _exec(AutopilotHandler(fake), routine)
+    wm = result.new_watermark
+    assert wm["status"] == "completed"
+    assert wm["progress"] == 100
+    assert wm["budget_overshoot"] == pytest.approx(3.0)
+
+
+@pytest.mark.asyncio
+async def test_timeout_tick_meters_sink_spend(notify_calls):
+    """A timed-out tick's LLM calls were genuinely charged — the
+    on_usage sink must advance spent_credits (before 2026-07-16 they
+    were invisible to the mission ledger)."""
+    routine = await _mk_mission(
+        cfg={"goal": "g", "budget_credits": 50, "tick_timeout_s": 1},
+        state={"status": "active", "spent_credits": 5.0},
+    )
+    fake = BudgetFakeRunner(
+        [_resp("never returned")], slow=True,
+        usage_events=[("gpt-4o-mini", 100_000, 20_000)],
+    )
+    result = await _exec(AutopilotHandler(fake), routine)
+    wm = result.new_watermark
+    assert wm["ticks_run"] == 1
+    assert wm["spent_credits"] > 5.0
+
+
+# ── runner-side pure-function pins ──
+
+
+def test_credits_for_llm_call_positive_for_priced_model():
+    from app.agent.agent_runner import _credits_for_llm_call
+    from app.config import settings
+
+    model = next(iter(settings.pricing_per_1k))
+    assert _credits_for_llm_call(model, 100_000, 20_000) > 0
+
+
+def test_tokens_to_credits_raw_has_no_floor():
+    from decimal import Decimal
+    from app.services.credit_service import tokens_to_credits, tokens_to_credits_raw
+
+    model = "gpt-4o-mini"
+    floored = tokens_to_credits(model, 10, 5)
+    raw = tokens_to_credits_raw(model, 10, 5)
+    assert floored >= Decimal("0.1")
+    assert raw < floored
+
+
+# ── Clean mission chat (2026-07-16): headless ticks, one terminal message ──
+
+
+def test_strip_tick_markers_removes_engine_contract_lines():
+    from app.agent.routines.autopilot_handler import strip_tick_markers
+
+    raw = (
+        "Here is what I found about design tools.\n"
+        "AUTOPILOT_STATUS: done\n"
+        "Some more detail.\n"
+        "autopilot_summary: finished the report\n"
+        "AUTOPILOT_PROGRESS: 100\n"
+        "AUTOPILOT_NOTE: private scratchpad\n"
+    )
+    out = strip_tick_markers(raw)
+    assert "AUTOPILOT_" not in out.upper()
+    assert "Here is what I found" in out
+    assert "Some more detail." in out
+
+
+@pytest.fixture
+def chat_writes(monkeypatch):
+    """Capture the routine message-writer seam (the real writer needs
+    the pgvector-backed messages table, absent under SQLite)."""
+    import app.agent.routines.message_writer as mw
+
+    writes: list[dict] = []
+    broadcasts: list[dict] = []
+
+    async def fake_write(db, **kwargs):
+        writes.append(kwargs)
+        return f"msg-{len(writes)}", "dc-1"
+
+    async def fake_broadcast(user_id, **kwargs):
+        broadcasts.append({"user_id": user_id, **kwargs})
+        return {"ws_count": 1, "channel_results": {}}
+
+    monkeypatch.setattr(mw, "write_routine_message", fake_write)
+    monkeypatch.setattr(mw, "broadcast_routine_message", fake_broadcast)
+    return {"writes": writes, "broadcasts": broadcasts}
+
+
+@pytest.mark.asyncio
+async def test_ticks_run_headless(notify_calls, chat_writes):
+    """The tick's raw reply (with its mandated AUTOPILOT_* trailer)
+    must never persist as a chat message — working ticks are silent."""
+    routine = await _mk_mission(state={"status": "active"})
+    fake = BudgetFakeRunner([_resp(
+        "AUTOPILOT_STATUS: working\nAUTOPILOT_SUMMARY: step 1",
+    )])
+    result = await _exec(AutopilotHandler(fake), routine)
+    assert fake.calls[0]["save_assistant_message"] is False
+    assert fake.calls[0]["disable_post_processing"] is True
+    assert result.summary_message_id is None
+    assert chat_writes["writes"] == [], "working tick wrote a chat message"
+
+
+@pytest.mark.asyncio
+async def test_done_writes_one_clean_chat_message(notify_calls, chat_writes):
+    """Mission completion posts exactly ONE user-facing message with
+    the cleaned results — no AUTOPILOT_ markers — and stamps its id
+    on the RoutineResult so 'Open in chat' works."""
+    routine = await _mk_mission(state={"status": "active"})
+    fake = BudgetFakeRunner([_resp(
+        "The final report is ready: Figma leads for teams.\n"
+        "AUTOPILOT_STATUS: done\n"
+        "AUTOPILOT_SUMMARY: report finished\n"
+        "AUTOPILOT_PROGRESS: 100",
+        credits=2.0,
+    )])
+    result = await _exec(AutopilotHandler(fake), routine)
+    assert len(chat_writes["writes"]) == 1
+    w = chat_writes["writes"][0]
+    assert w["source"] == "autopilot"
+    assert "Mission complete" in w["content"]
+    assert "Figma leads for teams" in w["content"]
+    assert "AUTOPILOT_" not in w["content"]
+    assert w["extra_metadata"]["mission_id"] == routine.id
+    assert result.summary_message_id == "msg-1"
+    assert len(chat_writes["broadcasts"]) == 1
+
+
+def test_read_paths_hide_autopilot_channel():
+    """Historical raw tick rows are hidden at the two user-visible
+    read paths (no data migration needed)."""
+    import inspect
+    from app.api import day_chats, messages_recover
+
+    assert inspect.getsource(day_chats).count('Conversation.channel != "autopilot"') == 2
+    assert 'Conversation.channel != "autopilot"' in inspect.getsource(messages_recover)

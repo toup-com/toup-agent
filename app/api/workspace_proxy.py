@@ -2,17 +2,21 @@
 Workspace file browser proxy — lets authenticated users browse files
 in their own VPS container's workspace directory.
 
-Uses host-level SSH commands (not docker exec) because container volumes
-may not be mounted. Files live at /data/agents/{user_prefix}/workspace/
-on the Docker host.
+Listing/read go agent-first over HTTP (X-Agent-Key to the agent's
+/api/workspace routes) because pool containers keep the workspace
+entirely inside the container — no host bind. Host-level SSH commands
+against /data/agents/{user_prefix}/workspace/ remain as the fallback
+for legacy volume-mounted tenants and the write/rename/preview routes.
 """
 
 import io
 import logging
 import base64
+import shlex
 from datetime import datetime
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -78,6 +82,67 @@ async def _require_container(user_id: str, db: AsyncSession) -> ManagedContainer
     return container
 
 
+async def _get_agent_proxy_info(user_id: str, db: AsyncSession):
+    """Return (agent_url, agent_api_key) for the caller's remote agent, or None.
+
+    Workspace files live INSIDE the tenant container (pool members have
+    no host bind for /app/workspace), so the agent's own /api/workspace
+    routes are the source of truth. Mirrors files.py's proxy pattern.
+    """
+    try:
+        from app.db.models import AgentConfig  # noqa — may not exist on agent DBs
+        result = await db.execute(
+            select(AgentConfig.agent_url, AgentConfig.agent_api_key).where(
+                AgentConfig.user_id == user_id,
+                AgentConfig.deploy_status == "active",
+            )
+        )
+        row = result.first()
+        if row and row.agent_url and row.agent_api_key:
+            return (row.agent_url, row.agent_api_key)
+    except Exception:
+        pass
+    return None
+
+
+async def _agent_workspace_get(agent, route: str, params: dict) -> Optional[dict]:
+    """GET {agent_url}/api/workspace/{route} with X-Agent-Key.
+
+    Returns the agent's JSON on 2xx. Raises to pass 404/413/415
+    through (file genuinely missing / too large / binary — the SSH
+    fallback can't answer better). Returns None when the agent is
+    unreachable, errors, or predates the workspace_files router (old
+    image) so the caller falls back to the legacy SSH path.
+    """
+    agent_url, agent_key = agent
+    from app.services.agent_http import get_agent_http_client
+    client = get_agent_http_client()
+    try:
+        resp = await client.get(
+            f"{agent_url.rstrip('/')}/api/workspace/{route}",
+            headers={"X-Agent-Key": agent_key},
+            params=params,
+            timeout=10.0,
+        )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code < 300:
+        return resp.json()
+    if resp.status_code in (404, 413, 415):
+        try:
+            detail = resp.json().get("detail", "")
+        except Exception:
+            detail = ""
+        # FastAPI's detail for a MISSING ROUTE is exactly "Not Found"
+        # (capital F) — an agent image without workspace_files.py yet.
+        # The router's own 404s say "File not found"/"Directory not
+        # found"/"Not found", which are real answers to pass through.
+        if resp.status_code == 404 and detail == "Not Found":
+            return None
+        raise HTTPException(resp.status_code, detail or "Not found")
+    return None  # 5xx / key desync — the legacy SSH path may still work
+
+
 # ── List files ───────────────────────────────────────────────────
 
 @router.get("/files")
@@ -88,13 +153,22 @@ async def list_workspace_files(
 ):
     """List files in the user's workspace directory."""
     await _require_container(current_user.id, db)
-    base = _host_workspace(current_user.id)
 
+    # Agent-first: live files exist only inside the container for
+    # pool-bound tenants. SSH host listing is the legacy fallback for
+    # volume-mounted tenants / agent images without the route yet.
+    agent = await _get_agent_proxy_info(current_user.id, db)
+    if agent:
+        result = await _agent_workspace_get(agent, "files", {"path": path})
+        if result is not None:
+            return result
+
+    base = _host_workspace(current_user.id)
     clean_path = path.strip("/").replace("..", "")
     target = f"{base}/{clean_path}" if clean_path else base
 
     raw = await _ssh_cmd(
-        f"find {target} -maxdepth 1 -printf '%y|%s|%T@|%f\\n' 2>/dev/null | head -500"
+        f"find {shlex.quote(target)} -maxdepth 1 -printf '%y|%s|%T@|%f\\n' 2>/dev/null | head -500"
     )
     if not raw:
         return {"path": clean_path, "files": [], "base": "/workspace"}
@@ -127,16 +201,23 @@ async def read_workspace_file(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Read a file from the user's workspace (tries container then host)."""
+    """Read a file from the user's workspace (agent HTTP, then container, then host)."""
     container = await _require_container(current_user.id, db)
     host_base = _host_workspace(current_user.id)
+
+    # Agent-first (see list_workspace_files). Passes 404/413/415 through.
+    agent = await _get_agent_proxy_info(current_user.id, db)
+    if agent:
+        result = await _agent_workspace_get(agent, "file", {"path": path})
+        if result is not None:
+            return result
 
     clean_path = path.strip("/").replace("..", "")
     if not clean_path:
         raise HTTPException(400, "Path is required")
 
     # Try container first (live files), fall back to host
-    container_target = f"{_container_workspace()}/{clean_path}"
+    container_target = shlex.quote(f"{_container_workspace()}/{clean_path}")
     size_check = await _ssh_cmd(
         f"docker exec {container.container_name} stat -c%s {container_target} 2>/dev/null"
     )
@@ -149,7 +230,7 @@ async def read_workspace_file(
         return {"path": clean_path, "content": content, "size": int(size_check.strip())}
 
     # Fall back to host path
-    host_target = f"{host_base}/{clean_path}"
+    host_target = shlex.quote(f"{host_base}/{clean_path}")
     size_check = await _ssh_cmd(f"stat -c%s {host_target} 2>/dev/null")
     if not size_check or not size_check.strip().isdigit():
         raise HTTPException(404, "File not found")
@@ -180,13 +261,13 @@ async def workspace_tree(
     container_target = f"{container_base}/{clean_path}" if clean_path else container_base
     raw = await _ssh_cmd(
         f"docker exec {container.container_name} "
-        f"find {container_target} -maxdepth {depth} -printf '%y|%s|%P\\n' 2>/dev/null | head -1000"
+        f"find {shlex.quote(container_target)} -maxdepth {depth} -printf '%y|%s|%P\\n' 2>/dev/null | head -1000"
     )
 
     # Also check host path for files that may not be in container
     host_target = f"{host_base}/{clean_path}" if clean_path else host_base
     host_raw = await _ssh_cmd(
-        f"find {host_target} -maxdepth {depth} -printf '%y|%s|%P\\n' 2>/dev/null | head -1000"
+        f"find {shlex.quote(host_target)} -maxdepth {depth} -printf '%y|%s|%P\\n' 2>/dev/null | head -1000"
     )
 
     # Merge: container files take priority, host files fill gaps
@@ -293,7 +374,7 @@ async def write_workspace_file(
     clean_path = body.path.strip("/").replace("..", "")
     if not clean_path:
         raise HTTPException(400, "Path is required")
-    target = f"{base}/{clean_path}"
+    target = shlex.quote(f"{base}/{clean_path}")
 
     b64 = base64.b64encode(body.content.encode()).decode()
     await _ssh_cmd(
@@ -322,7 +403,7 @@ async def delete_workspace_file(
     clean_path = path.strip("/").replace("..", "")
     if not clean_path:
         raise HTTPException(400, "Cannot delete workspace root")
-    target = f"{base}/{clean_path}"
+    target = shlex.quote(f"{base}/{clean_path}")
 
     exists = await _ssh_cmd(f"test -e {target} && echo yes || echo no")
     if exists != "yes":
@@ -354,8 +435,8 @@ async def rename_workspace_file(
     if not old_clean or not new_clean:
         raise HTTPException(400, "Both old_path and new_path are required")
 
-    old_target = f"{base}/{old_clean}"
-    new_target = f"{base}/{new_clean}"
+    old_target = shlex.quote(f"{base}/{old_clean}")
+    new_target = shlex.quote(f"{base}/{new_clean}")
 
     await _ssh_cmd(
         f"mkdir -p \"$(dirname {new_target})\" && mv {old_target} {new_target}"
@@ -387,7 +468,7 @@ async def create_workspace_dir(
     clean_path = body.path.strip("/").replace("..", "")
     if not clean_path:
         raise HTTPException(400, "Path is required")
-    target = f"{base}/{clean_path}"
+    target = shlex.quote(f"{base}/{clean_path}")
 
     await _ssh_cmd(f"mkdir -p {target}")
 
@@ -413,7 +494,7 @@ async def download_workspace_file(
     clean_path = path.strip("/").replace("..", "")
     if not clean_path:
         raise HTTPException(400, "Path is required")
-    target = f"{base}/{clean_path}"
+    target = shlex.quote(f"{base}/{clean_path}")
 
     size_check = await _ssh_cmd(f"stat -c%s {target} 2>/dev/null")
     if not size_check or not size_check.strip().isdigit():
@@ -470,20 +551,20 @@ async def preview_workspace_file(
         raise HTTPException(400, "Path is required")
 
     # If path points to a directory, try index.html
-    container_target = f"{container_base}/{clean_path}"
+    container_target = shlex.quote(f"{container_base}/{clean_path}")
     is_dir = await _ssh_cmd(
         f"docker exec {container.container_name} test -d {container_target} && echo yes || echo no"
     )
     if is_dir == "yes":
         clean_path = f"{clean_path}/index.html"
-        container_target = f"{container_base}/{clean_path}"
+        container_target = shlex.quote(f"{container_base}/{clean_path}")
 
     # Try container first, then host
     b64_content = await _ssh_cmd(
         f"docker exec {container.container_name} base64 {container_target} 2>/dev/null"
     )
     if not b64_content:
-        host_target = f"{host_base}/{clean_path}"
+        host_target = shlex.quote(f"{host_base}/{clean_path}")
         b64_content = await _ssh_cmd(f"base64 {host_target} 2>/dev/null")
 
     if not b64_content:

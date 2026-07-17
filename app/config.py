@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     notification_dispatch_interval_seconds: int = 30
     notification_receipt_delay_minutes: int = 15  # Expo says ~15 min
     notification_max_attempts: int = 5
+    # Progress fast lane (2026-07-16): dispatch event_kind='progress'
+    # rows inline at ingest (CAS-claimed, replica-safe) instead of
+    # waiting up to notification_dispatch_interval_seconds — interim
+    # Live Activity bar motion is worthless 30s late. Kill switch only;
+    # on failure the row stays queued for the normal loop.
+    notification_progress_fastlane_enabled: bool = True
 
     # APNs (direct, token-based auth) — drives iOS Live Activities for
     # Autopilot missions (push-to-start + progress updates + end). All
