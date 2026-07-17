@@ -1225,6 +1225,77 @@ class RoutineRunner:
         if fire_at is None:
             fire_at = datetime.utcnow()
 
+        # Every routine fire reaches the phone (founder decision
+        # 2026-07-17) — this funnel covers ALL kinds, with two carve-outs:
+        # `autopilot` self-notifies via _transition (a second row here
+        # would double-push), and reminder SUCCESS self-notifies at fire
+        # time inside ReminderHandler (its payload flips the countdown
+        # card). no_agent_fallback: the channel fan-out above already
+        # delivered Telegram/WhatsApp — the dispatcher fallback would
+        # duplicate it. Best-effort by contract: notify plumbing must
+        # never fail a delivered run.
+        if routine.kind != "autopilot":
+            try:
+                from app.services.agent_notify_client import notify
+
+                _name = (routine.name or routine.kind or "Routine").strip()
+                if (result.status in ("success", "partial")
+                        and routine.kind != "reminder"):
+                    await notify(
+                        event_kind="mission_completed",
+                        title=f"✅ {_name}"[:200],
+                        body=None,
+                        data={
+                            "mission_id": f"routine:{routine.id}",
+                            "mission_title": _name[:80],
+                            "kind": "routine",
+                            "route": "chat",
+                            # The user chose this schedule — quiet hours
+                            # must not defer their 07:00 briefing, and
+                            # the daily cap must not eat it.
+                            "urgent": True,
+                            "cap_exempt": True,
+                            "no_agent_fallback": True,
+                            "progress": 100,
+                            "dismiss_after_s": 3600,
+                        },
+                        priority="high",
+                        # Per-fire key (run_id is unique per fire, shared
+                        # by retries of the SAME fire) — a stable key
+                        # would swallow tomorrow's briefing.
+                        dedup_key=f"{routine.id}:fired:{run_id}",
+                    )
+                elif result.status in ("failed", "skipped_reauth"):
+                    _mid = (
+                        f"reminder:{routine.id}" if routine.kind == "reminder"
+                        else f"routine:{routine.id}"
+                    )
+                    await notify(
+                        event_kind="mission_failed",
+                        title=f"⚠️ {_name} didn't run"[:200],
+                        body=None,
+                        data={
+                            "mission_id": _mid,
+                            "mission_title": _name[:80],
+                            "kind": ("reminder" if routine.kind == "reminder"
+                                     else "routine"),
+                            "route": "chat",
+                            "urgent": False,
+                            "no_agent_fallback": True,
+                            "dismiss_after_s": 900,
+                        },
+                        priority="default",
+                        # One failure push per local day per routine —
+                        # an 'every 60s' reminder in a failure loop must
+                        # not become an alert stream.
+                        dedup_key=f"{routine.id}:failed:{fire_at.date().isoformat()}",
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[routine_runner] terminal notify failed routine_id=%s: %s",
+                    routine.id, e,
+                )
+
         # Advance watermark on success only.
         if result.status == "success" and result.new_watermark is not None:
             try:

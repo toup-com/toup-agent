@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     apns_team_id: Optional[str] = None      # Apple team id (5W2R26Z4H7)
     apns_bundle_id: str = "ai.toup.app"     # LA topic = <bundle>.push-type.liveactivity
     live_activity_enabled: bool = True      # ops kill switch for the LA lane
+    # Reminder countdown card (2026-07-17): arm an on-device Live
+    # Activity timer at reminder creation for near-term one-shots.
+    # Producer-side kill switch, independent of the LA lane switch above.
+    reminder_countdown_live_activity_enabled: bool = True
     
     # Telegram Bot
     telegram_bot_token: Optional[str] = None  # Set via TELEGRAM_BOT_TOKEN env var

@@ -173,6 +173,7 @@ def build_start_payload(
     alert_body: Optional[str] = None,
     timestamp: Optional[int] = None,
     deep_link: str = "toup://mission-control",
+    timer_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Push-to-start payload. ``attributes.name`` carries the mission id —
     the app's onTokenReceived listener echoes it back so a reported
@@ -201,6 +202,11 @@ def build_start_payload(
         },
         "content-state": _content_state(title, subtitle, progress, timer_end_ms),
     }
+    # Compact Dynamic Island timer style — the widget decodes
+    # attributes.timerType ('circular' default | 'digital' mm:ss).
+    # Attributes are start-fixed, so it must ride the start push.
+    if timer_type in ("circular", "digital"):
+        aps["attributes"]["timerType"] = timer_type
     alert = _alert(alert_title, alert_body)
     if alert:
         aps["alert"] = alert

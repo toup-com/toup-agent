@@ -286,4 +286,36 @@ class JobRunner:
             fresh.status = "failed"
             fresh.error_message = error_message
             fresh.completed_at = datetime.utcnow()
+            title = fresh.title
             await db.commit()
+
+        # Runner-internal job deaths reach the phone too — update_job /
+        # subagent finalize cover their own terminal paths; this covers
+        # handler crashes and missing handlers. Same dedup key as the
+        # subagent reaper's failed notify so the dispatcher collapses a
+        # double-report. Best-effort: a job must never fail on
+        # notification plumbing.
+        try:
+            from app.services.agent_notify_client import notify
+
+            label = (title or "Background job")[:80]
+            await notify(
+                event_kind="mission_failed",
+                title=f"⚠️ {label} failed"[:200],
+                body=(error_message or "")[:300] or None,
+                data={
+                    "route": "mission-control",
+                    "mission_id": job_id,
+                    "mission_title": label,
+                    "kind": "job",
+                    "urgent": True,
+                    "dismiss_after_s": 900,
+                },
+                priority="high",
+                dedup_key=f"{job_id}:failed",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "[job_runner] mission_failed notify skipped job=%s: %s",
+                job_id, e,
+            )

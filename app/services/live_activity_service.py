@@ -70,6 +70,19 @@ LIVE_ACTIVITY_KINDS = {
 }
 
 
+# Alert kinds that restart a missing card before delivering (mirrors
+# the progress self-heal): without this, a terminal/needs-* row for a
+# never-started or preempted card terminated 'no_active_activity' and
+# the alert was silently lost — exactly when it mattered most (LA is
+# the ONLY iOS push surface while expo-notifications isn't installed).
+_START_IF_MISSING_KINDS = {
+    NOTIFY_KIND_NEEDS_INPUT,
+    NOTIFY_KIND_NEEDS_APPROVAL,
+    NOTIFY_KIND_MISSION_COMPLETED,
+    NOTIFY_KIND_MISSION_FAILED,
+}
+
+
 def live_activity_ready() -> bool:
     return settings.live_activity_enabled and apns_push.apns_configured()
 
@@ -246,20 +259,26 @@ async def _send_start(
     await _preempt_device(db, device, mission_id, now)
 
     progress = _progress_fraction(row)
+    data = row.data_json or {}
     # Card-tap target: chat turns land in the conversation where the
     # answer lives; everything else keeps Mission Control.
-    _route = (row.data_json or {}).get("route")
-    deep_link = "toup://chat" if _route == "chat" else "toup://mission-control"
+    deep_link = "toup://chat" if data.get("route") == "chat" else "toup://mission-control"
+    # Producer subtitle override (e.g. reminder countdowns carry the
+    # reminder text); non-silent starts keep the legacy 'Starting…'.
+    subtitle_override = data.get("subtitle") if isinstance(data.get("subtitle"), str) else None
+    timer_type = data.get("timer_type")
     payload = apns_push.build_start_payload(
         mission_id=mission_id,
         title=_mission_title(row),
-        subtitle=(row.body or "Working…")[:120] if silent else "Starting…",
+        subtitle=(row.body or "Working…")[:120] if silent
+                 else (subtitle_override or "Starting…")[:120],
         progress=progress if progress is not None else 0.0,
         timer_end_ms=_timer_end_ms(row),
         alert_title=None if silent else row.title,
         alert_body=None if silent else row.body,
         timestamp=int(now.timestamp()),
         deep_link=deep_link,
+        timer_type=timer_type if timer_type in ("circular", "digital") else None,
     )
     status, reason, _env = await _send_with_env_selfheal(
         db, device, device.push_to_start_token, payload, priority=10,
@@ -357,6 +376,10 @@ async def handle_notification_row(
     errored = False
 
     if row.event_kind == NOTIFY_KIND_MISSION_STARTED:
+        # data.silent → card appears without a banner (reminder
+        # countdown arms: the user just got chat confirmation — the
+        # card IS the feedback).
+        start_silent = bool((row.data_json or {}).get("silent"))
         devices = await _active_devices(db, row.user_id)
         if not devices:
             return {"status": "skipped", "reason": "no_live_activity_devices"}
@@ -367,7 +390,7 @@ async def handle_notification_row(
                 # start push would spawn a duplicate card on screen.
                 per_device[device.id] = {"status": "skipped", "reason": "already_started"}
                 continue
-            result = await _send_start(db, device, row, mission_id, now)
+            result = await _send_start(db, device, row, mission_id, now, silent=start_silent)
             per_device[device.id] = result
             delivered = delivered or result["status"] == "ok"
             errored = errored or result["status"] == "error"
@@ -376,11 +399,25 @@ async def handle_notification_row(
         return {"status": status, "delivered": delivered, "devices": per_device}
 
     activities = await _activities_for_mission(db, row.user_id, mission_id)
+    restarted = False
 
-    if not activities and row.event_kind == NOTIFY_KIND_PROGRESS:
+    if not activities and (
+        row.event_kind == NOTIFY_KIND_PROGRESS
+        or (
+            row.event_kind in _START_IF_MISSING_KINDS
+            and not (row.data_json or {}).get("silent")
+        )
+    ):
         # Self-healing: the card was preempted by a newer task (or the
-        # device rebooted). Bring it back silently — no banner — with
-        # the freshest progress.
+        # device rebooted / was never started because the producer only
+        # emits terminal kinds — foregrounded chat turns, reminder
+        # fires whose countdown never armed). Bring it back silently —
+        # no banner on the start; for alert kinds the update/end push
+        # that follows carries the banner, so the alert is guaranteed
+        # even with no pre-started card (2026-07-17). Silent terminal
+        # rows (reminder cancel ends) skip the restart: there is
+        # nothing to alert, an end for a card that isn't there is a
+        # no-op.
         devices = await _active_devices(db, row.user_id)
         if not devices:
             return {"status": "skipped", "reason": "no_live_activity_devices"}
@@ -390,9 +427,15 @@ async def handle_notification_row(
             delivered = delivered or result["status"] == "ok"
             errored = errored or result["status"] == "error"
         await db.commit()
-        status = "ok" if delivered else ("error" if errored else "skipped")
-        return {"status": status, "delivered": delivered,
-                "restarted": True, "devices": per_device}
+        if row.event_kind == NOTIFY_KIND_PROGRESS:
+            status = "ok" if delivered else ("error" if errored else "skipped")
+            return {"status": status, "delivered": delivered,
+                    "restarted": True, "devices": per_device}
+        # Alert kinds fall through to the normal update/end loop on the
+        # freshly started card.
+        restarted = True
+        delivered = False
+        activities = await _activities_for_mission(db, row.user_id, mission_id)
 
     if not activities:
         return {"status": "skipped", "reason": "no_active_activity"}
@@ -428,11 +471,19 @@ async def handle_notification_row(
             )
         else:  # mission_completed | mission_failed
             done = row.event_kind == NOTIFY_KIND_MISSION_COMPLETED
+            _data = row.data_json or {}
+            # data.silent → silent end (reminder cancel/delete: the card
+            # just vanishes, no banner). data.subtitle → producer text
+            # on the final card (reminder fires show the reminder text
+            # instead of 'Completed ✓').
+            _silent_end = bool(_data.get("silent"))
+            _subtitle = _data.get("subtitle") if isinstance(_data.get("subtitle"), str) else None
             payload = apns_push.build_end_payload(
                 title=title,
-                subtitle="Completed ✓" if done else "Stopped — needs attention",
+                subtitle=_subtitle or ("Completed ✓" if done else "Stopped — needs attention"),
                 progress=1.0 if done else effective,
-                alert_title=row.title, alert_body=row.body,
+                alert_title=None if _silent_end else row.title,
+                alert_body=None if _silent_end else row.body,
                 dismissal_date=_dismissal_date(row, now),
                 timestamp=int(now.timestamp()),
             )
@@ -446,5 +497,8 @@ async def handle_notification_row(
         delivered = delivered or result["status"] == "ok"
 
     await db.commit()
-    return {"status": "ok" if delivered else "error",
-            "delivered": delivered, "devices": per_device}
+    frag: Dict[str, Any] = {"status": "ok" if delivered else "error",
+                            "delivered": delivered, "devices": per_device}
+    if restarted:
+        frag["restarted"] = True
+    return frag

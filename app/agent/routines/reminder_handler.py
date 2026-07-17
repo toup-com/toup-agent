@@ -94,6 +94,46 @@ class ReminderHandler:
             if isinstance(broadcast_out, dict):
                 channel_results = broadcast_out.get("channel_results", {}) or {}
 
+        # Phone surface (2026-07-17): the urgent "now" alert. Same
+        # mission_id as the creation-time countdown card, so the LA lane
+        # flips it (bar completes, banner fires, card auto-clears after
+        # 15 min); restart-if-missing guarantees the banner even when
+        # the countdown was preempted or never armed. urgent bypasses
+        # quiet hours — a user-scheduled instant is an alarm, not a
+        # nudge. no_agent_fallback: the broadcast above already fanned
+        # out to Telegram/WhatsApp. Best-effort: notify plumbing must
+        # never fail a delivered run.
+        try:
+            from app.services.agent_notify_client import notify
+
+            name = (routine.name or "Reminder").strip() or "Reminder"
+            run_ref = getattr(run, "id", None) or int(datetime.utcnow().timestamp())
+            await notify(
+                event_kind="mission_completed",
+                title=f"⏰ {name} — now"[:200],
+                body=text[:400],
+                data={
+                    "mission_id": f"reminder:{routine.id}",
+                    "mission_title": f"⏰ {name}"[:80],
+                    "kind": "reminder",
+                    "route": "chat",
+                    "subtitle": text[:120],
+                    "urgent": True,
+                    "cap_exempt": True,
+                    "dismiss_after_s": 900,
+                    "no_agent_fallback": True,
+                },
+                priority="high",
+                # Per-run key: daily reminders alert daily; retries of
+                # the SAME run collapse in the dedup window.
+                dedup_key=f"reminder:{routine.id}:fire:{run_ref}",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[reminder] fire notify failed routine_id=%s: %s",
+                routine.id, e,
+            )
+
         logger.info(
             "[reminder] delivered routine_id=%s user_id=%s msg_id=%s chars=%d "
             "channels=%s",

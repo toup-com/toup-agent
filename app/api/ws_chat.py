@@ -2575,45 +2575,50 @@ async def ws_chat(
                         _done_payload["build_jobs"] = list(_pending_job_cards)
                     _done_delivered = await _safe_send(_done_payload)
 
-                    # Presence-aware answer delivery: the done frame
-                    # failed AND no other client of this user is
-                    # connected (own queue is still registered until the
-                    # finally below, hence <= 1) → the user never saw the
-                    # answer. Push it: alert with the preview + the Live
-                    # Activity card flips to Completed. urgent bypasses
-                    # quiet hours — they asked seconds ago.
-                    if not _done_delivered and len(_user_ws_queues.get(user_id, [])) <= 1:
-                        try:
-                            from app.services.agent_notify_client import notify
-                            _answer_data = {
-                                "mission_id": _turn_mission_id,
-                                "mission_title": "Working on your answer",
-                                "route": "chat",
-                                "kind": "chat_turn",
-                                "urgent": True,
-                                "progress": 100,
-                                "dismiss_after_s": 900,
-                            }
-                            if response.session_id:
-                                _answer_data["session_id"] = response.session_id
-                            if getattr(response, "day_chat_id", None):
-                                _answer_data["day_chat_id"] = response.day_chat_id
-                            if getattr(response, "asst_message_id", None):
-                                _answer_data["message_id"] = response.asst_message_id
-                            await notify(
-                                event_kind="mission_completed",
-                                title="Answer ready",
-                                body=(response.text or "")[:180] or None,
-                                data=_answer_data,
-                                priority="high",
-                                dedup_key=f"{_turn_mission_id}:completed",
-                            )
-                            logger.info(
-                                "[WS] answer push queued for offline user %s",
-                                user_id[:8],
-                            )
-                        except Exception as _pe:  # noqa: BLE001
-                            logger.warning("[WS] answer push failed: %s", _pe)
+                    # Answer delivery push — UNCONDITIONAL (founder
+                    # decision 2026-07-17): every chat answer notifies
+                    # the phone regardless of app state; the old gate
+                    # (done frame failed AND no other WS client) meant a
+                    # locked phone next to an open web tab never buzzed.
+                    # Spam brakes: per-turn dedup key collapses retry
+                    # replays, dismiss_after_s auto-clears the card,
+                    # cap_exempt keeps the daily cap from eating answer
+                    # #11, and the LA lane start-if-missing renders the
+                    # banner even when no 'working' card was started.
+                    # urgent bypasses quiet hours — they asked seconds
+                    # ago.
+                    try:
+                        from app.services.agent_notify_client import notify
+                        _answer_data = {
+                            "mission_id": _turn_mission_id,
+                            "mission_title": "Working on your answer",
+                            "route": "chat",
+                            "kind": "chat_turn",
+                            "urgent": True,
+                            "cap_exempt": True,
+                            "progress": 100,
+                            "dismiss_after_s": 900,
+                        }
+                        if response.session_id:
+                            _answer_data["session_id"] = response.session_id
+                        if getattr(response, "day_chat_id", None):
+                            _answer_data["day_chat_id"] = response.day_chat_id
+                        if getattr(response, "asst_message_id", None):
+                            _answer_data["message_id"] = response.asst_message_id
+                        await notify(
+                            event_kind="mission_completed",
+                            title="Answer ready",
+                            body=(response.text or "")[:180] or None,
+                            data=_answer_data,
+                            priority="high",
+                            dedup_key=f"{_turn_mission_id}:completed",
+                        )
+                        logger.info(
+                            "[WS] answer push queued user=%s ws_delivered=%s",
+                            user_id[:8], _done_delivered,
+                        )
+                    except Exception as _pe:  # noqa: BLE001
+                        logger.warning("[WS] answer push failed: %s", _pe)
 
                 except asyncio.CancelledError:
                     stop_task.cancel()

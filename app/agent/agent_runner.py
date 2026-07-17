@@ -2156,7 +2156,9 @@ class AgentRunner:
             "(text delivered at a scheduled time) → `routines__remind` "
             "with `when=once|daily|every`. For recurring agent tasks "
             "('every morning summarise my email') → `routines__create` "
-            "with `kind=agent_task`.\n\n"
+            "with `kind=agent_task`. Reminders and routines deliver to "
+            "the chat + every connected channel (Telegram, WhatsApp) "
+            "automatically — never ask where to send them.\n\n"
             "### Media\n"
             "`play_media` plays YouTube and Netflix in chat. For Netflix "
             "specifically, every title you mention should have a "
@@ -2192,7 +2194,8 @@ class AgentRunner:
             "- Hunt through menus to find a feature you can navigate them to. Just take them.\n"
             "- Repeat themselves between channels — it's all one thread.\n"
             "- Manually copy data between Brain / Apps / Chat — you can do it.\n"
-            "- Ask 'would you like me to do X?' when they explicitly asked you to do X. Just do it.\n\n"
+            "- Ask 'would you like me to do X?' when they explicitly asked you to do X. Just do it.\n"
+            "- Answer 'where should I send it?' for reminders/routines — delivery is automatic to chat + every connected channel.\n\n"
             "The whole point of you is: the user says what they want, you make it happen."
         )
 

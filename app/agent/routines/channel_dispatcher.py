@@ -66,6 +66,64 @@ def parse_delivery_channels(config_json: Optional[dict]) -> list[str]:
     return out
 
 
+async def get_connected_channels(user_id: str, db_session_maker) -> list[str]:
+    """Channels a fire-time send would actually reach, right now.
+
+    Lives next to the senders ON PURPOSE: each probe reuses the EXACT
+    deliverability gates the fire-time code checks, so "connected" is
+    provably identical to "deliverable" —
+      • telegram: `_get_telegram_bot()` booted with `.app` AND a
+        `TelegramUserMapping` row for this user (same gates as
+        `_send_telegram_detailed`). A configured-but-never-DM'd bot is
+        correctly NOT connected — a send would skip `no_recipient`.
+      • whatsapp: adapter registered in `ChannelRegistry` AND
+        `_resolve_whatsapp_recipient` yields a self-E164 (same gates as
+        `_send_whatsapp_detailed`).
+      • website: always — the Day-as-Chat write is unconditional.
+
+    Callers use this as the delivery default when the user didn't name
+    channels ("deliver everywhere, never ask" — founder decision
+    2026-07-17). Best-effort: a failed probe drops that channel, never
+    raises. Agent-container only — `_get_telegram_bot` reads agent_main
+    state, so a platform-side call degrades to website-only.
+    """
+    out = ["website"]
+
+    try:
+        bot = _get_telegram_bot()
+        if bot is not None and getattr(bot, "app", None) is not None:
+            from app.db.models import TelegramUserMapping
+
+            async with db_session_maker() as db:
+                chat_id = await db.scalar(
+                    select(TelegramUserMapping.telegram_id).where(
+                        TelegramUserMapping.user_id == user_id,
+                    ).limit(1)
+                )
+            if chat_id:
+                out.append("telegram")
+    except Exception:  # noqa: BLE001 — probe failure ≠ delivery failure
+        logger.warning(
+            "[connected_channels] telegram probe failed user=%s",
+            user_id, exc_info=True,
+        )
+
+    try:
+        from app.agent.channels.registry import ChannelRegistry
+        from app.agent.channels.base import ChannelType
+
+        if ChannelRegistry.get(ChannelType.WHATSAPP) is not None:
+            if await _resolve_whatsapp_recipient(db_session_maker):
+                out.append("whatsapp")
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[connected_channels] whatsapp probe failed user=%s",
+            user_id, exc_info=True,
+        )
+
+    return out
+
+
 async def deliver_to_extra_channels(
     *,
     user_id: str,

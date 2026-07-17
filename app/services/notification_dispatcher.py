@@ -174,26 +174,44 @@ def evaluate_policy(
 
     Order matters: cheap terminal suppressions first, deferral last so
     a suppressed row never bounces around the queue until morning."""
+    data = row.data_json or {}
+
     if row.event_kind == NOTIFY_KIND_PROGRESS:
         # Progress is an in-app surface (WS frames / Mission Control),
         # never an OS interruption.
         return ("suppress", "progress_in_app_only")
 
-    if row.event_kind != "generic" and not prefs.get("autopilot_push", True):
+    # The autopilot_push pref governs autopilot MISSIONS only. Rows from
+    # the other producer families declare themselves via data.kind
+    # (chat_turn / reminder / routine / job) and are never suppressed by
+    # it — pre-2026-07-17 one toggle silently killed chat answers and
+    # reminders too.
+    if (
+        row.event_kind != "generic"
+        and data.get("kind") in (None, "mission")
+        and not prefs.get("autopilot_push", True)
+    ):
         return ("suppress", "autopilot_push_disabled")
 
     if recent_dedup_hit:
         return ("suppress", "dedup_window")
 
+    urgent = bool(data.get("urgent"))
+
+    # Cap bypass: needs_input/needs_approval (the user asked to be
+    # interrupted for exactly these), urgent rows (user-scheduled
+    # instants — a 07:00 reminder must not be eaten by cap slot #11),
+    # and producer-declared cap_exempt rows (chat answers).
     cap = prefs.get("daily_push_cap", 10)
     if (
         cap
         and row.event_kind not in _CAP_BYPASS_KINDS
+        and not urgent
+        and not data.get("cap_exempt")
         and sent_today_count >= cap
     ):
         return ("suppress", "daily_cap")
 
-    urgent = bool((row.data_json or {}).get("urgent"))
     if not urgent:
         until = quiet_hours_defer_until(prefs, tz_name, now_utc)
         if until is not None:
@@ -545,10 +563,15 @@ async def _dispatch_row(db, row_id: str, now: datetime) -> str:
         channels["expo"] = {"status": "skipped", "reason": "no_active_devices"}
 
     # Out-of-band fallback only when push couldn't reach anyone.
+    # Producers that already fanned the same text out via the agent's
+    # channel_dispatcher (reminder/routine fires) set no_agent_fallback
+    # — the fallback would land the identical message on Telegram/
+    # WhatsApp twice.
     if (
         not delivered
         and row.event_kind in _FALLBACK_KINDS
         and prefs.get("autopilot_channel_fallback", True)
+        and not (row.data_json or {}).get("no_agent_fallback")
     ):
         fallback = await _request_agent_channel_delivery(db, row)
         channels["agent_fallback"] = fallback

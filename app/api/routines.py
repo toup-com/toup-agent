@@ -107,6 +107,114 @@ def _kind_enabled_or_404(kind: str) -> None:
             raise HTTPException(status_code=404, detail="Feature not available")
 
 
+# ── Reminder countdown Live Activity (2026-07-17) ─────────────────────
+#
+# Near-term one-shot reminders arm an on-device countdown card at
+# creation (notify → LA push-to-start with timer_end_ms; the widget
+# animates the bar with zero update pushes). The fire-time notify in
+# ReminderHandler shares the mission_id and flips the card into the
+# urgent "now" alert; cancel/delete/reschedule ends it silently.
+# ActivityKit hard-caps an activity at 8h of active life — beyond the
+# window there is no countdown (the fire alert still renders via the
+# LA lane's restart-if-missing). Recurring reminders get NO countdown:
+# a perpetual card would permanently occupy the one-activity-per-device
+# slot.
+
+_REMINDER_COUNTDOWN_WINDOW_S = 8 * 3600 - 600  # 8h ActivityKit cap − 10min margin
+
+
+def _reminder_countdown_eligible(routine) -> bool:
+    from app.config import settings
+    if not getattr(settings, "reminder_countdown_live_activity_enabled", True):
+        return False
+    if routine.kind != "reminder" or not routine.enabled:
+        return False
+    if (getattr(routine, "schedule_kind", None) or "cron") != "at":
+        return False
+    at = getattr(routine, "schedule_at", None)
+    if at is None:
+        return False
+    delta = (at - datetime.utcnow()).total_seconds()
+    return 0 < delta <= _REMINDER_COUNTDOWN_WINDOW_S
+
+
+async def _reminder_countdown_notify(routine) -> None:
+    """Arm the countdown card. Best-effort by contract — the CRUD
+    response must never fail on notification plumbing."""
+    try:
+        from app.services.agent_notify_client import notify
+
+        name = (routine.name or routine.reminder_text or "Reminder").strip()[:80]
+        # schedule_at is stored UTC-NAIVE (RoutineCreate strips tzinfo)
+        # — attach utc before the epoch-ms conversion or a bare
+        # .timestamp() applies the container's local offset.
+        end_ms = int(
+            routine.schedule_at.replace(tzinfo=timezone.utc).timestamp() * 1000
+        )
+        await notify(
+            event_kind="mission_started",
+            title=f"⏰ {name}"[:200],
+            body=(routine.reminder_text or "")[:400] or None,
+            data={
+                "mission_id": f"reminder:{routine.id}",
+                "mission_title": f"⏰ {name}"[:80],
+                "kind": "reminder",
+                "route": "chat",
+                "timer_end_ms": end_ms,
+                "timer_type": "digital",
+                # silent: the card appears with no banner — the user
+                # just got chat confirmation; the card IS the feedback.
+                "silent": True,
+                # urgent: a reminder set at 23:00 for 07:00 gets its
+                # card immediately, not after quiet hours.
+                "urgent": True,
+                "progress": 0,
+            },
+            priority="default",
+            # No dedup_key: the LA lane's per-device already_started
+            # guard dedups; a window here would swallow the re-arm
+            # right after a reschedule.
+            dedup_key=None,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[routines] countdown notify failed routine_id=%s: %s",
+            getattr(routine, "id", "?"), e,
+        )
+
+
+async def _reminder_cancel_notify(routine_id: str) -> None:
+    """Silent end + immediate dismissal for a canceled/disabled/
+    rescheduled reminder's countdown card. silent suppresses both the
+    banner AND the LA lane's restart-if-missing (nothing to alert); if
+    no card is live the lane skips 'no_active_activity' harmlessly.
+    urgent so the end push isn't deferred by quiet hours — a stale
+    countdown sitting on the lock screen all night is worse than a
+    silent nighttime end."""
+    try:
+        from app.services.agent_notify_client import notify
+
+        await notify(
+            event_kind="mission_completed",
+            title="Reminder canceled",
+            data={
+                "mission_id": f"reminder:{routine_id}",
+                "kind": "reminder",
+                "route": "chat",
+                "silent": True,
+                "urgent": True,
+                "cap_exempt": True,
+                "dismiss_after_s": 0,
+                "no_agent_fallback": True,
+            },
+            priority="low",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[routines] cancel notify failed routine_id=%s: %s", routine_id, e,
+        )
+
+
 # ── Pydantic models ────────────────────────────────────────────────────
 
 
@@ -870,6 +978,12 @@ async def create_routine(req: RoutineCreate):
             # reload_all later. The row is already persisted.
             pass
 
+    # Arm the on-device countdown card for near-term one-shot reminders.
+    # Covers both the routines skill (delegates here in-process) and
+    # Mission Control HTTP.
+    if _reminder_countdown_eligible(routine):
+        await _reminder_countdown_notify(routine)
+
     return _row_to_response(routine)
 
 
@@ -1029,6 +1143,17 @@ async def update_routine(routine_id: str, req: RoutineUpdate):
             raise
         await db.refresh(routine)
 
+    # Countdown lifecycle on edits: disabling or moving the schedule
+    # ends the armed card (silent, immediate dismissal); a still-enabled
+    # in-window 'at' reminder re-arms. Cancel-end lands before the fresh
+    # start via the dispatcher's created_at ordering.
+    if routine.kind == "reminder" and (req.enabled is False or schedule_changed):
+        from app.config import settings as _settings
+        if getattr(_settings, "reminder_countdown_live_activity_enabled", True):
+            await _reminder_cancel_notify(routine.id)
+            if _reminder_countdown_eligible(routine):
+                await _reminder_countdown_notify(routine)
+
     if _runner is not None:
         try:
             await _runner.reload_routine(routine.id)
@@ -1085,8 +1210,17 @@ async def delete_routine(routine_id: str):
                 status_code=409,
                 detail="This is an Autopilot mission — cancel it via /api/autopilot/missions",
             )
+        # Captured before delete — the ORM instance is unusable after
+        # the commit expunges it.
+        was_reminder = routine.kind == "reminder"
         await db.delete(routine)
         await db.commit()
+
+    if was_reminder:
+        from app.config import settings as _settings
+        if getattr(_settings, "reminder_countdown_live_activity_enabled", True):
+            # End any armed countdown card silently.
+            await _reminder_cancel_notify(routine_id)
 
     if _runner is not None:
         try:

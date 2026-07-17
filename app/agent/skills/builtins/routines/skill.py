@@ -160,14 +160,14 @@ class RoutinesSkill(Skill):
                     "timezone. Examples: `30 6 * * *` = 06:30 every day; "
                     "`0 7 * * 1-5` = 07:00 weekdays; `0 9 * * 0` = 09:00 Sundays. "
                     "Confirm the time with the user BEFORE calling this tool.\n\n"
-                    "**Delivery channels:** ALWAYS ask the user where they want "
-                    "to see the result before creating the routine. Options:\n"
-                    "  • `website` — the chat thread on toup.ai (default)\n"
-                    "  • `telegram` — the user's Telegram bot DM\n"
-                    "  • `whatsapp` — the user's WhatsApp self-chat\n"
-                    "Pass the chosen subset as `delivery_channels`. The website "
-                    "is always included (it's the canonical record); listing "
-                    "telegram/whatsapp fans the summary OUT to those channels too."
+                    "**Delivery:** the routine is delivered to the chat AND "
+                    "every channel the user has connected (Telegram, WhatsApp) "
+                    "automatically. Do NOT ask where to send it — omit "
+                    "`delivery_channels` entirely and the default covers "
+                    "everything. Only pass it when the user EXPLICITLY "
+                    "restricts delivery (\"only telegram\" → [\"telegram\"]; "
+                    "\"just here in chat\" → [\"website\"]). The website chat "
+                    "is always included as the permanent record."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -216,11 +216,12 @@ class RoutinesSkill(Skill):
                                 "enum": ["website", "telegram", "whatsapp"],
                             },
                             "description": (
-                                "Where to deliver the routine's output. Ask the "
-                                "user before picking. `website` is always "
-                                "included server-side. Examples: "
-                                "[\"website\",\"telegram\"], [\"telegram\",\"whatsapp\"] "
-                                "(both channels), [\"website\"] (chat only — the default)."
+                                "OMIT this field for the default: chat + every "
+                                "connected channel, automatically — do NOT ask. "
+                                "Only set it when the user explicitly names "
+                                "channels (\"only telegram\" → [\"telegram\"]; "
+                                "\"just here in chat\" → [\"website\"]). "
+                                "`website` is always included server-side."
                             ),
                         },
                     },
@@ -252,9 +253,11 @@ class RoutinesSkill(Skill):
                     "runs 24/7.\n\n"
                     "The skill resolves the user's timezone server-side; all "
                     "the time inputs are interpreted in their local tz. "
-                    "**Delivery channels**: same as `routines__create` — ALWAYS "
-                    "ask the user where they want the reminder (chat, Telegram, "
-                    "WhatsApp, or all) before calling this tool."
+                    "**Delivery**: do NOT ask where to deliver. Omitting "
+                    "`delivery_channels` delivers the reminder to the chat AND "
+                    "every channel the user has connected (Telegram, WhatsApp) "
+                    "automatically. Pass it only when the user explicitly "
+                    "restricts delivery (\"only telegram\" → [\"telegram\"])."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -330,9 +333,10 @@ class RoutinesSkill(Skill):
                                 "enum": ["website", "telegram", "whatsapp"],
                             },
                             "description": (
-                                "Where to deliver. Defaults to `[\"website\"]` "
-                                "(chat thread). Ask the user before picking; "
-                                "website is always included server-side."
+                                "OMIT for the default: chat + every connected "
+                                "channel, automatically — do NOT ask. Only set "
+                                "it when the user explicitly names channels; "
+                                "`website` is always included server-side."
                             ),
                         },
                         "enabled": {
@@ -482,18 +486,18 @@ class RoutinesSkill(Skill):
             "  1. Confirm the schedule with the user in plain English (\"so "
             "you want this at 6:30am every day, right?\"). The user thinks in "
             "their local time — never echo UTC.\n"
-            "  2. **ASK WHERE to deliver it.** Before creating the routine, "
-            "ask the user which channel(s) they want to receive it on. "
-            "Phrase the question naturally: \"Where do you want to see this "
-            "— here in the chat, on Telegram, on WhatsApp, or all of them?\" "
-            "Default is `website` (the chat thread). Map the answer to a "
-            "`delivery_channels` list:\n"
-            "     - \"here\" / \"the chat\" / \"website\" → `[\"website\"]`\n"
-            "     - \"Telegram\" → `[\"website\", \"telegram\"]`\n"
-            "     - \"WhatsApp\" → `[\"website\", \"whatsapp\"]`\n"
-            "     - \"all channels\" / \"everywhere\" → `[\"website\", \"telegram\", \"whatsapp\"]`\n"
-            "     (The website is always kept so the user has a permanent "
-            "record on their dashboard even when the buzz goes to phone.)\n"
+            "  2. **NEVER ask where to deliver it.** Reminders and routines "
+            "automatically go to the chat AND every channel the user has "
+            "connected (Telegram, WhatsApp) — omit `delivery_channels` and "
+            "the default covers everything. Never phrase a question like "
+            "\"where do you want to see this?\". Pass the field ONLY when "
+            "the user explicitly restricts delivery:\n"
+            "     - \"just here\" / \"only the chat\" → `[\"website\"]`\n"
+            "     - \"only Telegram\" → `[\"telegram\"]`\n"
+            "     - \"only WhatsApp\" → `[\"whatsapp\"]`\n"
+            "     (The website is always kept server-side so the user has a "
+            "permanent record on their dashboard even when the buzz goes "
+            "to phone.)\n"
             "  3. Pick the kind:\n"
             "     - `email_briefing` for \"summarize my unread emails\" "
             "(preset Gmail flow — no prompt needed).\n"
@@ -502,10 +506,11 @@ class RoutinesSkill(Skill):
             "of this conversation, so spell out exactly what to do.\n"
             "  4. Convert the spoken schedule to a 5-part cron in the user's "
             "tz: `30 6 * * *` = 06:30 daily; `0 7 * * 1-5` = 07:00 weekdays.\n"
-            "  5. Call `routines__create` with kind + schedule + name + "
-            "delivery_channels (+ prompt_text for agent_task). Confirm "
-            "success to the user, mention which channel(s) they'll see it on, "
-            "and tell them they can adjust later from Mission Control on the dashboard.\n"
+            "  5. Call `routines__create` with kind + schedule + name "
+            "(+ prompt_text for agent_task). Confirm success to the user, "
+            "mention the channels it will arrive on (read them from the tool "
+            "result's `delivery_channels`), and tell them they can adjust "
+            "later from Mission Control on the dashboard.\n"
             "\n"
             "**Before creating, always call `routines__list` first** to check "
             "if a similar routine already exists — if so, offer to update it "
@@ -712,6 +717,26 @@ class RoutinesSkill(Skill):
                 "needs the timezone once."
             )
 
+        # Model omitted the param → default to every channel the user is
+        # actually connected to (chat + Telegram + WhatsApp), never ask
+        # (founder decision 2026-07-17). An explicit list ("only
+        # telegram") passes through untouched; create_routine still
+        # force-includes website as the canonical record.
+        if not delivery:
+            try:
+                from app.agent.routines.channel_dispatcher import (
+                    get_connected_channels,
+                )
+                delivery = await get_connected_channels(
+                    user_id, async_session_maker,
+                )
+            except Exception:
+                logger.warning(
+                    "[routines_skill.remind] connected-channel probe failed "
+                    "— falling back to website-only", exc_info=True,
+                )
+                delivery = None
+
         # ── Build the create payload now that tz is resolved ───────────
         payload: Dict[str, Any] = {
             "kind": "reminder",
@@ -867,6 +892,27 @@ class RoutinesSkill(Skill):
         if not schedule:
             return "ERROR: `schedule_cron_local` is required (5-part cron)."
 
+        # Same never-ask default as `_remind`: an omitted param means
+        # chat + every connected channel; explicit lists pass through.
+        delivery = args.get("delivery_channels")
+        if not delivery:
+            try:
+                from app.config import settings
+                from app.db.database import async_session_maker
+                from app.agent.routines.channel_dispatcher import (
+                    get_connected_channels,
+                )
+                delivery = await get_connected_channels(
+                    str(getattr(settings, "user_id", "") or ""),
+                    async_session_maker,
+                )
+            except Exception:
+                logger.warning(
+                    "[routines_skill.create] connected-channel probe failed "
+                    "— falling back to website-only", exc_info=True,
+                )
+                delivery = None
+
         try:
             req = RoutineCreate(
                 kind=kind,
@@ -874,7 +920,7 @@ class RoutinesSkill(Skill):
                 name=args.get("name"),
                 prompt_text=args.get("prompt_text"),
                 enabled=bool(args.get("enabled", True)),
-                delivery_channels=args.get("delivery_channels"),
+                delivery_channels=delivery,
                 config=args.get("config"),
             )
         except Exception as e:
