@@ -204,6 +204,11 @@ def test_existing_call_sites_do_not_pass_new_params():
             continue  # the definition site
         if path.name == "prompt_profile.py":
             continue  # the definition site
+        if path.name == "autopilot_handler.py":
+            # Headless ticks (PR #282, 2026-07-16) intentionally pass
+            # save_assistant_message=False + disable_post_processing=True
+            # so raw AUTOPILOT_* marker replies stop landing in chat.
+            continue
         try:
             src = path.read_text()
         except Exception:

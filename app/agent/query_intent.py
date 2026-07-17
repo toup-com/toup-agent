@@ -67,6 +67,20 @@ TOOLS_ADMIN: FrozenSet[str] = frozenset({
     "message", "skill_marketplace", "talk_mode",
 })
 
+# Scheduling — reminders + recurring routines (the routines skill).
+# Founder bug 2026-07-16: "Remind me two minutes later" and "Every
+# 11:10 pm send me a joke" scored ZERO in every category (no keyword
+# list contained remind/every/daily/schedule), fell to 'question', and
+# the routines__ tools were filtered out — the agent truthfully told
+# the user "the reminder tool isn't available to me in this turn".
+TOOLS_SCHEDULING: FrozenSet[str] = frozenset({
+    "routines__create", "routines__remind", "routines__list",
+    "routines__update", "routines__delete", "routines__run_now",
+    # A "while I'm away, keep me updated" ask can read as scheduling —
+    # keep the mission hand-off reachable from this intent.
+    "start_mission",
+}) | TOOLS_RECALL
+
 # Composite sets for multi-intent categories
 TOOLS_CODE_FULL: FrozenSet[str] = TOOLS_CODE | TOOLS_WEB | TOOLS_MEMORY | TOOLS_ADMIN
 TOOLS_WEB_FULL: FrozenSet[str] = TOOLS_WEB | TOOLS_MEMORY
@@ -284,6 +298,32 @@ _AGENT_PATTERNS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Scheduling intent — reminders and recurring routines. Time-anchored
+# phrasings are the signal; plain "every"/"tomorrow" alone are not
+# (too common in prose).
+_SCHEDULING_KEYWORDS = {
+    "remind", "reminder", "reminders", "schedule", "scheduled",
+    "routine", "routines", "briefing", "daily", "weekly", "hourly",
+    "every morning", "every night", "every evening", "every day",
+    "every week", "each morning", "each day", "wake me",
+}
+
+_SCHEDULING_PATTERNS_RE = re.compile(
+    # "remind me…", "set a reminder", "don't let me forget"
+    r'\bremind(?:er)?s?\b'
+    r'|\bdon\'?t let me forget\b'
+    # "every 11:10 pm", "every day at 7", "at 7 am every morning"
+    r'|\bevery\s+(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)?|day|morning|night|evening|week|hour|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b'
+    # "at 11:10 pm send/tell/nudge/wake/message me"
+    r'|\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b.*\b(?:send|tell|text|message|nudge|wake|ping|joke)\b'
+    r'|\b(?:send|tell|text|message|nudge|wake|ping)\b.*\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b'
+    # "in 20 minutes/2 hours" paired with an action verb
+    r'|\bin\s+\d+\s*(?:min(?:ute)?s?|hours?|hrs?)\b'
+    # daily/weekly/morning briefing or summary
+    r'|\b(?:daily|weekly|morning|evening)\b.*\b(?:briefing|summary|digest|report|joke|quote|news)\b',
+    re.IGNORECASE,
+)
+
 # Short but meaningful messages that should NOT be classified as greetings
 _SHORT_BUT_MEANINGFUL_RE = re.compile(
     r'\b(?:delete|remove|cancel|stop|abort|undo|redo|reset|clear|wipe)\b'
@@ -349,6 +389,15 @@ INTENT_CODE = QueryIntent(
     include_skills=True,
     include_skill_prompts=True,
     include_environment=True,
+    include_media_section=False,
+)
+
+INTENT_SCHEDULING = QueryIntent(
+    category="scheduling",
+    tool_names=TOOLS_SCHEDULING,
+    include_skills=False,           # routines__ names match explicitly
+    include_skill_prompts=False,
+    include_environment=True,       # reminders need the current clock
     include_media_section=False,
 )
 
@@ -436,7 +485,17 @@ def classify_query_intent(message: str) -> QueryIntent:
         "web": 0,
         "code": 0,
         "agent": 0,
+        "scheduling": 0,
     }
+
+    # Scheduling — checked like the others; wins ties (see priority
+    # order below) because a time-anchored ask ("every morning send me
+    # the news") is a routine to CREATE, not a one-off web search.
+    for kw in _SCHEDULING_KEYWORDS:
+        if kw in normalized:
+            scores["scheduling"] += 2
+    if _SCHEDULING_PATTERNS_RE.search(normalized):
+        scores["scheduling"] += 3
 
     # Memory
     for kw in _MEMORY_KEYWORDS:
@@ -483,8 +542,10 @@ def classify_query_intent(message: str) -> QueryIntent:
     max_score = max(scores.values())
 
     if max_score >= 2:
-        # Pick the winner (ties resolved by priority: code > web > media > memory > agent)
-        priority = ["code", "web", "media", "memory", "agent"]
+        # Pick the winner (ties resolved by priority: scheduling > code
+        # > web > media > memory > agent — a time-anchored ask is a
+        # routine to create, not a search to run).
+        priority = ["scheduling", "code", "web", "media", "memory", "agent"]
         for cat in priority:
             if scores[cat] == max_score:
                 intent_map = {
@@ -493,6 +554,7 @@ def classify_query_intent(message: str) -> QueryIntent:
                     "web": INTENT_WEB,
                     "code": INTENT_CODE,
                     "agent": INTENT_AGENT,
+                    "scheduling": INTENT_SCHEDULING,
                 }
                 return intent_map[cat]
 
@@ -526,6 +588,16 @@ _ALWAYS_INCLUDED_TOOLS = frozenset({
     # switch + per-tenant subagent_spawning_enabled flag), so making it
     # always-visible to the LLM doesn't bypass the rollout controls.
     "spawn",
+    # Reminders are the canonical short-message ask, and typos defeat
+    # keyword classification entirely: founder repro 2026-07-16 —
+    # "Temind me teo means later" (→ question, zero score) left the
+    # agent truthfully saying "the reminder tool isn't available to me
+    # in this turn". Same failure class as the spawn incident above.
+    # The runtime flag gates (ROUTINES_REMINDERS_ENABLED) still apply
+    # at execution, so visibility here bypasses nothing.
+    "routines__remind",
+    "routines__create",
+    "routines__list",
 })
 
 
