@@ -704,6 +704,16 @@ async def init_db():
         "ALTER TABLE support_issues ADD COLUMN IF NOT EXISTS graded_by_user_id VARCHAR(36)",
         "ALTER TABLE support_issues ADD COLUMN IF NOT EXISTS graded_at TIMESTAMP",
         "CREATE INDEX IF NOT EXISTS ix_support_issues_grade_verdict ON support_issues (grade_verdict)",
+        # ── Live Activity install_id (alembic 072) ──
+        # Mirrored per the support_issues precedent above: platform-api
+        # boots via init_db and `alembic upgrade head` is best-effort —
+        # without this, device registration 500s the moment the ORM
+        # model references install_id on a pre-072 platform DB.
+        # live_activity_devices is PLATFORM_ONLY → no-op on agent DBs
+        # (table absent → swallowed). The 072 partial unique index is
+        # NOT mirrored: it requires the migration's dedupe pass first.
+        "ALTER TABLE live_activity_devices ADD COLUMN IF NOT EXISTS install_id VARCHAR(64)",
+        "CREATE INDEX IF NOT EXISTS ix_live_activity_devices_user_install ON live_activity_devices (user_id, install_id)",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

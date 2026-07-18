@@ -254,6 +254,15 @@ async def _requeue_stuck(db, now: datetime) -> int:
     await db.commit()
     if result.rowcount:
         logger.warning("notification dispatch: re-queued %d stuck rows", result.rowcount)
+    # Live Activity staleness GC for ALL users, mirrored from the
+    # per-user sweep at the LA lane entry: idle devices (no queued
+    # rows) must converge too, or a >8h-dead started row blocks the
+    # one-activity-per-device invariant until the next mission.
+    try:
+        await live_activity_service.sweep_stale_activities(db, now)
+    except Exception:  # noqa: BLE001 — GC must never stall the tick
+        logger.exception("live-activity stale sweep failed")
+        await db.rollback()
     return result.rowcount or 0
 
 

@@ -7,7 +7,8 @@ Protocol:
     { "type": "ping" }
 
   Server sends JSON:
-    { "type": "status", "stage": "received" | "thinking" }
+    { "type": "status", "stage": "received" | "thinking",
+      "mission_id": "chatturn:<hex>" }
     { "type": "text_chunk", "text": "..." }
     { "type": "tool_start", "tool": "..." }
     { "type": "tool_end", "tool": "...", "summary": "..." }
@@ -1897,8 +1898,18 @@ async def ws_chat(
                 # the wire is silent through the whole pre-LLM pipeline +
                 # the model's reasoning, and the app shows dead air for
                 # ~10s on tool-first turns.
+                #
+                # The turn's mission id is minted HERE — before the first
+                # status frame — so every status frame of the turn carries
+                # it (additive field): the app uses it to correlate frames
+                # with the turn's Live Activity card (chatturn:<hex> is
+                # also the ActivityAttributes name in the start payload).
+                _turn_mission_id = f"chatturn:{uuid.uuid4().hex[:12]}"
                 try:
-                    await websocket.send_json({"type": "status", "stage": "received"})
+                    await websocket.send_json({
+                        "type": "status", "stage": "received",
+                        "mission_id": _turn_mission_id,
+                    })
                 except Exception:
                     pass
 
@@ -2053,9 +2064,9 @@ async def ws_chat(
                 # phone gets a Live Activity while we work and the final
                 # answer as a push when no client is connected to receive
                 # the done frame. One mission id ties start→complete.
-                # Minted BEFORE the callbacks so the interim-progress
-                # emitter can close over it.
-                _turn_mission_id = f"chatturn:{uuid.uuid4().hex[:12]}"
+                # _turn_mission_id was minted up at the 'received' status
+                # frame — before the callbacks — so the status frames and
+                # the interim-progress emitter close over the same id.
                 _turn_flags = {"client_gone": False, "response_persisted": False}
 
                 # Interim Live Activity progress at tool boundaries. The
@@ -2129,7 +2140,10 @@ async def ws_chat(
                     the client can show a live indicator through
                     reasoning TTFT and post-tool iterations."""
                     try:
-                        await websocket.send_json({"type": "status", "stage": stage})
+                        await websocket.send_json({
+                            "type": "status", "stage": stage,
+                            "mission_id": _turn_mission_id,
+                        })
                     except Exception:
                         pass
 

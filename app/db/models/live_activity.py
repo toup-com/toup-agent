@@ -81,6 +81,14 @@ class LiveActivityDevice(Base):
     )
     device_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     app_version: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    # Stable per-install identifier reported by the app (UUID minted on
+    # first launch, persisted in local storage). Reinstalls rotate the
+    # push-to-start token but keep registering; matching on (user_id,
+    # install_id) lets re-registration UPDATE the row in place instead
+    # of accreting a stale sibling whose dead token APNs still accepts
+    # with 200 — pushes into the void, forever. Nullable: older app
+    # builds don't send it.
+    install_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False,
     )
@@ -91,6 +99,7 @@ class LiveActivityDevice(Base):
 
     __table_args__ = (
         Index("ix_live_activity_devices_user_revoked", "user_id", "revoked_at"),
+        Index("ix_live_activity_devices_user_install", "user_id", "install_id"),
     )
 
 

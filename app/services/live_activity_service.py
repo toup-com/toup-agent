@@ -25,10 +25,15 @@ push-to-start token UNDEFINED (the ``input-push-token`` alias is
 card or silently no-op while APNs returns 200 — see the 2026-07-10
 investigation). So: starting a new activity first ENDS any other
 platform-driven activity on that device (immediate dismissal), and
-the shared-token fallback is refused outright whenever more than one
-LA_STARTED row exists for a device. Preempted missions self-heal: the
-next progress heartbeat silently restarts their card. Per-activity
-tokens reported by the app are always preferred when present.
+when a tokenless send finds more than one LA_STARTED row for a
+device the lane RESOLVES the ambiguity by preempting every other
+row first (end push + DB force-end) instead of skipping — a skip
+would repeat forever (rows are never mutated) and the alert would
+retry to failure (2026-07-16 founder incident: a replica race left
+two started rows and every terminal send for that device was lost).
+Preempted missions self-heal: the next progress heartbeat silently
+restarts their card. Per-activity tokens reported by the app are
+always preferred when present.
 
 Progress bars: discrete ``data.progress`` (0-100) for missions; for
 bounded quick jobs the producer sends ``data.timer_end_ms`` instead
@@ -42,10 +47,11 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.db.models import (
@@ -85,6 +91,43 @@ _START_IF_MISSING_KINDS = {
 
 def live_activity_ready() -> bool:
     return settings.live_activity_enabled and apns_push.apns_configured()
+
+
+# Apple hard-caps Live Activities at 8 hours — a started row older
+# than that is guaranteed dead on-device, so ending it is bookkeeping
+# only (DB-only, zero pushes). Without this sweep a stale row keeps
+# counting against the one-activity-per-device invariant forever.
+_STALE_ACTIVITY_MAX_AGE = timedelta(hours=8)
+
+
+async def sweep_stale_activities(
+    db, now: datetime, user_id: Optional[str] = None,
+) -> int:
+    """End every LA_STARTED row older than Apple's 8h hard cap.
+
+    DB-only — the on-device card is already gone, a push would be
+    wasted (and on a rotated token, misdirected). Deliberately does
+    NOT filter on activity_push_token: tokenful rows die at 8h too.
+    Returns the number of rows swept."""
+    stmt = (
+        update(LiveActivity)
+        .where(
+            LiveActivity.status == LA_STARTED,
+            LiveActivity.started_at < now - _STALE_ACTIVITY_MAX_AGE,
+        )
+        .values(status=LA_ENDED, ended_at=now, updated_at=now)
+    )
+    if user_id is not None:
+        stmt = stmt.where(LiveActivity.user_id == user_id)
+    result = await db.execute(stmt)
+    swept = result.rowcount or 0
+    if swept:
+        await db.commit()
+        logger.info(
+            "live-activity GC: ended %d stale (>8h) started rows%s",
+            swept, f" for user {user_id[:8]}" if user_id else "",
+        )
+    return swept
 
 
 # ── Row field extraction ──────────────────────────────────────────
@@ -225,11 +268,15 @@ async def _send_with_env_selfheal(
 
 async def _preempt_device(
     db, device: LiveActivityDevice, keep_mission_id: str, now: datetime,
-) -> None:
+) -> int:
     """ONE-ACTIVITY-PER-DEVICE enforcement: end (immediate dismissal,
     no alert) every other started activity on this device before a new
-    one starts. At this point at most one other exists (the invariant
-    this function maintains), so a shared-token end is unambiguous."""
+    one starts (or before an unambiguous shared-token send). The DB
+    force-end is unconditional — even when APNs rejects the end push
+    the row must stop claiming the device. Ends ride the env-self-heal
+    path so a stale-environment row's end still lands on the flipped
+    host. Returns the number of rows preempted."""
+    preempted = 0
     for la in await _started_rows_for_device(db, device.id):
         if la.mission_id == keep_mission_id:
             continue
@@ -239,17 +286,20 @@ async def _preempt_device(
             dismissal_date=int(now.timestamp()) - 1,
             timestamp=int(now.timestamp()),
         )
-        status, reason = await apns_push.send_live_activity(
-            token, payload, environment=la.apns_environment, priority=10,
+        status, reason, _env = await _send_with_env_selfheal(
+            db, device, token, payload,
+            priority=10, environment=la.apns_environment,
         )
         la.status = LA_ENDED
         la.ended_at = now
         la.updated_at = now
+        preempted += 1
         if status != 200:
             logger.info(
                 "live-activity preempt end for %s/%s: %s %s",
                 device.id, la.mission_id, status, reason,
             )
+    return preempted
 
 
 async def _send_start(
@@ -319,12 +369,19 @@ async def _send_to_activity(
     end: bool = False,
 ) -> Dict[str, Any]:
     token = la.activity_push_token
+    preempted = 0
     if not token:
         # Shared-token fallback is only safe while it is unambiguous —
         # Apple's routing with 2+ activities on one token is undefined.
+        # RESOLVE the ambiguity instead of skipping (a skip repeats
+        # forever: nothing mutates the rows, so the queue row retries
+        # to failure and the alert is lost — 2026-07-16 incident).
+        # _preempt_device ends every OTHER started row on this device
+        # (end push + unconditional DB force-end), after which the
+        # shared push-to-start token is unambiguous again.
         started = await _started_rows_for_device(db, device.id)
         if len(started) > 1:
-            return {"status": "skipped", "reason": "ambiguous_shared_token"}
+            preempted = await _preempt_device(db, device, la.mission_id, now)
         token = device.push_to_start_token
 
     status, reason, env_used = await _send_with_env_selfheal(
@@ -338,7 +395,10 @@ async def _send_to_activity(
         if end:
             la.status = LA_ENDED
             la.ended_at = now
-        return {"status": "ok"}
+        out: Dict[str, Any] = {"status": "ok"}
+        if preempted:
+            out["preempted"] = preempted  # ladebug: ambiguity was resolved here
+        return out
     if apns_push.is_token_dead(status, reason):
         if la.activity_push_token:
             # The reported per-activity token went stale — drop it so
@@ -351,7 +411,10 @@ async def _send_to_activity(
             # there is nothing left to update.
             la.status = LA_ENDED
             la.ended_at = now
-    return {"status": "error", "http": status, "reason": reason}
+    err: Dict[str, Any] = {"status": "error", "http": status, "reason": reason}
+    if preempted:
+        err["preempted"] = preempted
+    return err
 
 
 # ── Dispatcher entry point ────────────────────────────────────────
@@ -370,6 +433,11 @@ async def handle_notification_row(
         return None
     if not live_activity_ready():
         return {"status": "skipped", "reason": "apns_not_configured"}
+
+    # Staleness GC at lane entry: rows past Apple's 8h hard cap are
+    # dead on-device — end them (DB-only) before they can masquerade
+    # as a second started activity and trip the preemption path.
+    await sweep_stale_activities(db, now, user_id=row.user_id)
 
     per_device: Dict[str, Any] = {}
     delivered = False
@@ -394,7 +462,19 @@ async def handle_notification_row(
             per_device[device.id] = result
             delivered = delivered or result["status"] == "ok"
             errored = errored or result["status"] == "error"
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            # uq_live_activities_device_started: the OTHER replica won
+            # the start race for this device. Roll back and report an
+            # error — the queue row retries on backoff and next time
+            # sees the winner's row (already_started dedup).
+            await db.rollback()
+            logger.info(
+                "live-activity start lost replica race for mission %s", mission_id,
+            )
+            return {"status": "error", "delivered": False,
+                    "reason": "device_started_race", "devices": per_device}
         status = "ok" if delivered else ("error" if errored else "skipped")
         return {"status": status, "delivered": delivered, "devices": per_device}
 
@@ -426,7 +506,17 @@ async def handle_notification_row(
             per_device[device.id] = result
             delivered = delivered or result["status"] == "ok"
             errored = errored or result["status"] == "error"
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            # Same replica race as the mission_started branch — the
+            # silent restart lost; retry via the normal backoff path.
+            await db.rollback()
+            logger.info(
+                "live-activity restart lost replica race for mission %s", mission_id,
+            )
+            return {"status": "error", "delivered": False,
+                    "reason": "device_started_race", "devices": per_device}
         if row.event_kind == NOTIFY_KIND_PROGRESS:
             status = "ok" if delivered else ("error" if errored else "skipped")
             return {"status": status, "delivered": delivered,

@@ -205,6 +205,162 @@ async def test_activity_token_report_updates_started_rows(
         headers=auth_headers,
     )
     assert resp2.json()["updated"] == 0
+    assert "adopted" not in resp2.json()
+
+
+# ── install_id token lifecycle ────────────────────────────────────
+#
+# Reinstalls rotate the push-to-start token. Without a stable install
+# identity, every reinstall accretes a new device row while the stale
+# sibling keeps its dead token — which APNs accepts with 200 forever,
+# so half the user's cards go into the void.
+
+
+@pytest.mark.asyncio
+async def test_install_id_token_rotation_updates_row_in_place(client, auth_headers):
+    install = "install-rotation-1"
+    r1 = await client.post(
+        "/api/devices/live-activity",
+        json={"token": "a1" * 32, "environment": "development",
+              "install_id": install},
+        headers=auth_headers,
+    )
+    assert r1.status_code == 200, r1.text
+    device_id = r1.json()["id"]
+
+    # Reinstall: same install_id, rotated token → SAME row, new token.
+    r2 = await client.post(
+        "/api/devices/live-activity",
+        json={"token": "a2" * 32, "environment": "development",
+              "install_id": install},
+        headers=auth_headers,
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["id"] == device_id
+
+    from sqlalchemy import select
+    from app.db import async_session_maker
+
+    async with async_session_maker() as db:
+        device = await db.get(LiveActivityDevice, device_id)
+        assert device.push_to_start_token == "a2" * 32
+        assert device.revoked_at is None
+        count = len((await db.execute(
+            select(LiveActivityDevice).where(
+                LiveActivityDevice.install_id == install
+            )
+        )).scalars().all())
+        assert count == 1  # no sibling accreted
+
+
+@pytest.mark.asyncio
+async def test_install_id_registration_revokes_null_install_sibling(
+    client, auth_headers,
+):
+    """A stale row from an app build that predates install_id (NULL)
+    with a different token is a reinstall leftover — revoke it."""
+    # Old-build registration: no install_id.
+    r_old = await client.post(
+        "/api/devices/live-activity",
+        json={"token": "b1" * 32, "environment": "development"},
+        headers=auth_headers,
+    )
+    old_id = r_old.json()["id"]
+
+    # New-build registration after reinstall: install_id + new token.
+    r_new = await client.post(
+        "/api/devices/live-activity",
+        json={"token": "b2" * 32, "environment": "development",
+              "install_id": "install-sweep-1"},
+        headers=auth_headers,
+    )
+    new_id = r_new.json()["id"]
+    assert new_id != old_id
+
+    from app.db import async_session_maker
+
+    async with async_session_maker() as db:
+        old = await db.get(LiveActivityDevice, old_id)
+        new = await db.get(LiveActivityDevice, new_id)
+        assert old.revoked_at is not None  # superseded reinstall leftover
+        assert new.revoked_at is None
+
+    # A wrongly-swept second REAL device self-heals: its next launch
+    # re-registers its token and the upsert un-revokes the row.
+    r_back = await client.post(
+        "/api/devices/live-activity",
+        json={"token": "b1" * 32, "environment": "development"},
+        headers=auth_headers,
+    )
+    assert r_back.json()["id"] == old_id
+    async with async_session_maker() as db:
+        old = await db.get(LiveActivityDevice, old_id)
+        assert old.revoked_at is None
+
+
+# ── activity-token adoption (locally-started chat-turn cards) ─────
+
+
+@pytest.mark.asyncio
+async def test_activity_token_adopts_locally_started_chatturn(
+    client, auth_headers, test_user_id,
+):
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "c1" * 32, "environment": "production",
+              "install_id": "install-adopt-1"},
+        headers=auth_headers,
+    )
+
+    turn = "chatturn:cafe01234567"
+    resp = await client.post(
+        "/api/devices/live-activity/activity-token",
+        json={"mission_id": turn, "activity_push_token": "dd" * 32,
+              "source": "local_start"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("adopted") is True
+
+    from sqlalchemy import select
+    from app.db import async_session_maker
+
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == turn)
+        )).scalars().one()
+        assert la.status == LA_STARTED
+        assert la.activity_push_token == "dd" * 32
+        assert la.apns_environment == "production"
+        assert la.user_id == test_user_id
+
+
+@pytest.mark.asyncio
+async def test_activity_token_does_not_adopt_non_chatturn_missions(
+    client, auth_headers,
+):
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "c2" * 32, "environment": "development"},
+        headers=auth_headers,
+    )
+    resp = await client.post(
+        "/api/devices/live-activity/activity-token",
+        json={"mission_id": "m-not-a-turn", "activity_push_token": "ee" * 32},
+        headers=auth_headers,
+    )
+    body = resp.json()
+    assert body["updated"] == 0
+    assert "adopted" not in body
+
+    from sqlalchemy import select
+    from app.db import async_session_maker
+
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "m-not-a-turn")
+        )).scalars().all()
+        assert rows == []
 
 
 # ── Dispatcher routing ────────────────────────────────────────────
@@ -603,39 +759,201 @@ async def test_progress_silently_restarts_preempted_card(monkeypatch):
         assert row.last_progress == 40
 
 
+async def _mk_started_rows(user_id: str, device_id: str, mission_ids, *, started_at=None):
+    from app.db import async_session_maker
+
+    async with async_session_maker() as db:
+        for mid in mission_ids:
+            db.add(LiveActivity(
+                id=str(uuid.uuid4()), user_id=user_id, mission_id=mid,
+                device_id=device_id, status=LA_STARTED,
+                started_at=started_at or datetime.utcnow(),
+            ))
+        await db.commit()
+
+
 @pytest.mark.asyncio
-async def test_shared_token_fallback_refused_when_ambiguous(monkeypatch):
-    """Belt for the invariant: if two started rows ever coexist on a
-    device (constructed here directly), updates must refuse the shared
-    push-to-start token rather than hit an undefined card."""
+async def test_shared_token_ambiguity_resolved_by_preemption(monkeypatch):
+    """2026-07-16 incident: a replica race left TWO started rows on one
+    device; every tokenless send then skipped 'ambiguous_shared_token'
+    FOREVER (nothing mutates the rows) and the alert retried to failure.
+    The lane must now RESOLVE: preempt-end every other row (the shared
+    token becomes unambiguous), then deliver the send."""
     sent: list = []
     _patch_apns(monkeypatch, sent)
     user_id = await _mk_user()
     device_id = await _mk_la_device(user_id)
-
-    from app.db import async_session_maker
-    async with async_session_maker() as db:
-        for mid in ("m-X", "m-Y"):
-            db.add(LiveActivity(
-                id=str(uuid.uuid4()), user_id=user_id, mission_id=mid,
-                device_id=device_id, status=LA_STARTED,
-                started_at=datetime.utcnow(),
-            ))
-        await db.commit()
+    await _mk_started_rows(user_id, device_id, ("m-X", "m-Y"))
 
     await _claim_and_dispatch(await _enqueue(
         user_id, data_json={"mission_id": "m-X", "progress": 50},
     ))
-    assert sent == []  # nothing sent — ambiguous target
+    # End push for m-Y on the shared token, then m-X's update delivers.
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["end", "update"]
+    assert sent[1]["payload"]["aps"]["content-state"]["progress"] == 0.5
 
-    from app.db import async_session_maker as asm
-    async with asm() as db:
+    from app.db import async_session_maker
+    from sqlalchemy import select
+    async with async_session_maker() as db:
+        rows = {r.mission_id: r.status for r in (await db.execute(
+            select(LiveActivity).where(LiveActivity.user_id == user_id)
+        )).scalars().all()}
+        assert rows == {"m-X": LA_STARTED, "m-Y": LA_ENDED}
+
         row = await db.get(NotificationQueue, (await db.execute(
             __import__("sqlalchemy").select(NotificationQueue.id).order_by(
                 NotificationQueue.created_at.desc()).limit(1)
         )).scalar_one())
         frag = row.channels_json["live_activity"]["devices"][device_id]
-        assert frag == {"status": "skipped", "reason": "ambiguous_shared_token"}
+        assert frag == {"status": "ok", "preempted": 1}
+
+
+@pytest.mark.asyncio
+async def test_terminal_send_resolves_ambiguity_end_to_end(monkeypatch):
+    """The exact founder failure shape: two started rows + a terminal
+    row for one of them. Must deliver (row → sent), and BOTH LiveActivity
+    rows end — one preempted, one terminally."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    await _mk_started_rows(user_id, device_id, ("m-X", "m-Y"))
+
+    async def fake_fallback(db, row):
+        return {"status": "skipped", "reason": "no_active_agent"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fake_fallback)
+
+    row_id = await _enqueue(
+        user_id, event_kind="mission_completed", title="✅ Done: X",
+        priority="default",
+        data_json={"mission_id": "m-X", "mission_title": "X", "progress": 100},
+    )
+    result = await _claim_and_dispatch(row_id)
+    assert result == "sent"
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["end", "end"]  # preempt m-Y, then terminal end for m-X
+    assert sent[1]["payload"]["aps"]["alert"]["title"] == "✅ Done: X"
+
+    from app.db import async_session_maker
+    from sqlalchemy import select
+    async with async_session_maker() as db:
+        row = await db.get(NotificationQueue, row_id)
+        assert row.status == NQ_SENT
+        assert row.channels_json["live_activity"]["delivered"] is True
+        rows = {r.mission_id: r.status for r in (await db.execute(
+            select(LiveActivity).where(LiveActivity.user_id == user_id)
+        )).scalars().all()}
+        assert rows == {"m-X": LA_ENDED, "m-Y": LA_ENDED}
+
+
+@pytest.mark.asyncio
+async def test_stale_started_rows_swept_at_lane_entry_without_pushes(monkeypatch):
+    """Apple hard-caps Live Activities at 8h — a 9h-old started row is
+    dead on-device. The lane-entry GC must end it DB-only (zero pushes
+    for it) and leave fresh rows untouched."""
+    from datetime import timedelta
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    await _mk_started_rows(
+        user_id, device_id, ("m-old",),
+        started_at=datetime.utcnow() - timedelta(hours=9),
+    )
+    await _mk_started_rows(user_id, device_id, ("m-new",))
+
+    await _claim_and_dispatch(await _enqueue(
+        user_id, data_json={"mission_id": "m-new", "progress": 20},
+    ))
+    # The GC beat the preemption path: only m-new's update went out —
+    # no end push was wasted on the long-dead m-old card.
+    assert [s["payload"]["aps"]["event"] for s in sent] == ["update"]
+
+    from app.db import async_session_maker
+    from sqlalchemy import select
+    async with async_session_maker() as db:
+        rows = {r.mission_id: r for r in (await db.execute(
+            select(LiveActivity).where(LiveActivity.user_id == user_id)
+        )).scalars().all()}
+        assert rows["m-old"].status == LA_ENDED
+        assert rows["m-old"].ended_at is not None
+        assert rows["m-new"].status == LA_STARTED
+
+
+@pytest.mark.asyncio
+async def test_requeue_stuck_sweeps_stale_rows_for_all_users(monkeypatch):
+    """Idle devices converge too: the dispatcher's _requeue_stuck pass
+    runs the same 8h GC across ALL users — no queued row required."""
+    from datetime import timedelta
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    await _mk_started_rows(
+        user_id, device_id, ("m-idle",),
+        started_at=datetime.utcnow() - timedelta(hours=9),
+    )
+
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        await nd._requeue_stuck(db, datetime.utcnow())
+
+    from sqlalchemy import select
+    async with async_session_maker() as db:
+        row = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "m-idle")
+        )).scalars().one()
+        assert row.status == LA_ENDED
+    assert sent == []  # DB-only, zero pushes
+
+
+@pytest.mark.asyncio
+async def test_terminal_restart_delivers_despite_foreign_started_row(monkeypatch):
+    """Founder scenario regression (2026-07-16): a terminal row for a
+    never-started chat turn while a FOREIGN mission's tokenless started
+    row occupies the device. The _START_IF_MISSING restart must preempt
+    the foreign card, start the turn card, and the fall-through end must
+    deliver the alert."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    await _mk_started_rows(user_id, device_id, ("m-foreign",))
+
+    async def fake_fallback(db, row):
+        return {"status": "skipped", "reason": "no_active_agent"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fake_fallback)
+
+    turn = "chatturn:deadbeef1234"
+    row_id = await _enqueue(
+        user_id, event_kind="mission_completed", title="Answer ready",
+        priority="default",
+        data_json={"mission_id": turn, "mission_title": "Answer",
+                   "route": "chat", "kind": "chat_turn"},
+    )
+    result = await _claim_and_dispatch(row_id)
+    assert result == "sent"
+    # Preempt the foreign card, silently start the turn card, then the
+    # end push carries the banner.
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["end", "start", "end"]
+    assert "alert" not in sent[1]["payload"]["aps"]  # restart is silent
+    assert sent[2]["payload"]["aps"]["alert"]["title"] == "Answer ready"
+
+    from app.db import async_session_maker
+    from sqlalchemy import select
+    async with async_session_maker() as db:
+        row = await db.get(NotificationQueue, row_id)
+        assert row.status == NQ_SENT
+        rows = {r.mission_id: r.status for r in (await db.execute(
+            select(LiveActivity).where(LiveActivity.user_id == user_id)
+        )).scalars().all()}
+        assert rows == {"m-foreign": LA_ENDED, turn: LA_ENDED}
 
 
 @pytest.mark.asyncio
