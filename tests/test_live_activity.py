@@ -53,6 +53,22 @@ def test_start_payload_matches_swift_contract():
     assert cs["title"] == "Research CRMs"
     assert cs["progress"] == 0.0
     assert aps["alert"]["title"] == "🚀 Autopilot engaged"
+    assert aps["alert"]["sound"] == "default"
+
+
+def test_start_payload_always_carries_alert_config():
+    """iOS 26 drops start events with no alert configuration
+    (liveactivitiesd SessionCore, observed on-device 2026-07-18) — a
+    'silent' start must still ship a synthesized, SOUNDLESS alert or
+    the card never renders while APNs returns 200."""
+    p = apns_push.build_start_payload(
+        mission_id="m-1", title="⏰ Stretch", subtitle="Time to stretch",
+        timer_end_ms=1_752_000_000_000, timestamp=1,
+    )
+    alert = p["aps"]["alert"]
+    assert alert["title"] == "⏰ Stretch"
+    assert alert["body"] == "Time to stretch"
+    assert "sound" not in alert
 
 
 def test_update_payload_clamps_progress_and_omits_none():
@@ -740,10 +756,12 @@ async def test_progress_silently_restarts_preempted_card(monkeypatch):
         data_json={"mission_id": "m-A", "mission_title": "Task A", "progress": 40},
     ))
     assert result == "suppressed:progress_in_app_only"
-    # Job B's card was ended, then A restarted — silently (no alert).
+    # Job B's card was ended, then A restarted — quiet start: iOS 26
+    # requires an alert config on every start, so it is synthesized
+    # from the card content with no sound.
     events = [s["payload"]["aps"]["event"] for s in sent]
     assert events == ["end", "start"]
-    assert "alert" not in sent[1]["payload"]["aps"]
+    assert "sound" not in sent[1]["payload"]["aps"]["alert"]
     assert sent[1]["payload"]["aps"]["attributes"]["name"] == "m-A"
     assert sent[1]["payload"]["aps"]["content-state"]["progress"] == 0.4
 
@@ -938,11 +956,12 @@ async def test_terminal_restart_delivers_despite_foreign_started_row(monkeypatch
     )
     result = await _claim_and_dispatch(row_id)
     assert result == "sent"
-    # Preempt the foreign card, silently start the turn card, then the
-    # end push carries the banner.
+    # Preempt the foreign card, quietly start the turn card (iOS 26
+    # requires an alert config on every start — synthesized, soundless),
+    # then the end push carries the real banner.
     events = [s["payload"]["aps"]["event"] for s in sent]
     assert events == ["end", "start", "end"]
-    assert "alert" not in sent[1]["payload"]["aps"]  # restart is silent
+    assert "sound" not in sent[1]["payload"]["aps"]["alert"]  # quiet restart
     assert sent[2]["payload"]["aps"]["alert"]["title"] == "Answer ready"
 
     from app.db import async_session_maker

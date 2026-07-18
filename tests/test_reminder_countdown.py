@@ -144,7 +144,9 @@ async def test_silent_countdown_start_no_banner_timer_and_digital_island(monkeyp
 
     aps = sent[0]["payload"]["aps"]
     assert aps["event"] == "start"
-    assert "alert" not in aps  # silent: the card IS the feedback
+    # iOS 26 requires an alert config on every start: the arm carries a
+    # synthesized, soundless banner (which doubles as set-confirmation).
+    assert "sound" not in aps["alert"]
     assert aps["content-state"]["timerEndDateInMilliseconds"] == timer_ms
     assert aps["content-state"]["subtitle"] == "Time to stretch"
     assert aps["attributes"]["timerType"] == "digital"
@@ -218,7 +220,7 @@ async def test_fire_with_no_card_restarts_then_alerts(monkeypatch):
     assert result == "sent"
     events = [s["payload"]["aps"]["event"] for s in sent]
     assert events == ["start", "end"]
-    assert "alert" not in sent[0]["payload"]["aps"]  # silent restart
+    assert "sound" not in sent[0]["payload"]["aps"]["alert"]  # quiet restart
     assert sent[1]["payload"]["aps"]["alert"]["title"] == "⏰ Stretch — now"
 
     from app.db import async_session_maker

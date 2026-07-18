@@ -179,8 +179,10 @@ def build_start_payload(
     the app's onTokenReceived listener echoes it back so a reported
     per-activity token can be matched to its live_activities row.
 
-    No ``alert`` kwargs → a silent start: the card appears without a
-    banner (used by the self-healing restart path)."""
+    Every start carries an alert configuration — iOS 26 drops alertless
+    starts outright. No ``alert`` kwargs → a QUIET start: the alert is
+    synthesized from the card content with no sound (used by countdown
+    arms and the self-healing restart path)."""
     aps: Dict[str, Any] = {
         "timestamp": int(timestamp or time.time()),
         "event": "start",
@@ -208,8 +210,19 @@ def build_start_payload(
     if timer_type in ("circular", "digital"):
         aps["attributes"]["timerType"] = timer_type
     alert = _alert(alert_title, alert_body)
-    if alert:
-        aps["alert"] = alert
+    if alert is None:
+        # iOS 26 REJECTS start events with no alert configuration —
+        # liveactivitiesd publishes the activity, then SessionCore logs
+        # "Received start without an alert configuration" and drops it:
+        # APNs 200s, the card never renders (observed on-device
+        # 2026-07-18, iOS 26.4.2 — the root cause of every invisible
+        # card since silent starts shipped). Every start therefore
+        # carries an alert; producer-"silent" starts synthesize it from
+        # the card content and omit the sound so the arm stays quiet.
+        alert = {"title": title[:120]}
+        if subtitle:
+            alert["body"] = subtitle[:400]
+    aps["alert"] = alert
     return {"aps": aps}
 
 
