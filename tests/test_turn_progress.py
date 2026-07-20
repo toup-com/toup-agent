@@ -99,10 +99,13 @@ async def test_notify_failure_never_raises(monkeypatch):
 
 
 def test_wiring_pins():
-    """The emitter is only useful if the two call sites actually wire
-    it: autopilot ticks (always-on) and chat turns (gated)."""
+    """The emitter is only useful if the call sites actually wire it:
+    autopilot ticks, chat turns (ungated — rows are update_only since
+    P4, so they can only refresh an existing card), and sub-agent job
+    runs."""
     import inspect
     from app.agent.routines import autopilot_handler
+    from app.agent import subagent_orchestrator
     from app.api import ws_chat
 
     hsrc = inspect.getsource(autopilot_handler)
@@ -112,8 +115,13 @@ def test_wiring_pins():
 
     wsrc = inspect.getsource(ws_chat)
     assert "TurnProgressEmitter" in wsrc
-    assert 'gate=lambda: _turn_flags["client_gone"]' in wsrc
+    assert "mission_title=_turn_title" in wsrc  # per-task card title
+    assert "gate=" not in wsrc  # ungated: update_only rows are safe
     assert "_turn_emitter.force_next()" in wsrc
+
+    osrc = inspect.getsource(subagent_orchestrator)
+    assert "TurnProgressEmitter" in osrc
+    assert "on_tool_start=_job_emitter.on_tool_start" in osrc
 
 
 def test_progress_fastlane_flag_and_ingest_pin():

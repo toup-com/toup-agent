@@ -10,7 +10,10 @@ seams (``on_tool_start`` / ``on_tool_end``) and emits throttled
 ``event_kind='progress'`` rows through the durable notify outbox. The
 Live Activity lane turns those into content-state updates (bar +
 step subtitle); the dispatcher never renders ``progress`` as an alert
-push, so emitting mid-turn is safe.
+push, so emitting mid-turn is safe. Rows carry ``update_only`` — they
+refresh an existing card and never silently START one, so emitting on
+every turn (Claude-parity live status) cannot grow lock-screen cards
+on ordinary foreground turns.
 
 Interpolation: ``p(k) = base + (ceiling - base) * (1 - 0.85**k)`` —
 strictly monotonic in the number of tool calls ``k``, asymptotic to
@@ -67,10 +70,8 @@ class TurnProgressEmitter:
     into ``AgentRunner.run``'s callbacks (compose with existing ones).
 
     ``gate``: optional callable; when it returns False, nothing is
-    emitted. Chat turns pass ``lambda: client_gone`` — progress rows
-    silently (re)start a Live Activity card, so emitting while the
-    client is still connected would put a lock-screen card on every
-    ordinary chat turn.
+    emitted. With ``update_only`` rows (the default) most producers
+    need no gate — the row can only refresh an existing card.
     """
 
     def __init__(
@@ -131,6 +132,8 @@ class TurnProgressEmitter:
                     "mission_title": self.mission_title[:80],
                     "route": self.route,
                     "progress": progress,
+                    # Refresh an existing card only — never start one.
+                    "update_only": True,
                 },
                 priority="low",
                 dedup_key=f"{self.mission_id}:progress",

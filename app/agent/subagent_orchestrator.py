@@ -388,6 +388,21 @@ async def _run_child(
             urgent=(parent_channel != "autopilot"),
         )
 
+        # Live status on the card while the child works (Claude
+        # parity): tool-boundary subtitles + interpolated progress ride
+        # update_only rows onto the card started above. The first
+        # update swaps the blind timer bar for a discrete bar with a
+        # real status line ("Searching the web…").
+        from app.agent.turn_progress import TurnProgressEmitter
+
+        _job_emitter = TurnProgressEmitter(
+            mission_id=job_id,
+            mission_title=(label or task or "Background task")[:60],
+            base_progress=5,
+            ceiling=90,
+            route="mission-control",
+        )
+
         try:
             response = await asyncio.wait_for(
                 agent_runner.run(
@@ -402,6 +417,7 @@ async def _run_child(
                     save_assistant_message=False,
                     disable_post_processing=True,
                     model_override=model,
+                    on_tool_start=_job_emitter.on_tool_start,
                 ),
                 timeout=timeout_seconds,
             )

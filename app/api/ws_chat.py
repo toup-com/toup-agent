@@ -1905,10 +1905,21 @@ async def ws_chat(
                 # with the turn's Live Activity card (chatturn:<hex> is
                 # also the ActivityAttributes name in the start payload).
                 _turn_mission_id = f"chatturn:{uuid.uuid4().hex[:12]}"
+                # Per-task card title (Claude parity): the card says WHAT
+                # is being worked on — the user's ask, one line — not a
+                # generic "Working on your answer". Rides every status
+                # frame so the app can name a locally-started card, and
+                # every platform push for the turn. No new exposure: the
+                # started push already carries a 180-char text preview.
+                _turn_title = (
+                    " ".join((_original_user_text or text or "").split())[:60].strip()
+                    or "Working on your answer"
+                )
                 try:
                     await websocket.send_json({
                         "type": "status", "stage": "received",
                         "mission_id": _turn_mission_id,
+                        "title": _turn_title,
                     })
                 except Exception:
                     pass
@@ -2069,20 +2080,21 @@ async def ws_chat(
                 # the interim-progress emitter close over the same id.
                 _turn_flags = {"client_gone": False, "response_persisted": False}
 
-                # Interim Live Activity progress at tool boundaries. The
-                # gate is load-bearing: progress rows silently (re)start
-                # a card, so we emit ONLY after the client is gone —
-                # otherwise every ordinary chat turn would put a card on
-                # the lock screen.
+                # Interim Live Activity progress at tool boundaries.
+                # Emits on EVERY turn (Claude parity: the backgrounded
+                # card streams live status), but rows are update_only —
+                # they refresh an existing card and can never START one,
+                # so ordinary foreground turns still grow no card. The
+                # card itself appears only via the app's local start on
+                # backgrounding or the client-gone platform start.
                 from app.agent.turn_progress import TurnProgressEmitter
 
                 _turn_emitter = TurnProgressEmitter(
                     mission_id=_turn_mission_id,
-                    mission_title="Working on your answer",
+                    mission_title=_turn_title,
                     base_progress=5,
                     ceiling=90,
                     route="chat",
-                    gate=lambda: _turn_flags["client_gone"],
                 )
 
                 # Stream callbacks
@@ -2128,7 +2140,7 @@ async def ws_chat(
                         await websocket.send_json({"type": "tool_start", "tool": tool_name})
                     except Exception:
                         pass
-                    # Gated on client_gone — no-op while the user watches.
+                    # update_only rows: refresh the card if one exists.
                     try:
                         await _turn_emitter.on_tool_start(tool_name)
                     except Exception:
@@ -2143,6 +2155,7 @@ async def ws_chat(
                         await websocket.send_json({
                             "type": "status", "stage": stage,
                             "mission_id": _turn_mission_id,
+                            "title": _turn_title,
                         })
                     except Exception:
                         pass
@@ -2430,7 +2443,8 @@ async def ws_chat(
                                 body=_user_text_preview or None,
                                 data={
                                     "mission_id": _turn_mission_id,
-                                    "mission_title": "Working on your answer",
+                                    "mission_title": _turn_title,
+                                    "subtitle": "Working on it…",
                                     "route": "chat",
                                     "kind": "chat_turn",
                                     "urgent": True,
@@ -2605,7 +2619,7 @@ async def ws_chat(
                         from app.services.agent_notify_client import notify
                         _answer_data = {
                             "mission_id": _turn_mission_id,
-                            "mission_title": "Working on your answer",
+                            "mission_title": _turn_title,
                             "route": "chat",
                             "kind": "chat_turn",
                             "urgent": True,
@@ -2687,7 +2701,7 @@ async def ws_chat(
                                 body="Something went wrong — open the app and ask again.",
                                 data={
                                     "mission_id": _turn_mission_id,
-                                    "mission_title": "Working on your answer",
+                                    "mission_title": _turn_title,
                                     "route": "chat",
                                     "kind": "chat_turn",
                                     "urgent": True,

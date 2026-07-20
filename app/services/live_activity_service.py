@@ -545,7 +545,14 @@ async def handle_notification_row(
     restart_loud = False
 
     if not activities and (
-        row.event_kind == NOTIFY_KIND_PROGRESS
+        (
+            row.event_kind == NOTIFY_KIND_PROGRESS
+            # update_only progress (turn/job status beacons) refreshes
+            # an existing card and must NEVER start one — that is what
+            # lets producers emit on every turn without growing cards
+            # on ordinary foreground turns.
+            and not (row.data_json or {}).get("update_only")
+        )
         or (
             row.event_kind in _START_IF_MISSING_KINDS
             and not (row.data_json or {}).get("silent")

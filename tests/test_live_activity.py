@@ -1406,3 +1406,67 @@ async def test_active_missions_lists_started_only(
     missions = resp.json()["missions"]
     assert "reminder:recon-live" in missions
     assert "reminder:recon-done" not in missions
+
+
+# ── P4 parity: update_only progress lane ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_only_progress_never_starts_a_card(monkeypatch):
+    """Turn/job status beacons emit on EVERY turn now — safe only
+    because update_only rows refresh an existing card and never
+    silently start one (no card on ordinary foreground turns)."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id,  # kind=progress, no card started
+        data_json={"mission_id": "chatturn:p4nocard0001", "mission_title": "T",
+                   "progress": 40, "update_only": True},
+    ))
+    assert result == "suppressed:progress_in_app_only"
+    assert sent == []  # no restart, no start push — nothing
+
+
+@pytest.mark.asyncio
+async def test_update_only_progress_updates_existing_card(monkeypatch):
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    await _mk_started_rows(user_id, device_id, ("chatturn:p4card00001",))
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id,
+        data_json={"mission_id": "chatturn:p4card00001",
+                   "mission_title": "Find flights to Lisbon",
+                   "progress": 40, "update_only": True},
+        body="Searching the web…",
+    ))
+    assert result == "suppressed:progress_in_app_only"
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["update"]
+    cs = sent[0]["payload"]["aps"]["content-state"]
+    assert cs["title"] == "Find flights to Lisbon"
+    assert cs["subtitle"] == "Searching the web…"
+    assert cs["progress"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_plain_progress_still_restarts_preempted_card(monkeypatch):
+    """Autopilot mission markers (no update_only) keep the self-heal:
+    a preempted mission card comes back on the next heartbeat."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id,
+        data_json={"mission_id": "m-heal", "mission_title": "T", "progress": 40},
+    ))
+    assert result == "suppressed:progress_in_app_only"
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["start"]  # silent self-heal restart preserved
