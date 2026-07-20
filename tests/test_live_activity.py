@@ -71,6 +71,47 @@ def test_start_payload_always_carries_alert_config():
     assert "sound" not in alert
 
 
+def test_start_payload_orb_color_strict_hex_only():
+    """attributes.orbColor carries the user's agent color to the
+    widget face; the widget's hex parser assumes exactly '#RRGGBB', so
+    anything looser is dropped (widget falls back to brand default)
+    and a valid color also tints the progress bar to match."""
+    p = apns_push.build_start_payload(
+        mission_id="m-1", title="T", timestamp=1, orb_color="#2ECC71",
+    )
+    assert p["aps"]["attributes"]["orbColor"] == "#2ECC71"
+    assert p["aps"]["attributes"]["progressViewTint"] == "#2ECC71"
+
+    for bad in (None, "", "2ECC71", "#2ECC7", "#2ECC711", "#GGGGGG", "green"):
+        p = apns_push.build_start_payload(
+            mission_id="m-1", title="T", timestamp=1, orb_color=bad,
+        )
+        assert "orbColor" not in p["aps"]["attributes"], bad
+        # Unset/invalid color keeps the fixed default tint.
+        assert p["aps"]["attributes"]["progressViewTint"] == "#3B82F6"
+
+
+@pytest.mark.asyncio
+async def test_start_push_carries_users_agent_color(monkeypatch):
+    """_send_start reads the LIVE agent_configs.agent_color (the same
+    source the in-app orb renders) at send time."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+
+    from app.db import async_session_maker
+    from app.db.models import AgentConfig
+    async with async_session_maker() as db:
+        db.add(AgentConfig(user_id=user_id, agent_color="#2ECC71"))
+        await db.commit()
+
+    await _claim_and_dispatch(await _enqueue(user_id, event_kind="mission_started"))
+    attrs = sent[0]["payload"]["aps"]["attributes"]
+    assert attrs["orbColor"] == "#2ECC71"
+    assert attrs["progressViewTint"] == "#2ECC71"
+
+
 def test_update_payload_clamps_progress_and_omits_none():
     p = apns_push.build_update_payload(title="T", progress=1.7, timestamp=1)
     cs = p["aps"]["content-state"]

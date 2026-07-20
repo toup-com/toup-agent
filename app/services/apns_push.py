@@ -153,6 +153,18 @@ def _content_state(
     return state
 
 
+def _valid_hex_color(value: Optional[str]) -> bool:
+    """Strict '#RRGGBB' — the widget's hex parser assumes exactly this
+    shape; anything looser must be dropped, not passed through."""
+    if not isinstance(value, str) or len(value) != 7 or value[0] != "#":
+        return False
+    try:
+        int(value[1:], 16)
+    except ValueError:
+        return False
+    return True
+
+
 def _alert(alert_title: Optional[str], alert_body: Optional[str]) -> Optional[Dict[str, Any]]:
     if not alert_title:
         return None
@@ -174,6 +186,7 @@ def build_start_payload(
     timestamp: Optional[int] = None,
     deep_link: str = "toup://mission-control",
     timer_type: Optional[str] = None,
+    orb_color: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Push-to-start payload. ``attributes.name`` carries the mission id —
     the app's onTokenReceived listener echoes it back so a reported
@@ -209,6 +222,15 @@ def build_start_payload(
     # Attributes are start-fixed, so it must ride the start push.
     if timer_type in ("circular", "digital"):
         aps["attributes"]["timerType"] = timer_type
+    # The user's agent color: the widget draws the orb face (and tints
+    # the progress bar) in it, so every user's card matches their
+    # in-app agent. Attributes are start-fixed — a color change lands
+    # on the NEXT card. Strict '#RRGGBB' only: an unparsable value in
+    # Color(hex:) renders black, so anything else is dropped and the
+    # widget falls back to the brand default.
+    if _valid_hex_color(orb_color):
+        aps["attributes"]["orbColor"] = orb_color
+        aps["attributes"]["progressViewTint"] = orb_color
     alert = _alert(alert_title, alert_body)
     if alert is None:
         # iOS 26 REJECTS start events with no alert configuration —

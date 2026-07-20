@@ -62,7 +62,7 @@ from sqlalchemy.exc import IntegrityError
 from app.config import settings
 from app.db.models import (
     LA_ENDED, LA_STARTED,
-    LiveActivity, LiveActivityDevice, NotificationQueue,
+    AgentConfig, LiveActivity, LiveActivityDevice, NotificationQueue,
     NOTIFY_KIND_MISSION_COMPLETED, NOTIFY_KIND_MISSION_FAILED,
     NOTIFY_KIND_MISSION_STARTED, NOTIFY_KIND_NEEDS_APPROVAL,
     NOTIFY_KIND_NEEDS_INPUT, NOTIFY_KIND_PROGRESS,
@@ -316,6 +316,18 @@ async def _preempt_device(
     return preempted
 
 
+async def _user_orb_color(db, user_id: str) -> Optional[str]:
+    """The user's live agent color (agent_configs.agent_color) — the
+    same source of truth the in-app orb renders, NOT the stale
+    bind-time runtime.json snapshot. None when unset (widget falls
+    back to the brand default)."""
+    return (
+        await db.execute(
+            select(AgentConfig.agent_color).where(AgentConfig.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+
+
 async def _send_start(
     db, device: LiveActivityDevice, row: NotificationQueue,
     mission_id: str, now: datetime, *, silent: bool = False,
@@ -343,6 +355,7 @@ async def _send_start(
         timestamp=int(now.timestamp()),
         deep_link=deep_link,
         timer_type=timer_type if timer_type in ("circular", "digital") else None,
+        orb_color=await _user_orb_color(db, row.user_id),
     )
     status, reason, _env = await _send_with_env_selfheal(
         db, device, device.push_to_start_token, payload, priority=10,
