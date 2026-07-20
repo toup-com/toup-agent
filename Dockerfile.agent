@@ -68,6 +68,17 @@ RUN useradd -m -u 1000 toup && \
     mkdir -p /app/workspace /app/skills && \
     chown -R toup:toup /app/workspace /app/skills /home/toup
 
+# Sandbox user for the `exec` tool (security hardening, docs/security/audit-2026.md
+# EXF-3). The agent runs as root (trusted supervisor); when EXEC_SANDBOX_USER is
+# set, every `exec`/user-code child drops to THIS uid via preexec_fn, so it can
+# no longer read the platform source at /app or the agent's /proc env — while the
+# agent itself is unaffected. `o-rwx /app` makes the shipped source unreadable to
+# any non-root uid; the workspace/skills are made group-writable to the sandbox at
+# boot (see CMD). Harmless until EXEC_SANDBOX_USER is enabled.
+RUN useradd -u 2000 -M -d /home/sandbox -s /usr/sbin/nologin sandbox && \
+    mkdir -p /home/sandbox && chown sandbox:sandbox /home/sandbox && \
+    chmod -R o-rwx /app
+
 # Memory & retrieval — agent containers do NOT bundle
 # `sentence-transformers`/torch (saves ~2.5 GB image weight). The
 # embedding service falls back to "local" mode by default and dies
@@ -133,4 +144,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
 # definitions, surfacing as "column X of relation Y does not exist"
 # the moment a new feature column was referenced (e.g. routines.schedule_kind
 # from migration 042 broke every reminder create call).
-CMD ["bash", "-c", "alembic upgrade head || echo '[boot] alembic upgrade failed — continuing without applying migrations; check logs above'; exec uvicorn agent_main:app --host 0.0.0.0 --port 8001"]
+# The workspace/skills mounts arrive owned by the host bridge uid at runtime; make
+# them group-writable by the sandbox uid (2000) so a dropped `exec` can still build
+# the user's apps. No-op / harmless when EXEC_SANDBOX_USER is unset. Never fails boot.
+CMD ["bash", "-c", "chown -R :2000 /app/workspace /app/skills 2>/dev/null || true; chmod -R g+rwX /app/workspace /app/skills 2>/dev/null || true; alembic upgrade head || echo '[boot] alembic upgrade failed — continuing without applying migrations; check logs above'; exec uvicorn agent_main:app --host 0.0.0.0 --port 8001"]

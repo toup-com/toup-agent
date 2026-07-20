@@ -403,6 +403,32 @@ async def get_usage_summary(
 
         await _merge_build_usage(current_user_id, since, provider_map, db)
 
+        # Defense-in-depth: alias real provider/model ids to neutral tier
+        # labels so the usage screen doesn't surface "anthropic / claude-opus".
+        # Flag-gated (default off); token/cost numbers are untouched.
+        # See docs/security/audit-2026.md MI-2.
+        if settings.security_leak_filter:
+            from app.services.model_alias import public_model_label, public_provider_label
+            merged: dict[str, dict] = {}
+            for p in provider_map.values():
+                label = public_provider_label(p["provider"])
+                bucket = merged.setdefault(label, {
+                    "provider": label, "input_tokens": 0, "output_tokens": 0,
+                    "total_tokens": 0, "cost_usd": 0.0, "request_count": 0, "models": [],
+                })
+                bucket["input_tokens"] += p["input_tokens"]
+                bucket["output_tokens"] += p["output_tokens"]
+                bucket["total_tokens"] += p["total_tokens"]
+                bucket["cost_usd"] = round(bucket["cost_usd"] + p["cost_usd"], 4)
+                bucket["request_count"] += p["request_count"]
+                for m in p["models"]:
+                    bucket["models"].append({
+                        **m,
+                        "model": public_model_label(m.get("model")),
+                        "provider": label,
+                    })
+            provider_map = merged
+
         providers_sorted = sorted(provider_map.values(), key=lambda p: p["total_tokens"], reverse=True)
         total_inp = sum(p["input_tokens"] for p in providers_sorted)
         total_out = sum(p["output_tokens"] for p in providers_sorted)

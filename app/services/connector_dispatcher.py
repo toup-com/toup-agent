@@ -105,6 +105,20 @@ _REFRESH_SKEW_SECONDS = 30
 # voice/telegram.
 _MUTATES_DEFAULT_DENY_CHANNELS = frozenset({"voice", "telegram", "autopilot"})
 
+# No-user-present channels: background routines / triggers run a fully
+# tool-enabled agent turn with nobody watching, so injected content in an
+# ingested email/web/doc can drive a mutating connector call unattended
+# (docs/security/audit-2026.md INJ-1, the Critical). When injection_fencing_v2
+# is on we default-deny mutating connectors on these channels too. Flag-gated
+# because it changes unattended-automation behaviour (an agent_task routine
+# can no longer auto-send email until a confirmation path exists — INJ-4/G6).
+# "autopilot" is already in the default-deny set above; this is the additive
+# rest of the unattended surface.
+_MUTATES_UNATTENDED_DENY_CHANNELS = frozenset({
+    "routine", "trigger", "heartbeat", "cron", "agent_task",
+    "email_briefing", "background",
+})
+
 
 # ─── Per-identity refresh-coalescing locks ────────────────────────────
 
@@ -614,7 +628,11 @@ def _resolve_channel_policy(
             message=f"tool {manifest_tool.name!r} is not available on channel {channel!r}",
             retryable=False,
         )
-    if manifest_tool.mutates and channel in _MUTATES_DEFAULT_DENY_CHANNELS:
+    _deny_channels = _MUTATES_DEFAULT_DENY_CHANNELS
+    from app.config import settings as _settings
+    if getattr(_settings, "injection_fencing_v2", False):
+        _deny_channels = _MUTATES_DEFAULT_DENY_CHANNELS | _MUTATES_UNATTENDED_DENY_CHANNELS
+    if manifest_tool.mutates and channel in _deny_channels:
         return ConnectorToolError(
             message=(
                 f"mutating tool {manifest_tool.name!r} is denied by default "

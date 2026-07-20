@@ -464,7 +464,74 @@ class Settings(BaseSettings):
     # Docker Sandbox
     sandbox_enabled: bool = False  # Route exec through Docker container
     sandbox_image: str = "python:3.12-slim"  # Sandbox container image
-    
+
+    # ── Security hardening (docs/security/audit-2026.md) ───────────────
+    # Production defaults. The platform is fully hosted (no user-supplied
+    # provider keys — the LLM is provided per-user through the proxy), so the
+    # hardened posture is the correct default. Each flag can still be turned
+    # OFF via env for staging/debug.
+    #
+    # voice_identity_anchor: mirror the text-channel "you are the user's
+    #   agent, never name the underlying LLM provider" guard into the voice /
+    #   realtime + think prompts. Additive guard.
+    voice_identity_anchor: bool = True
+    # security_leak_filter: server-side alias of real provider/model ids to
+    #   neutral tier labels on user-facing surfaces (usage, jobs, messages,
+    #   telegram, proxy). Enforces the white-label story.
+    security_leak_filter: bool = True
+    # injection_fencing_v2: wrap ingested web/doc/trigger content in an
+    #   untrusted-data envelope + a standing data≠instructions rule, and deny
+    #   MUTATING CONNECTOR calls on no-user-present channels (routine/trigger/
+    #   background). NOTE: internal tools (reminders, notifications, memory) are
+    #   unaffected — only external connector WRITES (gmail send, drive/calendar
+    #   write) are denied in an unattended run, because there is no human to
+    #   confirm an action injected content might have requested (INJ-1).
+    injection_fencing_v2: bool = True
+    # exec_env_scrub: strip platform/tenant secrets from the env handed to the
+    #   exec/PTY/code-engine CHILD shells. The agent PROCESS keeps them (used by
+    #   embeddings, the proxy, DB), only the tool subprocess loses them, so one
+    #   `printenv` in a tool call can't dump a credential. Safe under the fully-
+    #   hosted model: no tenant shell command legitimately needs a provider key;
+    #   the code engines re-inject their own auth explicitly after scrubbing.
+    #   DATABASE_URL is intentionally KEPT so the documented `psql $DATABASE_URL`
+    #   via-exec capability still works (tenant's own, per-DB-scoped credential).
+    exec_env_scrub: bool = True
+    exec_env_scrub_keys: list[str] = [
+        "POOL_ADMIN_TOKEN",          # platform pool-admin bearer (cross-tenant)
+        "AGENT_API_KEY",             # the agent's own inbound auth key
+        "BRAVE_API_KEY",             # platform-shared search key
+        "TOUP_TOKEN",                # LLM-proxy bearer (agent process only)
+        "OPENAI_API_KEY",            # provider keys — used by the process, not shells
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "MISTRAL_API_KEY",
+        "XAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",   # code engines re-inject their own after scrub
+        "OPENAI_CODEX_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+        "DISCORD_BOT_TOKEN",
+        # DATABASE_URL intentionally NOT listed — preserves psql-via-exec.
+    ]
+    # embeddings_via_proxy: route the agent's embedding calls through the
+    #   platform LLM proxy (TOUP_TOKEN) instead of a raw OpenAI key in the
+    #   container — the last step to remove ALL provider keys from tenant
+    #   containers (audit EXF-1 residual / hardening-runbook.md Step 1).
+    #   Default OFF: this is a MEMORY-CRITICAL path — enable + validate on
+    #   staging (store/search a memory, confirm a proxy `embeddings` event)
+    #   BEFORE flipping it on and dropping OPENAI_API_KEY from the bridge env.
+    embeddings_via_proxy: bool = False
+    # exec_sandbox_user: run the `exec`/PTY tool AND its children as a separate,
+    #   lower-privileged OS user (e.g. "sandbox") instead of the agent's uid.
+    #   This is the REAL fix for "exec can read /app platform source and
+    #   /proc/<agent>/environ" — those become unreadable to a different uid,
+    #   while the agent process itself keeps full access. The container image
+    #   must define this user and give it write access ONLY to the workspace
+    #   (see Dockerfile.agent). Empty = disabled (current behaviour). The agent
+    #   process must be root (or hold CAP_SETUID) to drop privileges.
+    #   hardening-runbook.md Step 2. Enable + validate on staging first.
+    exec_sandbox_user: str = ""
+
     # Cross-Encoder Re-ranker (Phase 6)
     enable_reranker: bool = True  # Enable cross-encoder re-ranking after RRF
     cohere_api_key: Optional[str] = None  # Set via COHERE_API_KEY env var

@@ -31,17 +31,33 @@ class EmbeddingService:
             cls._instance = super().__new__(cls)
         return cls._instance
 
+    @staticmethod
+    def _proxy_embeddings_active() -> bool:
+        """True when embeddings should route through the platform proxy
+        (bundle mode + flag) instead of a raw OpenAI key in the container.
+        Lets embeddings work with NO OPENAI_API_KEY present — the toup_token
+        + proxy carry the call. See hardening-runbook.md Step 1."""
+        return bool(
+            getattr(settings, "embeddings_via_proxy", False)
+            and getattr(settings, "llm_mode", "") == "bundle"
+            and getattr(settings, "toup_token", "")
+        )
+
     @property
     def provider(self) -> str:
-        """Resolve actual provider: use OpenAI only if explicitly configured AND key exists."""
+        """Resolve actual provider: use OpenAI if a key exists OR the proxy
+        path is active; otherwise fall back to local."""
         if self._resolved_provider is None:
-            if settings.embedding_provider == "openai" and settings.openai_api_key:
+            if settings.embedding_provider == "openai" and (
+                settings.openai_api_key or self._proxy_embeddings_active()
+            ):
                 self._resolved_provider = "openai"
             else:
                 self._resolved_provider = "local"
                 if settings.embedding_provider == "openai":
                     logger.warning(
-                        "OPENAI_API_KEY not set — falling back to local embedding model"
+                        "OPENAI_API_KEY not set and proxy path inactive — "
+                        "falling back to local embedding model"
                     )
         return self._resolved_provider
 
@@ -73,8 +89,16 @@ class EmbeddingService:
     def openai_client(self):
         if self._openai_client is None and self.is_openai:
             from openai import OpenAI
-            self._openai_client = OpenAI(api_key=settings.openai_api_key)
-            logger.info(f"OpenAI embedding client initialized: {self.model_name}")
+            if self._proxy_embeddings_active():
+                # Route through the platform proxy with the scoped TOUP_TOKEN —
+                # no raw provider key needed in the container. The SDK POSTs to
+                # {base_url}/embeddings → /llm/openai/v1/embeddings.
+                base = f"{settings.platform_api_url.rstrip('/')}/llm/openai/v1"
+                self._openai_client = OpenAI(api_key=settings.toup_token, base_url=base)
+                logger.info("OpenAI embedding client via platform proxy: %s", self.model_name)
+            else:
+                self._openai_client = OpenAI(api_key=settings.openai_api_key)
+                logger.info(f"OpenAI embedding client initialized: {self.model_name}")
         return self._openai_client
 
     @property

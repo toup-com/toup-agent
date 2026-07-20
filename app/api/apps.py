@@ -208,6 +208,14 @@ def _job_to_response(job: BuildJob) -> JobResponse:
     except (json.JSONDecodeError, TypeError):
         pass
 
+    # Alias the real model id to a neutral tier label on this user-facing job
+    # card (docs/security/audit-2026.md MI-2). Flag-gated (default off).
+    _job_model = job.model or ""
+    from app.config import settings as _settings
+    if _settings.security_leak_filter and _job_model:
+        from app.services.model_alias import public_model_label
+        _job_model = public_model_label(_job_model)
+
     return JobResponse(
         id=job.id,
         app_id=job.app_id,
@@ -216,7 +224,7 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         prompt=job.prompt,
         status=job.status,
         steps=steps,
-        model=job.model or "",
+        model=_job_model,
         total_tokens=job.total_tokens or 0,
         error_message=job.error_message,
         paused_at=job.paused_at.isoformat() if getattr(job, 'paused_at', None) else None,

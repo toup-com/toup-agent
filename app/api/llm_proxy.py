@@ -703,7 +703,10 @@ async def proxy_chat(
     # show the real provider model (e.g. "claude-opus-4-1-20250805") instead
     # of the Toup-internal alias (e.g. "claude-opus-4-7"). Read by the agent's
     # response handler from the response headers.
-    resolved_model_header = {"x-toup-resolved-model": model}
+    # NOTE: this header currently has no client consumer (dead metadata) and
+    # is a model-identity leak source; when security_leak_filter is on we drop
+    # it (docs/security/audit-2026.md MI-4). Default off = unchanged.
+    resolved_model_header = {} if settings.security_leak_filter else {"x-toup-resolved-model": model}
 
     backend, api_key = _route_chat(model, config)
 
@@ -785,6 +788,9 @@ async def proxy_chat(
                 detail = e.body.decode("utf-8", errors="replace")
             except Exception:
                 detail = str(e.body)
+            if settings.security_leak_filter:
+                from app.services.model_alias import scrub_provider_names
+                detail = scrub_provider_names(detail)
             raise HTTPException(e.status, detail=detail)
         except StopAsyncIteration:
             first_chunk = b""
@@ -846,6 +852,9 @@ async def proxy_chat(
                 detail = body_bytes.decode("utf-8", errors="replace")
             except Exception:
                 detail = str(body_bytes)
+            if settings.security_leak_filter:
+                from app.services.model_alias import scrub_provider_names
+                detail = scrub_provider_names(detail)
             raise HTTPException(resp.status_code, detail=detail)
 
         latency = int((time.time() - start_ts) * 1000)
@@ -902,6 +911,18 @@ async def proxy_openai_chat_completions(
 ):
     """OpenAI SDK compatibility shim — body is already in OpenAI format."""
     return await proxy_chat(request, db)
+
+
+@router.post("/openai/v1/embeddings")
+async def proxy_openai_embeddings(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """OpenAI SDK compatibility shim for embeddings — lets the agent's
+    embedding service set base_url=.../llm/openai/v1 and auth with TOUP_TOKEN,
+    so NO OpenAI key needs to live in the container (hardening-runbook Step 1).
+    Inert until settings.embeddings_via_proxy is enabled."""
+    return await proxy_embeddings(request, db)
 
 
 @router.post("/embeddings")

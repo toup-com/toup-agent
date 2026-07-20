@@ -396,6 +396,30 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         f"- The current date and time is {now_str}."
     )
 
+    # 3b. Identity anchor — voice parity with the text channel.
+    # Without this the Realtime model (gpt-4o-realtime) falls back to its
+    # baked-in self-identity and answers "I'm GPT-4o by OpenAI" when asked
+    # what it is — breaking the white-label story on the one always-on
+    # channel that had NO such guard (docs/security/audit-2026.md MI-1).
+    # Mirrors agent_runner.py identity_anchor. Flag-gated (default on): it
+    # only ADDS a guardrail, so nothing a user relies on changes.
+    if settings.voice_identity_anchor:
+        sections.append(
+            "# Who you are (identity)\n"
+            "You are the user's own personal agent on Toup. Toup is the "
+            "platform you run on (toup.ai), not your name.\n"
+            "You are NOT Claude, NOT GPT, NOT Sonnet, NOT Opus, NOT any "
+            "specific provider model. If the user asks what model you are, "
+            "who built you, what powers you, or what technology/stack Toup "
+            "is built with, answer as their agent — never name the "
+            "underlying LLM provider or version, and don't disclose the "
+            "underlying tech stack (it's proprietary). The provider may "
+            "change without notice; your identity to the user is stable.\n"
+            "(If the user asks who FOUNDED or owns Toup — the company — that "
+            "is a separate, allowed question; answer it if you know. This "
+            "guard is only about the underlying model/technology.)"
+        )
+
     # 4. Onboarding mode — agent's first conversation to learn about the user
     if onboarding:
         sections.append(
@@ -474,15 +498,27 @@ async def _authenticate_ws(token: str) -> Optional[str]:
 
 
 async def _get_user_openai_key(user_id: str) -> Optional[str]:
-    """Retrieve the user's stored OpenAI API key."""
+    """Return the OpenAI key to use for this user's realtime voice session.
+
+    Fully-hosted model: users no longer supply their own provider key — the
+    platform provides the LLM. So we fall back to the platform's OpenAI key
+    (per-tenant bundle key if provisioned, else the platform master). This key
+    is used ONLY here on the PLATFORM side (the realtime WS proxy runs on the
+    platform, not in the tenant container), so it is never exposed to a
+    container. A legacy per-user key, if any, still wins.
+    """
     from app.db.database import async_session_maker
     from app.db import AgentConfig
 
     async with async_session_maker() as db:
         result = await db.execute(
-            select(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)
+            select(AgentConfig.openai_api_key, AgentConfig.bundle_openai_api_key)
+            .where(AgentConfig.user_id == user_id)
         )
-        return result.scalar_one_or_none()
+        row = result.first()
+    user_key = (row[0] if row else None) or None
+    bundle_key = (row[1] if row else None) or None
+    return user_key or bundle_key or settings.platform_openai_api_key or settings.openai_api_key or None
 
 
 # ── VPS helpers — all personal data lives on user's VPS, never platform ──
@@ -698,15 +734,11 @@ async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: 
             logger.info("[REALTIME] VPS not connected, skipping voice memory extraction")
             return
 
-        # Fetch the user's own OpenAI API key for LLM extraction (operational data, not personal)
-        user_api_key = None
-        from app.db.database import async_session_maker
-        from app.db import AgentConfig
-        async with async_session_maker() as db:
-            result = await db.execute(
-                select(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)
-            )
-            user_api_key = result.scalar_one_or_none()
+        # Key for LLM extraction (operational data, not personal). Under the
+        # fully-hosted model the user has no key of their own, so reuse the
+        # realtime key resolver which falls back to the platform key — else
+        # voice memory extraction silently no-ops for every hosted user.
+        user_api_key = await _get_user_openai_key(user_id)
 
         extractor = get_memory_extractor()
         extracted = await extractor.extract_memories_with_llm(
@@ -821,7 +853,7 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
             chunks = []
             async for event in svc.create_message_stream(
                 messages=context_messages,
-                system="You are a powerful reasoning assistant. Answer thoroughly and accurately. Be concise enough for a voice response.",
+                system="You are a powerful reasoning assistant. Answer thoroughly and accurately. Be concise enough for a voice response. Never state or hint at which underlying AI model or provider you are, or Toup's tech stack; refer to yourself only as the user's agent.",
                 tools=[],
                 model=model_override,
             ):
@@ -843,7 +875,7 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
                     json={
                         "model": model_override,
                         "messages": [
-                            {"role": "system", "content": "You are a reasoning assistant. Answer accurately and concisely for a voice response."},
+                            {"role": "system", "content": "You are a reasoning assistant. Answer accurately and concisely for a voice response. Never state or hint at which underlying AI model or provider you are, or Toup's tech stack; refer to yourself only as the user's agent."},
                             {"role": "user", "content": task},
                         ],
                         "max_tokens": 2048,

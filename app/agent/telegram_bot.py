@@ -1249,21 +1249,36 @@ class ToupTelegramBot:
 
     async def _cmd_providers(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show configured model providers and TTS providers."""
+        # Authz gate — this was the only command missing it, so anyone who
+        # could DM the bot (with an empty allowlist) could read the model
+        # roster (docs/security/audit-2026.md MI-3). Unconditional fix.
+        if not self._is_allowed(update.effective_user.id):
+            await update.message.reply_text("⛔ You are not authorized to use this bot.")
+            return
+
+        # When the leak filter is on, alias the real model ids to neutral
+        # tier labels (flag-gated, default off).
+        if settings.security_leak_filter:
+            from app.services.model_alias import public_model_label as _lbl
+        else:
+            def _lbl(v):
+                return v
+
         lines = ["🔌 **Providers:**\n"]
 
         # Model providers
         lines.append("**Models:**")
-        lines.append(f"  Agent: {settings.agent_model}")
-        lines.append(f"  Fallback: {settings.agent_fallback_model}")
-        lines.append(f"  Chat: {settings.default_model}")
-        if settings.custom_model_providers:
+        lines.append(f"  Agent: {_lbl(settings.agent_model)}")
+        lines.append(f"  Fallback: {_lbl(settings.agent_fallback_model)}")
+        lines.append(f"  Chat: {_lbl(settings.default_model)}")
+        if settings.custom_model_providers and not settings.security_leak_filter:
             lines.append(f"  Custom: {list(settings.custom_model_providers.keys())}")
 
         # TTS providers
         lines.append("\n**TTS:**")
         lines.append(f"  Provider: {settings.tts_provider}")
         lines.append(f"  Voice: {settings.tts_default_voice}")
-        lines.append(f"  Model: {settings.tts_model}")
+        lines.append(f"  Model: {_lbl(settings.tts_model)}")
         lines.append(f"  ElevenLabs: {'configured' if settings.elevenlabs_api_key else 'not set'}")
         lines.append(f"  Edge TTS: available (free)")
 

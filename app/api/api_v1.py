@@ -370,12 +370,22 @@ async def api_session_messages(
     )
     messages = list(reversed(result.scalars().all()))
 
+    # Alias the real model id before it leaves the API (docs/security/
+    # audit-2026.md MI-2). Flag-gated (default off).
+    from app.config import settings as _settings
+    _scrub = _settings.security_leak_filter
+    if _scrub:
+        from app.services.model_alias import public_model_label
+
+    def _mu(v):
+        return public_model_label(v) if (_scrub and v) else v
+
     return [
         MessageOut(
             role=m.role,
             content=m.content,
             created_at=m.created_at.isoformat(),
-            model_used=m.model_used,
+            model_used=_mu(m.model_used),
         )
         for m in messages
     ]

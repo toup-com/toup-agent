@@ -647,6 +647,14 @@ def _message_to_response(
             if isinstance(att, dict)
         ]
 
+    # Alias the real model id before it leaves the API (docs/security/
+    # audit-2026.md MI-2). Flag-gated (default off).
+    _model_used = message.model_used
+    from app.config import settings as _settings
+    if _settings.security_leak_filter and _model_used:
+        from app.services.model_alias import public_model_label
+        _model_used = public_model_label(_model_used)
+
     resp = dict(
         id=message.id,
         role=message.role,
@@ -654,7 +662,7 @@ def _message_to_response(
         created_at=message.created_at,
         tokens_prompt=message.tokens_prompt,
         tokens_completion=message.tokens_completion,
-        model_used=message.model_used,
+        model_used=_model_used,
         memories_retrieved=memories_retrieved,
         processing_time_ms=message.processing_time_ms,
         media=msg_metadata.get("media") if msg_metadata else None,
