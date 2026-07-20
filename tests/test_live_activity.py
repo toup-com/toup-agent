@@ -1365,3 +1365,44 @@ async def test_ack_ends_cards_and_suppresses_pending_rows(
         )).scalars().all()}
         assert rows["ack-c"] == NQ_SUPPRESSED
         assert rows["ack-n"] == NQ_QUEUED  # needs_input untouched
+
+
+@pytest.mark.asyncio
+async def test_active_missions_lists_started_only(
+    client, auth_headers, test_user_id,
+):
+    """The foreground-reconcile contract: exactly the user's STARTED
+    mission ids, nothing ended, nobody else's."""
+    from app.db import async_session_maker
+
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "cb" * 32, "environment": "development",
+              "install_id": "install-recon-1"},
+        headers=auth_headers,
+    )
+    async with async_session_maker() as db:
+        device_id = (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id,
+            mission_id="reminder:recon-live", device_id=device_id,
+            status=LA_STARTED, started_at=datetime.utcnow(),
+        ))
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id,
+            mission_id="reminder:recon-done", device_id=device_id,
+            status=LA_ENDED, started_at=datetime.utcnow(),
+            ended_at=datetime.utcnow(),
+        ))
+        await db.commit()
+
+    resp = await client.get(
+        "/api/devices/live-activity/active-missions", headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    missions = resp.json()["missions"]
+    assert "reminder:recon-live" in missions
+    assert "reminder:recon-done" not in missions

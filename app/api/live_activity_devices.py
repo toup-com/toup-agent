@@ -384,6 +384,29 @@ async def report_activity_token(
     return {"ok": True, "updated": 0, "adopted": True}
 
 
+@router.get("/active-missions")
+async def list_active_live_activity_missions(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Missions the platform believes have a live (started) card for
+    this user. The app's foreground reconcile ends any on-device
+    activity whose mission is absent here — the only authoritative
+    cleanup for a card whose end push APNs accepted but the device
+    never applied (shared-token routing)."""
+    missions = (
+        await db.execute(
+            select(LiveActivity.mission_id)
+            .where(
+                LiveActivity.user_id == current_user.id,
+                LiveActivity.status == LA_STARTED,
+            )
+            .distinct()
+        )
+    ).scalars().all()
+    return {"missions": list(missions)}
+
+
 class LiveActivityAck(BaseModel):
     mission_id: str = Field(..., min_length=1, max_length=64)
 
