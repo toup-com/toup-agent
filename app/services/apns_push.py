@@ -25,6 +25,7 @@ The whole payload (attributes + content-state) must stay under 4KB.
 from __future__ import annotations
 
 import base64
+import logging
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -32,6 +33,8 @@ import httpx
 import jwt as pyjwt
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 APNS_HOST_PRODUCTION = "https://api.push.apple.com"
 APNS_HOST_SANDBOX = "https://api.sandbox.push.apple.com"
@@ -112,16 +115,30 @@ async def send_live_activity(
     """
     host = APNS_HOST_SANDBOX if environment == "development" else APNS_HOST_PRODUCTION
     client = _client_for(host)
-    resp = await client.post(
-        f"/3/device/{token_hex}",
-        json=payload,
-        headers={
-            "authorization": f"bearer {_provider_jwt()}",
-            "apns-topic": f"{settings.apns_bundle_id}.push-type.liveactivity",
-            "apns-push-type": "liveactivity",
-            "apns-priority": str(priority),
-        },
-    )
+    try:
+        resp = await client.post(
+            f"/3/device/{token_hex}",
+            json=payload,
+            headers={
+                "authorization": f"bearer {_provider_jwt()}",
+                "apns-topic": f"{settings.apns_bundle_id}.push-type.liveactivity",
+                "apns-push-type": "liveactivity",
+                "apns-priority": str(priority),
+            },
+        )
+    except httpx.HTTPError as exc:
+        # Transport failure (timeout, GOAWAY, broken H2 stream…) must
+        # surface as a normal error verdict, never a raise — a raise
+        # here strands the queue row in 'sending' (2026-07-18: 8h of
+        # 10-min retry cycles). Evict the pooled client too: a wedged
+        # HTTP/2 connection otherwise fails every subsequent send.
+        _clients.pop(host, None)
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 — best-effort close
+            pass
+        logger.warning("APNs transport error on %s: %r", host, exc)
+        return 599, f"transport:{type(exc).__name__}"
     reason = ""
     if resp.status_code != 200:
         try:
@@ -187,6 +204,7 @@ def build_start_payload(
     deep_link: str = "toup://mission-control",
     timer_type: Optional[str] = None,
     orb_color: Optional[str] = None,
+    stale_date: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Push-to-start payload. ``attributes.name`` carries the mission id —
     the app's onTokenReceived listener echoes it back so a reported
@@ -231,6 +249,11 @@ def build_start_payload(
     if _valid_hex_color(orb_color):
         aps["attributes"]["orbColor"] = orb_color
         aps["attributes"]["progressViewTint"] = orb_color
+    # Zombie-card backstop: if every follow-up push is lost, the card
+    # self-marks stale (widget dims it) instead of looking live at
+    # 0:00 for hours (founder incident 2026-07-18). Updates refresh it.
+    if stale_date:
+        aps["stale-date"] = int(stale_date)
     alert = _alert(alert_title, alert_body)
     if alert is None:
         # iOS 26 REJECTS start events with no alert configuration —

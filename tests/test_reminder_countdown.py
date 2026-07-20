@@ -150,7 +150,10 @@ async def test_silent_countdown_start_no_banner_timer_and_digital_island(monkeyp
     assert aps["content-state"]["timerEndDateInMilliseconds"] == timer_ms
     assert aps["content-state"]["subtitle"] == "Time to stretch"
     assert aps["attributes"]["timerType"] == "digital"
-    assert aps["attributes"]["deepLinkUrl"] == "toup://chat"
+    # The mission id rides the tap URL so the app can ack the tap.
+    assert aps["attributes"]["deepLinkUrl"] == "toup://chat?mission=reminder:r-1"
+    # Zombie backstop: the card self-marks stale 2 min after fire time.
+    assert aps["stale-date"] == int(timer_ms / 1000) + 120
 
 
 # ── LA lane: fire flips the same-mission card ─────────────────────

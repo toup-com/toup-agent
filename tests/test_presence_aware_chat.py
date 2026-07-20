@@ -112,6 +112,8 @@ def test_ws_chat_emits_status_frames():
     from app.api import ws_chat
 
     src = inspect.getsource(ws_chat)
-    assert '{"type": "status", "stage": "received"}' in src
+    # Since #287 the frame also carries the turn's mission_id — pin the
+    # protocol keys, not the exact literal.
+    assert '"type": "status", "stage": "received"' in src
     assert 'async def on_status' in src
     assert 'on_status=on_status' in src

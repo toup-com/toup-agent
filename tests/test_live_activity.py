@@ -14,14 +14,16 @@ here breaks phones in the field silently — these tests are the tripwire.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 
 from app.config import settings
 from app.db.models import (
     LA_ENDED, LA_STARTED, LiveActivity, LiveActivityDevice,
-    NotificationQueue, User, NQ_QUEUED, NQ_SENT, NQ_SUPPRESSED,
+    NotificationQueue, User, NQ_QUEUED, NQ_SENDING, NQ_SENT,
+    NQ_SUPPRESSED, NQ_FAILED,
 )
 from app.services import apns_push
 from app.services import live_activity_service as las
@@ -1160,3 +1162,206 @@ async def test_dead_on_both_hosts_still_revokes(monkeypatch):
     async with async_session_maker() as db:
         device = await db.get(LiveActivityDevice, device_id)
         assert device.revoked_at is not None
+
+
+# ── P3 lifecycle: attempts cap, exception containment, ack, wedge ──
+
+
+@pytest.mark.asyncio
+async def test_requeue_stuck_fails_rows_at_the_attempts_cap(monkeypatch):
+    """The 2026-07-18 incident class: a row whose every attempt raises
+    never completes a dispatch, so the in-dispatch cap checks never
+    run. _requeue_stuck must fail such rows at the cap instead of
+    resurrecting them every 10 minutes forever (attempts=48 over 8h)."""
+    from app.db import async_session_maker
+
+    user_id = await _mk_user()
+    stale_claim = datetime.utcnow() - timedelta(minutes=30)
+    capped_id = await _enqueue(
+        user_id, status=NQ_SENDING, attempts=settings.notification_max_attempts,
+        claimed_at=stale_claim,
+    )
+    fresh_id = await _enqueue(
+        user_id, status=NQ_SENDING, attempts=1, claimed_at=stale_claim,
+        idempotency_key=f"idem-fresh-{uuid.uuid4()}",
+    )
+
+    async with async_session_maker() as db:
+        await nd._requeue_stuck(db, datetime.utcnow())
+
+    async with async_session_maker() as db:
+        capped = await db.get(NotificationQueue, capped_id)
+        fresh = await db.get(NotificationQueue, fresh_id)
+        assert capped.status == NQ_FAILED
+        assert capped.last_error == "stuck_requeue_exhausted"
+        assert fresh.status == NQ_QUEUED  # under the cap: normal requeue
+
+
+@pytest.mark.asyncio
+async def test_dispatch_exception_requeues_row_with_recorded_error(monkeypatch):
+    """An exception mid-dispatch must not strand the row in 'sending'
+    with a NULL last_error — it re-queues on the normal backoff with
+    the exception recorded, so the cap applies and the incident is
+    readable off the row."""
+    from app.db import async_session_maker
+
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+    row_id = await _enqueue(user_id)  # kind=progress → LA lane runs first
+
+    async def boom(db, row, now):
+        raise RuntimeError("simulated wedge")
+
+    monkeypatch.setattr(nd.live_activity_service, "handle_notification_row", boom)
+    monkeypatch.setattr(settings, "notification_dispatch_enabled", True)
+
+    stats = await nd.run_notification_dispatch()
+    assert stats.get("errored") == 1
+
+    async with async_session_maker() as db:
+        row = await db.get(NotificationQueue, row_id)
+        assert row.status == NQ_QUEUED
+        assert row.last_error.startswith("dispatch_exception: RuntimeError")
+        assert row.scheduled_for is not None  # backoff applied
+
+
+@pytest.mark.asyncio
+async def test_chatturn_rows_swept_after_30_minutes():
+    """A chatturn row still 'started' after 30 min is a wedge (turns
+    live minutes; local cards carry a 10-min staleDate) — the sweep
+    must end it long before Apple's 8h cap, without touching younger
+    turn rows or ordinary missions."""
+    from app.db import async_session_maker
+    from app.services.live_activity_service import sweep_stale_activities
+
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    old = datetime.utcnow() - timedelta(minutes=31)
+    await _mk_started_rows(user_id, device_id, ("chatturn:aged00000001",),
+                           started_at=old)
+    await _mk_started_rows(user_id, device_id, ("m-long-mission",),
+                           started_at=old)
+    await _mk_started_rows(user_id, device_id, ("chatturn:fresh0000001",))
+
+    async with async_session_maker() as db:
+        swept = await sweep_stale_activities(db, datetime.utcnow(), user_id=user_id)
+    assert swept == 1
+
+    async with async_session_maker() as db:
+        rows = {r.mission_id: r.status for r in (await db.execute(
+            select(LiveActivity).where(LiveActivity.user_id == user_id)
+        )).scalars().all()}
+    assert rows["chatturn:aged00000001"] == LA_ENDED
+    assert rows["m-long-mission"] == LA_STARTED  # 8h rule untouched
+    assert rows["chatturn:fresh0000001"] == LA_STARTED
+
+
+@pytest.mark.asyncio
+async def test_activity_token_does_not_revive_ended_turn(
+    client, auth_headers, test_user_id,
+):
+    """The 8h-wedge shape: the platform already ENDED the turn, then
+    the app's token report arrives. The token is stored (post-hoc ack
+    pushes can still reach the card) but the row must NOT be revived —
+    nothing ever ends a revived row for a finished turn."""
+    from app.db import async_session_maker
+
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "c9" * 32, "environment": "development",
+              "install_id": "install-wedge-1"},
+        headers=auth_headers,
+    )
+    turn = "chatturn:wedge0000001"
+    async with async_session_maker() as db:
+        device_id = (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id, mission_id=turn,
+            device_id=device_id, status=LA_ENDED,
+            started_at=datetime.utcnow(), ended_at=datetime.utcnow(),
+        ))
+        await db.commit()
+
+    resp = await client.post(
+        "/api/devices/live-activity/activity-token",
+        json={"mission_id": turn, "activity_push_token": "df" * 32,
+              "source": "local_start"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("already_ended") is True
+
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == turn)
+        )).scalars().one()
+        assert la.status == LA_ENDED  # NOT revived
+        assert la.activity_push_token == "df" * 32  # token stored
+
+
+@pytest.mark.asyncio
+async def test_ack_ends_cards_and_suppresses_pending_rows(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """Tap-ack: ends the mission's cards (push + DB) and suppresses its
+    pending completed/progress rows; needs_input stays — seen is not
+    answered."""
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "ca" * 32, "environment": "development",
+              "install_id": "install-ack-1"},
+        headers=auth_headers,
+    )
+    mission = "reminder:ack00000001"
+    async with async_session_maker() as db:
+        device_id = (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id, mission_id=mission,
+            device_id=device_id, status=LA_STARTED,
+            started_at=datetime.utcnow(),
+        ))
+        for kind, idem in (("mission_completed", "ack-c"), ("needs_input", "ack-n")):
+            db.add(NotificationQueue(
+                id=str(uuid.uuid4()), user_id=test_user_id, source="agent",
+                event_kind=kind, title="t", priority="high",
+                idempotency_key=idem, status=NQ_QUEUED,
+                created_at=datetime.utcnow(),
+                data_json={"mission_id": mission},
+            ))
+        await db.commit()
+
+    resp = await client.post(
+        "/api/devices/live-activity/ack",
+        json={"mission_id": mission},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ended"] == 1
+    assert body["suppressed"] == 1
+    # The end push is immediate-dismissal, bannerless.
+    assert sent[-1]["payload"]["aps"]["event"] == "end"
+    assert "alert" not in sent[-1]["payload"]["aps"]
+
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_ENDED
+        rows = {r.idempotency_key: r.status for r in (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.user_id == test_user_id)
+        )).scalars().all()}
+        assert rows["ack-c"] == NQ_SUPPRESSED
+        assert rows["ack-n"] == NQ_QUEUED  # needs_input untouched

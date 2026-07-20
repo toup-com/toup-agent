@@ -37,8 +37,11 @@ from app.api.auth import get_current_user
 from app.db import get_db
 from app.db.models import (
     KNOWN_APNS_ENVIRONMENTS, LA_ENDED, LA_STARTED,
-    LiveActivity, LiveActivityDevice,
+    LiveActivity, LiveActivityDevice, NotificationQueue,
+    NOTIFY_KIND_MISSION_COMPLETED, NOTIFY_KIND_MISSION_FAILED,
+    NOTIFY_KIND_PROGRESS, NQ_QUEUED, NQ_SENDING, NQ_SUPPRESSED,
 )
+from app.services import apns_push
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +340,17 @@ async def report_activity_token(
             LiveActivity.mission_id == body.mission_id,
         )
     )).scalar_one_or_none()
+    if existing is not None and existing.status == LA_ENDED:
+        # The turn ALREADY completed — the platform end beat the token
+        # report. Store the token (a later ack/cleanup push can still
+        # reach the card) but do NOT revive: nothing ever ends a
+        # revived row for a finished turn, and it squats the
+        # one-started-per-device slot until the GC (2026-07-18: 8h
+        # wedge that every reminder-fire attempt fought).
+        existing.activity_push_token = body.activity_push_token
+        existing.updated_at = now
+        await db.commit()
+        return {"ok": True, "updated": 0, "already_ended": True}
     if existing is not None:
         existing.status = LA_STARTED
         existing.activity_push_token = body.activity_push_token
@@ -368,6 +382,89 @@ async def report_activity_token(
         body.mission_id, device.id, body.source or "unspecified",
     )
     return {"ok": True, "updated": 0, "adopted": True}
+
+
+class LiveActivityAck(BaseModel):
+    mission_id: str = Field(..., min_length=1, max_length=64)
+
+
+@router.post("/ack")
+async def ack_live_activity(
+    body: LiveActivityAck,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Tap acknowledgment: the user tapped this mission's card (deep
+    links carry ``?mission=<id>``), which proves the alert was SEEN.
+    End the mission's cards on every device (immediate dismissal) and
+    suppress its still-pending completed/failed/progress queue rows so
+    an already-seen mission never re-alerts. needs_input/needs_approval
+    rows are deliberately NOT suppressed — seen is not answered."""
+    user_id = current_user.id
+    now = datetime.utcnow()
+
+    rows = (
+        await db.execute(
+            select(LiveActivity, LiveActivityDevice)
+            .join(LiveActivityDevice, LiveActivity.device_id == LiveActivityDevice.id)
+            .where(
+                LiveActivity.user_id == user_id,
+                LiveActivity.mission_id == body.mission_id,
+                LiveActivity.status == LA_STARTED,
+            )
+        )
+    ).all()
+    ended = 0
+    for la, device in rows:
+        token = la.activity_push_token or device.push_to_start_token
+        if token and apns_push.apns_configured():
+            payload = apns_push.build_end_payload(
+                title="Done",
+                dismissal_date=int(now.timestamp()) - 1,
+                timestamp=int(now.timestamp()),
+            )
+            # Best-effort: the DB end below is the invariant; the push
+            # just clears the on-screen card faster than staleness.
+            await apns_push.send_live_activity(
+                token, payload,
+                environment=device.apns_environment or "development",
+                priority=10,
+            )
+        la.status = LA_ENDED
+        la.ended_at = now
+        la.updated_at = now
+        ended += 1
+
+    pending = (
+        await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.user_id == user_id,
+                NotificationQueue.status.in_([NQ_QUEUED, NQ_SENDING]),
+                NotificationQueue.event_kind.in_([
+                    NOTIFY_KIND_MISSION_COMPLETED,
+                    NOTIFY_KIND_MISSION_FAILED,
+                    NOTIFY_KIND_PROGRESS,
+                ]),
+            )
+        )
+    ).scalars().all()
+    suppressed = 0
+    for row in pending:
+        if (row.data_json or {}).get("mission_id") != body.mission_id:
+            continue
+        row.status = NQ_SUPPRESSED
+        row.claimed_at = None
+        row.channels_json = {**(row.channels_json or {}),
+                             "policy": {"suppressed": "acked"}}
+        suppressed += 1
+
+    await db.commit()
+    if ended or suppressed:
+        logger.info(
+            "live-activity ack: mission %s — ended %d cards, suppressed %d rows",
+            body.mission_id, ended, suppressed,
+        )
+    return {"ok": True, "ended": ended, "suppressed": suppressed}
 
 
 @router.post("/unregister")

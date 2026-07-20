@@ -105,6 +105,10 @@ def live_activity_ready() -> bool:
 # counting against the one-activity-per-device invariant forever.
 _STALE_ACTIVITY_MAX_AGE = timedelta(hours=8)
 
+# Chat turns are minutes-long; their cards carry a 10-minute local
+# staleDate. A chatturn row still started after this is a wedge.
+_TURN_ACTIVITY_MAX_AGE = timedelta(minutes=30)
+
 
 async def sweep_stale_activities(
     db, now: datetime, user_id: Optional[str] = None,
@@ -127,10 +131,28 @@ async def sweep_stale_activities(
         stmt = stmt.where(LiveActivity.user_id == user_id)
     result = await db.execute(stmt)
     swept = result.rowcount or 0
+    # Chat-turn rows age out far sooner: a turn lives minutes and its
+    # local card carries a 10-min staleDate — a chatturn row still
+    # 'started' after 30 min is a wedge (2026-07-18: an adopted row
+    # for an already-answered turn squatted the one-per-device slot
+    # for 8h and every reminder fire fought it).
+    turn_stmt = (
+        update(LiveActivity)
+        .where(
+            LiveActivity.status == LA_STARTED,
+            LiveActivity.mission_id.like("chatturn:%"),
+            LiveActivity.started_at < now - _TURN_ACTIVITY_MAX_AGE,
+        )
+        .values(status=LA_ENDED, ended_at=now, updated_at=now)
+    )
+    if user_id is not None:
+        turn_stmt = turn_stmt.where(LiveActivity.user_id == user_id)
+    turn_result = await db.execute(turn_stmt)
+    swept += turn_result.rowcount or 0
     if swept:
         await db.commit()
         logger.info(
-            "live-activity GC: ended %d stale (>8h) started rows%s",
+            "live-activity GC: ended %d stale started rows%s",
             swept, f" for user {user_id[:8]}" if user_id else "",
         )
     return swept
@@ -337,8 +359,20 @@ async def _send_start(
     progress = _progress_fraction(row)
     data = row.data_json or {}
     # Card-tap target: chat turns land in the conversation where the
-    # answer lives; everything else keeps Mission Control.
-    deep_link = "toup://chat" if data.get("route") == "chat" else "toup://mission-control"
+    # answer lives; everything else keeps Mission Control. The mission
+    # id rides as a query param so the app can ACK the tap (end the
+    # card everywhere + stop re-alerts for this mission).
+    base_link = "toup://chat" if data.get("route") == "chat" else "toup://mission-control"
+    deep_link = f"{base_link}?mission={mission_id}"
+    # Stale backstop: a countdown card goes visually stale 2 minutes
+    # after its timer fires; a non-timer card after 30 minutes with no
+    # update. Progress updates refresh the horizon — only a card whose
+    # pushes are LOST can ever dim.
+    timer_ms = _timer_end_ms(row)
+    stale_ts = (
+        int(timer_ms / 1000) + 120 if timer_ms
+        else int(now.timestamp()) + 1800
+    )
     # Producer subtitle override (e.g. reminder countdowns carry the
     # reminder text); non-silent starts keep the legacy 'Starting…'.
     subtitle_override = data.get("subtitle") if isinstance(data.get("subtitle"), str) else None
@@ -349,13 +383,14 @@ async def _send_start(
         subtitle=(row.body or "Working…")[:120] if silent
                  else (subtitle_override or "Starting…")[:120],
         progress=progress if progress is not None else 0.0,
-        timer_end_ms=_timer_end_ms(row),
+        timer_end_ms=timer_ms,
         alert_title=None if silent else row.title,
         alert_body=None if silent else row.body,
         timestamp=int(now.timestamp()),
         deep_link=deep_link,
         timer_type=timer_type if timer_type in ("circular", "digital") else None,
         orb_color=await _user_orb_color(db, row.user_id),
+        stale_date=stale_ts,
     )
     status, reason, _env = await _send_with_env_selfheal(
         db, device, device.push_to_start_token, payload, priority=10,
@@ -580,6 +615,7 @@ async def handle_notification_row(
             payload = apns_push.build_update_payload(
                 title=title, subtitle=headline, progress=effective,
                 timer_end_ms=_timer_end_ms(row),
+                stale_date=int(now.timestamp()) + 1800,
                 timestamp=int(now.timestamp()),
             )
             result = await _send_to_activity(
@@ -637,7 +673,10 @@ async def handle_notification_row(
                 # rather than closing the card silently.
                 alert_title=None if (_silent_end or alerted) else row.title,
                 alert_body=None if (_silent_end or alerted) else row.body,
-                dismissal_date=_dismissal_date(row, now),
+                # Producer override, else 1h — a finished card must
+                # never linger the full system default 4h.
+                dismissal_date=_dismissal_date(row, now)
+                or int(now.timestamp()) + 3600,
                 timestamp=int(now.timestamp()),
             )
             result = await _send_to_activity(
@@ -663,7 +702,18 @@ async def handle_notification_row(
         per_device[device.id] = result
         delivered = delivered or result["status"] == "ok"
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Same replica race as the start/restart commit sites — roll
+        # back and let the queue row retry on the normal backoff. A
+        # bare raise here strands the row in 'sending' (2026-07-18).
+        await db.rollback()
+        logger.info(
+            "live-activity update/end lost replica race for mission %s", mission_id,
+        )
+        return {"status": "error", "delivered": False,
+                "reason": "device_started_race", "devices": per_device}
     frag: Dict[str, Any] = {"status": "ok" if delivered else "error",
                             "delivered": delivered, "devices": per_device}
     if restarted:

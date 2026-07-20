@@ -240,7 +240,21 @@ async def _cas_status(
 
 async def _requeue_stuck(db, now: datetime) -> int:
     """Rows claimed by a dispatcher that died mid-send. Re-queue —
-    at-least-once by contract."""
+    at-least-once by contract, but NEVER past the attempts cap: a row
+    whose every attempt dies in an exception completes no dispatch, so
+    the in-dispatch cap checks never run — pre-fix, such a row cycled
+    sending→stuck→queued every 10 minutes forever (founder incident
+    2026-07-18: a reminder fire hit attempts=48 over 8h and delivered
+    its alarm at 01:40 in the morning)."""
+    capped = await db.execute(
+        update(NotificationQueue)
+        .where(
+            NotificationQueue.status.in_([NQ_QUEUED, NQ_SENDING, NQ_CHECKING_RECEIPT]),
+            NotificationQueue.attempts >= settings.notification_max_attempts,
+        )
+        .values(status=NQ_FAILED, claimed_at=None,
+                last_error="stuck_requeue_exhausted")
+    )
     cutoff = now - _STUCK_CLAIM_MAX_AGE
     result = await db.execute(
         update(NotificationQueue)
@@ -252,6 +266,11 @@ async def _requeue_stuck(db, now: datetime) -> int:
         .values(status=NQ_QUEUED, claimed_at=None)
     )
     await db.commit()
+    if capped.rowcount:
+        logger.warning(
+            "notification dispatch: failed %d rows at the attempts cap",
+            capped.rowcount,
+        )
     if result.rowcount:
         logger.warning("notification dispatch: re-queued %d stuck rows", result.rowcount)
     # Live Activity staleness GC for ALL users, mirrored from the
@@ -656,9 +675,37 @@ async def run_notification_dispatch() -> Dict[str, int]:
             try:
                 outcome = await _dispatch_row(db, row_id, now)
                 stats[outcome.split(":")[0]] = stats.get(outcome.split(":")[0], 0) + 1
-            except Exception:  # noqa: BLE001 — one bad row must not stall the batch
+            except Exception as exc:  # noqa: BLE001 — one bad row must not stall the batch
                 logger.exception("notification dispatch failed for row %s", row_id)
                 await db.rollback()
+                # An exception must not strand the row in 'sending'
+                # (pre-fix that meant a 10-min stuck-requeue loop with
+                # no cap and no recorded error). Requeue on the normal
+                # backoff — or fail at the cap — with the exception on
+                # last_error so the incident is readable off the row.
+                try:
+                    err = f"dispatch_exception: {exc!r}"[:200]
+                    row = await db.get(NotificationQueue, row_id)
+                    if row is not None and row.status == NQ_SENDING:
+                        if row.attempts >= settings.notification_max_attempts:
+                            await _cas_status(
+                                db, row_id, NQ_SENDING, NQ_FAILED, now,
+                                extra={"last_error": err, "claimed_at": None},
+                            )
+                        else:
+                            backoff = min(
+                                _RETRY_BACKOFF_BASE * (4 ** max(0, row.attempts - 1)),
+                                _RETRY_BACKOFF_CAP,
+                            )
+                            await _cas_status(
+                                db, row_id, NQ_SENDING, NQ_QUEUED, now,
+                                extra={"last_error": err, "claimed_at": None,
+                                       "scheduled_for": now + backoff},
+                            )
+                        stats["errored"] = stats.get("errored", 0) + 1
+                except Exception:  # noqa: BLE001
+                    logger.exception("failed to finalize errored row %s", row_id)
+                    await db.rollback()
     if stats["claimed"]:
         logger.info("notification dispatch: %s", stats)
     return stats
