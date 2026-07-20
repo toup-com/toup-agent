@@ -189,6 +189,16 @@ def _dismissal_date(row: NotificationQueue, now: datetime) -> Optional[int]:
     return None
 
 
+def _alert_sound(row: NotificationQueue) -> Optional[str]:
+    """Producer-chosen bundled alert sound (reminder fires pass
+    'toup_alarm.caf'); None keeps the system default. Bundled file
+    names only — path-ish values are dropped."""
+    raw = (row.data_json or {}).get("sound")
+    if isinstance(raw, str) and raw and "/" not in raw and len(raw) <= 64:
+        return raw
+    return None
+
+
 def _mission_title(row: NotificationQueue) -> str:
     title = (row.data_json or {}).get("mission_title")
     if isinstance(title, str) and title.strip():
@@ -386,6 +396,7 @@ async def _send_start(
         timer_end_ms=timer_ms,
         alert_title=None if silent else row.title,
         alert_body=None if silent else row.body,
+        alert_sound=None if silent else _alert_sound(row),
         timestamp=int(now.timestamp()),
         deep_link=deep_link,
         timer_type=timer_type if timer_type in ("circular", "digital") else None,
@@ -513,12 +524,24 @@ async def handle_notification_row(
         devices = await _active_devices(db, row.user_id)
         if not devices:
             return {"status": "skipped", "reason": "no_live_activity_devices"}
+        is_chat_turn = (row.data_json or {}).get("kind") == "chat_turn"
         for device in devices:
             started = await _started_rows_for_device(db, device.id)
             if any(la.mission_id == mission_id for la in started):
                 # at-least-once retry after a partial failure — a second
                 # start push would spawn a duplicate card on screen.
                 per_device[device.id] = {"status": "skipped", "reason": "already_started"}
+                continue
+            if is_chat_turn and any(
+                la.mission_id.startswith("reminder:") for la in started
+            ):
+                # REMINDER WINS (founder rule 2026-07-20): a working
+                # chat-turn card must never preempt a live countdown —
+                # the preempt end rides the shared token, routinely
+                # no-ops on-device, and the fire's restart then stacks
+                # a duplicate card. The answer still arrives as its
+                # own banner; only the ambient working card yields.
+                per_device[device.id] = {"status": "skipped", "reason": "yields_to_reminder"}
                 continue
             result = await _send_start(db, device, row, mission_id, now, silent=start_silent)
             per_device[device.id] = result
@@ -665,6 +688,7 @@ async def handle_notification_row(
                     title=title, subtitle=final_subtitle,
                     progress=final_progress,
                     alert_title=row.title, alert_body=row.body,
+                    alert_sound=_alert_sound(row),
                     timestamp=int(now.timestamp()),
                 )
                 upd_result = await _send_to_activity(
@@ -680,6 +704,7 @@ async def handle_notification_row(
                 # rather than closing the card silently.
                 alert_title=None if (_silent_end or alerted) else row.title,
                 alert_body=None if (_silent_end or alerted) else row.body,
+                alert_sound=None if (_silent_end or alerted) else _alert_sound(row),
                 # Producer override, else 1h — a finished card must
                 # never linger the full system default 4h.
                 dismissal_date=_dismissal_date(row, now)

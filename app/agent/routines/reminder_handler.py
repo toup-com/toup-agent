@@ -120,7 +120,15 @@ class ReminderHandler:
                     "subtitle": text[:120],
                     "urgent": True,
                     "cap_exempt": True,
-                    "dismiss_after_s": 900,
+                    # Short linger: a fired card that sits for 15 min
+                    # hogs the Dynamic Island and hides the NEXT
+                    # countdown (founder repro 2026-07-20) — 2 min is
+                    # plenty; the banner already alerted.
+                    "dismiss_after_s": 120,
+                    # A reminder is an alarm, not a ding — the app
+                    # bundles this alarm tone; unknown names fall back
+                    # to the system default sound.
+                    "sound": "toup_alarm.caf",
                     "no_agent_fallback": True,
                 },
                 priority="high",

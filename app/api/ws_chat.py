@@ -2078,7 +2078,8 @@ async def ws_chat(
                 # _turn_mission_id was minted up at the 'received' status
                 # frame — before the callbacks — so the status frames and
                 # the interim-progress emitter close over the same id.
-                _turn_flags = {"client_gone": False, "response_persisted": False}
+                _turn_flags = {"client_gone": False, "response_persisted": False,
+                               "finished": False}
 
                 # Interim Live Activity progress at tool boundaries.
                 # Emits on EVERY turn (Claude parity: the backgrounded
@@ -2435,31 +2436,43 @@ async def ws_chat(
                             "[WS] client left mid-turn (%s) — continuing headless",
                             user_id[:8],
                         )
-                        try:
-                            from app.services.agent_notify_client import notify
-                            await notify(
-                                event_kind="mission_started",
-                                title="Working on your answer",
-                                body=_user_text_preview or None,
-                                data={
-                                    "mission_id": _turn_mission_id,
-                                    "mission_title": _turn_title,
-                                    "subtitle": "Working on it…",
-                                    "route": "chat",
-                                    "kind": "chat_turn",
-                                    "urgent": True,
-                                    "timer_end_ms": int((time.time() + 120) * 1000),
-                                },
-                                priority="default",
-                                dedup_key=f"{_turn_mission_id}:started",
-                            )
-                        except Exception:  # noqa: BLE001 — best-effort card
-                            pass
-                        # The card may appear mid-turn after several tools
-                        # already ran — let the next tool boundary emit
-                        # progress immediately instead of waiting out the
-                        # throttle window.
-                        _turn_emitter.force_next()
+
+                        async def _delayed_working_card():
+                            # Grace window: quick turns (reminder arms,
+                            # short answers) finish inside it and never
+                            # spawn a working card — the user just gets
+                            # the answer/reminder banner (founder rule
+                            # 2026-07-20: no working-card noise; it
+                            # also kept preempting live countdowns).
+                            await asyncio.sleep(12)
+                            if _turn_flags["finished"]:
+                                return
+                            try:
+                                from app.services.agent_notify_client import notify
+                                await notify(
+                                    event_kind="mission_started",
+                                    title="Working on your answer",
+                                    body=_user_text_preview or None,
+                                    data={
+                                        "mission_id": _turn_mission_id,
+                                        "mission_title": _turn_title,
+                                        "subtitle": "Working on it…",
+                                        "route": "chat",
+                                        "kind": "chat_turn",
+                                        "urgent": True,
+                                        "timer_end_ms": int((time.time() + 120) * 1000),
+                                    },
+                                    priority="default",
+                                    dedup_key=f"{_turn_mission_id}:started",
+                                )
+                            except Exception:  # noqa: BLE001 — best-effort card
+                                return
+                            # The card appears mid-turn after several
+                            # tools already ran — let the next tool
+                            # boundary emit progress immediately.
+                            _turn_emitter.force_next()
+
+                        asyncio.create_task(_delayed_working_card())
 
                 stop_task = asyncio.create_task(_wait_for_stop())
 
@@ -2481,6 +2494,9 @@ async def ws_chat(
                     # The runner has saved the assistant Message by now —
                     # nothing after this point may re-save a partial.
                     _turn_flags["response_persisted"] = True
+                    # Cancels the delayed working card: a turn that
+                    # finished inside the grace window spawns none.
+                    _turn_flags["finished"] = True
                     stop_task.cancel()
                     try:
                         await stop_task  # Wait for stop task to actually finish
@@ -2634,7 +2650,9 @@ async def ws_chat(
                             "urgent": True,
                             "cap_exempt": True,
                             "progress": 100,
-                            "dismiss_after_s": 900,
+                            # 5 min, not 15 — a lingering finished card
+                            # hogs the island and hides live countdowns.
+                            "dismiss_after_s": 300,
                         }
                         if response.session_id:
                             _answer_data["session_id"] = response.session_id
@@ -2699,6 +2717,7 @@ async def ws_chat(
                         except Exception:
                             pass
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
+                    _turn_flags["finished"] = True
                     # Tell a gone client's phone the turn died — the
                     # 'working' card must not sit there forever.
                     if _turn_flags["client_gone"]:

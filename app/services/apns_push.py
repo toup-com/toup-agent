@@ -182,10 +182,19 @@ def _valid_hex_color(value: Optional[str]) -> bool:
     return True
 
 
-def _alert(alert_title: Optional[str], alert_body: Optional[str]) -> Optional[Dict[str, Any]]:
+def _alert(
+    alert_title: Optional[str], alert_body: Optional[str],
+    sound: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """``sound``: a bundled file name ('toup_alarm.caf') for alarm-class
+    alerts (reminder fires); anything falsy keeps the system default.
+    iOS silently falls back to default when the file is missing."""
     if not alert_title:
         return None
-    alert: Dict[str, Any] = {"title": alert_title[:120], "sound": "default"}
+    alert: Dict[str, Any] = {
+        "title": alert_title[:120],
+        "sound": (sound or "default")[:64],
+    }
     if alert_body:
         alert["body"] = alert_body[:400]
     return alert
@@ -200,6 +209,7 @@ def build_start_payload(
     timer_end_ms: Optional[int] = None,
     alert_title: Optional[str] = None,
     alert_body: Optional[str] = None,
+    alert_sound: Optional[str] = None,
     timestamp: Optional[int] = None,
     deep_link: str = "toup://mission-control",
     timer_type: Optional[str] = None,
@@ -254,7 +264,7 @@ def build_start_payload(
     # 0:00 for hours (founder incident 2026-07-18). Updates refresh it.
     if stale_date:
         aps["stale-date"] = int(stale_date)
-    alert = _alert(alert_title, alert_body)
+    alert = _alert(alert_title, alert_body, alert_sound)
     if alert is None:
         # iOS 26 REJECTS start events with no alert configuration —
         # liveactivitiesd publishes the activity, then SessionCore logs
@@ -279,6 +289,7 @@ def build_update_payload(
     timer_end_ms: Optional[int] = None,
     alert_title: Optional[str] = None,
     alert_body: Optional[str] = None,
+    alert_sound: Optional[str] = None,
     stale_date: Optional[int] = None,
     timestamp: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -289,7 +300,7 @@ def build_update_payload(
     }
     if stale_date:
         aps["stale-date"] = int(stale_date)
-    alert = _alert(alert_title, alert_body)
+    alert = _alert(alert_title, alert_body, alert_sound)
     if alert:
         aps["alert"] = alert
     return {"aps": aps}
@@ -302,6 +313,7 @@ def build_end_payload(
     progress: Optional[float] = None,
     alert_title: Optional[str] = None,
     alert_body: Optional[str] = None,
+    alert_sound: Optional[str] = None,
     dismissal_date: Optional[int] = None,
     timestamp: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -314,7 +326,7 @@ def build_end_payload(
     }
     if dismissal_date:
         aps["dismissal-date"] = int(dismissal_date)
-    alert = _alert(alert_title, alert_body)
+    alert = _alert(alert_title, alert_body, alert_sound)
     if alert:
         aps["alert"] = alert
     return {"aps": aps}

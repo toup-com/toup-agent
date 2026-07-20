@@ -575,7 +575,10 @@ async def test_reminder_fire_notifies_now_alert(notify_calls):
     assert data["urgent"] is True
     assert data["cap_exempt"] is True
     assert data["no_agent_fallback"] is True
-    assert data["dismiss_after_s"] == 900
+    # Short linger (island hogging, founder repro 2026-07-20) and the
+    # bundled alarm tone — a reminder is an alarm, not a ding.
+    assert data["dismiss_after_s"] == 120
+    assert data["sound"] == "toup_alarm.caf"
 
 
 @pytest.mark.asyncio
@@ -625,3 +628,72 @@ def test_countdown_payloads_pass_ingest_validation():
         priority="high", dedup_key=f"reminder:{rid}:fire:run-1",
     )
     assert fired.data["subtitle"] == "Time to stretch"
+
+
+@pytest.mark.asyncio
+async def test_fire_alert_carries_alarm_sound(monkeypatch):
+    """The audible surface plays the bundled alarm tone, not the
+    default ding, when the producer asks for it (data.sound)."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started", title="⏰ Stretch",
+        body="Time to stretch", priority="default",
+        data_json={"mission_id": "reminder:r-8", "silent": True,
+                   "kind": "reminder", "urgent": True,
+                   "timer_end_ms": int((datetime.utcnow().timestamp() + 120) * 1000)},
+    ))
+    sent.clear()
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id,
+        data_json={"mission_id": "reminder:r-8", "mission_title": "⏰ Stretch",
+                   "kind": "reminder", "route": "chat",
+                   "subtitle": "Time to stretch", "urgent": True,
+                   "sound": "toup_alarm.caf", "dismiss_after_s": 120,
+                   "no_agent_fallback": True},
+    ))
+    assert result == "sent"
+    upd = sent[0]["payload"]["aps"]
+    assert upd["event"] == "update"
+    assert upd["alert"]["sound"] == "toup_alarm.caf"
+
+
+@pytest.mark.asyncio
+async def test_chat_turn_start_yields_to_live_countdown(monkeypatch):
+    """REMINDER WINS: a working chat-turn card must not preempt a live
+    countdown (the preempt end no-ops on-device over the shared token
+    and the fire's restart then stacks a duplicate — founder repro
+    2026-07-18 and again 2026-07-20)."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started", title="⏰ Stretch",
+        body="Time to stretch", priority="default",
+        data_json={"mission_id": "reminder:r-10", "silent": True,
+                   "kind": "reminder", "urgent": True,
+                   "timer_end_ms": int((datetime.utcnow().timestamp() + 120) * 1000)},
+    ))
+    sent.clear()
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started", title="Working on your answer",
+        body="Remind me to stretch", priority="default",
+        data_json={"mission_id": "chatturn:deadbeef0001",
+                   "mission_title": "Remind me to stretch",
+                   "kind": "chat_turn", "route": "chat", "urgent": True},
+    ))
+    assert sent == []  # no start, no preempt push — countdown untouched
+    assert result == "suppressed:live_activity_unavailable"
+
+    from app.db import async_session_maker
+    from sqlalchemy import select
+    async with async_session_maker() as db:
+        rows = {r.mission_id: r.status for r in (await db.execute(
+            select(LiveActivity).where(LiveActivity.user_id == user_id)
+        )).scalars().all()}
+    assert rows == {"reminder:r-10": LA_STARTED}  # countdown still owns the device
