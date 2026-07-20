@@ -90,3 +90,28 @@ def scrub_provider_names(text: str | None) -> str:
     if not text:
         return text or ""
     return _PROVIDER_RE.sub("the model", text)
+
+
+# Infrastructure / stack tokens to neutralize in diagnostic text that reaches
+# the model (e.g. the `doctor` tool). These are the "how Toup is built" details
+# the identity anchor says are proprietary (docs/security/audit-2026.md MI-5).
+# Word-boundaried, case-insensitive; replaced with a neutral "[component]".
+_STACK_TOKENS = [
+    r"docker", r"fastapi", r"uvicorn", r"sqlalchemy", r"alembic", r"pydantic",
+    r"playwright", r"patchright", r"chromium", r"pgvector", r"postgresql",
+    r"postgres", r"sqlite", r"redis", r"nginx", r"caddy", r"railway",
+    r"supabase", r"baileys", r"libreoffice", r"hermes", r"expo",
+]
+_STACK_RE = re.compile(r"\b(?:" + "|".join(_STACK_TOKENS) + r")\b", re.IGNORECASE)
+
+
+def scrub_stack_terms(text: str | None) -> str:
+    """Neutralize infrastructure/stack names in free text with "[component]".
+
+    Companion to scrub_provider_names for diagnostic output (the `doctor`
+    tool) that would otherwise recite the architecture into model context.
+    Returns the input unchanged when empty.
+    """
+    if not text:
+        return text or ""
+    return _STACK_RE.sub("[component]", text)

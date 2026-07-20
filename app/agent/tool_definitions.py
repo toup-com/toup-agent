@@ -516,12 +516,13 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
-        # 11. Analyze image — GPT vision on URL or workspace file
+        # 11. Analyze image — vision on URL or workspace file
         # ------------------------------------------------------------------
         {
             "name": "analyze_image",
             "description": (
-                "Analyze an image using GPT vision. Accepts an image URL or a workspace file path. "
+                "Analyze an image (describe it, extract text/OCR, answer questions about it). "
+                "Accepts an image URL or a workspace file path. "
                 "Use when you need to describe, extract text (OCR), or answer questions about an image "
                 "that the user referenced by URL or that you downloaded/created."
             ),
@@ -541,13 +542,13 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
-        # 11b. Generate image — ChatGPT (gpt-image-1) text-to-image
+        # 11b. Generate image — text-to-image
         # ------------------------------------------------------------------
         {
             "name": "generate_image",
             "description": (
-                "Generate a brand-new image from a text prompt using ChatGPT's "
-                "image model (gpt-image-1). Use this whenever the user asks you "
+                "Generate a brand-new image from a text prompt. "
+                "Use this whenever the user asks you "
                 "to create, draw, design, paint, illustrate, or make a picture, "
                 "logo, icon, artwork, poster, or diagram. The image is delivered "
                 "to the user automatically as an inline attachment and also saved "
@@ -588,8 +589,8 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "edit_image",
             "description": (
-                "Edit / modify an EXISTING image using ChatGPT's image model "
-                "(gpt-image-1). Use this whenever the user attaches a photo (or "
+                "Edit / modify an EXISTING image from a text instruction. "
+                "Use this whenever the user attaches a photo (or "
                 "references one they sent) and asks you to change, modify, edit, "
                 "add, remove, replace, recolor, restyle, retouch, or transform it "
                 "— e.g. 'make the sky purple', 'remove the person in the back', "
@@ -1471,9 +1472,9 @@ def get_extended_tools():
         {
             "name": "doctor",
             "description": (
-                "Run system health checks and diagnostics. "
-                "Checks: python_deps, config, database, disk_space, docker, "
-                "api_key_openai, api_key_anthropic, workspace, memory_system, telegram_bot, browser."
+                "Run system health checks and diagnostics across dependencies, "
+                "config, database, disk, runtime, provider keys, workspace, "
+                "memory, messaging, and browser. Omit 'checks' to run everything."
             ),
             "input_schema": {
                 "type": "object",

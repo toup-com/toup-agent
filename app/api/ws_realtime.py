@@ -1571,10 +1571,19 @@ async def realtime_voice_ws(
                                     full_text = content["transcript"]
 
                     if full_text:
+                        # Alias the model id before it crosses the WS boundary —
+                        # voice is the always-on white-label channel; the raw
+                        # turn_model (incl. cross-provider ids after a think turn)
+                        # must not reach the client (docs/security/audit-2026.md
+                        # MI-1/MI-2). Flag-gated; DB persist is scrubbed on read.
+                        _rt_model = turn_model
+                        if settings.security_leak_filter and _rt_model:
+                            from app.services.model_alias import public_model_label
+                            _rt_model = public_model_label(_rt_model)
                         await websocket.send_json({
                             "type": "response_done",
                             "text": full_text,
-                            "model": turn_model,
+                            "model": _rt_model,
                         })
 
                         # Persist assistant message to DB. Await the SHARED

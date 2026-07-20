@@ -406,6 +406,10 @@ class CronService:
                 user_message=f"[Scheduled task: {name}] {message}",
                 user_id=user_id,
                 telegram_chat_id=chat_id,
+                # Unattended run — tag the channel so injection_fencing_v2's
+                # mutating-connector deny applies (nobody is present to confirm
+                # an action injected content might request). audit-2026 INJ-1.
+                channel="cron",
                 on_text_chunk=handler.on_text_chunk,
                 on_tool_start=handler.on_tool_start,
                 on_tool_end=handler.on_tool_end,

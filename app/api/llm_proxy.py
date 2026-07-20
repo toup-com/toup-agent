@@ -93,7 +93,7 @@ async def _auth_agent(request: Request, db: AsyncSession) -> AgentConfig:
         raise HTTPException(
             401,
             "Missing token. Provide either 'Authorization: Bearer <TOUP_TOKEN>' "
-            "or 'x-api-key: <TOUP_TOKEN>' (Anthropic SDK convention).",
+            "or 'x-api-key: <TOUP_TOKEN>'.",
         )
 
     token_hash = _hash_token(token)

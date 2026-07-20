@@ -290,14 +290,19 @@ async def api_chat_stream(
             for event in tool_events:
                 yield f"data: {json.dumps(event)}\n\n"
 
-            # Emit final result
+            # Emit final result — alias the model id like the message serializer
+            # above (docs/security/audit-2026.md MI-2). Flag-gated.
+            _sse_model = response.model
+            if settings.security_leak_filter and _sse_model:
+                from app.services.model_alias import public_model_label
+                _sse_model = public_model_label(_sse_model)
             done = {
                 "type": "done",
                 "text": response.text,
                 "session_id": response.session_id,
                 "tokens_input": response.tokens_input,
                 "tokens_output": response.tokens_output,
-                "model": response.model,
+                "model": _sse_model,
                 "tool_calls": len(response.tool_calls),
                 "processing_time_ms": response.processing_time_ms,
             }

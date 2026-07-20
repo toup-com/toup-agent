@@ -1726,7 +1726,14 @@ class AgentRunner:
             if total > settings.web_turn_token_budget:
                 share = max(256, settings.web_turn_token_budget // len(results))
                 for g in results.values():
-                    g["result"] = truncate_to_tokens(g["result"], share)
+                    _r = truncate_to_tokens(g["result"], share)
+                    # execute() already fenced external results; an end-trim can
+                    # cut the closing </external_content> tag, leaving the
+                    # untrusted-data envelope unterminated. Re-seal it so the
+                    # data/instruction boundary stays well-formed (audit INJ-2).
+                    if _r.startswith("<external_content") and not _r.rstrip().endswith("</external_content>"):
+                        _r = _r + "\n---\n</external_content>"
+                    g["result"] = _r
                 logger.info(
                     "[PERF] web_turn_budget: %d tok > %d cap -> trimmed %d results to %d tok each",
                     total, settings.web_turn_token_budget, len(results), share,

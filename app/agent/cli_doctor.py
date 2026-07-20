@@ -374,9 +374,11 @@ async def _check_openai_key() -> CheckResult:
                 message="OPENAI_API_KEY format looks invalid",
             )
         return CheckResult(
+            # Never echo key material — not even a prefix (a `sk-` fragment is
+            # still credential data). docs/security/audit-2026.md EXF/MI.
             name="api_key_openai",
             status=CheckStatus.OK,
-            message=f"OpenAI key configured ({key[:8]}...)",
+            message="OpenAI key configured",
         )
     except Exception as e:
         return CheckResult(
@@ -400,7 +402,7 @@ async def _check_anthropic_key() -> CheckResult:
         return CheckResult(
             name="api_key_anthropic",
             status=CheckStatus.OK,
-            message=f"Anthropic key configured ({key[:8]}...)",
+            message="Anthropic key configured",
         )
     except Exception as e:
         return CheckResult(

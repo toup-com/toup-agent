@@ -2568,6 +2568,15 @@ async def ws_chat(
                             logger.warning(f"[WS] Failed to persist job cards: {_je}")
                         _pending_job_cards.clear()
 
+                    # Alias the real model id to a neutral tier label before it
+                    # crosses the WS boundary — the live `done` frame is the same
+                    # user-facing model-id surface the REST serializers scrub
+                    # (docs/security/audit-2026.md MI-2/MI-4). Flag-gated; the DB
+                    # read path is already scrubbed in sessions.py.
+                    _done_model = response.model
+                    if settings.security_leak_filter and _done_model:
+                        from app.services.model_alias import public_model_label
+                        _done_model = public_model_label(_done_model)
                     _done_payload = {
                         "type": "done",
                         "text": response.text,
@@ -2577,7 +2586,7 @@ async def ws_chat(
                             "output": response.tokens_output,
                             "total": response.tokens_total,
                         },
-                        "model": response.model,
+                        "model": _done_model,
                         "tool_calls": len(response.tool_calls),
                         "processing_time_ms": response.processing_time_ms,
                         # Server-side UUID of the saved Message row.

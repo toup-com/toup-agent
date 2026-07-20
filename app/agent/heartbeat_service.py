@@ -80,6 +80,9 @@ class HeartbeatService:
             user_message=f"[Heartbeat] {settings.heartbeat_prompt}",
             user_id=user_id,
             telegram_chat_id=chat_id,
+            # Unattended run — tag the channel so injection_fencing_v2's
+            # mutating-connector deny applies (audit-2026 INJ-1).
+            channel="heartbeat",
         )
 
         text = (response.text or "").strip()

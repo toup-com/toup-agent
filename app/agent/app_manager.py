@@ -19,6 +19,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+# Scrub platform/tenant secrets from every app-builder child (npm/expo/git):
+# the agent writes package.json, so a lifecycle script (postinstall) runs
+# arbitrary code — it must not inherit provider keys / TOUP_TOKEN /
+# POOL_ADMIN_TOKEN / bot tokens (docs/security/audit-2026.md EXF-3, round-2
+# follow-up). scrubbed_environ() preserves PATH/HOME/npm/proxy/git vars so
+# builds are unaffected; DATABASE_URL is kept.
+from app.services.exec_env import scrubbed_environ
+
 logger = logging.getLogger(__name__)
 
 APPS_DIR = os.environ.get("TOUP_APPS_DIR", "/opt/toup-agent/apps")
@@ -125,7 +133,7 @@ class AppManager:
             cwd=APPS_DIR,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "npm_config_yes": "true"},
+            env={**scrubbed_environ(), "npm_config_yes": "true"},
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         output = (stdout or b"").decode() + (stderr or b"").decode()
@@ -176,7 +184,7 @@ class AppManager:
         # Install extra deps using `npx expo install` for version compatibility
         if deps:
             cmd2 = ["npx", "expo", "install"] + deps
-            env = {**os.environ, "EXPO_NO_TELEMETRY": "1"}
+            env = {**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1"}
             proc2 = await asyncio.create_subprocess_exec(
                 *cmd2, cwd=app_dir,
                 stdout=asyncio.subprocess.PIPE,
@@ -237,10 +245,14 @@ class AppManager:
             logger.info("[INSTALL] Using npm install for %s (no lock file)", app_id[:8])
 
         t0 = time.time()
+        # npm ci/install runs agent-written package.json lifecycle scripts
+        # (preinstall/postinstall) — scrub secrets from their env so a
+        # postinstall can't read a provider key / POOL_ADMIN_TOKEN.
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=scrubbed_environ(),
         )
 
         try:
@@ -332,7 +344,7 @@ class AppManager:
             cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "EXPO_NO_TELEMETRY": "1", "CI": "1"},
+            env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "CI": "1"},
         )
 
         managed.metro_port = port
@@ -371,7 +383,7 @@ class AppManager:
             cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
+            env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
         )
 
         managed.web_port = port
@@ -507,7 +519,7 @@ class AppManager:
             cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "EXPO_NO_TELEMETRY": "1", "CI": "1"},
+            env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "CI": "1"},
         )
         managed.metro_port = metro_port
         managed.metro_process = metro_proc
@@ -520,7 +532,7 @@ class AppManager:
             cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
+            env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
         )
         managed.web_port = web_port
         managed.web_process = web_proc
@@ -771,7 +783,7 @@ export default supabase;
         await self._run_cmd(
             ["git", "commit", "-m", f"Initial commit: {app_name}"],
             cwd=app_dir,
-            env={**os.environ, "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
+            env={**scrubbed_environ(), "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
                  "GIT_COMMITTER_NAME": "Toup Agent", "GIT_COMMITTER_EMAIL": "agent@toup.ai"},
         )
 
@@ -803,7 +815,7 @@ export default supabase;
         await self._run_cmd(
             ["git", "commit", "-m", f"Update app ({time.strftime('%Y-%m-%d %H:%M')})"],
             cwd=app_dir,
-            env={**os.environ, "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
+            env={**scrubbed_environ(), "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
                  "GIT_COMMITTER_NAME": "Toup Agent", "GIT_COMMITTER_EMAIL": "agent@toup.ai"},
         )
         result = await self._run_cmd(["git", "push"], cwd=app_dir, timeout=30)

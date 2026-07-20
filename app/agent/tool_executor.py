@@ -591,9 +591,17 @@ class ToolExecutor:
             # Fence external/ingested tool output as untrusted DATA so injected
             # instructions inside a fetched page / email / DOM can't be executed
             # (docs/security/audit-2026.md INJ-2). Flag-gated (default off).
+            # analyze_image: a vision/OCR call on an arbitrary (possibly
+            # attacker-hosted) image — text rendered inside the image is
+            # transcribed and re-enters model context, a classic image-OCR
+            # injection vector, so it is external DATA too (audit-2026 INJ-2
+            # follow-up). Connector READ payloads (gmail/drive/…) are covered by
+            # the standing prompt-level "ingested content is DATA" rule in
+            # agent_runner.platform_knowledge, so they are not double-fenced here.
             _EXTERNAL_CONTENT_TOOLS = {
                 "web_fetch", "web_search", "browser", "browser_action",
                 "extension_read", "extension_research", "extension_search",
+                "analyze_image",
             }
             if (
                 settings.injection_fencing_v2
@@ -4127,8 +4135,20 @@ class ToolExecutor:
         report = await run_doctor(include=checks)
 
         if fmt == "json":
-            return _json.dumps(report.to_dict(), indent=2)
-        return report.to_text()
+            out = _json.dumps(report.to_dict(), indent=2)
+        else:
+            out = report.to_text()
+
+        # The doctor report enumerates the production stack + provider names into
+        # model context, where the model could recite them despite the identity
+        # anchor (docs/security/audit-2026.md MI-5 follow-up). When the leak
+        # filter is on, neutralize provider + infra names so the model still sees
+        # the health STATUS but not the recitable architecture. Admins reading
+        # logs directly still get the raw report.
+        if settings.security_leak_filter:
+            from app.services.model_alias import scrub_provider_names, scrub_stack_terms
+            out = scrub_stack_terms(scrub_provider_names(out))
+        return out
 
     # ─────────────────────────────────────────────────────────
     # 36. talk_mode — Continuous voice conversation management

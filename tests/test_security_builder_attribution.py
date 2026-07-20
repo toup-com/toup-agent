@@ -247,3 +247,100 @@ def test_embeddings_proxy_route_exists():
     """The OpenAI-SDK embeddings shim is mounted so the proxy path resolves."""
     src = (_BACKEND / "app" / "api" / "llm_proxy.py").read_text()
     assert '"/openai/v1/embeddings"' in src
+
+
+# ── Round 2: residual gaps found by the adversarial verification pass ───
+# (docs/security/audit-2026.md — WS/voice model-id, analyze_image fence,
+# doctor disclosure, app-builder env scrub, telegram siblings, latent channels)
+
+
+def test_ws_chat_done_frame_aliases_model():
+    """The live WS chat `done` frame must alias the model id under the flag."""
+    src = (_BACKEND / "app" / "api" / "ws_chat.py").read_text()
+    assert "public_model_label" in src and "security_leak_filter" in src
+    # The raw response.model must NOT be assigned directly into the done frame.
+    assert '"model": response.model' not in src
+
+
+def test_sse_done_frame_aliases_model():
+    src = (_BACKEND / "app" / "api" / "api_v1.py").read_text()
+    assert '"model": response.model' not in src
+    assert "public_model_label" in src
+
+
+def test_voice_response_done_aliases_model():
+    src = (_BACKEND / "app" / "api" / "ws_realtime.py").read_text()
+    assert '"model": turn_model' not in src
+    assert "public_model_label" in src
+
+
+def test_analyze_image_is_fenced():
+    """analyze_image (OCR) output is treated as untrusted external content."""
+    src = (_BACKEND / "app" / "agent" / "tool_executor.py").read_text()
+    # It must appear inside the _EXTERNAL_CONTENT_TOOLS set.
+    marker = src.split("_EXTERNAL_CONTENT_TOOLS", 1)[1][:400]
+    assert '"analyze_image"' in marker
+
+
+def test_scrub_stack_terms_neutralizes_infra_names():
+    from app.services.model_alias import scrub_stack_terms
+    out = scrub_stack_terms("running on Docker with FastAPI + pgvector and Playwright")
+    for tok in ("docker", "fastapi", "pgvector", "playwright"):
+        assert tok not in out.lower()
+    assert "[component]" in out
+    assert scrub_stack_terms("") == ""
+
+
+def test_doctor_output_scrubbed_and_no_key_fragment():
+    """doctor tool scrubs provider/stack names; key checks never echo material."""
+    te = (_BACKEND / "app" / "agent" / "tool_executor.py").read_text()
+    assert "scrub_stack_terms" in te and "scrub_provider_names" in te
+    doc = (_BACKEND / "app" / "agent" / "cli_doctor.py").read_text()
+    # The key-prefix leak (key[:8]) must be gone from the key checks.
+    assert "key[:8]" not in doc
+
+
+def test_app_builder_subprocess_env_scrubbed():
+    """Every app_manager child gets a scrubbed env (no raw os.environ spawn)."""
+    src = (_BACKEND / "app" / "agent" / "app_manager.py").read_text()
+    assert "from app.services.exec_env import scrubbed_environ" in src
+    # No spawn should splat the full os.environ into a child.
+    assert "{**os.environ," not in src
+
+
+def test_telegram_sibling_commands_alias_model():
+    src = (_BACKEND / "app" / "agent" / "telegram_bot.py").read_text()
+    assert "_tg_model_label" in src
+    # The raw settings.agent_model must not be printed unaliased in status.
+    assert "Model: <code>{settings.agent_model}</code>" not in src
+
+
+def test_unattended_executors_tag_channel():
+    """cron + heartbeat pass an unattended channel so the mutating deny applies."""
+    cron = (_BACKEND / "app" / "agent" / "cron_service.py").read_text()
+    hb = (_BACKEND / "app" / "agent" / "heartbeat_service.py").read_text()
+    assert 'channel="cron"' in cron
+    assert 'channel="heartbeat"' in hb
+    # And those channels are in the deny set.
+    from app.services import connector_dispatcher as cd
+    assert "cron" in cd._MUTATES_UNATTENDED_DENY_CHANNELS
+    assert "heartbeat" in cd._MUTATES_UNATTENDED_DENY_CHANNELS
+
+
+def test_tool_descriptions_drop_provider_names():
+    src = (_BACKEND / "app" / "agent" / "tool_definitions.py").read_text()
+    assert "GPT vision" not in src
+    assert "gpt-image-1" not in src
+    assert "ChatGPT" not in src
+
+
+def test_parallel_web_trim_reseals_fence():
+    src = (_BACKEND / "app" / "agent" / "agent_runner.py").read_text()
+    assert "</external_content>" in src
+    assert "_r.rstrip().endswith" in src
+
+
+def test_public_health_omits_embedding_model():
+    src = (_BACKEND / "platform_main.py").read_text()
+    # The health payload must not name the embedding model.
+    assert '"embedding_model": settings.embedding_model' not in src

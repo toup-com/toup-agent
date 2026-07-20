@@ -44,6 +44,17 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _tg_model_label(value: str | None) -> str:
+    """Alias a raw model id to a neutral tier label (Fast/Balanced/Deep) when
+    security_leak_filter is on, else return it unchanged. Used across the model-
+    id-bearing Telegram commands (/status /model /usage /config) so none leaks
+    the real provider/model (docs/security/audit-2026.md MI-3)."""
+    if value and settings.security_leak_filter:
+        from app.services.model_alias import public_model_label
+        return public_model_label(value)
+    return value or ""
+
+
 class ToupTelegramBot:
     """
     Telegram bot that connects to the Toup Agent Runtime.
@@ -578,7 +589,7 @@ class ToupTelegramBot:
 
         await update.message.reply_text(
             f"📊 <b>Status</b>\n\n"
-            f"Model: <code>{settings.agent_model}</code>\n"
+            f"Model: <code>{_tg_model_label(settings.agent_model)}</code>\n"
             f"Session: {msg_count} messages\n"
             f"Tokens used: {tokens_used:,}\n"
             f"Memories: {mem_count} stored\n"
@@ -820,13 +831,18 @@ class ToupTelegramBot:
 
         args = context.args
         if not args:
+            _leak = settings.security_leak_filter
             if settings.agent_model == "auto":
-                mode_info = "⚡ <b>Auto</b> (routes by complexity)\n  • Light → Claude Sonnet 4.5\n  • Medium → GPT-5.2\n  • Heavy → Claude Opus 4.6"
+                mode_info = (
+                    "⚡ <b>Auto</b> (routes by complexity)\n  • Light → Fast\n  • Medium → Balanced\n  • Heavy → Deep"
+                    if _leak else
+                    "⚡ <b>Auto</b> (routes by complexity)\n  • Light → Claude Sonnet 4.5\n  • Medium → GPT-5.2\n  • Heavy → Claude Opus 4.6"
+                )
             else:
-                mode_info = f"<code>{settings.agent_model}</code>"
+                mode_info = f"<code>{_tg_model_label(settings.agent_model)}</code>"
             await update.message.reply_text(
                 f"🤖 Current model: {mode_info}\n\n"
-                f"Switch: <code>/model auto</code> or <code>/model gpt-5.5</code>",
+                f"Switch: <code>/model auto</code> or <code>/model &lt;tier&gt;</code>",
                 parse_mode="HTML",
             )
             return
@@ -838,9 +854,13 @@ class ToupTelegramBot:
             "claude-opus-4-6", "claude-sonnet-4-5", "claude-sonnet-4-5-20250514", "claude-sonnet-4-20250514",
         ]
         if new_model not in allowed_models:
+            # Don't echo the raw roster of dated provider ids when the leak
+            # filter is on — the model still accepts them, we just don't list.
+            _avail = ("auto + tier aliases" if settings.security_leak_filter
+                      else ', '.join(f'<code>{m}</code>' for m in allowed_models))
             await update.message.reply_text(
                 f"❌ Unknown model: <code>{new_model}</code>\n\n"
-                f"Available: {', '.join(f'<code>{m}</code>' for m in allowed_models)}",
+                f"Available: {_avail}",
                 parse_mode="HTML",
             )
             return
@@ -852,9 +872,10 @@ class ToupTelegramBot:
             self.agent_runner.llm.default_model = new_model
 
         if new_model == "auto":
-            label = "⚡ Auto (Sonnet 4.5 / GPT-5.2 / Opus 4.6)"
+            label = ("⚡ Auto (Fast / Balanced / Deep)" if settings.security_leak_filter
+                     else "⚡ Auto (Sonnet 4.5 / GPT-5.2 / Opus 4.6)")
         else:
-            label = f"<code>{new_model}</code>"
+            label = f"<code>{_tg_model_label(new_model)}</code>"
         await update.message.reply_text(
             f"✅ Model switched: <code>{old_model}</code> → {label}",
             parse_mode="HTML",
@@ -997,7 +1018,7 @@ class ToupTelegramBot:
             from app.config import settings
             lines = [
                 "⚙️ <b>Runtime Config</b>\n",
-                f"agent_model: <code>{settings.agent_model}</code>",
+                f"agent_model: <code>{_tg_model_label(settings.agent_model)}</code>",
                 f"agent_max_tokens: <code>{settings.agent_max_tokens}</code>",
                 f"agent_max_tool_iterations: <code>{settings.agent_max_tool_iterations}</code>",
                 f"temperature: <code>{settings.temperature}</code>",
@@ -1430,7 +1451,7 @@ class ToupTelegramBot:
             f"Session: {session_total:,} tokens (${session_cost:.2f})\n"
             f"Today: {today_total:,} tokens (${today_cost:.2f})\n"
             f"All time: {all_total:,} tokens (${all_cost:.2f})\n\n"
-            f"Model: <code>{model}</code>\n"
+            f"Model: <code>{_tg_model_label(model)}</code>\n"
             f"Rate: ${rate_in}/1K in, ${rate_out}/1K out",
             parse_mode="HTML",
         )
