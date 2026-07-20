@@ -235,6 +235,28 @@ def test_exec_sandbox_preexec_disabled_by_default(monkeypatch):
     assert exec_env.sandbox_preexec() is None
 
 
+def test_sandbox_preexec_resolves_existing_user(monkeypatch):
+    """When exec_sandbox_user names a real OS user, preexec returns a callable
+    (the drop fn). Uses the test-runner's own user so it resolves everywhere."""
+    import getpass
+    from app.services import exec_env
+    monkeypatch.setattr(exec_env.settings, "exec_sandbox_user", getpass.getuser(), raising=False)
+    fn = exec_env.sandbox_preexec()
+    assert callable(fn)
+
+
+def test_agent_image_enables_exec_sandbox_as_toup():
+    """The agent image drops exec to the workspace-owning `toup` uid and makes
+    /app traversable-but-not-readable so exec keeps workspace R/W while losing
+    /app source + /proc secret access (docs/security/audit-2026.md EXF-3)."""
+    df = (_BACKEND / "Dockerfile.agent").read_text()
+    assert "ENV EXEC_SANDBOX_USER=toup" in df
+    assert "chmod -R o-rwx /app" in df        # source unreadable to non-root
+    assert "chmod o+x /app" in df             # ...but /app dir is traversable
+    # The boot step keeps the workspace owned by toup (the exec uid).
+    assert "chown -R toup:toup /app/workspace" in df
+
+
 def test_embeddings_proxy_inactive_by_default(monkeypatch):
     """Embeddings-via-proxy is a validated, opt-in switch (memory-critical)."""
     from app.services.embedding_service import EmbeddingService

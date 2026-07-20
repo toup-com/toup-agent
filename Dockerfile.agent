@@ -68,16 +68,33 @@ RUN useradd -m -u 1000 toup && \
     mkdir -p /app/workspace /app/skills && \
     chown -R toup:toup /app/workspace /app/skills /home/toup
 
-# Sandbox user for the `exec` tool (security hardening, docs/security/audit-2026.md
-# EXF-3). The agent runs as root (trusted supervisor); when EXEC_SANDBOX_USER is
-# set, every `exec`/user-code child drops to THIS uid via preexec_fn, so it can
-# no longer read the platform source at /app or the agent's /proc env — while the
-# agent itself is unaffected. `o-rwx /app` makes the shipped source unreadable to
-# any non-root uid; the workspace/skills are made group-writable to the sandbox at
-# boot (see CMD). Harmless until EXEC_SANDBOX_USER is enabled.
+# `exec` sandboxing (security hardening, docs/security/audit-2026.md EXF-3).
+# The agent process runs as root (trusted supervisor). When EXEC_SANDBOX_USER is
+# set, every `exec`/PTY/process child is dropped to THAT uid via preexec_fn, so a
+# tenant's shell command (or injected content that reaches exec) can no longer
+# read the platform source at /app NOR the agent's secrets via
+# /proc/<agent-pid>/environ — while the agent itself is unaffected.
+#
+# Default = `toup` (uid 1000), the user that OWNS /app/workspace, so a dropped
+# exec keeps full read+write on the USER's workspace (no build/exec breakage)
+# yet is a different uid from the root agent (→ /proc secrets denied) and cannot
+# read the shipped source:
+#   * `chmod -R o-rwx /app`  → source unreadable to any non-root uid.
+#   * `chmod o+x /app`       → re-grant TRAVERSE (not read) on the /app dir so the
+#                              dropped exec can reach /app/workspace; `ls /app`
+#                              and reading /app/app/** stay denied (x without r).
+# A stricter, fully-isolated `sandbox` uid (2000, zero workspace access) is also
+# defined for future use — switch EXEC_SANDBOX_USER to it after making the
+# workspace group-2000-writable.
 RUN useradd -u 2000 -M -d /home/sandbox -s /usr/sbin/nologin sandbox && \
     mkdir -p /home/sandbox && chown sandbox:sandbox /home/sandbox && \
-    chmod -R o-rwx /app
+    chmod -R o-rwx /app && \
+    chmod o+x /app
+
+# Enable the exec drop by default: exec/PTY/process children run as `toup`, not
+# as the root agent. Closes the exec→/proc-secret and exec→/app-source paths
+# (EXF-3). Reversible per-agent via `.env` EXEC_SANDBOX_USER="" (exec runs root).
+ENV EXEC_SANDBOX_USER=toup
 
 # Memory & retrieval — agent containers do NOT bundle
 # `sentence-transformers`/torch (saves ~2.5 GB image weight). The
@@ -144,7 +161,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
 # definitions, surfacing as "column X of relation Y does not exist"
 # the moment a new feature column was referenced (e.g. routines.schedule_kind
 # from migration 042 broke every reminder create call).
-# The workspace/skills mounts arrive owned by the host bridge uid at runtime; make
-# them group-writable by the sandbox uid (2000) so a dropped `exec` can still build
-# the user's apps. No-op / harmless when EXEC_SANDBOX_USER is unset. Never fails boot.
-CMD ["bash", "-c", "chown -R :2000 /app/workspace /app/skills 2>/dev/null || true; chmod -R g+rwX /app/workspace /app/skills 2>/dev/null || true; alembic upgrade head || echo '[boot] alembic upgrade failed — continuing without applying migrations; check logs above'; exec uvicorn agent_main:app --host 0.0.0.0 --port 8001"]
+# Ensure the workspace/skills are owned by `toup` (uid 1000) at boot — a dropped
+# `exec` runs as toup and must read+write them. Covers the case where a runtime
+# mount arrives owned by another uid. Best-effort; never fails boot.
+CMD ["bash", "-c", "chown -R toup:toup /app/workspace /app/skills 2>/dev/null || true; alembic upgrade head || echo '[boot] alembic upgrade failed — continuing without applying migrations; check logs above'; exec uvicorn agent_main:app --host 0.0.0.0 --port 8001"]
