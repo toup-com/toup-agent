@@ -13,10 +13,16 @@ Activity pushes:
     needs_approval    → content-state update + alert, priority 10
                         (activity stays alive — the task is waiting)
     mission_completed /
-    mission_failed    → event=end + final content-state + alert;
-                        card lingers on the lock screen (default 4h,
-                        or ``data.dismiss_after_s`` when the producer
-                        wants a shorter linger, e.g. quick jobs)
+    mission_failed    → alerting UPDATE (banner + sound on Apple's
+                        documented alert surface) then a bannerless
+                        event=end with the final content-state; card
+                        lingers on the lock screen (default 4h, or
+                        ``data.dismiss_after_s`` when the producer
+                        wants a shorter linger, e.g. quick jobs).
+                        When the card had to be restarted first, the
+                        start itself carries the alert (loud restart)
+                        and both follow-ups go bannerless — exactly
+                        one audible alert per terminal row.
 
 ONE ACTIVITY PER DEVICE — the load-bearing correctness rule. Apple
 leaves the behavior of multiple concurrent activities sharing one
@@ -299,6 +305,14 @@ async def _preempt_device(
                 "live-activity preempt end for %s/%s: %s %s",
                 device.id, la.mission_id, status, reason,
             )
+    if preempted:
+        # The session runs with autoflush off (pgbouncer setup): flush
+        # the force-ends NOW so (a) a follow-up started-rows SELECT in
+        # the same unit of work can't see the preempted rows and
+        # preempt them twice, and (b) a subsequent INSERT of a started
+        # row can't race the partial unique index ahead of these
+        # UPDATEs (SQLAlchemy flushes INSERTs before UPDATEs).
+        await db.flush()
     return preempted
 
 
@@ -480,6 +494,7 @@ async def handle_notification_row(
 
     activities = await _activities_for_mission(db, row.user_id, mission_id)
     restarted = False
+    restart_loud = False
 
     if not activities and (
         row.event_kind == NOTIFY_KIND_PROGRESS
@@ -491,18 +506,26 @@ async def handle_notification_row(
         # Self-healing: the card was preempted by a newer task (or the
         # device rebooted / was never started because the producer only
         # emits terminal kinds — foregrounded chat turns, reminder
-        # fires whose countdown never armed). Bring it back silently —
-        # no banner on the start; for alert kinds the update/end push
-        # that follows carries the banner, so the alert is guaranteed
-        # even with no pre-started card (2026-07-17). Silent terminal
-        # rows (reminder cancel ends) skip the restart: there is
-        # nothing to alert, an end for a card that isn't there is a
-        # no-op.
+        # fires whose countdown never armed). Progress rows restart
+        # silently. Alert kinds restart LOUD: the start alert (with
+        # sound) is the one Live Activity surface iOS 26 provably
+        # renders — it mandates an alert config on every start — while
+        # an alert riding the follow-up end travels Apple's least-
+        # documented surface (end-event alert over the shared
+        # push-to-start token) and reached the founder's phone silently
+        # or not at all (2026-07-18: every backgrounded fire). The
+        # follow-up update/end then goes bannerless — one alert, on
+        # the surface that works. Silent terminal rows (reminder
+        # cancel ends) skip the restart: there is nothing to alert,
+        # an end for a card that isn't there is a no-op.
+        restart_loud = row.event_kind != NOTIFY_KIND_PROGRESS
         devices = await _active_devices(db, row.user_id)
         if not devices:
             return {"status": "skipped", "reason": "no_live_activity_devices"}
         for device in devices:
-            result = await _send_start(db, device, row, mission_id, now, silent=True)
+            result = await _send_start(
+                db, device, row, mission_id, now, silent=not restart_loud,
+            )
             per_device[device.id] = result
             delivered = delivered or result["status"] == "ok"
             errored = errored or result["status"] == "error"
@@ -553,7 +576,10 @@ async def handle_notification_row(
             payload = apns_push.build_update_payload(
                 title=title, subtitle="Needs your answer",
                 progress=effective,
-                alert_title=row.title, alert_body=row.body,
+                # After a loud restart the start already delivered the
+                # banner+sound — a second alert here would double-bang.
+                alert_title=None if restart_loud else row.title,
+                alert_body=None if restart_loud else row.body,
                 timestamp=int(now.timestamp()),
             )
             result = await _send_to_activity(
@@ -568,18 +594,56 @@ async def handle_notification_row(
             # instead of 'Completed ✓').
             _silent_end = bool(_data.get("silent"))
             _subtitle = _data.get("subtitle") if isinstance(_data.get("subtitle"), str) else None
+            final_subtitle = _subtitle or ("Completed ✓" if done else "Stopped — needs attention")
+            final_progress = 1.0 if done else effective
+            # The audible banner rides an alerting UPDATE (Apple's
+            # documented alert surface — the end-event alert is
+            # undocumented and proved unreliable on iOS 26), then a
+            # bannerless end closes the card. Skip the update when the
+            # loud restart already alerted, or the producer asked for
+            # silence.
+            alerted = restart_loud
+            upd_result: Optional[Dict[str, Any]] = None
+            if not _silent_end and not alerted:
+                upd = apns_push.build_update_payload(
+                    title=title, subtitle=final_subtitle,
+                    progress=final_progress,
+                    alert_title=row.title, alert_body=row.body,
+                    timestamp=int(now.timestamp()),
+                )
+                upd_result = await _send_to_activity(
+                    db, la, device, upd, priority=10, now=now,
+                )
+                alerted = upd_result["status"] == "ok"
             payload = apns_push.build_end_payload(
                 title=title,
-                subtitle=_subtitle or ("Completed ✓" if done else "Stopped — needs attention"),
-                progress=1.0 if done else effective,
-                alert_title=None if _silent_end else row.title,
-                alert_body=None if _silent_end else row.body,
+                subtitle=final_subtitle,
+                progress=final_progress,
+                # Fallback only: if neither the loud start nor the
+                # alerting update got through, the end keeps the alert
+                # rather than closing the card silently.
+                alert_title=None if (_silent_end or alerted) else row.title,
+                alert_body=None if (_silent_end or alerted) else row.body,
                 dismissal_date=_dismissal_date(row, now),
                 timestamp=int(now.timestamp()),
             )
             result = await _send_to_activity(
                 db, la, device, payload, priority=10, now=now, end=True,
             )
+            if upd_result and upd_result.get("preempted"):
+                # Ambiguity was resolved during the alerting update —
+                # keep the marker on the recorded fragment (ladebug).
+                result.setdefault("preempted", upd_result["preempted"])
+            if result["status"] != "ok" and alerted:
+                # The banner reached the device even though the close
+                # didn't — count the row delivered (the alert is the
+                # job; the card close is hygiene), and close the DB row
+                # so it can't squat the one-activity-per-device slot.
+                la.status = LA_ENDED
+                la.ended_at = now
+                la.updated_at = now
+                result = {**result, "alerted": True}
+                delivered = True
 
         if result["status"] == "ok" and effective is not None:
             la.last_progress = int(effective * 100)

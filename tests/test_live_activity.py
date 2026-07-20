@@ -589,11 +589,17 @@ async def test_completed_ends_activity_and_counts_as_delivery(monkeypatch):
     result = await _claim_and_dispatch(row_id)
 
     # APNs acceptance = delivery: no retry loop, row lands sent even
-    # with zero Expo devices and no Telegram.
+    # with zero Expo devices and no Telegram. The banner+sound ride an
+    # alerting update (documented surface); the end closes bannerless.
     assert result == "sent"
-    assert sent[0]["payload"]["aps"]["event"] == "end"
-    assert sent[0]["payload"]["aps"]["content-state"]["progress"] == 1.0
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["update", "end"]
     assert sent[0]["payload"]["aps"]["alert"]["title"] == "✅ “T” is done"
+    assert sent[0]["payload"]["aps"]["alert"]["sound"] == "default"
+    assert sent[0]["payload"]["aps"]["content-state"]["progress"] == 1.0
+    assert sent[1]["payload"]["aps"]["event"] == "end"
+    assert sent[1]["payload"]["aps"]["content-state"]["progress"] == 1.0
+    assert "alert" not in sent[1]["payload"]["aps"]
 
     from app.db import async_session_maker
     from sqlalchemy import select
@@ -851,8 +857,12 @@ async def test_terminal_send_resolves_ambiguity_end_to_end(monkeypatch):
     result = await _claim_and_dispatch(row_id)
     assert result == "sent"
     events = [s["payload"]["aps"]["event"] for s in sent]
-    assert events == ["end", "end"]  # preempt m-Y, then terminal end for m-X
+    # Preempt m-Y (end), alerting update for m-X on the now-unambiguous
+    # shared token, then the bannerless terminal end.
+    assert events == ["end", "update", "end"]
     assert sent[1]["payload"]["aps"]["alert"]["title"] == "✅ Done: X"
+    assert sent[1]["payload"]["aps"]["alert"]["sound"] == "default"
+    assert "alert" not in sent[2]["payload"]["aps"]
 
     from app.db import async_session_maker
     from sqlalchemy import select
@@ -956,13 +966,14 @@ async def test_terminal_restart_delivers_despite_foreign_started_row(monkeypatch
     )
     result = await _claim_and_dispatch(row_id)
     assert result == "sent"
-    # Preempt the foreign card, quietly start the turn card (iOS 26
-    # requires an alert config on every start — synthesized, soundless),
-    # then the end push carries the real banner.
+    # Preempt the foreign card, LOUD-start the turn card (the start
+    # alert with sound is the surface iOS 26 provably renders), then a
+    # bannerless end closes it.
     events = [s["payload"]["aps"]["event"] for s in sent]
     assert events == ["end", "start", "end"]
-    assert "sound" not in sent[1]["payload"]["aps"]["alert"]  # quiet restart
-    assert sent[2]["payload"]["aps"]["alert"]["title"] == "Answer ready"
+    assert sent[1]["payload"]["aps"]["alert"]["title"] == "Answer ready"
+    assert sent[1]["payload"]["aps"]["alert"]["sound"] == "default"
+    assert "alert" not in sent[2]["payload"]["aps"]
 
     from app.db import async_session_maker
     from sqlalchemy import select
@@ -1001,7 +1012,9 @@ async def test_job_timer_and_dismissal_payloads(monkeypatch):
         data_json={"mission_id": "job-1", "mission_title": "PM tools",
                    "progress": 100, "dismiss_after_s": 900, "urgent": True},
     ))
-    aps = sent[0]["payload"]["aps"]
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["update", "end"]  # alerting update, bannerless end
+    aps = sent[1]["payload"]["aps"]
     assert aps["event"] == "end"
     assert aps["content-state"]["progress"] == 1.0
     assert now_ts + 800 <= aps["dismissal-date"] <= now_ts + 1000

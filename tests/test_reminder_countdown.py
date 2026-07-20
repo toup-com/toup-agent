@@ -182,11 +182,21 @@ async def test_fire_flips_countdown_card_with_subtitle_override(monkeypatch):
                    "no_agent_fallback": True},
     ))
     assert result == "sent"
-    aps = sent[0]["payload"]["aps"]
+    # Audible fire = alerting UPDATE (documented alert surface, with
+    # sound) followed by a bannerless end that closes the card.
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["update", "end"]
+    upd = sent[0]["payload"]["aps"]
+    assert upd["alert"]["title"] == "⏰ Stretch — now"
+    assert upd["alert"]["sound"] == "default"
+    # Producer subtitle replaces the hard-coded 'Completed ✓' on BOTH
+    # pushes — the update already shows the fired state, so a lost end
+    # can no longer leave a live-looking card.
+    assert upd["content-state"]["subtitle"] == "Time to stretch"
+    aps = sent[1]["payload"]["aps"]
     assert aps["event"] == "end"
-    # Producer subtitle replaces the hard-coded 'Completed ✓'.
+    assert "alert" not in aps
     assert aps["content-state"]["subtitle"] == "Time to stretch"
-    assert aps["alert"]["title"] == "⏰ Stretch — now"
     now_ts = int(datetime.utcnow().timestamp())
     assert now_ts + 800 <= aps["dismissal-date"] <= now_ts + 1000
 
@@ -202,9 +212,10 @@ async def test_fire_flips_countdown_card_with_subtitle_override(monkeypatch):
 @pytest.mark.asyncio
 async def test_fire_with_no_card_restarts_then_alerts(monkeypatch):
     """The preempted/never-armed path: a terminal alert row with zero
-    started activities silently restarts the card, then the end push
-    carries the banner — the alert is guaranteed (this is what makes
-    the unconditional ws_chat 'Answer ready' render too)."""
+    started activities restarts the card LOUD — the start alert (with
+    sound) is the surface iOS 26 provably renders — then the end goes
+    bannerless (this is what makes the unconditional ws_chat 'Answer
+    ready' audible too)."""
     sent: list = []
     _patch_apns(monkeypatch, sent)
     user_id = await _mk_user()
@@ -220,8 +231,10 @@ async def test_fire_with_no_card_restarts_then_alerts(monkeypatch):
     assert result == "sent"
     events = [s["payload"]["aps"]["event"] for s in sent]
     assert events == ["start", "end"]
-    assert "sound" not in sent[0]["payload"]["aps"]["alert"]  # quiet restart
-    assert sent[1]["payload"]["aps"]["alert"]["title"] == "⏰ Stretch — now"
+    start_alert = sent[0]["payload"]["aps"]["alert"]
+    assert start_alert["title"] == "⏰ Stretch — now"  # loud restart
+    assert start_alert["sound"] == "default"
+    assert "alert" not in sent[1]["payload"]["aps"]  # bannerless close
 
     from app.db import async_session_maker
     from sqlalchemy import select
@@ -254,7 +267,11 @@ async def test_needs_input_with_no_card_restarts_then_alerts(monkeypatch):
     assert result == "sent"
     events = [s["payload"]["aps"]["event"] for s in sent]
     assert events == ["start", "update"]
-    assert sent[1]["payload"]["aps"]["alert"]["title"] == "“T” needs you"
+    # Loud restart: the start carries the banner+sound; the follow-up
+    # update goes bannerless (no double-bang).
+    assert sent[0]["payload"]["aps"]["alert"]["title"] == "“T” needs you"
+    assert sent[0]["payload"]["aps"]["alert"]["sound"] == "default"
+    assert "alert" not in sent[1]["payload"]["aps"]
 
     # The card stays alive — the task is waiting for the user.
     from app.db import async_session_maker
@@ -267,6 +284,62 @@ async def test_needs_input_with_no_card_restarts_then_alerts(monkeypatch):
 
 
 # ── LA lane: silent cancel end ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fire_counts_delivered_when_banner_lands_but_close_fails(monkeypatch):
+    """The alert is the job; the card close is hygiene. If the alerting
+    update 200s but the follow-up end fails, the row must land sent —
+    NOT retry (a re-alert would double-bang the user)."""
+    sent: list = []
+
+    async def fake_send(token, payload, *, environment="development", priority=10):
+        sent.append({"token": token, "payload": payload,
+                     "environment": environment, "priority": priority})
+        if payload["aps"]["event"] == "end":
+            return 500, "InternalServerError"
+        return 200, ""
+
+    monkeypatch.setattr(las.apns_push, "send_live_activity", fake_send)
+    monkeypatch.setattr(settings, "apns_key_b64", "eA==")
+    monkeypatch.setattr(settings, "apns_key_id", "KEY123")
+    monkeypatch.setattr(settings, "apns_team_id", "TEAM123")
+
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started", title="⏰ Stretch",
+        body="Time to stretch", priority="default",
+        data_json={"mission_id": "reminder:r-5", "silent": True,
+                   "kind": "reminder", "urgent": True,
+                   "timer_end_ms": int((datetime.utcnow().timestamp() + 120) * 1000)},
+    ))
+    sent.clear()
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id,
+        data_json={"mission_id": "reminder:r-5", "mission_title": "⏰ Stretch",
+                   "kind": "reminder", "route": "chat",
+                   "subtitle": "Time to stretch", "urgent": True,
+                   "dismiss_after_s": 900, "no_agent_fallback": True},
+    ))
+    assert result == "sent"
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["update", "end"]
+    assert sent[0]["payload"]["aps"]["alert"]["sound"] == "default"
+
+    from app.db import async_session_maker
+    from sqlalchemy import select
+    async with async_session_maker() as db:
+        row_id = (await db.execute(
+            select(NotificationQueue.id).order_by(
+                NotificationQueue.created_at.desc()).limit(1)
+        )).scalar_one()
+        row = await db.get(NotificationQueue, row_id)
+        frag = row.channels_json["live_activity"]
+        assert frag["delivered"] is True
+        device_frag = list(frag["devices"].values())[0]
+        assert device_frag["alerted"] is True
 
 
 @pytest.mark.asyncio
