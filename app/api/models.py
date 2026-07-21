@@ -33,7 +33,7 @@ the canonical "what's installable" source per audit §1.c.
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 router = APIRouter(tags=["Models"])
@@ -70,14 +70,34 @@ def _label_for(model_id: str) -> str:
 
 
 @router.get("/models")
-async def list_models() -> JSONResponse:
+async def list_models(request: Request) -> JSONResponse:
     """Return the canonical model registry.
 
-    No auth required, no per-user resolution — this advertises platform
-    defaults + the catalogue of supported models. Tenants can still
-    override `agent_model` / `app_builder_*_model` per-tenant; that
-    happens at use-time in the agent's runtime, not here.
+    Per-user resolution isn't done here — this advertises platform defaults +
+    the catalogue of supported models. Tenants can still override
+    `agent_model` / `app_builder_*_model` per-tenant at use-time.
+
+    White-label gate: when `security_leak_filter` is on, this requires a valid
+    session so an ANONYMOUS internet caller can't enumerate the real
+    provider/model catalogue (which otherwise contradicts the agent's
+    "never name the underlying model" posture — docs/security/audit-2026.md
+    MI / the `/api/models` finding). Authed web (cookie) + mobile (bearer) still
+    get it for the model picker. Flag-off = public (prior behaviour).
     """
+    from app.config import settings as _settings
+
+    if getattr(_settings, "security_leak_filter", False):
+        from app.services import decode_access_token
+        from app.api.auth import SSO_COOKIE_NAME
+        _tok = None
+        _ah = request.headers.get("authorization") or ""
+        if _ah.lower().startswith("bearer "):
+            _tok = _ah[7:].strip()
+        if not _tok:
+            _tok = request.cookies.get(SSO_COOKIE_NAME)
+        if not (_tok and decode_access_token(_tok)):
+            return JSONResponse({"detail": "Authentication required"}, status_code=401)
+
     from app.services.model_resolver import (
         default_model,
         default_fallback_model,
@@ -86,7 +106,6 @@ async def list_models() -> JSONResponse:
     )
     from app.agent.model_providers import get_provider_registry
 
-    from app.config import settings as _settings
     anthropic_on = getattr(_settings, "anthropic_enabled", True)
 
     registry = get_provider_registry()

@@ -366,3 +366,20 @@ def test_public_health_omits_embedding_model():
     src = (_BACKEND / "platform_main.py").read_text()
     # The health payload must not name the embedding model.
     assert '"embedding_model": settings.embedding_model' not in src
+
+
+def test_models_endpoint_gated_when_leak_filter_on():
+    """GET /api/models requires a valid session when security_leak_filter is on,
+    so anonymous callers can't enumerate the real model catalogue (audit MI)."""
+    src = (_BACKEND / "app" / "api" / "models.py").read_text()
+    assert "security_leak_filter" in src
+    assert "decode_access_token" in src
+    assert "status_code=401" in src
+
+
+def test_web_models_hook_sends_credentials():
+    """The web model hook sends the session cookie so the gated endpoint works
+    for logged-in users (paired with the backend gate above)."""
+    hook = (_BACKEND.parent / "frontend" / "src" / "hooks" / "useModels.ts").read_text()
+    assert "credentials: 'include'" in hook
+    assert "credentials: 'omit'" not in hook
