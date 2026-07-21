@@ -383,3 +383,69 @@ def test_web_models_hook_sends_credentials():
     hook = (_BACKEND.parent / "frontend" / "src" / "hooks" / "useModels.ts").read_text()
     assert "credentials: 'include'" in hook
     assert "credentials: 'omit'" not in hook
+
+
+# ── Round 5: gaps found by the final adversarial re-audit (16 confirmed) ───
+
+
+def test_mcp_known_channels_superset_of_deny_sets():
+    """The transport channel allow-list must include every unattended channel
+    the dispatcher denies, else the deny is silently bypassed (channel clamped
+    to web). Fail-closed clamp target must be a deny-set member."""
+    from app.mcp_auth import _KNOWN_CHANNELS, _UNKNOWN_CHANNEL_CLAMP
+    from app.services import connector_dispatcher as cd
+    deny = cd._MUTATES_DEFAULT_DENY_CHANNELS | cd._MUTATES_UNATTENDED_DENY_CHANNELS
+    assert deny <= _KNOWN_CHANNELS, f"deny channels not all known: {deny - _KNOWN_CHANNELS}"
+    assert _UNKNOWN_CHANNEL_CLAMP in cd._MUTATES_UNATTENDED_DENY_CHANNELS
+
+
+def test_scrub_stack_terms_covers_embedding_names():
+    from app.services.model_alias import scrub_stack_terms
+    out = scrub_stack_terms("pgvector + all-MiniLM-L6-v2 / text-embedding-3-small")
+    assert "MiniLM".lower() not in out.lower()
+    assert "text-embedding-3-small" not in out
+
+
+def test_file_tools_path_jail_present():
+    """_resolve_path must jail file tools out of /proc + /app source (the
+    in-process file-tool EXF-3 hole the exec sandbox did not cover)."""
+    src = (_BACKEND / "app" / "agent" / "tool_executor.py").read_text()
+    assert "_guard_path" in src
+    assert "/proc" in src and "platform source" in src
+    # grep gets a NUL/binary guard so /proc/*/environ can't be line-dumped.
+    assert "Binary file skipped" in src
+
+
+def test_app_builder_spawns_drop_privileges():
+    """app_manager + app_builder npm/expo spawns must drop to the sandbox uid
+    (preexec) and no longer inherit the full root os.environ."""
+    am = (_BACKEND / "app" / "agent" / "app_manager.py").read_text()
+    assert "sandbox_preexec" in am and "preexec_fn=sandbox_preexec()" in am
+    assert "os.chown(APPS_DIR" in am
+    skill = (_BACKEND / "app" / "agent" / "skills" / "builtins" / "app_builder" / "skill.py").read_text()
+    assert "sandbox_preexec" in skill
+    assert '{**os.environ, "EXPO_NO_TELEMETRY"' not in skill  # no raw root env
+
+
+def test_credits_ledger_and_v1_chat_alias_model():
+    cr = (_BACKEND / "app" / "api" / "credits.py").read_text()
+    assert "public_model_label" in cr and "public_provider_label" in cr
+    assert "model=r.model, provider=r.provider" not in cr
+    v1 = (_BACKEND / "app" / "api" / "api_v1.py").read_text()
+    # non-streaming ChatResponse must not pass the raw model straight through
+    assert "model=response.model," not in v1
+
+
+def test_tool_descriptions_scrubbed_at_runtime():
+    ar = (_BACKEND / "app" / "agent" / "agent_runner.py").read_text()
+    assert "_scrub_tool_descriptions" in ar
+    # system prompt no longer names the browser engine / db brand
+    assert "headless Chromium" not in ar
+    assert "tenant PostgreSQL database" not in ar
+
+
+def test_web_fetch_has_ssrf_guard():
+    rd = (_BACKEND / "app" / "agent" / "smart_fetch" / "reader.py").read_text()
+    assert "_assert_public_url" in rd
+    assert "is_private" in rd and "is_link_local" in rd
+    assert "follow_redirects=False" in rd  # redirects guarded per hop

@@ -96,10 +96,23 @@ HEADER_TOUP_CHANNEL = "x-toup-channel"
 HEADER_REQUEST_ID = "x-request-id"
 HEADER_TRACEPARENT = "traceparent"
 
-# Channels the dispatcher knows about. An incoming header outside this
-# set is logged + clamped to "web" so a typo doesn't bypass the
-# voice/telegram default-deny on mutating tools.
-_KNOWN_CHANNELS = frozenset({"web", "mobile", "voice", "telegram", "whatsapp"})
+# Channels the dispatcher knows about. MUST stay a superset of every channel
+# name the connector_dispatcher deny-sets reference (_MUTATES_DEFAULT_DENY_CHANNELS
+# + _MUTATES_UNATTENDED_DENY_CHANNELS) — otherwise the unattended/autopilot deny is
+# silently bypassed because the transport rewrites e.g. "routine" → "web" BEFORE
+# the dispatcher's policy check ever sees it (docs/security/audit-2026.md — the
+# re-audit found the two sets had drifted, nulling the INJ-1 unattended deny).
+# Interactive channels first, then the unattended/automation channels.
+_KNOWN_CHANNELS = frozenset({
+    "web", "mobile", "voice", "telegram", "whatsapp",
+    "autopilot", "routine", "trigger", "heartbeat", "cron",
+    "agent_task", "email_briefing", "background",
+})
+# Fail-CLOSED clamp target for a genuinely-unknown channel: a member of the
+# unattended deny set, so an unrecognized value denies mutating connectors
+# rather than falling through to permissive "web". (Legit channels are all in
+# _KNOWN_CHANNELS above and pass through verbatim.)
+_UNKNOWN_CHANNEL_CLAMP = "background"
 
 
 def get_mcp_user_id() -> str:
@@ -207,17 +220,17 @@ class MCPAuthMiddleware:
             or "no-id"
         )
         # T1f: Channel header. Default "web" when missing — matches the
-        # majority case (browser-originated tool calls). Unknown values
-        # are clamped to "web" with WARN so a typo can't accidentally
-        # bypass the voice/telegram default-deny on mutating tools.
+        # majority case (browser-originated tool calls). A genuinely-unknown
+        # value FAILS CLOSED to a deny-set channel (not "web") so a typo/garbage
+        # value can't bypass the mutating-connector default-deny.
         raw_channel = (headers.get(HEADER_TOUP_CHANNEL) or "").strip().lower()
         if raw_channel and raw_channel not in _KNOWN_CHANNELS:
             logger.warning(
-                "MCP unknown channel %r → clamped to 'web' (path=%s, "
-                "request_id=%s)",
-                raw_channel, path, request_id,
+                "MCP unknown channel %r → clamped to %r (fail-closed) "
+                "(path=%s, request_id=%s)",
+                raw_channel, _UNKNOWN_CHANNEL_CLAMP, path, request_id,
             )
-            channel = "web"
+            channel = _UNKNOWN_CHANNEL_CLAMP
         elif raw_channel:
             channel = raw_channel
         else:

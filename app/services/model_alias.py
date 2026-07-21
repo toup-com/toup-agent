@@ -101,6 +101,8 @@ _STACK_TOKENS = [
     r"playwright", r"patchright", r"chromium", r"pgvector", r"postgresql",
     r"postgres", r"sqlite", r"redis", r"nginx", r"caddy", r"railway",
     r"supabase", r"baileys", r"libreoffice", r"hermes", r"expo",
+    # embedding subsystem names (the doctor tool emits these; re-audit)
+    r"minilm", r"sentence-transformers", r"text-embedding[\w.-]*",
 ]
 _STACK_RE = re.compile(r"\b(?:" + "|".join(_STACK_TOKENS) + r")\b", re.IGNORECASE)
 

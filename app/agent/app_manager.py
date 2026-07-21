@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # POOL_ADMIN_TOKEN / bot tokens (docs/security/audit-2026.md EXF-3, round-2
 # follow-up). scrubbed_environ() preserves PATH/HOME/npm/proxy/git vars so
 # builds are unaffected; DATABASE_URL is kept.
-from app.services.exec_env import scrubbed_environ
+from app.services.exec_env import scrubbed_environ, sandbox_preexec
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,13 @@ class AppManager:
         self._used_web_ports: Set[int] = set()
         self._public_ip: Optional[str] = None
         os.makedirs(APPS_DIR, exist_ok=True)
+        # The dropped app-builder uid (toup, 1000) must be able to write here;
+        # APPS_DIR is created by the root agent (audit EXF-3 completion).
+        try:
+            os.chown(APPS_DIR, 1000, 1000)
+        except (PermissionError, OSError):
+            pass
+
 
     async def _resolve_app_dir(self, app_id: str, app_dir: Optional[str] = None) -> str:
         """Resolve the canonical app directory for a given app.
@@ -134,6 +141,7 @@ class AppManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**scrubbed_environ(), "npm_config_yes": "true"},
+            preexec_fn=sandbox_preexec(),
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         output = (stdout or b"").decode() + (stderr or b"").decode()
@@ -190,6 +198,7 @@ class AppManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                preexec_fn=sandbox_preexec(),
             )
             try:
                 stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=NPM_INSTALL_TIMEOUT)
@@ -253,6 +262,7 @@ class AppManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=scrubbed_environ(),
+            preexec_fn=sandbox_preexec(),
         )
 
         try:
@@ -345,6 +355,7 @@ class AppManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "CI": "1"},
+            preexec_fn=sandbox_preexec(),
         )
 
         managed.metro_port = port
@@ -384,6 +395,7 @@ class AppManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
+            preexec_fn=sandbox_preexec(),
         )
 
         managed.web_port = port
@@ -520,6 +532,7 @@ class AppManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "CI": "1"},
+            preexec_fn=sandbox_preexec(),
         )
         managed.metro_port = metro_port
         managed.metro_process = metro_proc
@@ -533,6 +546,7 @@ class AppManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
+            preexec_fn=sandbox_preexec(),
         )
         managed.web_port = web_port
         managed.web_process = web_proc
@@ -983,6 +997,7 @@ export default supabase;
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            preexec_fn=sandbox_preexec(),
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         output = (stdout or b"").decode()

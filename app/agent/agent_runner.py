@@ -178,6 +178,39 @@ def _credits_for_llm_call(model: str, tokens_in: int, tokens_out: int) -> float:
         return 0.0
 
 
+def _scrub_tool_descriptions(tool_defs: list) -> list:
+    """Return a copy of the tool-def list with provider/model/stack names
+    removed from every human-readable ``description`` (top-level + nested
+    input_schema property descriptions). enum/name/required/type are left
+    intact because they are load-bearing tool-call parameters. Gated by the
+    caller on ``security_leak_filter`` (audit-2026 MI-5, re-audit backstop)."""
+    import copy
+    from app.services.model_alias import scrub_provider_names, scrub_stack_terms
+
+    def _clean(text):
+        if isinstance(text, str) and text:
+            return scrub_stack_terms(scrub_provider_names(text))
+        return text
+
+    out = []
+    for td in tool_defs:
+        try:
+            t = copy.deepcopy(td)
+            if isinstance(t, dict):
+                if "description" in t:
+                    t["description"] = _clean(t.get("description"))
+                schema = t.get("input_schema")
+                props = schema.get("properties") if isinstance(schema, dict) else None
+                if isinstance(props, dict):
+                    for _k, spec in props.items():
+                        if isinstance(spec, dict) and "description" in spec:
+                            spec["description"] = _clean(spec.get("description"))
+            out.append(t)
+        except Exception:
+            out.append(td)  # never break tool assembly over a scrub hiccup
+    return out
+
+
 class AgentRunner:
     """
     Runs the agentic loop:  user message → (LLM ↔ tools)* → final response.
@@ -199,6 +232,14 @@ class AgentRunner:
         self._core_tool_defs = get_agent_tools() + get_extended_tools()
         if getattr(settings, "feature_doc_generation", False):
             self._core_tool_defs += get_doc_generation_tools()
+        # White-label backstop: the tool schema is sent to the model on every
+        # turn, and some tool DESCRIPTIONS name the underlying provider/model/
+        # stack ("Claude Vision", "gpt-4o-mini-tts", "Chromium"). Scrub those
+        # tokens out of description text (never enum/name/required, which are
+        # load-bearing) so the identity anchor isn't the sole defense and future
+        # tools can't regress this (docs/security/audit-2026.md MI-5, re-audit).
+        if getattr(settings, "security_leak_filter", False):
+            self._core_tool_defs = _scrub_tool_descriptions(self._core_tool_defs)
         self.max_iterations = settings.agent_max_tool_iterations
         self._session_model_override: Optional[str] = None  # Per-session model
         self._current_lane: str = 'main'  # Active execution lane
@@ -2130,7 +2171,7 @@ class AgentRunner:
             "After building or restarting, offer `[[open_app:<slug>]]` so "
             "they can tap to see it.\n\n"
             "### Live Browser (lives at `/browser`)\n"
-            "You have a real headless Chromium via the `browser` tool. You "
+            "You have a real headless browser via the `browser` tool. You "
             "can search, navigate, click, type, scroll, screenshot. The user "
             "watches you do it live at `/browser`. Use it for: real-time "
             "research, shopping comparisons, bookings, sign-ups, form "
@@ -2582,7 +2623,7 @@ class AgentRunner:
                         "Connector tools return STRUCTURED error variants. "
                         "When you see one, surface it cleanly to the user "
                         "— do NOT try the `browser` tool as a fallback "
-                        "(it will fail; Chromium is not installed in your "
+                        "(it will fail; the browser engine is not installed in your "
                         "runtime):\n"
                         "- `[reauth_required] Reconnect at <URL>` — tell "
                         "the user ONE short line (e.g. \"Gmail's still "
@@ -2623,7 +2664,7 @@ class AgentRunner:
             "This means:\n"
             "- **Terminal access**: Your `exec` tool runs shell commands directly on THIS machine. "
             "You have full access to the filesystem, system tools, package managers, and services.\n"
-            "- **Database access**: You have direct access to your tenant PostgreSQL database via "
+            "- **Database access**: You have direct access to your tenant database via "
             "`memory_store`, `memory_search`, and other tools. You can also query it via `exec` with psql.\n"
             "- **File system**: You can read, write, and edit files anywhere on this machine using "
             "`read_file`, `write_file`, `edit_file`, `ls`, `find`, `grep`.\n"

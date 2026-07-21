@@ -11,8 +11,11 @@ No API keys needed. No CAPTCHA. Works on 95% of websites.
 """
 
 import logging
+import ipaddress
 import re
+import socket
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,6 +24,49 @@ from app.config import settings
 from app.agent.smart_fetch._cache import TTLCache
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_public_url(url: str) -> None:
+    """SSRF guard (docs/security/audit-2026.md, re-audit): web_fetch only ever
+    needs the public internet. Reject any URL whose host resolves to a
+    private / loopback / link-local / metadata / CGNAT address so injected
+    content can't point the agent at internal services (cloud metadata, the
+    docker-bridge pgbouncer, another tenant's container, the bridge admin API).
+    Called on the initial URL AND on every redirect hop."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"web_fetch: unsupported URL scheme {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("web_fetch: URL has no host")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as e:
+        raise ValueError(f"web_fetch: cannot resolve host {host!r}: {e}")
+    _cgnat = ipaddress.ip_network("100.64.0.0/10")  # CGNAT / Tailscale range
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+                or (ip.version == 4 and ip in _cgnat)):
+            raise ValueError(
+                f"web_fetch: refusing to fetch internal address {ip} (host {host!r})")
+
+
+async def _guarded_get(client: "httpx.AsyncClient", url: str, headers: dict,
+                       max_redirects: int = 5) -> "httpx.Response":
+    """GET with the SSRF guard applied to the initial URL and every redirect
+    hop (client must be created with follow_redirects=False)."""
+    current = url
+    for _ in range(max_redirects + 1):
+        _assert_public_url(current)
+        resp = await client.get(current, headers=headers)
+        if resp.is_redirect and resp.headers.get("location"):
+            current = urljoin(current, resp.headers["location"])
+            continue
+        return resp
+    raise ValueError("web_fetch: too many redirects")
 
 # Per-tenant TTL+LRU cache of extracted page text, keyed on (requested url,
 # max_chars) and the final post-redirect url. Cleared on /admin/bind
@@ -162,10 +208,10 @@ async def toup_read_page(url: str, max_chars: int = 15000) -> str:
     try:
         async with httpx.AsyncClient(
             timeout=20,
-            follow_redirects=True,
+            follow_redirects=False,  # redirects are followed manually, guarded per hop
             max_redirects=5,
         ) as client:
-            resp = await client.get(url, headers=_HEADERS)
+            resp = await _guarded_get(client, url, _HEADERS, max_redirects=5)
             resp.raise_for_status()
 
         content_type = resp.headers.get("content-type", "")

@@ -225,13 +225,19 @@ async def api_chat(
             model_override=req.model,
         )
 
+        # Alias the model id like the SSE sibling + messages endpoint
+        # (docs/security/audit-2026.md MI-2, re-audit found this non-stream path).
+        _resp_model = response.model
+        if settings.security_leak_filter and _resp_model:
+            from app.services.model_alias import public_model_label
+            _resp_model = public_model_label(_resp_model)
         return ChatResponse(
             text=response.text,
             session_id=response.session_id,
             tokens_input=response.tokens_input,
             tokens_output=response.tokens_output,
             tokens_total=response.tokens_total,
-            model=response.model,
+            model=_resp_model,
             tool_calls=len(response.tool_calls),
             processing_time_ms=response.processing_time_ms,
         )

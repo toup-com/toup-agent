@@ -3233,6 +3233,13 @@ class ToolExecutor:
 
         if os.path.isfile(search_path):
             try:
+                # Binary/pseudo-file guard (parity with read_file): a NUL-bearing
+                # file like /proc/*/environ is one giant "line" that would dump
+                # its whole content on a match — skip it. (The path jail in
+                # _resolve_path already blocks /proc etc.; this is belt-and-braces.)
+                with open(search_path, 'rb') as _bf:
+                    if b"\x00" in _bf.read(8192):
+                        return f"Binary file skipped: {os.path.basename(search_path)}"
                 with open(search_path, 'r', encoding='utf-8', errors='replace') as f:
                     for lineno, line in enumerate(f, 1):
                         if compiled.search(line):
@@ -3985,15 +3992,52 @@ class ToolExecutor:
     # Helpers
     # ------------------------------------------------------------------
     def _resolve_path(self, path: str) -> str:
-        """Resolve a path relative to the session workspace (or user workspace) if not absolute."""
+        """Resolve a path relative to the session workspace (or user workspace) if not absolute.
+
+        Path jail (docs/security/audit-2026.md EXF-3 completion): the agent
+        process runs as ROOT, and the in-process file tools (read_file, grep,
+        ls, find, write_file, edit_file, send_file) call this — so without a
+        guard they can read the platform source at /app or the agent's own
+        secrets via /proc/<pid>/environ, which the EXEC_SANDBOX_USER drop only
+        blocks for *subprocess* children, not these in-process opens. We block
+        the sensitive targets after realpath (so `..`/symlink escapes are
+        caught) while leaving the workspace, the app-builder dir, /tmp and the
+        agent home fully usable.
+        """
         base = getattr(self, '_session_workspace', None) or self._get_user_workspace()
         if not path:
             return base
         # Expand ~ to the user's home directory
         path = os.path.expanduser(path)
-        if os.path.isabs(path):
-            return path
-        return os.path.join(base, path)
+        resolved = path if os.path.isabs(path) else os.path.join(base, path)
+        self._guard_path(resolved, base)
+        return resolved
+
+    def _guard_path(self, resolved: str, base: str) -> None:
+        """Raise PermissionError if `resolved` escapes into a protected area.
+        Anything under the session/user workspace is always allowed."""
+        try:
+            rp = os.path.realpath(resolved)
+            base_rp = os.path.realpath(base)
+        except Exception:
+            return  # never hard-fail path resolution on a realpath hiccup
+        if rp == base_rp or rp.startswith(base_rp + os.sep):
+            return  # inside the workspace — fine
+        # Process env + kernel pseudo-filesystems: secrets live in /proc/*/environ.
+        for d in ("/proc", "/sys", "/dev"):
+            if rp == d or rp.startswith(d + os.sep):
+                raise PermissionError(f"path {resolved!r} is not accessible (system path)")
+        # Platform source ships in /app; only the workspace + skills subtrees are ok.
+        if rp == "/app" or (rp.startswith("/app" + os.sep)
+                            and not rp.startswith("/app/skills")
+                            and not rp.startswith("/app/workspace")):
+            raise PermissionError(f"path {resolved!r} is not accessible (platform source)")
+        # Other sensitive host areas the agent has no reason to read.
+        for d in ("/root", "/boot", "/etc/ssl/private", "/run/secrets", "/var/run/secrets"):
+            if rp == d or rp.startswith(d + os.sep):
+                raise PermissionError(f"path {resolved!r} is not accessible (system path)")
+        if rp.endswith("/.ssh") or "/.ssh/" in rp or rp.endswith("/shadow"):
+            raise PermissionError(f"path {resolved!r} is not accessible (credentials)")
 
     def set_user_id(self, user_id: str):
         """Set the current user ID for memory tools.

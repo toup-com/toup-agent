@@ -186,11 +186,26 @@ async def get_credit_ledger(
     if event_id:
         stmt = stmt.where(CreditLedger.event_id == event_id)
     rows = (await db.execute(stmt)).scalars().all()
+
+    # White-label: alias the real model id + provider name before they leave the
+    # API — the ledger feeds the mobile Credits screen (docs/security/audit-2026.md
+    # MI-2, re-audit). Flag-gated; token/amount fields are untouched.
+    from app.config import settings as _settings
+    _leak = _settings.security_leak_filter
+    if _leak:
+        from app.services.model_alias import public_model_label, public_provider_label
+
+    def _m(v):
+        return public_model_label(v) if (_leak and v) else v
+
+    def _p(v):
+        return public_provider_label(v) if (_leak and v) else v
+
     return LedgerResponse(rows=[
         LedgerRow(
             id=r.id, event_type=r.event_type, bucket=r.bucket,
             amount=float(r.amount), balance_after=float(r.balance_after),
-            event_id=r.event_id, model=r.model, provider=r.provider,
+            event_id=r.event_id, model=_m(r.model), provider=_p(r.provider),
             created_at=r.created_at,
         ) for r in rows
     ])

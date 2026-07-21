@@ -38,6 +38,10 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.skills.base import Skill, SkillContext, SkillMeta
+# EXF-3 completion: app-builder subprocesses must scrub secrets AND drop to
+# the toup uid, else npm/expo lifecycle scripts run as root and can read
+# /proc/1/environ (docs/security/audit-2026.md).
+from app.services.exec_env import scrubbed_environ, sandbox_preexec
 
 logger = logging.getLogger(__name__)
 
@@ -2172,6 +2176,7 @@ class AppBuilderSkill(Skill):
                                 proc = await asyncio.create_subprocess_exec(
                                     *install_cmd, cwd=app_dir,
                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                                    env=scrubbed_environ(), preexec_fn=sandbox_preexec(),
                                 )
                                 await asyncio.wait_for(proc.communicate(), timeout=120)
                             except Exception as dep_err:
@@ -2263,6 +2268,7 @@ class AppBuilderSkill(Skill):
                                     "npx", "expo", "start", "--clear", "--web", "--port", str(web_port),
                                     cwd=app_dir,
                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                                    env=scrubbed_environ(), preexec_fn=sandbox_preexec(),
                                 )
                                 # Don't wait for it to finish — just start it and let the next round check
                                 await asyncio.sleep(8)
@@ -2294,6 +2300,7 @@ class AppBuilderSkill(Skill):
                                 cwd=app_dir,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.STDOUT,
+                                env=scrubbed_environ(), preexec_fn=sandbox_preexec(),
                             )
                             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
                             output = stdout.decode("utf-8", errors="replace") if stdout else ""
@@ -4947,7 +4954,8 @@ const _webDb = {
                 cwd=app_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, "EXPO_NO_TELEMETRY": "1"},
+                env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1"},
+                preexec_fn=sandbox_preexec(),
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
             output = stdout.decode("utf-8", errors="replace") if stdout else ""
@@ -4987,7 +4995,8 @@ const _webDb = {
                 cwd=app_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, "EXPO_NO_TELEMETRY": "1"},
+                env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1"},
+                preexec_fn=sandbox_preexec(),
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
             if proc.returncode == 0:
