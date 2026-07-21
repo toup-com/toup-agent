@@ -1470,3 +1470,196 @@ async def test_plain_progress_still_restarts_preempted_card(monkeypatch):
     assert result == "suppressed:progress_in_app_only"
     events = [s["payload"]["aps"]["event"] for s in sent]
     assert events == ["start"]  # silent self-heal restart preserved
+
+
+# ── Alarm-class rows: ring-until-acked chain ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_alarm_fire_rings_open_card_and_chains_next_ring(monkeypatch):
+    """Ring 1 of a reminder fire: alerting update with the DEFAULT
+    tone (iOS has never honored a named sound on a Live Activity push
+    alert — the producer's file must never reach the wire), card left
+    OPEN, and the next ring booked as an LA-only row one gap out."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    monkeypatch.setattr(
+        nd.expo_push, "send_push_messages",
+        lambda msgs: (_ for _ in ()).throw(AssertionError("no expo devices")),
+    )
+
+    async def fake_fallback(db, row):
+        return {"status": "skipped", "reason": "no_active_agent"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fake_fallback)
+
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started",
+        data_json={"mission_id": "reminder:r1", "mission_title": "⏰ Ring",
+                   "silent": True},
+    ))
+    sent.clear()
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_completed", title="⏰ Ring — now",
+        body="Deep probe", priority="high",
+        data_json={"mission_id": "reminder:r1", "mission_title": "⏰ Ring",
+                   "sound": "toup_alarm.caf", "dismiss_after_s": 120,
+                   "subtitle": "Deep probe"},
+    ))
+    assert result == "sent"
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["update"]  # card stays OPEN for ring 2 / the ack
+    aps = sent[0]["payload"]["aps"]
+    assert aps["alert"]["title"] == "⏰ Ring — now"
+    assert aps["alert"]["sound"] == "default"
+
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "reminder:r1")
+        )).scalars().one()
+        assert la.status == LA_STARTED
+        ring2 = (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.idempotency_key == "alarm-ring:reminder:r1:2",
+            )
+        )).scalars().one()
+        assert ring2.data_json["realert_seq"] == 2
+        assert ring2.data_json["la_only"] is True
+        assert ring2.data_json["no_agent_fallback"] is True
+        assert ring2.scheduled_for is not None
+        assert ring2.event_kind == "mission_completed"
+        assert ring2.title == "⏰ Ring — now"
+
+
+@pytest.mark.asyncio
+async def test_alarm_last_ring_ends_card_and_stops_chain(monkeypatch):
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started",
+        data_json={"mission_id": "reminder:r1", "mission_title": "⏰ Ring",
+                   "silent": True},
+    ))
+    sent.clear()
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_completed", title="⏰ Ring — now",
+        priority="high",
+        data_json={"mission_id": "reminder:r1", "mission_title": "⏰ Ring",
+                   "sound": "toup_alarm.caf", "dismiss_after_s": 120,
+                   "realert_seq": 3, "la_only": True,
+                   "no_agent_fallback": True},
+    ))
+    assert result == "sent"
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["update", "end"]  # final ring closes the card
+    assert sent[0]["payload"]["aps"]["alert"]["sound"] == "default"
+    assert "alert" not in sent[1]["payload"]["aps"]
+
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "reminder:r1")
+        )).scalars().one()
+        assert la.status == LA_ENDED
+        ring4 = (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.idempotency_key == "alarm-ring:reminder:r1:4",
+            )
+        )).scalars().all()
+        assert ring4 == []
+
+
+@pytest.mark.asyncio
+async def test_realert_after_ack_stays_silent(monkeypatch):
+    """The ack (or a user swipe) ended the card between rings: a
+    chained ring must NOT loud-restart it, must NOT fall back to
+    Expo/chat, and must NOT book another ring — suppressed quietly."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    monkeypatch.setattr(
+        nd.expo_push, "send_push_messages",
+        lambda msgs: (_ for _ in ()).throw(AssertionError("expo must not fire")),
+    )
+
+    async def fail_fallback(db, row):
+        raise AssertionError("agent fallback must not fire")
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fail_fallback)
+
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started",
+        data_json={"mission_id": "reminder:r1", "mission_title": "⏰ Ring",
+                   "silent": True},
+    ))
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "reminder:r1")
+        )).scalars().one()
+        la.status = LA_ENDED
+        la.ended_at = datetime.utcnow()
+        await db.commit()
+    sent.clear()
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_completed", title="⏰ Ring — now",
+        priority="high",
+        data_json={"mission_id": "reminder:r1", "mission_title": "⏰ Ring",
+                   "sound": "toup_alarm.caf", "realert_seq": 2,
+                   "la_only": True, "no_agent_fallback": True},
+    ))
+    assert result == "suppressed:la_only_undeliverable"
+    assert sent == []
+
+    async with async_session_maker() as db:
+        ring3 = (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.idempotency_key == "alarm-ring:reminder:r1:3",
+            )
+        )).scalars().all()
+        assert ring3 == []
+
+
+@pytest.mark.asyncio
+async def test_plain_completed_does_not_chain_rings(monkeypatch):
+    """Non-alarm terminal rows keep the classic single-bang contract:
+    alerting update + bannerless end, no follow-up ring rows."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    async def fake_fallback(db, row):
+        return {"status": "skipped", "reason": "no_active_agent"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fake_fallback)
+
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+    await _claim_and_dispatch(await _enqueue(user_id, event_kind="mission_started"))
+    sent.clear()
+
+    result = await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_completed", title="✅ Done",
+        priority="default",
+        data_json={"mission_id": "m-1", "mission_title": "T", "progress": 100},
+    ))
+    assert result == "sent"
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["update", "end"]
+
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        rings = (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.idempotency_key.like("alarm-ring:%"),
+            )
+        )).scalars().all()
+        assert rings == []

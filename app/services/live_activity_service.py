@@ -23,6 +23,16 @@ Activity pushes:
                         start itself carries the alert (loud restart)
                         and both follow-ups go bannerless — exactly
                         one audible alert per terminal row.
+                        ALARM-CLASS rows (``data.sound``/``data.alarm``
+                        — reminder fires) ring up to _ALARM_MAX_RINGS
+                        times: each ring but the last leaves the card
+                        open and chains an LA-only follow-up row one
+                        gap out; the tap ack ends the card and
+                        suppresses queued rings; the last ring closes
+                        the card. Alert sounds are ALWAYS the system
+                        default tone — iOS has never honored a named
+                        sound on a Live Activity push alert (silence,
+                        not fallback).
 
 ONE ACTIVITY PER DEVICE — the load-bearing correctness rule. Apple
 leaves the behavior of multiple concurrent activities sharing one
@@ -189,14 +199,83 @@ def _dismissal_date(row: NotificationQueue, now: datetime) -> Optional[int]:
     return None
 
 
-def _alert_sound(row: NotificationQueue) -> Optional[str]:
-    """Producer-chosen bundled alert sound (reminder fires pass
-    'toup_alarm.caf'); None keeps the system default. Bundled file
-    names only — path-ish values are dropped."""
-    raw = (row.data_json or {}).get("sound")
-    if isinstance(raw, str) and raw and "/" not in raw and len(raw) <= 64:
+# ── Alarm-class rows ──────────────────────────────────────────────
+# data.sound (reminder fires send 'toup_alarm.caf') marks a row
+# ALARM-CLASS; the named file itself is NEVER put on the wire. iOS
+# has never honored a custom named sound on an ActivityKit push
+# alert — the result is total silence, not a fallback to default
+# (verified on the founder's device 2026-07-20/21 with the file in
+# both the app and widget-extension bundles; Apple forums thread
+# 718659 reports exactly this since Oct 2022, unanswered, and every
+# production payload ever verified audible uses "default"). So the
+# alert always plays the system default tone, and alarm-class rows
+# compensate by RE-RINGING: each ring but the last leaves the card
+# open and chains an LA-only follow-up row one gap out; the tap ack
+# (live_activity_devices /ack) ends the card and suppresses the
+# queued rings, and the last ring closes the card itself. True alarm
+# audio that breaks the silent switch/Focus is out of reach for Live
+# Activities BY DESIGN — that tier is AlarmKit (iOS 26), a separate
+# app-side project.
+_ALARM_MAX_RINGS = 3
+_ALARM_RING_GAP = timedelta(seconds=20)
+
+
+def _is_alarm_row(row: NotificationQueue) -> bool:
+    data = row.data_json or {}
+    return bool(data.get("sound") or data.get("alarm"))
+
+
+def _realert_seq(row: NotificationQueue) -> int:
+    """1 on the original terminal row; 2.. on chained ring rows."""
+    raw = (row.data_json or {}).get("realert_seq")
+    if isinstance(raw, int) and raw >= 1:
         return raw
-    return None
+    return 1
+
+
+def _alarm_rings(row: NotificationQueue) -> int:
+    """Total rings for this row's mission: alarm-class rows ring
+    _ALARM_MAX_RINGS times, everything else exactly once."""
+    return _ALARM_MAX_RINGS if _is_alarm_row(row) else 1
+
+
+async def _enqueue_next_ring(
+    db, row: NotificationQueue, mission_id: str, next_seq: int, now: datetime,
+) -> bool:
+    """Chain the next alarm ring as its own queue row: LA-only,
+    scheduled one gap out, idempotent per (mission, seq) so a partial
+    -failure retry of this row can never double-book a ring. The
+    caller's end-of-lane commit persists it."""
+    idem = f"alarm-ring:{mission_id}:{next_seq}"
+    existing = await db.execute(
+        select(NotificationQueue.id).where(
+            NotificationQueue.user_id == row.user_id,
+            NotificationQueue.idempotency_key == idem,
+        )
+    )
+    if existing.scalar_one_or_none() is not None:
+        return False
+    data = dict(row.data_json or {})
+    data.update({
+        "realert_seq": next_seq,
+        # Re-rings only re-sound the card — the first ring already
+        # carried the Expo copy and the agent's own channel fan-out.
+        "la_only": True,
+        "no_agent_fallback": True,
+    })
+    db.add(NotificationQueue(
+        id=str(uuid.uuid4()),
+        user_id=row.user_id,
+        source="platform",
+        event_kind=row.event_kind,
+        title=row.title,
+        body=row.body,
+        data_json=data,
+        priority=row.priority,
+        scheduled_for=now + _ALARM_RING_GAP,
+        idempotency_key=idem,
+    ))
+    return True
 
 
 def _mission_title(row: NotificationQueue) -> str:
@@ -396,7 +475,6 @@ async def _send_start(
         timer_end_ms=timer_ms,
         alert_title=None if silent else row.title,
         alert_body=None if silent else row.body,
-        alert_sound=None if silent else _alert_sound(row),
         timestamp=int(now.timestamp()),
         deep_link=deep_link,
         timer_type=timer_type if timer_type in ("circular", "digital") else None,
@@ -579,6 +657,11 @@ async def handle_notification_row(
         or (
             row.event_kind in _START_IF_MISSING_KINDS
             and not (row.data_json or {}).get("silent")
+            # A re-ring never resurrects a card: ring 1 restarts (a
+            # fire must always alert), but if the card is gone by
+            # ring 2+ the user closed or acked it — silence is the
+            # correct outcome, not a fresh card.
+            and _realert_seq(row) == 1
         )
     ):
         # Self-healing: the card was preempted by a newer task (or the
@@ -675,6 +758,13 @@ async def handle_notification_row(
             _subtitle = _data.get("subtitle") if isinstance(_data.get("subtitle"), str) else None
             final_subtitle = _subtitle or ("Completed ✓" if done else "Stopped — needs attention")
             final_progress = 1.0 if done else effective
+            # Alarm-class rows ring more than once: every ring except
+            # the last is an alerting UPDATE that leaves the card open
+            # (already showing the fired state) for the next chained
+            # ring row — or for the tap ack, which ends the card and
+            # suppresses the remaining rings. Only the last ring
+            # closes the card.
+            _last_ring = _silent_end or _realert_seq(row) >= _alarm_rings(row)
             # The audible banner rides an alerting UPDATE (Apple's
             # documented alert surface — the end-event alert is
             # undocumented and proved unreliable on iOS 26), then a
@@ -688,51 +778,68 @@ async def handle_notification_row(
                     title=title, subtitle=final_subtitle,
                     progress=final_progress,
                     alert_title=row.title, alert_body=row.body,
-                    alert_sound=_alert_sound(row),
                     timestamp=int(now.timestamp()),
                 )
                 upd_result = await _send_to_activity(
                     db, la, device, upd, priority=10, now=now,
                 )
                 alerted = upd_result["status"] == "ok"
-            payload = apns_push.build_end_payload(
-                title=title,
-                subtitle=final_subtitle,
-                progress=final_progress,
-                # Fallback only: if neither the loud start nor the
-                # alerting update got through, the end keeps the alert
-                # rather than closing the card silently.
-                alert_title=None if (_silent_end or alerted) else row.title,
-                alert_body=None if (_silent_end or alerted) else row.body,
-                alert_sound=None if (_silent_end or alerted) else _alert_sound(row),
-                # Producer override, else 1h — a finished card must
-                # never linger the full system default 4h.
-                dismissal_date=_dismissal_date(row, now)
-                or int(now.timestamp()) + 3600,
-                timestamp=int(now.timestamp()),
-            )
-            result = await _send_to_activity(
-                db, la, device, payload, priority=10, now=now, end=True,
-            )
-            if upd_result and upd_result.get("preempted"):
-                # Ambiguity was resolved during the alerting update —
-                # keep the marker on the recorded fragment (ladebug).
-                result.setdefault("preempted", upd_result["preempted"])
-            if result["status"] != "ok" and alerted:
-                # The banner reached the device even though the close
-                # didn't — count the row delivered (the alert is the
-                # job; the card close is hygiene), and close the DB row
-                # so it can't squat the one-activity-per-device slot.
-                la.status = LA_ENDED
-                la.ended_at = now
-                la.updated_at = now
-                result = {**result, "alerted": True}
-                delivered = True
+            if not _last_ring:
+                # Loud restart counts as this ring's bang: the card is
+                # freshly started in fired state, nothing else to send.
+                result = upd_result or {"status": "ok", "reason": "restart_alerted"}
+            else:
+                payload = apns_push.build_end_payload(
+                    title=title,
+                    subtitle=final_subtitle,
+                    progress=final_progress,
+                    # Fallback only: if neither the loud start nor the
+                    # alerting update got through, the end keeps the alert
+                    # rather than closing the card silently.
+                    alert_title=None if (_silent_end or alerted) else row.title,
+                    alert_body=None if (_silent_end or alerted) else row.body,
+                    # Producer override, else 1h — a finished card must
+                    # never linger the full system default 4h.
+                    dismissal_date=_dismissal_date(row, now)
+                    or int(now.timestamp()) + 3600,
+                    timestamp=int(now.timestamp()),
+                )
+                result = await _send_to_activity(
+                    db, la, device, payload, priority=10, now=now, end=True,
+                )
+                if upd_result and upd_result.get("preempted"):
+                    # Ambiguity was resolved during the alerting update —
+                    # keep the marker on the recorded fragment (ladebug).
+                    result.setdefault("preempted", upd_result["preempted"])
+                if result["status"] != "ok" and alerted:
+                    # The banner reached the device even though the close
+                    # didn't — count the row delivered (the alert is the
+                    # job; the card close is hygiene), and close the DB row
+                    # so it can't squat the one-activity-per-device slot.
+                    la.status = LA_ENDED
+                    la.ended_at = now
+                    la.updated_at = now
+                    result = {**result, "alerted": True}
+                    delivered = True
 
         if result["status"] == "ok" and effective is not None:
             la.last_progress = int(effective * 100)
         per_device[device.id] = result
         delivered = delivered or result["status"] == "ok"
+
+    # Alarm chain: once THIS ring reached a device, book the next one.
+    # Gated on delivered so a failed ring retries via the row's own
+    # backoff instead of forking the chain; the idempotency key makes
+    # the booking safe to repeat on partial-failure retries.
+    if (
+        delivered
+        and row.event_kind in (NOTIFY_KIND_MISSION_COMPLETED,
+                               NOTIFY_KIND_MISSION_FAILED)
+        and _is_alarm_row(row)
+        and not bool((row.data_json or {}).get("silent"))
+        and _realert_seq(row) < _alarm_rings(row)
+    ):
+        await _enqueue_next_ring(db, row, mission_id, _realert_seq(row) + 1, now)
 
     try:
         await db.commit()

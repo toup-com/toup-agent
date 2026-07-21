@@ -555,6 +555,37 @@ async def _dispatch_row(db, row_id: str, now: datetime) -> str:
         channels["live_activity"] = la
         la_delivered = bool(la.get("delivered"))
 
+    # Alarm re-rings (data.la_only, chained by the LA lane) exist ONLY
+    # to re-sound the on-screen card — the first ring already carried
+    # the Expo copy and the agent's own channel fan-out. Deliver,
+    # retry, or suppress quietly; never a second Expo/chat delivery.
+    if (row.data_json or {}).get("la_only"):
+        if la_delivered:
+            await _finalize(db, row_id, NQ_SENT, now, channels=channels, sent=True)
+            return "sent"
+        if (
+            la is not None
+            and la.get("status") == "error"
+            and row.attempts < settings.notification_max_attempts
+        ):
+            backoff = min(
+                _RETRY_BACKOFF_BASE * (4 ** max(0, row.attempts - 1)),
+                _RETRY_BACKOFF_CAP,
+            )
+            await _finalize(
+                db, row_id, NQ_QUEUED, now,
+                channels=channels,
+                last_error="live_activity_send_failed",
+                scheduled_for=now + backoff,
+            )
+            return "retry_scheduled"
+        await _finalize(
+            db, row_id, NQ_SUPPRESSED, now,
+            channels={**channels,
+                      "policy": {"suppressed": "la_only_undeliverable"}},
+        )
+        return "suppressed:la_only_undeliverable"
+
     devices = await _active_devices(db, row.user_id)
     if devices:
         messages = [
