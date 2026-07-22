@@ -1244,6 +1244,16 @@ class ToolExecutor:
         if not url:
             return "ERROR: url is required"
 
+        # SSRF guard up front — BEFORE either the httpx reader or the browser
+        # fallback — so a blocked internal URL returns an error instead of the
+        # reader's ValueError falling through to an unguarded headless-browser
+        # goto (re-audit round 6 found that bypass).
+        try:
+            from app.agent.smart_fetch.reader import _assert_public_url
+            _assert_public_url(url)
+        except ValueError as _ssrf:
+            return f"ERROR: {_ssrf}"
+
         # ── API-first: httpx + readability extraction (no browser, no CAPTCHA) ──
         try:
             from app.agent.smart_fetch.reader import toup_read_page
@@ -3141,6 +3151,16 @@ class ToolExecutor:
         if not url:
             return "ERROR: 'url' is required"
 
+        # SSRF guard — never let the container browser be pointed at internal
+        # services (cloud metadata, the docker-bridge pgbouncer, another
+        # tenant's container, the bridge admin API) by injected content
+        # (re-audit round 6; web_fetch's guard did not cover this tool).
+        try:
+            from app.agent.smart_fetch.reader import _assert_public_url
+            _assert_public_url(url)
+        except ValueError as _ssrf:
+            return f"ERROR: {_ssrf}"
+
         try:
             from app.agent import browser as browser_svc
         except ImportError:
@@ -3221,6 +3241,14 @@ class ToolExecutor:
                     fpath = os.path.join(dirpath, fname)
                     files_searched += 1
                     try:
+                        # Per-file jail: a symlink under the workspace could point
+                        # at /proc/*/environ or /app source; realpath+guard rejects
+                        # it (re-audit round 6 — the walk bypassed the root jail).
+                        self._guard_path(fpath, search_path)
+                        # NUL/binary guard so a pseudo-file can't be line-dumped.
+                        with open(fpath, 'rb') as _bf:
+                            if b"\x00" in _bf.read(8192):
+                                continue
                         with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                             for lineno, line in enumerate(f, 1):
                                 if compiled.search(line):
@@ -4013,31 +4041,44 @@ class ToolExecutor:
         self._guard_path(resolved, base)
         return resolved
 
+    def _allowed_path_roots(self, base: str) -> list:
+        """Realpath'd roots the file tools may touch: the workspace(s), the
+        app-builder dir, /tmp and the agent home. Deny-by-default everything
+        else (allow-list — the only robust jail when the agent is root)."""
+        candidates = [
+            base,
+            getattr(self, "_session_workspace", None),
+            self._get_user_workspace(),
+            "/app/workspace", "/app/skills",
+            os.environ.get("TOUP_APPS_DIR", "/opt/toup-agent/apps"),
+            "/tmp", "/home/toup",
+        ]
+        roots = []
+        for p in candidates:
+            if not p:
+                continue
+            try:
+                roots.append(os.path.realpath(p))
+            except Exception:
+                pass
+        return roots
+
     def _guard_path(self, resolved: str, base: str) -> None:
-        """Raise PermissionError if `resolved` escapes into a protected area.
-        Anything under the session/user workspace is always allowed."""
+        """Raise PermissionError unless `resolved` — after realpath, so symlink
+        and ``..`` escapes are resolved — lives under an ALLOWED root. This is
+        deny-by-default: reading /proc/*/environ (secrets), /app source, /etc,
+        /root, or a symlink pointing at any of them is rejected, whether named
+        directly OR reached via a recursive grep/find/ls walk. The agent runs
+        as root so permission bits don't protect these — the jail does
+        (docs/security/audit-2026.md EXF-3, re-audit round 6)."""
         try:
             rp = os.path.realpath(resolved)
-            base_rp = os.path.realpath(base)
         except Exception:
-            return  # never hard-fail path resolution on a realpath hiccup
-        if rp == base_rp or rp.startswith(base_rp + os.sep):
-            return  # inside the workspace — fine
-        # Process env + kernel pseudo-filesystems: secrets live in /proc/*/environ.
-        for d in ("/proc", "/sys", "/dev"):
-            if rp == d or rp.startswith(d + os.sep):
-                raise PermissionError(f"path {resolved!r} is not accessible (system path)")
-        # Platform source ships in /app; only the workspace + skills subtrees are ok.
-        if rp == "/app" or (rp.startswith("/app" + os.sep)
-                            and not rp.startswith("/app/skills")
-                            and not rp.startswith("/app/workspace")):
-            raise PermissionError(f"path {resolved!r} is not accessible (platform source)")
-        # Other sensitive host areas the agent has no reason to read.
-        for d in ("/root", "/boot", "/etc/ssl/private", "/run/secrets", "/var/run/secrets"):
-            if rp == d or rp.startswith(d + os.sep):
-                raise PermissionError(f"path {resolved!r} is not accessible (system path)")
-        if rp.endswith("/.ssh") or "/.ssh/" in rp or rp.endswith("/shadow"):
-            raise PermissionError(f"path {resolved!r} is not accessible (credentials)")
+            raise PermissionError(f"path {resolved!r} is not accessible")
+        for root in self._allowed_path_roots(base):
+            if rp == root or rp.startswith(root + os.sep):
+                return
+        raise PermissionError(f"path {resolved!r} is outside the allowed workspace")
 
     def set_user_id(self, user_id: str):
         """Set the current user ID for memory tools.

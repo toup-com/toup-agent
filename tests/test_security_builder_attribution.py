@@ -449,3 +449,49 @@ def test_web_fetch_has_ssrf_guard():
     assert "_assert_public_url" in rd
     assert "is_private" in rd and "is_link_local" in rd
     assert "follow_redirects=False" in rd  # redirects guarded per hop
+
+
+# ── Round 6: gaps the focused re-audit found (incl. round-5 regressions) ───
+
+
+def test_mcp_known_channels_include_orchestration_channels():
+    """The round-5 fail-closed clamp must NOT over-deny legit internal channels
+    (subagent/app_builder/…) — they pass through so the dispatcher applies its
+    normal policy (re-audit round 6 regression)."""
+    from app.mcp_auth import _KNOWN_CHANNELS
+    for ch in ("subagent", "app_builder", "netflix", "chat_intent", "app", "api", "agent"):
+        assert ch in _KNOWN_CHANNELS, f"legit channel {ch} would be wrongly clamped"
+
+
+def test_path_jail_is_allow_list_and_covers_walk():
+    """The file-tool jail is deny-by-default (allow-list) so grep path='/' or
+    '/etc' is rejected, and grep's recursive walk guards each file (symlink to
+    /proc can't leak) — re-audit round 6 CRITICAL."""
+    src = (_BACKEND / "app" / "agent" / "tool_executor.py").read_text()
+    assert "_allowed_path_roots" in src
+    assert "outside the allowed workspace" in src  # allow-list deny message
+    # grep's recursive walk guards each file before opening it.
+    assert "self._guard_path(fpath" in src
+
+
+def test_web_fetch_ssrf_guard_before_browser_fallback():
+    src = (_BACKEND / "app" / "agent" / "tool_executor.py").read_text()
+    fn = src.split("async def _tool_web_fetch", 1)[1].split("async def ", 1)[0]
+    # guard runs before the browser fallback (browser_fetch_enabled)
+    assert "_assert_public_url" in fn
+    assert fn.index("_assert_public_url") < fn.index("browser_fetch_enabled")
+
+
+def test_browser_tool_has_ssrf_guard():
+    src = (_BACKEND / "app" / "agent" / "tool_executor.py").read_text()
+    fn = src.split("async def _tool_browser(", 1)[1].split("async def ", 1)[0]
+    assert "_assert_public_url" in fn
+
+
+def test_tunnel_endpoints_gated():
+    src = (_BACKEND / "app" / "api" / "ws_agent_tunnel.py").read_text()
+    # tunnel_status now authenticates + refuses cross-tenant disclosure
+    st = src.split('async def tunnel_status(', 1)[1].split("@router", 1)[0]
+    assert "_authenticate_tunnel" in st and "never disclose another tenant" in st
+    # tunnel_debug no longer seeds tunnels_active before auth
+    assert 'result: dict = {"tunnels_active": list(_tunnels.keys())}' not in src

@@ -384,15 +384,38 @@ async def agent_tunnel_ws(
 
 
 @router.get("/agent/tunnel-status")
-async def tunnel_status(user_id: str = Query(None)):
-    """Check if a user's terminal agent is connected via tunnel.
+async def tunnel_status(
+    request: Request,
+    user_id: str = Query(None),
+    token: str = Query(None),
+):
+    """Check if the CALLER's own terminal agent is connected via tunnel.
 
-    Accepts user_id as query param (for authenticated API calls).
+    Authz (re-audit round 6 IDOR fix): the caller is derived from their own
+    bearer/token — another tenant's tunnel presence is NEVER disclosed. A
+    client-supplied ``user_id`` must equal the authenticated user or nothing is
+    returned. (Previously this took ``user_id`` from the query with no auth,
+    making it a cross-tenant presence oracle.)
     """
-    if not user_id:
-        return {"connected": False, "error": "user_id required"}
+    from app.api._ws_auth_helpers import log_deprecated_http_query_token
 
-    tunnel = _tunnels.get(user_id)
+    caller = None
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        header_token = auth_header[7:].strip()
+        if header_token:
+            caller = await _authenticate_tunnel(header_token)
+    if not caller and token:
+        caller = await _authenticate_tunnel(token)
+        if caller:
+            log_deprecated_http_query_token("/api/agent/tunnel-status")
+
+    if not caller:
+        return {"connected": False, "error": "authentication required"}
+    if user_id and user_id != caller:
+        return {"connected": False}  # never disclose another tenant's presence
+
+    tunnel = _tunnels.get(caller)
     if not tunnel:
         return {"connected": False}
 
@@ -459,7 +482,10 @@ async def tunnel_debug(
     """
     from app.api._ws_auth_helpers import log_deprecated_http_query_token
 
-    result: dict = {"tunnels_active": list(_tunnels.keys())}
+    # Do NOT expose the live tenant user_id set before auth — it was previously
+    # returned on the no-token path, an unauthenticated cross-tenant enumeration
+    # (re-audit round 6). Populated only after the caller authenticates below.
+    result: dict = {}
 
     user_id = None
     auth_token: Optional[str] = None

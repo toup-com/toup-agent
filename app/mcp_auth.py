@@ -104,9 +104,16 @@ HEADER_TRACEPARENT = "traceparent"
 # re-audit found the two sets had drifted, nulling the INJ-1 unattended deny).
 # Interactive channels first, then the unattended/automation channels.
 _KNOWN_CHANNELS = frozenset({
+    # interactive / attended
     "web", "mobile", "voice", "telegram", "whatsapp",
+    "app", "api", "agent", "netflix", "chat_intent",
+    # automation / unattended (also in the dispatcher deny sets)
     "autopilot", "routine", "trigger", "heartbeat", "cron",
     "agent_task", "email_briefing", "background",
+    # internal orchestration turns — pass through so the dispatcher applies its
+    # normal policy instead of being fail-closed-clamped (re-audit round 6 found
+    # the round-5 clamp over-denied these, breaking their connector calls).
+    "subagent", "app_builder",
 })
 # Fail-CLOSED clamp target for a genuinely-unknown channel: a member of the
 # unattended deny set, so an unrecognized value denies mutating connectors
