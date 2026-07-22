@@ -88,26 +88,40 @@ def underlying_cost_to_credits(cost_cents: float | int | Decimal) -> Decimal:
     return _q(cost_cents, _DISPLAY_QUANTUM)
 
 
-def image_generation_cost_cents(size: Optional[str], quality: Optional[str]) -> Decimal:
-    """True OpenAI cost (in cents) for one gpt-image-1 image at (size, quality).
+def image_generation_cost_cents(
+    size: Optional[str], quality: Optional[str], model: Optional[str] = None
+) -> Decimal:
+    """True OpenAI cost (in cents) for one image at (size, quality) for ``model``.
 
-    Pulls from ``settings.image_gen_pricing_cents`` (keyed ``"<size>:<quality>"``)
-    and falls back to ``settings.image_gen_fallback_cents`` for unknown combos.
-    Both the bundle LLM proxy (which charges bundle users inline) and the
-    agent's generate_image tool (which reports the charge for manual/BYO users)
-    call this so the two paths never diverge on price.
+    The primary model (gpt-image-2) is priced from ``image_gen_pricing_cents``;
+    the legacy fallback model (gpt-image-1 / dall-e) is priced from
+    ``image_gen_pricing_cents_legacy`` so a rare fallback image is not billed at
+    the newer model's higher rate. ``model`` defaults to ``image_gen_model``, so
+    callers that don't know the served model still get the primary price. Both
+    the bundle LLM proxy (charges bundle users inline) and the agent's
+    generate_image / edit_image tools (self-report for manual/BYO users) call
+    this so the two paths never diverge on price.
     """
     size_n = (size or settings.image_gen_default_size or "1024x1024").strip().lower()
     qual_n = (quality or settings.image_gen_default_quality or "high").strip().lower()
     if qual_n in ("auto", "hd", "standard", ""):
         # Map dall-e / "auto" qualities onto our low/medium/high scale so the
-        # price table always resolves. "auto" bills as high (gpt-image-1's auto
-        # skews toward high); dall-e-3 "hd"->high, "standard"->medium.
+        # price table always resolves. "auto" bills as high (gpt-image auto skews
+        # toward high); dall-e-3 "hd"->high, "standard"->medium.
         qual_n = {"hd": "high", "standard": "medium", "auto": "high", "": "high"}[qual_n]
-    table = settings.image_gen_pricing_cents or {}
+    model_n = (model or settings.image_gen_model or "").strip().lower()
+    is_legacy = model_n.startswith("dall-e") or model_n == "gpt-image-1"
+    if is_legacy:
+        table = getattr(settings, "image_gen_pricing_cents_legacy", None) or settings.image_gen_pricing_cents or {}
+        default_cents = getattr(settings, "image_gen_fallback_cents_legacy", None)
+        if default_cents is None:
+            default_cents = settings.image_gen_fallback_cents
+    else:
+        table = settings.image_gen_pricing_cents or {}
+        default_cents = settings.image_gen_fallback_cents
     cents = table.get(f"{size_n}:{qual_n}")
     if cents is None:
-        cents = settings.image_gen_fallback_cents
+        cents = default_cents
     # Return underlying cost in CENTS (Decimal, 0.1c granularity). Callers pass
     # this as underlying_cost_cents and convert to credits via
     # underlying_cost_to_credits() (1c = 1 credit peg).
@@ -311,6 +325,39 @@ def _is_unlimited_user(user) -> bool:
     untouched), so an operator/owner account can use the platform freely.
     Centralized so try_charge, reserve, and the /status view all agree."""
     return user is not None and getattr(user, "role", None) == "admin"
+
+
+async def free_tier_image_quota(db: AsyncSession, user_id: str) -> tuple[bool, int, int]:
+    """(exceeded, used_this_month, limit) for the free-tier monthly image cap.
+
+    Free-PLAN users may create at most ``settings.free_tier_monthly_image_limit``
+    images per calendar month — generate AND edit both count (each writes a
+    ``LEDGER_IMAGE_GEN`` row). Admins and any paid-plan user are unlimited.
+    ``limit <= 0`` disables the cap. Independent of ``credit_enforcement_enabled``:
+    this is a hard product limit on an expensive feature, not a balance check.
+    """
+    from sqlalchemy import func
+    from app.db.models import User, LEDGER_IMAGE_GEN
+
+    limit = int(getattr(settings, "free_tier_monthly_image_limit", 0) or 0)
+    if limit <= 0:
+        return (False, 0, 0)
+    user = await db.get(User, user_id)
+    if _is_unlimited_user(user):                       # admins → unlimited
+        return (False, 0, limit)
+    balance = await db.get(CreditBalance, user_id)
+    plan = (getattr(balance, "plan_id", None) or "free")
+    if plan != "free":                                 # any paid plan → unlimited
+        return (False, 0, limit)
+    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    used = await db.scalar(
+        select(func.count()).select_from(CreditLedger).where(
+            CreditLedger.user_id == user_id,
+            CreditLedger.event_type == LEDGER_IMAGE_GEN,
+            CreditLedger.created_at >= month_start,
+        )
+    ) or 0
+    return (int(used) >= limit, int(used), limit)
 
 
 def _email_verification_required(user) -> bool:

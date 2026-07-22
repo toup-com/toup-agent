@@ -1033,7 +1033,7 @@ async def proxy_openai_images(
         credit_service, image_generation_cost_cents, underlying_cost_to_credits,
     )
     from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
-    cents_each = image_generation_cost_cents(size, quality)
+    cents_each = image_generation_cost_cents(size, quality, model)
     total_cents = cents_each * n
     credits = max(_MIN_IMAGE_CREDITS, underlying_cost_to_credits(total_cents))
     charge_id = str(uuid.uuid4())
@@ -1147,7 +1147,7 @@ async def proxy_openai_image_edits(
         credit_service, image_generation_cost_cents, underlying_cost_to_credits,
     )
     from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
-    cents_each = image_generation_cost_cents(size, quality)
+    cents_each = image_generation_cost_cents(size, quality, model)
     total_cents = cents_each * n
     credits = max(_MIN_IMAGE_CREDITS, underlying_cost_to_credits(total_cents))
     charge_id = str(uuid.uuid4())
@@ -1170,6 +1170,92 @@ async def proxy_openai_image_edits(
     )
 
     return resp_data
+
+
+@router.post("/kie/image")
+async def proxy_kie_image(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate or edit an image via Kie.ai (Nano Banana Pro) for ANY agent.
+
+    The ONE shared platform Kie key lives here (never in agents, like the bundle
+    OpenAI key). The agent's generate_image/edit_image tools POST
+    {mode, prompt, size, image_b64} here; we enforce the free-tier monthly image
+    cap, run Kie's async job (create → poll → fetch), charge the user per image,
+    and return the result as base64. Failure semantics the agent relies on:
+      • 429 {code:image_quota_exceeded} → free cap hit → show upgrade, NO fallback
+      • 502 {code:kie_failed}          → Kie error → agent falls back to gpt-image-2
+      • 200 {b64,...}                  → deliver the image
+    """
+    import base64 as _b64
+    from app.services import kie_client
+    from app.services.credit_service import credit_service, underlying_cost_to_credits
+    from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
+
+    config = await _auth_agent(request, db)
+    body = await request.json()
+    mode = (body.get("mode") or "generate").strip().lower()
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is required")
+
+    # Free-tier monthly image cap — a hard product limit, checked BEFORE spending
+    # any Kie credits so a capped free user costs nothing.
+    exceeded, used, limit = await credit_service.free_tier_image_quota(db, config.user_id)
+    if exceeded:
+        raise HTTPException(status_code=429, detail={
+            "code": "image_quota_exceeded", "used": used, "limit": limit,
+            "message": (f"Your free plan includes {limit} images per month, and "
+                        f"you've used them all. Upgrade for unlimited images."),
+        })
+
+    start_ts = time.time()
+    try:
+        if mode == "edit":
+            image_b64 = body.get("image_b64")
+            if not image_b64:
+                raise HTTPException(400, "edit mode requires image_b64")
+            try:
+                src = _b64.b64decode(image_b64)
+            except Exception:
+                raise HTTPException(400, "image_b64 is not valid base64")
+            result = await kie_client.edit(prompt, src, body.get("image_mime") or "image/png")
+        else:
+            result = await kie_client.generate(prompt, body.get("size"))
+    except kie_client.KieError as e:
+        latency = int((time.time() - start_ts) * 1000)
+        await _log_event(db, config.user_id, "kie", settings.kie_image_model, "images",
+                         0, 0, 0, latency, status="error")
+        raise HTTPException(status_code=502, detail={
+            "code": "kie_failed", "moderation": bool(e.moderation), "message": str(e)[:300],
+        })
+
+    latency = int((time.time() - start_ts) * 1000)
+
+    # Charge: Kie credits × kie_credit_cents → our credits (1¢ = 1 credit).
+    cents = (float(result.credits_consumed) * float(settings.kie_credit_cents)
+             if result.credits_consumed else float(settings.kie_fallback_cents))
+    cents_d = Decimal(str(round(cents, 4)))
+    credits = max(_MIN_IMAGE_CREDITS, underlying_cost_to_credits(cents_d))
+    charge_id = str(uuid.uuid4())
+    try:
+        await credit_service.try_charge(
+            db, config.user_id, LEDGER_IMAGE_GEN, BUCKET_MESSAGE, credits,
+            idempotency_key=charge_id, event_id=charge_id,
+            model=result.model, provider="kie",
+            underlying_cost_cents=cents_d,
+            metadata={"endpoint": "kie_image", "mode": mode,
+                      "kie_credits": result.credits_consumed},
+        )
+    except Exception:
+        logger.exception("[credits] kie image try_charge failed user=%s", config.user_id[:8])
+    await _log_event(db, config.user_id, "kie", result.model, "images", 0, 0, int(cents), latency)
+
+    return {
+        "b64": _b64.b64encode(result.image_bytes).decode(),
+        "mime": result.mime, "model": result.model, "credits": float(credits),
+    }
 
 
 @router.get("/usage", response_model=UsageResponse)

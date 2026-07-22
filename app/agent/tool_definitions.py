@@ -564,7 +564,13 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                         "description": (
                             "Detailed description of the image to generate. Be "
                             "specific about subject, style, composition, colors, "
-                            "lighting, and mood for best results."
+                            "lighting, and mood for best results. When the user "
+                            "wants a REALISTIC photo (a person, product, or scene "
+                            "they might post to social media), explicitly ask for "
+                            "a photorealistic result with natural skin texture, "
+                            "real lighting, and authentic detail, and say to avoid "
+                            "an over-smoothed, plastic, or obviously AI-generated "
+                            "look — otherwise the result skews artificial."
                         ),
                     },
                     "size": {

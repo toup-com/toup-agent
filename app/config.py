@@ -1189,25 +1189,69 @@ class Settings(BaseSettings):
     # (credit.image_price.* handled the same way as flat-fee overrides is a
     # future extension; for now edit here or via env override).
     image_gen_enabled: bool = True
-    image_gen_model: str = "gpt-image-1"          # "ChatGPT image"; falls back to dall-e-3 on unsupported-model errors
-    image_gen_fallback_model: str = "dall-e-3"    # used when gpt-image-1 is unavailable (org not verified, old SDK)
+    # gpt-image-2 (OpenAI's GPT Image 2, GA 2026-04-21) — same /images/generations
+    # and /images/edits endpoints and same low|medium|high quality tokens as
+    # gpt-image-1, so it is a drop-in. gpt-image-1 is scheduled for shutdown
+    # ~2026-10-23, so we default to v2 and keep v1 only as a same-API fallback
+    # (works through the bundle proxy AND the direct path) for the unlikely case
+    # the platform org isn't yet verified for v2. Override live via IMAGE_GEN_MODEL.
+    image_gen_model: str = "gpt-image-2"
+    image_gen_fallback_model: str = "gpt-image-1"  # same Images API; used if the primary model errors (not on moderation)
     image_gen_default_size: str = "1024x1024"     # 1024x1024 | 1024x1536 (portrait) | 1536x1024 (landscape)
     image_gen_default_quality: str = "high"       # low | medium | high  (default HIGH per product decision)
-    image_gen_timeout_s: float = 180.0            # gpt-image-1 can be slow
-    # edit_image (gpt-image-1 edits endpoint) — modify a user's uploaded image.
-    # Reuses image_gen_* pricing/size/quality/timeout. gpt-image-1 ONLY: dall-e-3
-    # has no edits endpoint, so there is no fallback model here.
+    image_gen_timeout_s: float = 180.0            # gpt-image edits/gens can be slow
+    # edit_image (the /images/edits endpoint) — modify a user's uploaded image.
+    # Reuses image_gen_* pricing/size/quality/timeout. dall-e has no edits
+    # endpoint, so only a gpt-image-* model can be the edit fallback.
     image_edit_enabled: bool = True
 
-    # Per-image cost in CENTS, keyed "<size>:<quality>". Mirrors OpenAI's
-    # gpt-image-1 image-token pricing (approx). Unknown combos fall back to
-    # image_gen_fallback_cents. 1 cent -> 1 credit at settle time.
+    # Per-image cost in CENTS, keyed "<size>:<quality>" — the PRIMARY model's
+    # (gpt-image-2) published per-image USD cost expressed in cents. Unknown
+    # combos fall back to image_gen_fallback_cents. 1 cent -> 1 credit at settle.
+    # Source: OpenAI image-generation guide per-image table (2026).
     image_gen_pricing_cents: dict[str, float] = {
+        "1024x1024:low": 0.6,   "1024x1024:medium": 5.3,  "1024x1024:high": 21.1,
+        "1024x1536:low": 0.5,   "1024x1536:medium": 4.1,  "1024x1536:high": 16.5,
+        "1536x1024:low": 0.5,   "1536x1024:medium": 4.1,  "1536x1024:high": 16.5,
+    }
+    image_gen_fallback_cents: float = 21.1        # unknown size/quality -> charge ~high 1024²
+    # Legacy gpt-image-1 per-image cents — used ONLY to bill the rare fallback
+    # path correctly (a v1 image must not be billed at v2's higher rate).
+    image_gen_pricing_cents_legacy: dict[str, float] = {
         "1024x1024:low": 1.1,   "1024x1024:medium": 4.2,  "1024x1024:high": 16.7,
         "1024x1536:low": 1.6,   "1024x1536:medium": 6.3,  "1024x1536:high": 25.0,
         "1536x1024:low": 1.6,   "1536x1024:medium": 6.3,  "1536x1024:high": 25.0,
     }
-    image_gen_fallback_cents: float = 17.0        # unknown size/quality -> charge ~high 1024²
+    image_gen_fallback_cents_legacy: float = 17.0
+
+    # ── Image engine: Kie.ai / Nano Banana (PRIMARY) ───────────────
+    # Highest-quality natural image gen/edit. When image_provider == "kie" the
+    # agent routes generate_image/edit_image through the platform's Kie proxy
+    # (one shared platform key, like bundle OpenAI — users never hold it) and
+    # falls back to OpenAI (gpt-image-2) on any Kie failure. Set image_provider
+    # to "openai" to disable Kie instantly (env IMAGE_PROVIDER=openai).
+    image_provider: str = "kie"                   # "kie" (Nano Banana primary) | "openai"
+    kie_api_key: str = ""                          # platform secret (env KIE_API_KEY); one shared key
+    kie_api_base: str = "https://api.kie.ai"       # jobs/createTask + jobs/recordInfo
+    kie_upload_base: str = "https://kieai.redpandaai.co"  # file-base64-upload host (NOT api.kie.ai)
+    kie_image_model: str = "nano-banana-pro"       # Gemini 3 Pro Image — unified generate + edit
+    kie_image_size: str = "4K"                     # 1K | 2K | 4K (Pro). 4K measured same 18 Kie credits as 2K, ~35s.
+    kie_output_format: str = "png"
+    # Nano Banana normally finishes in ~30s. Cap the poll below the 200s
+    # generate_image/edit_image tool-wrapper timeout so a stuck task fails fast
+    # enough to leave room for the OpenAI fallback within the same tool call.
+    kie_timeout_s: float = 120.0
+    kie_poll_interval_s: float = 2.5
+    # Billing: Kie returns creditsConsumed (Kie credits) per task; we charge the
+    # user (kie credits × kie_credit_cents) our-credits. ~0.5¢/Kie-credit
+    # (nano-banana-pro 2K ≈ 18 credits ≈ 9¢). Tune once reconciled with Kie's
+    # live pricing; env KIE_CREDIT_CENTS.
+    kie_credit_cents: float = 0.5
+    kie_fallback_cents: float = 9.0                # charge if creditsConsumed is missing
+
+    # Free-tier monthly image quota — a free user may generate/edit this many
+    # images per calendar month; paid users and admins are unlimited. 0 = off.
+    free_tier_monthly_image_limit: int = 10
 
     # Strip whitespace from API key fields on load (users often paste with spaces)
     _KEY_FIELDS = {
@@ -1215,7 +1259,7 @@ class Settings(BaseSettings):
         "mistral_api_key", "groq_api_key", "xai_api_key", "deepseek_api_key",
         "telegram_bot_token", "discord_bot_token", "slack_bot_token",
         "slack_app_token", "brave_api_key", "elevenlabs_api_key",
-        "cohere_api_key", "agent_api_key", "toup_token",
+        "cohere_api_key", "agent_api_key", "toup_token", "kie_api_key",
         "stripe_secret_key", "stripe_webhook_secret",
         "gmail_oauth_client_id", "gmail_oauth_client_secret",
         "gmail_oauth_refresh_token",

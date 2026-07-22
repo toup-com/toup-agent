@@ -40,6 +40,33 @@ except Exception:  # pragma: no cover - depends on optional native wheel
     pass
 
 
+# Appended to every edit_image prompt. OpenAI's image models tend toward an
+# over-smoothed "plastic / obviously-AI" look on close-up human detail; when we
+# are EDITING a real photo the user almost always wants the untouched parts to
+# stay exactly as shot. This steers the model to change only what was asked and
+# preserve the source's real texture/grain/lighting, while still deferring to an
+# explicit style request (e.g. "make it a cartoon").
+_EDIT_REALISM_SUFFIX = (
+    " — Make only the change described above and blend it in seamlessly. "
+    "Preserve the rest of the source image exactly: keep its existing style, "
+    "resolution, texture, film grain, colour, and lighting. If the source is a "
+    "real photograph, keep the result photorealistic with natural skin texture, "
+    "pores and detail — do NOT smooth, beautify, airbrush, upscale, restyle, or "
+    "give it an artificial over-processed 'AI-generated' look. Only depart from "
+    "the original's style if the instruction explicitly asks for a different one."
+)
+
+
+class _KieQuotaExceeded(Exception):
+    """Raised when the free-tier monthly image cap is hit. The image tools
+    surface `message` to the user and DO NOT fall back to OpenAI (it's a quota,
+    not a technical failure)."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Per-call state ContextVars (Phase 8 concurrency refactor)
 #
@@ -2026,6 +2053,66 @@ class ToolExecutor:
             "content_policy", "content policy", "image_generation_user_error",
         ))
 
+    async def _call_kie_image(self, mode: str, prompt: str, *, size: Optional[str] = None,
+                              image_bytes: Optional[bytes] = None,
+                              image_mime: str = "image/png") -> Optional[bytes]:
+        """Ask the platform's Kie proxy (Nano Banana Pro) for an image.
+
+        The one shared Kie key lives on the platform, so the agent posts here
+        with its toup_token (same auth as the bundle OpenAI proxy). Returns the
+        image bytes on success. Raises _KieQuotaExceeded on the free-tier cap
+        (caller surfaces it, no fallback). Raises RuntimeError on a Kie/technical
+        failure (caller falls back to OpenAI). Returns None when the platform
+        isn't reachable (BYO/manual with no toup_token) → caller uses OpenAI.
+        """
+        import base64 as _b64
+        base = (getattr(settings, "platform_api_url", "") or "").rstrip("/")
+        token = (getattr(settings, "toup_token", "") or "").strip()
+        if not base or not token:
+            return None  # no platform access → fall back to OpenAI
+        payload: Dict[str, Any] = {"mode": mode, "prompt": prompt}
+        if size:
+            payload["size"] = size
+        if mode == "edit" and image_bytes is not None:
+            payload["image_b64"] = _b64.b64encode(image_bytes).decode()
+            payload["image_mime"] = image_mime
+        url = f"{base}/llm/kie/image"
+        timeout = float(getattr(settings, "kie_timeout_s", 240.0)) + 25.0
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, json=payload,
+                                      headers={"Authorization": f"Bearer {token}"})
+        except Exception as exc:
+            raise RuntimeError(f"kie proxy unreachable: {exc}")
+        if r.status_code == 429:
+            try:
+                detail = (r.json() or {}).get("detail") or {}
+            except Exception:
+                detail = {}
+            raise _KieQuotaExceeded(detail.get("message")
+                                    or "You've reached your free monthly image limit.")
+        if r.status_code != 200:
+            raise RuntimeError(f"kie proxy HTTP {r.status_code}: {r.text[:200]}")
+        b64 = (r.json() or {}).get("b64")
+        if not b64:
+            raise RuntimeError("kie proxy returned no image data")
+        return _b64.b64decode(b64)
+
+    async def _persist_deliver_image(self, img_bytes: bytes, filename: str,
+                                     mime: str = "image/png") -> str:
+        """Persist an image attachment + drop a workspace copy; return the
+        delivery summary. Shared finish step for the Kie image path (the OpenAI
+        path keeps its own inline persist so its BYO credit self-report stays)."""
+        from app.agent.doc_generators import _persist
+        uid = self._current_user_id or ""
+        att = await _persist(img_bytes, filename, mime, uid or self._user_scope())
+        try:
+            with open(self._resolve_path(filename), "wb") as f:
+                f.write(img_bytes)
+        except Exception:
+            logger.debug("image workspace copy skipped", exc_info=True)
+        return await self._register_attachment(att)
+
     async def _openai_generate_image(self, client, model, prompt, size, quality):
         """Call OpenAI images.generate for `model`; return base64 PNG string.
 
@@ -2077,6 +2164,23 @@ class ToolExecutor:
         if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
             filename = f"{filename}.png"
 
+        # PRIMARY: Nano Banana (Kie) for the highest-quality natural result.
+        # Charging + the free-tier cap happen platform-side. On the free cap we
+        # surface the upgrade message (no fallback); on any Kie failure we fall
+        # through to the OpenAI path below.
+        if (getattr(settings, "image_provider", "openai") or "").strip().lower() == "kie":
+            try:
+                _kb = await self._call_kie_image("generate", prompt, size=size)
+            except _KieQuotaExceeded as q:
+                return f"ERROR: {q.message}"
+            except Exception as kie_exc:
+                logger.warning("generate_image: Kie failed, falling back to OpenAI (%s)", kie_exc)
+                _kb = None
+            if _kb:
+                summary = await self._persist_deliver_image(_kb, filename, "image/png")
+                return (f"Image generated with {getattr(settings, 'kie_image_model', 'nano-banana-pro')} "
+                        f"and delivered to the user. {summary}")
+
         # ONE client factory for both bundle (→ platform LLM proxy, which also
         # charges) and manual/BYO (→ api.openai.com direct). See
         # bundle_client.make_openai_client.
@@ -2089,14 +2193,17 @@ class ToolExecutor:
                 "This tenant needs bundle mode or an OpenAI API key in Settings."
             )
 
-        primary = getattr(settings, "image_gen_model", "gpt-image-1")
-        fallback = getattr(settings, "image_gen_fallback_model", "dall-e-3") or ""
-        # The bundle LLM proxy only serves gpt-image-1. A dall-e-3 fallback
-        # routed through it fails with "Unknown parameter: response_format",
-        # which then MASKS the real reason (usually a content-policy block).
-        # So the fallback model is only usable on the DIRECT path (a tenant with
-        # its own OpenAI key); in bundle mode we must not attempt it.
+        primary = getattr(settings, "image_gen_model", "gpt-image-2")
+        fallback = getattr(settings, "image_gen_fallback_model", "gpt-image-1") or ""
+        # The bundle LLM proxy serves the standard Images API (gpt-image-1 /
+        # gpt-image-2) but NOT dall-e — a dall-e fallback routed through it fails
+        # with "Unknown parameter: response_format", masking the real cause. So a
+        # gpt-image-* fallback (e.g. gpt-image-2 -> gpt-image-1) works on BOTH the
+        # bundle and direct paths; a dall-e fallback is direct-path only.
         bundle_mode = not bool(keys.openai)
+        fallback_usable = bool(fallback) and fallback != primary and (
+            not bundle_mode or not fallback.lower().startswith("dall-e")
+        )
         used_model = primary
         b64 = None
         try:
@@ -2114,7 +2221,7 @@ class ToolExecutor:
                     "as explicit — then try again."
                 )
             logger.warning("generate_image: %s failed (%s)", primary, primary_exc)
-            if fallback and fallback != primary and not bundle_mode:
+            if fallback_usable:
                 try:
                     b64 = await self._openai_generate_image(client, fallback, prompt, size, quality)
                     used_model = fallback
@@ -2155,7 +2262,7 @@ class ToolExecutor:
                 image_generation_cost_cents, underlying_cost_to_credits,
             )
             from app.services.credit_reporter import report_image_charge
-            cents = image_generation_cost_cents(size, quality)
+            cents = image_generation_cost_cents(size, quality, used_model)
             if uid:
                 await report_image_charge(
                     user_id=uid,
@@ -2358,6 +2465,24 @@ class ToolExecutor:
         if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
             filename = f"{filename}.png"
 
+        # PRIMARY: Nano Banana (Kie) edit — highest-quality natural result,
+        # framing preserved. Charging + free cap platform-side; quota → upgrade
+        # message (no fallback); any Kie failure → OpenAI edit path below.
+        if (getattr(settings, "image_provider", "openai") or "").strip().lower() == "kie":
+            try:
+                _kb = await self._call_kie_image(
+                    "edit", prompt + _EDIT_REALISM_SUFFIX,
+                    image_bytes=src_bytes, image_mime=src_mime)
+            except _KieQuotaExceeded as q:
+                return f"ERROR: {q.message}"
+            except Exception as kie_exc:
+                logger.warning("edit_image: Kie failed, falling back to OpenAI (%s)", kie_exc)
+                _kb = None
+            if _kb:
+                summary = await self._persist_deliver_image(_kb, filename, "image/png")
+                return (f"Image edited with {getattr(settings, 'kie_image_model', 'nano-banana-pro')} "
+                        f"and delivered to the user. {summary}")
+
         # ONE client factory: bundle (→ platform proxy /images/edits, which also
         # charges) or manual/BYO (→ api.openai.com direct + self-report below).
         from app.services.bundle_client import make_openai_client
@@ -2369,11 +2494,17 @@ class ToolExecutor:
                 "This tenant needs bundle mode or an OpenAI API key in Settings."
             )
 
-        # gpt-image-1 only — dall-e-3 has no edits endpoint, so no fallback.
-        model = getattr(settings, "image_gen_model", "gpt-image-1")
+        model = getattr(settings, "image_gen_model", "gpt-image-2")
+        # Only a gpt-image-* model can be an edit fallback (dall-e has no edits
+        # endpoint). gpt-image-1 works through both the bundle proxy and direct.
+        fallback = getattr(settings, "image_gen_fallback_model", "gpt-image-1") or ""
+        edit_fallback = fallback if (fallback != model and fallback.lower().startswith("gpt-image")) else ""
         image_file = (src_name, src_bytes, src_mime)
+        # Steer away from the plastic "AI" look and preserve the untouched parts.
+        edit_prompt = prompt + _EDIT_REALISM_SUFFIX
+        used_model = model
         try:
-            b64 = await self._openai_edit_image(client, model, image_file, prompt, size, quality)
+            b64 = await self._openai_edit_image(client, model, image_file, edit_prompt, size, quality)
         except Exception as edit_exc:
             if self._is_image_moderation_error(edit_exc):
                 logger.info("edit_image: request declined by safety filter")
@@ -2383,7 +2514,15 @@ class ToolExecutor:
                     "and try again."
                 )
             logger.warning("edit_image: %s failed (%s)", model, edit_exc)
-            return f"ERROR: Image edit failed: {str(edit_exc)[:300]}"
+            if edit_fallback:
+                try:
+                    b64 = await self._openai_edit_image(client, edit_fallback, image_file, edit_prompt, size, quality)
+                    used_model = edit_fallback
+                except Exception as fb_exc:
+                    logger.exception("edit_image fallback failed")
+                    return f"ERROR: Image edit failed: {str(fb_exc)[:300]}"
+            else:
+                return f"ERROR: Image edit failed: {str(edit_exc)[:300]}"
 
         if not b64:
             return "ERROR: Image edit returned no image data."
@@ -2413,13 +2552,13 @@ class ToolExecutor:
                 image_generation_cost_cents, underlying_cost_to_credits,
             )
             from app.services.credit_reporter import report_image_charge
-            cents = image_generation_cost_cents(size, quality)
+            cents = image_generation_cost_cents(size, quality, used_model)
             if uid:
                 await report_image_charge(
                     user_id=uid,
                     credits=float(underlying_cost_to_credits(cents)),
                     underlying_cost_cents=float(cents),
-                    model=model,
+                    model=used_model,
                     idempotency_key=f"image_edit:{uid}:{att.id}",
                     metadata={"size": size, "quality": quality, "op": "edit"},
                 )
@@ -2428,7 +2567,7 @@ class ToolExecutor:
 
         summary = await self._register_attachment(att)
         return (
-            f"Image edited with {model} ({size}, {quality} quality) and "
+            f"Image edited with {used_model} ({size}, {quality} quality) and "
             f"delivered to the user. {summary}"
         )
 
