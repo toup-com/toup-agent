@@ -989,6 +989,17 @@ async def proxy_openai_images(
     (0 tokens) so the LLMProxyEvent cost shows in usage/budget dashboards.
     """
     config = await _auth_agent(request, db)
+    # Free-tier monthly image cap (audit-2026 re-audit round 7): the same hard
+    # product limit the Kie route enforces. Without it here, a free-tier user
+    # bypasses the cap by routing image generation through the OpenAI proxy.
+    from app.services.credit_service import credit_service as _cs
+    _exceeded, _used, _limit = await _cs.free_tier_image_quota(db, config.user_id)
+    if _exceeded:
+        raise HTTPException(status_code=429, detail={
+            "code": "image_quota_exceeded", "used": _used, "limit": _limit,
+            "message": (f"Your free plan includes {_limit} images per month, and "
+                        f"you've used them all. Upgrade for unlimited images."),
+        })
     body = await request.json()
     model = body.get("model") or getattr(settings, "image_gen_model", "gpt-image-1")
     size = body.get("size") or getattr(settings, "image_gen_default_size", "1024x1024")
@@ -1073,6 +1084,16 @@ async def proxy_openai_image_edits(
     /credits/agent-charge, so they never reach this route.
     """
     config = await _auth_agent(request, db)
+    # Free-tier monthly image cap (audit-2026 re-audit round 7) — mirror the
+    # generate route so the edit path can't bypass the cap either.
+    from app.services.credit_service import credit_service as _cs
+    _exceeded, _used, _limit = await _cs.free_tier_image_quota(db, config.user_id)
+    if _exceeded:
+        raise HTTPException(status_code=429, detail={
+            "code": "image_quota_exceeded", "used": _used, "limit": _limit,
+            "message": (f"Your free plan includes {_limit} images per month, and "
+                        f"you've used them all. Upgrade for unlimited images."),
+        })
     form = await request.form()
 
     def _sval(key: str, default: str) -> str:

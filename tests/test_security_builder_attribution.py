@@ -495,3 +495,66 @@ def test_tunnel_endpoints_gated():
     assert "_authenticate_tunnel" in st and "never disclose another tenant" in st
     # tunnel_debug no longer seeds tunnels_active before auth
     assert 'result: dict = {"tunnels_active": list(_tunnels.keys())}' not in src
+
+
+# ── Round 7 (2026-07-22 adversarial re-audit of deployed #303) ─────────
+_TE_SRC = (_BACKEND / "app" / "agent" / "tool_executor.py").read_text()
+
+
+def _te_func(name: str) -> str:
+    m = re.search(rf"\n    (?:async )?def {name}\(self.*?(?=\n    (?:async )?def )", _TE_SRC, re.S)
+    assert m, f"{name} not found in tool_executor.py"
+    return m.group(0)
+
+
+def test_apply_patch_routes_through_path_jail():
+    """CRITICAL: apply_patch's _apply_hunks must resolve its target via
+    _resolve_path (the path-jail) — never a raw os.path.join(workspace,
+    rel_path), which an absolute/`..` diff `+++` header would use to overwrite
+    /app source or /etc as root (arbitrary-write -> RCE)."""
+    body = _te_func("_apply_hunks")
+    assert "self._resolve_path(rel_path)" in body
+    assert "os.path.join(workspace, rel_path)" not in body
+
+
+def test_edit_image_has_ssrf_guard():
+    """HIGH: edit_image fetches a user/injection-supplied URL server-side from
+    inside the agent container, so it must call _assert_public_url (https-only)
+    before the httpx GET, like web_fetch/browser."""
+    body = _te_func("_tool_edit_image")
+    assert "_assert_public_url" in body
+
+
+def test_image_tool_results_do_not_leak_engine_name():
+    """White-label: image tool-result strings must not name the engine."""
+    assert "Image generated with {getattr(settings, 'kie_image_model'" not in _TE_SRC
+    assert "Image edited with {getattr(settings, 'kie_image_model'" not in _TE_SRC
+    assert "Image generated with {used_model}" not in _TE_SRC
+    assert "Image edited with {used_model}" not in _TE_SRC
+
+
+def test_external_content_fence_not_skipped_on_error_prefix():
+    """The <external_content> fence must not be skipped based on the result
+    string starting with 'ERROR' (that string is attacker-controllable)."""
+    assert 'not result.startswith("ERROR")' not in _TE_SRC
+
+
+def test_subagent_channel_in_unattended_deny_set():
+    """HIGH: a spawned sub-agent runs unattended, so 'subagent' and
+    'app_builder' must be in the unattended mutating-connector deny set."""
+    from app.services import connector_dispatcher as cd
+    assert "subagent" in cd._MUTATES_UNATTENDED_DENY_CHANNELS
+    assert "app_builder" in cd._MUTATES_UNATTENDED_DENY_CHANNELS
+    from app.mcp_auth import _KNOWN_CHANNELS
+    assert {"subagent", "app_builder"} <= _KNOWN_CHANNELS
+
+
+def test_openai_image_proxy_routes_enforce_free_tier_cap():
+    """Both OpenAI image proxy routes must enforce the free-tier image cap
+    (not just the Kie route), else free users bypass it via the OpenAI proxy."""
+    src = (_BACKEND / "app" / "api" / "llm_proxy.py").read_text()
+    assert src.count("free_tier_image_quota") >= 3
+    for fn in ("proxy_openai_images", "proxy_openai_image_edits"):
+        m = re.search(rf"async def {fn}\(.*?(?=\nasync def |\Z)", src, re.S)
+        assert m, f"{fn} not found"
+        assert "free_tier_image_quota" in m.group(0), f"{fn} does not enforce the cap"

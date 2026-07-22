@@ -630,10 +630,16 @@ class ToolExecutor:
                 "extension_read", "extension_research", "extension_search",
                 "analyze_image",
             }
+            # Always fence external-content tool results (audit-2026 re-audit
+            # round 7): the fence-skip must NOT be derived from the result
+            # string, because that string is attacker-controlled — a fetched
+            # page whose text begins with "ERROR" would otherwise skip the
+            # fence and re-enter model context unfenced. A genuine tool error
+            # wrapped as external DATA is harmless (it's not instructions).
             if (
                 settings.injection_fencing_v2
                 and tool_name in _EXTERNAL_CONTENT_TOOLS
-                and result and not result.startswith("ERROR")
+                and result
             ):
                 result = (
                     f'<external_content untrusted="true" tool="{tool_name}">\n'
@@ -2178,8 +2184,9 @@ class ToolExecutor:
                 _kb = None
             if _kb:
                 summary = await self._persist_deliver_image(_kb, filename, "image/png")
-                return (f"Image generated with {getattr(settings, 'kie_image_model', 'nano-banana-pro')} "
-                        f"and delivered to the user. {summary}")
+                # White-label (audit-2026 re-audit round 7): never surface the
+                # underlying image engine name to the model/user.
+                return (f"Image generated and delivered to the user. {summary}")
 
         # ONE client factory for both bundle (→ platform LLM proxy, which also
         # charges) and manual/BYO (→ api.openai.com direct). See
@@ -2277,7 +2284,7 @@ class ToolExecutor:
 
         summary = await self._register_attachment(att)
         return (
-            f"Image generated with {used_model} ({size}, {quality} quality) and "
+            f"Image generated ({size}, {quality} quality) and "
             f"delivered to the user. {summary}"
         )
 
@@ -2414,7 +2421,17 @@ class ToolExecutor:
             # Explicit workspace-relative path or https URL (mirrors analyze_image).
             try:
                 if _img_arg.lower().startswith(("http://", "https://")):
-                    async with httpx.AsyncClient(timeout=30) as _hc:
+                    # SSRF guard (audit-2026 re-audit round 7): edit_image does a
+                    # server-side fetch FROM INSIDE the agent container, so an
+                    # attacker/injection-supplied URL could reach 169.254.169.254,
+                    # the docker-bridge pgbouncer, another tenant, or the bridge
+                    # admin API. Same guard web_fetch/browser use — https only,
+                    # host must resolve public, no redirects.
+                    from app.agent.smart_fetch.reader import _assert_public_url
+                    if not _img_arg.lower().startswith("https://"):
+                        return "ERROR: the image URL must be https."
+                    _assert_public_url(_img_arg)
+                    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as _hc:
                         _r = await _hc.get(_img_arg)
                         _r.raise_for_status()
                         src_bytes = _r.content
@@ -2480,8 +2497,8 @@ class ToolExecutor:
                 _kb = None
             if _kb:
                 summary = await self._persist_deliver_image(_kb, filename, "image/png")
-                return (f"Image edited with {getattr(settings, 'kie_image_model', 'nano-banana-pro')} "
-                        f"and delivered to the user. {summary}")
+                # White-label (audit-2026 re-audit round 7): no engine name.
+                return (f"Image edited and delivered to the user. {summary}")
 
         # ONE client factory: bundle (→ platform proxy /images/edits, which also
         # charges) or manual/BYO (→ api.openai.com direct + self-report below).
@@ -2567,7 +2584,7 @@ class ToolExecutor:
 
         summary = await self._register_attachment(att)
         return (
-            f"Image edited with {used_model} ({size}, {quality} quality) and "
+            f"Image edited ({size}, {quality} quality) and "
             f"delivered to the user. {summary}"
         )
 
@@ -3598,7 +3615,17 @@ class ToolExecutor:
 
     def _apply_hunks(self, rel_path: str, hunks: list, workspace: str) -> str:
         """Apply parsed hunks to a single file."""
-        full_path = os.path.join(workspace, rel_path)
+        # Path-jail (audit-2026 EXF-3, re-audit round 7): apply_patch is a
+        # file-MUTATION tool and MUST route through _resolve_path/_guard_path
+        # like write_file/edit_file. The diff `+++` header (rel_path) is
+        # agent/injection-controllable, so a raw os.path.join(workspace, …)
+        # lets an absolute path or `..` escape overwrite /app source, /etc, or
+        # a $HOME dotfile as root — an arbitrary-write→RCE primitive that
+        # defeats the whole exfil jail. The guard IS the jail.
+        try:
+            full_path = self._resolve_path(rel_path)
+        except PermissionError as exc:
+            return f"ERROR: {exc}"
         if not os.path.isfile(full_path):
             return f"ERROR: File not found: {rel_path}"
 

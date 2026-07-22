@@ -117,6 +117,14 @@ _MUTATES_DEFAULT_DENY_CHANNELS = frozenset({"voice", "telegram", "autopilot"})
 _MUTATES_UNATTENDED_DENY_CHANNELS = frozenset({
     "routine", "trigger", "heartbeat", "cron", "agent_task",
     "email_briefing", "background",
+    # A spawned sub-agent / app-builder turn runs autonomously with nobody
+    # watching each tool call, so it is an unattended surface too. Without
+    # these, a denied unattended parent (routine/cron/trigger) could LAUNDER a
+    # mutating connector call through a child sub-agent that hard-codes
+    # channel="subagent" (audit-2026 re-audit round 7, INJ-1 follow-up). A
+    # user's explicit per-tool ConnectorUserPreference allow still overrides,
+    # same resolution order as autopilot.
+    "subagent", "app_builder",
 })
 
 
