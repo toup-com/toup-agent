@@ -144,6 +144,12 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=32000)
     session_id: Optional[str] = None
     model: Optional[str] = None
+    # When False, run the full agent (tools/skills/connectors + session context)
+    # but do NOT persist this turn to the session. Used by the realtime-voice
+    # `think` path: the voice handler already persists the spoken user/assistant
+    # turn, so persisting here too would duplicate the day-chat. Default True
+    # keeps existing API-chat behavior unchanged.
+    save: bool = True
 
 
 class ChatResponse(BaseModel):
@@ -223,6 +229,8 @@ async def api_chat(
             user_id=user_id,
             session_id=req.session_id,
             model_override=req.model,
+            save_user_message=req.save,
+            save_assistant_message=req.save,
         )
 
         # Alias the model id like the SSE sibling + messages endpoint

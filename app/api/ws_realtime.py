@@ -16,6 +16,8 @@ Protocol (Browser ↔ Proxy):
     { "type": "audio", "data": "<base64 PCM16>" }             — mic audio chunk
     { "type": "stop" }                                          — end session
     { "type": "config", "voice": "nova", "session_id": "..." } — session config
+    { "type": "played", "ms": 1234 }                            — V2: audio ms actually
+                                                                  played before barge-in
 
   Server sends:
     { "type": "audio_delta", "data": "<base64 PCM16>" }  — assistant audio chunk
@@ -28,11 +30,13 @@ Protocol (Browser ↔ Proxy):
     { "type": "status", "stage": "authenticated|preparing|connecting_ai" }
                                                            — pre-ready progress beacons
     { "type": "ready" }                                    — session ready, start sending audio
+    { "type": "session_expiring", "seconds_left": 300 }    — V2: OpenAI 60-min cap approaching
     { "type": "error", "message": "..." }
 """
 
 import asyncio
 import json
+import contextvars
 import logging
 import time
 from datetime import datetime, timezone
@@ -60,6 +64,27 @@ def set_realtime_refs(tool_executor, agent_runner=None):
     global _tool_executor, _agent_runner
     _tool_executor = tool_executor
     _agent_runner = agent_runner
+
+
+# ── Per-connection V2 resolution ──────────────────────────────────────
+# V2 is enabled when the global flag is on OR the connecting user is in the
+# rollout allowlist. Resolved ONCE at the WS-handler entry and stored in this
+# ContextVar; every module-level helper reads it via _v2_active(). When unset
+# (unit tests calling these helpers directly, no live connection) it falls back
+# to the global flag — so the existing tests keep pinning v1/v2 via settings.
+_v2_ctx: contextvars.ContextVar = contextvars.ContextVar("realtime_v2", default=None)
+
+
+def _resolve_v2_for_user(user_id: Optional[str]) -> bool:
+    if settings.voice_realtime_v2:
+        return True
+    ids = {u.strip() for u in (settings.voice_realtime_v2_user_ids or "").split(",") if u.strip()}
+    return bool(user_id and user_id in ids)
+
+
+def _v2_active() -> bool:
+    v = _v2_ctx.get()
+    return settings.voice_realtime_v2 if v is None else v
 
 
 # Warm-reopen context cache: user_id → (instructions, tools, monotonic_ts).
@@ -156,13 +181,16 @@ def _build_realtime_tools():
     tools.append({
         "type": "function",
         "name": "think",
+        # Description stays capability-neutral: REALTIME_TOOLS is a module-level
+        # constant shared by v1 and v2 sessions. What `think` actually reaches
+        # (v1: a reasoning model; V2: the user's FULL agent with every tool,
+        # skill, and connector) is set per-session in build_realtime_instructions.
         "description": (
-            "Use a dedicated reasoning model to answer the user's question or solve their task. "
-            "You MUST call this tool for ANY question, request, or task that requires knowledge, "
-            "reasoning, analysis, coding, math, planning, research, explanations, or factual answers. "
-            "Only skip this for simple greetings (hi, hello, bye), yes/no acknowledgments, and casual "
-            "small talk that needs no real thought. Pass the user's full question as-is. "
-            "Relay the result naturally in your own words."
+            "Hand off the user's question or task to solve it. You MUST call this for ANY request "
+            "that needs real knowledge, reasoning, research, coding, math, planning, up-to-date "
+            "facts, or problem-solving — everything except greetings, acknowledgments, and small "
+            "talk. Pass the user's full request verbatim, then relay the result naturally in your "
+            "own words as your own work."
         ),
         "parameters": {
             "type": "object",
@@ -187,8 +215,17 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
 
     Reads ALL personal data (identities, memories, history) from the user's VPS
     via httpx API calls. The platform DB is NEVER used for personal data.
+
+    V2 (VOICE_REALTIME_V2): the memory + day-history sections are trimmed to a
+    character budget. Two reasons: (a) OpenAI caps instructions+tools at
+    16,384 tokens and overflow behavior is undefined; (b) instructions are
+    re-billed as input on every response — an unbounded blob makes each voice
+    turn cost more for the same experience. Identity docs are never trimmed
+    (they ARE the persona); memories keep their head (highest priority first),
+    day history keeps its tail (newest messages).
     """
     sections = []
+    _budget = settings.voice_realtime_instructions_budget_chars if _v2_active() else 0
 
     vps = await _get_vps_info(user_id)
     if vps:
@@ -247,7 +284,10 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
                         cat = m.get("category", "")
                         content = m.get("content", "")
                         lines.append(f"- [{cat}] {content}")
-                    sections.append("\n".join(lines))
+                    text = "\n".join(lines)
+                    if _budget:
+                        text = _cap_chars(text, int(_budget * 0.2), keep="head")
+                    sections.append(text)
         except Exception as e:
             logger.warning("[REALTIME] Failed to load VPS agent memories: %s", e)
 
@@ -261,7 +301,10 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
                         cat = m.get("category", "")
                         content = m.get("content", "")
                         lines.append(f"- [{cat}] {content}")
-                    sections.append("\n".join(lines))
+                    text = "\n".join(lines)
+                    if _budget:
+                        text = _cap_chars(text, int(_budget * 0.3), keep="head")
+                    sections.append(text)
                     logger.info("[REALTIME] Loaded %d user brain memories from VPS", len(mems))
         except Exception as e:
             logger.warning("[REALTIME] Failed to load VPS user memories: %s", e)
@@ -314,7 +357,10 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
                         lines.append(f"{speaker}{ch}: {content}")
 
                 if len(lines) > 1:
-                    sections.append("\n".join(lines))
+                    text = "\n".join(lines)
+                    if _budget:
+                        text = _cap_chars(text, int(_budget * 0.5), keep="tail")
+                    sections.append(text)
                     logger.info("[REALTIME] Loaded %d day-chat messages from VPS (Day-as-Chat, full)", total)
             else:
                 logger.info("[REALTIME] No day-chat messages for today, falling back to sessions")
@@ -383,14 +429,29 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         "edit files (edit_file), search files (grep, find, ls), browse the web (web_search, browser), "
         "and more. Use these tools whenever the user asks you to do something on their computer.\n"
         "- When executing terminal commands, briefly tell the user what you're doing.\n"
-        "- IMPORTANT: You have a 'think' tool. You MUST call it for ANY question, task, or request "
-        "that requires knowledge, reasoning, analysis, coding, math, planning, research, explanations, "
-        "factual answers, or problem-solving. The 'think' tool connects you to a powerful reasoning model. "
-        "Only handle simple greetings (hi, hello, bye), yes/no acknowledgments, and casual small talk directly. "
-        "For EVERYTHING ELSE, call think(task=<user's full question>). "
-        "When you get the result, relay the answer naturally in your own words. "
-        "NEVER mention the think tool, model switching, or reasoning models to the user.\n"
-        "- The user may share their screen with you. When they do, you'll receive periodic "
+        + (
+            # V2: `think` runs the user's FULL agent — every tool, skill, and connector.
+            "- IMPORTANT: You have a 'think' tool that hands off to your FULL agent — the same brain, "
+            "tools, skills, memory, and connected apps (email, calendar, drive, GitHub, and every "
+            "connector) you have in text chat. You MUST call it for ANY question, task, action, or "
+            "request that needs knowledge, reasoning, research, coding, math, planning, up-to-date facts, "
+            "problem-solving, OR an action in the user's tools, accounts, or connected apps. "
+            "Only handle simple greetings (hi, hello, bye), yes/no acknowledgments, and casual small talk directly. "
+            "For EVERYTHING ELSE, call think(task=<user's full request>). "
+            "When you get the result, relay it naturally in your own words as your own work. "
+            "NEVER mention the think tool, model switching, reasoning models, or your internal setup to the user.\n"
+            if _v2_active() else
+            # v1: `think` reaches a reasoning model only (tool-less on platform) —
+            # do not promise actions/connectors it cannot perform.
+            "- IMPORTANT: You have a 'think' tool. You MUST call it for ANY question, task, or request "
+            "that requires knowledge, reasoning, analysis, coding, math, planning, research, explanations, "
+            "factual answers, or problem-solving. The 'think' tool connects you to a powerful reasoning model. "
+            "Only handle simple greetings (hi, hello, bye), yes/no acknowledgments, and casual small talk directly. "
+            "For EVERYTHING ELSE, call think(task=<user's full question>). "
+            "When you get the result, relay the answer naturally in your own words. "
+            "NEVER mention the think tool, model switching, or reasoning models to the user.\n"
+        )
+        + "- The user may share their screen with you. When they do, you'll receive periodic "
         "[Screen context: ...] messages describing what's on their screen. Use this visual context "
         "to help them. Don't describe the screen unprompted every time — wait for the user to ask or reference it.\n"
         f"- The current date and time is {now_str}."
@@ -543,11 +604,13 @@ async def _get_vps_info(user_id: str) -> Optional[tuple]:
 
 async def _vps_api(
     agent_url: str, agent_api_key: str, method: str, path: str,
-    params: dict = None, json_body: dict = None,
+    params: dict = None, json_body: dict = None, timeout: float = 15.0,
 ):
     """Make an authenticated API call to the user's VPS agent.
 
     Uses X-Agent-Key header — VPS auth.py resolves to settings.user_id.
+    `timeout` defaults to 15 s (fine for the short identity/memory reads); a
+    full agent turn via /api/chat (think parity path) passes a larger value.
     """
     url = f"{agent_url}{path}"
     # TKT-LAT-007 (wave 3): shared agent_http client.
@@ -557,12 +620,12 @@ async def _vps_api(
         if method == "GET":
             resp = await client.get(
                 url, headers={"X-Agent-Key": agent_api_key},
-                params=params or {}, timeout=15.0,
+                params=params or {}, timeout=timeout,
             )
         else:
             resp = await client.post(
                 url, headers={"X-Agent-Key": agent_api_key},
-                json=json_body or {}, timeout=15.0,
+                json=json_body or {}, timeout=timeout,
             )
         if resp.status_code == 200:
             return resp.json()
@@ -821,6 +884,45 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
         except Exception as e:
             logger.warning("[REALTIME] think via agent_runner failed: %s", e)
 
+    # Option A2 (platform-api, V2): the realtime relay runs on platform-api,
+    # where the in-process agent_runner is absent. Route `think` to the user's
+    # OWN agent over its HTTP /api/chat — the SAME AgentRunner text chat runs —
+    # so voice gets the user's COMPLETE capability set: web + browser + files +
+    # memory AND every skill and connected MCP connector (Gmail, Calendar,
+    # Drive, GitHub, …). This is what makes voice a true peer of chat rather
+    # than a stripped-down voice model; it also runs in the user's agent session
+    # so the turn is shared with their chat history. V2-gated so v1 keeps its
+    # current behavior until the flag rolls out globally.
+    if _v2_active():
+        vps = await _get_vps_info(user_id)
+        if vps:
+            agent_url, agent_api_key = vps
+            try:
+                data = await _vps_api(
+                    agent_url, agent_api_key, "POST", "/api/chat",
+                    json_body={
+                        "message": task,
+                        "session_id": session_id,   # context (history) only
+                        "model": model_override,
+                        # Don't persist here — the voice handler already saves the
+                        # spoken user/assistant turn (avoids a duplicate day-chat
+                        # entry). Requires the agent image that honors `save`;
+                        # enable VOICE_REALTIME_V2 for an account only after its
+                        # agent has that build (see deploy notes).
+                        "save": False,
+                    },
+                    timeout=settings.voice_realtime_think_timeout_s,
+                )
+                if data and data.get("text"):
+                    logger.info(
+                        "[REALTIME] think via agent /api/chat: %d chars, model=%s, tool_calls=%s",
+                        len(data["text"]), data.get("model"), data.get("tool_calls"),
+                    )
+                    return data["text"], data.get("model") or model_override
+                logger.warning("[REALTIME] think via agent /api/chat: empty result, falling back")
+            except Exception as e:
+                logger.warning("[REALTIME] think via agent /api/chat failed: %s", e)
+
     # Option B: Direct API call (fallback — no tools but always works)
     try:
         # If it's a Claude model, use Anthropic API
@@ -1029,6 +1131,190 @@ async def _finalize_onboarding(user_id: str) -> str:
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
 
 
+def realtime_model() -> str:
+    """Model slug for this session. V2 tracks the current generation
+    (gpt-realtime-2.1: 128k context, semantic VAD, better interruption
+    behavior at the same audio price); V1 stays pinned to gen-1."""
+    if _v2_active():
+        return settings.voice_realtime_model
+    return "gpt-realtime"
+
+
+def realtime_url() -> str:
+    return f"wss://api.openai.com/v1/realtime?model={realtime_model()}"
+
+
+def build_session_config(instr: str, tools: list, voice: str) -> dict:
+    """The session.update payload. Module-level (not a closure) so tests can
+    pin the exact V1/V2 shapes without a socket."""
+    v2 = _v2_active()
+    if v2:
+        # semantic_vad scores the *words* for turn-completion probability —
+        # a trailing "umm" extends the wait, a finished sentence ends it
+        # quickly. This replaces the fixed 700ms silence gate, which is the
+        # main thing that made v1 feel robotic (it interrupted thinking
+        # pauses and always waited the full beat on clear completions).
+        turn_detection: dict = {
+            "type": "semantic_vad",
+            "eagerness": "auto",
+            "create_response": True,
+            "interrupt_response": True,
+        }
+        transcription = {"model": settings.voice_realtime_transcription_model}
+    else:
+        turn_detection = {
+            "type": "server_vad",
+            "threshold": 0.8,
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 700,
+        }
+        transcription = {"model": "whisper-1"}
+    session: dict = {
+        "type": "realtime",
+        "output_modalities": ["audio"],
+        "instructions": instr,
+        "audio": {
+            "input": {
+                "format": {"type": "audio/pcm", "rate": 24000},
+                "transcription": transcription,
+                # Filters the input buffer before VAD — documented to
+                # reduce false speech_started triggers. far_field:
+                # the phone is a loudspeaker at arm's length, and the
+                # dominant false trigger is the agent's own speaker
+                # bleed (echo) reaching the mic.
+                "noise_reduction": {"type": "far_field"},
+                "turn_detection": turn_detection,
+            },
+            "output": {
+                "format": {"type": "audio/pcm", "rate": 24000},
+                "voice": voice,
+            },
+        },
+        "tools": tools,
+        "tool_choice": "auto",
+    }
+    if v2:
+        # Drop 20% of oldest history at once when the context ceiling hits,
+        # instead of just-enough — just-enough truncation shifts the prompt
+        # prefix every turn and busts the $0.40/M cache back to $32/M.
+        session["truncation"] = {"type": "retention_ratio", "retention_ratio": 0.8}
+    return {"type": "session.update", "session": session}
+
+
+def _cap_chars(text: str, max_chars: int, keep: str = "head") -> str:
+    """Trim a section to a budget on line boundaries. keep="head" preserves
+    the start (memory lists: highest-priority entries come first);
+    keep="tail" preserves the end (day history: newest messages last)."""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    lines = text.split("\n")
+    header, body = lines[0], lines[1:]
+    kept: list = []
+    used = len(header)
+    seq = body if keep == "head" else reversed(body)
+    for ln in seq:
+        if used + len(ln) + 1 > max_chars:
+            break
+        kept.append(ln)
+        used += len(ln) + 1
+    if keep == "tail":
+        kept.reverse()
+    marker = "- [context trimmed to budget]"
+    return "\n".join([header, marker] + kept) if keep == "tail" else "\n".join([header] + kept + [marker])
+
+
+def _usage_to_cost_cents(model: str, usage: dict) -> float:
+    """True OpenAI cost (cents) of one response from its usage block.
+
+    Audio and text price differently, and cached input tokens bill at ~1% of
+    the uncached rate — the cached/uncached split is where realtime cost is
+    won or lost, so it is modeled exactly, not averaged.
+    """
+    pricing = settings.voice_realtime_pricing_per_1m.get(model)
+    if not pricing:
+        pricing = settings.voice_realtime_pricing_per_1m.get("gpt-realtime-2.1", {})
+    if not pricing:
+        return 0.0
+    in_d = usage.get("input_token_details", {}) or {}
+    out_d = usage.get("output_token_details", {}) or {}
+    cached_d = in_d.get("cached_tokens_details", {}) or {}
+    cached_text = cached_d.get("text_tokens", 0) or 0
+    cached_audio = cached_d.get("audio_tokens", 0) or 0
+    text_in = max(0, (in_d.get("text_tokens", 0) or 0) - cached_text)
+    audio_in = max(0, (in_d.get("audio_tokens", 0) or 0) - cached_audio)
+    usd = (
+        audio_in * pricing["audio_in"]
+        + cached_audio * pricing["audio_in_cached"]
+        + text_in * pricing["text_in"]
+        + cached_text * pricing["text_in_cached"]
+        + (out_d.get("audio_tokens", 0) or 0) * pricing["audio_out"]
+        + (out_d.get("text_tokens", 0) or 0) * pricing["text_out"]
+    ) / 1_000_000.0
+    return usd * 100.0
+
+
+async def _meter_voice_turn(user_id: str, model: str, usage: dict, response_id: str) -> None:
+    """Charge one realtime response to the user's message credits.
+
+    Mirrors llm_proxy._log_event: an LLMProxyEvent row for the cost
+    dashboards + credit_service.try_charge keyed by the OpenAI response id,
+    so relay retries / duplicate response.done events can't double-charge.
+    Only called when the session runs on the PLATFORM key — BYOK users pay
+    OpenAI directly and must not be charged twice.
+    """
+    try:
+        from decimal import Decimal
+        import uuid as _uuid
+        from app.db.database import async_session_maker
+        from app.db.models import LEDGER_CHAT_MESSAGE, LLMProxyEvent
+        from app.services.credit_service import (
+            credit_service, underlying_cost_to_credits, BUCKET_MESSAGE,
+        )
+
+        cost_cents = _usage_to_cost_cents(model, usage)
+        input_tokens = usage.get("input_tokens", 0) or 0
+        output_tokens = usage.get("output_tokens", 0) or 0
+        if input_tokens <= 0 and output_tokens <= 0:
+            return
+        credits = max(Decimal("0.1"), underlying_cost_to_credits(cost_cents))
+
+        async with async_session_maker() as db:
+            event = LLMProxyEvent(
+                id=str(_uuid.uuid4()),
+                user_id=user_id,
+                provider="openai",
+                model=model,
+                endpoint="realtime_voice",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_cents=int(round(cost_cents)),
+                was_fallback=False,
+                latency_ms=0,
+                status="ok",
+            )
+            db.add(event)
+            result = await credit_service.try_charge(
+                db, user_id, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, credits,
+                idempotency_key=f"rtv:{response_id}", event_id=event.id,
+                model=model, provider="openai",
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                underlying_cost_cents=Decimal(str(cost_cents)),
+                metadata={"endpoint": "realtime_voice", "channel": "voice"},
+            )
+            await db.commit()
+        logger.info(
+            "[REALTIME] metered response=%s user=%s model=%s tokens=%d/%d "
+            "cost_cents=%.3f credits=%s balance_after=%s",
+            response_id[:12], user_id[:8], model, input_tokens, output_tokens,
+            cost_cents, credits, result.balance_after,
+        )
+    except Exception:
+        # Metering must never kill a live call — but it must also never fail
+        # silently into free voice; exception-level log so it pages in triage.
+        logger.exception("[REALTIME] voice metering failed user=%s response=%s",
+                         user_id[:8], response_id[:12])
+
+
 @router.websocket("/ws/realtime")
 async def realtime_voice_ws(
     websocket: WebSocket,
@@ -1080,6 +1366,12 @@ async def realtime_voice_ws(
 
     logger.info("[REALTIME] Session starting for user %s", user_id[:8])
 
+    # Resolve V2 for THIS connection (global flag OR per-user allowlist) and pin
+    # it for every helper this session calls (model, session config, think,
+    # metering, …). One read, one source of truth for the whole connection.
+    _v2_ctx.set(_resolve_v2_for_user(user_id))
+    logger.info("[REALTIME] voice v2=%s for user %s", _v2_active(), user_id[:8])
+
     async def _status(stage: str) -> None:
         # Pre-ready progress beacons. The clients' connect watchdogs treat any
         # frame as "pipeline engaged"; total silence reads as a dead route and
@@ -1103,6 +1395,9 @@ async def realtime_voice_ws(
     except Exception:
         logger.exception("[REALTIME] OpenAI key lookup failed")
         openai_key = None
+    # Platform-key sessions are the ones we meter (V2): BYOK users pay OpenAI
+    # directly, charging them credits too would be a double-bill.
+    using_platform_key = not openai_key
     openai_key = openai_key or settings.openai_api_key
     if not openai_key:
         await websocket.send_json({
@@ -1111,6 +1406,33 @@ async def realtime_voice_ws(
         })
         await websocket.close(code=4400)
         return
+
+    # V2 pre-flight: zero-balance gate, same semantics as the LLM proxy
+    # (enforces only when credit_enforcement_enabled; shadow mode never
+    # blocks). Points at TOUP billing — a platform-credit exhaustion must
+    # never send users to platform.openai.com (the bundle-credit
+    # misleading-copy incident).
+    if _v2_active() and using_platform_key:
+        try:
+            from decimal import Decimal as _Dec
+            from app.db.database import async_session_maker as _asm
+            from app.services.credit_service import credit_service, BUCKET_MESSAGE
+            if getattr(settings, "credit_enforcement_enabled", False):
+                async with _asm() as _db:
+                    preflight = await credit_service.check_balance(
+                        _db, user_id, BUCKET_MESSAGE, _Dec("0.1"),
+                    )
+                if not preflight.success:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "You're out of Toup credits. Top up or upgrade your plan to keep talking.",
+                        "billing": True,
+                        "billing_url": "https://toup.ai/account?tab=billing",
+                    })
+                    await websocket.close(code=4402)
+                    return
+        except Exception:
+            logger.warning("[REALTIME] credit pre-flight failed open — continuing", exc_info=True)
 
     # ── 3+4+5 fan-out: `ready` waits ONLY on the OpenAI connect ──────────
     # The single hard prerequisite for the user to start talking is an OpenAI
@@ -1124,7 +1446,7 @@ async def realtime_voice_ws(
 
     async def _connect_openai():
         return await websockets.connect(
-            OPENAI_REALTIME_URL,
+            realtime_url(),
             additional_headers={
                 "Authorization": f"Bearer {openai_key}",
             },
@@ -1214,7 +1536,9 @@ async def realtime_voice_ws(
     # ── 5. OpenAI connect — the critical path ─────────────────
     await _status("connecting_ai")
     # Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
-    voice = "coral"  # natural, expressive voice
+    # V2 defaults to marin — the GA-new voice OpenAI documents as its most
+    # natural (with cedar); clients can still request any valid voice.
+    voice = "marin" if _v2_active() else "coral"
     openai_ws = None
 
     try:
@@ -1238,38 +1562,7 @@ async def realtime_voice_ws(
 
     # ── 6. Configure session: cached-or-base config now, full context behind ──
     def _session_config(instr: str, tools: list) -> dict:
-        return {
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "output_modalities": ["audio"],
-                "instructions": instr,
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 24000},
-                        "transcription": {"model": "whisper-1"},
-                        # Filters the input buffer before VAD — documented to
-                        # reduce false speech_started triggers. far_field:
-                        # the phone is a loudspeaker at arm's length, and the
-                        # dominant false trigger is the agent's own speaker
-                        # bleed (echo) reaching the mic.
-                        "noise_reduction": {"type": "far_field"},
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.8,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 700,
-                        },
-                    },
-                    "output": {
-                        "format": {"type": "audio/pcm", "rate": 24000},
-                        "voice": voice,
-                    },
-                },
-                "tools": tools,
-                "tool_choice": "auto",
-            },
-        }
+        return build_session_config(instr, tools, voice)
 
     _cached = _instr_cache.get(user_id)
     _cache_hit = bool(
@@ -1307,6 +1600,18 @@ async def realtime_voice_ws(
             pass
         return
     logger.info("[REALTIME] ready in %.0fms (cache_hit=%s)", (time.monotonic() - _t0) * 1000, _cache_hit)
+
+    # V2: warn the client 5 minutes before OpenAI's hard 60-minute session cap
+    # so the UI can offer a graceful reopen (the API has no resumption — the
+    # alternative is a mid-sentence drop).
+    if _v2_active():
+        async def _expiry_warn() -> None:
+            await asyncio.sleep(55 * 60)
+            try:
+                await websocket.send_json({"type": "session_expiring", "seconds_left": 300})
+            except Exception:
+                pass
+        _bg_tasks.append(asyncio.create_task(_expiry_warn()))
 
     # Onboarding is the one flow where a first response on the base config
     # would be actively wrong (the whole flow lives in the instructions) —
@@ -1369,7 +1674,16 @@ async def realtime_voice_ws(
     # Track state for transcript accumulation and persistence
     response_text_accum = ""
     last_user_text = ""  # Track last user message for memory extraction
-    turn_model = "gpt-4o-realtime"  # Model used for current turn (changes if deep_think is called)
+    # V1 kept the legacy "gpt-4o-realtime" label; V2 reports the real slug.
+    default_turn_model = realtime_model() if _v2_active() else "gpt-4o-realtime"
+    turn_model = default_turn_model  # Model used for current turn (changes if deep_think is called)
+
+    # V2 shared state between the two relay loops: which assistant item is
+    # currently voicing (for barge-in truncation) and end-of-user-speech
+    # timestamps (for the ttfa_ms latency trail).
+    last_audio_item: dict = {"id": None, "content_index": 0}
+    speech_stopped_at: dict = {"t": 0.0}
+    first_audio_of_response: dict = {"pending": False}
 
     screen_sharing_active = False
     first_frame_sent = False
@@ -1526,6 +1840,31 @@ async def realtime_voice_ws(
                         await openai_ws.send(json.dumps({"type": "response.create"}))
                         logger.info("[REALTIME] Injected text: %s", inject_content[:60])
 
+                elif msg_type == "played":
+                    # V2 barge-in truncation: the client reports how many ms of
+                    # the interrupted reply it actually played. Truncating the
+                    # conversation item to that point keeps the model's context
+                    # matched to what the user heard — without it the model
+                    # believes it said things the user never got to hear, and
+                    # follow-ups go incoherent (documented OpenAI failure mode
+                    # for WebSocket transports, where the client owns playback).
+                    if _v2_active() and last_audio_item["id"] is not None:
+                        try:
+                            audio_end_ms = max(0, int(msg.get("ms", 0)))
+                        except (TypeError, ValueError):
+                            audio_end_ms = 0
+                        if audio_end_ms > 0:
+                            await openai_ws.send(json.dumps({
+                                "type": "conversation.item.truncate",
+                                "item_id": last_audio_item["id"],
+                                "content_index": last_audio_item["content_index"],
+                                "audio_end_ms": audio_end_ms,
+                            }))
+                            logger.info(
+                                "[REALTIME] truncated %s at %dms (barge-in)",
+                                last_audio_item["id"], audio_end_ms,
+                            )
+
                 elif msg_type == "stop":
                     break
 
@@ -1544,6 +1883,20 @@ async def realtime_voice_ws(
 
                 # ── Audio response chunks → browser (GA: response.output_audio.delta) ──
                 if etype == "response.output_audio.delta":
+                    if _v2_active():
+                        if event.get("item_id"):
+                            last_audio_item["id"] = event.get("item_id")
+                            last_audio_item["content_index"] = event.get("content_index", 0) or 0
+                        if first_audio_of_response["pending"]:
+                            first_audio_of_response["pending"] = False
+                            if speech_stopped_at["t"]:
+                                # End-of-user-speech → first audio byte out: the
+                                # number the latency acceptance criteria are
+                                # measured against (target p50 ≤ 1000ms).
+                                logger.info(
+                                    "[REALTIME] ttfa_ms=%.0f",
+                                    (time.monotonic() - speech_stopped_at["t"]) * 1000,
+                                )
                     await websocket.send_json({
                         "type": "audio_delta",
                         "data": event.get("delta", ""),
@@ -1562,6 +1915,17 @@ async def realtime_voice_ws(
                 # ── Response complete ──
                 elif etype == "response.done":
                     response = event.get("response", {})
+
+                    # V2 metering: every response re-bills the accumulated
+                    # context, so this — not the mic stream — is the billing
+                    # unit. Platform-key sessions only (BYOK pays OpenAI).
+                    if _v2_active() and using_platform_key:
+                        _usage = response.get("usage") or {}
+                        _rid = response.get("id") or ""
+                        if _usage and _rid:
+                            _bg_tasks.append(asyncio.create_task(
+                                _meter_voice_turn(user_id, realtime_model(), _usage, _rid)
+                            ))
                     # Extract final text from output items
                     full_text = response_text_accum
                     for item in response.get("output", []):
@@ -1612,7 +1976,7 @@ async def realtime_voice_ws(
                             last_user_text = ""  # Reset so we don't re-extract
 
                     response_text_accum = ""
-                    turn_model = "gpt-4o-realtime"  # Reset for next turn
+                    turn_model = default_turn_model  # Reset for next turn
 
                     await websocket.send_json({"type": "state", "state": "listening"})
 
@@ -1649,6 +2013,9 @@ async def realtime_voice_ws(
 
                 # ── VAD: user stopped speaking → thinking ──
                 elif etype == "input_audio_buffer.speech_stopped":
+                    if _v2_active():
+                        speech_stopped_at["t"] = time.monotonic()
+                        first_audio_of_response["pending"] = True
                     await websocket.send_json({"type": "state", "state": "thinking"})
 
                 # ── Response started → speaking ──

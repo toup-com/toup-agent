@@ -232,6 +232,33 @@ class Settings(BaseSettings):
     # (~200 ms first-byte vs. 500–2 500 ms full-body wait). Defaults to
     # OFF until per-provider streaming is verified across mobile.
     tts_streaming_enabled: bool = False
+    # ── Realtime voice V2 (env VOICE_REALTIME_V2) ──────────────
+    # Feature-flagged upgrade of the /api/ws/realtime relay: current model
+    # generation (gpt-realtime-2.1), semantic turn detection, marin voice,
+    # streaming transcription, barge-in truncation, budgeted instructions,
+    # and per-turn credit metering. OFF ⇒ byte-identical v1 behavior.
+    # Decision record: toup-platform-app/docs/decisions/voice-architecture.md
+    voice_realtime_v2: bool = False
+    # Per-account rollout: comma-separated user_ids that get V2 even while the
+    # global flag is OFF. Lets us enable one account (the founder's) and verify
+    # on-device before flipping V2 on for everyone. A connection uses V2 when the
+    # global flag is on OR its user_id is listed here.
+    voice_realtime_v2_user_ids: str = ""
+    voice_realtime_model: str = "gpt-realtime-2.1"
+    voice_realtime_transcription_model: str = "gpt-realtime-whisper"
+    # Character budget for the personalized parts of the instructions blob
+    # (memories + day history; identity docs are never trimmed). ~4 chars per
+    # token ⇒ 24k chars ≈ 6k tokens, leaving headroom under OpenAI's
+    # 16,384-token instructions+tools cap, which the tool schemas share.
+    voice_realtime_instructions_budget_chars: int = 24000
+    # Full-parity `think` (V2): the realtime relay runs on platform-api, where
+    # the in-process agent_runner is absent, so `think` runs the user's OWN
+    # agent over its HTTP /api/chat (the SAME AgentRunner text chat uses — full
+    # tools, skills, and every connected MCP connector). A tool-using agent turn
+    # (e.g. a web browse or a calendar action) can outlast the 15 s default VPS
+    # timeout, so give it a generous ceiling. The realtime session has no turn
+    # watchdog once past connect, and the model verbally holds the floor.
+    voice_realtime_think_timeout_s: float = 60.0
     # TKT-LAT-015: pin Haiku for the Toup-Code supervisor loop. The
     # supervisor only makes routing decisions (click/type/scroll/done) in
     # ≤800 tokens — Opus/GPT-5.5 is overkill and burns ~$0.20–$1 per
@@ -1131,6 +1158,26 @@ class Settings(BaseSettings):
         "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
         "claude-sonnet-4-5-20250514": {"input": 0.003, "output": 0.015},
         "claude-sonnet-4-20250514": {"input": 0.003, "output": 0.015},
+    }
+
+    # Realtime voice pricing (USD per 1M tokens). Voice needs its own table
+    # because audio and text tokens price differently and the cached-input
+    # rate is the dominant cost lever (the whole conversation re-bills on
+    # every response; cached context is $0.40/M vs $32/M uncached).
+    # Verified against developers.openai.com/api/docs/pricing 2026-07-17.
+    voice_realtime_pricing_per_1m: dict[str, dict[str, float]] = {
+        "gpt-realtime-2.1": {
+            "audio_in": 32.0, "audio_in_cached": 0.40, "audio_out": 64.0,
+            "text_in": 4.0, "text_in_cached": 0.40, "text_out": 24.0,
+        },
+        "gpt-realtime-2.1-mini": {
+            "audio_in": 10.0, "audio_in_cached": 0.30, "audio_out": 20.0,
+            "text_in": 0.60, "text_in_cached": 0.06, "text_out": 2.40,
+        },
+        "gpt-realtime": {
+            "audio_in": 32.0, "audio_in_cached": 0.40, "audio_out": 64.0,
+            "text_in": 4.0, "text_in_cached": 0.40, "text_out": 16.0,
+        },
     }
 
     # ── Image generation (ChatGPT / gpt-image-1) ───────────────
