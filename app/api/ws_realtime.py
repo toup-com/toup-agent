@@ -1495,6 +1495,18 @@ async def realtime_voice_ws(
                     logger.info("[REALTIME] Filtered %d disabled tools for user %s", len(_user_disabled), user_id[:8])
         except Exception as e:
             logger.warning("[REALTIME] Failed to load disabled tools: %s", e)
+        # V2 (hosted agent): the raw agent tools (web_search, browser, edit_file, memory_*,
+        # …) execute only via the terminal-agent tunnel or a local ToolExecutor — neither of
+        # which exists on platform-api for a hosted agent, so a DIRECT call to one returns
+        # "your terminal agent is not connected" (_execute_tool) and the model narrates a
+        # tool-connection failure mid-call. Offer only the tools that actually run on the
+        # relay: `think` — which routes to the user's FULL hosted agent (every tool, skill,
+        # and connector) via /api/v1/internal/agent-turn — plus the client-side `navigate_to`.
+        # Onboarding tools are re-added below. This forces the model down the working path
+        # instead of calling e.g. web_search directly.
+        if _v2_active():
+            _REALTIME_NATIVE = {"think", "navigate_to"}
+            tools = [t for t in tools if t["name"] in _REALTIME_NATIVE]
         if onboarding:
             tools = list(tools)  # copy
             tools.append({
