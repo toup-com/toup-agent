@@ -43,6 +43,7 @@ from app.agent.tool_executor import ToolExecutor
 from app.agent.skills.loader import SkillLoader
 from app.agent.query_intent import (
     classify_query_intent, filter_tools_by_intent, QueryIntent, INTENT_FULL,
+    with_inbound_image,
 )
 from app.config import settings
 from app.services.openai_agent_service import OpenAIAgentService, StreamEvent
@@ -514,10 +515,24 @@ class AgentRunner:
         # ── Classify query intent (lightweight, <1ms) ─────────────────
         t_classify = time.perf_counter()
         query_intent = classify_query_intent(user_message)
+        # Tool-gating above is text-only. An inbound image almost always means
+        # the user wants it looked at or edited, but a short caption like "make
+        # a six pack" / "fix this" (or no caption at all) names no image-noun
+        # and would leave edit_image/analyze_image unexposed — the model then
+        # falsely claims it "can't edit/render the image in this chat". Whenever
+        # the turn carries an image, merge the media toolset in so those tools
+        # are actually available.
+        _has_inbound_image = any(
+            str((a or {}).get("mime_type", "")).startswith("image/")
+            for a in (inbound_attachments or [])
+        )
+        if _has_inbound_image:
+            query_intent = with_inbound_image(query_intent)
         logger.info(
             f"[PERF] query_intent: {(time.perf_counter() - t_classify) * 1000:.1f}ms → "
             f"category={query_intent.category}, "
             f"tools={len(query_intent.tool_names) or 'all'}"
+            f"{', +inbound_image_media' if _has_inbound_image else ''}"
         )
 
         # Set user context for memory tools and current chat

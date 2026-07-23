@@ -20,7 +20,7 @@ Performance target: <1ms. No regex compilation at call time (all pre-compiled).
 
 import re
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import FrozenSet, Set
 
 logger = logging.getLogger(__name__)
@@ -646,3 +646,24 @@ def filter_tools_by_intent(
             filtered.append(tool)
 
     return filtered
+
+
+def with_inbound_image(intent: QueryIntent) -> QueryIntent:
+    """Augment a text-classified intent for a turn that carries an inbound image.
+
+    Tool-gating above is *text-only*. When a user attaches a photo they almost
+    always want it looked at or edited, but a short caption that names no
+    image-noun — "make a six pack", "fix this", "make me look muscular", or no
+    caption at all — classifies as ``question``/``greeting``/``code``/``memory``
+    and never exposes ``edit_image``/``analyze_image``. The model is then handed
+    the image (it can *see* it) but has no tool to act on it, so it falsely
+    claims it "can't edit/render the image in this chat".
+
+    Given an inbound image we merge the media toolset onto whatever the text
+    classified into, so ``edit_image``/``generate_image``/``analyze_image`` are
+    always available. We only ADD tools — the model still decides whether to
+    call one (e.g. it can still just answer "what's in this?" without editing).
+    """
+    if intent.category == "full":
+        return intent  # "full" already exposes every tool, including media
+    return replace(intent, tool_names=frozenset(intent.tool_names) | TOOLS_MEDIA)
