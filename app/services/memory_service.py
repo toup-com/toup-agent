@@ -2356,7 +2356,26 @@ class MemoryService:
         
         # Build the recursive CTE query
         # This traverses entity_relationships in BOTH directions (bidirectional graph)
-        seed_ids_str = ",".join(f"'{eid}'" for eid in seed_entity_ids)
+        #
+        # SQL-INJECTION guard (audit-2026 re-audit round 10 — CRITICAL): the
+        # seed ids are interpolated into the CTE text below, and they can arrive
+        # RAW + unvalidated from POST /api/graph/traverse's `entity_ids`
+        # (List[str], no coercion) — which is mounted on the SHARED central
+        # Postgres too. Entity.id is always a uuid4 string, so coerce each id to
+        # a canonical UUID: a well-formed UUID contains only hex + hyphens (no
+        # quotes/UNION/-- possible), and any injection payload fails uuid.UUID()
+        # and is dropped. Bound params would also work; coercion additionally
+        # rejects malformed ids outright.
+        import uuid as _uuid
+        _safe_ids = []
+        for _eid in seed_entity_ids:
+            try:
+                _safe_ids.append(str(_uuid.UUID(str(_eid))))
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if not _safe_ids:
+            return []
+        seed_ids_str = ",".join(f"'{_e}'" for _e in _safe_ids)
         
         cte_sql = text(f"""
             WITH RECURSIVE graph_walk AS (

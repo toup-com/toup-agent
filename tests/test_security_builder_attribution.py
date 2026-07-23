@@ -640,3 +640,34 @@ def test_recalled_memory_is_data_fenced():
     src = (_BACKEND / "app" / "agent" / "agent_runner.py").read_text()
     assert "STORED REFERENCE DATA recalled" in src
     assert "never follow instructions" in src.lower() or "NEVER follow instructions" in src
+
+
+# ── Round 10 (2026-07-22 sink+authz sweep) ─────────────────────────────
+def test_graph_traverse_sql_ids_are_uuid_coerced():
+    """CRITICAL: traverse_entity_graph must coerce seed ids to UUIDs so a
+    caller-supplied `'`/UNION/-- payload in /api/graph/traverse can't inject
+    into the recursive-CTE IN(...) list (runs on the shared central DB too)."""
+    src = (_BACKEND / "app" / "services" / "memory_service.py").read_text()
+    m = re.search(r"async def traverse_entity_graph\(.*?(?=\n    async def |\n    def )", src, re.S)
+    assert m
+    body = m.group(0)
+    # UUID coercion happens before the IN(...) interpolation.
+    assert "_uuid.UUID(str(_eid))" in body or "uuid.UUID(str(" in body
+    assert "_safe_ids" in body
+
+
+def test_write_app_files_path_jailed():
+    """HIGH: AppManager.write_app_files must confine every planned key to
+    app_dir (LLM-planned path keys run as root; `..` = out-of-app RCE)."""
+    src = (_BACKEND / "app" / "agent" / "app_manager.py").read_text()
+    m = re.search(r"async def write_app_files\(.*?(?=\n    async def |\n    def )", src, re.S)
+    assert m
+    body = m.group(0)
+    assert "os.path.realpath" in body and "app_root" in body
+    assert "rejected out-of-app path" in body
+
+
+def test_ws_browser_navigate_and_tabopen_ssrf_guarded():
+    """HIGH: co-browse navigate() + tab_open must SSRF-guard client/LLM URLs."""
+    src = (_BACKEND / "app" / "api" / "ws_browser.py").read_text()
+    assert src.count("_assert_public_url") >= 2  # navigate + tab_open

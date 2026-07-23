@@ -693,6 +693,16 @@ async def _exec_browser_tool(
                 return "ERROR: url is required"
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
+            # SSRF guard (audit-2026 re-audit round 10): co-browse navigate()
+            # drives a real headless browser inside the container at a
+            # client/LLM-supplied URL — guard it like web_fetch/browser so it
+            # can't reach cloud metadata (169.254.169.254), the bridge admin API
+            # (127.0.0.1:8443), pgbouncer, or another tenant container.
+            try:
+                from app.agent.smart_fetch.reader import _assert_public_url
+                _assert_public_url(url)
+            except ValueError as _ssrf_e:
+                return f"ERROR: {_ssrf_e}"
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             except Exception:
@@ -2715,6 +2725,19 @@ async def ws_browser(
                         await websocket.send_json({"type": "error", "message": "Browser not available"})
                         continue
                     url = data.get("url", "about:blank")
+                    # SSRF guard (audit-2026 re-audit round 10): tab_open opens
+                    # the headless browser at a CLIENT-supplied URL — block
+                    # internal targets (metadata / bridge admin / pgbouncer /
+                    # other tenants). about:blank and public hosts (incl.
+                    # netflix.com) pass.
+                    if url and not url.startswith("about:"):
+                        _chk = url if url.startswith(("http://", "https://")) else "https://" + url
+                        try:
+                            from app.agent.smart_fetch.reader import _assert_public_url
+                            _assert_public_url(_chk)
+                        except ValueError as _ssrf_e:
+                            await websocket.send_json({"type": "error", "message": f"Blocked: {_ssrf_e}"})
+                            continue
                     ctx = await get_stealth_context()
 
                     # For Netflix: silently login first, then show content

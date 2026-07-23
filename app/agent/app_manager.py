@@ -165,10 +165,22 @@ class AppManager:
         """Write files dict to app directory on disk."""
         app_dir = await self._resolve_app_dir(app_id, app_dir)
         assert os.path.exists(app_dir), f"app_dir {app_dir} does not exist"
+        app_root = os.path.realpath(app_dir)
         for file_path, content in files.items():
             # Normalize path
             rel_path = file_path.lstrip("/")
             full_path = os.path.join(app_dir, rel_path)
+            # Path-jail (audit-2026 re-audit round 10): this runs as ROOT and
+            # file_path is an LLM-PLANNED key derived from the (injection-
+            # steerable) app description. lstrip("/") does NOT strip "..", so a
+            # key like ../../../../etc/cron.d/x would write outside app_dir as
+            # root (RCE/persistence). Confine every key to app_dir — mirrors the
+            # forbidden-segment check the /import-from-toup-code caller already
+            # applies. Skip (don't write) anything that escapes.
+            rp = os.path.realpath(full_path)
+            if rp != app_root and not rp.startswith(app_root + os.sep):
+                logger.warning(f"[APP] rejected out-of-app path in write_app_files: {file_path!r}")
+                continue
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
