@@ -72,6 +72,7 @@ off the notification row.
 from __future__ import annotations
 
 import logging
+import urllib.parse
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -481,11 +482,39 @@ async def _send_start(
     # card everywhere + stop re-alerts for this mission).
     base_link = "toup://chat" if data.get("route") == "chat" else "toup://mission-control"
     deep_link = f"{base_link}?mission={mission_id}"
+    timer_ms = _timer_end_ms(row)
+    # INSTANT-OPEN seed (2026-07-23): reminder cards carry the reminder
+    # text + fire instant on the tap URL so the app can render the
+    # message the user is navigating to IMMEDIATELY — before any
+    # network round-trip (the fire row persists server-side ~1s after
+    # T-0; the old tap showed a stale thread, then the message popped
+    # in). rtext clipped to 120 pre-encoding keeps the worst-case
+    # percent-encoded URL (~1.1KB) inside the 4KB APNs LA start budget.
+    # rat = the fire instant: countdown cards pass their timer end (the
+    # app's pre-fire gate refuses to seed before it), fire cards pass
+    # now. Old app binaries ignore the extra params.
+    _subtitle_for_link = data.get("subtitle") if isinstance(data.get("subtitle"), str) else None
+    if not _subtitle_for_link and isinstance(row.body, str) and row.body.strip():
+        # Countdown arm rows carry the reminder text as row.body, not
+        # data.subtitle (review F3) — without this fallback the most
+        # common reminder surface never seeded.
+        _subtitle_for_link = row.body
+    if data.get("route") == "chat" and mission_id.startswith("reminder:") and _subtitle_for_link:
+        _rat = timer_ms or int(now.timestamp() * 1000)
+        # Cap the ENCODED length, not the character count (review F5):
+        # emoji percent-encode at ~12 bytes/char, and the 4KB APNs
+        # budget is shared with body/content-state copies of the text.
+        _sub = _subtitle_for_link[:120]
+        _q = urllib.parse.quote(_sub)
+        while len(_q) > 600 and _sub:
+            _sub = _sub[:-8]
+            _q = urllib.parse.quote(_sub)
+        deep_link = f"{deep_link}&rtext={_q}&rat={_rat}"
+
     # Stale backstop: a countdown card goes visually stale 2 minutes
     # after its timer fires; a non-timer card after 30 minutes with no
     # update. Progress updates refresh the horizon — only a card whose
     # pushes are LOST can ever dim.
-    timer_ms = _timer_end_ms(row)
     stale_ts = (
         int(timer_ms / 1000) + 120 if timer_ms
         else int(now.timestamp()) + 1800

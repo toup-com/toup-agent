@@ -2449,3 +2449,44 @@ async def test_alarm_owned_report_without_token_never_inserts(
             select(LiveActivity).where(LiveActivity.mission_id == mission)
         )).scalars().all()
         assert rows == []  # external-channel wake vector preserved
+
+
+@pytest.mark.asyncio
+async def test_reminder_card_deeplink_carries_seed_params(monkeypatch):
+    """INSTANT-OPEN contract: reminder cards' tap URL carries the
+    reminder text (rtext, clipped+encoded) and the fire instant (rat)
+    so the app renders the message before any network round-trip.
+    Chat-turn cards carry neither."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+
+    end_ms = int((datetime.utcnow().timestamp() + 240) * 1000)
+    # Production shape: countdown arm rows carry the reminder text as
+    # row.body, NOT data.subtitle (routines._reminder_countdown_notify)
+    # — the body fallback is what makes the countdown card seed.
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started", title="⏰ Stretch",
+        body="Time to stretch & breathe", priority="default",
+        data_json={"mission_id": "reminder:seed0001", "silent": True,
+                   "kind": "reminder", "route": "chat",
+                   "timer_end_ms": end_ms},
+    ))
+    url = sent[0]["payload"]["aps"]["attributes"]["deepLinkUrl"]
+    assert url.startswith("toup://chat?mission=reminder:seed0001&rtext=")
+    assert "Time%20to%20stretch%20%26%20breathe" in url
+    assert f"&rat={end_ms}" in url
+
+    # Chat turns: no seed params. Fresh user — the live countdown above
+    # would otherwise make this yield (REMINDER WINS) and send nothing.
+    user2 = await _mk_user()
+    await _mk_la_device(user2)
+    sent.clear()
+    await _claim_and_dispatch(await _enqueue(
+        user2, event_kind="mission_started", title="Working",
+        data_json={"mission_id": "chatturn:seedless01", "kind": "chat_turn",
+                   "route": "chat", "mission_title": "Working"},
+    ))
+    url2 = sent[0]["payload"]["aps"]["attributes"]["deepLinkUrl"]
+    assert "rtext" not in url2 and "rat" not in url2
