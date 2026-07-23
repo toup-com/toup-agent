@@ -254,6 +254,71 @@ async def api_chat(
         raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
 
 
+@router.post("/internal/agent-turn", response_model=ChatResponse, include_in_schema=False)
+async def internal_agent_turn(req: ChatRequest, request: Request):
+    """Internal-only: run a FULL agent turn (every tool/skill/connector) for the
+    realtime-voice `think` path.
+
+    The voice relay runs on platform-api, where the in-process agent_runner is
+    absent — so voice reasoning has to hop to the user's OWN agent container to
+    get the identical toolset chat has (web, browser, files, memory, and every
+    connected MCP connector + skill). This endpoint is that hop.
+
+    It is deliberately NOT part of the public API v1: it authenticates with the
+    tenant's X-Agent-Key (the same primitive soul-sync / refresh-tools use, not
+    a user `hx_` key), resolves to settings.user_id, and is invisible (404) on
+    the platform process so only agent containers expose it.
+
+    `save` is False when voice calls it: the realtime handler already persists the
+    spoken user/assistant turn, so persisting here too would duplicate the
+    day-chat. Session history (context) is still read from session_id regardless.
+    """
+    # Only meaningful on tenant agent containers. On the platform, 404 so the
+    # endpoint is invisible to probers (mirrors agent.py:refresh-tools).
+    if settings.run_mode != "agent":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+    # X-Agent-Key auth — same primitive as agent.py:437.
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+
+    if not _agent_runner:
+        raise HTTPException(status_code=503, detail="Agent not available")
+
+    user_id = settings.user_id
+    if not user_id:
+        raise HTTPException(status_code=503, detail="Agent user not configured")
+
+    try:
+        response = await _agent_runner.run(
+            user_message=req.message,
+            user_id=user_id,
+            session_id=req.session_id,
+            model_override=req.model,
+            channel="voice",
+            save_user_message=req.save,
+            save_assistant_message=req.save,
+        )
+        _resp_model = response.model
+        if settings.security_leak_filter and _resp_model:
+            from app.services.model_alias import public_model_label
+            _resp_model = public_model_label(_resp_model)
+        return ChatResponse(
+            text=response.text,
+            session_id=response.session_id,
+            tokens_input=response.tokens_input,
+            tokens_output=response.tokens_output,
+            tokens_total=response.tokens_total,
+            model=_resp_model,
+            tool_calls=len(response.tool_calls),
+            processing_time_ms=response.processing_time_ms,
+        )
+    except Exception as e:
+        logger.exception(f"Internal agent-turn error for user {user_id}")
+        raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
+
+
 @router.post("/chat/stream")
 async def api_chat_stream(
     req: ChatRequest,

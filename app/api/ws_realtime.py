@@ -886,42 +886,48 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
 
     # Option A2 (platform-api, V2): the realtime relay runs on platform-api,
     # where the in-process agent_runner is absent. Route `think` to the user's
-    # OWN agent over its HTTP /api/chat — the SAME AgentRunner text chat runs —
-    # so voice gets the user's COMPLETE capability set: web + browser + files +
-    # memory AND every skill and connected MCP connector (Gmail, Calendar,
-    # Drive, GitHub, …). This is what makes voice a true peer of chat rather
-    # than a stripped-down voice model; it also runs in the user's agent session
-    # so the turn is shared with their chat history. V2-gated so v1 keeps its
-    # current behavior until the flag rolls out globally.
+    # OWN agent over its internal full-agent endpoint — the SAME AgentRunner the
+    # text chat runs — so voice gets the user's COMPLETE capability set: web +
+    # browser + files + memory AND every skill and connected MCP connector
+    # (Gmail, Calendar, Drive, GitHub, …). This is what makes voice a true peer
+    # of chat rather than a stripped-down voice model; it also runs in the user's
+    # agent session so the turn shares their chat history.
+    #
+    # NOTE: this MUST NOT be /api/chat — that route is a memory-augmented but
+    # TOOL-LESS single LLM completion (app/api/chat.py) and it always persists,
+    # which would both strip voice of tools and DOUBLE-write the day-chat. The
+    # full agent lives behind /api/v1/internal/agent-turn (X-Agent-Key gated,
+    # runs _agent_runner.run with save honored). V2-gated so v1 is unchanged
+    # until the flag rolls out globally.
     if _v2_active():
         vps = await _get_vps_info(user_id)
         if vps:
             agent_url, agent_api_key = vps
             try:
                 data = await _vps_api(
-                    agent_url, agent_api_key, "POST", "/api/chat",
+                    agent_url, agent_api_key, "POST", "/api/v1/internal/agent-turn",
                     json_body={
                         "message": task,
                         "session_id": session_id,   # context (history) only
                         "model": model_override,
                         # Don't persist here — the voice handler already saves the
                         # spoken user/assistant turn (avoids a duplicate day-chat
-                        # entry). Requires the agent image that honors `save`;
-                        # enable VOICE_REALTIME_V2 for an account only after its
-                        # agent has that build (see deploy notes).
+                        # entry). Requires the agent image that exposes this
+                        # endpoint; enable VOICE_REALTIME_V2 for an account only
+                        # after its agent has that build (see deploy notes).
                         "save": False,
                     },
                     timeout=settings.voice_realtime_think_timeout_s,
                 )
                 if data and data.get("text"):
                     logger.info(
-                        "[REALTIME] think via agent /api/chat: %d chars, model=%s, tool_calls=%s",
+                        "[REALTIME] think via agent full-turn: %d chars, model=%s, tool_calls=%s",
                         len(data["text"]), data.get("model"), data.get("tool_calls"),
                     )
                     return data["text"], data.get("model") or model_override
-                logger.warning("[REALTIME] think via agent /api/chat: empty result, falling back")
+                logger.warning("[REALTIME] think via agent full-turn: empty result, falling back")
             except Exception as e:
-                logger.warning("[REALTIME] think via agent /api/chat failed: %s", e)
+                logger.warning("[REALTIME] think via agent full-turn failed: %s", e)
 
     # Option B: Direct API call (fallback — no tools but always works)
     try:

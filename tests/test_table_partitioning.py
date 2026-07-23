@@ -53,10 +53,17 @@ def test_agent_only_tables_are_correct():
 
 def test_platform_only_tables_are_correct():
     """Smoke test: known platform-only tables must be in the set."""
-    for t in ("vps_plans", "agent_configs", "managed_containers"):
+    for t in ("vps_plans", "invites", "managed_containers"):
         assert t in PLATFORM_ONLY_TABLES, f"'{t}' should be in PLATFORM_ONLY_TABLES"
 
 
 def test_shared_tables_are_correct():
-    """Smoke test: users is the only shared table."""
+    """Smoke test: tables that live in BOTH databases.
+
+    agent_configs is SHARED (not platform-only): the agent chat/runner/tool path
+    reads it by direct query (ws_chat.py, agent_runner.py, tool_executor.py,
+    chat.py), so init_db must create it on agent DBs too — see the note in
+    base.py SHARED_TABLES for the 2026-07 chat-persistence incident this fixes.
+    """
     assert "users" in SHARED_TABLES
+    assert "agent_configs" in SHARED_TABLES

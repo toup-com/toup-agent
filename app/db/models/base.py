@@ -128,8 +128,6 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "llm_bundle_allocations",
     "llm_usage_records",
     "llm_proxy_events",
-    # Agent configuration (platform manages, agent reads via API)
-    "agent_configs",
     # Streaming credentials (platform stores, agent fetches via API)
     "streaming_credentials",
     "credential_access_log",
@@ -189,4 +187,20 @@ PLATFORM_ONLY_TABLES: set[str] = {
 SHARED_TABLES: set[str] = {
     # Users table exists in both: platform has all users, agent has its owner
     "users",
+    # agent_configs was PLATFORM_ONLY on the theory "agent reads it via API",
+    # but the agent chat/runner/tool hot path in fact reads it by DIRECT query:
+    # SELECT AgentConfig WHERE user_id=… at ws_chat.py:1564/2548,
+    # agent_runner.py:587/3091/3439, tool_executor.py:1091, chat.py:189/438
+    # (BYOK OpenAI key + per-user disabled-tools). Older agent DBs carried the
+    # table as a monolith leftover, so this was latent; newer partitioned agent
+    # DBs that init_db never created it on hit `UndefinedTable`, which aborts the
+    # surrounding transaction and — because the callers catch the Python error
+    # without rolling back — poisons the very next write, so chat persistence
+    # broke fleet-wide (2026-07 incident). SHARED creates an EMPTY table on the
+    # agent: every touch site is a read that already handles the no-row case by
+    # falling back (platform key / no disabled tools). No secret is ever written
+    # agent-side (no INSERT/UPDATE against AgentConfig runs in agent mode), so the
+    # platform-owns-the-config isolation still holds. This is the permanent fix
+    # for that incident; the live fleet was already hot-patched with the table.
+    "agent_configs",
 }

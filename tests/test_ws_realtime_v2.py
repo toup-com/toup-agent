@@ -194,7 +194,9 @@ async def test_think_v2_runs_full_agent_via_http(v2_on, monkeypatch):
     assert len(calls) == 1
     c = calls[0]
     assert c["method"] == "POST"
-    assert c["path"] == "/api/chat"
+    # MUST be the full-agent endpoint, NOT /api/chat (that route is tool-less +
+    # always-persists — see api_v1.internal_agent_turn / ws_realtime._think).
+    assert c["path"] == "/api/v1/internal/agent-turn"
     assert c["json_body"]["message"] == "what's the newest model?"
     assert c["json_body"]["session_id"] == "sess-9"
     assert c["json_body"]["save"] is False              # voice handler owns persistence
@@ -240,7 +242,8 @@ async def test_think_v1_does_not_use_agent_http(v2_off, monkeypatch):
     text, _model = await rt._think("user-1", "hello?", "sess-9")
 
     assert text == "fallback answer"
-    assert ("POST", "/api/chat") not in paths     # parity path skipped when flag off
+    # parity path skipped when flag off
+    assert ("POST", "/api/v1/internal/agent-turn") not in paths
 
 
 def test_v2_per_user_allowlist(monkeypatch):
