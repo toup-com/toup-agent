@@ -631,9 +631,13 @@ def test_countdown_payloads_pass_ingest_validation():
 
 
 @pytest.mark.asyncio
-async def test_fire_alert_carries_alarm_sound(monkeypatch):
-    """The audible surface plays the bundled alarm tone, not the
-    default ding, when the producer asks for it (data.sound)."""
+async def test_fire_alert_rings_default_tone_with_fired_state(monkeypatch):
+    """data.sound marks the row ALARM-CLASS; the named file itself must
+    NEVER reach the wire (iOS has never honored a named sound on a Live
+    Activity push alert — total silence, not a fallback; #299). The
+    audible ring is the system default tone, and since 2026-07-22 the
+    content-state carries ``fired`` instead of any progress so the
+    widget renders the ringing presentation, never a 0%/100% bar."""
     sent: list = []
     _patch_apns(monkeypatch, sent)
     user_id = await _mk_user()
@@ -658,7 +662,9 @@ async def test_fire_alert_carries_alarm_sound(monkeypatch):
     assert result == "sent"
     upd = sent[0]["payload"]["aps"]
     assert upd["event"] == "update"
-    assert upd["alert"]["sound"] == "toup_alarm.caf"
+    assert upd["alert"]["sound"] == "default"
+    assert upd["content-state"].get("fired") is True
+    assert "progress" not in upd["content-state"]
 
 
 @pytest.mark.asyncio

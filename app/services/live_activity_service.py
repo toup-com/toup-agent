@@ -54,6 +54,16 @@ always preferred when present.
 Progress bars: discrete ``data.progress`` (0-100) for missions; for
 bounded quick jobs the producer sends ``data.timer_end_ms`` instead
 and the widget animates the bar on-device with zero pushes.
+Alarm-class terminal rows send ``content-state.fired`` instead of any
+progress — the widget renders a ringing presentation, never a bar.
+
+REMINDER WINS (founder rule): a chat-turn card must never displace or
+orphan a live ``reminder:*`` countdown — enforced in the
+mission_started branch, the restart-if-missing lane, AND
+``_preempt_device`` itself. When the app reports that a device alarm
+(AlarmKit) owns a reminder's fire (``alarm_owned_at``), the fire lane
+stays quiet on that device: no loud restart, no rings — AlarmKit is
+already ringing through silent/Focus.
 
 Every function returns a channels_json fragment — the dispatcher
 records it verbatim, so a production incident can be read straight
@@ -397,6 +407,24 @@ async def _preempt_device(
     for la in await _started_rows_for_device(db, device.id):
         if la.mission_id == keep_mission_id:
             continue
+        if (
+            la.mission_id.startswith("reminder:")
+            and keep_mission_id.startswith("chatturn:")
+        ):
+            # REMINDER WINS, enforced at the preempt itself (2026-07-22
+            # incident: the Answer-ready restart force-ended the live
+            # countdown row here; the end push no-op'd on-device, the
+            # platform lost track of the visible card, and the fire had
+            # to restart a bare 0% card). A chat-turn card must never
+            # kill a user-scheduled countdown — the callers' yield
+            # guards make this path unreachable for chat turns, and if
+            # a future caller slips through we keep the countdown row
+            # and accept shared-token ambiguity as the lesser evil.
+            logger.info(
+                "live-activity preempt: refusing to end %s for %s",
+                la.mission_id, keep_mission_id,
+            )
+            continue
         token = la.activity_push_token or device.push_to_start_token
         payload = apns_push.build_end_payload(
             title="Superseded",
@@ -466,6 +494,15 @@ async def _send_start(
     # reminder text); non-silent starts keep the legacy 'Starting…'.
     subtitle_override = data.get("subtitle") if isinstance(data.get("subtitle"), str) else None
     timer_type = data.get("timer_type")
+    # An alarm-class terminal row restarting its card IS the fire
+    # moment: the fresh card renders the ringing presentation, never a
+    # bare 0% progress bar (the fire row carries no timer/progress —
+    # 2026-07-22 founder repro: '0% silently, then a stale 100% bar').
+    fired = (
+        _is_alarm_row(row)
+        and row.event_kind in (NOTIFY_KIND_MISSION_COMPLETED,
+                               NOTIFY_KIND_MISSION_FAILED)
+    )
     payload = apns_push.build_start_payload(
         mission_id=mission_id,
         title=_mission_title(row),
@@ -480,6 +517,7 @@ async def _send_start(
         timer_type=timer_type if timer_type in ("circular", "digital") else None,
         orb_color=await _user_orb_color(db, row.user_id),
         stale_date=stale_ts,
+        fired=fired,
     )
     status, reason, _env = await _send_with_env_selfheal(
         db, device, device.push_to_start_token, payload, priority=10,
@@ -495,6 +533,10 @@ async def _send_start(
             existing.started_at = now
             existing.updated_at = now
             existing.ended_at = None
+            # Fresh card = fresh alarm-ownership cycle: the app re-arms
+            # its device alarm off this very start (countdown-armed
+            # sync) and re-reports ownership if it still holds one.
+            existing.alarm_owned_at = None
             if progress is not None:
                 existing.last_progress = int(progress * 100)
         else:
@@ -602,7 +644,15 @@ async def handle_notification_row(
         devices = await _active_devices(db, row.user_id)
         if not devices:
             return {"status": "skipped", "reason": "no_live_activity_devices"}
-        is_chat_turn = (row.data_json or {}).get("kind") == "chat_turn"
+        # Belt-and-braces: key on the mission prefix too, so a future
+        # chatturn producer that forgets data.kind still yields (the
+        # _preempt_device refusal keys on the prefix — a kind-less
+        # chatturn start would otherwise insert-race the partial unique
+        # index forever).
+        is_chat_turn = (
+            (row.data_json or {}).get("kind") == "chat_turn"
+            or mission_id.startswith("chatturn:")
+        )
         for device in devices:
             started = await _started_rows_for_device(db, device.id)
             if any(la.mission_id == mission_id for la in started):
@@ -683,7 +733,42 @@ async def handle_notification_row(
         devices = await _active_devices(db, row.user_id)
         if not devices:
             return {"status": "skipped", "reason": "no_live_activity_devices"}
+        is_chat_turn = (
+            (row.data_json or {}).get("kind") == "chat_turn"
+            or mission_id.startswith("chatturn:")
+        )
         for device in devices:
+            if is_chat_turn and any(
+                la.mission_id.startswith("reminder:")
+                for la in await _started_rows_for_device(db, device.id)
+            ):
+                # REMINDER WINS in the restart lane too (2026-07-22
+                # founder repro: the 'Answer ready' terminal row
+                # push-to-started a chat-turn card 20s after a countdown
+                # armed — most-recently-started owns the Dynamic Island,
+                # so the job card squatted the island for its 5-minute
+                # linger while the live countdown was demoted to the
+                # lock screen, and the start's preempt orphaned the
+                # countdown row). The answer already reached the chat;
+                # only this ambient card yields. Mirror of the
+                # mission_started guard above.
+                per_device[device.id] = {
+                    "status": "skipped", "reason": "yields_to_reminder",
+                }
+                continue
+            if _is_alarm_row(row):
+                prior = await _row_for(db, device.id, mission_id)
+                if prior is not None and prior.alarm_owned_at is not None:
+                    # This device's AlarmKit alarm owns the fire moment
+                    # (the app retired the countdown card when it armed
+                    # the alarm). A platform loud restart on top would
+                    # double-alert — AlarmKit is already ringing through
+                    # silent/Focus, strictly louder than anything this
+                    # lane can do.
+                    per_device[device.id] = {
+                        "status": "skipped", "reason": "alarm_owned",
+                    }
+                    continue
             result = await _send_start(
                 db, device, row, mission_id, now, silent=not restart_loud,
             )
@@ -712,7 +797,15 @@ async def handle_notification_row(
         activities = await _activities_for_mission(db, row.user_id, mission_id)
 
     if not activities:
-        return {"status": "skipped", "reason": "no_active_activity"}
+        frag_skip: Dict[str, Any] = {
+            "status": "skipped", "reason": "no_active_activity",
+        }
+        if per_device:
+            # The restart lane ran and skipped (yields_to_reminder /
+            # alarm_owned) — keep the per-device verdicts on the row so
+            # ladebug shows WHY nothing was pushed.
+            frag_skip["devices"] = per_device
+        return frag_skip
 
     progress = _progress_fraction(row)
     title = _mission_title(row)
@@ -755,9 +848,39 @@ async def handle_notification_row(
             # on the final card (reminder fires show the reminder text
             # instead of 'Completed ✓').
             _silent_end = bool(_data.get("silent"))
+            _alarm = _is_alarm_row(row)
             _subtitle = _data.get("subtitle") if isinstance(_data.get("subtitle"), str) else None
             final_subtitle = _subtitle or ("Completed ✓" if done else "Stopped — needs attention")
-            final_progress = 1.0 if done else effective
+            # Alarm-class terminal rows render the RINGING presentation
+            # (content-state.fired), never progress math: 1.0 on a fire
+            # card paints the stale full bar the founder reproduced
+            # 2026-07-22; the widget shows a bell + 'Ringing' instead.
+            final_progress = None if _alarm else (1.0 if done else effective)
+            if _alarm and not _silent_end and la.alarm_owned_at is not None:
+                # This device's AlarmKit alarm owns the fire — it is
+                # already ringing through silent/Focus. Close our card
+                # quietly and contribute nothing to the ring chain.
+                payload = apns_push.build_end_payload(
+                    title=title, subtitle=final_subtitle, fired=True,
+                    dismissal_date=_dismissal_date(row, now)
+                    or int(now.timestamp()) + 120,
+                    timestamp=int(now.timestamp()),
+                )
+                result = await _send_to_activity(
+                    db, la, device, payload, priority=10, now=now, end=True,
+                )
+                # The fire CONSUMES the ownership cycle: without this
+                # clear, a later fire of the same mission that never
+                # re-armed (reschedule beyond the countdown window —
+                # no card, no re-report) would be muted by the stale
+                # flag — recreating the silent-T-0 incident. Marker
+                # key kept separate from `reason` so a failed end's
+                # APNs verdict stays readable in ladebug.
+                la.alarm_owned_at = None
+                result = {**result, "alarm_owned": True}
+                per_device[device.id] = result
+                delivered = delivered or result["status"] == "ok"
+                continue
             # Alarm-class rows ring more than once: every ring except
             # the last is an alerting UPDATE that leaves the card open
             # (already showing the fired state) for the next chained
@@ -777,6 +900,7 @@ async def handle_notification_row(
                 upd = apns_push.build_update_payload(
                     title=title, subtitle=final_subtitle,
                     progress=final_progress,
+                    fired=_alarm,
                     alert_title=row.title, alert_body=row.body,
                     timestamp=int(now.timestamp()),
                 )
@@ -793,6 +917,7 @@ async def handle_notification_row(
                     title=title,
                     subtitle=final_subtitle,
                     progress=final_progress,
+                    fired=_alarm,
                     # Fallback only: if neither the loud start nor the
                     # alerting update got through, the end keeps the alert
                     # rather than closing the card silently.
@@ -827,12 +952,21 @@ async def handle_notification_row(
         per_device[device.id] = result
         delivered = delivered or result["status"] == "ok"
 
-    # Alarm chain: once THIS ring reached a device, book the next one.
-    # Gated on delivered so a failed ring retries via the row's own
-    # backoff instead of forking the chain; the idempotency key makes
-    # the booking safe to repeat on partial-failure retries.
+    # Alarm chain: once THIS ring actually RANG a device, book the next
+    # one. Gated on a real ring — not mere delivery — so an
+    # alarm-owned quiet close (AlarmKit is doing the ringing) never
+    # chains platform rings on top of it, while a failed ring retries
+    # via the row's own backoff instead of forking the chain; the
+    # idempotency key makes the booking safe to repeat on
+    # partial-failure retries.
+    rang = any(
+        isinstance(r, dict)
+        and r.get("status") == "ok"
+        and not r.get("alarm_owned")
+        for r in per_device.values()
+    )
     if (
-        delivered
+        rang
         and row.event_kind in (NOTIFY_KIND_MISSION_COMPLETED,
                                NOTIFY_KIND_MISSION_FAILED)
         and _is_alarm_row(row)

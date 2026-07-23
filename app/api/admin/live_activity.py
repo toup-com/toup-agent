@@ -126,6 +126,11 @@ async def live_activity_debug(
                 "token_prefix": (d.push_to_start_token or "")[:12],
                 "environment": d.apns_environment,
                 "device_name": d.device_name,
+                "app_version": d.app_version,
+                # AlarmKit state as last reported by the app — the
+                # one-query answer to 'why was the fire silent'.
+                "alarm_auth": d.alarm_auth,
+                "alarms_armed": d.alarms_armed,
                 "revoked_at": _iso(d.revoked_at),
                 "created_at": _iso(d.created_at),
                 "last_seen_at": _iso(d.last_seen_at),
@@ -139,6 +144,7 @@ async def live_activity_debug(
                 "status": a.status,
                 "last_progress": a.last_progress,
                 "has_activity_token": bool(a.activity_push_token),
+                "alarm_owned_at": _iso(a.alarm_owned_at),
                 "updated_at": _iso(a.updated_at),
             }
             for a in activities

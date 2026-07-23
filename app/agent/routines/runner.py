@@ -891,10 +891,19 @@ class RoutineRunner:
             _job_type = "routine_run"
             _title = f"Routine fire: {routine.kind} {local_date}"
         try:
+            # Reminder fires: the job's user turn is the reminder text —
+            # without it the job detail screen rendered an EMPTY 'YOU'
+            # bubble (prompt='', founder repro 2026-07-22). Other kinds
+            # keep no prompt (their detail views show the run itself).
+            _prompt = (
+                (routine.reminder_text or routine.name or "").strip()
+                if routine.kind == "reminder" else None
+            )
             _job = await _runner.create_job(
                 job_type=_job_type,
                 spec=_spec,
                 title=_title,
+                prompt=_prompt or None,
                 idempotency_key=idempotency_key,
             )
         except Exception as _e:

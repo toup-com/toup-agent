@@ -89,6 +89,15 @@ class LiveActivityDevice(Base):
     # with 200 — pushes into the void, forever. Nullable: older app
     # builds don't send it.
     install_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # AlarmKit observability (2026-07-22, the silent-T-0 incident: the
+    # phone had NO device alarm armed and nothing anywhere could say
+    # so). Reported by the app with every registration:
+    #   alarm_auth   — 'authorized' | 'denied' | 'notDetermined' |
+    #                  'unavailable' (pre-iOS-26 / module missing)
+    #   alarms_armed — count of scheduled device alarms at report time
+    # Diagnosable from ladebug in one query; nullable = older builds.
+    alarm_auth: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    alarms_armed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False,
     )
@@ -138,6 +147,14 @@ class LiveActivity(Base):
         String(16), nullable=False, default=LA_STARTED, index=True,
     )
     last_progress: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Set when the app reported that a DEVICE alarm (AlarmKit, iOS 26)
+    # owns this mission's fire moment: the app retired the platform
+    # countdown card and the alarm's own Live Activity took over. The
+    # fire lane then skips its loud restart + ring chain for this
+    # device — AlarmKit rings through silent/Focus, a platform ring on
+    # top double-alerts. Cleared whenever the platform starts a fresh
+    # card for the mission (new countdown cycle re-arms and re-reports).
+    alarm_owned_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     started_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False,
     )

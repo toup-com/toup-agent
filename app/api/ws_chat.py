@@ -2660,6 +2660,26 @@ async def ws_chat(
                             _answer_data["day_chat_id"] = response.day_chat_id
                         if getattr(response, "asst_message_id", None):
                             _answer_data["message_id"] = response.asst_message_id
+                        # REMINDER WINS at the source: when this turn
+                        # created a reminder, its countdown card (armed
+                        # by the routines API mid-turn) IS the
+                        # confirmation — the user just read 'Done —
+                        # I'll remind you at …' in chat. A loud
+                        # 'Answer ready' card 20s later steals the
+                        # Dynamic Island from the countdown for its
+                        # 5-minute linger (founder repro 2026-07-22).
+                        # silent: the LA lane skips the restart and
+                        # ends any working card bannerlessly.
+                        # routines__remind is the ONLY reminder-minting
+                        # tool (routines__create's kind enum has no
+                        # 'reminder'); reschedules via routines__update
+                        # are not detectable here — the LA lane's
+                        # yields_to_reminder guard covers them.
+                        if any(
+                            (tc.get("name") or "") == "routines__remind"
+                            for tc in response.tool_calls
+                        ):
+                            _answer_data["silent"] = True
                         await notify(
                             event_kind="mission_completed",
                             title="Answer ready",

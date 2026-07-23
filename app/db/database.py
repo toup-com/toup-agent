@@ -714,6 +714,13 @@ async def init_db():
         # NOT mirrored: it requires the migration's dedupe pass first.
         "ALTER TABLE live_activity_devices ADD COLUMN IF NOT EXISTS install_id VARCHAR(64)",
         "CREATE INDEX IF NOT EXISTS ix_live_activity_devices_user_install ON live_activity_devices (user_id, install_id)",
+        # ── AlarmKit ownership + observability (alembic 073) ──
+        # Same precedent as 072 above: platform-api boots via init_db,
+        # so the ORM must never reference a column a pre-073 DB lacks.
+        # Both tables PLATFORM_ONLY → no-op on agent DBs.
+        "ALTER TABLE live_activity_devices ADD COLUMN IF NOT EXISTS alarm_auth VARCHAR(16)",
+        "ALTER TABLE live_activity_devices ADD COLUMN IF NOT EXISTS alarms_armed INTEGER",
+        "ALTER TABLE live_activities ADD COLUMN IF NOT EXISTS alarm_owned_at TIMESTAMP",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

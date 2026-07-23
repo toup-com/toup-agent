@@ -1663,3 +1663,536 @@ async def test_plain_completed_does_not_chain_rings(monkeypatch):
             )
         )).scalars().all()
         assert rings == []
+
+
+# ── 2026-07-22 reminder pipeline incident: REMINDER WINS in the
+#    restart lane, pre-fire tap exemption, fired state, alarm-owned ──
+
+
+@pytest.mark.asyncio
+async def test_answer_restart_yields_to_live_countdown(monkeypatch):
+    """The 'Answer ready' chat-turn terminal row must NOT push-to-start
+    a card over a live reminder countdown (it stole the Dynamic Island
+    for its 5-min linger and its preempt orphaned the countdown row —
+    founder repro 2026-07-22)."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    async def fake_fallback(db, row):
+        return {"status": "skipped", "reason": "no_active_agent"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fake_fallback)
+
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    await _mk_started_rows(user_id, device_id, ("reminder:cd0001",))
+    sent.clear()
+
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_completed", title="Answer ready",
+        body="Done — I'll remind you at 3:50 PM.", priority="high",
+        data_json={"mission_id": "chatturn:beefbeef0001",
+                   "mission_title": "Remind me in 4 min",
+                   "kind": "chat_turn", "progress": 100,
+                   "dismiss_after_s": 300},
+    ))
+    # No start push — the countdown keeps the island.
+    assert [s["payload"]["aps"]["event"] for s in sent] == []
+
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(
+                LiveActivity.mission_id == "reminder:cd0001")
+        )).scalars().one()
+        assert la.status == LA_STARTED  # countdown row untouched
+
+
+@pytest.mark.asyncio
+async def test_preempt_refuses_to_end_reminder_for_chatturn():
+    """Belt-and-braces: even a direct preempt call must never end a
+    reminder:* row to make room for a chat-turn card."""
+    from app.db import async_session_maker
+
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    await _mk_started_rows(user_id, device_id, ("reminder:cd0002",))
+
+    async with async_session_maker() as db:
+        device = (await db.execute(
+            select(LiveActivityDevice).where(
+                LiveActivityDevice.id == device_id)
+        )).scalars().one()
+        preempted = await las._preempt_device(
+            db, device, "chatturn:cafecafe0001", datetime.utcnow(),
+        )
+        await db.commit()
+        assert preempted == 0
+        la = (await db.execute(
+            select(LiveActivity).where(
+                LiveActivity.mission_id == "reminder:cd0002")
+        )).scalars().one()
+        assert la.status == LA_STARTED
+
+
+@pytest.mark.asyncio
+async def test_prefire_countdown_tap_is_navigation_only(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """A tap on a still-counting reminder card deep-links WITHOUT
+    acking: card stays, nothing suppressed (the countdown and fired
+    cards share the same ?mission= link — phase comes from the newest
+    arm row's timer)."""
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "cc" * 32, "environment": "development",
+              "install_id": "install-prefire-1"},
+        headers=auth_headers,
+    )
+    mission = "reminder:prefire00001"
+    future_ms = int((datetime.utcnow().timestamp() + 240) * 1000)
+    async with async_session_maker() as db:
+        device_id = (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id, mission_id=mission,
+            device_id=device_id, status=LA_STARTED,
+            started_at=datetime.utcnow(),
+        ))
+        db.add(NotificationQueue(
+            id=str(uuid.uuid4()), user_id=test_user_id, source="agent",
+            event_kind="mission_started", title="⏰ TV", priority="default",
+            idempotency_key="prefire-arm", status="sent",
+            created_at=datetime.utcnow(),
+            data_json={"mission_id": mission, "timer_end_ms": future_ms,
+                       "silent": True},
+        ))
+        await db.commit()
+
+    resp = await client.post(
+        "/api/devices/live-activity/ack",
+        json={"mission_id": mission},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("pre_fire") is True
+    assert body["ended"] == 0 and body["suppressed"] == 0
+    assert sent == []  # no end push
+
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_STARTED
+
+
+@pytest.mark.asyncio
+async def test_postfire_tap_acks_and_future_nonring_rows_survive(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """After the timer passed, the tap keeps full ack semantics: cards
+    end, queued rings (future-scheduled by design) are suppressed —
+    but a future-scheduled NON-ring row for the mission survives."""
+    from datetime import timedelta as _td
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "cd" * 32, "environment": "development",
+              "install_id": "install-postfire-1"},
+        headers=auth_headers,
+    )
+    mission = "reminder:postfire0001"
+    past_ms = int((datetime.utcnow().timestamp() - 30) * 1000)
+    async with async_session_maker() as db:
+        device_id = (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id, mission_id=mission,
+            device_id=device_id, status=LA_STARTED,
+            started_at=datetime.utcnow(),
+        ))
+        db.add(NotificationQueue(
+            id=str(uuid.uuid4()), user_id=test_user_id, source="agent",
+            event_kind="mission_started", title="⏰ TV", priority="default",
+            idempotency_key="postfire-arm", status="sent",
+            created_at=datetime.utcnow(),
+            data_json={"mission_id": mission, "timer_end_ms": past_ms,
+                       "silent": True},
+        ))
+        db.add(NotificationQueue(  # queued ring 2 — MUST be suppressed
+            id=str(uuid.uuid4()), user_id=test_user_id, source="platform",
+            event_kind="mission_completed", title="⏰ TV — now",
+            priority="high", idempotency_key=f"alarm-ring:{mission}:2",
+            status=NQ_QUEUED, created_at=datetime.utcnow(),
+            scheduled_for=datetime.utcnow() + _td(seconds=20),
+            data_json={"mission_id": mission, "realert_seq": 2,
+                       "la_only": True, "sound": "toup_alarm.caf"},
+        ))
+        db.add(NotificationQueue(  # future ordinary row — MUST survive
+            id=str(uuid.uuid4()), user_id=test_user_id, source="agent",
+            event_kind="mission_completed", title="tomorrow",
+            priority="high", idempotency_key="postfire-future",
+            status=NQ_QUEUED, created_at=datetime.utcnow(),
+            scheduled_for=datetime.utcnow() + _td(hours=20),
+            data_json={"mission_id": mission},
+        ))
+        await db.commit()
+
+    resp = await client.post(
+        "/api/devices/live-activity/ack",
+        json={"mission_id": mission},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("pre_fire") is None
+    assert body["ended"] == 1
+    assert body["suppressed"] == 1  # the ring; not the future row
+
+    async with async_session_maker() as db:
+        rows = {r.idempotency_key: r.status for r in (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.user_id == test_user_id)
+        )).scalars().all()}
+        assert rows[f"alarm-ring:{mission}:2"] == NQ_SUPPRESSED
+        assert rows["postfire-future"] == NQ_QUEUED
+
+
+@pytest.mark.asyncio
+async def test_alarm_fire_carries_fired_state_not_progress(monkeypatch):
+    """Fire pushes render the RINGING presentation: content-state.fired
+    on the alerting update (card present) and on the loud restart (card
+    missing) — never a 0%/100% progress bar."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    async def fake_fallback(db, row):
+        return {"status": "skipped", "reason": "no_active_agent"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fake_fallback)
+
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    # Card present → alerting update carries fired, no progress.
+    await _mk_started_rows(user_id, device_id, ("reminder:fired001",))
+    sent.clear()
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_completed", title="⏰ TV — now",
+        priority="high",
+        data_json={"mission_id": "reminder:fired001", "mission_title": "⏰ TV",
+                   "sound": "toup_alarm.caf", "subtitle": "Turn off the TV."},
+    ))
+    upd_cs = sent[0]["payload"]["aps"]["content-state"]
+    assert upd_cs.get("fired") is True
+    assert "progress" not in upd_cs and "timerEndDateInMilliseconds" not in upd_cs
+
+    # Card missing → ring-1 loud restart start payload carries fired.
+    sent.clear()
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_completed", title="⏰ TV — now",
+        priority="high",
+        data_json={"mission_id": "reminder:fired002", "mission_title": "⏰ TV",
+                   "sound": "toup_alarm.caf", "subtitle": "Turn off the TV."},
+    ))
+    start = next(s for s in sent
+                 if s["payload"]["aps"]["event"] == "start")
+    start_cs = start["payload"]["aps"]["content-state"]
+    assert start_cs.get("fired") is True
+    assert "progress" not in start_cs
+
+
+@pytest.mark.asyncio
+async def test_alarm_owned_fire_stays_quiet_and_chains_nothing(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """Once the app reports AlarmKit ownership (retiring the countdown
+    card), the fire lane must not loud-restart or ring — the device
+    alarm is already ringing through silent/Focus."""
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    async def fake_fallback(db, row):
+        return {"status": "skipped", "reason": "no_active_agent"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fake_fallback)
+
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "ce" * 32, "environment": "development",
+              "install_id": "install-owned-1"},
+        headers=auth_headers,
+    )
+    mission = "reminder:owned0001"
+    async with async_session_maker() as db:
+        device_id = (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id, mission_id=mission,
+            device_id=device_id, status=LA_STARTED,
+            started_at=datetime.utcnow(),
+        ))
+        await db.commit()
+
+    # The app arms its device alarm and reports ownership. The row
+    # STAYS started — it is the anchor every REMINDER-WINS guard keys
+    # off (ending it would let the next chat turn start a card over
+    # the AlarmKit countdown); only the flag flips.
+    resp = await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated"] == 1
+
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_STARTED  # guard anchor survives
+        assert la.alarm_owned_at is not None
+
+    sent.clear()
+    await _claim_and_dispatch(await _enqueue(
+        test_user_id, event_kind="mission_completed", title="⏰ TV — now",
+        priority="high",
+        data_json={"mission_id": mission, "mission_title": "⏰ TV",
+                   "sound": "toup_alarm.caf", "subtitle": "Turn off the TV."},
+    ))
+    # AlarmKit owns the fire: the ghost row is closed QUIETLY — a
+    # bannerless fired end, never a loud restart or alerting update.
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["end"]
+    assert "alert" not in sent[0]["payload"]["aps"]
+    assert sent[0]["payload"]["aps"]["content-state"].get("fired") is True
+
+    async with async_session_maker() as db:
+        rings = (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.idempotency_key.like(
+                    f"alarm-ring:{mission}:%"),
+            )
+        )).scalars().all()
+        assert rings == []  # chain never started
+
+
+@pytest.mark.asyncio
+async def test_fresh_countdown_start_clears_alarm_ownership(monkeypatch):
+    """A new countdown cycle re-arms from scratch: the platform start
+    resets alarm_owned_at so a stale ownership flag can never mute a
+    later fire the device no longer owns."""
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    device_id = await _mk_la_device(user_id)
+    mission = "reminder:recycle01"
+    async with async_session_maker() as db:
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=user_id, mission_id=mission,
+            device_id=device_id, status=LA_ENDED,
+            started_at=datetime.utcnow(), ended_at=datetime.utcnow(),
+            alarm_owned_at=datetime.utcnow(),
+        ))
+        await db.commit()
+
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started",
+        data_json={"mission_id": mission, "mission_title": "⏰ TV",
+                   "silent": True, "timer_end_ms":
+                   int((datetime.utcnow().timestamp() + 300) * 1000)},
+    ))
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_STARTED
+        assert la.alarm_owned_at is None
+
+
+@pytest.mark.asyncio
+async def test_register_stores_alarm_observability(
+    client, auth_headers, test_user_id,
+):
+    """alarm_auth/alarms_armed ride the normal registration — the
+    one-query answer to 'why was the fire silent on this phone'."""
+    from app.db import async_session_maker
+
+    resp = await client.post(
+        "/api/devices/live-activity",
+        json={"token": "cf" * 32, "environment": "development",
+              "install_id": "install-obs-1",
+              "alarm_auth": "authorized", "alarms_armed": 3},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    async with async_session_maker() as db:
+        device = (await db.execute(
+            select(LiveActivityDevice).where(
+                LiveActivityDevice.push_to_start_token == "cf" * 32)
+        )).scalars().one()
+        assert device.alarm_auth == "authorized"
+        assert device.alarms_armed == 3
+
+
+@pytest.mark.asyncio
+async def test_owned_fire_consumes_ownership_and_next_fire_rings_loud(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """F1 regression (review 2026-07-23): the fire consumes the
+    alarm-ownership cycle. A later fire of the same mission that never
+    re-armed (reschedule beyond the countdown window — no card, no
+    re-report) must ring LOUD, not be muted by the stale flag."""
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    async def fake_fallback(db, row):
+        return {"status": "skipped", "reason": "no_active_agent"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fake_fallback)
+
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "d0" * 32, "environment": "development",
+              "install_id": "install-cycle-1"},
+        headers=auth_headers,
+    )
+    mission = "reminder:cycle0001"
+    async with async_session_maker() as db:
+        device_id = (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id, mission_id=mission,
+            device_id=device_id, status=LA_STARTED,
+            started_at=datetime.utcnow(),
+        ))
+        await db.commit()
+    resp = await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission}, headers=auth_headers,
+    )
+    assert resp.json()["updated"] == 1
+
+    # Fire 1: quiet owned end — and the flag is CONSUMED.
+    await _claim_and_dispatch(await _enqueue(
+        test_user_id, event_kind="mission_completed", title="⏰ R — now",
+        priority="high",
+        data_json={"mission_id": mission, "mission_title": "⏰ R",
+                   "sound": "toup_alarm.caf", "subtitle": "ring"},
+    ))
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_ENDED
+        assert la.alarm_owned_at is None  # cycle consumed
+
+    # Fire 2 (rescheduled far out, never re-armed): must restart LOUD.
+    sent.clear()
+    await _claim_and_dispatch(await _enqueue(
+        test_user_id, event_kind="mission_completed", title="⏰ R — now",
+        priority="high",
+        data_json={"mission_id": mission, "mission_title": "⏰ R",
+                   "sound": "toup_alarm.caf", "subtitle": "ring again"},
+    ))
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert "start" in events  # loud restart happened
+    start = next(s for s in sent if s["payload"]["aps"]["event"] == "start")
+    assert "alert" in start["payload"]["aps"]
+
+    async with async_session_maker() as db:
+        ring2 = (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.idempotency_key == f"alarm-ring:{mission}:2",
+            )
+        )).scalars().all()
+        assert len(ring2) == 1  # chain armed again
+
+
+@pytest.mark.asyncio
+async def test_postfire_ack_suppresses_retrying_fire_row(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """F2 regression (review 2026-07-23): a ring-1 fire row sitting in
+    retry backoff (attempts>=1, future scheduled_for) is part of the
+    in-progress alert — a post-fire tap must suppress it, or it
+    loud-restarts minutes after the user already acknowledged."""
+    from datetime import timedelta as _td
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "d1" * 32, "environment": "development",
+              "install_id": "install-retryack-1"},
+        headers=auth_headers,
+    )
+    mission = "reminder:retryack01"
+    past_ms = int((datetime.utcnow().timestamp() - 30) * 1000)
+    async with async_session_maker() as db:
+        device_id = (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id, mission_id=mission,
+            device_id=device_id, status=LA_STARTED,
+            started_at=datetime.utcnow(),
+        ))
+        db.add(NotificationQueue(
+            id=str(uuid.uuid4()), user_id=test_user_id, source="agent",
+            event_kind="mission_started", title="⏰ R", priority="default",
+            idempotency_key="retryack-arm", status="sent",
+            created_at=datetime.utcnow(),
+            data_json={"mission_id": mission, "timer_end_ms": past_ms,
+                       "silent": True},
+        ))
+        db.add(NotificationQueue(  # ring-1 fire row in retry backoff
+            id=str(uuid.uuid4()), user_id=test_user_id, source="agent",
+            event_kind="mission_completed", title="⏰ R — now",
+            priority="high", idempotency_key="retryack-fire",
+            status=NQ_QUEUED, attempts=1,
+            created_at=datetime.utcnow(),
+            scheduled_for=datetime.utcnow() + _td(minutes=8),
+            data_json={"mission_id": mission, "sound": "toup_alarm.caf"},
+        ))
+        await db.commit()
+
+    resp = await client.post(
+        "/api/devices/live-activity/ack",
+        json={"mission_id": mission}, headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["suppressed"] == 1
+
+    async with async_session_maker() as db:
+        fire = (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.idempotency_key == "retryack-fire")
+        )).scalars().one()
+        assert fire.status == NQ_SUPPRESSED

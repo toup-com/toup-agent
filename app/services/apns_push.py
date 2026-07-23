@@ -155,10 +155,20 @@ def _content_state(
     subtitle: Optional[str],
     progress: Optional[float],
     timer_end_ms: Optional[int] = None,
+    fired: Optional[bool] = None,
 ) -> Dict[str, Any]:
     state: Dict[str, Any] = {"title": title[:80]}
     if subtitle:
         state["subtitle"] = subtitle[:120]
+    # fired: alarm-class terminal state (reminder fires). The widget
+    # renders a ringing presentation instead of any progress surface,
+    # so fired cards carry NEITHER timer NOR progress — a fired
+    # reminder shown as a 0%-then-100% bar reads as a stale job card
+    # (founder repro 2026-07-22). Optional in the Swift ContentState:
+    # old widgets ignore the extra key, old payloads decode nil.
+    if fired:
+        state["fired"] = True
+        return state
     # Timer wins over discrete progress: the widget renders
     # timerEndDateInMilliseconds as a bar that animates ON-DEVICE with
     # zero pushes — the right surface for bounded quick jobs, while
@@ -215,6 +225,7 @@ def build_start_payload(
     timer_type: Optional[str] = None,
     orb_color: Optional[str] = None,
     stale_date: Optional[int] = None,
+    fired: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Push-to-start payload. ``attributes.name`` carries the mission id —
     the app's onTokenReceived listener echoes it back so a reported
@@ -243,7 +254,7 @@ def build_start_payload(
             # Control).
             "deepLinkUrl": deep_link,
         },
-        "content-state": _content_state(title, subtitle, progress, timer_end_ms),
+        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired),
     }
     # Compact Dynamic Island timer style — the widget decodes
     # attributes.timerType ('circular' default | 'digital' mm:ss).
@@ -292,11 +303,12 @@ def build_update_payload(
     alert_sound: Optional[str] = None,
     stale_date: Optional[int] = None,
     timestamp: Optional[int] = None,
+    fired: Optional[bool] = None,
 ) -> Dict[str, Any]:
     aps: Dict[str, Any] = {
         "timestamp": int(timestamp or time.time()),
         "event": "update",
-        "content-state": _content_state(title, subtitle, progress, timer_end_ms),
+        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired),
     }
     if stale_date:
         aps["stale-date"] = int(stale_date)
@@ -316,13 +328,14 @@ def build_end_payload(
     alert_sound: Optional[str] = None,
     dismissal_date: Optional[int] = None,
     timestamp: Optional[int] = None,
+    fired: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """End payload. Without ``dismissal_date`` the finished card lingers
     on the lock screen (up to 4h) so the user sees the final state."""
     aps: Dict[str, Any] = {
         "timestamp": int(timestamp or time.time()),
         "event": "end",
-        "content-state": _content_state(title, subtitle, progress),
+        "content-state": _content_state(title, subtitle, progress, fired=fired),
     }
     if dismissal_date:
         aps["dismissal-date"] = int(dismissal_date)

@@ -39,7 +39,8 @@ from app.db.models import (
     KNOWN_APNS_ENVIRONMENTS, LA_ENDED, LA_STARTED,
     LiveActivity, LiveActivityDevice, NotificationQueue,
     NOTIFY_KIND_MISSION_COMPLETED, NOTIFY_KIND_MISSION_FAILED,
-    NOTIFY_KIND_PROGRESS, NQ_QUEUED, NQ_SENDING, NQ_SUPPRESSED,
+    NOTIFY_KIND_MISSION_STARTED, NOTIFY_KIND_PROGRESS,
+    NQ_QUEUED, NQ_SENDING, NQ_SUPPRESSED,
 )
 from app.services import apns_push
 
@@ -66,6 +67,11 @@ class LiveActivityDeviceRegister(BaseModel):
     # (user_id, install_id) lets us update the row in place instead
     # of accreting a stale sibling (APNs 200s dead tokens forever).
     install_id: Optional[str] = Field(default=None, max_length=64)
+    # AlarmKit observability (2026-07-22 silent-T-0 incident: nothing
+    # anywhere could say 'this phone has no device alarm armed').
+    # 'authorized' | 'denied' | 'notDetermined' | 'unavailable'.
+    alarm_auth: Optional[str] = Field(default=None, max_length=16)
+    alarms_armed: Optional[int] = Field(default=None, ge=0, le=1000)
 
     @field_validator("token")
     @classmethod
@@ -191,6 +197,10 @@ async def register_live_activity_device(
             device.app_version = body.app_version or device.app_version
             if body.install_id:
                 device.install_id = body.install_id
+            if body.alarm_auth is not None:
+                device.alarm_auth = body.alarm_auth
+            if body.alarms_armed is not None:
+                device.alarms_armed = body.alarms_armed
             device.last_seen_at = now
             device.revoked_at = None
         else:
@@ -204,6 +214,8 @@ async def register_live_activity_device(
                 device_name=body.device_name,
                 app_version=body.app_version,
                 install_id=body.install_id,
+                alarm_auth=body.alarm_auth,
+                alarms_armed=body.alarms_armed,
                 created_at=now,
                 last_seen_at=now,
             )
@@ -422,9 +434,48 @@ async def ack_live_activity(
     End the mission's cards on every device (immediate dismissal) and
     suppress its still-pending completed/failed/progress queue rows so
     an already-seen mission never re-alerts. needs_input/needs_approval
-    rows are deliberately NOT suppressed — seen is not answered."""
+    rows are deliberately NOT suppressed — seen is not answered.
+
+    PRE-FIRE EXEMPTION (2026-07-22 founder repro): a reminder's
+    countdown card and its fired card carry the SAME deep link, so a
+    tap on a still-counting card used to be treated as an alert ack —
+    it wiped the pending countdown and the user lost their alert
+    surface. When the mission's newest countdown arm
+    (mission_started row with ``timer_end_ms``) is still in the
+    future, the tap is just navigation: keep the card, suppress
+    nothing. Post-fire taps keep full ack semantics (end everywhere +
+    suppress queued rings)."""
     user_id = current_user.id
     now = datetime.utcnow()
+
+    if body.mission_id.startswith("reminder:"):
+        # Newest countdown arm for THIS mission decides the phase —
+        # filtered in SQL (JSON ->> / as_string, portable across the
+        # JSONB prod column and the sqlite test variant) so a chatty
+        # day's flood of other mission_started rows can never push the
+        # arm out of scope.
+        newest_arm = (
+            await db.execute(
+                select(NotificationQueue)
+                .where(
+                    NotificationQueue.user_id == user_id,
+                    NotificationQueue.event_kind == NOTIFY_KIND_MISSION_STARTED,
+                    NotificationQueue.data_json["mission_id"].as_string()
+                    == body.mission_id,
+                )
+                .order_by(NotificationQueue.created_at.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if newest_arm is not None:
+            end_ms = (newest_arm.data_json or {}).get("timer_end_ms")
+            if (
+                isinstance(end_ms, (int, float))
+                and end_ms / 1000.0 > now.timestamp()
+            ):
+                # Still counting down — navigation only.
+                return {"ok": True, "ended": 0, "suppressed": 0,
+                        "pre_fire": True}
 
     rows = (
         await db.execute(
@@ -456,6 +507,10 @@ async def ack_live_activity(
         la.status = LA_ENDED
         la.ended_at = now
         la.updated_at = now
+        # A post-fire ack consumes the alarm-ownership cycle too — a
+        # stale flag on this row must never mute a future fire of the
+        # same mission (the app re-reports on every fresh arming).
+        la.alarm_owned_at = None
         ended += 1
 
     pending = (
@@ -473,7 +528,26 @@ async def ack_live_activity(
     ).scalars().all()
     suppressed = 0
     for row in pending:
-        if (row.data_json or {}).get("mission_id") != body.mission_id:
+        data = row.data_json or {}
+        if data.get("mission_id") != body.mission_id:
+            continue
+        # Suppress only rows that are part of an in-progress alert:
+        # already due, chained alarm rings (deliberately future-
+        # scheduled 20s out — the whole point of the tap ack is
+        # stopping them), or a RETRYING row (attempts >= 1: its
+        # future scheduled_for is dispatcher backoff, not a schedule —
+        # without this, a ring-1 fire row that failed once would
+        # survive the ack and loud-restart minutes later). A fresh
+        # FUTURE-scheduled ordinary row (attempts 0 — e.g. the next
+        # fire of a daily reminder queued by an edit race) survives a
+        # tap that only meant 'I saw this one'.
+        is_ring = bool(data.get("la_only")) or (
+            isinstance(data.get("realert_seq"), int)
+            and data["realert_seq"] >= 2
+        )
+        due = row.scheduled_for is None or row.scheduled_for <= now
+        retrying = (row.attempts or 0) >= 1
+        if not (is_ring or due or retrying):
             continue
         row.status = NQ_SUPPRESSED
         row.claimed_at = None
@@ -488,6 +562,73 @@ async def ack_live_activity(
             body.mission_id, ended, suppressed,
         )
     return {"ok": True, "ended": ended, "suppressed": suppressed}
+
+
+class AlarmOwnedReport(BaseModel):
+    """The app armed (or disarmed) a DEVICE alarm — AlarmKit, iOS 26 —
+    for this mission and retired the platform countdown card. ``token``
+    (the device's push-to-start token) scopes the report to that
+    device's rows; without it every row of the mission is marked
+    (single-phone reality, and safe: the flag only quiets the fire
+    lane's own restart+rings)."""
+
+    mission_id: str = Field(..., min_length=1, max_length=64)
+    owned: bool = True
+    token: Optional[str] = Field(default=None, min_length=32, max_length=200)
+
+
+@router.post("/alarm-owned")
+async def report_alarm_owned(
+    body: AlarmOwnedReport,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Record device-alarm ownership of a mission's fire moment so the
+    fire lane skips its loud restart + ring chain on that device
+    (AlarmKit already rings through silent/Focus — a platform ring on
+    top double-alerts). ``owned=false`` clears the flag (alarm
+    canceled / rescheduled away).
+
+    The row's STATUS is deliberately left alone: the app retired the
+    on-device push card, but the started reminder row is what every
+    REMINDER-WINS guard keys off — ending it here would let the next
+    chat turn legally start a card over the AlarmKit countdown. The
+    ghost row is harmless: the fire lane's alarm_owned branch closes
+    it quietly at fire time, and the 8h GC is the backstop."""
+    user_id = current_user.id
+    now = datetime.utcnow()
+
+    stmt = select(LiveActivity).where(
+        LiveActivity.user_id == user_id,
+        LiveActivity.mission_id == body.mission_id,
+    )
+    if body.token:
+        device_id = (
+            await db.execute(
+                select(LiveActivityDevice.id).where(
+                    LiveActivityDevice.user_id == user_id,
+                    LiveActivityDevice.push_to_start_token
+                    == body.token.strip().lower(),
+                )
+            )
+        ).scalar_one_or_none()
+        if device_id is None:
+            return {"ok": True, "updated": 0}
+        stmt = stmt.where(LiveActivity.device_id == device_id)
+
+    rows = (await db.execute(stmt)).scalars().all()
+    updated = 0
+    for la in rows:
+        la.alarm_owned_at = now if body.owned else None
+        la.updated_at = now
+        updated += 1
+    if updated:
+        await db.commit()
+        logger.info(
+            "live-activity alarm-owned: mission %s owned=%s — %d row(s)",
+            body.mission_id, body.owned, updated,
+        )
+    return {"ok": True, "updated": updated}
 
 
 @router.post("/unregister")
