@@ -992,8 +992,10 @@ async def proxy_openai_images(
     # Free-tier monthly image cap (audit-2026 re-audit round 7): the same hard
     # product limit the Kie route enforces. Without it here, a free-tier user
     # bypasses the cap by routing image generation through the OpenAI proxy.
-    from app.services.credit_service import credit_service as _cs
-    _exceeded, _used, _limit = await _cs.free_tier_image_quota(db, config.user_id)
+    from app.services.credit_service import (
+        reserve_free_image_slot, release_free_image_slot, settle_free_image_slot,
+    )
+    _exceeded, _used, _limit, _img_slot = await reserve_free_image_slot(db, config.user_id)
     if _exceeded:
         raise HTTPException(status_code=429, detail={
             "code": "image_quota_exceeded", "used": _used, "limit": _limit,
@@ -1021,6 +1023,7 @@ async def proxy_openai_images(
     except Exception as e:
         latency = int((time.time() - start_ts) * 1000)
         await _log_event(db, config.user_id, "openai", model, "images", 0, 0, 0, latency, status="error")
+        await release_free_image_slot(db, _img_slot)   # generation failed → free the slot
         raise HTTPException(502, f"OpenAI image error: {e}")
 
     latency = int((time.time() - start_ts) * 1000)
@@ -1028,6 +1031,7 @@ async def proxy_openai_images(
         # Surface OpenAI's error verbatim (e.g. org-not-verified for gpt-image-1)
         # so the agent can retry with the fallback model.
         await _log_event(db, config.user_id, "openai", model, "images", 0, 0, 0, latency, status="error")
+        await release_free_image_slot(db, _img_slot)   # no image produced → free the slot
         try:
             detail = resp.json()
         except Exception:
@@ -1061,6 +1065,7 @@ async def proxy_openai_images(
             "[credits] image try_charge failed user=%s model=%s size=%s q=%s",
             config.user_id[:8], model, size, quality,
         )
+    await settle_free_image_slot(db, _img_slot)   # slot consumed → stop double-counting
     # Record the usage event (0 tokens → its internal charge is a no-op) and
     # commit both the charge ledger row and the event together.
     await _log_event(
@@ -1084,10 +1089,12 @@ async def proxy_openai_image_edits(
     /credits/agent-charge, so they never reach this route.
     """
     config = await _auth_agent(request, db)
-    # Free-tier monthly image cap (audit-2026 re-audit round 7) — mirror the
-    # generate route so the edit path can't bypass the cap either.
-    from app.services.credit_service import credit_service as _cs
-    _exceeded, _used, _limit = await _cs.free_tier_image_quota(db, config.user_id)
+    # Free-tier monthly image cap — mirror the generate route so the edit path
+    # can't bypass the cap either. RESERVE before generating (round 12 TOCTOU).
+    from app.services.credit_service import (
+        reserve_free_image_slot, release_free_image_slot, settle_free_image_slot,
+    )
+    _exceeded, _used, _limit, _img_slot = await reserve_free_image_slot(db, config.user_id)
     if _exceeded:
         raise HTTPException(status_code=429, detail={
             "code": "image_quota_exceeded", "used": _used, "limit": _limit,
@@ -1147,12 +1154,14 @@ async def proxy_openai_image_edits(
     except Exception as e:
         latency = int((time.time() - start_ts) * 1000)
         await _log_event(db, config.user_id, "openai", model, "images", 0, 0, 0, latency, status="error")
+        await release_free_image_slot(db, _img_slot)   # generation failed → free the slot
         raise HTTPException(502, f"OpenAI image edit error: {e}")
 
     latency = int((time.time() - start_ts) * 1000)
     if resp.status_code >= 400:
         # Surface OpenAI's error verbatim (moderation, bad image, etc.).
         await _log_event(db, config.user_id, "openai", model, "images", 0, 0, 0, latency, status="error")
+        await release_free_image_slot(db, _img_slot)   # no image produced → free the slot
         try:
             detail = resp.json()
         except Exception:
@@ -1185,6 +1194,7 @@ async def proxy_openai_image_edits(
             "[credits] image-edit try_charge failed user=%s model=%s size=%s q=%s",
             config.user_id[:8], model, size, quality,
         )
+    await settle_free_image_slot(db, _img_slot)   # slot consumed → stop double-counting
     await _log_event(
         db, config.user_id, "openai", model, "images",
         0, 0, int(float(total_cents)), latency,
@@ -1211,7 +1221,10 @@ async def proxy_kie_image(
     """
     import base64 as _b64
     from app.services import kie_client
-    from app.services.credit_service import credit_service, underlying_cost_to_credits
+    from app.services.credit_service import (
+        credit_service, underlying_cost_to_credits,
+        reserve_free_image_slot, release_free_image_slot, settle_free_image_slot,
+    )
     from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
 
     config = await _auth_agent(request, db)
@@ -1221,9 +1234,11 @@ async def proxy_kie_image(
     if not prompt:
         raise HTTPException(400, "prompt is required")
 
-    # Free-tier monthly image cap — a hard product limit, checked BEFORE spending
-    # any Kie credits so a capped free user costs nothing.
-    exceeded, used, limit = await credit_service.free_tier_image_quota(db, config.user_id)
+    # Free-tier monthly image cap — a hard product limit. RESERVE the slot BEFORE
+    # spending any Kie credits (round 12): the reservation is TOCTOU-safe, so
+    # concurrent requests can't all pass a stale count and blow past the cap.
+    # (This also fixes the prior instance-attr call that raised AttributeError.)
+    exceeded, used, limit, _img_slot = await reserve_free_image_slot(db, config.user_id)
     if exceeded:
         raise HTTPException(status_code=429, detail={
             "code": "image_quota_exceeded", "used": used, "limit": limit,
@@ -1248,6 +1263,7 @@ async def proxy_kie_image(
         latency = int((time.time() - start_ts) * 1000)
         await _log_event(db, config.user_id, "kie", settings.kie_image_model, "images",
                          0, 0, 0, latency, status="error")
+        await release_free_image_slot(db, _img_slot)   # generation failed → free the slot
         raise HTTPException(status_code=502, detail={
             "code": "kie_failed", "moderation": bool(e.moderation), "message": str(e)[:300],
         })
@@ -1271,6 +1287,7 @@ async def proxy_kie_image(
         )
     except Exception:
         logger.exception("[credits] kie image try_charge failed user=%s", config.user_id[:8])
+    await settle_free_image_slot(db, _img_slot)   # slot consumed → stop double-counting
     await _log_event(db, config.user_id, "kie", result.model, "images", 0, 0, int(cents), latency)
 
     return {

@@ -721,6 +721,21 @@ async def init_db():
         "ALTER TABLE live_activity_devices ADD COLUMN IF NOT EXISTS alarm_auth VARCHAR(16)",
         "ALTER TABLE live_activity_devices ADD COLUMN IF NOT EXISTS alarms_armed INTEGER",
         "ALTER TABLE live_activities ADD COLUMN IF NOT EXISTS alarm_owned_at TIMESTAMP",
+        # ── Global consumable-IAP replay guard (alembic 074, round 12) ──
+        # A consumable StoreKit / Play transaction may be redeemed by EXACTLY
+        # ONE account, ever. The credit_ledger idempotency index is per-user
+        # (user_id, idempotency_key), so a farmed second account could replay a
+        # real purchase and mint credits (docs/security/audit-2026.md). This
+        # table's transaction_id PRIMARY KEY enforces GLOBAL uniqueness. No FK
+        # to users, so `CREATE TABLE IF NOT EXISTS` is safe on any DB partition
+        # (an unused empty table on agent DBs). This init_db line is the
+        # authoritative heal on the platform (the Dockerfile `alembic upgrade
+        # head` is best-effort); migration 074 mirrors it for schema tracking.
+        "CREATE TABLE IF NOT EXISTS redeemed_iap_transactions ("
+        "transaction_id VARCHAR(120) PRIMARY KEY, "
+        "user_id VARCHAR(36) NOT NULL, "
+        "platform VARCHAR(16), "
+        "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

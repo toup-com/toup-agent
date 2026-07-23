@@ -36,7 +36,9 @@ def _build_agent_bridge_script(token: str, app_id: str) -> str:
         "<script>"
         "(function(){"
         # ── Config ──
-        f'var T="{token}",A="{app_id}";'
+        # json.dumps so a token/app_id can never break out of the JS string
+        # literal (defense-in-depth; token is an app-preview-scoped JWT).
+        f'var T={json.dumps(token)},A={json.dumps(app_id)};'
         # Chat endpoint — same-origin HTTP POST, no WebSocket needed
         'var chatUrl="/api/apps/"+A+"/chat";'
         # ── Set globals for generated code that checks them ──
@@ -861,6 +863,43 @@ async def _get_user_from_token(token: str, db: AsyncSession):
         return None
 
 
+async def _get_user_from_preview_token(token: str, app_id: str, db: AsyncSession):
+    """Validate an app-preview-scoped token bound to this app_id (round 12).
+
+    This is what the preview iframe carries now — a token that only works for
+    THIS app's preview/chat and is rejected by general auth, so exfiltrating
+    it from the agent-authored page can't take over the account."""
+    from app.services.auth_service import decode_preview_token
+    try:
+        user_id = decode_preview_token(token, app_id)
+        if not user_id:
+            return None
+        return type("User", (), {"id": user_id})()
+    except Exception:
+        return None
+
+
+@router.post("/{app_id}/preview-token")
+async def mint_preview_token(
+    app_id: str,
+    current_user=Depends(get_current_user),
+):
+    """Mint a short-lived, app-scoped token for the preview iframe URL.
+
+    The SPA calls this with its real account bearer, then puts the RETURNED
+    token (not the account JWT) in the iframe ``src``. So the credential that
+    rides in an agent-authored, same-origin preview page — reachable by
+    prompt-injected app code — is a minutes-scale, single-app token that
+    general auth rejects, not the account credential (round 12)."""
+    from app.services.auth_service import create_preview_token
+    from app.config import settings as _settings
+    tok = create_preview_token(str(current_user.id), app_id)
+    return {
+        "token": tok,
+        "expires_in": _settings.preview_token_expire_minutes * 60,
+    }
+
+
 @router.get("/{app_id}/preview/{path:path}")
 @router.get("/{app_id}/preview")
 async def preview_proxy(
@@ -891,7 +930,12 @@ async def preview_proxy(
     except Exception:
         pass
     if not user and token:
-        user = await _get_user_from_token(token, db)
+        # Prefer an app-preview-scoped token (bound to this app_id, worthless
+        # elsewhere) — that's what the iframe carries post round-12. Fall back
+        # to a full account token for older clients still sending one.
+        user = await _get_user_from_preview_token(token, app_id, db)
+        if not user:
+            user = await _get_user_from_token(token, db)
     if not user:
         cookie_token = request.cookies.get("preview_token")
         if cookie_token:
@@ -935,8 +979,17 @@ async def preview_proxy(
             # AgentPlaceholder to the user's real agent via WebSocket.
             # This runs BEFORE the Expo bundle, so window.__TOUP_AGENT_BRIDGE
             # is ready when the generated agentBridge.ts loads.
+            #
+            # Always mint a FRESH app-preview-scoped token for the page's JS,
+            # regardless of how this request authenticated (round 12). The
+            # preview HTML is agent-authored and runs same-origin with the SPA;
+            # a full account JWT embedded here is exfiltratable by injected app
+            # code, so the bridge only ever gets a token that works for THIS
+            # app's chat and nothing else. get_current_user rejects it.
+            from app.services.auth_service import create_preview_token
+            bridge_token = create_preview_token(str(user.id), app_id)
             agent_bridge_script = _build_agent_bridge_script(
-                resolved_token or "", app_id
+                bridge_token, app_id
             )
             # Meta charset MUST be first in <head> — WKWebView uses it to
             # decide text encoding before parsing any other content.
@@ -1021,14 +1074,18 @@ async def app_chat_proxy(
     """
     import asyncio
 
-    # Authenticate (same as preview_proxy)
+    # Authenticate (same as preview_proxy). The in-preview bridge calls this
+    # with the app-preview-scoped token minted for the page, so accept that
+    # (bound to app_id) before the full-account fallback.
     user = None
     try:
         user = await get_current_user(request, db)
     except Exception:
         pass
     if not user and token:
-        user = await _get_user_from_token(token, db)
+        user = await _get_user_from_preview_token(token, app_id, db)
+        if not user:
+            user = await _get_user_from_token(token, db)
     if not user:
         cookie_token = request.cookies.get("preview_token")
         if cookie_token:

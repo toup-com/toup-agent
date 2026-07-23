@@ -76,19 +76,75 @@ def create_access_token(user_id: str) -> str:
 
 
 def decode_access_token(token: str) -> Optional[str]:
-    """Decode a JWT token and return the user ID"""
+    """Decode a JWT token and return the user ID.
+
+    A full account credential has no ``scope`` claim (or ``scope == "full"``).
+    Narrowly-scoped tokens — e.g. the app-preview token minted for the
+    in-app preview iframe — carry a ``scope`` this general path must REJECT,
+    so a scoped token that leaks out of an agent-authored preview page can
+    never be replayed as the account bearer. This is the safe-by-construction
+    half of the preview-token fix (docs/security/audit-2026.md, round 12);
+    the preview/chat proxies validate scoped tokens via decode_preview_token.
+    """
     try:
         payload = jwt.decode(
             token,
             settings.jwt_secret,
             algorithms=[settings.jwt_algorithm]
         )
+        scope = payload.get("scope")
+        if scope is not None and scope != "full":
+            return None
         user_id: str = payload.get("sub")
         if user_id is None:
             return None
         return user_id
     except JWTError:
         return None
+
+
+def create_preview_token(user_id: str, app_id: str) -> str:
+    """Mint a short-lived, single-app token for the in-app preview iframe.
+
+    Deliberately NOT a full account credential. It authorizes ONLY the
+    preview reverse-proxy + the agent-bridge chat for THIS one ``app_id``,
+    and general auth (decode_access_token / get_current_user) rejects it via
+    the ``scope`` claim. The preview page is agent-authored HTML that runs
+    same-origin with the SPA, so a full JWT embedded there is exfiltratable
+    by prompt-injected app code; a scoped token keeps the blast radius to one
+    app for minutes instead of the whole account (round 12)."""
+    expire = datetime.utcnow() + timedelta(
+        minutes=settings.preview_token_expire_minutes)
+    to_encode = {
+        "sub": user_id,
+        "exp": expire,
+        "iat": datetime.utcnow(),
+        "jti": str(uuid.uuid4()),
+        "scope": "app_preview",
+        "app_id": str(app_id),
+    }
+    return jwt.encode(
+        to_encode, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_preview_token(token: str, app_id: str) -> Optional[str]:
+    """Validate an app-preview-scoped token bound to a specific ``app_id``.
+
+    Returns the user_id iff the token is ``scope == "app_preview"`` AND its
+    ``app_id`` claim matches exactly. Used only by the preview/chat proxies —
+    never by general auth. A full account token (no scope) is intentionally
+    NOT accepted here; callers fall back to decode_access_token for those."""
+    try:
+        payload = jwt.decode(
+            token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        return None
+    if payload.get("scope") != "app_preview":
+        return None
+    if str(payload.get("app_id")) != str(app_id):
+        return None
+    user_id = payload.get("sub")
+    return user_id or None
 
 
 async def authenticate_user(

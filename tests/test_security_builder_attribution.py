@@ -551,13 +551,15 @@ def test_subagent_channel_in_unattended_deny_set():
 
 def test_openai_image_proxy_routes_enforce_free_tier_cap():
     """Both OpenAI image proxy routes must enforce the free-tier image cap
-    (not just the Kie route), else free users bypass it via the OpenAI proxy."""
+    (not just the Kie route), else free users bypass it via the OpenAI proxy.
+    Round 12: enforcement is the TOCTOU-safe reserve_free_image_slot (replacing
+    the old free_tier_image_quota gate, which also raised AttributeError)."""
     src = (_BACKEND / "app" / "api" / "llm_proxy.py").read_text()
-    assert src.count("free_tier_image_quota") >= 3
+    assert src.count("reserve_free_image_slot(db, config.user_id)") >= 3
     for fn in ("proxy_openai_images", "proxy_openai_image_edits"):
         m = re.search(rf"async def {fn}\(.*?(?=\nasync def |\Z)", src, re.S)
         assert m, f"{fn} not found"
-        assert "free_tier_image_quota" in m.group(0), f"{fn} does not enforce the cap"
+        assert "reserve_free_image_slot" in m.group(0), f"{fn} does not enforce the cap"
 
 
 # ── Round 9 (2026-07-22 deep-dive: prompt-injection + credential exfil) ──
@@ -694,3 +696,143 @@ def test_xlsx_preview_escapes_cells_and_sheet_names():
     assert "_html.escape(str(v))" in src, "cell values not escaped"
     assert "_html.escape(str(name))" in src, "sheet name not escaped"
     assert "else str(v)}</{tag}>" not in src  # the raw form is gone
+
+
+# ── Round 12: app-preview iframe carries a scoped token, not the account JWT ──
+
+def test_preview_token_roundtrips_and_is_app_bound():
+    """create_preview_token → decode_preview_token returns the user only for the
+    matching app_id; a different app_id is rejected."""
+    from app.services.auth_service import (
+        create_preview_token, decode_preview_token)
+    tok = create_preview_token("user-abc", "app-123")
+    assert decode_preview_token(tok, "app-123") == "user-abc"
+    assert decode_preview_token(tok, "app-999") is None
+
+
+def test_preview_token_is_rejected_by_general_auth():
+    """CRITICAL invariant: a leaked app-preview token must NOT authenticate the
+    account. decode_access_token (used by get_current_user) rejects scoped."""
+    from app.services.auth_service import (
+        create_preview_token, decode_access_token)
+    tok = create_preview_token("user-abc", "app-123")
+    assert decode_access_token(tok) is None
+
+
+def test_full_account_token_still_authenticates_but_is_not_a_preview_token():
+    """A normal account token (no scope claim) still authenticates generally and
+    is NOT accepted as a preview token (which requires scope=app_preview)."""
+    from app.services.auth_service import (
+        create_access_token, decode_access_token, decode_preview_token)
+    tok = create_access_token("user-abc")
+    assert decode_access_token(tok) == "user-abc"
+    assert decode_preview_token(tok, "app-123") is None
+
+
+def test_preview_bridge_embeds_freshly_minted_scoped_token():
+    """The injected agent-bridge must mint a fresh app-preview-scoped token for
+    the page's JS and never embed the request's account JWT (round 12)."""
+    src = (_BACKEND / "app" / "api" / "apps_proxy.py").read_text()
+    assert "bridge_token = create_preview_token(str(user.id), app_id)" in src
+    assert 'resolved_token or "", app_id' not in src  # old full-JWT form gone
+    # json.dumps so a token can never break out of the JS string literal
+    assert "json.dumps(token)" in src and "json.dumps(app_id)" in src
+
+
+def test_preview_and_chat_proxies_accept_the_scoped_token_first():
+    """preview_proxy + app_chat_proxy must try the app-bound scoped token before
+    the full-account fallback (so the scoped token the iframe carries works)."""
+    src = (_BACKEND / "app" / "api" / "apps_proxy.py").read_text()
+    assert src.count("_get_user_from_preview_token(token, app_id, db)") >= 2
+
+
+def test_frontend_preview_url_uses_scoped_token_not_account_jwt():
+    """The SPA must put the app-scoped token (not getAuthToken()) in the preview
+    iframe URL + the postMessage config (round 12)."""
+    root = _BACKEND.parent / "frontend" / "src"
+    ap = (root / "modules" / "workspace" / "AppPreview.tsx").read_text()
+    wb = (root / "modules" / "workspace" / "WorkspaceBuilder.tsx").read_text()
+    # iframe URL is gated on the fetched previewToken, no getAuthToken() fallback
+    assert "appsApi.previewToken(id)" in ap
+    assert "token=${encodeURIComponent(previewToken)}" in ap
+    assert "token: previewToken," in ap  # postMessage config uses scoped token
+    assert "token: getAuthToken()," not in ap  # the account-JWT push is gone
+    assert "previewToken" in wb and "getAuthToken()" not in previewwb_url(wb)
+
+
+def previewwb_url(wb: str) -> str:
+    """Isolate the previewWebUrl memo body so the assertion only covers it (the
+    file still uses getAuthToken for the trusted builder WS)."""
+    m = re.search(r"const previewWebUrl = useMemo\(\(\) => \{.*?\}, \[", wb, re.S)
+    return m.group(0) if m else wb
+
+
+# ── Round 12: one IAP purchase is redeemable on exactly ONE account ──────
+
+def test_iap_grant_reserves_transaction_globally_before_crediting():
+    """HIGH: the consumable grant must reserve the transaction id in the
+    globally-unique table BEFORE crediting, so a farmed second account can't
+    replay the same real purchase (per-user idempotency is insufficient)."""
+    src = (_BACKEND / "app" / "services" / "credit_service.py").read_text()
+    # Scope to grant_purchased's body — other functions also mutate the balance.
+    m = re.search(r"async def grant_purchased\(.*?(?=\n    async def |\Z)", src, re.S)
+    assert m, "grant_purchased not found"
+    body = m.group(0)
+    assert "INSERT INTO redeemed_iap_transactions" in body
+    assert "global_txn_id" in body
+    # The reserve happens before the balance mutation (order matters).
+    assert body.index("INSERT INTO redeemed_iap_transactions") < body.index(
+        "balance.purchased_credits_remaining = _q(")
+    # A cross-account collision refuses the grant, it does not credit.
+    assert "cross-account IAP replay refused" in body
+
+
+def test_apple_verify_passes_global_txn_id():
+    """The Apple consumable verify endpoint must pass the raw transaction id as
+    the global replay key (not only the per-user idempotency key)."""
+    src = (_BACKEND / "app" / "api" / "iap.py").read_text()
+    assert "global_txn_id=verified.transaction_id" in src
+
+
+def test_redeemed_iap_table_is_globally_unique_and_self_healed():
+    """The guard table must exist with a GLOBAL primary key on transaction_id,
+    created by both init_db self-heal and alembic 074."""
+    db = (_BACKEND / "app" / "db" / "database.py").read_text()
+    assert "CREATE TABLE IF NOT EXISTS redeemed_iap_transactions" in db
+    assert "transaction_id VARCHAR(120) PRIMARY KEY" in db
+    mig = _BACKEND / "alembic" / "versions" / \
+        "20260723_0074_074_redeemed_iap_transactions.py"
+    assert mig.exists(), "migration 074 missing"
+    mtext = mig.read_text()
+    assert 'down_revision = "073"' in mtext  # linear chain, no collision
+    assert '"transaction_id", sa.String(120), primary_key=True' in mtext
+
+
+# ── Round 12: free-tier image cap is TOCTOU-safe (reserve before generate) ──
+
+def test_image_cap_reserves_before_generate_at_every_route():
+    """MED: all three image routes must RESERVE a slot before generating (not
+    check-then-generate-then-charge), and settle/release it. Also fixes the
+    prior instance-attr call `credit_service.free_tier_image_quota` that raised
+    AttributeError (the module-level fn was never bound to the instance)."""
+    src = (_BACKEND / "app" / "api" / "llm_proxy.py").read_text()
+    # the broken instance-attribute gate is gone
+    assert "free_tier_image_quota(db" not in src
+    # every route reserves + settles; each also releases on a failure path
+    assert src.count("reserve_free_image_slot(db, config.user_id)") == 3
+    assert src.count("settle_free_image_slot(db, _img_slot)") == 3
+    assert src.count("release_free_image_slot(db, _img_slot)") >= 3
+
+
+def test_reserve_free_image_slot_is_advisory_locked_and_counts_pending():
+    """The reserve path must serialize per-user (advisory lock) and count open,
+    unexpired reservations so concurrent requests can't race the cap."""
+    src = (_BACKEND / "app" / "services" / "credit_service.py").read_text()
+    m = re.search(r"async def reserve_free_image_slot\(.*?async def release_free_image_slot",
+                  src, re.S)
+    assert m, "reserve_free_image_slot not found"
+    body = m.group(0)
+    assert "pg_advisory_xact_lock" in body
+    assert "RESERVATION_OPEN" in body and "expires_at > datetime.utcnow()" in body
+    # reservation is committed (published) so concurrent requests see it
+    assert "await db.commit()" in body

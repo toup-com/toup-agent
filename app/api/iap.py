@@ -96,6 +96,10 @@ async def apple_verify(
     balance_after, already_redeemed = await credit_service.grant_purchased(
         db, current_user.id, verified.credits,
         idempotency_key=verified.transaction_id,
+        # Global cross-account replay guard (round 12): a consumable txn may be
+        # redeemed by exactly one account, ever — not just once per account.
+        global_txn_id=verified.transaction_id,
+        platform="apple",
         metadata={
             "product_id": verified.product_id,
             "original_transaction_id": verified.original_transaction_id,

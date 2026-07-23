@@ -360,6 +360,114 @@ async def free_tier_image_quota(db: AsyncSession, user_id: str) -> tuple[bool, i
     return (int(used) >= limit, int(used), limit)
 
 
+async def reserve_free_image_slot(
+    db: AsyncSession, user_id: str,
+) -> tuple[bool, int, int, Optional[str]]:
+    """Atomically claim a free-tier monthly image slot BEFORE generating.
+
+    Returns ``(exceeded, used, limit, reservation_id)``.
+
+    Fixes the check-then-generate TOCTOU (round 12): the old flow ran a plain
+    unlocked ``COUNT`` and only wrote the charge row AFTER the multi-second
+    generation, so N concurrent requests all read the same pre-write count and
+    all passed the cap. Here we take a per-user transaction advisory lock, count
+    committed image charges PLUS open image reservations, and — if under the cap
+    — insert an OPEN reservation that concurrent requests immediately see. The
+    caller MUST call ``settle_free_image_slot`` on success (after writing the
+    real charge) or ``release_free_image_slot`` on failure, or the held slot
+    leaks until its 10-minute expiry.
+
+    ``reservation_id`` is ``None`` when the cap is disabled / the user is
+    unlimited (nothing to settle) and also when ``exceeded`` is True.
+
+    NOTE: this is a module-level coroutine (call it as
+    ``reserve_free_image_slot(db, uid)``, not ``credit_service.reserve_…``) —
+    it is the working replacement for the image-cap gate.
+    """
+    from sqlalchemy import func, text as _text
+    from app.db.models import User, LEDGER_IMAGE_GEN
+
+    limit = int(getattr(settings, "free_tier_monthly_image_limit", 0) or 0)
+    if limit <= 0:
+        return (False, 0, 0, None)
+    user = await db.get(User, user_id)
+    if _is_unlimited_user(user):
+        return (False, 0, limit, None)
+    balance = await db.get(CreditBalance, user_id)
+    if (getattr(balance, "plan_id", None) or "free") != "free":
+        return (False, 0, limit, None)
+
+    # Serialize the count+reserve per user. Txn-scoped advisory lock, released
+    # on commit/rollback — the same primitive pool_service uses. Two concurrent
+    # requests now queue here instead of both reading a stale count.
+    await db.execute(
+        _text("SELECT pg_advisory_xact_lock(hashtext(:k)::bigint)"),
+        {"k": f"free_image:{user_id}"},
+    )
+    month_start = datetime.utcnow().replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0)
+    used = await db.scalar(
+        select(func.count()).select_from(CreditLedger).where(
+            CreditLedger.user_id == user_id,
+            CreditLedger.event_type == LEDGER_IMAGE_GEN,
+            CreditLedger.created_at >= month_start,
+        )
+    ) or 0
+    # Only count OPEN reservations that haven't expired — so a slot leaked by a
+    # generation path that never settled/released self-heals after its 10-minute
+    # TTL instead of blocking the user forever.
+    pending = await db.scalar(
+        select(func.count()).select_from(CreditReservation).where(
+            CreditReservation.user_id == user_id,
+            CreditReservation.event_type == LEDGER_IMAGE_GEN,
+            CreditReservation.status == RESERVATION_OPEN,
+            CreditReservation.expires_at > datetime.utcnow(),
+        )
+    ) or 0
+    total = int(used) + int(pending)
+    if total >= limit:
+        # Nothing reserved; drop the advisory lock.
+        await db.rollback()
+        return (True, total, limit, None)
+
+    res = CreditReservation(
+        user_id=user_id, event_type=LEDGER_IMAGE_GEN, bucket=BUCKET_MESSAGE,
+        estimated_amount=Decimal("0"), status=RESERVATION_OPEN,
+        expires_at=datetime.utcnow() + timedelta(minutes=10),
+    )
+    db.add(res)
+    await db.flush()
+    rid = res.id
+    # Publish the reservation so concurrent requests count it (also releases the
+    # txn-scoped advisory lock).
+    await db.commit()
+    return (False, total, limit, rid)
+
+
+async def release_free_image_slot(db: AsyncSession, reservation_id: Optional[str]) -> None:
+    """Free a held image slot when generation failed (round 12)."""
+    if not reservation_id:
+        return
+    res = await db.get(CreditReservation, reservation_id)
+    if res is not None and res.status == RESERVATION_OPEN:
+        res.status = RESERVATION_REFUNDED
+        res.settled_at = datetime.utcnow()
+        await db.commit()
+
+
+async def settle_free_image_slot(db: AsyncSession, reservation_id: Optional[str]) -> None:
+    """Mark a held image slot settled after the real charge row was written
+    (round 12). The committed ``LEDGER_IMAGE_GEN`` charge now counts against the
+    cap, so the reservation stops counting — avoiding double-counting."""
+    if not reservation_id:
+        return
+    res = await db.get(CreditReservation, reservation_id)
+    if res is not None and res.status == RESERVATION_OPEN:
+        res.status = RESERVATION_SETTLED
+        res.settled_at = datetime.utcnow()
+        await db.commit()
+
+
 def _email_verification_required(user) -> bool:
     """True iff this user must verify email before being charged. F13."""
     if not getattr(settings, "require_email_verification_for_credits", False):
@@ -1087,6 +1195,7 @@ class CreditService:
         self, db: AsyncSession, user_id: str, amount: Decimal | float | int, *,
         event_type: str = LEDGER_IAP_PURCHASE, idempotency_key: str,
         metadata: Optional[dict] = None,
+        global_txn_id: Optional[str] = None, platform: Optional[str] = None,
     ) -> tuple[Decimal, bool]:
         """Mint non-expiring purchased credits into the MESSAGE wallet.
 
@@ -1098,6 +1207,12 @@ class CreditService:
         The amount lands in the purchased wallet only; the ledger row is
         written against the MESSAGE bucket with balance_after = the spendable
         total, matching how every other MESSAGE row is recorded.
+
+        ``global_txn_id`` (round 12): when set (the IAP consumable grant passes
+        the raw transaction id), the transaction is additionally reserved in the
+        globally-unique ``redeemed_iap_transactions`` table BEFORE crediting, so
+        a farmed second account cannot replay the same real purchase. Per-user
+        idempotency alone (the ledger index) does not stop cross-account replay.
         """
         amount_q = _q(amount, _BALANCE_QUANTUM)
         if amount_q <= 0:
@@ -1114,6 +1229,50 @@ class CreditService:
         existing = prior.scalar_one_or_none()
         if existing is not None:
             return Decimal(existing.balance_after), True
+
+        # ── Global cross-account replay guard (round 12) ──
+        # A consumable IAP transaction may be redeemed by exactly ONE account,
+        # ever. The per-user short-circuit above already handled a same-user
+        # re-verify, so reaching here means THIS user has never redeemed the
+        # key. Reserve the transaction in the globally-unique table before
+        # crediting; a DIFFERENT account replaying the same real purchase hits
+        # the PRIMARY KEY and is refused (no grant) — this is what stops one
+        # purchase minting credits on unlimited farmed accounts.
+        if global_txn_id is not None:
+            from sqlalchemy import text as _text
+            try:
+                await db.execute(
+                    _text(
+                        "INSERT INTO redeemed_iap_transactions "
+                        "(transaction_id, user_id, platform, created_at) "
+                        "VALUES (:t, :u, :p, :ts)"
+                    ),
+                    {"t": global_txn_id, "u": user_id,
+                     "p": (platform or "unknown")[:16], "ts": datetime.utcnow()},
+                )
+                await db.flush()
+            except IntegrityError:
+                # Redeemed by some account already (same-user was short-circuited
+                # above) → a different account replaying a real purchase. Refuse.
+                await db.rollback()
+                balance = await self._lock_balance(db, user_id)
+                logger.warning(
+                    "[credit] cross-account IAP replay refused: txn=%s user=%s",
+                    global_txn_id, user_id,
+                )
+                return _bucket_remaining(balance, BUCKET_MESSAGE), True
+            except Exception as _guard_err:  # noqa: BLE001
+                # The guard table is always present on Postgres prod (init_db +
+                # migration 074). Only a non-Postgres/test DB reaches here; the
+                # per-user idempotency below still applies. Never fail a real
+                # grant on the guard's own infra error — reset the aborted tx
+                # and continue degraded.
+                await db.rollback()
+                balance = await self._lock_balance(db, user_id)
+                logger.warning(
+                    "[credit] IAP replay-guard unavailable (%s); per-user "
+                    "idempotency only", str(_guard_err)[:120],
+                )
 
         balance.purchased_credits_remaining = _q(
             Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0) + amount_q,

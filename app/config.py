@@ -41,7 +41,11 @@ class Settings(BaseSettings):
     jwt_secret: str = "toup-dev-secret-change-in-production"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24 * 7  # 1 week
-    
+    # App-preview iframe token: short-lived + app-scoped (round 12). It rides in
+    # an agent-authored, same-origin preview page, so it must never be a full
+    # account credential — keep the TTL tight to bound a leak.
+    preview_token_expire_minutes: int = 60 * 6  # 6 hours
+
     # API
     api_prefix: str = "/api"
     cors_origins: list[str] = [
