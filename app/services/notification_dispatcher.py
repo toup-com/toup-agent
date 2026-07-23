@@ -631,6 +631,12 @@ async def _dispatch_row(db, row_id: str, now: datetime) -> str:
         and row.event_kind in _FALLBACK_KINDS
         and prefs.get("autopilot_channel_fallback", True)
         and not (row.data_json or {}).get("no_agent_fallback")
+        # A SILENT row must never alert out-of-band: the producer's
+        # intent is quiet card bookkeeping (e.g. the Answer-ready row
+        # of a reminder-creating turn — the countdown card IS the
+        # confirmation), and a loud Telegram/WhatsApp copy would
+        # contradict it for channel-linked users with no push devices.
+        and not (row.data_json or {}).get("silent")
     ):
         fallback = await _request_agent_channel_delivery(db, row)
         channels["agent_fallback"] = fallback
@@ -641,6 +647,30 @@ async def _dispatch_row(db, row_id: str, now: datetime) -> str:
         new_status = NQ_SENT_PENDING_RECEIPT if has_tickets else NQ_SENT
         await _finalize(db, row_id, new_status, now, channels=channels, sent=True)
         return "sent"
+
+    # Silent rows exist to quietly update/close cards — when every
+    # channel merely SKIPPED (no live card, no push devices, no
+    # fallback recipient), there is nothing to retry toward: the next
+    # attempt sees the same world, and silence IS the intended outcome.
+    # Suppress instead of churning the backoff ladder (every reminder-
+    # creating chat turn mints a silent Answer-ready row while the user
+    # is in-app — 2026-07-23 probe: stuck at attempts=3,
+    # last_error=no_channel_delivered, retrying for nothing). A real
+    # ERROR on any channel still takes the retry path below.
+    if (
+        bool((row.data_json or {}).get("silent"))
+        and channels
+        and all(
+            isinstance(v, dict) and v.get("status") in ("skipped", "suppressed")
+            for v in channels.values()
+        )
+    ):
+        await _finalize(
+            db, row_id, NQ_SUPPRESSED, now,
+            channels={**channels,
+                      "policy": {"suppressed": "silent_undeliverable"}},
+        )
+        return "suppressed:silent_undeliverable"
 
     # Nothing reached the user — retry with backoff or give up.
     attempts = row.attempts  # already incremented at claim

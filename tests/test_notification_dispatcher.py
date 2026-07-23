@@ -368,3 +368,37 @@ def test_dispatch_loop_wired_into_platform_lifespan():
         "dispatcher must not ALSO be registered on the APScheduler — "
         "the lifespan loop supersedes it"
     )
+
+
+@pytest.mark.asyncio
+async def test_silent_row_with_only_skips_suppresses_instead_of_retrying():
+    """A silent row (quiet card bookkeeping — e.g. the Answer-ready
+    push of a reminder-creating turn while the user is in-app) whose
+    every channel merely SKIPPED must suppress, not churn the retry
+    backoff ladder: the next attempt sees the same world and silence
+    IS the intended outcome (2026-07-23 probe: such a row sat at
+    attempts=3, last_error=no_channel_delivered)."""
+    from app.db import async_session_maker
+    from sqlalchemy import select
+
+    user_id = await _mk_user()  # no push devices, no LA devices
+    row_id = await _enqueue(
+        user_id,
+        event_kind="mission_completed",
+        title="Answer ready",
+        data_json={"mission_id": "chatturn:beef00000001", "kind": "chat_turn",
+                   "silent": True, "progress": 100},
+    )
+    now = datetime.utcnow()
+    async with async_session_maker() as db:
+        claimed = await nd._claim_batch(db, now)
+        assert row_id in claimed
+        result = await nd._dispatch_row(db, row_id, now)
+    assert result == "suppressed:silent_undeliverable"
+
+    async with async_session_maker() as db:
+        row = (await db.execute(
+            select(NotificationQueue).where(NotificationQueue.id == row_id)
+        )).scalars().one()
+        assert row.status == NQ_SUPPRESSED
+        assert row.channels_json["policy"]["suppressed"] == "silent_undeliverable"
