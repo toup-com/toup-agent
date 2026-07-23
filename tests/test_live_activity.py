@@ -2196,3 +2196,256 @@ async def test_postfire_ack_suppresses_retrying_fire_row(
                 NotificationQueue.idempotency_key == "retryack-fire")
         )).scalars().one()
         assert fire.status == NQ_SUPPRESSED
+
+
+# ── 2026-07-23 round 4: pre-start alarm-owned MARKER rows ─────────
+# The app arms the AlarmKit countdown ~1-2s after the reminder tool
+# runs and reports ownership token-scoped BEFORE the platform's own
+# countdown push dispatches — the marker makes that push a no-op so
+# the user never sees a duplicate card flash.
+
+
+async def _register_and_get_device(client, auth_headers, test_user_id, token):
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": token, "environment": "development",
+              "install_id": f"install-{token[:8]}"},
+        headers=auth_headers,
+    )
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        return (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.push_to_start_token == token)
+        )).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_alarm_owned_pre_start_inserts_marker_and_dedups_start(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    token = "e0" * 32
+    await _register_and_get_device(client, auth_headers, test_user_id, token)
+
+    mission = "reminder:marker0001"
+    resp = await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission, "token": token},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("marker") == "inserted"
+
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_STARTED
+        assert la.alarm_owned_at is not None
+
+    # The platform's own countdown push now dedups per-device: no card.
+    sent.clear()
+    await _claim_and_dispatch(await _enqueue(
+        test_user_id, event_kind="mission_started",
+        data_json={"mission_id": mission, "mission_title": "⏰ M",
+                   "silent": True, "timer_end_ms":
+                   int((datetime.utcnow().timestamp() + 120) * 1000)},
+    ))
+    assert sent == []  # zero APNs sends — the marker owns the slot
+    async with async_session_maker() as db:
+        count = len((await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().all())
+        assert count == 1  # no duplicate row either
+
+
+@pytest.mark.asyncio
+async def test_alarm_owned_marker_anchors_reminder_wins(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    token = "e1" * 32
+    await _register_and_get_device(client, auth_headers, test_user_id, token)
+    mission = "reminder:marker0002"
+    await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission, "token": token},
+        headers=auth_headers,
+    )
+
+    sent.clear()
+    await _claim_and_dispatch(await _enqueue(
+        test_user_id, event_kind="mission_started",
+        data_json={"mission_id": "chatturn:markerturn01",
+                   "mission_title": "Working", "kind": "chat_turn"},
+    ))
+    assert sent == []  # chat turn yields to the marker — no preempt/start
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_STARTED  # marker untouched
+
+
+@pytest.mark.asyncio
+async def test_alarm_owned_conflict_with_started_foreign_row_is_flag_only(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    from app.db import async_session_maker
+
+    token = "e2" * 32
+    device_id = await _register_and_get_device(
+        client, auth_headers, test_user_id, token)
+    async with async_session_maker() as db:
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id,
+            mission_id="chatturn:occupies01", device_id=device_id,
+            status=LA_STARTED, started_at=datetime.utcnow(),
+        ))
+        await db.commit()
+
+    mission = "reminder:marker0003"
+    resp = await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission, "token": token},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("marker") == "skipped"
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().all()
+        assert rows == []  # nothing inserted; slot respected
+
+
+@pytest.mark.asyncio
+async def test_alarm_owned_false_ends_started_marker(
+    client, auth_headers, test_user_id,
+):
+    from app.db import async_session_maker
+
+    token = "e3" * 32
+    await _register_and_get_device(client, auth_headers, test_user_id, token)
+    mission = "reminder:marker0004"
+    await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission, "token": token},
+        headers=auth_headers,
+    )
+    resp = await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission, "token": token, "owned": False},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_ENDED  # slot freed
+        assert la.alarm_owned_at is None
+
+
+@pytest.mark.asyncio
+async def test_fire_lane_quiet_ends_marker_without_ring_chain(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+
+    async def fake_fallback(db, row):
+        return {"status": "skipped", "reason": "no_active_agent"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", fake_fallback)
+
+    token = "e4" * 32
+    await _register_and_get_device(client, auth_headers, test_user_id, token)
+    mission = "reminder:marker0005"
+    await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission, "token": token},
+        headers=auth_headers,
+    )
+
+    sent.clear()
+    await _claim_and_dispatch(await _enqueue(
+        test_user_id, event_kind="mission_completed", title="⏰ M — now",
+        priority="high",
+        data_json={"mission_id": mission, "mission_title": "⏰ M",
+                   "sound": "toup_alarm.caf", "subtitle": "ring"},
+    ))
+    events = [s["payload"]["aps"]["event"] for s in sent]
+    assert events == ["end"]  # quiet fired end, no loud restart/update
+    assert "alert" not in sent[0]["payload"]["aps"]
+    assert sent[0]["payload"]["aps"]["content-state"].get("fired") is True
+    async with async_session_maker() as db:
+        rings = (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.idempotency_key.like(
+                    f"alarm-ring:{mission}:%"),
+            )
+        )).scalars().all()
+        assert rings == []
+
+
+@pytest.mark.asyncio
+async def test_reminder_cancel_silently_ends_marker(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    token = "e5" * 32
+    await _register_and_get_device(client, auth_headers, test_user_id, token)
+    mission = "reminder:marker0006"
+    await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission, "token": token},
+        headers=auth_headers,
+    )
+
+    sent.clear()
+    await _claim_and_dispatch(await _enqueue(
+        test_user_id, event_kind="mission_completed", title="Reminder canceled",
+        data_json={"mission_id": mission, "mission_title": "⏰ M",
+                   "silent": True, "dismiss_after_s": 0},
+    ))
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_ENDED  # cancel consumed the marker
+
+
+@pytest.mark.asyncio
+async def test_alarm_owned_report_without_token_never_inserts(
+    client, auth_headers, test_user_id,
+):
+    from app.db import async_session_maker
+
+    mission = "reminder:marker0007"
+    resp = await client.post(
+        "/api/devices/live-activity/alarm-owned",
+        json={"mission_id": mission},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated"] == 0
+    assert "marker" not in resp.json() or resp.json().get("marker") is None
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().all()
+        assert rows == []  # external-channel wake vector preserved

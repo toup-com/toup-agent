@@ -586,49 +586,128 @@ async def report_alarm_owned(
     """Record device-alarm ownership of a mission's fire moment so the
     fire lane skips its loud restart + ring chain on that device
     (AlarmKit already rings through silent/Focus — a platform ring on
-    top double-alerts). ``owned=false`` clears the flag (alarm
-    canceled / rescheduled away).
+    top double-alerts), and — token-scoped, PRE-start — plant a
+    STARTED MARKER row so the platform never pushes its own countdown
+    card at all (the app arms the AlarmKit card ~1-2s after the
+    reminder tool runs; the platform push would arrive 15-40s later
+    as a brief duplicate). The marker triples as the REMINDER-WINS
+    anchor (chat-turn cards yield to started reminder rows) and is
+    consumed by the fire lane's quiet alarm_owned end.
 
-    The row's STATUS is deliberately left alone: the app retired the
-    on-device push card, but the started reminder row is what every
-    REMINDER-WINS guard keys off — ending it here would let the next
-    chat turn legally start a card over the AlarmKit countdown. The
-    ghost row is harmless: the fire lane's alarm_owned branch closes
-    it quietly at fire time, and the 8h GC is the backstop."""
+    Rules (2026-07-23 design review):
+    - Marker inserts/revivals happen ONLY with a device token. A
+      tokenless report stays flag-only forever — external-channel
+      pocket reminders depend on the platform card as their WAKE
+      vector, and a blind marker would silence it.
+    - The device's one-started-row slot is never fought over: if some
+      OTHER mission's card is live, the report stays flag-only and the
+      normal pipeline (platform start preempts, countdown-armed lane
+      retires + re-reports) converges one dispatcher tick later.
+    - owned=false ends a STARTED row (no push — no on-device card
+      exists in any owned=false scenario): a phantom marker would
+      otherwise squat the unique slot and keep chat turns yielding to
+      nothing."""
     user_id = current_user.id
     now = datetime.utcnow()
 
-    stmt = select(LiveActivity).where(
-        LiveActivity.user_id == user_id,
-        LiveActivity.mission_id == body.mission_id,
-    )
+    device: Optional[LiveActivityDevice] = None
     if body.token:
-        device_id = (
+        device = (
             await db.execute(
-                select(LiveActivityDevice.id).where(
+                select(LiveActivityDevice).where(
                     LiveActivityDevice.user_id == user_id,
                     LiveActivityDevice.push_to_start_token
                     == body.token.strip().lower(),
                 )
             )
         ).scalar_one_or_none()
-        if device_id is None:
+        if device is None:
             return {"ok": True, "updated": 0}
-        stmt = stmt.where(LiveActivity.device_id == device_id)
 
+    stmt = select(LiveActivity).where(
+        LiveActivity.user_id == user_id,
+        LiveActivity.mission_id == body.mission_id,
+    )
+    if device is not None:
+        stmt = stmt.where(LiveActivity.device_id == device.id)
     rows = (await db.execute(stmt)).scalars().all()
+
     updated = 0
+    if not body.owned:
+        for la in rows:
+            la.alarm_owned_at = None
+            if la.status == LA_STARTED:
+                la.status = LA_ENDED
+                la.ended_at = now
+            la.updated_at = now
+            updated += 1
+        if updated:
+            await db.commit()
+        return {"ok": True, "updated": updated}
+
     for la in rows:
-        la.alarm_owned_at = now if body.owned else None
+        la.alarm_owned_at = now
         la.updated_at = now
         updated += 1
-    if updated:
+
+    marker = None
+    if device is not None:
+        other_started = (
+            await db.execute(
+                select(LiveActivity.id).where(
+                    LiveActivity.device_id == device.id,
+                    LiveActivity.status == LA_STARTED,
+                    LiveActivity.mission_id != body.mission_id,
+                ).limit(1)
+            )
+        ).scalar_one_or_none() is not None
+        mine = rows[0] if rows else None
+        if mine is not None and mine.status == LA_ENDED and not other_started:
+            # Revive as the marker (reuse-row pattern of _send_start):
+            # the countdown is device-owned again for a fresh cycle.
+            mine.status = LA_STARTED
+            mine.started_at = now
+            mine.ended_at = None
+            mine.activity_push_token = None
+            marker = "revived"
+        elif mine is None and not other_started:
+            db.add(LiveActivity(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                mission_id=body.mission_id,
+                device_id=device.id,
+                apns_environment=device.apns_environment,
+                status=LA_STARTED,
+                alarm_owned_at=now,
+                started_at=now,
+                updated_at=now,
+            ))
+            marker = "inserted"
+            updated += 1
+        elif other_started:
+            # A live card owns the slot (e.g. a chatturn working card).
+            # Flag-only: the platform's own start will preempt it, the
+            # countdown-armed lane retires + re-reports, and the flag
+            # lands on the real row — one brief card flash, accepted.
+            marker = "skipped"
+
+    try:
         await db.commit()
+    except IntegrityError:
+        # uq_live_activities_device_started: a concurrent start won the
+        # slot between our check and the commit. Flag-only is the safe
+        # outcome; the countdown-armed retirement lane converges it.
+        await db.rollback()
+        return {"ok": True, "updated": 0, "marker": "raced"}
+    if updated or marker:
         logger.info(
-            "live-activity alarm-owned: mission %s owned=%s — %d row(s)",
-            body.mission_id, body.owned, updated,
+            "live-activity alarm-owned: mission %s owned=%s — %d row(s), marker=%s",
+            body.mission_id, body.owned, updated, marker,
         )
-    return {"ok": True, "updated": updated}
+    out: dict = {"ok": True, "updated": updated}
+    if marker:
+        out["marker"] = marker
+    return out
 
 
 @router.post("/unregister")
