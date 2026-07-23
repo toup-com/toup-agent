@@ -357,5 +357,27 @@ async def gen_html_to_pdf(html: str, filename: str, *, user_scope: str) -> Attac
 
     filename = _safe_filename(filename, ".pdf")
     buf = io.BytesIO()
-    HTML(string=html or "").write_pdf(buf)
+    # SSRF/LFI guard (audit-2026 re-audit round 9): WeasyPrint's DEFAULT
+    # url_fetcher resolves file:// and http(s) URLs embedded in the (possibly
+    # injection-controlled) HTML. `<img src="file:///proc/self/environ">` would
+    # embed the agent's env secrets into the PDF; `<img
+    # src="http://169.254.169.254/…">` or an internal host would SSRF. Restrict
+    # to inline data: URIs + public https only.
+    HTML(string=html or "", url_fetcher=_safe_pdf_url_fetcher).write_pdf(buf)
     return await _persist(buf.getvalue(), filename, MIME_PDF, user_scope)
+
+
+def _safe_pdf_url_fetcher(url: str):
+    """Allow only inline data: URIs and public https for WeasyPrint PDF
+    rendering (audit-2026 re-audit round 9). Blocks file:// (LFI) and any
+    private/loopback/link-local/metadata host (SSRF)."""
+    from weasyprint.urls import default_url_fetcher  # type: ignore
+    u = (url or "").strip()
+    low = u.lower()
+    if low.startswith("data:"):
+        return default_url_fetcher(u)
+    if low.startswith("https://"):
+        from app.agent.smart_fetch.reader import _assert_public_url
+        _assert_public_url(u)  # raises ValueError on private/internal/metadata
+        return default_url_fetcher(u)
+    raise ValueError(f"blocked non-public URL in PDF generation: {u[:80]!r}")

@@ -4750,8 +4750,11 @@ class ToolExecutor:
         # pre-declared sub-steps.
         from app.agent.job_runner import JobRunner, TaskSpec
         spec = TaskSpec(
+            # Unattended background turn (audit-2026 re-audit round 9): use a
+            # deny-listed channel so injected content can't drive a mutating
+            # connector without confirmation. See apps.py create_job.
             user_id=user_id,
-            channel="web",
+            channel="agent_task",
             source_kind="manual",
             conversation_id=getattr(self, "_current_session_id", None),
         )

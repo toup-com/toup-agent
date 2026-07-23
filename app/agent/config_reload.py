@@ -100,11 +100,23 @@ def get_reloadable_fields() -> List[str]:
 
 
 def get_current_config(fields: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Return current values of config fields."""
+    """Return current values of config fields.
+
+    SECURITY (audit-2026 re-audit round 9 — CRITICAL): only RELOADABLE_FIELDS
+    are ever returned. An explicit `fields` list is INTERSECTED with the
+    allow-list, so the `config_reload` agent tool's action="get" can never read
+    a secret (jwt_secret, database_url, agent_api_key, provider/stripe/apns
+    keys) even if the caller names one. The agent runs as ROOT and relays tool
+    output to the user/channel — a raw jwt_secret here = cross-tenant JWT
+    forgery; a raw database_url = direct DB access. Previously the allow-list
+    only applied to the fields=None default, so an explicit field bypassed it.
+    """
     from app.config import settings
 
     if fields is None:
         fields = sorted(RELOADABLE_FIELDS)
+    else:
+        fields = [f for f in fields if f in RELOADABLE_FIELDS]
 
     result = {}
     for f in fields:

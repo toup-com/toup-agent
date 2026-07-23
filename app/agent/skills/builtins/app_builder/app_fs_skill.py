@@ -57,17 +57,20 @@ def _validate_syntax(file_path: str, app_dir: str) -> Optional[str]:
 
     abs_path = file_path if os.path.isabs(file_path) else os.path.join(app_dir, file_path.lstrip('/'))
 
-    # Use node to parse — fast (~50ms), catches all syntax errors
+    # SECURITY (audit-2026 re-audit round 9 — CRITICAL): pass the parser + file
+    # paths as process.argv, NEVER string-interpolated into the `node -e`
+    # source. abs_path derives from the agent-controlled file_path; a `"` or
+    # `");` in it would break out of the JS string literal and inject arbitrary
+    # code that node executes (RCE). argv is data, not code.
     script = (
-        f'try{{'
-        f'const p=require("{babel_parser}");'
-        f'const c=require("fs").readFileSync("{abs_path}","utf8");'
-        f'p.parse(c,{{sourceType:"module",plugins:["typescript","jsx","decorators-legacy"]}});'
-        f'}}catch(e){{console.error(e.message.split("\\n")[0]);process.exit(1)}}'
+        'const p=require(process.argv[1]);'
+        'const c=require("fs").readFileSync(process.argv[2],"utf8");'
+        'try{p.parse(c,{sourceType:"module",plugins:["typescript","jsx","decorators-legacy"]});}'
+        'catch(e){console.error(e.message.split("\\n")[0]);process.exit(1)}'
     )
     try:
         result = subprocess.run(
-            ['node', '-e', script],
+            ['node', '-e', script, babel_parser, abs_path],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
@@ -403,12 +406,37 @@ class AppFsSkill(Skill):
         lines.append(f"\n{file_count} files, {total_size / 1024:.1f} KB total")
         return "\n".join(lines)
 
+    def _safe_abs(self, file_path: str) -> Optional[str]:
+        """Resolve file_path under app_dir and REJECT any escape.
+
+        Path-jail (audit-2026 re-audit round 9 — CRITICAL): these AppFsSkill
+        file tools run IN-PROCESS as ROOT, and file_path is an
+        agent/injection-controlled tool argument. `lstrip("/")` only
+        neutralizes absolute paths, NOT `..` traversal, and there was no
+        realpath confine — so `../../../../proc/self/environ` read the agent's
+        env secrets (X-Agent-Key, provider keys, DB DSN) and a `..` write
+        could overwrite /app source or ~/.ssh as root (RCE). Returns the
+        realpath-resolved (symlink-safe) path confined to app_dir, or None on
+        escape.
+        """
+        abs_path = os.path.join(self.app_dir, file_path.lstrip("/"))
+        try:
+            rp = os.path.realpath(abs_path)
+            root = os.path.realpath(self.app_dir)
+        except Exception:
+            return None
+        if rp == root or rp.startswith(root + os.sep):
+            return rp
+        return None
+
     async def _read_file(self, args: Dict, ctx: SkillContext) -> str:
         file_path = args.get("file_path", "")
         if not file_path:
             return "ERROR: file_path is required"
 
-        abs_path = os.path.join(self.app_dir, file_path.lstrip("/"))
+        abs_path = self._safe_abs(file_path)
+        if abs_path is None:
+            return f"ERROR: '{file_path}' is outside the app directory"
         if not os.path.exists(abs_path):
             return f"File '{file_path}' not found in {self.app_dir}"
 
@@ -432,7 +460,9 @@ class AppFsSkill(Skill):
         if not content:
             return "ERROR: content is required"
 
-        abs_path = os.path.join(self.app_dir, file_path.lstrip("/"))
+        abs_path = self._safe_abs(file_path)
+        if abs_path is None:
+            return f"ERROR: '{file_path}' is outside the app directory"
         is_new = not os.path.exists(abs_path)
         original_content = None
         if not is_new:
@@ -482,7 +512,9 @@ class AppFsSkill(Skill):
         if not file_path or not old_text:
             return "ERROR: file_path and old_text are required"
 
-        abs_path = os.path.join(self.app_dir, file_path.lstrip("/"))
+        abs_path = self._safe_abs(file_path)
+        if abs_path is None:
+            return f"ERROR: '{file_path}' is outside the app directory"
         if not os.path.exists(abs_path):
             return f"File '{file_path}' not found"
 
@@ -770,8 +802,8 @@ class AppFsSkill(Skill):
 
         result = f"Navigating to '{screen}' in '{self.app_name}'."
         if screen_file:
-            abs_path = os.path.join(self.app_dir, screen_file.lstrip("/"))
-            if os.path.exists(abs_path):
+            abs_path = self._safe_abs(screen_file)
+            if abs_path and os.path.exists(abs_path):
                 result += f"\nScreen file: {screen_file}"
         else:
             result += f"\nNote: No exact screen file found for '{screen}'. Available: {', '.join(available_screens)}"

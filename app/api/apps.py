@@ -595,8 +595,14 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
     # the user clicking "submit" twice creates two distinct jobs).
     from app.agent.job_runner import JobRunner, TaskSpec
     spec = TaskSpec(
+        # Unattended (audit-2026 re-audit round 9): a dashboard task runs
+        # fire-and-forget with nobody watching each tool call, so it must use a
+        # channel in _MUTATES_UNATTENDED_DENY_CHANNELS — NOT "web" — otherwise
+        # injected content in an ingested doc/web/email could drive a mutating
+        # connector (gmail send / calendar-drive write) without a confirmation
+        # gate. A user's explicit per-tool allow still overrides.
         user_id=user_id,
-        channel="web",
+        channel="agent_task",
         source_kind="manual",
     )
     job = await JobRunner().create_job(
@@ -620,7 +626,7 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
                     user_message=req.description or req.title,
                     user_id=user_id,
                     session_id=f"dashboard-task-{job_id[:8]}",
-                    channel="web",
+                    channel="agent_task",  # unattended — see TaskSpec above (round 9)
                     # Phase 8: enable parent_job_id linkage so any
                     # sub-agent spawned during this dashboard task
                     # lands as a child row in Mission Control.
