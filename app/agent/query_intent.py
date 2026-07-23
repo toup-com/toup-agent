@@ -244,7 +244,14 @@ _MEDIA_KEYWORDS = {
 _MEDIA_PATTERNS_RE = re.compile(
     r'\b(?:play|listen to|watch|put on|queue)\b.*\b(?:song|music|video|movie|show|episode|track|album|playlist|netflix|youtube|spotify)\b'
     r'|\b(?:send|share)\s+(?:this|a|the|my)?\s*(?:photo|image|picture|file|document|video|voice)\b'
-    r'|\b(?:play|listen|watch)\s+(?:me\s+)?(?:some|a)\b',
+    r'|\b(?:play|listen|watch)\s+(?:me\s+)?(?:some|a)\b'
+    # Image generate/edit — a verb + an image-noun, plus the extremely common
+    # slang "pic"/"pics". Word boundaries keep "pic" from matching inside
+    # epic / typical / picnic / spicy / pickup. Without this, "generate pic" or
+    # "make me a photo" scored 0 for media and generate_image was never offered
+    # to the model, which then wrongly claimed it couldn't generate images.
+    r'|\b(?:generate|create|make|draw|paint|render|design|edit|modify|change|retouch|redraw|redo|upscale)\b(?:\s+\w+){0,4}?\s+(?:photos?|pics?|images?|pictures?|selfies?|portraits?|avatars?|wallpapers?|logos?|posters?|illustrations?)\b'
+    r'|\bpics?\b',
     re.IGNORECASE,
 )
 
