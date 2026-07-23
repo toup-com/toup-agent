@@ -323,6 +323,7 @@ async def preview_file(
             from openpyxl import load_workbook  # type: ignore
         except ImportError:
             raise HTTPException(status_code=501, detail="openpyxl not installed")
+        import html as _html  # stored-XSS guard (audit-2026 re-audit round 11)
         wb = load_workbook(backend.path(key), read_only=True, data_only=True)
         parts: list[str] = [
             "<!doctype html><meta charset='utf-8'>",
@@ -340,7 +341,7 @@ async def preview_file(
         ]
         for i, name in enumerate(wb.sheetnames):
             parts.append(
-                f"<div class='tab{' active' if i == 0 else ''}' onclick=\"for(var e of document.querySelectorAll('.tab,.sheet'))e.classList.remove('active');this.classList.add('active');document.getElementById('s{i}').classList.add('active')\">{name}</div>"
+                f"<div class='tab{' active' if i == 0 else ''}' onclick=\"for(var e of document.querySelectorAll('.tab,.sheet'))e.classList.remove('active');this.classList.add('active');document.getElementById('s{i}').classList.add('active')\">{_html.escape(str(name))}</div>"
             )
         parts.append("</div>")
         for i, name in enumerate(wb.sheetnames):
@@ -349,7 +350,7 @@ async def preview_file(
             for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
                 tag = "th" if row_idx == 0 else "td"
                 parts.append("<tr>" + "".join(
-                    f"<{tag}>{'' if v is None else str(v)}</{tag}>" for v in row
+                    f"<{tag}>{'' if v is None else _html.escape(str(v))}</{tag}>" for v in row
                 ) + "</tr>")
             parts.append("</table></div>")
         return HTMLResponse(content="".join(parts))

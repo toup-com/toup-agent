@@ -671,3 +671,26 @@ def test_ws_browser_navigate_and_tabopen_ssrf_guarded():
     """HIGH: co-browse navigate() + tab_open must SSRF-guard client/LLM URLs."""
     src = (_BACKEND / "app" / "api" / "ws_browser.py").read_text()
     assert src.count("_assert_public_url") >= 2  # navigate + tab_open
+
+
+# ── Round 11 (2026-07-22 auth/web/upload sweep) ────────────────────────
+def test_sso_exchange_applies_revocation_gates():
+    """HIGH: POST /auth/sso must re-apply the password-change + session-revoke
+    gates before minting a fresh token (else a stolen JWT survives logout)."""
+    src = (_BACKEND / "app" / "api" / "auth.py").read_text()
+    m = re.search(r"async def sso_exchange\(.*?(?=\n@router|\n# ── Logout)", src, re.S)
+    assert m, "sso_exchange not found"
+    body = m.group(0)
+    assert "password_changed_at" in body, "sso_exchange missing password-change gate"
+    assert "is_revoked" in body and "get_session_by_jti" in body, "sso_exchange missing session-revoke gate"
+    # And the mint happens AFTER the gates.
+    assert body.index("password_changed_at") < body.index("create_access_token(user.id)")
+
+
+def test_xlsx_preview_escapes_cells_and_sheet_names():
+    """HIGH: the XLSX attachment preview must html.escape sheet names + cell
+    values (served as text/html same-origin → stored XSS otherwise)."""
+    src = (_BACKEND / "app" / "api" / "files.py").read_text()
+    assert "_html.escape(str(v))" in src, "cell values not escaped"
+    assert "_html.escape(str(name))" in src, "sheet name not escaped"
+    assert "else str(v)}</{tag}>" not in src  # the raw form is gone

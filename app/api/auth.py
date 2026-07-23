@@ -1479,6 +1479,29 @@ async def sso_exchange(body: SSOExchangeRequest, request: Request, response: Res
     user = await get_user_by_id(db, user_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+
+    # SECURITY (audit-2026 re-audit round 11 — session-invalidation bypass):
+    # apply the SAME revocation gates get_current_user enforces BEFORE minting a
+    # fresh token. Otherwise a stolen-but-signature-valid JWT can be laundered
+    # through /auth/sso into a new full-TTL token AFTER the victim changed their
+    # password or signed this device out — defeating both invalidation levers
+    # and re-rollable before each expiry = effectively permanent access.
+    try:
+        _sso_payload = jwt.decode(body.token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        _sso_payload = {}
+    _sso_iat = datetime.utcfromtimestamp(_sso_payload.get("iat", 0))
+    if getattr(user, "password_changed_at", None) and _sso_iat < user.password_changed_at:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Token invalidated by password change. Please log in again.")
+    _sso_jti = _sso_payload.get("jti")
+    if _sso_jti:
+        from app.services.session_tracker import get_session_by_jti
+        _sso_session = await get_session_by_jti(db, _sso_jti)
+        if _sso_session is not None and _sso_session.is_revoked:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="This session was signed out. Please log in again.")
+
     new_token = create_access_token(user.id)
     # New token = new session row, same way as /login does it.
     await record_login_session(db, user.id, new_token, request)
