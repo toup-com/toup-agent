@@ -67,6 +67,25 @@ class _KieQuotaExceeded(Exception):
         self.message = message
 
 
+class _KieModerationRefused(Exception):
+    """Raised when the image provider DECLINED the request on content policy.
+
+    Distinct from a technical Kie failure on purpose (2026-07-23). Nano Banana
+    returns e.g. `422 The input or output was flagged as sensitive`; the platform
+    proxy forwards that as 502 {code: kie_failed, moderation: true}. Previously
+    the agent treated it like any other Kie error and retried on OpenAI, which
+    refuses the same class of request — so the user waited another ~30-60s, paid
+    for the attempt, and got back "the wording was flagged / rephrase". That hint
+    is wrong for a policy refusal (it's the image CONTENT, not the phrasing), and
+    it sent the founder round in circles re-wording a request that could never
+    succeed. On this exception the caller surfaces the honest reason and does NOT
+    fall back."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Per-call state ContextVars (Phase 8 concurrency refactor)
 #
@@ -2098,6 +2117,18 @@ class ToolExecutor:
             raise _KieQuotaExceeded(detail.get("message")
                                     or "You've reached your free monthly image limit.")
         if r.status_code != 200:
+            # A content-policy refusal is NOT a technical failure: the platform
+            # marks it {code: kie_failed, moderation: true}. Falling back to
+            # OpenAI on a policy refusal just buys the same refusal ~30-60s and
+            # one paid attempt later, so split it out and let the caller stop.
+            try:
+                _d = (r.json() or {}).get("detail") or {}
+            except Exception:
+                _d = {}
+            if isinstance(_d, dict) and _d.get("moderation"):
+                logger.info("kie image: provider declined on content policy (%s)",
+                            str(_d.get("message"))[:160])
+                raise _KieModerationRefused(str(_d.get("message") or "").strip())
             raise RuntimeError(f"kie proxy HTTP {r.status_code}: {r.text[:200]}")
         b64 = (r.json() or {}).get("b64")
         if not b64:
@@ -2179,6 +2210,15 @@ class ToolExecutor:
                 _kb = await self._call_kie_image("generate", prompt, size=size)
             except _KieQuotaExceeded as q:
                 return f"ERROR: {q.message}"
+            except _KieModerationRefused:
+                # Policy refusal — OpenAI declines the same class of request, so
+                # don't spend another ~30-60s and a paid attempt to be told no twice.
+                return (
+                    "ERROR: The image provider declined this request under its "
+                    "content policy. Re-wording the same request will not change "
+                    "the outcome. Tell the user plainly that this image can't be "
+                    "generated, and offer a genuinely different subject instead."
+                )
             except Exception as kie_exc:
                 logger.warning("generate_image: Kie failed, falling back to OpenAI (%s)", kie_exc)
                 _kb = None
@@ -2222,10 +2262,11 @@ class ToolExecutor:
                 # wastes time and buries the real cause. Surface it cleanly.
                 logger.info("generate_image: prompt declined by safety filter")
                 return (
-                    "ERROR: The image request was declined by the content-safety "
-                    "filter (the wording was flagged). Rephrase the description — "
-                    "keep it plainly descriptive and avoid phrasing that could read "
-                    "as explicit — then try again."
+                    "ERROR: The image request was declined by the provider's "
+                    "content-safety filter. This is usually the SUBJECT, not the "
+                    "phrasing, so re-wording the same request often will not help. "
+                    "Tell the user plainly what was declined rather than silently "
+                    "retrying, and offer a genuinely different subject."
                 )
             logger.warning("generate_image: %s failed (%s)", primary, primary_exc)
             if fallback_usable:
@@ -2492,6 +2533,20 @@ class ToolExecutor:
                     image_bytes=src_bytes, image_mime=src_mime)
             except _KieQuotaExceeded as q:
                 return f"ERROR: {q.message}"
+            except _KieModerationRefused:
+                # Policy refusal on the IMAGE, not the phrasing. OpenAI's edit
+                # endpoint declines the same class of request, so stop here
+                # instead of burning another ~30-60s and a paid attempt to
+                # surface a second refusal that misleadingly blames wording.
+                return (
+                    "ERROR: The image provider declined this edit under its content "
+                    "policy. Edits that alter a real person's body or physique — and "
+                    "photos showing minimal clothing — are refused, and re-wording the "
+                    "request will NOT change that. Tell the user honestly that this "
+                    "particular edit isn't possible; do not retry it with different "
+                    "wording. Other edits to the same photo (lighting, background, "
+                    "colour, style, cropping) still work."
+                )
             except Exception as kie_exc:
                 logger.warning("edit_image: Kie failed, falling back to OpenAI (%s)", kie_exc)
                 _kb = None
@@ -2526,9 +2581,13 @@ class ToolExecutor:
             if self._is_image_moderation_error(edit_exc):
                 logger.info("edit_image: request declined by safety filter")
                 return (
-                    "ERROR: The edit request was declined by the content-safety filter "
-                    "(the wording was flagged). Rephrase — keep it plainly descriptive — "
-                    "and try again."
+                    "ERROR: The edit was declined by the provider's content-safety "
+                    "filter. Edits that change a real person's body or physique, and "
+                    "photos showing minimal clothing, are refused — that is about the "
+                    "IMAGE, not your phrasing, so re-wording will NOT help. Tell the "
+                    "user honestly that this edit isn't possible instead of retrying. "
+                    "Other edits to the same photo (lighting, background, colour, "
+                    "style, cropping) still work."
                 )
             logger.warning("edit_image: %s failed (%s)", model, edit_exc)
             if edit_fallback:
