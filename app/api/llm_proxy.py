@@ -1296,6 +1296,149 @@ async def proxy_kie_image(
     }
 
 
+# ── Async image jobs (2026-07-23) ─────────────────────────────────────────
+# The synchronous route above holds one HTTP request open for the whole render.
+# Kie's latency is wildly variable (measured 25/36/39/74s and a 399s success),
+# so a fixed budget either abandons a task the user ALREADY PAID 18 credits for
+# — the founder's 20:08 edit was still `running` on Kie, charged, and never
+# delivered — or exceeds what an HTTP hop will tolerate. start+poll keeps every
+# request short and lets a 400s render finish and still be delivered.
+
+@router.post("/kie/image/start")
+async def proxy_kie_image_start(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a Kie image job. Returns fast — does NOT wait for the render.
+
+    Returns {task_id, reservation_id}. The caller polls /kie/image/poll. The
+    free-tier slot is reserved here (TOCTOU-safe) and is settled or released by
+    the poll endpoint, so the reservation travels with the job.
+    """
+    from app.services import kie_client
+    from app.services.credit_service import reserve_free_image_slot, release_free_image_slot
+
+    config = await _auth_agent(request, db)
+    body = await request.json()
+    mode = (body.get("mode") or "generate").strip().lower()
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is required")
+
+    exceeded, used, limit, _img_slot = await reserve_free_image_slot(db, config.user_id)
+    if exceeded:
+        raise HTTPException(status_code=429, detail={
+            "code": "image_quota_exceeded", "used": used, "limit": limit,
+            "message": (f"Your free plan includes {limit} images per month, and "
+                        f"you've used them all. Upgrade for unlimited images."),
+        })
+
+    src: Optional[bytes] = None
+    if mode == "edit":
+        image_b64 = body.get("image_b64")
+        if not image_b64:
+            await release_free_image_slot(db, _img_slot)
+            raise HTTPException(400, "edit mode requires image_b64")
+        try:
+            import base64 as _b64m
+            src = _b64m.b64decode(image_b64)
+        except Exception:
+            await release_free_image_slot(db, _img_slot)
+            raise HTTPException(400, "image_b64 is not valid base64")
+
+    try:
+        task_id = await kie_client.start_task(
+            mode, prompt, size=body.get("size"), image_bytes=src,
+            mime=body.get("image_mime") or "image/png")
+    except kie_client.KieError as e:
+        await release_free_image_slot(db, _img_slot)   # nothing started → free it
+        raise HTTPException(status_code=502, detail={
+            "code": "kie_failed", "moderation": bool(e.moderation),
+            "message": str(e)[:300],
+        })
+    return {"task_id": task_id, "reservation_id": _img_slot, "status": "pending"}
+
+
+@router.post("/kie/image/poll")
+async def proxy_kie_image_poll(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Probe a Kie job once. Short request regardless of render time.
+
+    pending → {status:"pending"}; fail → 502 (moderation flagged when it was a
+    content refusal); success → charge once, settle the slot, return the image.
+    """
+    import base64 as _b64
+    from app.services import kie_client
+    from app.services.credit_service import (
+        credit_service, underlying_cost_to_credits,
+        release_free_image_slot, settle_free_image_slot,
+    )
+    from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
+
+    config = await _auth_agent(request, db)
+    body = await request.json()
+    task_id = (body.get("task_id") or "").strip()
+    if not task_id:
+        raise HTTPException(400, "task_id is required")
+    reservation_id = body.get("reservation_id")
+
+    try:
+        st = await kie_client.poll_task(task_id)
+    except kie_client.KieError as e:
+        raise HTTPException(status_code=502, detail={
+            "code": "kie_failed", "moderation": bool(e.moderation), "message": str(e)[:300],
+        })
+
+    if st.get("state") == "pending":
+        return {"status": "pending"}
+
+    if st.get("state") == "fail":
+        await release_free_image_slot(db, reservation_id)
+        await _log_event(db, config.user_id, "kie", settings.kie_image_model, "images",
+                         0, 0, 0, 0, status="error")
+        raise HTTPException(status_code=502, detail={
+            "code": "kie_failed", "moderation": bool(st.get("moderation")),
+            "message": str(st.get("message"))[:300],
+        })
+
+    # success — download, charge ONCE (task_id is the idempotency key so repeat
+    # polls after a dropped response can never double-bill), settle the slot.
+    try:
+        img, mime = await kie_client.fetch_result(st["result_url"])
+    except kie_client.KieError as e:
+        raise HTTPException(status_code=502, detail={
+            "code": "kie_failed", "moderation": False, "message": str(e)[:300],
+        })
+
+    kie_credits = float(st.get("credits") or 0.0)
+    cents = (kie_credits * float(settings.kie_credit_cents)
+             if kie_credits else float(settings.kie_fallback_cents))
+    cents_d = Decimal(str(round(cents, 4)))
+    credits = max(_MIN_IMAGE_CREDITS, underlying_cost_to_credits(cents_d))
+    charge_key = f"kie_task:{task_id}"
+    try:
+        await credit_service.try_charge(
+            db, config.user_id, LEDGER_IMAGE_GEN, BUCKET_MESSAGE, credits,
+            idempotency_key=charge_key, event_id=charge_key,
+            model=settings.kie_image_model, provider="kie",
+            underlying_cost_cents=cents_d,
+            metadata={"endpoint": "kie_image_poll", "kie_credits": kie_credits,
+                      "task_id": task_id},
+        )
+    except Exception:
+        logger.exception("[credits] kie image try_charge failed user=%s", config.user_id[:8])
+    await settle_free_image_slot(db, reservation_id)
+    await _log_event(db, config.user_id, "kie", settings.kie_image_model, "images",
+                     0, 0, int(cents), 0)
+
+    return {
+        "status": "success", "b64": _b64.b64encode(img).decode(),
+        "mime": mime, "model": settings.kie_image_model, "credits": float(credits),
+    }
+
+
 @router.get("/usage", response_model=UsageResponse)
 async def get_proxy_usage(
     request: Request,

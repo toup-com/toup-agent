@@ -615,12 +615,15 @@ class Settings(BaseSettings):
     tool_timeout_overrides: dict[str, int] = {  # Per-tool timeout overrides
         "exec": 120, "web_fetch": 60, "web_search": 30,
         "browser": 120, "spawn": 300, "process": 300,
-        # gpt-image-1 generation/edit takes 30-90s (esp. high quality), which
-        # blows the 30s default and returns "Tool timed out". Give it headroom
-        # ABOVE image_gen_timeout_s (180) so the OpenAI HTTP timeout surfaces a
-        # clean error first rather than the tool wrapper killing it mid-flight.
-        "generate_image": 200,
-        "edit_image": 200,
+        # Image tools must outlast the SLOWEST render, not the average one.
+        # Kie/Nano Banana is highly variable — 25s/36s/39s/74s and a measured
+        # 399s success — and at 200s the wrapper killed the tool while the job
+        # was still rendering, so the user waited the full 200s, got nothing,
+        # and was still billed for the abandoned task. Keep this ABOVE
+        # kie_job_timeout_s (420) so the polling loop reports a real reason
+        # first instead of being cut off mid-flight.
+        "generate_image": 480,
+        "edit_image": 480,
     }
 
     # ── DM / Group Policy ────────────────────────────────────
@@ -1241,11 +1244,17 @@ class Settings(BaseSettings):
     kie_image_model: str = "nano-banana-pro"       # Gemini 3 Pro Image — unified generate + edit
     kie_image_size: str = "4K"                     # 1K | 2K | 4K (Pro). 4K measured same 18 Kie credits as 2K, ~35s.
     kie_output_format: str = "png"
-    # Nano Banana normally finishes in ~30s. Cap the poll below the 200s
-    # generate_image/edit_image tool-wrapper timeout so a stuck task fails fast
-    # enough to leave room for the OpenAI fallback within the same tool call.
+    # Legacy SYNCHRONOUS path (kie_client.generate/edit) only. The agent now uses
+    # start+poll, which is bounded by kie_job_timeout_s below instead.
     kie_timeout_s: float = 120.0
     kie_poll_interval_s: float = 2.5
+    # How long the AGENT keeps polling a started Kie job. Measured Kie renders:
+    # 25s / 36s / 39s / 74s … and a 399s success. The old single synchronous call
+    # gave up at kie_timeout_s and ABANDONED a task the user had ALREADY been
+    # charged 18 Kie credits for — the founder's 20:08 edit sat `running` on Kie,
+    # billed, never delivered. Polling is cheap, so this is generous enough to
+    # actually collect that slow tail instead of paying for nothing.
+    kie_job_timeout_s: float = 420.0
     # Billing: Kie returns creditsConsumed (Kie credits) per task; we charge the
     # user (kie credits × kie_credit_cents) our-credits. ~0.5¢/Kie-credit
     # (nano-banana-pro 2K ≈ 18 credits ≈ 9¢). Tune once reconciled with Kie's

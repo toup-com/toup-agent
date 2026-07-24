@@ -211,3 +211,94 @@ async def edit(prompt: str, image_bytes: bytes, mime: str = "image/png") -> KieR
     out_mime = "image/png" if settings.kie_output_format == "png" else "image/jpeg"
     return KieResult(image_bytes=img, mime=out_mime,
                      credits_consumed=credits, model=settings.kie_image_model)
+
+
+# ── Async job primitives (2026-07-23) ─────────────────────────────────────
+# `generate`/`edit` above hold ONE http request open for the whole render. Kie's
+# real latency is wildly variable — measured 25s / 36s / 39s / 74s and a
+# **399s** success in one account's logs — so any synchronous budget is either
+# too short (we abandon a task the user already paid 18 credits for, which is
+# exactly what happened to the founder's 20:08 edit: still `running` on Kie,
+# charged, never delivered) or too long to survive an HTTP hop.
+#
+# These split the same flow into short calls so the caller can poll:
+#   start_task()  -> upload (edit only) + createTask   ~1-3s
+#   poll_task()   -> ONE recordInfo probe             ~0.2s
+#   fetch_result()-> download the finished image      ~0.5s
+# No request is ever held open for the render itself.
+
+async def start_task(mode: str, prompt: str, *, size: Optional[str] = None,
+                     image_bytes: Optional[bytes] = None,
+                     mime: str = "image/png") -> str:
+    """Create a Kie job and return its taskId. Does NOT wait for the render."""
+    if not settings.kie_api_key:
+        raise KieError("kie_api_key not configured")
+    timeout = httpx.Timeout(60.0, connect=15.0)  # upload+create only, never the render
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if mode == "edit":
+            if not image_bytes:
+                raise KieError("edit mode requires image_bytes")
+            aspect = "1:1"
+            try:
+                import io
+                from PIL import Image
+                with Image.open(io.BytesIO(image_bytes)) as im:
+                    aspect = _nearest_aspect(im.width, im.height)
+            except Exception:
+                logger.debug("kie edit: could not read source dims, defaulting 1:1",
+                             exc_info=True)
+            src_url = await _upload_source(client, image_bytes, mime)
+            inp = {
+                "prompt": prompt,
+                "image_input": [src_url],
+                "aspect_ratio": aspect,
+                "image_size": settings.kie_image_size,
+                "output_format": settings.kie_output_format,
+            }
+        else:
+            inp = {
+                "prompt": prompt,
+                "image_size": settings.kie_image_size,
+                "aspect_ratio": _aspect_from_size(size),
+                "output_format": settings.kie_output_format,
+            }
+        return await _create_task(client, settings.kie_image_model, inp)
+
+
+async def poll_task(task_id: str) -> dict[str, Any]:
+    """ONE recordInfo probe. Never blocks on the render.
+
+    Returns {state: pending|success|fail, result_url, credits, message, moderation}.
+    """
+    if not settings.kie_api_key:
+        raise KieError("kie_api_key not configured")
+    url = f"{settings.kie_api_base.rstrip('/')}/api/v1/jobs/recordInfo"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0)) as client:
+        r = await client.get(url, params={"taskId": task_id}, headers=_headers())
+        if r.status_code >= 400:
+            raise KieError(f"kie recordInfo HTTP {r.status_code}: {r.text[:200]}")
+        d = (r.json() or {}).get("data") or {}
+    state = d.get("state")
+    if state == "success":
+        try:
+            result = json.loads(d.get("resultJson") or "{}")
+        except (ValueError, TypeError):
+            raise KieError(f"kie resultJson unparseable: {str(d.get('resultJson'))[:200]}")
+        urls = result.get("resultUrls") or []
+        if not urls:
+            raise KieError("kie success but no resultUrls")
+        return {"state": "success", "result_url": urls[0],
+                "credits": float(d.get("creditsConsumed") or 0.0)}
+    if state == "fail":
+        msg = str(d.get("failMsg") or d.get("failCode") or "unknown")
+        return {"state": "fail", "message": msg,
+                "moderation": _looks_like_moderation(msg)}
+    return {"state": "pending"}
+
+
+async def fetch_result(result_url: str) -> tuple[bytes, str]:
+    """Download a finished image. Returns (bytes, mime)."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+        img = await _fetch_bytes(client, result_url)
+    mime = "image/png" if settings.kie_output_format == "png" else "image/jpeg"
+    return img, mime

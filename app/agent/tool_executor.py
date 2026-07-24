@@ -2101,12 +2101,44 @@ class ToolExecutor:
         if mode == "edit" and image_bytes is not None:
             payload["image_b64"] = _b64.b64encode(image_bytes).decode()
             payload["image_mime"] = image_mime
-        url = f"{base}/llm/kie/image"
-        timeout = float(getattr(settings, "kie_timeout_s", 240.0)) + 25.0
+        # START + POLL rather than one long request. Kie renders take anywhere
+        # from ~25s to ~400s; a single synchronous call either abandons a job the
+        # user already paid for or outlives what the HTTP hop tolerates. Each
+        # call here is short, so only the (generous) job deadline below bounds us.
+        hdrs = {"Authorization": f"Bearer {token}"}
+        job_deadline = float(getattr(settings, "kie_job_timeout_s", 420.0))
+        interval = float(getattr(settings, "kie_poll_interval_s", 2.5))
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.post(url, json=payload,
-                                      headers={"Authorization": f"Bearer {token}"})
+            async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
+                r = await client.post(f"{base}/llm/kie/image/start", json=payload, headers=hdrs)
+                if r.status_code == 200:
+                    started = r.json() or {}
+                    task_id = started.get("task_id")
+                    reservation_id = started.get("reservation_id")
+                    if not task_id:
+                        raise RuntimeError("kie start returned no task_id")
+                    # NOTE: `time` is not a module-level import here — use the
+                    # running loop's monotonic clock (same source kie_client polls on).
+                    _clock = asyncio.get_running_loop().time
+                    deadline = _clock() + job_deadline
+                    poll_body = {"task_id": task_id, "reservation_id": reservation_id}
+                    while _clock() < deadline:
+                        await asyncio.sleep(interval)
+                        r = await client.post(f"{base}/llm/kie/image/poll",
+                                              json=poll_body, headers=hdrs)
+                        if r.status_code != 200:
+                            break  # fall through to the shared error handling below
+                        if (r.json() or {}).get("status") == "pending":
+                            continue
+                        break
+                    else:
+                        raise RuntimeError(
+                            f"kie job still rendering after {job_deadline:.0f}s "
+                            f"(task {task_id})")
+        except (_KieQuotaExceeded, _KieModerationRefused):
+            raise
+        except RuntimeError:
+            raise
         except Exception as exc:
             raise RuntimeError(f"kie proxy unreachable: {exc}")
         if r.status_code == 429:
