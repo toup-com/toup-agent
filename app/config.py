@@ -234,6 +234,18 @@ class Settings(BaseSettings):
     # tool_choice cannot express an allowlist).
     stable_prefix_layout: bool = False
 
+    # Per-tenant CANARY for the stable prefix layout. Agent feature flags are
+    # otherwise baked fleet-wide by the bridge's docker-run env — there is no
+    # per-container override — so a proper single-tenant canary of
+    # stable_prefix_layout is impossible without this. Comma-separated
+    # user_ids: the stable layout activates for a turn when the global flag is
+    # on OR the turn's user_id is in this list. Set it fleet-wide on the
+    # bridge (STABLE_PREFIX_CANARY_USER_IDS=<one-user-id>) to enable the layout
+    # for exactly one tenant while every other container stays on the legacy
+    # path — measure that tenant's [PERF] cache_read= / cache-daily, then flip
+    # the global flag once proven. Empty = nobody (default).
+    stable_prefix_canary_user_ids: str = ""
+
     # Cache-aware overflow rollover (token-efficiency PR-3; audit finding
     # F-6 / A8-5..A8-6 in docs/audits/2026-07-token-efficiency.md). When
     # true, compact_messages:

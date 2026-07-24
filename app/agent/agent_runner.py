@@ -143,6 +143,24 @@ def same_local_day(started_utc, now_utc, tz_name: Optional[str]) -> bool:
     return started_utc.date() == now_utc.date()
 
 
+def stable_prefix_enabled(user_id: Optional[str]) -> bool:
+    """Whether the prefix-stable layout is active for this turn.
+
+    True when the global ``stable_prefix_layout`` flag is on, OR the turn's
+    ``user_id`` is listed in ``stable_prefix_canary_user_ids`` (comma-sep).
+    The canary list is the only way to enable the layout for a single
+    tenant — agent flags are otherwise fleet-wide (see config). The list is
+    parsed per call (tiny, and lets an ops change take effect on the next
+    turn without a process restart beyond the env update).
+    """
+    if getattr(settings, "stable_prefix_layout", False):
+        return True
+    raw = getattr(settings, "stable_prefix_canary_user_ids", "") or ""
+    if not raw or not user_id:
+        return False
+    return user_id in {u.strip() for u in raw.split(",") if u.strip()}
+
+
 @dataclass
 class AgentResponse:
     """Final response from a single agent run."""
@@ -752,7 +770,7 @@ class AgentRunner:
             # message after history at message-prep below. Function-local —
             # no shared runner state (this runner is a singleton).
             _turn_context_parts: Dict[str, str] = {}
-            _stable_layout = bool(getattr(settings, "stable_prefix_layout", False))
+            _stable_layout = stable_prefix_enabled(user_id)
             system_prompt = await self._build_system_prompt(
                 db, user_id, user_message,
                 channel=channel, intent=query_intent, client_tz=client_tz,
@@ -2374,7 +2392,7 @@ class AgentRunner:
         # the out-dict — profile paths that don't (none today) keep
         # legacy behavior.
         _stable = bool(
-            getattr(settings, "stable_prefix_layout", False)
+            stable_prefix_enabled(user_id)
             and turn_context_out is not None
         )
         # Profile allow-list, resolved early: a section that the profile

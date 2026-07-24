@@ -286,3 +286,40 @@ class TestAnthropicBreakpointPlacement:
         from app.services.anthropic_service import _mark_messages_cacheable
         out = _mark_messages_cacheable(self._msgs(with_tc=False))
         assert self._marked_indices(out) == [len(out) - 1]
+
+
+class TestCanaryGate:
+    """Per-tenant canary for the stable prefix layout — agent flags are
+    otherwise fleet-wide (no per-container override), so this list is the
+    only way to prove the layout on one tenant before a global flip."""
+
+    def _call(self, monkeypatch, *, global_flag, canary_ids, user_id):
+        from app.config import settings
+        from app.agent import agent_runner
+        monkeypatch.setattr(settings, "stable_prefix_layout", global_flag, raising=False)
+        monkeypatch.setattr(settings, "stable_prefix_canary_user_ids", canary_ids, raising=False)
+        return agent_runner.stable_prefix_enabled(user_id)
+
+    def test_global_flag_on_enables_everyone(self, monkeypatch):
+        assert self._call(monkeypatch, global_flag=True, canary_ids="", user_id="u1") is True
+        assert self._call(monkeypatch, global_flag=True, canary_ids="", user_id=None) is True
+
+    def test_off_by_default(self, monkeypatch):
+        assert self._call(monkeypatch, global_flag=False, canary_ids="", user_id="u1") is False
+
+    def test_canary_user_enabled_others_not(self, monkeypatch):
+        assert self._call(monkeypatch, global_flag=False, canary_ids="canary-uid", user_id="canary-uid") is True
+        assert self._call(monkeypatch, global_flag=False, canary_ids="canary-uid", user_id="other") is False
+
+    def test_canary_list_multi_and_whitespace(self, monkeypatch):
+        ids = " a , b ,c "
+        assert self._call(monkeypatch, global_flag=False, canary_ids=ids, user_id="b") is True
+        assert self._call(monkeypatch, global_flag=False, canary_ids=ids, user_id="c") is True
+        assert self._call(monkeypatch, global_flag=False, canary_ids=ids, user_id="d") is False
+
+    def test_none_user_never_matches_canary(self, monkeypatch):
+        assert self._call(monkeypatch, global_flag=False, canary_ids="a,b", user_id=None) is False
+
+    def test_flag_off_default_in_settings(self):
+        from app.config import Settings
+        assert Settings.model_fields["stable_prefix_canary_user_ids"].default == ""
