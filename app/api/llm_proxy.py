@@ -15,17 +15,18 @@ import hashlib
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.admin.deps import require_admin
 from app.config import settings
 from app.db import get_db, AgentConfig, LLMProxyEvent
 
@@ -237,8 +238,15 @@ async def _log_event(
     was_fallback: bool = False,
     status: str = "ok",
     operation_type: Optional[str] = None,
+    cached_tokens: Optional[int] = None,
 ):
     """Log an LLM usage event.
+
+    `cached_tokens` (F-7 / A9-1): prompt-cache read hits reported by the
+    provider (OpenAI usage.prompt_tokens_details.cached_tokens, Anthropic
+    cache_read_input_tokens). Telemetry-only — it does NOT participate in
+    cost_cents or credit math (A9-2 is documented out of scope). None means
+    the call site had no usage to inspect (error paths).
 
     `operation_type` semantics (CRITICAL — do not change without updating _get_spend):
       - None or "user.*" → user-attributable, counts toward the user's cap.
@@ -273,6 +281,7 @@ async def _log_event(
         latency_ms=latency_ms,
         status=status,
         operation_type=operation_type,
+        cached_tokens=cached_tokens,
     )
     db.add(event)
 
@@ -313,9 +322,10 @@ async def _log_event(
 
     logger.info(
         "llm_proxy user=%s provider=%s model=%s tokens_in=%d tokens_out=%d "
-        "cost_cents=%d latency=%dms fallback=%s status=%s op=%s",
+        "cached=%d cost_cents=%d latency=%dms fallback=%s status=%s op=%s",
         user_id[:8], provider, model, input_tokens, output_tokens,
-        cost_cents, latency_ms, was_fallback, status, operation_type or "user",
+        cached_tokens or 0, cost_cents, latency_ms, was_fallback, status,
+        operation_type or "user",
     )
 
 
@@ -591,11 +601,12 @@ def _route_chat(model: str, config: AgentConfig) -> tuple[LLMBackend, str]:
 # ── Streaming SSE helpers ────────────────────────────────────────────
 
 
-def _extract_anthropic_usage(raw_bytes: bytes) -> tuple[int, int]:
-    """Extract input_tokens and output_tokens from Anthropic SSE stream bytes."""
+def _extract_anthropic_usage(raw_bytes: bytes) -> tuple[int, int, int]:
+    """Extract input, output and cached tokens from Anthropic SSE stream bytes."""
     import json
     input_tokens = 0
     output_tokens = 0
+    cached_tokens = 0
     for line in raw_bytes.decode("utf-8", errors="replace").split("\n"):
         if not line.startswith("data: "):
             continue
@@ -607,19 +618,41 @@ def _extract_anthropic_usage(raw_bytes: bytes) -> tuple[int, int]:
             if obj.get("type") == "message_start" and "message" in obj:
                 usage = obj["message"].get("usage", {})
                 input_tokens = usage.get("input_tokens", 0)
+                cached_tokens = usage.get("cache_read_input_tokens", 0) or 0
             elif obj.get("type") == "message_delta":
                 usage = obj.get("usage", {})
                 output_tokens = usage.get("output_tokens", 0)
         except (json.JSONDecodeError, KeyError):
             pass
-    return input_tokens, output_tokens
+    return input_tokens, output_tokens, cached_tokens
 
 
-def _extract_openai_usage(raw_bytes: bytes) -> tuple[int, int]:
-    """Extract usage from OpenAI SSE stream bytes."""
+def _extract_openai_cached_tokens(usage: dict) -> int:
+    """Read prompt-cache hits from an OpenAI usage dict (0 when absent).
+
+    F-7 / A9-1: OpenAI nests the count under prompt_tokens_details;
+    older API versions may omit the field (or return null) entirely.
+    Shared by the streamed-SSE and non-stream JSON extraction paths so
+    both shapes stay in lockstep.
+    """
+    details = usage.get("prompt_tokens_details") or {}
+    if not isinstance(details, dict):
+        return 0
+    # Review pr5-#2: a truthy non-numeric value here would raise out of
+    # the stream path's narrow except and abort the log write in
+    # stream_and_log's finally — telemetry must never take down logging.
+    try:
+        return int(details.get("cached_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_openai_usage(raw_bytes: bytes) -> tuple[int, int, int]:
+    """Extract usage (input, output, cached) from OpenAI SSE stream bytes."""
     import json
     input_tokens = 0
     output_tokens = 0
+    cached_tokens = 0
     for line in raw_bytes.decode("utf-8", errors="replace").split("\n"):
         if not line.startswith("data: "):
             continue
@@ -632,9 +665,10 @@ def _extract_openai_usage(raw_bytes: bytes) -> tuple[int, int]:
             if usage:
                 input_tokens = usage.get("prompt_tokens", 0)
                 output_tokens = usage.get("completion_tokens", 0)
+                cached_tokens = _extract_openai_cached_tokens(usage)
         except (json.JSONDecodeError, KeyError):
             pass
-    return input_tokens, output_tokens
+    return input_tokens, output_tokens, cached_tokens
 
 
 # ── Endpoints ────────────────────────────────────────────────────────
@@ -808,14 +842,15 @@ async def proxy_chat(
                 # Log usage after stream completes
                 latency = int((time.time() - start_ts) * 1000)
                 if backend.name == "anthropic":
-                    inp, out = _extract_anthropic_usage(bytes(collected_bytes))
+                    inp, out, cached = _extract_anthropic_usage(bytes(collected_bytes))
                 else:
-                    inp, out = _extract_openai_usage(bytes(collected_bytes))
+                    inp, out, cached = _extract_openai_usage(bytes(collected_bytes))
                 cost = _calc_cost_cents(model, inp, out)
                 try:
                     await _log_event(
                         db, config.user_id, backend.name, model, "chat",
                         inp, out, cost, latency, is_fallback,
+                        cached_tokens=cached,
                     )
                 except Exception as e:
                     logger.warning("Failed to log usage event: %s", e)
@@ -865,15 +900,18 @@ async def proxy_chat(
             usage = resp_data.get("usage", {})
             inp = usage.get("input_tokens", 0)
             out = usage.get("output_tokens", 0)
+            cached = usage.get("cache_read_input_tokens", 0) or 0
         else:
             usage = resp_data.get("usage", {})
             inp = usage.get("prompt_tokens", 0)
             out = usage.get("completion_tokens", 0)
+            cached = _extract_openai_cached_tokens(usage)
 
         cost = _calc_cost_cents(model, inp, out)
         await _log_event(
             db, config.user_id, backend.name, model, "chat",
             inp, out, cost, latency, is_fallback,
+            cached_tokens=cached,
         )
 
         # Use JSONResponse so we can attach the resolved-model header.
@@ -1628,3 +1666,72 @@ async def get_admin_stats(
         error_count_today=error_count,
         top_users=top_users,
     )
+
+
+class CacheDailyRow(BaseModel):
+    day: str
+    prompt_tokens: int
+    cached_tokens: int
+    cache_hit_ratio: float
+    calls: int
+
+
+class CacheDailyResponse(BaseModel):
+    days: int
+    user_id: Optional[str] = None
+    rows: list[CacheDailyRow]
+
+
+@admin_router.get("/cache-daily", response_model=CacheDailyResponse)
+async def get_admin_cache_daily(
+    days: int = Query(7, ge=1, le=90),
+    user_id: Optional[str] = Query(None),
+    endpoint: str = Query("chat", pattern=r"^[a-z_]{1,32}$|^all$"),
+    _admin=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin-only: per-day prompt-cache hit telemetry (F-7 / A9-1).
+
+    Aggregates llm_proxy_events over the last `days` UTC days, optionally
+    filtered to one user. cache_hit_ratio = sum(cached_tokens) /
+    sum(input_tokens); rows recorded before migration 075 have NULL
+    cached_tokens and count as 0 hits, so early ratios understate.
+
+    Review pr5-#1: defaults to the chat endpoint and successful calls —
+    voice/embeddings/image and error rows would dilute prompt_tokens and
+    inflate calls, understating the chat-path hit ratio this exists to
+    watch. Pass endpoint=all for the unfiltered view.
+    """
+    since = _today_utc_start() - timedelta(days=days - 1)
+    day_col = func.date(LLMProxyEvent.created_at)
+    stmt = (
+        select(
+            day_col.label("day"),
+            func.coalesce(func.sum(LLMProxyEvent.input_tokens), 0).label("prompt_tokens"),
+            func.coalesce(func.sum(LLMProxyEvent.cached_tokens), 0).label("cached_tokens"),
+            func.count().label("calls"),
+        )
+        .where(LLMProxyEvent.created_at >= since)
+        .where(LLMProxyEvent.status == "ok")
+        .group_by(day_col)
+        .order_by(day_col.desc())
+    )
+    if endpoint != "all":
+        stmt = stmt.where(LLMProxyEvent.endpoint == endpoint)
+    if user_id:
+        stmt = stmt.where(LLMProxyEvent.user_id == user_id)
+    result = await db.execute(stmt)
+
+    rows = []
+    for r in result:
+        prompt = int(r.prompt_tokens or 0)
+        cached = int(r.cached_tokens or 0)
+        rows.append(CacheDailyRow(
+            day=str(r.day),
+            prompt_tokens=prompt,
+            cached_tokens=cached,
+            cache_hit_ratio=round(cached / prompt, 4) if prompt > 0 else 0.0,
+            calls=int(r.calls or 0),
+        ))
+
+    return CacheDailyResponse(days=days, user_id=user_id, rows=rows)

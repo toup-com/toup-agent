@@ -243,6 +243,10 @@ class AgentDeductRequest(BaseModel):
     operation_type: Optional[str] = None  # "user.*" or "system.*"
     idempotency_key: Optional[str] = None
     event_id: Optional[str] = None
+    # Prompt-cache read hits (F-7 / A9-1). Telemetry only — stored in the
+    # ledger row's metadata_json, never enters the charge amount. Optional
+    # so older agent builds that omit the field stay compatible.
+    cached_tokens: Optional[int] = None
 
 
 class AgentDeductResponse(BaseModel):
@@ -354,6 +358,11 @@ async def agent_deduct(
         )
 
     credits = _tokens_to_credits(body.model, body.input_tokens, body.output_tokens)
+    # cached_tokens rides in metadata_json only (F-7 / A9-1) — the charge
+    # amount above is computed from input/output alone, unchanged.
+    _deduct_meta: dict = {"surface": "agent_direct", "operation_type": op}
+    if body.cached_tokens is not None:
+        _deduct_meta["cached_tokens"] = int(body.cached_tokens)
     result = await credit_service.try_charge(
         db, body.user_id, _LEDGER_CHAT_MESSAGE, _BUCKET_MESSAGE, credits,
         idempotency_key=body.idempotency_key,
@@ -363,7 +372,7 @@ async def agent_deduct(
         input_tokens=body.input_tokens,
         output_tokens=body.output_tokens,
         underlying_cost_cents=body.underlying_cost_cents,
-        metadata={"surface": "agent_direct", "operation_type": op},
+        metadata=_deduct_meta,
     )
     # Read the balance view AFTER try_charge committed so plan +
     # period_end reflect any lazy monthly-renewal that just landed.

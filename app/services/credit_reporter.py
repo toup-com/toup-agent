@@ -372,6 +372,7 @@ async def report_llm_usage(
     operation_type: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     event_id: Optional[str] = None,
+    cached_tokens: Optional[int] = None,
 ) -> DeductOutcome:
     """POST a deduction record to the platform.
 
@@ -411,6 +412,11 @@ async def report_llm_usage(
         payload["idempotency_key"] = idempotency_key
     if event_id:
         payload["event_id"] = event_id
+    if cached_tokens is not None:
+        # F-7 / A9-1: prompt-cache read hits — telemetry only, stored in the
+        # ledger row's metadata_json by the platform. Optional so older
+        # platform builds (which ignore unknown fields) stay compatible.
+        payload["cached_tokens"] = int(cached_tokens)
 
     try:
         async with httpx.AsyncClient(timeout=_REPORT_TIMEOUT_S) as client:

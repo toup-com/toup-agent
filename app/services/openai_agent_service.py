@@ -277,6 +277,10 @@ class OpenAIAgentService:
                             # that prompt_cache_key is day-stable (PR-1), so
                             # metering semantics are byte-identical to before.
                             idempotency_key=idempotency_key or prompt_cache_key,
+                            # F-7 / A9-1: cached hits were captured above but
+                            # dropped at report time — forward them so the
+                            # platform can persist cache telemetry.
+                            cached_tokens=int(usage_data.get("cache_read_input_tokens", 0) or 0),
                         )
                 except Exception:
                     logger.exception("[credits] openai stream report failed")

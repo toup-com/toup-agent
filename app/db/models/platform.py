@@ -184,6 +184,11 @@ class LLMProxyEvent(Base):
     # NULL or "user.*" = counts toward user caps. "system.*" (e.g. "system.day_archival")
     # = platform-side operations, tracked for cost dashboards but exempt from user caps.
     operation_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # Prompt-cache read hits for this call (F-7 / A9-1, alembic 075). OpenAI's
+    # usage.prompt_tokens_details.cached_tokens / Anthropic's
+    # cache_read_input_tokens. Telemetry only — never enters cost_cents or
+    # credit math. NULL = recorded before 075 or usage wasn't inspectable.
+    cached_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (

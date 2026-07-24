@@ -736,6 +736,13 @@ async def init_db():
         "user_id VARCHAR(36) NOT NULL, "
         "platform VARCHAR(16), "
         "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        # ── Cache telemetry (alembic 075, F-7 / A9-1) ──
+        # Same precedent as 072/073 above: platform-api boots via init_db,
+        # so the ORM must never reference a column a pre-075 DB lacks —
+        # without this, every _log_event INSERT 500s once LLMProxyEvent
+        # references cached_tokens. llm_proxy_events is PLATFORM_ONLY →
+        # no-op on agent DBs (table absent → swallowed).
+        "ALTER TABLE llm_proxy_events ADD COLUMN IF NOT EXISTS cached_tokens INTEGER",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

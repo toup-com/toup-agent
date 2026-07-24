@@ -368,6 +368,8 @@ class AnthropicService:
                             output_tokens=int(response.usage.output_tokens or 0),
                             idempotency_key=getattr(response, "id", None),
                             event_id=getattr(response, "id", None),
+                            # F-7 / A9-1: forward cache hits for telemetry.
+                            cached_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
                         )
                 except Exception:
                     logger.exception("[credits] anthropic non-stream report failed")
@@ -563,6 +565,8 @@ class AnthropicService:
                                 output_tokens=int(final_usage.output_tokens or 0),
                                 idempotency_key=getattr(final, "id", None),
                                 event_id=getattr(final, "id", None),
+                                # F-7 / A9-1: forward cache hits for telemetry.
+                                cached_tokens=int(cache_read or 0),
                             )
                     except Exception:
                         logger.exception("[credits] anthropic stream report failed")
