@@ -151,6 +151,7 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "edit_file": 1_000,
     "memory_search": 10_000,
     "memory_store": 1_000,
+    "memory_delete": 1_000,
     "web_search": 10_000,
     "web_fetch": 15_000,
     "extension_search": 12_000,
@@ -1097,7 +1098,9 @@ class ToolExecutor:
                 score = mem.get("similarity_score", 0)
                 cat = mem.get("category", "")
                 content = mem.get("content", "")
-                lines.append(f"{i}. [{cat}] (sim={score:.2f}) {content}")
+                # id included so memory_delete can target a result (A6-6).
+                mem_id = mem.get("id", "")
+                lines.append(f"{i}. [{cat}] (sim={score:.2f}, id={mem_id}) {content}")
             return "\n".join(lines)
         
         except Exception as exc:
@@ -1151,11 +1154,42 @@ class ToolExecutor:
                 )
             
             return f"Memory {action}: {memory.id} — {memory.content[:80]}"
-        
+
         except Exception as exc:
             logger.exception("memory_store failed")
             return f"ERROR: {exc}"
-    
+
+    # ------------------------------------------------------------------
+    # 6b. memory_delete
+    # ------------------------------------------------------------------
+    async def _tool_memory_delete(self, inp: Dict[str, Any]) -> str:
+        """A6-6: 'forget X' had no executable path — memory_delete was in
+        the memory-intent tool set with no definition or handler. Wired to
+        MemoryService.delete_memory (soft delete + audit event)."""
+        memory_id = inp.get("memory_id", "")
+
+        if not memory_id:
+            return "ERROR: memory_id is required"
+
+        try:
+            from app.db.database import async_session_maker
+            from app.services.memory_service import MemoryService
+
+            async with async_session_maker() as db:
+                svc = MemoryService(db)
+                deleted = await svc.delete_memory(
+                    memory_id=memory_id,
+                    user_id=self._current_user_id,
+                )
+
+            if deleted:
+                return f"Memory {memory_id} deleted."
+            return f"ERROR: memory {memory_id} not found."
+
+        except Exception as exc:
+            logger.exception("memory_delete failed")
+            return f"ERROR: {exc}"
+
     # ------------------------------------------------------------------
     # 7. web_search  (uses platform's stealth browser API)
     # ------------------------------------------------------------------

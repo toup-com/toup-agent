@@ -1000,6 +1000,83 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 print(f"⚠️ Could not start auto-update: {e}")
 
+        # ── Memory maintenance (audit A6-1) ───────────────────
+        # Decay / consolidation / end-of-day archival / retrieval-feedback
+        # analysis were registered only in platform_main's scheduler, whose
+        # DB excludes the AGENT_ONLY memories/day_chats tables — so they
+        # never ran against tenant data. Mirror the exact same entry points
+        # here, on the tenant scheduler where those tables actually live.
+        # Flag-gated (default OFF); each registration is individually
+        # guarded so one failing job never kills the lifespan.
+        # NOTE (review pr4-#1): these jobs ride CronService's APScheduler,
+        # so they inherit its cron_service_enabled kill switch — if that
+        # Phase-C deprecation gate is ever flipped off, the registrations
+        # below sit on a never-started scheduler (same as the existing
+        # heartbeat/auto-update jobs). Migrate them together when
+        # CronService is retired.
+        if (
+            settings.agent_memory_maintenance_enabled
+            and cron_service
+            and cron_service.scheduler
+        ):
+            from apscheduler.triggers.cron import CronTrigger as _MMCron
+            from apscheduler.triggers.interval import IntervalTrigger as _MMIvl
+
+            _mm_jobs = []
+            try:
+                from app.scripts.scheduled_tasks import (
+                    run_decay_for_all_users,
+                    run_consolidation_for_all_users,
+                    run_retrieval_feedback_analysis,
+                    run_end_of_day_archival,
+                )
+                _mm_jobs = [
+                    (
+                        "memory_decay",
+                        run_decay_for_all_users,
+                        _MMIvl(hours=settings.decay_interval_hours),
+                    ),
+                    (
+                        "memory_consolidation",
+                        run_consolidation_for_all_users,
+                        _MMCron(hour=settings.consolidation_cron_hour, minute=0),
+                    ),
+                    (
+                        "retrieval_feedback_analysis",
+                        run_retrieval_feedback_analysis,
+                        _MMCron(day_of_week="sun", hour=4, minute=0),
+                    ),
+                ]
+                # Hourly archival summaries — same enable_day_recall gate as
+                # platform_main's setup_scheduler (forced ON in the agent
+                # image, Dockerfile.agent). The job already summarizes any
+                # rolled-over day with >=1 user/assistant message (A6-9):
+                # light days that never hit the rolling-summary debounce
+                # still get an archival summary, so <recent_days> and
+                # recall_day stop silently skipping them.
+                if settings.enable_day_recall:
+                    _mm_jobs.append(
+                        ("day_archival", run_end_of_day_archival, _MMIvl(hours=1))
+                    )
+            except Exception as e:
+                print(f"⚠️ Memory maintenance imports failed: {e}")
+
+            _mm_registered = []
+            for _mm_id, _mm_fn, _mm_trigger in _mm_jobs:
+                try:
+                    cron_service.scheduler.add_job(
+                        _mm_fn,
+                        trigger=_mm_trigger,
+                        id=_mm_id,
+                        name=f"Memory Maintenance: {_mm_id}",
+                        replace_existing=True,
+                    )
+                    _mm_registered.append(_mm_id)
+                except Exception as e:
+                    print(f"⚠️ Could not register memory job {_mm_id}: {e}")
+            if _mm_registered:
+                print(f"🧠 Memory maintenance jobs: {', '.join(_mm_registered)}")
+
     except Exception as e:
         print(f"⚠️ Agent initialization error: {e}")
         import traceback

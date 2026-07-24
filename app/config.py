@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     enable_scheduler: bool = True  # Set to False in multi-worker deployments
     decay_interval_hours: int = 6  # How often to run decay
     consolidation_cron_hour: int = 3  # Hour to run consolidation (3 AM)
+    # Audit A6-1 (2026-07-23): the memory maintenance jobs (decay,
+    # consolidation, end-of-day archival, retrieval feedback) are started
+    # only by platform_main, whose DB excludes the AGENT_ONLY memories/
+    # day_chats tables — they have never run against tenant data. When
+    # True, agent_main's lifespan registers the same job entry points on
+    # the tenant container's scheduler where those tables actually live.
+    agent_memory_maintenance_enabled: bool = False
 
     # Proactive-notification dispatcher (Autopilot arc PR3). Runs on
     # EVERY replica — safety comes from per-row status CAS, not from

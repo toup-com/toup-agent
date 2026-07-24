@@ -585,6 +585,15 @@ _ALWAYS_INCLUDED_TOOLS = frozenset({
     "navigate_to",  # Page transfers — needed in any intent
     "recall_day",   # Past-day questions can fall under any category
     "memory_search",  # "what do you remember about X" can hit any intent
+    # "Remember <fact>" is an explicit-save ask the system prompt mandates
+    # a memory_store call for, yet greeting/question/web/media intents
+    # filtered the tool out — the model either hallucinated "saved!" or
+    # truthfully said it can't (audit A6-3, 2026-07-23). Same failure
+    # class as routines__remind below: short/typo'd asks score zero in
+    # the memory keyword list and land in question intent. Background
+    # auto-extraction still runs either way; exposing the tool just makes
+    # explicit saves real.
+    "memory_store",
     # spawn is a meta-affordance: any sufficiently expensive turn — even a
     # "research" prompt that classifies as web intent — may want to be
     # backgrounded into a sub-agent. Hiding spawn from non-agent intents

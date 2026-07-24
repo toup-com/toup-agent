@@ -230,6 +230,33 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
+        # 6b. Memory delete (audit A6-6: memory_delete was listed in the
+        #     memory-intent tool set but had no definition or handler, so
+        #     "forget X" could never be honored via tool)
+        # ------------------------------------------------------------------
+        {
+            "name": "memory_delete",
+            "description": (
+                "Delete a stored memory (soft delete). Use when the user asks "
+                "you to forget something or a stored fact is wrong/outdated. "
+                "Find the memory's id with memory_search first, then pass it "
+                "here."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {
+                        "type": "string",
+                        "description": (
+                            "The id of the memory to delete, as returned by "
+                            "memory_search."
+                        ),
+                    },
+                },
+                "required": ["memory_id"],
+            },
+        },
+        # ------------------------------------------------------------------
         # 7. Web search
         # ------------------------------------------------------------------
         {

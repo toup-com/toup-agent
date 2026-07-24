@@ -38,6 +38,45 @@ class ExtractedEntity:
     schema_type: Optional[str] = None
 
 
+# A6-2: seconds to wait before the single extraction retry. Module-level so
+# tests can zero it out.
+_EXTRACTION_RETRY_BACKOFF_S = 1.5
+
+
+async def _complete_json_with_retry(llm, *, messages, temperature, max_tokens):
+    """Call ``llm.complete_with_json`` with ONE retry after a short backoff.
+
+    A6-2: per-turn fact extraction is a single un-fallbacked LLM call — a
+    transient provider/network blip silently loses every fact stated that
+    turn. One retry covers the transient class without meaningful cost;
+    persistent failures (bad key, dead proxy) still fail fast on the second
+    attempt, which propagates unchanged so the caller's no-regex-fallback
+    policy stays intact.
+
+    Returns (response, retried: bool).
+    """
+    import asyncio
+    import logging
+
+    try:
+        response = await llm.complete_with_json(
+            messages=messages, temperature=temperature, max_tokens=max_tokens
+        )
+        return response, False
+    except Exception as first_err:
+        logging.warning(
+            "[memory_extractor] LLM extraction attempt 1 failed, retrying "
+            "once in %.1fs: %s: %s",
+            _EXTRACTION_RETRY_BACKOFF_S,
+            type(first_err).__name__, str(first_err)[:200],
+        )
+        await asyncio.sleep(_EXTRACTION_RETRY_BACKOFF_S)
+        response = await llm.complete_with_json(
+            messages=messages, temperature=temperature, max_tokens=max_tokens
+        )
+        return response, True
+
+
 class MemoryExtractor:
     """
     Extracts structured memories from conversation text.
@@ -642,8 +681,13 @@ Extract as many memories as the conversation warrants (up to {max_memories}). Do
 
 If the conversation is just casual chat, commands, or questions with nothing worth remembering long-term, return {{"memories": []}}. It is BETTER to extract nothing than to extract garbage."""
 
+        # A6-2: outcome of this extraction, surfaced on the next turn's
+        # [memory_health] line — "ok" / "retried" / "failed".
+        self.last_extraction_outcome = None
+
         try:
-            response = await llm.complete_with_json(
+            response, _retried = await _complete_json_with_retry(
+                llm,
                 messages=[{"role": "user", "content": extraction_prompt}],
                 temperature=0.3,
                 max_tokens=3000,
@@ -700,6 +744,7 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                     metadata={"brain_type": brain_type, "extracted_by": "llm"},
                 ))
 
+            self.last_extraction_outcome = "retried" if _retried else "ok"
             return memories
 
         except Exception as e:
@@ -713,6 +758,7 @@ If the conversation is just casual chat, commands, or questions with nothing wor
             #
             # Operators can re-extract from past turns by calling the
             # backfill script once the underlying LLM issue is resolved.
+            self.last_extraction_outcome = "failed"
             import logging
             logging.error(
                 "[memory_extractor] LLM extraction failed (skipping turn — "

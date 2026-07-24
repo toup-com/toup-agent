@@ -283,6 +283,13 @@ class AgentRunner:
         # the prompt is built so operators have a single grep target for
         # "is memory working for user X right now?". Resets per turn.
         self._memory_health: Dict[str, Any] = {}
+        # A6-2: outcome of the most recent COMPLETED background extraction
+        # (Y=ok, N=failed, R=retried-then-ok, "-"=none yet). Deliberately
+        # NOT in _memory_health — that dict resets per turn, while the
+        # fire-and-forget extraction for turn N finishes after turn N's
+        # [memory_health] line was already emitted. The line therefore
+        # reports the previous turn's extraction outcome.
+        self._last_extraction_ok: str = "-"
 
     @property
     def tool_defs(self) -> list:
@@ -883,12 +890,18 @@ class AgentRunner:
             #   reason=<reason>    → FF-B.2 failure taxonomy if last attempt failed
             #   intent=<cat>       → query intent classification
             #   tokens=N           → estimated system prompt tokens
+            #   extraction_ok=Y/N/R → most recent completed background fact
+            #                        extraction (A6-2). Y=ok, N=failed,
+            #                        R=retried-then-ok, -=none yet. Reports
+            #                        the PREVIOUS turn: this line is emitted
+            #                        before this turn's fire-and-forget
+            #                        extraction runs.
             try:
                 _mh = self._memory_health
                 logger.info(
                     "[memory_health] user=%s channel=%s retrieved=%d active_tasks=%d "
                     "recent_days=%d today_summary=%s summary=%s reason=%s "
-                    "intent=%s tokens=%d",
+                    "intent=%s tokens=%d extraction_ok=%s",
                     user_id[:8], channel,
                     _mh.get("retrieved", 0),
                     _mh.get("active_tasks", 0),
@@ -898,6 +911,7 @@ class AgentRunner:
                     _mh.get("summary_failure_reason") or "-",
                     getattr(query_intent, "category", "-"),
                     estimate_tokens(system_prompt),
+                    getattr(self, "_last_extraction_ok", "-"),
                 )
 
                 # F-final: WARN-level alert on degraded memory state.
@@ -3887,7 +3901,12 @@ class AgentRunner:
                 max_memories=15,
                 api_key=user_api_key,
             )
-            
+            # A6-2: surface the extraction outcome on the next turn's
+            # [memory_health] line (Y=ok, N=failed, R=retried-then-ok).
+            self._last_extraction_ok = {
+                "ok": "Y", "failed": "N", "retried": "R",
+            }.get(getattr(extractor, "last_extraction_outcome", None), "-")
+
             dedup = MemoryDedupService(db, api_key=user_api_key)
             count = 0
             for mem in extracted:
@@ -3983,6 +4002,9 @@ class AgentRunner:
             return count
         except Exception as e:
             logger.warning(f"Agent memory extraction failed: {e}")
+            # A6-2: storage/dedup failures also lose the turn's facts —
+            # report N even when the LLM call itself succeeded.
+            self._last_extraction_ok = "N"
             return 0
     
     @staticmethod
