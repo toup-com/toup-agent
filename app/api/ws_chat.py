@@ -195,12 +195,22 @@ async def _resolve_day_chat_id_for_now(db_session, user_id: str, tz_override: st
     return await resolve_day_chat_id_for_now(db_session, user_id, tz_override=tz_override)
 
 
-async def broadcast_to_user(user_id: str, event: dict) -> int:
+async def broadcast_to_user(
+    user_id: str, event: dict, exclude: Optional[asyncio.Queue] = None,
+) -> int:
     """Push an event to all WebSocket connections for a user.
+
+    `exclude` skips one connection's queue — used by the turn-mirror lane so
+    the socket that OWNS the running turn (and already receives the frame
+    directly) doesn't get a duplicate, while every other live socket of the
+    same user — a phone that just reconnected after a background stint — does.
+
     Returns number of connections that received the event."""
     queues = _user_ws_queues.get(user_id, [])
     sent = 0
     for q in queues:
+        if exclude is not None and q is exclude:
+            continue
         try:
             q.put_nowait(event)
             sent += 1
@@ -227,6 +237,80 @@ def _unregister_ws_queue(user_id: str, queue: asyncio.Queue) -> None:
         pass
     if not queues:
         _user_ws_queues.pop(user_id, None)
+
+
+# ── In-flight turn registry (2026-07-23) ─────────────────────────────
+# A turn that loses its client keeps running headless (see the client-gone
+# lane below) — but nothing ever told a RECONNECTING client that work was
+# still in progress. Returning to the app mid-turn therefore showed a
+# thread with the user's message and no sign of life: no "thinking"
+# indicator, no tool progress, nothing until the answer eventually landed
+# (founder repro 2026-07-23: "left the app while it was thinking, came
+# back to an empty chat").
+#
+# This registry is the missing signal. One entry per user for as long as
+# their turn runs: announced as a `turn_active` frame the moment a socket
+# connects, mirrored to every OTHER live socket as `turn_status` while the
+# turn advances, and closed out with `turn_ended`. In-process by design —
+# the turn itself lives in this process, so an entry can never outlive the
+# work it describes (and a hard TTL covers a killed process anyway).
+_active_turns: Dict[str, dict] = {}
+_TURN_STALE_S = 900.0  # 15 min: longer than any real turn, short enough to self-heal
+
+
+def _set_active_turn(user_id: str, **fields) -> None:
+    """Create or update this user's in-flight turn entry. A different mission
+    id starts a FRESH entry — the previous turn's tool/stage must never leak
+    into the new one."""
+    mission_id = fields.get("mission_id")
+    entry = _active_turns.get(user_id)
+    if entry is None or (mission_id and entry.get("mission_id") != mission_id):
+        entry = {}
+        _active_turns[user_id] = entry
+    entry.update(fields)
+
+
+def _clear_active_turn(user_id: str, mission_id: Optional[str] = None) -> None:
+    """Drop the entry. `mission_id` guards against a finished turn clearing a
+    NEWER turn's entry (the user sent again while the old one was wrapping up)."""
+    entry = _active_turns.get(user_id)
+    if entry is None:
+        return
+    if mission_id and entry.get("mission_id") != mission_id:
+        return
+    _active_turns.pop(user_id, None)
+
+
+def _get_active_turn(user_id: str) -> Optional[dict]:
+    """Fresh entry for this user, or None. Stale entries (a process that died
+    mid-turn, a leak) are dropped rather than announced — a client must never
+    be told to wait on a turn that no longer exists."""
+    entry = _active_turns.get(user_id)
+    if not entry:
+        return None
+    started = entry.get("started_at") or 0.0
+    if time.time() - started > _TURN_STALE_S:
+        _active_turns.pop(user_id, None)
+        return None
+    return entry
+
+
+def _turn_frame(kind: str, entry: dict, **extra) -> dict:
+    """Wire shape for turn_active / turn_status. `stage` is coarse
+    ('thinking' | 'tool' | 'writing'); `tool` is the raw tool name so the
+    client maps it to its own label + orb state (one vocabulary, client-side
+    — see agentStates.ts / getToolInfo)."""
+    frame = {
+        "type": kind,
+        "mission_id": entry.get("mission_id"),
+        "title": entry.get("title"),
+        "stage": entry.get("stage") or "thinking",
+        "tool": entry.get("tool"),
+        "started_at_ms": int((entry.get("started_at") or time.time()) * 1000),
+    }
+    frame.update(extra)
+    return frame
+
 
 # ── Onboarding prompt ────────────────────────────────────────────────
 _ONBOARDING_TRIGGER = (
@@ -1429,6 +1513,28 @@ async def ws_chat(
         # Register broadcast queue for this connection
         broadcast_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         _register_ws_queue(user_id, broadcast_queue)
+        # Last turn id THIS connection registered — the connection-level
+        # backstop for the in-flight registry (see the finally below). A turn
+        # that loses its client keeps running inside this handler, so by the
+        # time the finally runs the work is genuinely over.
+        _conn_turn_mission: Optional[str] = None
+
+        # ── Resume: announce a turn that is still running ──
+        # The phone reconnects on every foreground (ensureChatConnected).
+        # If this user's previous turn is still in flight — it kept running
+        # headless while they were away — say so immediately, so the app can
+        # put the working orb back up and keep narrating the agent's actions
+        # instead of showing a dead thread until the answer lands.
+        try:
+            _resume = _get_active_turn(user_id)
+            if _resume:
+                await websocket.send_json(_turn_frame("turn_active", _resume, resumed=True))
+                logger.info(
+                    "[WS] announced in-flight turn %s to reconnecting client %s",
+                    _resume.get("mission_id"), user_id[:8],
+                )
+        except Exception:  # noqa: BLE001 — never block a connect on the announce
+            pass
 
         async def _broadcast_reader():
             """Forward broadcast events to this WebSocket."""
@@ -1516,6 +1622,27 @@ async def ws_chat(
 
                 if msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
+                    continue
+
+                # ── "Is a turn still running for me?" ──
+                # The connect-time announce only helps a socket that just
+                # opened. A client whose chat screen REMOUNTS on a live socket
+                # (every deep link does) asks here instead, and gets the same
+                # answer: the running turn, or an explicit end.
+                if msg_type == "turn_probe":
+                    _probe = _get_active_turn(user_id)
+                    try:
+                        if _probe:
+                            await websocket.send_json(
+                                _turn_frame("turn_active", _probe, resumed=True)
+                            )
+                        else:
+                            await websocket.send_json({
+                                "type": "turn_ended",
+                                "mission_id": msg.get("mission_id"),
+                            })
+                    except Exception:  # noqa: BLE001
+                        pass
                     continue
 
                 if msg_type in (
@@ -1915,6 +2042,17 @@ async def ws_chat(
                     " ".join((_original_user_text or text or "").split())[:60].strip()
                     or "Working on your answer"
                 )
+                # Registered before the first frame: a client that reconnects
+                # one second into the turn already gets `turn_active`.
+                _set_active_turn(
+                    user_id,
+                    mission_id=_turn_mission_id,
+                    title=_turn_title,
+                    stage="thinking",
+                    tool=None,
+                    started_at=time.time(),
+                )
+                _conn_turn_mission = _turn_mission_id
                 try:
                     await websocket.send_json({
                         "type": "status", "stage": "received",
@@ -1984,6 +2122,10 @@ async def ws_chat(
                                     # already responded. The client's
                                     # `messages-since` reconnect path will
                                     # pull the assistant reply if it exists.
+                                    # No work will run under this turn's id —
+                                    # retire it so a reconnecting client is
+                                    # never told to wait on a phantom turn.
+                                    _clear_active_turn(user_id, _turn_mission_id)
                                     continue
                             _presave_dc_id = await _resolve_day_chat_id_for_now(_presave_db, user_id, tz_override=client_tz)
                             # Build kwargs defensively: omit reply_to_message_id
@@ -2081,6 +2223,26 @@ async def ws_chat(
                 _turn_flags = {"client_gone": False, "response_persisted": False,
                                "finished": False}
 
+                async def _mirror_turn(stage: str, tool: Optional[str] = None) -> None:
+                    """Keep the in-flight registry current and narrate the turn
+                    to the user's OTHER live sockets (the reconnected phone).
+                    Only real transitions go on the wire — a 400-chunk answer
+                    mirrors 'writing' once, not 400 times."""
+                    entry = _active_turns.get(user_id)
+                    if entry is None or entry.get("mission_id") != _turn_mission_id:
+                        return
+                    if entry.get("stage") == stage and entry.get("tool") == tool:
+                        return
+                    entry["stage"] = stage
+                    entry["tool"] = tool
+                    try:
+                        await broadcast_to_user(
+                            user_id, _turn_frame("turn_status", entry),
+                            exclude=broadcast_queue,
+                        )
+                    except Exception:  # noqa: BLE001 — narration is best-effort
+                        pass
+
                 # Interim Live Activity progress at tool boundaries.
                 # Emits on EVERY turn (Claude parity: the backgrounded
                 # card streams live status), but rows are update_only —
@@ -2101,6 +2263,12 @@ async def ws_chat(
                 # Stream callbacks
                 async def on_text_chunk(chunk: str):
                     _streamed_chunks.append(chunk)
+                    # Cheap inline guard: a long answer fires this callback
+                    # thousands of times, and only the FIRST chunk after a
+                    # stage change has anything to mirror.
+                    _e = _active_turns.get(user_id)
+                    if _e is not None and _e.get("stage") != "writing":
+                        await _mirror_turn("writing")
                     try:
                         await websocket.send_json({"type": "text_chunk", "text": chunk})
                     except Exception:
@@ -2137,6 +2305,7 @@ async def ws_chat(
 
                 async def on_tool_start(tool_name: str):
                     _tprint(f"{_DIM}  ⚙ {tool_name}{_RESET}")
+                    await _mirror_turn("tool", tool_name)
                     try:
                         await websocket.send_json({"type": "tool_start", "tool": tool_name})
                     except Exception:
@@ -2152,6 +2321,10 @@ async def ws_chat(
                     the runner emits 'thinking' before every LLM call so
                     the client can show a live indicator through
                     reasoning TTFT and post-tool iterations."""
+                    if stage == "thinking":
+                        # Between tools the agent is reasoning again — drop the
+                        # finished tool so a resumed client stops narrating it.
+                        await _mirror_turn("thinking")
                     try:
                         await websocket.send_json({
                             "type": "status", "stage": stage,
@@ -2423,6 +2596,17 @@ async def ws_chat(
                                 return
                             elif m2.get("type") == "ping":
                                 await websocket.send_json({"type": "pong"})
+                            elif m2.get("type") == "turn_probe":
+                                # The chat screen remounted on this very socket
+                                # (deep-link tap mid-turn) and lost its live
+                                # state — answer with the turn it is standing on.
+                                _p = _get_active_turn(user_id)
+                                if _p:
+                                    await websocket.send_json(
+                                        _turn_frame("turn_active", _p, resumed=True)
+                                    )
+                                else:
+                                    await websocket.send_json({"type": "turn_ended"})
                     except asyncio.CancelledError:
                         pass
                     except WebSocketDisconnect:
@@ -2628,6 +2812,36 @@ async def ws_chat(
                         _done_payload["build_jobs"] = list(_pending_job_cards)
                     _done_delivered = await _safe_send(_done_payload)
 
+                    # The asking socket is gone — but the user may already be
+                    # back on a NEW one (the phone reconnects on every
+                    # foreground). Hand that socket the persisted answer live;
+                    # the app renders `message` frames straight into the open
+                    # thread, so the reply appears the moment it exists instead
+                    # of waiting for the next refetch.
+                    if not _done_delivered and (response.text or "").strip():
+                        try:
+                            _late_frame = {
+                                "type": "message",
+                                "id": (
+                                    getattr(response, "asst_message_id", None)
+                                    or f"{_turn_mission_id}:answer"
+                                ),
+                                "role": "assistant",
+                                "content": response.text,
+                                "created_at": datetime.utcnow().isoformat() + "Z",
+                            }
+                            if getattr(response, "day_chat_id", None):
+                                _late_frame["day_chat_id"] = response.day_chat_id
+                            _late_sent = await broadcast_to_user(
+                                user_id, _late_frame, exclude=broadcast_queue,
+                            )
+                            logger.info(
+                                "[WS] late answer delivered to %d reconnected socket(s) user=%s",
+                                _late_sent, user_id[:8],
+                            )
+                        except Exception:  # noqa: BLE001 — push + refetch remain
+                            pass
+
                     # Answer delivery push — UNCONDITIONAL (founder
                     # decision 2026-07-17): every chat answer notifies
                     # the phone regardless of app state; the old gate
@@ -2778,11 +2992,31 @@ async def ws_chat(
                     # Show user-friendly error instead of raw exception
                     user_msg = _friendly_error(e)
                     await _safe_send({"type": "error", "message": user_msg})
+                finally:
+                    # However this turn ended — answer, error, user stop,
+                    # cancellation — it is no longer in flight. Retire the
+                    # registry entry (so a client connecting a second later is
+                    # not told to wait on finished work) and tell any resumed
+                    # socket to drop its working orb.
+                    _clear_active_turn(user_id, _turn_mission_id)
+                    try:
+                        await broadcast_to_user(user_id, {
+                            "type": "turn_ended",
+                            "mission_id": _turn_mission_id,
+                        }, exclude=broadcast_queue)
+                    except Exception:  # noqa: BLE001
+                        pass
         finally:
             # Clean up broadcast queue and task
             broadcast_task.cancel()
             keepalive_task.cancel()
             _unregister_ws_queue(user_id, broadcast_queue)
+            # Backstop for the in-flight registry: paths that never reach the
+            # per-turn finally (a duplicate-replay skip, a pre-dispatch raise)
+            # must not leave a phantom turn behind for the next connect to
+            # announce. Guarded by mission id, so a NEWER turn is untouched.
+            if _conn_turn_mission:
+                _clear_active_turn(user_id, _conn_turn_mission)
             # Phase A/B: release this WS from the drain counter. Match
             # the increment above; if drain has been engaged and this
             # was the last in-flight WS, the drain watcher will exit
