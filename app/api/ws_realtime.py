@@ -26,7 +26,11 @@ Protocol (Browser ↔ Proxy):
     { "type": "response_done", "text": "..." }            — full assistant text
     { "type": "session_id", "session_id": "..." }         — DB session ID (for chat sync)
     { "type": "speech_started" }                           — user started speaking (barge-in)
-    { "type": "state", "state": "listening|thinking|speaking" }
+    { "type": "state", "state": "listening|thinking|speaking|tool_use" }
+    { "type": "tool_call.started", "call_id","name","title","detail" }   — a tool began
+    { "type": "tool_call.completed", "call_id","name","ok","result_preview" } — tool result
+    { "type": "navigate", "path": "..." }                  — client-side navigate_to tool
+    { "type": "onboarding_phase", "phase": "color|profiling|done" }
     { "type": "status", "stage": "authenticated|preparing|connecting_ai" }
                                                            — pre-ready progress beacons
     { "type": "ready" }                                    — session ready, start sending audio
@@ -207,6 +211,45 @@ def _build_realtime_tools():
 
 
 REALTIME_TOOLS = _build_realtime_tools()
+
+
+# ── Tool-activity labels (client tool-use UI) ─────────────────────────
+# The realtime WS historically told the client only "a tool is running"
+# (state:"tool_use") with no name/args/result. The tool UI needs a human label
+# per call; map the common tools here, fall back to a humanized name.
+_TOOL_TITLES = {
+    "think": "Thinking",
+    "navigate_to": "Opening a page",
+    "web_search": "Searching the web",
+    "browser": "Browsing the web",
+    "read_file": "Reading a file",
+    "write_file": "Writing a file",
+    "edit_file": "Editing a file",
+    "exec": "Running a command",
+    "memory_search": "Recalling",
+    "memory_store": "Remembering",
+    "recall_day": "Recalling a past day",
+}
+
+
+def _tool_activity(func_name: str, arguments: dict) -> tuple:
+    """(title, detail) for a client tool-activity row. `detail` is a short,
+    human string pulled from the most salient argument (the search query, the
+    task, the path…), trimmed so large blobs never hit the wire."""
+    title = _TOOL_TITLES.get(func_name) or (func_name.replace("_", " ").strip().capitalize() or "Working")
+    detail = ""
+    if func_name == "think":
+        detail = str(arguments.get("task", ""))[:200]
+    elif func_name == "navigate_to":
+        detail = str(arguments.get("path", ""))
+    elif func_name in ("web_search", "browser"):
+        detail = str(arguments.get("query") or arguments.get("url") or "")[:200]
+    else:
+        for v in arguments.values():
+            if isinstance(v, str) and v.strip():
+                detail = v.strip()[:200]
+                break
+    return title, detail
 
 
 # ── Build system instructions from Identity + Memory ──────────────────
@@ -419,9 +462,21 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         "- Do NOT use markdown, code blocks, bullet points, or any text formatting.\n"
         "- Do NOT say 'here is a list' or read structured data verbatim.\n"
         "- Use natural speech patterns: contractions, casual phrasing.\n"
-        "- Match the user's language — if they speak Farsi, respond in Farsi.\n"
-        "- When you need to recall past information, use the memory_search tool.\n"
-        "- When the user shares something worth remembering, use the memory_store tool.\n"
+        "- Match the user's language. Speak EVERY language with a natural, NATIVE "
+        "accent and native pronunciation — never a foreign or English-accented one.\n"
+        "- When the user speaks Persian/Farsi, reply in fluent, natural Farsi with a "
+        "native Tehrani accent, pronouncing every Persian sound correctly (خ، غ، ق، ژ, "
+        "and the tapped ر) exactly as a native speaker from Tehran would — NOT with an "
+        "English accent. In Persian: «فارسی را کاملاً روان و طبیعی صحبت کن، با لهجهٔ "
+        "بومیِ تهرانی و تلفّظِ درستِ فارسی، بدون هیچ لهجهٔ خارجی یا انگلیسی.»\n"
+        "- Everything you already know about the user and about yourself is "
+        "provided ABOVE in this prompt — your identity, the user's profile, your "
+        "memories, and today's conversation. Answer questions about the user's "
+        "name, your OWN name, and any stored fact or preference DIRECTLY and "
+        "instantly from it. NEVER stall or say you need to 'check what we have on "
+        "record' for something already provided above.\n"
+        "- If the user asks about something genuinely NOT in your provided context, "
+        "hand it to the think tool to look it up — do not guess.\n"
         "- You can navigate the user to different pages using the navigate_to tool. "
         "Offer to show them relevant pages when helpful.\n"
         "- You have FULL ACCESS to the user's computer terminal through a connected agent. "
@@ -465,9 +520,20 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
     # Mirrors agent_runner.py identity_anchor. Flag-gated (default on): it
     # only ADDS a guardrail, so nothing a user relies on changes.
     if settings.voice_identity_anchor:
+        _agent_name = await _get_agent_name(user_id)
+        # Back-port the text channel's POSITIVE name statement (agent_runner.py
+        # identity_anchor). Voice previously carried only the negative guard, so
+        # "what's your name?" answered "I don't have a name". State it when set.
+        _name_line = (
+            f"Your name is {_agent_name}. That is your name — use it when you "
+            f"introduce or refer to yourself, and when the user asks your name, "
+            f"answer {_agent_name} (never 'Toup', which is only the platform).\n"
+            if _agent_name else ""
+        )
         sections.append(
             "# Who you are (identity)\n"
-            "You are the user's own personal agent on Toup. Toup is the "
+            + _name_line
+            + "You are the user's own personal agent on Toup. Toup is the "
             "platform you run on (toup.ai), not your name.\n"
             "You are NOT Claude, NOT GPT, NOT Sonnet, NOT Opus, NOT any "
             "specific provider model. If the user asks what model you are, "
@@ -580,6 +646,27 @@ async def _get_user_openai_key(user_id: str) -> Optional[str]:
     user_key = (row[0] if row else None) or None
     bundle_key = (row[1] if row else None) or None
     return user_key or bundle_key or settings.platform_openai_api_key or settings.openai_api_key or None
+
+
+async def _get_agent_name(user_id: str) -> Optional[str]:
+    """The agent's configured display name (AgentConfig.agent_name, platform DB)
+    — the SAME source the text channel's identity anchor reads (agent_runner.py).
+    Voice historically ported only the *negative* half of that anchor (never name
+    the provider) and never stated the agent's own name, so it answered "I don't
+    have a name". Read it so the voice anchor can state it positively."""
+    from app.db.database import async_session_maker
+    from app.db.models import AgentConfig
+    try:
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(AgentConfig.agent_name).where(AgentConfig.user_id == user_id)
+            )
+            row = result.first()
+            if row and row[0]:
+                return str(row[0]).strip() or None
+    except Exception:
+        pass  # agent_configs table may not exist on agent DBs
+    return None
 
 
 # ── VPS helpers — all personal data lives on user's VPS, never platform ──
@@ -2052,7 +2139,17 @@ async def realtime_voice_ws(
                             arguments = {}
 
                         logger.info("[REALTIME] Function call: %s(%s)", func_name, arguments)
+                        # Legacy coarse flag (kept for older app builds that only
+                        # read state) + the discrete lifecycle event the tool UI uses.
                         await websocket.send_json({"type": "state", "state": "tool_use"})
+                        _tc_title, _tc_detail = _tool_activity(func_name, arguments)
+                        await websocket.send_json({
+                            "type": "tool_call.started",
+                            "call_id": call_id,
+                            "name": func_name,
+                            "title": _tc_title,
+                            "detail": _tc_detail,
+                        })
 
                         # ── Client-side tool: navigate_to ──
                         if func_name == "navigate_to":
@@ -2134,6 +2231,16 @@ async def realtime_voice_ws(
                                         logger.info("[REALTIME] Onboarding completed for user %s", user_id[:8])
                             except Exception as oe:
                                 logger.warning("[REALTIME] Failed to mark onboarding complete: %s", oe)
+
+                        # Discrete completion event → client findings card.
+                        _res_str = result if isinstance(result, str) else str(result)
+                        await websocket.send_json({
+                            "type": "tool_call.completed",
+                            "call_id": call_id,
+                            "name": func_name,
+                            "ok": not _res_str.strip().upper().startswith("ERROR"),
+                            "result_preview": _res_str[:600],
+                        })
 
                         # Send result back to OpenAI
                         await openai_ws.send(json.dumps({
