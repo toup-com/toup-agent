@@ -37,6 +37,7 @@ from app.agent.context_manager import (
     compact_messages,
     estimate_tokens,
     estimate_messages_tokens,
+    is_context_overflow_error,
 )
 from app.agent.tool_definitions import get_agent_tools, get_extended_tools, get_doc_generation_tools
 from app.agent.tool_executor import ToolExecutor
@@ -997,10 +998,56 @@ class AgentRunner:
             except Exception as _cbl_err:
                 logger.warning("[context_budget] Log failed (non-fatal): %s", _cbl_err)
 
+        # A8-6 (flag-gated inside compact_messages via
+        # settings.cache_aware_overflow): when a span is summarized out of
+        # the context window, promote it to durable memory first via the
+        # existing background extractor. Fire-and-forget — the synchronous
+        # callback only schedules the task; it never blocks the turn.
+        def _promote_dropped_span(dropped: List[Dict[str, Any]]) -> None:
+            try:
+                user_parts: List[str] = []
+                asst_parts: List[str] = []
+                for _dm in dropped:
+                    _dc = _dm.get("content", "")
+                    if isinstance(_dc, list):
+                        _dt = " ".join(
+                            b.get("text", "") for b in _dc
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    else:
+                        _dt = str(_dc or "")
+                    if not _dt.strip():
+                        continue
+                    (user_parts if _dm.get("role") == "user" else asst_parts).append(_dt)
+                if not user_parts and not asst_parts:
+                    return
+
+                async def _promote() -> None:
+                    try:
+                        async with async_session_maker() as p_db:
+                            await self._extract_memories(
+                                db=p_db,
+                                user_id=user_id,
+                                user_message="\n".join(user_parts)[:8000],
+                                assistant_response="\n".join(asst_parts)[:8000],
+                            )
+                            await p_db.commit()
+                    except Exception as p_err:
+                        logger.warning(
+                            "[AGENT] drop-time memory promotion failed (non-fatal): %s", p_err
+                        )
+
+                asyncio.create_task(_promote())
+            except Exception:
+                logger.debug("[AGENT] drop-time promotion scheduling failed", exc_info=True)
+
         # Context window management — initial check
         if needs_compaction(system_prompt, messages, settings.agent_model):
             logger.info(f"[AGENT] Context compaction triggered ({len(messages)} messages)")
-            messages = await compact_messages(messages, settings.agent_model)
+            messages = await compact_messages(
+                messages, settings.agent_model,
+                conversation_id=session_id, on_drop=_promote_dropped_span,
+            )
             logger.info(f"[AGENT] After compaction: {len(messages)} messages, ~{estimate_messages_tokens(messages)} tokens")
 
         # Context tracking helper
@@ -1076,6 +1123,14 @@ class AgentRunner:
                 active_model, _coerced, channel,
             )
             active_model = _coerced
+
+        # A8-3: _context_window above was sized from settings.agent_model
+        # BEFORE routing, but the model actually called can differ
+        # (session/model override, router provider preference) and may
+        # have a far smaller window — history budgeted for gpt-5.5's
+        # 1.05M sent to a 200k Claude model is a guaranteed overflow.
+        # Re-key the mid-loop compaction math to the ACTIVE model.
+        _context_window = get_context_window(active_model)
 
         active_llm = self.anthropic if _is_claude_model(active_model) else self.llm
 
@@ -1197,6 +1252,8 @@ class AgentRunner:
             text_buf = ""
             pending_tool_calls: List[Dict[str, Any]] = []
             stop_reason = ""
+            # A8-2: one compact-and-retry per LLM call on context overflow.
+            _overflow_compacted = False
 
             for attempt in range(MAX_RETRIES + 1):
                 try:
@@ -1359,6 +1416,64 @@ class AgentRunner:
                             break  # exit retry loop, exit iteration loop below
                     except ImportError:
                         pass
+
+                    # A8-2: context overflow is a DETERMINISTIC 400 —
+                    # retrying the identical payload can never succeed, and
+                    # the generic ladder below would then stream the same
+                    # un-shrunk messages to the SMALLER-window fallback
+                    # model (gpt-4o, 128k). Compact once and retry with the
+                    # shrunk payload instead; a second overflow (or nothing
+                    # left to compact) raises a clear error.
+                    if is_context_overflow_error(e):
+                        if not _overflow_compacted and len(messages) > 1 and attempt < MAX_RETRIES:
+                            _overflow_compacted = True
+                            _compaction_count += 1
+                            _before_tokens = estimate_messages_tokens(messages)
+                            messages = await compact_messages(
+                                messages, active_model,
+                                conversation_id=session_id,
+                                on_drop=_promote_dropped_span,
+                            )
+                            _after_tokens = estimate_messages_tokens(messages)
+                            # Review pr3-#3: compact_messages no-ops when the
+                            # tail is too short or all-tool-pairs — retrying
+                            # the byte-identical payload is a guaranteed
+                            # second 400, so raise straight away instead.
+                            if _after_tokens < _before_tokens:
+                                logger.warning(
+                                    "[AGENT] context_length_exceeded on %s — compacted "
+                                    "~%d → ~%d est tokens, retrying once with the shrunk payload",
+                                    active_model, _before_tokens, _after_tokens,
+                                )
+                                continue
+                            logger.warning(
+                                "[AGENT] context_length_exceeded on %s — compaction was a "
+                                "no-op (~%d est tokens), raising without an identical-bytes retry",
+                                active_model, _before_tokens,
+                            )
+                        await self._log_error(
+                            user_id=user_id,
+                            session_id=session_id,
+                            error_type="context_overflow",
+                            error_message=str(e),
+                            context={
+                                "iteration": iteration, "model": active_model,
+                                "messages_count": len(messages),
+                                "compacted": _overflow_compacted,
+                            },
+                        )
+                        # Review pr3-#4: say what actually happened — the
+                        # compaction-couldn't-shrink message was misleading
+                        # when overflow first arrived on the final retry
+                        # attempt and compaction was never tried.
+                        _overflow_why = (
+                            "compaction could not shrink the conversation enough"
+                            if _overflow_compacted
+                            else "overflow surfaced before compaction could be attempted"
+                        )
+                        raise RuntimeError(
+                            f"Context window exceeded for {active_model} and {_overflow_why}: {e}"
+                        ) from e
 
                     # Detect errors that warrant immediate cross-provider fallback:
                     # - 401 auth errors: broken credentials, skip retries entirely
@@ -1646,18 +1761,40 @@ class AgentRunner:
             if _usage_ratio >= 0.80:
                 _compaction_count += 1
                 logger.info(f"[AGENT] Mid-loop compaction #{_compaction_count} at {_usage_ratio:.0%} ({_total_ctx:,} tokens)")
-                messages = await compact_messages(messages, settings.agent_model)
+                messages = await compact_messages(
+                    messages, active_model,
+                    conversation_id=session_id, on_drop=_promote_dropped_span,
+                )
                 _after = estimate_messages_tokens(messages)
                 logger.info(f"[AGENT] After compaction: {len(messages)} messages, ~{_after:,} tokens")
-                # Inject continuation marker so the agent picks up seamlessly
-                messages.insert(0, {
-                    "role": "user",
-                    "content": (
-                        "[This session was auto-compacted to free up context space. "
-                        "Earlier conversation has been summarized above. "
-                        "Continue seamlessly from where you left off.]"
+                # Inject continuation marker so the agent picks up seamlessly.
+                # A8-4b: placed directly AFTER the summary message — the old
+                # insert(0, ...) put the marker ABOVE the summary while its
+                # text claimed the summary was above, and rewrote messages[0]
+                # (busting the byte-stable head the cache_aware_overflow
+                # path preserves). Skipped when compaction was a no-op (no
+                # summary message present). Anchors to the FIRST summary:
+                # the fresh one lands at the front (index 0 legacy, right
+                # after the ≤2-message preserved head with the flag on),
+                # while a stale summary from a rapid double-compaction can
+                # only survive further down inside the recent window.
+                _sum_idx = next(
+                    (
+                        _si for _si, _sm in enumerate(messages)
+                        if isinstance(_sm.get("content"), str)
+                        and _sm["content"].startswith("[Conversation summary of")
                     ),
-                })
+                    None,
+                )
+                if _sum_idx is not None:
+                    messages.insert(_sum_idx + 1, {
+                        "role": "user",
+                        "content": (
+                            "[This session was auto-compacted to free up context space. "
+                            "Earlier conversation has been summarized above. "
+                            "Continue seamlessly from where you left off.]"
+                        ),
+                    })
 
         else:
             # Max iterations reached

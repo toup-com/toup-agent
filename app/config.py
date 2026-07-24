@@ -227,6 +227,25 @@ class Settings(BaseSettings):
     # tool_choice cannot express an allowlist).
     stable_prefix_layout: bool = False
 
+    # Cache-aware overflow rollover (token-efficiency PR-3; audit finding
+    # F-6 / A8-5..A8-6 in docs/audits/2026-07-token-efficiency.md). When
+    # true, compact_messages:
+    #   - keeps the FIRST messages (the cached prompt-prefix head)
+    #     byte-untouched and summarizes the MIDDLE of the conversation
+    #     instead of rewriting messages[0] with a fresh summary
+    #   - generates the summary deterministically (temperature 0.0) and
+    #     persists it on the Conversation row
+    #     (metadata_json["compaction_summary"], keyed by a hash of the
+    #     summarized span) so re-compacting the same span reuses it
+    #   - promotes the dropped span to durable memory via the existing
+    #     background extractor before it leaves the context window
+    # Default OFF: changes the model-visible message layout under
+    # compaction — flip via CACHE_AWARE_OVERFLOW=true after canary
+    # validation. The unflagged A8-2/A8-3/A8-4 fixes (overflow
+    # compact-and-retry, active-model window math, tool-pair-safe cut)
+    # are pure bug fixes and do NOT ride this flag.
+    cache_aware_overflow: bool = False
+
     # Document Generation + Web Attachments (Phase 1+2 of doc-delivery feature)
     # When false: generate_* tools are not registered, attachment WS events are not emitted.
     # Frontend has its own localStorage gate (TOUP_DOC_ATTACHMENTS) for the two-pane UI.
