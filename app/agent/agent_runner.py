@@ -120,6 +120,28 @@ def strip_vault_tool_for_channel(tools, channel):
     ]
 
 
+def same_local_day(started_utc, now_utc, tz_name: Optional[str]) -> bool:
+    """True when two UTC datetimes fall on the same calendar day in the
+    user's timezone (PR-2, audit A2-2).
+
+    Session rollover previously compared UTC dates while DayChat rolls on
+    the user's LOCAL date — so a Toronto user's session (and with it the
+    prompt_cache_key) re-minted at 8 PM local while the day chat kept
+    going, churning the cache scope mid-evening. Both clocks now roll at
+    local midnight. Unknown/invalid tz falls back to UTC (the previous
+    behavior, and what DayChat does for tz-less users).
+    """
+    tz = None
+    if tz_name and ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = None
+    if tz is not None:
+        return started_utc.astimezone(tz).date() == now_utc.astimezone(tz).date()
+    return started_utc.date() == now_utc.date()
+
+
 @dataclass
 class AgentResponse:
     """Final response from a single agent run."""
@@ -593,8 +615,18 @@ class AgentRunner:
         # ── Phase 1: Load from DB (short-lived session) ──────────
         t_phase1 = time.perf_counter()
         async with async_session_maker() as db:
+            # PR-2 (F-5/A2-2): resolve the effective timezone BEFORE session
+            # resolution so _get_or_create_session can (a) stamp the new
+            # Conversation's day_chat_id with the user's local day and
+            # (b) roll sessions at LOCAL midnight in step with DayChat
+            # instead of UTC. Previously this ran after session creation,
+            # and _get_or_create_session referenced a client_tz name it
+            # never received — the swallowed NameError wrote
+            # day_chat_id=NULL on every runner-created Conversation since
+            # 2026-04-13 (audit A2-1).
+            client_tz = await self._resolve_effective_tz(db, user_id, client_tz, channel)
             t_db = time.perf_counter()
-            session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session)
+            session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz)
             session_id = session.id
             logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
@@ -642,56 +674,10 @@ class AgentRunner:
                 )
             logger.info(f"[PERF] load_agent_config: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
-            # Resolve effective timezone here (not just inside
-            # _build_system_prompt) so day-chat resolution + history
-            # rendering both use the user's local time. Without this,
-            # Telegram/WhatsApp/voice channels — which never pass
-            # `client_tz` — got `tz_name=None` in
-            # `resolve_day_chat_id_for_now` / `load_day_context`,
-            # which then defaulted to UTC. Result: history messages
-            # the agent saw were stamped in UTC, so a 9:58 PM EDT
-            # message rendered as "1:58am" in the LLM context and
-            # the agent confidently told the user "you sent that at
-            # 1:58 AM". Single source of truth: User.timezone, with
-            # client_tz override when the surface supplies one.
-            if not client_tz:
-                # TKT-LAT-004: TTL-cache the User.timezone seed lookup so
-                # channels that never send client_tz (Telegram, voice,
-                # WhatsApp) don't pay a fresh DB round-trip every turn.
-                t_tz = time.perf_counter()
-                cached_tz = _get_cached_user_tz(user_id)
-                if cached_tz:
-                    client_tz = cached_tz
-                    logger.info(
-                        "[PERF] tz_seed=cache_hit %.1fms user=%s channel=%s tz=%s",
-                        (time.perf_counter() - t_tz) * 1000,
-                        user_id[:8], channel, cached_tz,
-                    )
-                else:
-                    try:
-                        from sqlalchemy import select as _select_for_tz
-                        from app.db.models import User as _User_for_tz
-                        _u_tz_row = (
-                            await db.execute(
-                                _select_for_tz(_User_for_tz).where(_User_for_tz.id == user_id)
-                            )
-                        ).scalar_one_or_none()
-                        _profile_tz = (
-                            getattr(_u_tz_row, "timezone", None) if _u_tz_row else None
-                        )
-                        logger.info(
-                            "[PERF] tz_seed=db_lookup %.1fms user=%s channel=%s tz=%s",
-                            (time.perf_counter() - t_tz) * 1000,
-                            user_id[:8], channel, _profile_tz,
-                        )
-                        if _profile_tz:
-                            client_tz = _profile_tz
-                            _set_cached_user_tz(user_id, _profile_tz)
-                    except Exception as _tz_seed_err:
-                        logger.debug(
-                            "[AGENT] tz_seed_failed user=%s err=%s",
-                            user_id[:8], _tz_seed_err,
-                        )
+            # Timezone was already resolved above (PR-2 moved the seed
+            # lookup ahead of _get_or_create_session — see
+            # _resolve_effective_tz). client_tz here is the effective tz:
+            # surface-supplied, else cached/DB User.timezone, else None.
 
             t_db = time.perf_counter()
             # ── Day-Chat context path (feature-flagged) ──
@@ -1935,6 +1921,63 @@ class AgentRunner:
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
+    async def _resolve_effective_tz(
+        self,
+        db: AsyncSession,
+        user_id: str,
+        client_tz: Optional[str],
+        channel: Optional[str],
+    ) -> Optional[str]:
+        """Effective user timezone for this turn (PR-2, moved ahead of
+        session resolution).
+
+        Single source of truth: explicit client_tz from the surface (web/
+        mobile WS payload) wins; else User.timezone persisted from prior
+        sessions. Channels that never send client_tz (Telegram, voice,
+        WhatsApp) previously got tz_name=None in resolve_day_chat_id_for_now
+        / load_day_context, which defaulted to UTC — history messages
+        rendered "9:58 PM EDT" as "1:58am" and the agent repeated the wrong
+        time to the user. TKT-LAT-004: the User.timezone seed lookup is
+        TTL-cached so tz-less channels don't pay a DB round-trip per turn.
+        Returns None when nothing is known (callers treat None as UTC).
+        """
+        if client_tz:
+            return client_tz
+        t_tz = time.perf_counter()
+        cached_tz = _get_cached_user_tz(user_id)
+        if cached_tz:
+            logger.info(
+                "[PERF] tz_seed=cache_hit %.1fms user=%s channel=%s tz=%s",
+                (time.perf_counter() - t_tz) * 1000,
+                user_id[:8], channel, cached_tz,
+            )
+            return cached_tz
+        try:
+            from sqlalchemy import select as _select_for_tz
+            from app.db.models import User as _User_for_tz
+            _u_tz_row = (
+                await db.execute(
+                    _select_for_tz(_User_for_tz).where(_User_for_tz.id == user_id)
+                )
+            ).scalar_one_or_none()
+            _profile_tz = (
+                getattr(_u_tz_row, "timezone", None) if _u_tz_row else None
+            )
+            logger.info(
+                "[PERF] tz_seed=db_lookup %.1fms user=%s channel=%s tz=%s",
+                (time.perf_counter() - t_tz) * 1000,
+                user_id[:8], channel, _profile_tz,
+            )
+            if _profile_tz:
+                _set_cached_user_tz(user_id, _profile_tz)
+                return _profile_tz
+        except Exception as _tz_seed_err:
+            logger.debug(
+                "[AGENT] tz_seed_failed user=%s err=%s",
+                user_id[:8], _tz_seed_err,
+            )
+        return None
+
     async def _get_or_create_session(
         self,
         db: AsyncSession,
@@ -1944,6 +1987,7 @@ class AgentRunner:
         channel: Optional[str] = None,
         app_id: Optional[str] = None,
         force_new: bool = False,
+        client_tz: Optional[str] = None,
     ):
         from sqlalchemy import select, and_
         from app.db.models import Conversation
@@ -2012,8 +2056,10 @@ class AgentRunner:
                     logger.info(f"[AGENT] Channel switched {session.channel} → {channel}, creating new session")
                 elif session.started_at:
                     started = session.started_at.replace(tzinfo=timezone.utc) if session.started_at.tzinfo is None else session.started_at
-                    if started.date() != now_utc.date():
-                        logger.info(f"[AGENT] Session {session_id} is from {started.date()}, creating new session for today")
+                    # PR-2 (A2-2): roll at the user's LOCAL midnight, in
+                    # step with DayChat — not UTC.
+                    if not same_local_day(started, now_utc, client_tz):
+                        logger.info(f"[AGENT] Session {session_id} is from {started.date()} (tz={client_tz or 'UTC'}), creating new session for today")
                     else:
                         return session, False
                 else:
@@ -2086,6 +2132,30 @@ class AgentRunner:
             _meta = json.dumps({"telegram_chat_id": telegram_chat_id})
         elif channel == "app" and app_id:
             _meta = json.dumps({"app_id": app_id})
+
+        # System-driven channels are governed by the partial unique index
+        # ix_conversations_system_channel_per_day (user_id, day_chat_id,
+        # channel) WHERE channel IN ('routine','trigger','api','digest').
+        # PR-2 fixed the client_tz NameError that had been writing
+        # day_chat_id=NULL on runner-created rows — but NULLs are distinct
+        # in a unique index, so that NULL was silently EVADING this index.
+        # With a real day_chat_id now stamped, a blind second insert for the
+        # same (user, day, channel) — e.g. a user's 2nd routine of the day —
+        # collides with an unhandled IntegrityError and the turn crashes.
+        # Route these channels through the canonical resolver, which reuses
+        # the day's existing thread and recovers from the insert race — the
+        # same helper routines/triggers message-writers already use, so the
+        # runner and the message-writer stop fighting over the row.
+        from app.agent.conversation_resolver import (
+            resolve_or_create_day_conversation as _resolve_day_conv,
+        )
+        _INDEXED_SYSTEM_CHANNELS = ("routine", "trigger", "api", "digest")
+        if _channel in _INDEXED_SYSTEM_CHANNELS and _day_chat_id is not None and not force_new:
+            conv = await _resolve_day_conv(
+                db, user_id=user_id, day_chat_id=_day_chat_id, channel=_channel,
+                metadata=json.loads(_meta) if _meta else None,
+            )
+            return conv, False
 
         session = Conversation(
             user_id=user_id,

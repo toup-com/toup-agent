@@ -1700,7 +1700,10 @@ async def ws_chat(
                 session_id = msg.get("session_id")
                 model = msg.get("model")
                 channel = msg.get("channel")  # e.g. "mobile", "web", "app"
-                client_tz = msg.get("tz")  # IANA timezone, e.g. "America/Toronto"
+                # IANA timezone, e.g. "America/Toronto". Web/mobile send "tz";
+                # the Chrome extension sidepanel sends "client_tz" (audit
+                # A2-7 — it silently fell back to DB User.timezone before).
+                client_tz = msg.get("tz") or msg.get("client_tz")
                 force_new_session = bool(msg.get("force_new"))  # Skip session reuse (New Thread in app workspace)
                 # system_action: true when a structured action (e.g. customize_app) triggers
                 # an agent turn without a real user message. Skip presave + user message save.
