@@ -45,6 +45,13 @@ from app.agent.query_intent import (
     classify_query_intent, filter_tools_by_intent, QueryIntent, INTENT_FULL,
     with_inbound_image,
 )
+from app.agent.prefix_stability import (
+    build_allowed_tools_choice,
+    build_turn_context_message,
+    render_time_lines,
+    strip_tools_for_channel,
+    tool_name as _tool_name,
+)
 from app.config import settings
 from app.services.openai_agent_service import OpenAIAgentService, StreamEvent
 from app.services.anthropic_service import AnthropicService
@@ -726,6 +733,12 @@ class AgentRunner:
                     )
                     _use_day_ctx = False
                     _day_context = None
+                    # PR-1 review #7/#9: the cache key scopes on _day_chat_id;
+                    # after a day-context load failure the content is
+                    # session-shaped, so the key must fall back to the
+                    # session too (the error log above already captured the
+                    # attempted id via locals()).
+                    _day_chat_id = None
                     history = await self._load_history(db, session_id, client_tz=client_tz)
                     logger.info(f"[PERF] load_history: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages (fallback)")
             else:
@@ -739,11 +752,19 @@ class AgentRunner:
                 logger.info("[AGENT] Overriding intent to FULL — app_builder context detected in history")
 
             t_prompt = time.perf_counter()
+            # PR-1 prefix-stable layout: volatile blocks (clock, user_brain,
+            # active_tasks, day summaries) collect here instead of mutating
+            # the system prompt; rendered as ONE per-turn <turn_context>
+            # message after history at message-prep below. Function-local —
+            # no shared runner state (this runner is a singleton).
+            _turn_context_parts: Dict[str, str] = {}
+            _stable_layout = bool(getattr(settings, "stable_prefix_layout", False))
             system_prompt = await self._build_system_prompt(
                 db, user_id, user_message,
                 channel=channel, intent=query_intent, client_tz=client_tz,
                 prompt_profile=prompt_profile,
                 subagent_task_label=subagent_task_label,
+                turn_context_out=_turn_context_parts if _stable_layout else None,
             )
 
             # Post-builder appended blocks (today_so_far / reply_to_directive /
@@ -760,7 +781,14 @@ class AgentRunner:
                 and _day_context.get("summary")
             ):
                 from app.agent.day_context_loader import build_today_so_far_block
-                system_prompt += build_today_so_far_block(_day_context["summary"])
+                _tsf_block = build_today_so_far_block(_day_context["summary"])
+                if _stable_layout:
+                    # PR-1: the rolling summary mutates whenever the
+                    # summarizer runs — appended to the system prompt it
+                    # invalidated the whole day-history cache behind it.
+                    _turn_context_parts["today_so_far"] = _tsf_block
+                else:
+                    system_prompt += _tsf_block
                 self._memory_health["today_summary_present"] = True
 
             # Reply-to directive: if the current user turn carries a <reply_to>
@@ -775,7 +803,7 @@ class AgentRunner:
                     r"<reply_to>.*?</reply_to>", _stripped_um, _re.DOTALL,
                 )
                 _reply_block = _block_match.group(0) if _block_match else ""
-                system_prompt += (
+                _rtd_block = (
                     "\n<reply_to_directive>\n"
                     "CRITICAL FOR THIS TURN ONLY:\n"
                     "The user's latest message begins with the following "
@@ -791,6 +819,11 @@ class AgentRunner:
                     "else.\n"
                     "</reply_to_directive>\n"
                 )
+                if _stable_layout:
+                    # PR-1: turn-specific by definition — never in the prefix.
+                    _turn_context_parts["reply_to_directive"] = _rtd_block
+                else:
+                    system_prompt += _rtd_block
 
             # F8: Inject <recent_days> recap on day-boundary warm starts.
             # Only fires when today's day-chat is fresh (no rolling summary
@@ -824,9 +857,16 @@ class AgentRunner:
                                 db, user_id, _today_dc.local_date,
                             )
                             if _recent:
-                                system_prompt += build_recent_days_block(
+                                _rd_block = build_recent_days_block(
                                     _recent, today_local_date=_today_dc.local_date,
                                 )
+                                if _stable_layout:
+                                    # PR-1: only present on fresh day-chats,
+                                    # then disappears — a system-prompt
+                                    # byte-flip mid-day. Deliver per turn.
+                                    _turn_context_parts["recent_days"] = _rd_block
+                                else:
+                                    system_prompt += _rd_block
                                 self._memory_health["recent_days"] = len(_recent)
                                 logger.info(
                                     "[AGENT] recent_days injected: %d day(s) "
@@ -917,6 +957,27 @@ class AgentRunner:
 
         # Prepare messages
         messages = list(history)
+        # PR-1 prefix-stable layout: ONE per-turn context message carrying
+        # everything volatile (clock, user_brain, active_tasks, day
+        # summaries, reply-to directive), placed after history and before
+        # the current user message. Its bytes differ every turn, but they
+        # now sit BEHIND the cacheable tools+system+history prefix instead
+        # of invalidating it. Never persisted (_save_messages stores only
+        # the user message + final reply), so it does not leak into the
+        # next turn's history.
+        _tc_tokens = 0
+        if _turn_context_parts:
+            _tc_order = (
+                "clock", "today_so_far", "recent_days", "user_brain",
+                "active_tasks", "reply_to_directive",
+            )
+            _tc_msg = build_turn_context_message(
+                [_turn_context_parts[k] for k in _tc_order if k in _turn_context_parts]
+                + [v for k, v in sorted(_turn_context_parts.items()) if k not in _tc_order]
+            )
+            if _tc_msg:
+                messages.append(_tc_msg)
+                _tc_tokens = estimate_tokens(_tc_msg["content"])
         if media_paths:
             content_blocks = self._build_media_content(user_message, media_paths)
             messages.append({"role": "user", "content": content_blocks})
@@ -936,9 +997,12 @@ class AgentRunner:
                         turn_id=None,  # Set after user message is saved
                         system_tokens=estimate_tokens(system_prompt),
                         summary_tokens=estimate_tokens(_day_context.get("summary") or ""),
-                        history_tokens=sum(estimate_tokens(m.get("content", "")) for m in messages),
+                        # PR-1: the <turn_context> message (memory, clock,
+                        # day blocks in the stable layout) is reported as
+                        # memory_tokens, not history (review #3).
+                        history_tokens=sum(estimate_tokens(m.get("content", "")) for m in messages) - _tc_tokens,
                         tool_tokens=0,  # Counted after tool loop
-                        memory_tokens=0,  # Already in system_tokens
+                        memory_tokens=_tc_tokens,  # legacy layout: 0 (memory lives in system_tokens)
                         total_tokens=estimate_tokens(system_prompt) + sum(estimate_tokens(m.get("content", "")) for m in messages),
                         model=settings.agent_model,
                         summary_was_stale=_day_context.get("summary_was_stale", False),
@@ -1035,21 +1099,18 @@ class AgentRunner:
         # isn't artificially constrained mid-conversation.
         all_tools = self.tool_defs
         filtered_tools = filter_tools_by_intent(all_tools, query_intent)
-        current_tools = filtered_tools
+        # Per-channel strips (vault card block, vibecoding app_builder strip,
+        # app-channel app_builder + core-mutator strip) — single shared
+        # implementation with the PR-1 stable path so the flag-on and
+        # flag-off wire arrays cannot silently drift (review #4).
+        current_tools = strip_tools_for_channel(
+            filtered_tools, channel,
+            strip_vault_tool_for_channel=strip_vault_tool_for_channel,
+        )
 
-        # Vault CP4.1: strip save_streaming_credential on channels that
-        # cannot render the confirmation card today (see module-level
-        # VAULT_TOOL_CHANNEL_BLOCK).
-        current_tools = strip_vault_tool_for_channel(current_tools, channel)
-
-        # In vibecoding mode, strip all app_builder tools — agent should code directly
         _vibe_job_id: Optional[str] = None
         _vibe_app_id: Optional[str] = None
         if channel == "vibecoding":
-            current_tools = [
-                t for t in current_tools
-                if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
-            ]
             logger.info(f"[VIBE] Stripped app_builder tools for vibecoding channel, {len(current_tools)} tools remaining")
 
             # Register vibecoding session in DB (App + BuildJob) for visibility
@@ -1072,21 +1133,57 @@ class AgentRunner:
             except Exception as e:
                 logger.warning(f"[VIBE] Failed to register vibecoding session: {e}")
 
-        # In app-channel mode, strip app_builder tools AND core mutation tools —
-        # customization must use app__write_file / app__edit_file so edits get logged
-        # via _record_layer2_change. Core write_file/edit_file/exec bypass the audit trail.
-        # Agent proved it uses exec with Python scripts as a workaround when write_file is stripped.
+        # App-channel strip rationale (now inside strip_tools_for_channel):
+        # customization must use app__write_file / app__edit_file so edits get
+        # logged via _record_layer2_change — core write_file/edit_file/exec
+        # bypass the audit trail, and the agent proved it uses exec with
+        # Python scripts as a workaround when write_file is stripped.
         if channel == "app":
-            current_tools = [
-                t for t in current_tools
-                if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
-                and (t.get("name", "") or t.get("function", {}).get("name", "") or "") not in ("write_file", "edit_file", "exec", "pty_exec", "apply_patch")
-            ]
             logger.info(f"[APP] Stripped app_builder + core mutation tools for app channel, {len(current_tools)} tools remaining")
 
         logger.info(
             f"[PERF] tool_filter: {len(all_tools)} total → {len(current_tools)} for intent={query_intent.category}"
         )
+
+        # ── Prefix-stable tools (PR-1, finding F-2) ────────────────────
+        # Tools serialize AHEAD of system+history in OpenAI's cached
+        # prefix, so the per-message intent filter above (and the mid-run
+        # escalation below) guaranteed a cache miss on every intent flip
+        # and every multi-tool turn. With the flag on, the wire array is
+        # the full channel-stripped set for the entire run and the intent
+        # decision becomes a tool_choice allowed_tools restriction —
+        # cache-safe because tool_choice is not part of the prompt prefix.
+        # OpenAI-only: Anthropic's tool_choice cannot express an allowlist,
+        # so a stable array there would silently drop intent gating (review
+        # #6); Claude models keep the legacy filtered array. (On Anthropic
+        # the tools tier re-caches on array change anyway — TKT-LAT-001.)
+        _stable_prefix = _stable_layout and not _is_claude_model(active_model)
+        _allowed_tool_names: Optional[List[str]] = None
+        if _stable_prefix:
+            _stable_tools = strip_tools_for_channel(
+                all_tools, channel,
+                strip_vault_tool_for_channel=strip_vault_tool_for_channel,
+            )
+            _stable_names = {_tool_name(t) for t in _stable_tools}
+            _gated_names = {_tool_name(t) for t in current_tools} & _stable_names
+            if not _gated_names and query_intent.category != "full":
+                # Edge (review #10): the gated set is empty (e.g. every
+                # always-included tool disabled) — legacy sent tools=None
+                # here. A stable-array override would expose the full
+                # toolset where none was intended; keep legacy for this
+                # run (rare, and a cache miss is the lesser evil).
+                _stable_prefix = False
+            else:
+                if _gated_names != _stable_names:
+                    _allowed_tool_names = sorted(_gated_names)
+                current_tools = _stable_tools
+                logger.info(
+                    "[PERF] stable_tools: wire=%d allowed=%s intent=%s",
+                    len(current_tools),
+                    len(_allowed_tool_names) if _allowed_tool_names else "all",
+                    query_intent.category,
+                )
+
         logger.info(f"[AGENT] Using {active_model} via {'Anthropic' if _is_claude_model(active_model) else 'OpenAI'} with {len(messages)} messages")
 
         text_buf = ""
@@ -1124,16 +1221,41 @@ class AgentRunner:
                     _t_first_token = None
 
                     # In vibecoding mode, force tool use on first iteration
-                    _tool_choice = "required" if (channel == "vibecoding" and iteration == 0 and current_tools) else None
+                    _tool_choice: Any = "required" if (channel == "vibecoding" and iteration == 0 and current_tools) else None
+                    # Prefix-stable path (PR-1): intent gating rides on
+                    # tool_choice instead of shrinking the tools array.
+                    # First iteration only — later iterations open the
+                    # full set, mirroring the legacy post-tool-use
+                    # escalation semantics without touching the array.
+                    # OpenAI-only shape; Anthropic keeps the legacy
+                    # str-or-None contract.
+                    if (
+                        _stable_prefix
+                        and iteration == 0
+                        and _allowed_tool_names
+                        and not _is_claude_model(active_model)
+                    ):
+                        _tool_choice = build_allowed_tools_choice(
+                            _allowed_tool_names,
+                            mode="required" if _tool_choice == "required" else "auto",
+                        )
 
-                    # TKT-LAT-018: stable per-session cache key. On the
-                    # OpenAI path this tells OpenAI's router to land
-                    # this user's requests on the replica that already
-                    # holds their prompt prefix in cache (lifts hit
-                    # rate under load). On the Anthropic path the
-                    # kwarg is accepted-and-ignored — cache_control
-                    # already wires the prompt cache via TKT-LAT-001.
-                    _cache_key = f"{user_id}:{session_id}" if user_id and session_id else None
+                    # TKT-LAT-018 → PR-1: prompt_cache_key is now keyed to
+                    # the Day-as-Chat day (user:day_chat_id) instead of the
+                    # per-channel Conversation, so web→Telegram→mobile
+                    # traffic inside one day routes to the same OpenAI
+                    # cache shard that already holds the shared day
+                    # prefix (finding F-4). Falls back to the session id
+                    # on the non-day-context path. The old per-session
+                    # value lives on as the billing idempotency key ONLY
+                    # (byte-identical metering semantics — see
+                    # openai_agent_service.report_llm_usage call).
+                    # On the Anthropic path both kwargs are
+                    # accepted-and-ignored — cache_control already wires
+                    # the prompt cache via TKT-LAT-001.
+                    _cache_scope = _day_chat_id or session_id
+                    _cache_key = f"{user_id}:{_cache_scope}" if user_id and _cache_scope else None
+                    _idem_key = f"{user_id}:{session_id}" if user_id and session_id else None
 
                     # Liveness: cover the dead-air from here to the first
                     # surfaced stream event (reasoning TTFT can be many
@@ -1153,6 +1275,8 @@ class AgentRunner:
                         thinking_budget=thinking_budget if _is_claude_model(active_model) else 0,
                         tool_choice=_tool_choice,
                         prompt_cache_key=_cache_key,
+                        safety_identifier=user_id or None,
+                        idempotency_key=_idem_key,
                     ):
                         if cancel_check and cancel_check():
                             logger.info("[AGENT] Cancelled during streaming")
@@ -1301,7 +1425,11 @@ class AgentRunner:
                                 stop_reason = ""
                                 # TKT-LAT-018: pass the same per-session
                                 # cache key on the failover provider too.
-                                _fb_cache_key = f"{user_id}:{session_id}" if user_id and session_id else None
+                                # Same day-scoped cache key + per-session
+                                # billing key as the primary call (PR-1).
+                                _fb_scope = _day_chat_id or session_id
+                                _fb_cache_key = f"{user_id}:{_fb_scope}" if user_id and _fb_scope else None
+                                _fb_idem_key = f"{user_id}:{session_id}" if user_id and session_id else None
                                 async for event in fallback_llm.create_message_stream(
                                     messages=messages,
                                     system=system_prompt,
@@ -1309,6 +1437,8 @@ class AgentRunner:
                                     model=fallback,
                                     thinking_budget=thinking_budget if _is_claude_model(fallback) else 0,
                                     prompt_cache_key=_fb_cache_key,
+                                    safety_identifier=user_id or None,
+                                    idempotency_key=_fb_idem_key,
                                 ):
                                     if cancel_check and cancel_check():
                                         raise asyncio.CancelledError("Cancelled")
@@ -1491,17 +1621,23 @@ class AgentRunner:
             messages.append({"role": "user", "content": tool_results})
 
             # After first tool use, escalate to full toolset for subsequent iterations
-            # so the agent isn't constrained if it discovers it needs more tools
-            if current_tools is not all_tools and query_intent.category != "full":
-                current_tools = all_tools
-                # Re-apply vibecoding filter after escalation
-                if channel == "vibecoding":
-                    current_tools = [
-                        t for t in current_tools
-                        if not (t.get("name", "") or t.get("function", {}).get("name", "") or "").startswith("app_builder__")
-                    ]
-                # Vault CP4.1: re-strip save_streaming_credential on blocked channels.
-                current_tools = strip_vault_tool_for_channel(current_tools, channel)
+            # so the agent isn't constrained if it discovers it needs more tools.
+            # Prefix-stable path (PR-1): the wire array is already the full
+            # channel-stripped set and only tool_choice was restricted (and
+            # tool_choice is None from iteration 1 on) — mutating the array
+            # here would re-introduce the guaranteed intra-turn cache miss
+            # this flag exists to remove (finding F-2), so skip.
+            if not _stable_prefix and current_tools is not all_tools and query_intent.category != "full":
+                # Re-apply ALL channel strips after escalation via the shared
+                # helper (review #4). This also closes a latent gap: the old
+                # inline re-strip covered vibecoding + vault but NOT the
+                # app-channel core-mutator strip, so post-tool-use escalation
+                # on channel="app" re-exposed write_file/exec and bypassed
+                # the _record_layer2_change audit trail.
+                current_tools = strip_tools_for_channel(
+                    all_tools, channel,
+                    strip_vault_tool_for_channel=strip_vault_tool_for_channel,
+                )
                 logger.info(f"[AGENT] Escalated to full toolset ({len(current_tools)} tools) after tool use")
 
             # ── Mid-loop context compaction ──────────────────────
@@ -1975,8 +2111,18 @@ class AgentRunner:
         client_tz: Optional[str] = None,
         prompt_profile: Optional["PromptProfile"] = None,
         subagent_task_label: Optional[str] = None,
+        turn_context_out: Optional[Dict[str, str]] = None,
     ) -> str:
         """Build a rich system prompt from identities + memories + runtime context.
+
+        Prefix-stable layout (PR-1, settings.stable_prefix_layout): when
+        ``turn_context_out`` is passed and the flag is on, the volatile
+        blocks (exact clock, retrieved user_brain memories, active tasks)
+        are written into that dict instead of the returned system prompt,
+        and run() renders them into a single per-turn <turn_context>
+        message after history — keeping the system prompt byte-stable
+        within a day so OpenAI's prefix cache can hit. Keys written:
+        "clock", "user_brain", "active_tasks" (only when non-empty).
 
         The `intent` parameter controls which sections are included:
         - Greetings/questions: skip memory retrieval, skills, environment, media
@@ -1999,6 +2145,28 @@ class AgentRunner:
 
         # Named section buckets — assembled in order at the end
         section_parts: Dict[str, str] = {}
+
+        # Prefix-stable layout (PR-1): volatile blocks leave the system
+        # prompt (→ turn_context_out) and intent-conditional sections are
+        # always included so consecutive turns produce byte-identical
+        # system prompts within a day. Only active when the caller passes
+        # the out-dict — profile paths that don't (none today) keep
+        # legacy behavior.
+        _stable = bool(
+            getattr(settings, "stable_prefix_layout", False)
+            and turn_context_out is not None
+        )
+        # Profile allow-list, resolved early: a section that the profile
+        # filter would DROP from the system prompt must never sneak into
+        # the turn-context message either (SUBAGENT deliberately gets no
+        # user_brain/active_tasks — that isolation must survive PR-1).
+        from app.agent.prompt_profile import (
+            sections_for as _sections_for,
+            PromptProfile as _PP,
+        )
+        _profile_sections = set(
+            _sections_for(prompt_profile if prompt_profile is not None else _PP.FULL)
+        )
 
         logger.info(f"[AGENT] Building system prompt for user: {user_id}")
 
@@ -2543,6 +2711,19 @@ class AgentRunner:
                 "text the user pasted or that arrived from other people.)\n",
                 1,
             )
+        # PR-1 (finding F-3): user_brain is per-query — different bytes on
+        # every message. In the stable layout it moves out of the system
+        # prompt (section position 8 of 22, ahead of the whole day history)
+        # into the per-turn <turn_context> message, so retrieval no longer
+        # invalidates the cached prefix.
+        if _stable and "user_brain" in section_parts:
+            if "user_brain" in _profile_sections:
+                turn_context_out["user_brain"] = section_parts.pop("user_brain")
+            else:
+                # Profile (e.g. SUBAGENT) forbids this section — the
+                # legacy path dropped it at the assembly filter; drop it
+                # here too rather than leaking it via turn context.
+                section_parts.pop("user_brain")
         logger.info(f"[PERF] memory_retrieval: {(time.perf_counter() - t_memory) * 1000:.0f}ms")
 
         # ── 3b. Active tasks — always built; injected if "active_tasks" is in SECTION_ORDER ──
@@ -2563,14 +2744,26 @@ class AgentRunner:
                 active_tasks = await get_active_tasks(db, user_id)
                 self._memory_health["active_tasks"] = len(active_tasks) if active_tasks else 0
                 if active_tasks:
-                    section_parts["active_tasks"] = build_active_tasks_block(active_tasks)
+                    _at_block = build_active_tasks_block(active_tasks)
+                    if _stable:
+                        # PR-1: varies with DB state — keep it out of the
+                        # cacheable system prefix, deliver per turn. Only
+                        # for profiles whose filter would have kept it.
+                        if "active_tasks" in _profile_sections:
+                            turn_context_out["active_tasks"] = _at_block
+                    else:
+                        section_parts["active_tasks"] = _at_block
                     logger.info(f"[AGENT] active_tasks built: {len(active_tasks)} task(s)")
             except Exception as _at_err:
                 self._memory_health["active_tasks"] = 0
                 logger.debug(f"[AGENT] Active tasks build skipped: {_at_err}")
 
         # ── 4. Skills (only if intent requires them) ─────────────
-        if self.skill_loader and intent.include_skill_prompts:
+        # PR-1 stable layout: intent-conditional sections appearing and
+        # disappearing between turns produce structurally different system
+        # prompts (finding A3-6), so with the flag on they are always
+        # included — the extra tokens are cached after the first turn.
+        if self.skill_loader and (intent.include_skill_prompts or _stable):
             skill_parts = self.skill_loader.get_all_system_prompt_sections()
             if skill_parts:
                 section_parts["skills"] = "\n\n".join(skill_parts)
@@ -2687,7 +2880,8 @@ class AgentRunner:
             logger.info(f"[PERF] skill_prompts: SKIPPED (intent={intent.category})")
 
         # ── 5. Environment & Capabilities (only if intent uses tools) ──
-        if not intent.include_environment:
+        # PR-1 stable layout: always included (see skills gate above).
+        if not (intent.include_environment or _stable):
             logger.info(f"[PERF] environment_section: SKIPPED (intent={intent.category})")
         else:
             section_parts["environment"] = (
@@ -2770,7 +2964,9 @@ class AgentRunner:
             )
 
         # ── 5b. Media Playback (web channel, only if intent includes media) ──
-        if channel in ("web", "app") and (intent.include_media_section or intent.category == "full"):
+        # PR-1 stable layout: channel-gated only — intent gating would flip
+        # the section between turns of the same (web/app) session.
+        if channel in ("web", "app") and (intent.include_media_section or intent.category == "full" or _stable):
             section_parts["media"] = (
                 "# Media Playback (IMPORTANT — read carefully)\n"
                 "You have a `play_media` tool that plays music and videos directly in the user's browser.\n"
@@ -2884,12 +3080,14 @@ class AgentRunner:
                 "- You don't know their name yet. If it comes up naturally, "
                 "ask once — don't interrogate them for it."
             )
-        _about_lines.append(
-            f"- Local time for them right now: **{_tod}** "
-            f"({now_local.strftime('%-I:%M %p')}). Let it inform tone subtly — "
-            "late at night, be quieter and lower-energy; morning, be fresh. "
-            "Don't announce the time of day; just feel it."
-        )
+        # PR-1 (finding F-1): the minute clock here sat at section 6 of 22
+        # and invalidated the cached prefix every minute. render_time_lines
+        # keeps only the coarse time-of-day word in the stable layout and
+        # routes the exact clock to the per-turn <turn_context> message.
+        _time_lines = render_time_lines(now_local, tz_name, _tod, stable=_stable)
+        _about_lines.append(_time_lines["about_you"])
+        if _stable and _time_lines["turn_context"]:
+            turn_context_out["clock"] = _time_lines["turn_context"]
         section_parts["about_you"] = "\n".join(_about_lines)
 
         # ── 6b. Founder recognition — only on the OWNER's own agent ────
@@ -2967,8 +3165,8 @@ class AgentRunner:
         # cleanly without the agent having to parse a date string.
         runtime_lines = [
             f"# Runtime Context",
-            f"- Current date/time: {now_local.strftime('%A, %B %d, %Y at %-I:%M %p')} "
-            f"({tz_name})",
+            # PR-1: date-only in stable layout (minute clock → turn_context)
+            _time_lines["runtime"],
             f"- Channel: {_channel_safe} — {_channel_guidance}",
             f"- Workspace directory: {settings.agent_workspace_dir}",
             f"- Max tool iterations: {self.max_iterations}",

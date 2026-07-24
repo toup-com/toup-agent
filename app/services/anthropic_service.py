@@ -53,11 +53,31 @@ def _mark_messages_cacheable(
     Cache control is incompatible with tool_result blocks containing only
     image content for some models, but for our agent loop the last message
     is always either user text or a tool_result with text — both supported.
+
+    PR-1 stable layout: the runner may append a per-turn ``<turn_context>``
+    message (volatile clock/memory/day blocks) between history and the
+    current user message. Its bytes differ every turn and it is never
+    persisted, so a breakpoint at the very end would cover a span that can
+    never re-match — every turn would re-WRITE the whole day history
+    (1.25x) and never read it back. Place the breakpoint on the last
+    message BEFORE the first trailing turn-context/user pair instead, so
+    the append-only history span stays cacheable and the volatile tail
+    sits after the breakpoint.
     """
     if not messages:
         return messages
     out = [dict(m) for m in messages]
-    last = dict(out[-1])
+    # Find a trailing <turn_context> message (at -1 or -2 — the runner puts
+    # it immediately before the current user message). Mark the message
+    # preceding it so the cached span ends at end-of-history.
+    mark_idx = len(out) - 1
+    for probe in (len(out) - 2, len(out) - 1):
+        if probe >= 1:
+            c = out[probe].get("content")
+            if isinstance(c, str) and c.startswith("<turn_context>"):
+                mark_idx = probe - 1
+                break
+    last = dict(out[mark_idx])
     content = last.get("content")
     if isinstance(content, str):
         if not content:
@@ -76,7 +96,7 @@ def _mark_messages_cacheable(
         last["content"] = new_blocks
     else:
         return out
-    out[-1] = last
+    out[mark_idx] = last
     return out
 
 
@@ -408,6 +428,8 @@ class AnthropicService:
         thinking_budget: int = 0,
         tool_choice: Optional[str] = None,
         prompt_cache_key: Optional[str] = None,  # noqa: ARG002 — TKT-LAT-018: accepted for cross-provider signature parity, unused on Anthropic (cache_control already wires the prompt cache)
+        safety_identifier: Optional[str] = None,  # noqa: ARG002 — PR-1 signature parity; OpenAI-only param
+        idempotency_key: Optional[str] = None,  # noqa: ARG002 — PR-1 signature parity; Anthropic metering is unchanged
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a message. Yields StreamEvent objects for text chunks,

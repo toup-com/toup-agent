@@ -14,7 +14,7 @@ alembic==1.13.1
 
 # Embeddings & NLP
 numpy==1.26.3
-openai>=1.68.0
+openai>=2.14.0  # PR-1: prompt_cache_key/safety_identifier/prompt_cache_retention + allowed_tools tool_choice all require 2.x (deployed images resolve 2.45.0)
 tiktoken>=0.5.0
 
 # Document Processing

@@ -207,6 +207,26 @@ class Settings(BaseSettings):
     # Day-as-Chat context architecture (feature flag)
     use_day_chat_context: bool = True  # Day-as-Chat: agent loads all sessions/channels for the day as context
 
+    # Prefix-stable prompt layout (token-efficiency PR-1; audit findings
+    # F-1/F-2/F-3 in docs/audits/2026-07-token-efficiency.md — measured 0%
+    # OpenAI prompt-cache hit rate in prod). When true:
+    #   - the wire tools array is fixed per run (channel strips only);
+    #     intent gating becomes a tool_choice allowed_tools restriction,
+    #     and the mid-run full-toolset escalation stops mutating the array
+    #   - the minute clock leaves the system prompt (date stays); the exact
+    #     clock, retrieved memories, active tasks, and day-summary blocks
+    #     render into ONE per-turn <turn_context> message appended after
+    #     history, behind the cacheable prefix
+    #   - OpenAI calls also send safety_identifier + prompt_cache_retention
+    # Default OFF: model-visible prompt layout change — flip after canary
+    # validation (STABLE_PREFIX_LAYOUT=true).
+    # Known residual (accepted): the coarse time-of-day word in about_you
+    # still flips ~4x/day (morning/afternoon/evening/late-night), so expect
+    # scheduled cache-hit dips near 05/12/17/22 local. OpenAI-only benefit:
+    # Claude models keep the legacy intent-filtered tools array (Anthropic
+    # tool_choice cannot express an allowlist).
+    stable_prefix_layout: bool = False
+
     # Document Generation + Web Attachments (Phase 1+2 of doc-delivery feature)
     # When false: generate_* tools are not registered, attachment WS events are not emitted.
     # Frontend has its own localStorage gate (TOUP_DOC_ATTACHMENTS) for the two-pane UI.

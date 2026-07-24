@@ -16,7 +16,7 @@ alembic==1.13.1
 aiosqlite==0.19.0
 
 # Embeddings (OpenAI only — no local models on platform)
-openai>=1.68.0
+openai>=2.14.0  # PR-1: keep in lockstep with requirements.txt (cache params need SDK 2.x)
 tiktoken>=0.5.0
 numpy==1.26.3
 

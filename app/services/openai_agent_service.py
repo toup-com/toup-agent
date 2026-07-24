@@ -94,8 +94,10 @@ class OpenAIAgentService:
         max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         thinking_budget: int = 0,
-        tool_choice: Optional[str] = None,
+        tool_choice: Optional[Any] = None,
         prompt_cache_key: Optional[str] = None,
+        safety_identifier: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a chat completion. Yields StreamEvent objects matching the
@@ -133,6 +135,17 @@ class OpenAIAgentService:
         # that already holds the session's prefix in its local cache.
         if prompt_cache_key:
             kwargs["prompt_cache_key"] = prompt_cache_key
+        # Token-efficiency PR-1 (flag-gated: new request params are a
+        # request-shape change; keep them off the legacy path).
+        # prompt_cache_retention="24h" keeps the day prefix warm across
+        # Day-as-Chat's natural gaps (default cache evicts after 5-10min
+        # idle); safety_identifier carries the per-user abuse-detection
+        # signal the deprecated `user` param used to (cache routing is
+        # prompt_cache_key's job).
+        if getattr(settings, "stable_prefix_layout", False):
+            kwargs["prompt_cache_retention"] = "24h"
+            if safety_identifier:
+                kwargs["safety_identifier"] = safety_identifier
 
         # Convert Anthropic-format tools to OpenAI format
         if tools:
@@ -260,7 +273,10 @@ class OpenAIAgentService:
                             provider="openai",
                             input_tokens=int(usage_data.get("input_tokens", 0) or 0),
                             output_tokens=int(usage_data.get("output_tokens", 0) or 0),
-                            idempotency_key=prompt_cache_key,
+                            # Billing dedupe key — kept per-session even now
+                            # that prompt_cache_key is day-stable (PR-1), so
+                            # metering semantics are byte-identical to before.
+                            idempotency_key=idempotency_key or prompt_cache_key,
                         )
                 except Exception:
                     logger.exception("[credits] openai stream report failed")
