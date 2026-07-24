@@ -1352,6 +1352,7 @@ class AgentRunner:
                         prompt_cache_key=_cache_key,
                         safety_identifier=user_id or None,
                         idempotency_key=_idem_key,
+                        stable_prefix_active=_stable_prefix,
                     ):
                         if cancel_check and cancel_check():
                             logger.info("[AGENT] Cancelled during streaming")
@@ -1572,6 +1573,7 @@ class AgentRunner:
                                     prompt_cache_key=_fb_cache_key,
                                     safety_identifier=user_id or None,
                                     idempotency_key=_fb_idem_key,
+                                    stable_prefix_active=_stable_prefix,
                                 ):
                                     if cancel_check and cancel_check():
                                         raise asyncio.CancelledError("Cancelled")

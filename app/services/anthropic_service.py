@@ -432,6 +432,7 @@ class AnthropicService:
         prompt_cache_key: Optional[str] = None,  # noqa: ARG002 — TKT-LAT-018: accepted for cross-provider signature parity, unused on Anthropic (cache_control already wires the prompt cache)
         safety_identifier: Optional[str] = None,  # noqa: ARG002 — PR-1 signature parity; OpenAI-only param
         idempotency_key: Optional[str] = None,  # noqa: ARG002 — PR-1 signature parity; Anthropic metering is unchanged
+        stable_prefix_active: bool = False,  # noqa: ARG002 — PR-1 signature parity; OpenAI-only (retention/safety_identifier)
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a message. Yields StreamEvent objects for text chunks,

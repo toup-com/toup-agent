@@ -323,3 +323,22 @@ class TestCanaryGate:
     def test_flag_off_default_in_settings(self):
         from app.config import Settings
         assert Settings.model_fields["stable_prefix_canary_user_ids"].default == ""
+
+
+class TestCanaryRetentionParity:
+    """The 24h retention + safety_identifier must gate on the EFFECTIVE
+    per-turn flag (so canary users get them too), not the global setting.
+    Measured 2026-07-24: retention="24h" turns an intermittent ~0.67
+    cached/prompt into a reliable 0.89 on prod."""
+
+    def test_service_gates_retention_on_effective_flag(self):
+        import inspect
+        from app.services.openai_agent_service import OpenAIAgentService
+        src = inspect.getsource(OpenAIAgentService.create_message_stream)
+        assert "if stable_prefix_active:" in src
+        assert 'kwargs["prompt_cache_retention"] = "24h"' in src
+        # must NOT re-read the global setting for this gate
+        assert 'getattr(settings, "stable_prefix_layout"' not in src
+
+    def test_runner_threads_effective_flag_to_both_calls(self):
+        assert _SRC.count("stable_prefix_active=_stable_prefix") >= 2  # primary + fallback

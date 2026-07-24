@@ -98,6 +98,7 @@ class OpenAIAgentService:
         prompt_cache_key: Optional[str] = None,
         safety_identifier: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        stable_prefix_active: bool = False,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a chat completion. Yields StreamEvent objects matching the
@@ -142,7 +143,14 @@ class OpenAIAgentService:
         # idle); safety_identifier carries the per-user abuse-detection
         # signal the deprecated `user` param used to (cache routing is
         # prompt_cache_key's job).
-        if getattr(settings, "stable_prefix_layout", False):
+        #
+        # Gated on the EFFECTIVE per-turn flag passed by agent_runner, NOT
+        # the global setting — otherwise a per-tenant CANARY (global flag
+        # off, user in stable_prefix_canary_user_ids) would get the stable
+        # layout but miss retention="24h", and measured out at ~0.67
+        # cached/prompt (intermittent replica routing) instead of the 0.89
+        # that retention makes reliable. Measured on prod, 2026-07-24.
+        if stable_prefix_active:
             kwargs["prompt_cache_retention"] = "24h"
             if safety_identifier:
                 kwargs["safety_identifier"] = safety_identifier
