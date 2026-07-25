@@ -77,10 +77,13 @@ def _friendly_error(exc: Exception) -> str:
 
     # ── OpenAI quota / billing exhausted (must check before generic 429) ──
     if any(kw in msg_lower for kw in ("insufficient_quota", "billing", "credit", "balance", "exceeded your current")) or ("quota" in msg_lower and "openai" in msg_lower):
+        # Toup credits, NOT the user's OpenAI account. The old copy sent users
+        # to platform.openai.com — wrong (it is the platform's own billing) and
+        # an App Review 3.1.1 anti-steering hit on iOS, where the only
+        # legitimate purchase surface is the in-app Credits screen.
         return (
-            "Your API credit limit has been reached. To continue:\n"
-            "• Add more credits at platform.openai.com/account/billing\n"
-            "• Or add a different API key in Settings"
+            "You're out of Toup credits. Open Credits to top up or upgrade "
+            "your plan and keep going."
         )
 
     # ── Rate limit (temporary, not billing) ──

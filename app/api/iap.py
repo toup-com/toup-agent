@@ -167,7 +167,10 @@ async def apple_subscribe_verify(
         )
         raise HTTPException(409, detail={
             "code": "subscription_exists_other_platform",
-            "message": "You already have a subscription via the web. Manage it at toup.ai/account.",
+            # No external management URL: this string is rendered by the iOS
+            # client, where linking users out to manage billing on the web is
+            # App Review 3.1.1 anti-steering.
+            "message": "You already have an active subscription on another platform.",
         })
 
     try:

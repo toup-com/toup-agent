@@ -1880,8 +1880,14 @@ async def realtime_voice_ws(
             "message": f"Failed to connect to OpenAI Realtime API: {e}",
         }
         if is_billing:
+            # Platform-side capacity/credit problem. NEVER surface the
+            # platform's own OpenAI billing page to a user — it is not their
+            # account, and on iOS an external purchase link is a 3.1.1 hit.
             error_payload["billing"] = True
-            error_payload["billing_url"] = "https://platform.openai.com/settings/organization/billing/overview"
+            error_payload["message"] = (
+                "Voice is temporarily unavailable while we top up capacity. "
+                "Please try again shortly."
+            )
         await websocket.send_json(error_payload)
         await websocket.close(code=4502)
         return
@@ -2497,11 +2503,15 @@ async def realtime_voice_ws(
                     )
 
                     if is_billing:
+                        # See above: the platform's OpenAI billing page is not
+                        # the user's to visit, and must never be linked.
                         await websocket.send_json({
                             "type": "error",
-                            "message": error_msg,
+                            "message": (
+                                "Voice is temporarily unavailable while we top "
+                                "up capacity. Please try again shortly."
+                            ),
                             "billing": True,
-                            "billing_url": "https://platform.openai.com/settings/organization/billing/overview",
                         })
                     else:
                         await websocket.send_json({
@@ -2523,7 +2533,10 @@ async def realtime_voice_ws(
             }
             if is_billing or e.code in (4002, 4003):
                 error_payload["billing"] = True
-                error_payload["billing_url"] = "https://platform.openai.com/settings/organization/billing/overview"
+                error_payload["message"] = (
+                    "Voice is temporarily unavailable while we top up "
+                    "capacity. Please try again shortly."
+                )
             try:
                 await websocket.send_json(error_payload)
             except Exception:
