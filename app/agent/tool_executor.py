@@ -4914,12 +4914,20 @@ class ToolExecutor:
         # the push lane (same contract as spawned jobs — the LA lane is
         # keyed on data.mission_id). Step counts give REAL discrete
         # progress here, updated by _tool_update_job.
+        import time as _t_cj
         from app.agent.subagent_orchestrator import _notify_job_event
         await _notify_job_event(
             job_id=job_id, label=title, kind="mission_started",
             title=f"🛠 Working on: {title[:150]}",
             body=(description or "")[:200],
-            progress=0,
+            # Indeterminate timer, NOT progress=0. `_content_state` picks timer
+            # over progress, so a bare 0 shipped a card reading a frozen "0%"
+            # for the whole turn — it looked broken and stayed that way until
+            # the first update_job. The countdown animates on-device with zero
+            # pushes and the first real update swaps in a discrete bar; same
+            # honest surface spawned sub-agents already use. Window matches the
+            # job_reaper's 30-minute stall cutoff.
+            timer_end_ms=int((_t_cj.time() + 1800) * 1000),
             dedup_suffix="started",
         )
 

@@ -2053,6 +2053,65 @@ class AgentRunner:
                 if hasattr(self.tools, 'set_session_workspace'):
                     self.tools.set_session_workspace(None)
 
+        # A job made by the `create_job` TOOL is advanced only by the model
+        # calling `update_job`. When a turn ends with one still 'running',
+        # nothing owns it: the phone's Live Activity stays frozen on its last
+        # push — "Starting…" at 0% when the model never updated it — until the
+        # 30-minute job_reaper closes it with a false "⚠️ Didn't finish" alert,
+        # for work the agent already delivered in its reply. ws_chat's
+        # finalizer only covers the regex-intake job (source_kind
+        # 'chat_intent'), and the voice path (/api/v1/internal/agent-turn) has
+        # no finalizer at all — so this belongs in the runner, the one seam
+        # every channel shares. Scoped by conversation_id so a dashboard job
+        # (also source_kind 'manual') is never touched; a job created without a
+        # session id keeps falling through to the reaper rather than risking a
+        # too-broad close.
+        if session_id and any(tc.get("name") == "create_job" for tc in all_tool_calls):
+            try:
+                from sqlalchemy import select as _sel_cj
+                from app.db.models import BuildJob as _CJ
+
+                _answered = bool((final_text or "").strip())
+                _closed: List[tuple] = []
+                async with async_session_maker() as _cdb:
+                    _rows = (await _cdb.execute(
+                        _sel_cj(_CJ).where(
+                            _CJ.user_id == user_id,
+                            _CJ.job_type == "agent_task",
+                            _CJ.source_kind == "manual",
+                            _CJ.status == "running",
+                            _CJ.conversation_id == session_id,
+                        )
+                    )).scalars().all()
+                    for _j in _rows:
+                        _j.status = "completed" if _answered else "failed"
+                        _j.completed_at = datetime.utcnow()
+                        if not _answered:
+                            _j.error_message = "The turn ended without a reply."
+                        _closed.append((_j.id, _j.title or ""))
+                    if _closed:
+                        await _cdb.commit()
+
+                if _closed:
+                    from app.agent.subagent_orchestrator import _notify_job_event
+                    for _jid, _jtitle in _closed:
+                        if _answered:
+                            await _notify_job_event(
+                                job_id=_jid, label=_jtitle, kind="mission_completed",
+                                title=f"✅ Done: {(_jtitle or 'background task')[:150]}",
+                                body="Finished.", progress=100,
+                                dismiss_after_s=900, dedup_suffix="completed",
+                            )
+                        else:
+                            await _notify_job_event(
+                                job_id=_jid, label=_jtitle, kind="mission_failed",
+                                title=f"⚠️ Didn't finish: {(_jtitle or 'background task')[:150]}",
+                                body="The turn ended without a reply.",
+                                dedup_suffix="failed",
+                            )
+            except Exception as _e:  # a turn must never fail on job plumbing
+                logger.warning("[AGENT] create_job turn-end finalize failed: %s", _e)
+
         return AgentResponse(
             text=final_text,
             session_id=session_id,
