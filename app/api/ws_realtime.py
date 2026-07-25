@@ -722,6 +722,194 @@ async def _vps_api(
     return None
 
 
+# ── Inner-tool relay (voice think) ────────────────────────────────────
+# `think` hands the turn to the user's OWN agent, which runs the real tools
+# (web search, browse, files, connectors). Those inner calls used to be
+# invisible: the blocking endpoint returned only a COUNT, so voice could never
+# show which tool ran, what it searched for, or where the answer came from.
+# This relays the agent's live SSE frames onto the phone wire.
+_INNER_MAX_ROWS    = 24
+_INNER_DETAIL_MAX  = 200
+_INNER_SOURCES_MAX = 5
+_INNER_PREVIEW_MAX = 240
+_INNER_FRAME_BYTES = 2048
+
+# agent_url → monotonic ts of the last 404/405 on the streaming route. An agent
+# image that predates the route is re-probed after the TTL, so a fleet roll
+# heals itself without a platform-api deploy.
+_stream_skew: dict = {}
+_STREAM_SKEW_TTL = 600.0
+_STREAM_IDLE_S   = 30.0     # per-chunk read timeout — NOT the turn budget
+
+
+def _stream_ok(agent_url: str) -> bool:
+    ts = _stream_skew.get(agent_url)
+    return ts is None or (time.monotonic() - ts) > _STREAM_SKEW_TTL
+
+
+class _InnerToolRelay:
+    """Maps agent-side SSE frames onto the ALREADY-SHIPPED phone wire.
+
+    Re-applies every cap: the relay does not trust the agent's caps, so a newer
+    agent talking to an older platform can never flood the audio WS.
+    """
+
+    def __init__(self, websocket, outer_call_id: str):
+        self._ws = websocket
+        self._outer = outer_call_id
+        self._open: dict = {}        # inner call_id → row call_id
+        self._rows = 0
+        self.alive = True
+
+    def _cid(self, inner: str) -> str:
+        # Namespaced so inner ids can never collide with OpenAI's outer ids.
+        return f"{self._outer}:{inner}"[:128]
+
+    async def _send(self, frame: dict) -> bool:
+        if not self.alive:
+            return False
+        try:
+            if len(json.dumps(frame)) > _INNER_FRAME_BYTES:
+                frame.pop("sources", None)
+                frame["result_preview"] = str(frame.get("result_preview", ""))[:200]
+            await self._ws.send_json(frame)
+            return True
+        except Exception:
+            self.alive = False       # phone gone — stop emitting, keep draining
+            return False
+
+    async def on_event(self, ev: dict) -> bool:
+        t = ev.get("type")
+        if t == "tool.intent":
+            # Legacy coarse flag only — keeps the orb docked, opens no row.
+            return await self._send({"type": "state", "state": "tool_use"})
+        if t == "tool.start":
+            if self._rows >= _INNER_MAX_ROWS:
+                return True
+            inner = str(ev.get("call_id", ""))
+            name = str(ev.get("name", ""))[:64]
+            args = ev.get("args") if isinstance(ev.get("args"), dict) else {}
+            title, detail = _tool_activity(name, args)
+            self._rows += 1
+            self._open[inner] = self._cid(inner)
+            return await self._send({
+                "type": "tool_call.started",
+                "call_id": self._cid(inner),
+                "parent_call_id": self._outer,
+                "name": name, "title": title,
+                "detail": str(detail)[:_INNER_DETAIL_MAX],
+            })
+        if t == "tool.end":
+            inner = str(ev.get("call_id", ""))
+            cid = self._open.pop(inner, None)
+            if cid is None:
+                return True          # start was capped/dropped — never orphan a completion
+            srcs = [s for s in (ev.get("sources") or []) if isinstance(s, dict)][:_INNER_SOURCES_MAX]
+            preview = str(ev.get("preview") or "")[:_INNER_PREVIEW_MAX]
+            if not preview and srcs:
+                doms = [str(s.get("domain") or "") for s in srcs if s.get("domain")]
+                if doms:
+                    preview = f"{len(srcs)} sources · " + " · ".join(doms[:3])
+            return await self._send({
+                "type": "tool_call.completed",
+                "call_id": cid, "parent_call_id": self._outer,
+                "name": str(ev.get("name", ""))[:64],
+                "ok": bool(ev.get("ok", True)),
+                "result_preview": preview,
+                "sources": srcs,
+                "elapsed_ms": int(ev.get("elapsed_ms") or 0),
+            })
+        if t == "status" and ev.get("stage") == "thinking":
+            # Deliberately NOT {"type":"state","state":"thinking"} — the shipped
+            # app clears usingTool on that, which would UN-DOCK the orb on every
+            # post-tool iteration. A new type is inert on old builds.
+            return await self._send({"type": "tool_call.progress",
+                                     "call_id": self._outer, "stage": "thinking"})
+        return True
+
+    async def close_open(self) -> None:
+        """Fail every still-running row so the phone never leaves a spinner."""
+        for cid in list(self._open.values()):
+            await self._send({"type": "tool_call.completed", "call_id": cid,
+                              "parent_call_id": self._outer, "name": "",
+                              "ok": False, "result_preview": ""})
+        self._open.clear()
+
+
+async def _vps_api_stream(agent_url: str, agent_api_key: str, path: str,
+                          json_body: dict, relay: "_InnerToolRelay") -> tuple:
+    """SSE sibling of _vps_api. NEVER raises.
+
+    Returns (outcome, payload, frames_seen):
+      ("stream", done_dict, n) — streamed and terminated with `done`
+      ("json",   body_dict, 0) — agent answered with plain JSON (unexpected but fine)
+      ("skew",   None,      0) — 404/405: agent build predates the route
+      ("fail",   None,      n) — anything else. n>0 means the turn ALREADY RAN
+                                 on the agent; the caller MUST NOT re-issue it.
+
+    Timeout semantics: with stream=True httpx's `read` timeout is a PER-CHUNK
+    idle timeout, so it cannot bound the turn — an agent heart-beating every
+    10 s would hold the voice floor forever. The caller wraps this in
+    asyncio.wait_for(voice_realtime_think_timeout_s), preserving the exact
+    ceiling the buffered POST had.
+    """
+    from app.services.agent_http import get_agent_http_client
+    client = get_agent_http_client()
+    resp = None
+    frames = 0
+    try:
+        req = client.build_request(
+            "POST", f"{agent_url}{path}",
+            headers={"X-Agent-Key": agent_api_key, "Accept": "text/event-stream"},
+            json=json_body,
+            timeout=httpx.Timeout(connect=5.0, read=_STREAM_IDLE_S, write=5.0, pool=5.0),
+        )
+        resp = await client.send(req, stream=True)
+        if resp.status_code in (404, 405):
+            await resp.aread()
+            return ("skew", None, 0)
+        if resp.status_code != 200:
+            await resp.aread()
+            logger.warning("[REALTIME] think stream → %s", resp.status_code)
+            return ("fail", None, 0)
+        if not resp.headers.get("content-type", "").startswith("text/event-stream"):
+            body = await resp.aread()
+            try:
+                return ("json", json.loads(body), 0)
+            except Exception:
+                return ("fail", None, 0)
+        async for line in resp.aiter_lines():
+            if not line or line[0] == ":" or not line.startswith("data:"):
+                continue                       # heartbeats / blank separators
+            try:
+                ev = json.loads(line[5:].strip())
+            except Exception:
+                continue
+            frames += 1
+            etype = ev.get("type")
+            if etype == "done":
+                return ("stream", ev, frames)
+            if etype == "error":
+                logger.warning("[REALTIME] think stream error frame: %s", ev.get("code"))
+                return ("fail", None, frames)
+            if relay is not None and relay.alive:
+                await relay.on_event(ev)
+        return ("fail", None, frames)          # stream ended with no terminal frame
+    except Exception as e:
+        logger.warning("[REALTIME] think stream failed: %s", e)
+        return ("fail", None, frames)
+    finally:
+        if resp is not None:
+            # MANDATORY. The shared client is a singleton with a bounded pool;
+            # a stream=True response not closed here permanently burns a slot,
+            # and enough leaks wedge ALL platform→agent HTTP (identity,
+            # memories, day-chats).
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+
+
 async def _ensure_vps_user(user_id: str):
     """Ensure the platform user exists in VPS users table (FK constraints).
 
@@ -931,7 +1119,8 @@ async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: 
 
 
 # ── Deep Think — Claude Opus reasoning for complex voice tasks ────────
-async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
+async def _think(user_id: str, task: str, session_id: Optional[str],
+                 relay: Optional["_InnerToolRelay"] = None) -> tuple:
     """
     Route reasoning to the best model using the model router.
 
@@ -990,22 +1179,54 @@ async def _think(user_id: str, task: str, session_id: Optional[str]) -> tuple:
         vps = await _get_vps_info(user_id)
         if vps:
             agent_url, agent_api_key = vps
+            _body = {
+                "message": task,
+                "session_id": session_id,   # context (history) only
+                "model": model_override,
+                # Don't persist here — the voice handler already saves the
+                # spoken user/assistant turn (avoids a duplicate day-chat
+                # entry). Requires the agent image that exposes this
+                # endpoint; enable VOICE_REALTIME_V2 for an account only
+                # after its agent has that build (see deploy notes).
+                "save": False,
+            }
+            data = None
+            _no_retry = False
             try:
-                data = await _vps_api(
-                    agent_url, agent_api_key, "POST", "/api/v1/internal/agent-turn",
-                    json_body={
-                        "message": task,
-                        "session_id": session_id,   # context (history) only
-                        "model": model_override,
-                        # Don't persist here — the voice handler already saves the
-                        # spoken user/assistant turn (avoids a duplicate day-chat
-                        # entry). Requires the agent image that exposes this
-                        # endpoint; enable VOICE_REALTIME_V2 for an account only
-                        # after its agent has that build (see deploy notes).
-                        "save": False,
-                    },
-                    timeout=settings.voice_realtime_think_timeout_s,
-                )
+                # Preferred path: stream, so the phone sees each inner tool —
+                # its name, its query, its sources — WHILE the turn runs.
+                if (settings.voice_realtime_tool_events
+                        and relay is not None and _stream_ok(agent_url)):
+                    try:
+                        outcome, payload, frames = await asyncio.wait_for(
+                            _vps_api_stream(
+                                agent_url, agent_api_key,
+                                "/api/v1/internal/agent-turn/stream", _body, relay),
+                            timeout=settings.voice_realtime_think_timeout_s,
+                        )
+                    except asyncio.TimeoutError:
+                        outcome, payload, frames = "fail", None, 1
+                        logger.warning("[REALTIME] think stream exceeded %.0fs budget",
+                                       settings.voice_realtime_think_timeout_s)
+                    if outcome == "skew":
+                        _stream_skew[agent_url] = time.monotonic()
+                        logger.info("[REALTIME] agent predates think-stream route: %s", agent_url)
+                    elif outcome in ("stream", "json") and payload and payload.get("text"):
+                        data = payload
+                    elif frames > 0:
+                        # The turn ALREADY RAN on the agent. Re-issuing the
+                        # blocking POST would double-charge credits and re-fire
+                        # any mutating connector. Drop straight to Option B
+                        # (tool-less, side-effect-free) instead.
+                        _no_retry = True
+                    await relay.close_open()
+
+                if data is None and not _no_retry:
+                    data = await _vps_api(
+                        agent_url, agent_api_key, "POST", "/api/v1/internal/agent-turn",
+                        json_body=_body,
+                        timeout=settings.voice_realtime_think_timeout_s,
+                    )
                 if data and data.get("text"):
                     logger.info(
                         "[REALTIME] think via agent full-turn: %d chars, model=%s, tool_calls=%s",
@@ -2168,7 +2389,9 @@ async def realtime_voice_ws(
                         # ── Think: delegate reasoning to best model ──
                         elif func_name == "think":
                             task = arguments.get("task", "")
-                            result, turn_model_used = await _think(user_id, task, db_session_id)
+                            _relay = _InnerToolRelay(websocket, call_id)
+                            result, turn_model_used = await _think(
+                                user_id, task, db_session_id, relay=_relay)
                             turn_model = turn_model_used
 
                         # ── Onboarding: set UI phase ──

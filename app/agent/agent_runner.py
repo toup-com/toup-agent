@@ -213,6 +213,19 @@ OnUsage = Callable[[str, int, int], Coroutine[Any, Any, None]]
 # show a live indicator through reasoning TTFT and post-tool
 # iterations — the two dead-air windows where zero frames flow.
 OnStatus = Callable[[str], Coroutine[Any, Any, None]]
+# Structured per-tool-call lifecycle. Additive and OPTIONAL — nothing else in
+# the tree passes it, so ws_chat.py and every other channel are unchanged.
+# It exists because neither existing callback can carry what a LIVE tool UI
+# needs: on_tool_start has no call id and no arguments (it fires at the LLM's
+# tool_use_start, before the arguments have finished streaming), and
+# on_tool_end's `summary` is result[:200] — which for every external-content
+# tool is 100% injection-fence envelope. We pass the FULL result here and let
+# the consumer project it, rather than widening the shared 200-char cap.
+# Payloads:
+#   {"phase":"start","call_id":str,"name":str,"input":dict,"started_ms":int}
+#   {"phase":"end","call_id":str,"name":str,"input":dict,"result":str,
+#    "started_ms":int,"completed_ms":int,"elapsed_ms":int}
+OnToolEvent = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 def _credits_for_llm_call(model: str, tokens_in: int, tokens_out: int) -> float:
@@ -471,6 +484,7 @@ class AgentRunner:
         on_credit_exhausted: Optional[OnCreditExhausted] = None,
         on_usage: Optional[OnUsage] = None,
         on_status: Optional[OnStatus] = None,
+        on_tool_event: Optional[OnToolEvent] = None,
         media_paths: Optional[List[str]] = None,
         inbound_attachments: Optional[List[Dict[str, Any]]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
@@ -563,6 +577,18 @@ class AgentRunner:
         # attachment WS events with a stable message_id before the message
         # is persisted. Used at line ~1649 when creating the assistant Message.
         asst_message_id = str(uuid.uuid4())
+
+        async def _emit_tool_event(payload: Dict[str, Any]) -> None:
+            # Non-fatal sink: a consumer that is slow, gone, or broken must
+            # never kill a turn (same convention as the on_attachment /
+            # on_tool_end sinks below).
+            if not on_tool_event:
+                return
+            try:
+                await on_tool_event(payload)
+            except Exception:  # noqa: BLE001
+                logger.debug("[AGENT] on_tool_event sink failed", exc_info=True)
+
         # Reset pending attachments — belongs to this run only.
         self.tools.pending_attachments = []
         _attachments_emitted_count = 0
@@ -1682,7 +1708,8 @@ class AgentRunner:
             _parallel_results: Dict[str, Dict[str, Any]] = {}
             if len(_parallel_tcs) > 1:
                 _parallel_results = await self._execute_tools_parallel(
-                    _parallel_tcs, settings.agent_parallel_tool_cap
+                    _parallel_tcs, settings.agent_parallel_tool_cap,
+                    on_tool_event=_emit_tool_event if on_tool_event else None,
                 )
             for tc in pending_tool_calls:
                 if cancel_check and cancel_check():
@@ -1709,6 +1736,10 @@ class AgentRunner:
                     _elapsed_ms = _pre["completed_ms"] - _pre["started_ms"]
                     _completed_at_ms = _pre["completed_ms"]
                 else:
+                    await _emit_tool_event({
+                        "phase": "start", "call_id": tc["id"], "name": tc["name"],
+                        "input": tc.get("input") or {}, "started_ms": _t_tool_started_ms,
+                    })
                     try:
                         result = await self.tools.execute(tc["name"], tc["input"])
                     except Exception as e:
@@ -1735,6 +1766,16 @@ class AgentRunner:
                 if on_tool_end:
                     summary = result[:200] + "..." if len(result) > 200 else result
                     await on_tool_end(tc["name"], summary, tc.get("input"))
+                if _pre is None:
+                    # Parallel-safe calls already emitted their own start/end
+                    # pair from _one() with true concurrent timings.
+                    await _emit_tool_event({
+                        "phase": "end", "call_id": tc["id"], "name": tc["name"],
+                        "input": tc.get("input") or {}, "result": result,
+                        "started_ms": _t_tool_started_ms,
+                        "completed_ms": _completed_at_ms,
+                        "elapsed_ms": int(_elapsed_ms),
+                    })
 
                 # Drain newly-registered attachments (from generate_* tools) and
                 # emit them over the WS. We emit per-attachment so the frontend
@@ -2032,6 +2073,7 @@ class AgentRunner:
         self,
         tcs: List[Dict[str, Any]],
         cap: int,
+        on_tool_event: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Execute idempotent read-only tool calls concurrently, bounded by a
         semaphore of size ``cap``.
@@ -2048,11 +2090,31 @@ class AgentRunner:
         async def _one(tc: Dict[str, Any]) -> Dict[str, Any]:
             async with sem:
                 started_ms = int(time.time() * 1000)
+                # Emit from HERE, not from the sequential loop below: these
+                # calls run concurrently and BEFORE that loop, so emitting
+                # there would report three searches starting and finishing
+                # instantly, in sequence, after they had all already run — a
+                # lie with wrong durations. This also fires before the
+                # aggregate re-trim, so a multi-search turn keeps its tail
+                # sources instead of silently losing them.
+                if on_tool_event:
+                    await on_tool_event({
+                        "phase": "start", "call_id": tc["id"], "name": tc["name"],
+                        "input": tc.get("input") or {}, "started_ms": started_ms,
+                    })
                 try:
                     result = await self.tools.execute(tc["name"], tc["input"])
                 except Exception as e:
                     logger.exception(f"[AGENT] Tool {tc['name']} crashed (parallel)")
                     result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
+                _done_ms = int(time.time() * 1000)
+                if on_tool_event:
+                    await on_tool_event({
+                        "phase": "end", "call_id": tc["id"], "name": tc["name"],
+                        "input": tc.get("input") or {}, "result": result,
+                        "started_ms": started_ms, "completed_ms": _done_ms,
+                        "elapsed_ms": _done_ms - started_ms,
+                    })
                 return {
                     "result": result,
                     "started_ms": started_ms,

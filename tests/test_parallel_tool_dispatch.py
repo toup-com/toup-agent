@@ -15,6 +15,7 @@ to lock the loop-integration invariants without booting the runtime.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -139,7 +140,12 @@ def test_loop_consumes_precomputed_parallel_results():
 
 
 def test_helper_uses_gather_and_bounded_semaphore():
+    # Bound the slice by the NEXT method rather than a fixed character count:
+    # the old `idx + 1500` window broke the moment the helper grew (adding the
+    # voice tool-event emissions pushed `asyncio.gather(` to offset ~2700),
+    # failing on a change that preserved the very invariant being asserted.
     idx = _SRC.index("async def _execute_tools_parallel(")
-    body = _SRC[idx: idx + 1500]
+    nxt = re.search(r"\n    (?:async )?def ", _SRC[idx + 10:])
+    body = _SRC[idx: idx + 10 + nxt.start()] if nxt else _SRC[idx:]
     assert "asyncio.gather(" in body
     assert "asyncio.Semaphore(" in body

@@ -321,6 +321,14 @@ class Settings(BaseSettings):
     # timeout, so give it a generous ceiling. The realtime session has no turn
     # watchdog once past connect, and the model verbally holds the floor.
     voice_realtime_think_timeout_s: float = 60.0
+    # Relay the hosted agent's INNER tool activity (which tool, the exact
+    # query, the sources) to the phone during a voice `think`. Ships DARK:
+    # it requires an agent image exposing /api/v1/internal/agent-turn/stream.
+    # Off — or agent 404 — falls back to the blocking POST, i.e. today's exact
+    # behavior. Nested inside _v2_active(), so v1 accounts are unaffected
+    # regardless. Platform-api only; the agent side needs no flag, because
+    # route existence IS the flag.
+    voice_realtime_tool_events: bool = False
     # TKT-LAT-015: pin Haiku for the Toup-Code supervisor loop. The
     # supervisor only makes routing decisions (click/type/scroll/done) in
     # ≤800 tokens — Opus/GPT-5.5 is overkill and burns ~$0.20–$1 per

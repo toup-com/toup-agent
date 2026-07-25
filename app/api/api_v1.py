@@ -22,14 +22,17 @@ Rate limiting:
   Tracked in-memory with sliding window.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -317,6 +320,314 @@ async def internal_agent_turn(req: ChatRequest, request: Request):
     except Exception as e:
         logger.exception(f"Internal agent-turn error for user {user_id}")
         raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
+
+
+# ── Voice inner-tool stream ───────────────────────────────────────────
+# Live visibility for the realtime-voice `think` path: which tool is running,
+# the exact query, and the sources the answer is grounded in — emitted WHILE
+# the turn runs instead of being discarded (the blocking sibling above returns
+# only len(tool_calls), an integer).
+#
+# Caps live here AND again in the relay (ws_realtime.py); neither side trusts
+# the other's caps, so version skew in either direction can never flood the
+# phone's audio socket.
+_VS_QUEUE_MAX       = 512     # frames buffered between runner and generator
+_VS_MAX_EVENTS      = 120     # tool.*/status frames per turn; `done` is exempt
+_VS_HEARTBEAT_S     = 10.0
+_VS_FRAME_BYTES_MAX = 4096
+_VS_SRC_MAX         = 6
+_VS_SRC_TITLE_MAX   = 120
+_VS_SRC_URL_MAX     = 300
+_VS_SRC_DOMAIN_MAX  = 64
+_VS_ARG_VALUE_MAX   = 200
+_VS_ARGS_BYTES_MAX  = 512
+_VS_PREVIEW_MAX     = 240
+
+# ALLOW-LIST, not a deny-list. A tool absent from this map ships with args={},
+# which makes exec(command=…), write_file(content=…) and every connector body
+# structurally unreachable rather than merely filtered.
+_VS_ARG_ALLOW: Dict[str, tuple] = {
+    "web_search":         ("query",),
+    "extension_search":   ("query",),
+    "extension_research": ("query",),
+    "web_fetch":          ("url",),
+    "extension_read":     ("url",),
+    "browser":            ("url", "query"),
+    "memory_search":      ("query",),
+    "recall_day":         ("date",),
+}
+_VS_PREVIEW_ALLOW     = {"web_fetch", "extension_read"}
+_VS_SOURCE_LIST_TOOLS = {"web_search", "extension_search", "extension_research"}
+_VS_SOURCE_ONE_TOOLS  = {"web_fetch", "extension_read", "browser"}
+
+_VS_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_VS_NUM_RE  = re.compile(r"^\s*\d+\.\s+(.*\S)\s*$")
+_VS_URL_RE  = re.compile(r"^\s+(https?://\S+)\s*$")
+
+
+def _vs_defence(s: str) -> str:
+    """Strip the injection-fence envelope wrapped around every
+    external-content tool result. Without this, `ok` is ALWAYS True (the
+    string starts with '<external_content') and any preview is pure
+    boilerplate rather than content."""
+    if not s or not s.startswith("<external_content"):
+        return s or ""
+    i = s.find("\n---\n")
+    j = s.rfind("\n---\n")
+    return s[i + 5:j] if (i != -1 and j > i) else s
+
+
+def _vs_clean(s: str) -> str:
+    # Control chars stripped: search titles are attacker-influenced text (that
+    # is exactly why the fence exists) and must not carry newlines or escapes
+    # into a UI. Provider-name scrubbing is deliberately NOT applied to
+    # external content — it would rewrite a legitimate result titled
+    # "OpenAI ships X" into nonsense. The arg/preview allow-list is what closes
+    # the stack-disclosure risk, structurally.
+    return _VS_CTRL_RE.sub(" ", s or "").strip()
+
+
+def _vs_source(title: str, url: str) -> dict:
+    try:
+        netloc = urlparse(url).netloc
+    except Exception:
+        netloc = ""
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return {
+        "title":  _vs_clean(title)[:_VS_SRC_TITLE_MAX],
+        "url":    url[:_VS_SRC_URL_MAX],
+        "domain": netloc[:_VS_SRC_DOMAIN_MAX],
+    }
+
+
+def _vs_sources(name: str, tool_input: dict, result: str) -> list:
+    """Structured sources from the FULL, de-fenced tool result.
+
+    Every web_search backend emits the same block:
+        N. Title
+           https://url
+           description…
+    A parse miss degrades to [], never to an error."""
+    body = _vs_defence(result)
+    out: list = []
+    if name in _VS_SOURCE_LIST_TOOLS:
+        title = ""
+        for ln in body.splitlines():
+            m = _VS_NUM_RE.match(ln)
+            if m:
+                title = m.group(1)
+                continue
+            u = _VS_URL_RE.match(ln)
+            if u and title:
+                out.append(_vs_source(title, u.group(1)))
+                title = ""
+                if len(out) >= _VS_SRC_MAX:
+                    break
+    elif name in _VS_SOURCE_ONE_TOOLS:
+        url = str((tool_input or {}).get("url", ""))
+        head = ""
+        for ln in body.splitlines()[:5]:
+            if ln.startswith("# "):
+                head = ln[2:].strip()
+                break
+        if url:
+            out.append(_vs_source(head or url, url))
+    return out
+
+
+def _vs_args(name: str, tool_input: dict) -> dict:
+    keys = _VS_ARG_ALLOW.get(name)
+    if not keys or not isinstance(tool_input, dict):
+        return {}
+    out, budget = {}, _VS_ARGS_BYTES_MAX
+    for k in keys:
+        v = tool_input.get(k)
+        if not isinstance(v, str) or not v.strip():
+            continue
+        v = _vs_clean(v)[:_VS_ARG_VALUE_MAX]
+        if len(v) > budget:
+            break
+        out[k] = v
+        budget -= len(v)
+    return out
+
+
+def _vs_sse(frame: dict) -> str:
+    blob = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
+    if len(blob) > _VS_FRAME_BYTES_MAX and frame.get("type") != "done":
+        frame.pop("sources", None)
+        frame.pop("preview", None)
+        blob = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
+    return f"data: {blob}\n\n"
+
+
+@router.post("/internal/agent-turn/stream", include_in_schema=False)
+async def internal_agent_turn_stream(req: ChatRequest, request: Request):
+    """Streaming sibling of /internal/agent-turn.
+
+    Same auth, same `save` semantics, same terminal payload — the only
+    difference is that inner tool activity is emitted live and the
+    ChatResponse body arrives as the final `done` event. The blocking
+    endpoint above is left byte-identical, so rollback is "stop calling
+    this route".
+
+    NOTE: Starlette commits `http.response.start` BEFORE the generator runs,
+    so nothing inside generate() can produce a non-200. Every fallible setup
+    step therefore happens here, in the handler body.
+    """
+    if settings.run_mode != "agent":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    if not _agent_runner:
+        raise HTTPException(status_code=503, detail="Agent not available")
+    user_id = settings.user_id
+    if not user_id:
+        raise HTTPException(status_code=503, detail="Agent user not configured")
+
+    q: "asyncio.Queue" = asyncio.Queue(maxsize=_VS_QUEUE_MAX)
+    budget = {"n": 0, "dropped": 0}
+    cancelled = {"v": False}
+
+    def _put(frame: dict) -> None:
+        # NEVER awaits and NEVER raises: the producer is the agent loop, and a
+        # slow or dead consumer must not be able to stall or kill a turn.
+        if budget["n"] >= _VS_MAX_EVENTS:
+            return
+        budget["n"] += 1
+        try:
+            q.put_nowait(frame)
+        except asyncio.QueueFull:
+            budget["dropped"] += 1
+
+    async def on_status(stage: str) -> None:
+        try:
+            if stage == "thinking":
+                _put({"type": "status", "stage": "thinking"})
+        except Exception:  # noqa: BLE001
+            logger.debug("[VSTREAM] on_status sink failed", exc_info=True)
+
+    async def on_tool_start(tool_name: str) -> None:
+        # Earliest possible beat: fires at the LLM's tool_use_start, BEFORE the
+        # arguments have finished streaming, so there is no call_id and no
+        # input here. It can flip the orb to tool_use a second or two sooner;
+        # it can NOT open a row.
+        try:
+            _put({"type": "tool.intent", "name": str(tool_name)[:64]})
+        except Exception:  # noqa: BLE001
+            logger.debug("[VSTREAM] on_tool_start sink failed", exc_info=True)
+
+    async def on_tool_event(ev: Dict[str, Any]) -> None:
+        try:
+            name = str(ev.get("name", ""))[:64]
+            cid = str(ev.get("call_id", ""))[:64]
+            inp = ev.get("input") or {}
+            if ev.get("phase") == "start":
+                _put({"type": "tool.start", "call_id": cid, "name": name,
+                      "args": _vs_args(name, inp),
+                      "started_ms": int(ev.get("started_ms") or 0)})
+            else:
+                raw = ev.get("result") or ""
+                body = _vs_defence(raw)
+                frame = {
+                    "type": "tool.end", "call_id": cid, "name": name,
+                    # `ok` MUST come off the DE-FENCED string: post-fence every
+                    # external result starts with '<external_content', so a
+                    # naive startswith("ERROR") test reports a failed search ok.
+                    "ok": not body.strip().upper().startswith("ERROR"),
+                    "elapsed_ms": int(ev.get("elapsed_ms") or 0),
+                    "sources": _vs_sources(name, inp, raw),
+                }
+                if name in _VS_PREVIEW_ALLOW:
+                    frame["preview"] = _vs_clean(body)[:_VS_PREVIEW_MAX]
+                _put(frame)
+        except Exception:  # noqa: BLE001
+            logger.debug("[VSTREAM] on_tool_event sink failed", exc_info=True)
+
+    async def _run_wrapped():
+        try:
+            return await _agent_runner.run(
+                user_message=req.message,
+                user_id=user_id,
+                session_id=req.session_id,
+                model_override=req.model,
+                channel="voice",
+                save_user_message=req.save,
+                save_assistant_message=req.save,
+                on_status=on_status,
+                on_tool_start=on_tool_start,
+                on_tool_event=on_tool_event,
+                cancel_check=lambda: cancelled["v"],
+                # on_text_chunk deliberately NOT passed: voice renders no token
+                # deltas, and omitting it takes the frame count from thousands
+                # per turn to 2-40, which makes backpressure a non-problem.
+            )
+        finally:
+            try:
+                q.put_nowait(None)          # terminal sentinel
+            except asyncio.QueueFull:
+                pass                        # drain loop's task.done() check covers it
+
+    async def generate():
+        task = asyncio.create_task(_run_wrapped())
+        try:
+            yield _vs_sse({"type": "ready"})
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=_VS_HEARTBEAT_S)
+                except asyncio.TimeoutError:
+                    if task.done() and q.empty():
+                        break
+                    yield ": ping\n\n"
+                    continue
+                if item is None:
+                    break
+                yield _vs_sse(item)
+
+            try:
+                response = await task
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("[VSTREAM] agent-turn stream failed for %s", user_id)
+                yield _vs_sse({"type": "error", "code": type(e).__name__})
+                return
+
+            _m = response.model
+            if settings.security_leak_filter and _m:
+                from app.services.model_alias import public_model_label
+                _m = public_model_label(_m)
+            yield _vs_sse({
+                "type": "done",
+                "text": response.text,
+                "session_id": response.session_id,
+                "tokens_input": response.tokens_input,
+                "tokens_output": response.tokens_output,
+                "tokens_total": response.tokens_total,
+                "model": _m,
+                "tool_calls": len(response.tool_calls),
+                "processing_time_ms": response.processing_time_ms,
+            })
+            if budget["dropped"]:
+                logger.warning("[VSTREAM] dropped %d frames (queue full)", budget["dropped"])
+        finally:
+            # Client gone (Starlette cancels the generator). Cooperative cancel
+            # first — the runner polls cancel_check — then hard cancel.
+            if not task.done():
+                cancelled["v"] = True
+                asyncio.get_running_loop().call_later(1.5, task.cancel)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/chat/stream")
