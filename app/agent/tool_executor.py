@@ -122,6 +122,23 @@ _JOB_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _SESSION_WS_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "tool_executor_session_workspace", default=None,
 )
+# Conversation this turn belongs to. `_tool_create_job` stamps it onto
+# BuildJob.conversation_id so Mission Control can show "spawned from chat
+# with ___". It used to read `getattr(self, "_current_session_id", None)`,
+# an attribute NOTHING ever assigned — so that column was silently NULL on
+# every agent-authored job since the feature shipped.
+_SESSION_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "tool_executor_session_id", default=None,
+)
+# Job ids created by the `create_job` TOOL during the current turn, in order.
+# AgentRunner.run() resets this per turn and closes exactly these rows at the
+# end, so a job cannot outlive the turn that made it. A ContextVar (not an
+# instance attr) because one ToolExecutor is shared across concurrent turns
+# and by spawned sub-agents — an instance list would let one turn close
+# another's jobs.
+_CREATED_JOB_IDS_CTX: contextvars.ContextVar[tuple] = contextvars.ContextVar(
+    "tool_executor_created_job_ids", default=(),
+)
 # Inbound attachments (persisted dicts) the user sent with the current turn.
 # Lets edit_image reach "the photo I just sent" without re-decoding the WS
 # payload. Per-asyncio-task, like the other per-call context above.
@@ -4384,6 +4401,19 @@ class ToolExecutor:
         Writes to the ``_CHANNEL_CTX`` ContextVar."""
         _CHANNEL_CTX.set((channel or "").strip().lower() or None)
 
+    def set_session_id(self, session_id: Optional[str]):
+        """Set the conversation this turn belongs to, and clear the per-turn
+        created-job list. Writes to the ``_SESSION_ID_CTX`` ContextVar."""
+        _SESSION_ID_CTX.set(session_id or None)
+        _CREATED_JOB_IDS_CTX.set(())
+
+    def take_created_job_ids(self) -> tuple:
+        """Job ids the `create_job` tool made during this turn, then reset.
+        AgentRunner.run() calls this once at turn end to close them."""
+        ids = _CREATED_JOB_IDS_CTX.get()
+        _CREATED_JOB_IDS_CTX.set(())
+        return ids
+
     def set_session_workspace(self, path: Optional[str]):
         """Set a per-session workspace override. Relative paths resolve against this.
 
@@ -4881,7 +4911,7 @@ class ToolExecutor:
             user_id=user_id,
             channel="agent_task",
             source_kind="manual",
-            conversation_id=getattr(self, "_current_session_id", None),
+            conversation_id=_SESSION_ID_CTX.get(),
         )
         job = await JobRunner().create_job(
             job_type="agent_task",
@@ -4894,6 +4924,13 @@ class ToolExecutor:
             steps_json=_json.dumps(steps),
         )
         job_id = job.id
+
+        # Remember it for the turn-end finalizer (AgentRunner.run). Targeting
+        # the exact ids is what keeps the close precise: filtering by
+        # conversation_id instead would sweep up jobs from EARLIER turns of the
+        # same long-lived conversation, and source_kind='manual' is shared with
+        # dashboard-created jobs.
+        _CREATED_JOB_IDS_CTX.set(_CREATED_JOB_IDS_CTX.get() + (job_id,))
 
         # Broadcast to frontend
         try:

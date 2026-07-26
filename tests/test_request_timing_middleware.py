@@ -186,6 +186,32 @@ def test_auth_paths_are_always_logged_even_when_fast(caplog):
                for r in caplog.records)
 
 
+def test_streaming_route_with_fast_headers_is_not_logged(caplog):
+    """GATE against a regression the pure-ASGI rewrite briefly introduced.
+
+    BaseHTTPMiddleware's `call_next` returned at http.response.start, so this
+    diagnostic has always meant TIME TO HEADERS. Timing the whole ASGI call
+    instead makes every SSE endpoint log a WARNING on every request — and
+    /api/mcp/mcp alone is ~94% of this service's traffic. Headers here are
+    instant; only the body is slow, so nothing should be logged."""
+    async def send(message):
+        return None
+
+    async def sse(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        for _ in range(3):
+            await asyncio.sleep(0.25)   # a long-lived stream
+            await send({"type": "http.response.body", "body": b"x", "more_body": True})
+        await send({"type": "http.response.body", "body": b""})
+
+    app = _RequestTimingMiddleware(sse)
+    with caplog.at_level(logging.WARNING, logger="req_timing"):
+        asyncio.run(app(_scope(path="/api/mcp/mcp", method="POST"), _receive, send))
+
+    logged = [r.getMessage() for r in caplog.records if "[req-timing]" in r.getMessage()]
+    assert not logged, f"streamed body must not be timed as latency: {logged}"
+
+
 def test_non_http_scopes_pass_through_untouched():
     """WebSockets (chat, realtime voice, agent tunnel) must not be wrapped."""
     seen = {}
