@@ -811,17 +811,25 @@ def test_redeemed_iap_table_is_globally_unique_and_self_healed():
 # ── Round 12: free-tier image cap is TOCTOU-safe (reserve before generate) ──
 
 def test_image_cap_reserves_before_generate_at_every_route():
-    """MED: all three image routes must RESERVE a slot before generating (not
-    check-then-generate-then-charge), and settle/release it. Also fixes the
+    """MED: EVERY image route must RESERVE a free-tier slot before generating
+    (not check-then-generate-then-charge), and settle/release it. Also fixes the
     prior instance-attr call `credit_service.free_tier_image_quota` that raised
-    AttributeError (the module-level fn was never bound to the instance)."""
+    AttributeError (the module-level fn was never bound to the instance).
+
+    Counted dynamically rather than pinned to a literal: this assertion was
+    pinned to ``== 3`` in round 12 and silently went red on main when the async
+    Kie start/poll route (#324) added a fourth image entry point. The invariant
+    is "every route that starts a render reserves first", not "there are exactly
+    three routes"."""
     src = (_BACKEND / "app" / "api" / "llm_proxy.py").read_text()
     # the broken instance-attribute gate is gone
     assert "free_tier_image_quota(db" not in src
-    # every route reserves + settles; each also releases on a failure path
-    assert src.count("reserve_free_image_slot(db, config.user_id)") == 3
-    assert src.count("settle_free_image_slot(db, _img_slot)") == 3
-    assert src.count("release_free_image_slot(db, _img_slot)") >= 3
+    n_reserve = src.count("reserve_free_image_slot(db, config.user_id)")
+    assert n_reserve >= 3, "an image route stopped reserving the free-tier slot"
+    # every reserving route must be able to give the slot back
+    assert src.count("release_free_image_slot(db, ") >= n_reserve
+    # the synchronous routes settle inline; the async one settles from /poll
+    assert src.count("settle_free_image_slot(db, ") >= 3
 
 
 def test_reserve_free_image_slot_is_advisory_locked_and_counts_pending():
@@ -836,3 +844,80 @@ def test_reserve_free_image_slot_is_advisory_locked_and_counts_pending():
     assert "RESERVATION_OPEN" in body and "expires_at > datetime.utcnow()" in body
     # reservation is committed (published) so concurrent requests see it
     assert "await db.commit()" in body
+
+
+# ── Round 13: the scoped-preview-token fix reaches EVERY preview surface ──
+
+def test_no_preview_surface_embeds_the_account_jwt():
+    """HIGH (round-12 miss): round 12 scoped the preview token in AppPreview +
+    WorkspaceBuilder but MISSED AppSplit — the default-ON preview route — which
+    still put the full account JWT in the iframe URL and postMessage'd it into
+    agent-authored HTML. Assert NO preview surface uses getAuthToken()."""
+    root = _BACKEND.parent / "frontend" / "src"
+    surfaces = [
+        root / "pages" / "AppSplit.tsx",
+        root / "modules" / "workspace" / "AppPreview.tsx",
+        root / "modules" / "workspace" / "WorkspaceBuilder.tsx",
+    ]
+    for path in surfaces:
+        assert path.exists(), f"preview surface missing: {path}"
+        src = path.read_text()
+        # the app-scoped token is fetched and used
+        assert "previewToken" in src, f"{path.name} does not use a scoped preview token"
+        # the account JWT never reaches the preview frame
+        assert "token=${token}" not in src, f"{path.name} still puts a raw token in the URL"
+        assert "token: getAuthToken()" not in src, f"{path.name} still postMessages the account JWT"
+
+
+def test_appsplit_holds_frame_until_scoped_token_and_targets_origin():
+    """AppSplit must gate the iframe on the scoped token (no account-JWT
+    fallback) and must not postMessage the config to a wildcard origin."""
+    src = (_BACKEND.parent / "frontend" / "src" / "pages" / "AppSplit.tsx").read_text()
+    assert "appsApi.previewToken(id)" in src
+    assert "if (!previewToken) return null;" in src
+    assert "token: previewToken," in src
+    assert "}, '*');" not in src, "agent config still posted to a wildcard target origin"
+
+
+# ── Round 13: an async Kie render is always paid for ──────────────────
+
+def test_kie_start_holds_credits_so_abandoned_renders_are_billed():
+    """MED: /kie/image/start began a real (billable) render while the only
+    charge lived in /poll, so a job that was never polled to completion was
+    never billed. start must take a credit hold keyed on the task."""
+    src = (_BACKEND / "app" / "api" / "llm_proxy.py").read_text()
+    m = re.search(r"async def proxy_kie_image_start\(.*?(?=\n@router)", src, re.S)
+    assert m, "proxy_kie_image_start not found"
+    body = m.group(0)
+    assert "credit_service.reserve(" in body, "start takes no credit hold"
+    assert 'idempotency_key=f"kie_task:{task_id}"' in body
+    # the hold is taken only once the render actually started (after start_task)
+    assert body.index("kie_client.start_task") < body.index("credit_service.reserve(")
+
+
+def test_kie_poll_settles_or_refunds_the_hold_without_double_billing():
+    """/poll must settle the hold on success and refund it on failure, finding
+    it by (user, task) so no client change is needed — and must not also
+    try_charge when a hold exists (that would double-bill)."""
+    src = (_BACKEND / "app" / "api" / "llm_proxy.py").read_text()
+    m = re.search(r"async def proxy_kie_image_poll\(.*?(?=\n@router)", src, re.S)
+    assert m, "proxy_kie_image_poll not found"
+    body = m.group(0)
+    assert "find_open_reservation_by_key(db, config.user_id, charge_key)" in body
+    assert "credit_service.settle(" in body
+    assert 'reason="kie_render_failed"' in body, "failed render does not refund the hold"
+    # try_charge survives ONLY as the else-branch fallback for pre-deploy jobs
+    assert "else:" in body and "credit_service.try_charge(" in body
+    assert body.index("credit_service.settle(") < body.index("credit_service.try_charge(")
+
+
+def test_reservation_lookup_is_user_scoped():
+    """The hold lookup must be scoped to the user, so one tenant can never
+    settle or refund another tenant's reservation."""
+    src = (_BACKEND / "app" / "services" / "credit_service.py").read_text()
+    m = re.search(r"async def find_open_reservation_by_key\(.*?return res\.id", src, re.S)
+    assert m, "find_open_reservation_by_key not found"
+    body = m.group(0)
+    assert "CreditReservation.user_id == user_id" in body
+    assert "CreditReservation.idempotency_key == idempotency_key" in body
+    assert "CreditReservation.status == RESERVATION_OPEN" in body

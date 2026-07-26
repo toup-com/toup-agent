@@ -444,6 +444,28 @@ async def reserve_free_image_slot(
     return (False, total, limit, rid)
 
 
+async def find_open_reservation_by_key(
+    db: AsyncSession, user_id: str, idempotency_key: str,
+) -> Optional[str]:
+    """Return the id of this user's OPEN reservation under ``idempotency_key``.
+
+    Lets an async job's completion path (e.g. the Kie image poll) recover the
+    credit hold its start path took, without the client having to carry the
+    reservation id back — the (user_id, idempotency_key) pair is enough, and it
+    is user-scoped so one tenant can never settle or refund another's hold.
+    Returns None when there is no open hold (e.g. a job started by an older
+    build, which the caller should fall back to charging directly)."""
+    row = await db.execute(
+        select(CreditReservation).where(
+            CreditReservation.user_id == user_id,
+            CreditReservation.idempotency_key == idempotency_key,
+            CreditReservation.status == RESERVATION_OPEN,
+        )
+    )
+    res = row.scalar_one_or_none()
+    return res.id if res is not None else None
+
+
 async def release_free_image_slot(db: AsyncSession, reservation_id: Optional[str]) -> None:
     """Free a held image slot when generation failed (round 12)."""
     if not reservation_id:

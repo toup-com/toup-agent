@@ -1394,6 +1394,34 @@ async def proxy_kie_image_start(
             "code": "kie_failed", "moderation": bool(e.moderation),
             "message": str(e)[:300],
         })
+
+    # Hold the estimated cost NOW that a real (billable) render is running.
+    # The charge used to live only in /poll, so a job that was started and never
+    # polled to completion — client crash, agent rollout, deadline overrun —
+    # burned real Kie spend that was never billed. The hold is keyed on the
+    # task so /poll can find and settle it without the client carrying the id;
+    # if the job is abandoned the hold simply stands (no expiry sweeper), which
+    # is the correct outcome: the render happened, so it stays paid for.
+    # settle() clamps the final charge to this estimate and refunds the rest.
+    from app.services.credit_service import credit_service, underlying_cost_to_credits
+    from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
+    _est_cents = Decimal(str(round(float(settings.kie_fallback_cents), 4)))
+    _est_credits = max(_MIN_IMAGE_CREDITS, underlying_cost_to_credits(_est_cents))
+    try:
+        await credit_service.reserve(
+            db, config.user_id, LEDGER_IMAGE_GEN, BUCKET_MESSAGE, _est_credits,
+            ttl_seconds=int(float(getattr(settings, "kie_job_timeout_s", 420.0))) + 600,
+            idempotency_key=f"kie_task:{task_id}",
+            event_id=f"kie_task:{task_id}",
+            metadata={"endpoint": "kie_image_start", "mode": mode, "task_id": task_id},
+        )
+        await db.commit()
+    except Exception:
+        # Never fail a started render on the accounting hop; /poll still charges
+        # directly when no hold is found.
+        logger.exception("[credits] kie start reserve failed user=%s task=%s",
+                         config.user_id[:8], task_id)
+
     return {"task_id": task_id, "reservation_id": _img_slot, "status": "pending"}
 
 
@@ -1412,6 +1440,7 @@ async def proxy_kie_image_poll(
     from app.services.credit_service import (
         credit_service, underlying_cost_to_credits,
         release_free_image_slot, settle_free_image_slot,
+        find_open_reservation_by_key,
     )
     from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
 
@@ -1434,6 +1463,12 @@ async def proxy_kie_image_poll(
 
     if st.get("state") == "fail":
         await release_free_image_slot(db, reservation_id)
+        # No image was produced → give back the hold /start took.
+        _hold_id = await find_open_reservation_by_key(
+            db, config.user_id, f"kie_task:{task_id}")
+        if _hold_id:
+            await credit_service.refund(db, _hold_id, reason="kie_render_failed")
+            await db.commit()
         await _log_event(db, config.user_id, "kie", settings.kie_image_model, "images",
                          0, 0, 0, 0, status="error")
         raise HTTPException(status_code=502, detail={
@@ -1457,16 +1492,27 @@ async def proxy_kie_image_poll(
     credits = max(_MIN_IMAGE_CREDITS, underlying_cost_to_credits(cents_d))
     charge_key = f"kie_task:{task_id}"
     try:
-        await credit_service.try_charge(
-            db, config.user_id, LEDGER_IMAGE_GEN, BUCKET_MESSAGE, credits,
-            idempotency_key=charge_key, event_id=charge_key,
-            model=settings.kie_image_model, provider="kie",
-            underlying_cost_cents=cents_d,
-            metadata={"endpoint": "kie_image_poll", "kie_credits": kie_credits,
-                      "task_id": task_id},
-        )
+        # Settle the hold /start took (clamped to the estimate; the difference
+        # is refunded). Falls back to a direct charge only for a job started by
+        # a build that predates the hold, so neither path can double-bill.
+        _hold_id = await find_open_reservation_by_key(db, config.user_id, charge_key)
+        if _hold_id:
+            await credit_service.settle(
+                db, _hold_id, credits,
+                metadata={"endpoint": "kie_image_poll", "kie_credits": kie_credits,
+                          "task_id": task_id},
+            )
+        else:
+            await credit_service.try_charge(
+                db, config.user_id, LEDGER_IMAGE_GEN, BUCKET_MESSAGE, credits,
+                idempotency_key=charge_key, event_id=charge_key,
+                model=settings.kie_image_model, provider="kie",
+                underlying_cost_cents=cents_d,
+                metadata={"endpoint": "kie_image_poll", "kie_credits": kie_credits,
+                          "task_id": task_id},
+            )
     except Exception:
-        logger.exception("[credits] kie image try_charge failed user=%s", config.user_id[:8])
+        logger.exception("[credits] kie image charge/settle failed user=%s", config.user_id[:8])
     await settle_free_image_slot(db, reservation_id)
     await _log_event(db, config.user_id, "kie", settings.kie_image_model, "images",
                      0, 0, int(cents), 0)
