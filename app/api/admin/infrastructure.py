@@ -122,19 +122,25 @@ async def overview(
             logger.warning("bridge host overview fetch failed: %s", e)
         return None
 
-    # Managed containers from platform DB
-    async def _fetch_managed():
-        result = await db.execute(
+    # Managed containers + user count from the platform DB. These two share
+    # ONE AsyncSession, so they must run in sequence: a session drives a single
+    # connection, and two overlapping executes raise
+    # InvalidRequestError("this session is provisioning a new connection;
+    # concurrent operations are not permitted"). This used to pass
+    # `db.execute(...)` as a third coroutine to the gather below, which raced
+    # `_fetch_managed` on the same session. Only the BRIDGE call — real network
+    # I/O on its own client — is worth overlapping with the DB work.
+    async def _fetch_db():
+        managed = (await db.execute(
             select(ManagedContainer, User.name, User.email)
             .outerjoin(User, ManagedContainer.user_id == User.id)
             .order_by(ManagedContainer.created_at.desc())
-        )
-        return result.all()
+        )).all()
+        total = await db.execute(select(func.count(User.id)))
+        return managed, total
 
-    total_users_task = db.execute(select(func.count(User.id)))
-
-    bridge_data, managed_rows, total_users_result = await asyncio.gather(
-        _fetch_bridge(), _fetch_managed(), total_users_task
+    bridge_data, (managed_rows, total_users_result) = await asyncio.gather(
+        _fetch_bridge(), _fetch_db()
     )
 
     def _fmt_bytes(n: int) -> str:

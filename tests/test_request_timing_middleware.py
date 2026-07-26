@@ -132,6 +132,36 @@ def test_platform_main_does_not_reintroduce_basehttpmiddleware():
     assert "app.add_middleware(_RequestTimingMiddleware)" in _SRC
 
 
+def test_no_basehttpmiddleware_anywhere_in_the_live_stack():
+    """Assert on the REAL app object, not the source text.
+
+    The grep above only catches the `@app.middleware("http")` decorator. The
+    likelier regression is `app.add_middleware(SomethingMiddleware)` where that
+    class happens to subclass BaseHTTPMiddleware — a third-party auth/tracing
+    middleware, say — which reinstates the anyio cancel scope for every request
+    while the text guard stays green. Walk the live stack instead."""
+    import platform_main as pm
+
+    offenders = [
+        m.cls.__name__ for m in pm.app.user_middleware
+        if isinstance(m.cls, type) and issubclass(m.cls, BaseHTTPMiddleware)
+    ]
+    assert not offenders, (
+        f"BaseHTTPMiddleware subclass in the live stack: {offenders}. It runs the "
+        "downstream app as an anyio task-group child and hard-cancels it on "
+        "client disconnect, which strands SQLAlchemy's pre-ping BEGIN;"
+    )
+
+
+def test_timing_middleware_is_registered_and_outermost():
+    """Ordering matters: it must still wrap CORS the way the decorator did."""
+    import platform_main as pm
+
+    names = [m.cls.__name__ for m in pm.app.user_middleware]
+    assert "_RequestTimingMiddleware" in names, names
+    assert names.index("_RequestTimingMiddleware") < names.index("CORSMiddleware"), names
+
+
 # ── Behaviour preserved from the decorator version ──────────────────────
 
 def test_slow_request_is_logged_with_status_and_duration(caplog):

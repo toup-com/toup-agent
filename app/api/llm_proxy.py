@@ -11,6 +11,7 @@ All budget enforcement happens here. Agents in bundle mode never talk
 to providers directly.
 """
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -846,12 +847,29 @@ async def proxy_chat(
                 else:
                     inp, out, cached = _extract_openai_usage(bytes(collected_bytes))
                 cost = _calc_cost_cents(model, inp, out)
+                # Do NOT reuse `db` here. It comes from Depends(get_db), and
+                # since FastAPI 0.106 the dependency AsyncExitStack is exited
+                # BEFORE the response body streams — so by the time this
+                # `finally` runs that session is already closed and owned by
+                # nobody. Writing through it silently re-checks out a
+                # connection that no `async with` will ever return, and if
+                # anything raises after checkout the `except` below swallows it
+                # and the connection is stranded. Own a fresh session, and
+                # shield it: this runs in the generator's finally, which is
+                # exactly where a client disconnect delivers cancellation.
+                # Reached by /chat AND the SDK aliases (/v1/messages,
+                # /openai/v1/chat/completions), which all delegate here.
+                async def _log_usage() -> None:
+                    from app.db.database import async_session_maker
+                    async with async_session_maker() as _log_db:
+                        await _log_event(
+                            _log_db, config.user_id, backend.name, model, "chat",
+                            inp, out, cost, latency, is_fallback,
+                            cached_tokens=cached,
+                        )
+
                 try:
-                    await _log_event(
-                        db, config.user_id, backend.name, model, "chat",
-                        inp, out, cost, latency, is_fallback,
-                        cached_tokens=cached,
-                    )
+                    await asyncio.shield(asyncio.create_task(_log_usage()))
                 except Exception as e:
                     logger.warning("Failed to log usage event: %s", e)
 

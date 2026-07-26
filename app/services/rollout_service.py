@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -603,8 +604,12 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
     await db.commit()
 
     # ── Phase A: upgrade canary ────────────────────────────────────
+    # Heartbeat REQUIRED: this single call is allowed 210s (hard_timeout_s) but
+    # the reconciler orphans at 180s, so a healthy-but-slow canary upgrade used
+    # to abort itself with the driver still running.
     logger.info("[ROLLOUT] %s canary=%s", rollout.id, canary.user_id[:8])
-    canary_attempt = await _upgrade_one(db, rollout, canary, rollout.image_tag)
+    async with _heartbeating(rollout.id, "canary-upgrade"):
+        canary_attempt = await _upgrade_one(db, rollout, canary, rollout.image_tag)
 
     if canary_attempt.status != "ok":
         # Canary upgrade failed (and was rolled back, or rollback also failed)
@@ -664,32 +669,11 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
         # heartbeat and stamp once more for the natural per-batch beat.
         # Uses its OWN session so a starved orchestrator pool doesn't
         # silence the heartbeat that's meant to detect that very state.
-        async def _batch_heartbeat(rollout_id: str) -> None:
-            while True:
-                await asyncio.sleep(60)
-                try:
-                    async with async_session_maker() as hb_db:
-                        await hb_db.execute(
-                            Rollout.__table__.update()
-                            .where(Rollout.id == rollout_id)
-                            .values(last_progress_at=datetime.utcnow())
-                        )
-                        await hb_db.commit()
-                except Exception as hb_err:
-                    logger.warning(
-                        "[ROLLOUT] mid-batch heartbeat failed (non-fatal): %s",
-                        hb_err,
-                    )
-
-        hb_task = asyncio.create_task(_batch_heartbeat(rollout.id))
-        try:
+        # Shared helper (see `_heartbeating`) rather than an inline copy — the
+        # duplicate was how `_resume_rollout_task`'s identical loop ended up
+        # with no heartbeat at all.
+        async with _heartbeating(rollout.id, "mid-batch"):
             results = await asyncio.gather(*tasks, return_exceptions=False)
-        finally:
-            hb_task.cancel()
-            try:
-                await hb_task
-            except (asyncio.CancelledError, Exception):
-                pass
         for r in results:
             if r.status == "ok":
                 total_ok += 1
@@ -823,6 +807,53 @@ _STUCK_PENDING_THRESHOLD_MIN = 5
 # So normal operation never has a >2-min gap between heartbeats. 3 min
 # adds a buffer for slow bridge calls without false-positiving.
 _STUCK_HEARTBEAT_MIN = 3
+
+
+@asynccontextmanager
+async def _heartbeating(rollout_id: str, what: str):
+    """Keep `last_progress_at` fresh across a long uninstrumented await.
+
+    The reconciler orphans a running rollout after `_STUCK_HEARTBEAT_MIN`
+    minutes (180s) without a beat, but a SINGLE bridge call is deliberately
+    allowed to take `hard_timeout_s` = bridge_upgrade_timeout_s + 30 = 210s.
+    Any stretch that awaits the bridge without beating is therefore a standing
+    race that aborts healthy rollouts — it does not need a redeploy to fire.
+    Observed 2026-07-25: three aborts in 20 minutes, two of them
+    `aborted_orphan` with the driver still alive and working.
+
+    Uses its OWN session per beat, so a starved orchestrator pool cannot
+    silence the very heartbeat meant to detect that state. Non-fatal by
+    contract: a failed beat must never fail a rollout.
+
+    This exists as ONE helper because the copy-paste version was the bug —
+    `_drive_rollout`'s batch loop had an inline heartbeat and
+    `_resume_rollout_task`'s otherwise-identical loop was missing it entirely.
+    """
+    async def _beat() -> None:
+        while True:
+            await asyncio.sleep(60)
+            try:
+                async with async_session_maker() as hb_db:
+                    await hb_db.execute(
+                        Rollout.__table__.update()
+                        .where(Rollout.id == rollout_id)
+                        .values(last_progress_at=datetime.utcnow())
+                    )
+                    await hb_db.commit()
+            except Exception as hb_err:
+                logger.warning(
+                    "[ROLLOUT] %s heartbeat failed (non-fatal): %s", what, hb_err,
+                )
+
+    task = asyncio.create_task(_beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 async def _stamp_progress(db: AsyncSession, rollout: Rollout) -> None:
@@ -1120,7 +1151,14 @@ async def _resume_rollout_task(rollout_id: str) -> None:
         for i in range(0, len(rest), batch_size):
             batch = rest[i : i + batch_size]
             tasks = [_upgrade_one(db, rollout, c, rollout.image_tag) for c in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=False)
+            # Beat DURING the batch, not just between batches: one batch can
+            # legitimately consume 210s (hard_timeout_s), which exceeds the
+            # reconciler's 180s orphan threshold. This loop previously had no
+            # in-flight heartbeat at all, so a resumed rollout could re-abort
+            # itself on its first slow batch — the very abort resume exists to
+            # recover from.
+            async with _heartbeating(rollout.id, "resume-batch"):
+                results = await asyncio.gather(*tasks, return_exceptions=False)
             for r in results:
                 if r.status == "ok":
                     total_ok += 1
