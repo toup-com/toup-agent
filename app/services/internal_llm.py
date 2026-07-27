@@ -62,6 +62,7 @@ async def call_system_llm(
     messages: List[Dict[str, Any]],
     model: Optional[str] = None,
     timeout: int = 45,
+    failure_out: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """Call the active LLM for a system operation.
 
@@ -80,6 +81,12 @@ async def call_system_llm(
 
     Returns the text completion on success, None on failure. Failures
     are logged but never raised — caller decides how to react.
+
+    `failure_out`: optional caller-supplied dict. When the call returns
+    None, `failure_out["reason"]` is set to a taxonomy value from
+    `_classify_failure_reason` so callers that persist structured
+    failure stubs (day_summarizer M3) can record WHY. Untouched on
+    success.
     """
     if not (operation_type.startswith("system.") or operation_type.startswith("user.")):
         raise ValueError(
@@ -125,6 +132,7 @@ async def call_system_llm(
             system=system,
             messages=messages,
             timeout=timeout,
+            failure_out=failure_out,
         )
     return await _system_call_anthropic(
         user_id=user_id,
@@ -134,6 +142,7 @@ async def call_system_llm(
         system=system,
         messages=messages,
         timeout=timeout,
+        failure_out=failure_out,
     )
 
 
@@ -144,6 +153,39 @@ def _bundle_active() -> bool:
         getattr(settings, "llm_mode", None) == "bundle"
         and bool(getattr(settings, "toup_token", None))
     )
+
+
+def _classify_failure_reason(
+    *,
+    status_code: Optional[int] = None,
+    exception: Optional[BaseException] = None,
+) -> str:
+    """Map a failed dispatch onto the M3 reason taxonomy used by the day
+    summarizer ({auth_error, rate_limit, timeout, server_error,
+    parse_error, no_keys, other}).
+
+    Surfaced to callers via the `failure_out` param — values end up in
+    day_chats.summary_last_failure_reason and metric labels, so keep the
+    set small and stable (matches day_summarizer._classify_failure).
+    """
+    if exception is not None:
+        # SDK errors (anthropic/openai APIStatusError) carry .status_code
+        code = getattr(exception, "status_code", None)
+        if isinstance(code, int):
+            return _classify_failure_reason(status_code=code)
+        name = type(exception).__name__.lower()
+        if "timeout" in name or "timeout" in str(exception).lower():
+            return "timeout"
+        return "other"
+    if status_code is None:
+        return "other"
+    if status_code in (401, 403):
+        return "auth_error"
+    if status_code == 429:
+        return "rate_limit"
+    if 500 <= status_code < 600:
+        return "server_error"
+    return "other"
 
 
 # Production fallback model when an Anthropic dispatch can't complete.
@@ -163,6 +205,7 @@ async def _system_call_anthropic(
     system: str,
     messages: List[Dict[str, Any]],
     timeout: int,
+    failure_out: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """Anthropic dispatch — bundle SDK when active, else direct API.
 
@@ -184,6 +227,7 @@ async def _system_call_anthropic(
     output_tokens = 0
     text: Optional[str] = None
     fallback_reason: Optional[str] = None  # set if we should fall through to OpenAI
+    anthropic_reason = ""  # taxonomy reason for the Anthropic-side failure
 
     if _bundle_active():
         # SDK path — let bundle_client handle proxy URL, TOUP_TOKEN auth,
@@ -197,6 +241,7 @@ async def _system_call_anthropic(
                     operation_type, _ANTHROPIC_FALLBACK_OPENAI_MODEL,
                 )
                 fallback_reason = "bundle_client_none"
+                anthropic_reason = "no_keys"
             else:
                 resp = await client.messages.create(
                     model=model,
@@ -222,10 +267,11 @@ async def _system_call_anthropic(
                 _ANTHROPIC_FALLBACK_OPENAI_MODEL,
             )
             fallback_reason = f"bundle_exc_{type(e).__name__}"
+            anthropic_reason = _classify_failure_reason(exception=e)
     else:
         # Legacy direct-API path. Same code as `call_anthropic_system`
         # below — inlined here to keep one logging call per dispatch.
-        text, input_tokens, output_tokens, status = await _direct_anthropic(
+        text, input_tokens, output_tokens, status, anthropic_reason = await _direct_anthropic(
             operation_type=operation_type,
             model=model,
             max_tokens=max_tokens,
@@ -289,7 +335,7 @@ async def _system_call_anthropic(
             "[internal_llm] Anthropic fallback engaged for op=%s reason=%s → %s",
             operation_type, fallback_reason, _ANTHROPIC_FALLBACK_OPENAI_MODEL,
         )
-        return await _system_call_openai(
+        fb_text = await _system_call_openai(
             user_id=user_id,
             operation_type=operation_type + ".anthropic_fallback",
             model=_ANTHROPIC_FALLBACK_OPENAI_MODEL,
@@ -297,7 +343,21 @@ async def _system_call_anthropic(
             system=system,
             messages=messages,
             timeout=timeout,
+            failure_out=failure_out,
         )
+        # Both providers failed: surface the more diagnostic reason —
+        # the Anthropic one wins unless it was generic (mirrors the M1
+        # composition the day summarizer used before this path existed).
+        # "no_keys" counts as generic here: with Anthropic disabled
+        # platform-wide the anthropic leg ALWAYS fails no_keys, and letting
+        # it stomp the OpenAI leg's real diagnostic (rate_limit, timeout…)
+        # would mislabel every dual failure on the prod-default config.
+        if fb_text is None and failure_out is not None and anthropic_reason not in ("", "other", "no_keys"):
+            failure_out["reason"] = anthropic_reason
+        return fb_text
+    if text is None and failure_out is not None:
+        # 200-with-empty-content (no fallback engaged) — closest taxonomy fit.
+        failure_out["reason"] = anthropic_reason or "parse_error"
     return text
 
 
@@ -310,6 +370,7 @@ async def _system_call_openai(
     system: str,
     messages: List[Dict[str, Any]],
     timeout: int,
+    failure_out: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """OpenAI dispatch — bundle SDK when active, else direct API.
 
@@ -328,6 +389,7 @@ async def _system_call_openai(
     input_tokens = 0
     output_tokens = 0
     text: Optional[str] = None
+    openai_reason = ""  # taxonomy reason for a failed dispatch
 
     chat_messages = [{"role": "system", "content": system}] + list(messages)
     token_kwarg = "max_completion_tokens" if uses_max_completion_tokens(model) else "max_tokens"
@@ -342,6 +404,8 @@ async def _system_call_openai(
                     "[internal_llm] bundle mode but make_openai_client returned None for op=%s",
                     operation_type,
                 )
+                if failure_out is not None:
+                    failure_out["reason"] = "no_keys"
                 return None
             kwargs: Dict[str, Any] = {
                 "model": model,
@@ -398,14 +462,16 @@ async def _system_call_openai(
                     output_tokens, reasoning_tokens,
                 )
                 status = "empty_output"
+                openai_reason = "parse_error"
         except Exception as e:
             status = "error"
+            openai_reason = _classify_failure_reason(exception=e)
             logger.warning(
                 "[internal_llm] bundle OpenAI call failed for op=%s: %s: %s",
                 operation_type, type(e).__name__, str(e)[:300],
             )
     else:
-        text, input_tokens, output_tokens, status = await _direct_openai(
+        text, input_tokens, output_tokens, status, openai_reason = await _direct_openai(
             operation_type=operation_type,
             model=model,
             max_tokens=max_tokens,
@@ -448,6 +514,8 @@ async def _system_call_openai(
             )
         except Exception:
             logger.exception("[credits] internal_llm openai direct deduct failed")
+    if text is None and failure_out is not None:
+        failure_out["reason"] = openai_reason or "parse_error"
     return text
 
 
@@ -459,9 +527,10 @@ async def _direct_anthropic(
     system: str,
     messages: List[Dict[str, Any]],
     timeout: int,
-) -> tuple[Optional[str], int, int, str]:
-    """BYOK direct-API Anthropic call. Returns (text, in_tokens, out_tokens, status).
+) -> tuple[Optional[str], int, int, str, str]:
+    """BYOK direct-API Anthropic call. Returns (text, in_tokens, out_tokens, status, reason).
 
+    `reason` is "" on success, else a `_classify_failure_reason` value.
     Same auth + OAuth detection as the legacy `call_anthropic_system`,
     factored out so the unified dispatcher can share it."""
     api_key = (
@@ -470,7 +539,7 @@ async def _direct_anthropic(
     )
     if not api_key:
         logger.warning("[internal_llm] No Anthropic key for op=%s", operation_type)
-        return None, 0, 0, "error"
+        return None, 0, 0, "error", "no_keys"
 
     is_oauth = isinstance(api_key, str) and api_key.startswith("sk-ant-oat")
     if is_oauth:
@@ -508,15 +577,16 @@ async def _direct_anthropic(
                     int(usage.get("input_tokens", 0) or 0),
                     int(usage.get("output_tokens", 0) or 0),
                     "ok",
+                    "" if text else "parse_error",
                 )
             logger.warning(
                 "[internal_llm] Anthropic %d for op=%s: %s",
                 resp.status_code, operation_type, resp.text[:300],
             )
-            return None, 0, 0, "error"
+            return None, 0, 0, "error", _classify_failure_reason(status_code=resp.status_code)
     except Exception as e:
         logger.warning("[internal_llm] Anthropic call failed for op=%s: %s", operation_type, e)
-        return None, 0, 0, "error"
+        return None, 0, 0, "error", _classify_failure_reason(exception=e)
 
 
 async def _direct_openai(
@@ -527,15 +597,17 @@ async def _direct_openai(
     chat_messages: List[Dict[str, Any]],
     token_kwarg: str,
     timeout: int,
-) -> tuple[Optional[str], int, int, str]:
-    """BYOK direct-API OpenAI call. Returns (text, in_tokens, out_tokens, status)."""
+) -> tuple[Optional[str], int, int, str, str]:
+    """BYOK direct-API OpenAI call. Returns (text, in_tokens, out_tokens, status, reason).
+
+    `reason` is "" on success, else a `_classify_failure_reason` value."""
     api_key = (
         getattr(settings, "platform_openai_api_key", None)
         or settings.openai_api_key
     )
     if not api_key:
         logger.warning("[internal_llm] No OpenAI key for op=%s", operation_type)
-        return None, 0, 0, "error"
+        return None, 0, 0, "error", "no_keys"
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -564,15 +636,16 @@ async def _direct_openai(
                     int(usage.get("prompt_tokens", 0) or 0),
                     int(usage.get("completion_tokens", 0) or 0),
                     "ok",
+                    "" if text else "parse_error",
                 )
             logger.warning(
                 "[internal_llm] OpenAI %d for op=%s: %s",
                 resp.status_code, operation_type, resp.text[:300],
             )
-            return None, 0, 0, "error"
+            return None, 0, 0, "error", _classify_failure_reason(status_code=resp.status_code)
     except Exception as e:
         logger.warning("[internal_llm] OpenAI call failed for op=%s: %s", operation_type, e)
-        return None, 0, 0, "error"
+        return None, 0, 0, "error", _classify_failure_reason(exception=e)
 
 
 def _calc_cost_cents(model: str, input_tokens: int, output_tokens: int) -> int:

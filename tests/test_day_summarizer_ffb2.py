@@ -3,10 +3,14 @@ FF-B.2 — bounded-retry + auth-fallback + structured-stub tests for the
 day summarizer.
 
 Covers:
-- M1: Anthropic 401 → OpenAI fallback fires (was the binding bug)
+- M1: Anthropic 401 → OpenAI fallback fires (was the binding bug).
+  W0.4b moved the fallback into internal_llm.call_system_llm — the
+  tests now exercise it through that layer (BYOK direct path).
 - M2: bounded retry with backoff via should_summarize() eligibility
 - M3: failure reason persisted to DayChat.summary_last_failure_reason
 - _classify_failure taxonomy: status-code & exception mapping
+- W0.4b: bundle tenants (no raw keys) summarize via the bundle client;
+  failure reasons surface the real cause, never a bogus no_keys.
 
 Pattern matches backend/tests/test_active_task.py — sqlite + raw CREATE
 TABLE + ORM inserts, bypassing the heavy app.services init and the
@@ -17,9 +21,10 @@ import asyncio
 import os
 import sys
 import uuid
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("ENVIRONMENT", "development")
 
@@ -41,6 +46,38 @@ _spec = _ilu.spec_from_file_location(
 )
 _sumr = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_sumr)
+
+
+@contextmanager
+def _patched_settings(**overrides):
+    """Patch attributes on the REAL app.config.settings instance.
+
+    internal_llm holds a module-level reference to that instance, so
+    swapping app.config.settings for a stub (the pre-W0.4b pattern)
+    would not reach it — attribute patching does.
+    """
+    from app.config import settings as real_settings
+
+    with ExitStack() as stack:
+        for key, value in overrides.items():
+            stack.enter_context(patch.object(real_settings, key, value))
+        # Never let a test write llm_proxy_events to a real DB.
+        stack.enter_context(
+            patch("app.services.internal_llm._log_system_event", new=AsyncMock())
+        )
+        yield
+
+
+_BYOK = dict(
+    llm_mode="manual",
+    toup_token="",
+    platform_anthropic_api_key=None,
+    platform_openai_api_key=None,
+)
+
+
+def _no_network(**kw):
+    raise AssertionError("httpx.AsyncClient must not be constructed in this test")
 
 
 # ── Test 1 — _classify_failure: status code + exception taxonomy ──
@@ -77,8 +114,9 @@ def test_classify_failure_taxonomy():
 async def test_m1_anthropic_401_falls_back_to_openai():
     """
     The pre-FF-B.2 code returned None when Anthropic returned 401, even
-    if the OpenAI key was set. M1 routes 401 → OpenAI. This is the
-    behavioural test for the diagnostic finding.
+    if the OpenAI key was set. M1 routes 401 → OpenAI. W0.4b: the
+    fallback now happens inside call_system_llm's BYOK direct path —
+    same observable behaviour through _try_summarize.
     """
     # Mock Anthropic 401 then OpenAI 200
     fake_anthropic_resp = AsyncMock()
@@ -91,8 +129,8 @@ async def test_m1_anthropic_401_falls_back_to_openai():
     fake_openai_resp.json = lambda: {"choices": [{"message": {"content": "fallback summary text"}}]}
 
     class _ClientCtx:
-        def __init__(self, resp):
-            self.resp = resp
+        def __init__(self, **kw):
+            pass
         async def __aenter__(self):
             return self
         async def __aexit__(self, *a):
@@ -104,14 +142,12 @@ async def test_m1_anthropic_401_falls_back_to_openai():
                 return fake_openai_resp
             raise AssertionError(f"unexpected url: {url}")
 
-    # Patch settings to advertise both keys, then replace httpx.AsyncClient
-    class _Settings:
-        anthropic_api_key = "sk-ant-test"
-        openai_api_key = "sk-openai-test"
-
-    with patch("app.config.settings", _Settings), \
-         patch("httpx.AsyncClient", lambda **kw: _ClientCtx(None)):
-        text, reason = await _sumr._try_summarize("dummy prompt")
+    with _patched_settings(
+        **_BYOK,
+        anthropic_api_key="sk-ant-test",
+        openai_api_key="sk-openai-test",
+    ), patch("httpx.AsyncClient", _ClientCtx):
+        text, reason = await _sumr._try_summarize("user-1", "dummy prompt")
     assert text == "fallback summary text", f"expected fallback summary, got {text!r}"
     assert reason == "", f"expected empty reason on success, got {reason!r}"
     print("OK test_m1_anthropic_401_falls_back_to_openai")
@@ -133,18 +169,19 @@ async def test_m1_both_providers_fail_returns_anthropic_reason():
     fake_openai.text = "internal"
 
     class _ClientCtx:
+        def __init__(self, **kw):
+            pass
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return None
         async def post(self, url, **kw):
             return fake_anthropic if "anthropic.com" in url else fake_openai
 
-    class _Settings:
-        anthropic_api_key = "sk-ant-test"
-        openai_api_key = "sk-openai-test"
-
-    with patch("app.config.settings", _Settings), \
-         patch("httpx.AsyncClient", lambda **kw: _ClientCtx()):
-        text, reason = await _sumr._try_summarize("dummy")
+    with _patched_settings(
+        **_BYOK,
+        anthropic_api_key="sk-ant-test",
+        openai_api_key="sk-openai-test",
+    ), patch("httpx.AsyncClient", _ClientCtx):
+        text, reason = await _sumr._try_summarize("user-1", "dummy")
     assert text is None
     # Anthropic's auth_error is more diagnostic than openai's server_error;
     # implementation prefers the non-generic reason from anthropic.
@@ -152,18 +189,82 @@ async def test_m1_both_providers_fail_returns_anthropic_reason():
     print("OK test_m1_both_providers_fail_returns_anthropic_reason")
 
 
-# ── Test 4 — M1: no keys configured → no_keys reason ──
+# ── Test 4 — M1: no keys configured (BYOK) → no_keys reason ──
 
 async def test_m1_no_keys_returns_no_keys_reason():
-    class _Settings:
-        anthropic_api_key = None
-        openai_api_key = None
-
-    with patch("app.config.settings", _Settings):
-        text, reason = await _sumr._try_summarize("dummy")
+    with _patched_settings(
+        **_BYOK,
+        anthropic_api_key=None,
+        openai_api_key=None,
+    ), patch("httpx.AsyncClient", _no_network):
+        text, reason = await _sumr._try_summarize("user-1", "dummy")
     assert text is None
     assert reason == "no_keys"
     print("OK test_m1_no_keys_returns_no_keys_reason")
+
+
+# ── Test 4b — W0.4b: bundle tenant without raw keys gets a summary ──
+
+async def test_w04b_bundle_mode_summarizes_without_raw_keys():
+    """The headline W0.4b fix: a bundle tenant has NO raw provider keys
+    — pre-fix that meant summary=failed reason=no_keys forever. Now the
+    call routes through bundle_client (platform proxy) and succeeds,
+    never touching httpx directly."""
+    block = MagicMock()
+    block.text = "bundle summary"
+    resp = MagicMock()
+    resp.content = [block]
+    resp.usage = MagicMock(input_tokens=100, output_tokens=50)
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=resp)
+
+    with _patched_settings(
+        llm_mode="bundle",
+        toup_token="toup_ct_test",
+        anthropic_api_key=None,
+        openai_api_key=None,
+        platform_anthropic_api_key=None,
+        platform_openai_api_key=None,
+    ), patch("app.services.bundle_client.make_anthropic_client", return_value=fake_client), \
+         patch("httpx.AsyncClient", _no_network):
+        text, reason = await _sumr._try_summarize("user-1", "dummy prompt")
+
+    assert text == "bundle summary", f"expected bundle summary, got {text!r}"
+    assert reason == "", f"expected empty reason on success, got {reason!r}"
+    kwargs = fake_client.messages.create.call_args.kwargs
+    assert kwargs["model"] == "claude-haiku-4-5-20251001"  # haiku pin preserved
+    assert kwargs["max_tokens"] == 1200  # cap preserved
+    assert kwargs["system"] == _sumr.SUMMARIZER_SYSTEM_PROMPT
+    print("OK test_w04b_bundle_mode_summarizes_without_raw_keys")
+
+
+# ── Test 4c — W0.4b: bundle failure surfaces the REAL reason, not no_keys ──
+
+async def test_w04b_bundle_failure_surfaces_real_reason():
+    """When the bundle call fails (e.g. 429 from the proxy) and the
+    OpenAI fallback can't run either, the persisted reason must be the
+    diagnostic one (rate_limit) — not a misleading no_keys."""
+    class _RateLimited(Exception):
+        status_code = 429
+
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(side_effect=_RateLimited("429 from proxy"))
+
+    with _patched_settings(
+        llm_mode="bundle",
+        toup_token="toup_ct_test",
+        anthropic_api_key=None,
+        openai_api_key=None,
+        platform_anthropic_api_key=None,
+        platform_openai_api_key=None,
+    ), patch("app.services.bundle_client.make_anthropic_client", return_value=fake_client), \
+         patch("app.services.bundle_client.make_openai_client", return_value=None), \
+         patch("httpx.AsyncClient", _no_network):
+        text, reason = await _sumr._try_summarize("user-1", "dummy")
+
+    assert text is None
+    assert reason == "rate_limit", f"expected rate_limit, got {reason!r}"
+    print("OK test_w04b_bundle_failure_surfaces_real_reason")
 
 
 # ── Test 5 — M2: should_summarize backoff window enforcement ──
@@ -182,6 +283,10 @@ async def _make_engine():
                 role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
                 updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
                 stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
+                email_verified_at TIMESTAMP,
+                email_verification_token VARCHAR(255),
+                email_verification_sent_at TIMESTAMP,
+                apple_refresh_token TEXT, apple_sub VARCHAR(255),
                 is_canary BOOLEAN DEFAULT 0
             )""",
             """CREATE TABLE IF NOT EXISTS day_chats (
@@ -335,6 +440,131 @@ async def test_m2_max_retries_permanent_fail():
     print("OK test_m2_max_retries_permanent_fail")
 
 
+# ── W0.4b — both LLM entry points route through call_system_llm ──
+#
+# ORM-created sqlite tables (full column set) because generate_summary /
+# generate_archival_summary select the whole Message entity, not just
+# the columns the raw CREATE TABLE helper above covers.
+
+async def _make_orm_engine():
+    from app.db.models.user import User
+    from app.db.models.day_chat import DayChat
+    from app.db.models import Message, Conversation
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite://", connect_args={"check_same_thread": False},
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(
+            lambda c: Message.metadata.create_all(
+                c,
+                tables=[
+                    User.__table__, DayChat.__table__,
+                    Conversation.__table__, Message.__table__,
+                ],
+            )
+        )
+    return engine
+
+
+async def _seed_day(sm, n_messages: int = 3):
+    """Insert user + day_chat + conversation + n messages. Returns (user_id, dc_id)."""
+    from datetime import date as _date
+    from app.db.models import Message, Conversation
+
+    user_id = str(uuid.uuid4())
+    dc_id = str(uuid.uuid4())
+    async with sm() as db:
+        db.add(User(
+            id=user_id, email=f"{user_id[:8]}@t.local", hashed_password="x",
+            name="Test", role="beta_user", is_active=True,
+            created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
+        ))
+        db.add(DayChat(id=dc_id, user_id=user_id, local_date=_date.today()))
+        conv_id = str(uuid.uuid4())
+        db.add(Conversation(id=conv_id, user_id=user_id, day_chat_id=dc_id, channel="web"))
+        for i in range(n_messages):
+            db.add(Message(
+                id=f"m-{dc_id[:8]}-{i}", conversation_id=conv_id, day_chat_id=dc_id,
+                role="user" if i % 2 == 0 else "assistant",
+                content=f"message number {i}",
+                created_at=datetime.utcnow() + timedelta(seconds=i),
+            ))
+        await db.commit()
+    return user_id, dc_id
+
+
+async def test_w04b_generate_summary_uses_metered_path():
+    """generate_summary hands the prompt to call_system_llm with the
+    day-summary operation tag + haiku pin, and passes the day owner's
+    user_id so metering lands on the right tenant."""
+    engine = await _make_orm_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    user_id, dc_id = await _seed_day(sm)
+
+    mock_llm = AsyncMock(return_value="rolling summary text")
+    with patch("app.services.internal_llm.call_system_llm", mock_llm):
+        async with sm() as db:
+            text, reason = await _sumr.generate_summary(db, dc_id)
+
+    assert text == "rolling summary text"
+    assert reason == ""
+    mock_llm.assert_called_once()
+    kwargs = mock_llm.call_args.kwargs
+    assert kwargs["user_id"] == user_id
+    assert kwargs["operation_type"] == "system.day_summary"
+    assert kwargs["model"] == "claude-haiku-4-5-20251001"
+    assert kwargs["max_tokens"] == 1200
+    assert "message number 0" in kwargs["messages"][0]["content"]
+    await engine.dispose()
+    print("OK test_w04b_generate_summary_uses_metered_path")
+
+
+async def test_w04b_generate_summary_failure_reason_propagates():
+    """When the metered call fails, generate_summary surfaces the reason
+    from failure_out — run_summarizer_if_needed persists it verbatim."""
+    engine = await _make_orm_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    _, dc_id = await _seed_day(sm)
+
+    async def _failing_llm(*, failure_out=None, **kwargs):
+        if failure_out is not None:
+            failure_out["reason"] = "server_error"
+        return None
+
+    with patch("app.services.internal_llm.call_system_llm", _failing_llm):
+        async with sm() as db:
+            text, reason = await _sumr.generate_summary(db, dc_id)
+
+    assert text is None
+    assert reason == "server_error", f"expected server_error, got {reason!r}"
+    await engine.dispose()
+    print("OK test_w04b_generate_summary_failure_reason_propagates")
+
+
+async def test_w04b_archival_routes_through_call_system_llm():
+    """The archival path gets the same treatment — unified metered call,
+    no legacy per-provider helpers."""
+    engine = await _make_orm_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    user_id, dc_id = await _seed_day(sm)
+
+    mock_llm = AsyncMock(return_value="archival text")
+    with patch("app.services.internal_llm.call_system_llm", mock_llm):
+        async with sm() as db:
+            text = await _sumr.generate_archival_summary(db, dc_id)
+
+    assert text == "archival text"
+    mock_llm.assert_called_once()
+    kwargs = mock_llm.call_args.kwargs
+    assert kwargs["user_id"] == user_id
+    assert kwargs["operation_type"] == "system.day_archival"
+    assert kwargs["model"] == "claude-haiku-4-5-20251001"
+    assert kwargs["max_tokens"] == 1800
+    await engine.dispose()
+    print("OK test_w04b_archival_routes_through_call_system_llm")
+
+
 # ── Run all ──
 
 if __name__ == "__main__":
@@ -342,7 +572,12 @@ if __name__ == "__main__":
     asyncio.run(test_m1_anthropic_401_falls_back_to_openai())
     asyncio.run(test_m1_both_providers_fail_returns_anthropic_reason())
     asyncio.run(test_m1_no_keys_returns_no_keys_reason())
+    asyncio.run(test_w04b_bundle_mode_summarizes_without_raw_keys())
+    asyncio.run(test_w04b_bundle_failure_surfaces_real_reason())
     asyncio.run(test_m2_backoff_window_blocks_premature_retry())
     asyncio.run(test_m2_past_backoff_is_eligible())
     asyncio.run(test_m2_max_retries_permanent_fail())
+    asyncio.run(test_w04b_generate_summary_uses_metered_path())
+    asyncio.run(test_w04b_generate_summary_failure_reason_propagates())
+    asyncio.run(test_w04b_archival_routes_through_call_system_llm())
     print("\nALL FF-B.2 TESTS PASSED")

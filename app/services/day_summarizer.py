@@ -26,6 +26,13 @@ FF-B.2 (2026-05-08) — three changes vs the original implementation:
 See docs/memory/summarizer-payload-analysis.md for the diagnostic that
 drove this rewrite — root cause was a 401 from Anthropic that the old
 fallback condition didn't catch.
+
+W0.4b (2026-07-27): all LLM calls in this file now route through
+internal_llm.call_system_llm — bundle-aware (platform proxy on bundle
+tenants, BYOK direct otherwise) and metered into llm_proxy_events. The
+M1 Anthropic→OpenAI fallback and the M3 reason surfacing live in that
+layer now (failure_out); this file no longer reads raw provider keys,
+which used to make every bundle tenant fail with reason=no_keys.
 """
 
 import json
@@ -305,164 +312,43 @@ async def generate_summary(
 
     # Call Haiku (with OpenAI fallback) and surface the (text, reason) tuple
     # to the caller — see _try_summarize for fallback semantics.
-    return await _try_summarize(user_prompt)
+    return await _try_summarize(dc.user_id, user_prompt)
 
 
-async def _try_summarize(user_prompt: str) -> Tuple[Optional[str], str]:
-    """Try Anthropic → OpenAI fallback. Returns (summary_or_None, reason).
+async def _try_summarize(user_id: str, user_prompt: str) -> Tuple[Optional[str], str]:
+    """Generate the rolling summary via the metered system-LLM path.
 
-    Reason is one of {"" success, "auth_error", "rate_limit", "timeout",
-    "server_error", "parse_error", "no_keys", "other"}. Used by
-    run_summarizer_if_needed to record the M3 structured failure stub.
+    W0.4b: routes through call_system_llm — bundle-aware (platform proxy
+    when LLM_MODE=bundle, BYOK direct otherwise) and logged into
+    llm_proxy_events (operation_type="system.day_summary", exempt from
+    user caps). Haiku is pinned; call_system_llm transparently falls
+    back to gpt-4o-mini when the Anthropic dispatch can't complete
+    (Anthropic disabled, auth failure, no key…) — same M1 semantics the
+    old inline implementation had, minus the raw-key reads that made
+    bundle tenants permanently fail with reason=no_keys.
 
-    Auth-failure fallback (M1): Anthropic 401/403 → try OpenAI before
-    giving up. Same for any non-2xx if an OpenAI key is configured —
-    cheaper to fall back than fail-and-retry-from-zero.
+    Returns (summary_or_None, reason). Reason is one of {"" success,
+    "auth_error", "rate_limit", "timeout", "server_error", "parse_error",
+    "no_keys", "other"} — surfaced from the underlying call via
+    failure_out. Used by run_summarizer_if_needed to record the M3
+    structured failure stub.
     """
-    import httpx
-    from app.config import settings
+    from app.services.internal_llm import call_system_llm
 
-    anthropic_key = settings.anthropic_api_key
-    openai_key = settings.openai_api_key
-
-    if not anthropic_key and not openai_key:
-        logger.warning("[summarizer] No API key configured for summarization")
-        return None, "no_keys"
-
-    last_reason = "other"
-
-    # Try Anthropic first (cheaper for this workload)
-    if anthropic_key:
-        # Anthropic accepts two auth shapes:
-        #   - API keys (sk-ant-api03-…) → `x-api-key` header
-        #   - OAuth tokens (sk-ant-oat01-…) → `Authorization: Bearer …`
-        #     plus the claude-code/oauth beta header
-        # The summarizer was hardcoded to `x-api-key`, so OAuth tokens
-        # got rejected with 401 invalid x-api-key — silently routing
-        # everything through the OpenAI fallback (which masked the bug
-        # for weeks). Other call sites already detect the prefix
-        # (browser.py, ws_browser.py); the summarizer now matches.
-        is_oauth = anthropic_key.startswith("sk-ant-oat")
-        if is_oauth:
-            anthropic_headers = {
-                "Authorization": f"Bearer {anthropic_key}",
-                "anthropic-version": "2023-06-01",
-                "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
-                "content-type": "application/json",
-            }
-        else:
-            anthropic_headers = {
-                "x-api-key": anthropic_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            }
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers=anthropic_headers,
-                    json={
-                        "model": "claude-haiku-4-5-20251001",
-                        "max_tokens": 1200,
-                        "system": SUMMARIZER_SYSTEM_PROMPT,
-                        "messages": [{"role": "user", "content": user_prompt}],
-                    },
-                )
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    summary_text = data.get("content", [{}])[0].get("text", "")
-                    if summary_text:
-                        return summary_text, ""
-                    last_reason = "parse_error"
-                    logger.warning(
-                        "[summarizer] Anthropic returned 200 with empty content — request_id=%s",
-                        resp.headers.get("x-request-id", "?"),
-                    )
-                except Exception as parse_err:
-                    last_reason = "parse_error"
-                    logger.warning("[summarizer] Anthropic parse failed: %s", parse_err)
-            else:
-                last_reason = _classify_failure(
-                    status_code=resp.status_code, error_body=resp.text[:200],
-                )
-                logger.warning(
-                    "[summarizer] Anthropic %d (%s) — request_id=%s body=%s",
-                    resp.status_code, last_reason,
-                    resp.headers.get("x-request-id", "?"), resp.text[:200],
-                )
-        except Exception as e:
-            last_reason = _classify_failure(exception=e)
-            logger.warning("[summarizer] Anthropic exception (%s): %s", last_reason, e)
-
-        # M1 fallback: any Anthropic failure with an OpenAI key in scope
-        # routes through OpenAI. Previously only triggered on empty key.
-        if openai_key:
-            logger.info(
-                "[summarizer] Falling back to OpenAI (anthropic reason=%s)",
-                last_reason,
-            )
-            text, openai_reason = await _summarize_openai(openai_key, user_prompt)
-            if text:
-                return text, ""
-            # If OpenAI also failed, the reason that surfaces is whichever
-            # was more diagnostic — but auth_error trumps generic other.
-            return None, last_reason if last_reason != "other" else openai_reason
-
-        return None, last_reason
-
-    # Anthropic key missing but OpenAI present
-    text, openai_reason = await _summarize_openai(openai_key, user_prompt)
+    failure: Dict[str, str] = {}
+    text = await call_system_llm(
+        user_id=user_id,
+        operation_type="system.day_summary",
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1200,
+        system=SUMMARIZER_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+        timeout=30,
+        failure_out=failure,
+    )
     if text:
         return text, ""
-    return None, openai_reason
-
-
-async def _summarize_openai(api_key: str, user_prompt: str) -> Tuple[Optional[str], str]:
-    """Fallback summarizer using OpenAI API.
-
-    Returns (text_or_None, reason). Reason is "" on success, otherwise
-    one of the M3 taxonomy values. Same return shape as _try_summarize so
-    the auth-fallback path can compose them.
-    """
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "max_tokens": 1200,
-                    "messages": [
-                        {"role": "system", "content": SUMMARIZER_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                },
-            )
-        if resp.status_code == 200:
-            try:
-                text = resp.json()["choices"][0]["message"]["content"]
-                if text:
-                    return text, ""
-                return None, "parse_error"
-            except Exception as parse_err:
-                logger.warning("[summarizer] OpenAI parse failed: %s", parse_err)
-                return None, "parse_error"
-        reason = _classify_failure(status_code=resp.status_code, error_body=resp.text[:200])
-        logger.warning(
-            "[summarizer] OpenAI %d (%s) body=%s",
-            resp.status_code, reason, resp.text[:200],
-        )
-        return None, reason
-    except Exception as e:
-        reason = _classify_failure(exception=e)
-        logger.warning("[summarizer] OpenAI exception (%s): %s", reason, e)
-        return None, reason
+    return None, failure.get("reason") or "other"
 
 
 async def generate_archival_summary(
@@ -483,7 +369,7 @@ async def generate_archival_summary(
     """
     from app.db.models.day_chat import DayChat
     from app.db.models import Message, Conversation
-    from app.services.internal_llm import call_anthropic_system, call_openai_system
+    from app.services.internal_llm import call_system_llm
 
     dc = (await db.execute(select(DayChat).where(DayChat.id == day_chat_id))).scalar_one_or_none()
     if not dc:
@@ -541,23 +427,14 @@ async def generate_archival_summary(
         f"Messages (chronological, across all channels):\n\n{messages_text}"
     )
 
-    # Prefer Anthropic Haiku (cheap, strong at structured summarization). Fall
-    # back to OpenAI only if no Anthropic key is configured on the platform.
-    text = await call_anthropic_system(
+    # Prefer Anthropic Haiku (cheap, strong at structured summarization).
+    # W0.4b: unified path — bundle-aware and metered. call_system_llm
+    # handles the Anthropic-off / failure → gpt-4o-mini fallback itself,
+    # so the explicit call_openai_system second leg is gone.
+    return await call_system_llm(
         user_id=dc.user_id,
         operation_type="system.day_archival",
         model="claude-haiku-4-5-20251001",
-        max_tokens=1800,
-        system=ARCHIVAL_SUMMARY_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    if text:
-        return text
-
-    return await call_openai_system(
-        user_id=dc.user_id,
-        operation_type="system.day_archival",
-        model="gpt-4o-mini",
         max_tokens=1800,
         system=ARCHIVAL_SUMMARY_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
