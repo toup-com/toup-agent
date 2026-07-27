@@ -140,6 +140,11 @@ class Settings(BaseSettings):
     # choice once the platform Claude account is funded.
     agent_model: str = "gpt-5.5"  # Primary agent model (OpenAI — per-tenant key)
     agent_fallback_model: str = "gpt-4o"  # Distinct OpenAI fallback if primary fails
+    # analyze_image tool (vision Q&A on a URL/workspace image). Routed through
+    # the bundle LLM proxy in bundle mode so it is metered + governed like every
+    # other LLM call; gpt-4o matches the previously hardcoded model. Override
+    # via ANALYZE_IMAGE_MODEL for a cheaper default (e.g. gpt-4o-mini).
+    analyze_image_model: str = "gpt-4o"
     # Anthropic provider master switch. DEACTIVATED platform-wide on
     # 2026-05-29: bundle Anthropic calls share ONE platform Claude account
     # and it ran out of credit, hard-400ing every bundle user's Claude call

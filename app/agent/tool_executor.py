@@ -2077,41 +2077,42 @@ class ToolExecutor:
                 "image_url": {"url": f"data:{mime};base64,{data}"},
             }
 
-        # Call OpenAI vision API
-        api_key = settings.openai_api_key
-        if not api_key:
-            return "ERROR: OpenAI API key not configured"
+        # ONE client factory for both bundle (→ platform LLM proxy, which
+        # meters + governs the call) and manual/BYO (→ api.openai.com direct).
+        # See bundle_client.make_openai_client. Previously this POSTed raw to
+        # api.openai.com with settings.openai_api_key even in bundle mode,
+        # bypassing credit metering entirely (audit W0.4a).
+        from app.services.bundle_client import make_openai_client
+        from app.services.key_provider import keys
+        client = make_openai_client(byok_key=(keys.openai or None))
+        if client is None:
+            return (
+                "ERROR: No OpenAI access is configured for image analysis. "
+                "This tenant needs bundle mode or an OpenAI API key in Settings."
+            )
 
+        model = getattr(settings, "analyze_image_model", "gpt-4o") or "gpt-4o"
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "gpt-4o",
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": question},
-                                    image_content,
-                                ],
-                            }
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": question},
+                            image_content,
                         ],
-                        "max_tokens": 1024,
-                    },
-                )
-                resp.raise_for_status()
+                    }
+                ],
+                max_tokens=1024,
+                timeout=60,
+            )
+            return resp.choices[0].message.content or ""
 
-            result = resp.json()
-            return result["choices"][0]["message"]["content"]
-
-        except httpx.HTTPStatusError as exc:
-            return f"ERROR: Vision API returned {exc.response.status_code}"
         except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if isinstance(status, int):
+                return f"ERROR: Vision API returned {status}"
             logger.exception("analyze_image failed")
             return f"ERROR: Image analysis failed: {exc}"
 
