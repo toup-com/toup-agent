@@ -3469,10 +3469,12 @@ class AgentRunner:
                 "- You don't know their name yet. If it comes up naturally, "
                 "ask once — don't interrogate them for it."
             )
-        # PR-1 (finding F-1): the minute clock here sat at section 6 of 22
-        # and invalidated the cached prefix every minute. render_time_lines
-        # keeps only the coarse time-of-day word in the stable layout and
-        # routes the exact clock to the per-turn <turn_context> message.
+        # PR-1 (finding F-1) + W1.1: the minute clock here sat at section
+        # 6 of 22 and invalidated the cached prefix every minute; the
+        # coarse time-of-day word still busted it at 5/12/17/22 local.
+        # render_time_lines keeps the stable-layout system lines fully
+        # day-stable and routes both the exact clock and the tod word to
+        # the per-turn <turn_context> message.
         _time_lines = render_time_lines(now_local, tz_name, _tod, stable=_stable)
         _about_lines.append(_time_lines["about_you"])
         if _stable and _time_lines["turn_context"]:

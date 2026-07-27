@@ -13,8 +13,9 @@ reintroduce a prefix-buster:
     ``ChatCompletionAllowedToolChoiceParam`` shape and is deterministic
     for identical name sets.
   * ``render_time_lines`` — the stable layout emits NO minute-resolution
-    text into the system prompt (two calls a minute apart are
-    byte-identical); legacy keeps the old behavior.
+    text AND no time-of-day word into the system prompt (two calls a
+    minute apart — or straddling a 5/12/17/22 tod boundary — are
+    byte-identical); legacy keeps the old behavior byte-for-byte.
   * ``build_turn_context_message`` — single ephemeral user message with
     the injection-fencing envelope; empty parts → no message.
   * ``settings.stable_prefix_layout`` defaults OFF (flag-gated rollout).
@@ -131,14 +132,49 @@ class TestRenderTimeLines:
         assert a["about_you"] == b["about_you"]
         assert a["runtime"] == b["runtime"]
         assert "2:05" not in a["about_you"] and "2:05" not in a["runtime"]
+        # W1.1: nor the time-of-day word — it flipped at 5/12/17/22 local
+        # and was the last scheduled intra-day prefix bust.
+        assert "afternoon" not in a["about_you"]
         # The exact clock still reaches the model — via the turn context.
         assert "2:05 PM" in a["turn_context"]
         assert "2:06 PM" in b["turn_context"]
+
+    def test_stable_system_lines_survive_tod_boundary(self):
+        """W1.1: two calls straddling the 12:00 boundary (morning →
+        afternoon) yield byte-identical system-prompt lines; only the
+        turn-context clock line differs and carries the tod word."""
+        before = render_time_lines(
+            datetime(2026, 7, 23, 11, 59), "Europe/Berlin", "morning", stable=True
+        )
+        after = render_time_lines(
+            datetime(2026, 7, 23, 12, 1), "Europe/Berlin", "afternoon", stable=True
+        )
+        assert before["about_you"] == after["about_you"]
+        assert before["runtime"] == after["runtime"]
+        assert before["turn_context"] != after["turn_context"]
+        # Tone calibration is preserved — the tod word rides the clock line.
+        assert "morning" in before["turn_context"]
+        assert "afternoon" in after["turn_context"]
 
     def test_stable_runtime_line_changes_at_day_boundary(self):
         a = render_time_lines(self.T1, "UTC", "afternoon", stable=True)
         c = render_time_lines(self.NEXT_DAY, "UTC", "morning", stable=True)
         assert a["runtime"] != c["runtime"]  # date is allowed to roll daily
+
+    def test_legacy_lines_byte_identical_regression(self):
+        """W1.1 guardrail: the legacy (flag-off) path must not move a
+        byte — these are the exact pre-W1.1 strings."""
+        lines = render_time_lines(self.T1, "Europe/Berlin", "afternoon", stable=False)
+        assert lines["about_you"] == (
+            "- Local time for them right now: **afternoon** (2:05 PM). "
+            "Let it inform tone subtly — late at night, be quieter and "
+            "lower-energy; morning, be fresh. Don't announce the time of "
+            "day; just feel it."
+        )
+        assert lines["runtime"] == (
+            "- Current date/time: Thursday, July 23, 2026 at 2:05 PM (Europe/Berlin)"
+        )
+        assert lines["turn_context"] == ""
 
 
 class TestTurnContextMessage:

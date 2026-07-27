@@ -108,8 +108,10 @@ def render_time_lines(
 
     Legacy (stable=False) keeps minute resolution inside the system
     prompt (the F-1 cache-buster). Stable layout keeps only day-stable
-    text in the system prompt and moves the minute clock to the per-turn
-    context message.
+    text in the system prompt and moves the minute clock AND the coarse
+    time-of-day word to the per-turn context message — the tod word
+    flips at 5/12/17/22 local, which was the last scheduled intra-day
+    prefix bust (W1.1).
 
     Returns keys: ``about_you`` (about_you section time line),
     ``runtime`` (runtime section date/time line), ``turn_context``
@@ -131,18 +133,21 @@ def render_time_lines(
             "turn_context": "",
         }
     return {
+        # W1.1: fully static — no time_of_day word here, or the line flips
+        # at 5/12/17/22 local and busts the prefix 3-4x/day.
         "about_you": (
-            f"- Rough local time of day for them: **{time_of_day}**. Let it inform "
-            "tone subtly — late at night, be quieter and lower-energy; morning, be "
-            "fresh. Don't announce the time of day; just feel it. The exact clock "
-            "is in the current-turn context block."
+            "- The current time and rough time of day for them arrive in the "
+            "<turn_context> block each turn. Let the time of day inform tone "
+            "subtly — late at night, be quieter and lower-energy; morning, be "
+            "fresh. Don't announce the time of day; just feel it."
         ),
         "runtime": (
             f"- Today's date: {now_local.strftime('%A, %B %d, %Y')} ({tz_name}). "
             "The exact current time arrives in the <turn_context> block each turn."
         ),
         "turn_context": (
-            f"Current time: {now_local.strftime('%-I:%M %p')} ({tz_name})"
+            f"Current time: {now_local.strftime('%-I:%M %p')} ({tz_name}) "
+            f"— {time_of_day} for them"
         ),
     }
 
