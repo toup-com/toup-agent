@@ -1092,19 +1092,20 @@ class ToolExecutor:
         try:
             from app.db.database import async_session_maker
             from app.services.memory_service import MemoryService
-            from app.services.embedding_service import get_embedding_service
-            
-            embedding_svc = get_embedding_service()
-            embedding = embedding_svc.embed(query)
-            
+
             async with async_session_maker() as db:
                 svc = MemoryService(db)
-                results = await svc.search_memories_by_embedding(
+                # W1.5: route through the hybrid engine (RRF over
+                # vector+keyword+graph, strength floor) — same retriever
+                # auto-recall uses every turn — instead of pure dense
+                # cosine, which missed keyword/graph-only matches.
+                results = await svc.hybrid_search(
                     user_id=self._current_user_id,
-                    embedding=embedding,
+                    query=query,
                     limit=limit,
                     min_similarity=0.1,
                     brain_types=[brain_type] if brain_type else None,
+                    strategies=["vector", "keyword", "graph"],
                 )
             
             if not results:

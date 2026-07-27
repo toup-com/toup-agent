@@ -151,9 +151,9 @@ class TestHybridSearchIntegration:
         mock_db = AsyncMock()
         service = MemoryService(mock_db)
 
-        # Mock the embedding service
+        # Mock the embedding service (hybrid_search awaits embed_async)
         service.embedding_service = MagicMock()
-        service.embedding_service.embed.return_value = [0.1] * 1536
+        service.embedding_service.embed_async = AsyncMock(return_value=[0.1] * 1536)
 
         # Mock individual strategies
         with patch.object(service, '_vector_search', return_value=[

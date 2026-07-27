@@ -1851,13 +1851,21 @@ class MemoryService:
         
         # Generate query embedding once (shared by vector strategy)
         # Use async version to avoid blocking the event loop during chat
-        query_embedding = await self.embedding_service.embed_async(query, api_key=self.api_key)
+        # W1.5: an embedding failure must not kill the whole search —
+        # keyword/graph/temporal don't need the embedding, so degrade
+        # to them instead of raising (per-strategy isolation below only
+        # covers the gather, not this shared call).
+        try:
+            query_embedding = await self.embedding_service.embed_async(query, api_key=self.api_key)
+        except Exception as e:
+            query_embedding = None
+            logger.warning(f"[HYBRID] Query embedding failed, skipping vector strategy: {e}")
 
         # Run enabled strategies in parallel
         tasks = {}
         fetch_limit = limit * 4  # Over-fetch per strategy for re-ranker input
         
-        if "vector" in strategies:
+        if "vector" in strategies and query_embedding is not None:
             # F-final (2026-05-10): pass min_similarity down so the
             # vector-only path applies the floor BEFORE results enter
             # RRF. Memories matched by keyword/graph still surface
@@ -1925,7 +1933,7 @@ class MemoryService:
         
         # Compute per-memory vector similarity (for scoring + response)
         similarity_map: Dict[str, float] = {}
-        if hasattr(Memory, 'embedding') and Memory.embedding is not None and fused_ids:
+        if hasattr(Memory, 'embedding') and Memory.embedding is not None and fused_ids and query_embedding is not None:
             try:
                 # pgvector accepts Python list directly (no string conversion needed)
                 embedding_vec = query_embedding  # raw list for pgvector
