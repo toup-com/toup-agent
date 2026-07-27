@@ -36,8 +36,15 @@ class Entity(Base):
     # Metadata
     attributes_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # Full-text search on name
-    name_search = Column(TSVECTOR, nullable=True)
+    # Full-text search on name (auto-updated by PostgreSQL trigger).
+    # `with_variant(TSVECTOR(), "postgresql")` keeps the prod schema as
+    # tsvector while letting SQLite compile the column as Text — same
+    # treatment as memories.search_vector. A bare TSVECTOR raises
+    # UnsupportedCompilationError on sqlite, which aborted the WHOLE bulk
+    # create_all in init_db (the error contains "vector", so the fallback
+    # then skipped memories AND entities as "needs pgvector") — leaving
+    # sqlite runs with no memories/entities tables at all (W0.1b).
+    name_search = Column(Text().with_variant(TSVECTOR(), "postgresql"), nullable=True)
 
     # Stats
     mention_count: Mapped[int] = mapped_column(Integer, default=1)

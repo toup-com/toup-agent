@@ -266,25 +266,35 @@ async def init_db():
             else:
                 raise
 
+    # Tables whose DDL needs the pgvector extension (embedding columns).
+    # Hoisted out of the fallback branch so the missing-table backstop
+    # below can reuse the same skip set.
+    _vector_tables = set()
+    for table in _allowed_tables:
+        for col in table.columns:
+            if "vector" in str(col.type).lower():
+                _vector_tables.add(table.name)
+                break
+
     # If create_all failed due to missing vector, create tables one by one
     # in a FRESH connection (the old transaction is in an aborted state).
+    # Each CREATE gets its OWN transaction: with one shared engine.begin(),
+    # the first failure (e.g. an FK onto a skipped vector table — entity_links
+    # → entities) aborts the transaction and every later CREATE then fails
+    # with "current transaction is aborted". That poisoning is how tenant
+    # 871bac24's DB ended up permanently missing memory_events +
+    # memory_relationships (W0.1b) — same lesson as the _alter_statements
+    # loop's 2026-04-28 incident below.
     if not _has_pgvector:
-        _vector_tables = set()
         for table in _allowed_tables:
-            for col in table.columns:
-                if "vector" in str(col.type).lower():
-                    _vector_tables.add(table.name)
-                    break
-
-        async with engine.begin() as conn:
-            for table in _allowed_tables:
-                if table.name in _vector_tables:
-                    _logger.info("Skipping table %s (needs pgvector)", table.name)
-                    continue
-                try:
+            if table.name in _vector_tables:
+                _logger.info("Skipping table %s (needs pgvector)", table.name)
+                continue
+            try:
+                async with engine.begin() as conn:
                     await conn.run_sync(table.create, checkfirst=True)
-                except Exception:
-                    _logger.warning("Failed to create table %s", table.name)
+            except Exception:
+                _logger.warning("Failed to create table %s", table.name)
 
     # ── Runtime safety assertion ──────────────────────────────────
     # Verify that forbidden tables were NOT created in this DB.
@@ -316,6 +326,43 @@ async def init_db():
         raise
     except Exception as _e:
         _logger.warning("Could not verify table partitioning: %s", _e)
+
+    # ── Missing-table backstop (W0.1b) ────────────────────────────────
+    # PROVEN in prod (tenant 871bac24): a DB can drift to a state where
+    # some model tables were never created — an old boot went down the
+    # no-pgvector fallback above when it still ran in ONE shared
+    # transaction, so the first failed CREATE silently killed every
+    # later one (memory_events, memory_relationships), and nothing ever
+    # retried them. `create_all` heals missing tables on a healthy boot,
+    # but any bulk-pass failure leaves the DB short forever. Re-check
+    # here and create stragglers individually, each in its own
+    # transaction, so one failure can't poison the rest. No-op (one
+    # inspection round-trip) when the schema is complete. Runs BEFORE
+    # the ALTER loop so healed tables also receive their index/backfill
+    # statements below.
+    try:
+        async with engine.connect() as conn:
+            _present_tables = set(await conn.run_sync(
+                lambda sync_conn: sa_inspect(sync_conn).get_table_names()
+            ))
+        for table in _allowed_tables:
+            if table.name in _present_tables:
+                continue
+            if not _has_pgvector and table.name in _vector_tables:
+                continue  # same skip as the fallback path above
+            try:
+                async with engine.begin() as conn:
+                    await conn.run_sync(table.create, checkfirst=True)
+                _logger.warning(
+                    "[init_db] table backstop: created missing table %s", table.name
+                )
+            except Exception as _e:
+                _logger.warning(
+                    "[init_db] table backstop: FAILED %s — %s",
+                    table.name, str(_e)[:200],
+                )
+    except Exception as _e:
+        _logger.warning("[init_db] table backstop skipped: %s", str(_e)[:200])
 
     # Add missing columns to existing tables (create_all only creates new tables).
     #
@@ -672,6 +719,59 @@ async def init_db():
         # land. Empty for v1 — listed here so the migration path is
         # obvious when we add columns later.
         # (Reserved space; no v1 ALTERs needed beyond create_all.)
+        # ── Tenant memory-schema drift heal (W0.1b, 2026-07-27) ──
+        # PROVEN in prod: tenant 871bac24's memories table predates the
+        # User Brain upgrades and was missing source_* (UndefinedColumnError
+        # on every memory query) — create_all only creates NEW tables, and
+        # the no-pgvector fallback skips memories entirely, so an ancient
+        # table never gains columns. Mirror the FULL current model column
+        # set with model defaults: the DEFAULTs matter because Postgres
+        # backfills existing rows, so filter-critical columns (is_deleted,
+        # is_active, strength …) read their model default instead of NULL —
+        # `WHERE is_deleted = FALSE` must keep matching legacy rows. The
+        # generic reconcile backstop below adds bare NULLable columns only,
+        # which would silently hide every legacy memory from retrieval.
+        # (embedding is deliberately absent: the vector-dim DO block below
+        # owns it, and it can't be added where pgvector is unavailable.)
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS brain_type VARCHAR(20) DEFAULT 'user'",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS summary VARCHAR(500)",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding_json TEXT",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS search_vector TSVECTOR",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS importance FLOAT DEFAULT 0.5",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence FLOAT DEFAULT 1.0",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS strength FLOAT DEFAULT 1.0",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_level VARCHAR(20) DEFAULT 'episodic'",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS emotional_salience FLOAT DEFAULT 0.5",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_reinforced_at TIMESTAMP",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS consolidation_count INTEGER DEFAULT 0",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS decay_rate FLOAT DEFAULT 0.1",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS created_at TIMESTAMP",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMP",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS access_count INTEGER DEFAULT 0",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_message_id VARCHAR(36)",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_type VARCHAR(50) DEFAULT 'conversation'",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS metadata_json TEXT",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tags_json TEXT",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS canonical_content TEXT",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS history_json TEXT",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS merged_from_json TEXT",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by VARCHAR(36)",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+        # Same heal for entities — also skipped by the no-pgvector fallback,
+        # so an ancient entities table drifts identically.
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS description TEXT",
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS embedding_json TEXT",
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS schema_type VARCHAR(50)",
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS attributes_json TEXT",
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS name_search TSVECTOR",
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS mention_count INTEGER DEFAULT 1",
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP",
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP",
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP",
+        "ALTER TABLE entities ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP",
         # Bug sweep 2026-05-13 / Ticket 2: explicit memory↔entity linkage
         # (ref_kind, ref_id) so memories ABOUT a specific routine/trigger
         # upsert instead of duplicating. Columns are nullable — legacy
