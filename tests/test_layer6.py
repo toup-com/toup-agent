@@ -928,10 +928,15 @@ class TestVoiceRouter(unittest.TestCase):
         self.assertIsNotNone(router)
         self.assertEqual(router.prefix, "/voice")
 
-    def test_set_refs(self):
-        from app.api.voice import set_voice_refs
-        set_voice_refs(MagicMock())
-        # Should not raise
+    def test_talk_surface_removed(self):
+        # The unauthenticated /ws/talk WebSocket and /talk/status endpoint
+        # were removed (W0.5) — the only voice conversation surface is
+        # /api/ws/realtime.
+        from app.api import voice
+        paths = [r.path for r in voice.router.routes]
+        self.assertFalse(any("/ws/talk" in p for p in paths))
+        self.assertFalse(any("/talk/status" in p for p in paths))
+        self.assertFalse(hasattr(voice, "set_voice_refs"))
 
 
 # ═══════════════════════════════════════════════════════════════

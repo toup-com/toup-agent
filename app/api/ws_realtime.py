@@ -1629,6 +1629,23 @@ async def _meter_voice_turn(user_id: str, model: str, usage: dict, response_id: 
                          user_id[:8], response_id[:12])
 
 
+def _maybe_meter_response(user_id: str, response: dict, using_platform_key: bool):
+    """Metering gate for one response.done (v1 AND v2 — usage frames arrive
+    identically on v1). Every response re-bills the accumulated context, so
+    this — not the mic stream — is the billing unit. Platform-key sessions
+    only (BYOK pays OpenAI). Returns the created task, or None if this
+    response bills nothing."""
+    if not using_platform_key:
+        return None
+    usage = response.get("usage") or {}
+    rid = response.get("id") or ""
+    if not usage or not rid:
+        return None
+    return asyncio.create_task(
+        _meter_voice_turn(user_id, realtime_model(), usage, rid)
+    )
+
+
 @router.websocket("/ws/realtime")
 async def realtime_voice_ws(
     websocket: WebSocket,
@@ -1709,8 +1726,8 @@ async def realtime_voice_ws(
     except Exception:
         logger.exception("[REALTIME] OpenAI key lookup failed")
         openai_key = None
-    # Platform-key sessions are the ones we meter (V2): BYOK users pay OpenAI
-    # directly, charging them credits too would be a double-bill.
+    # Platform-key sessions are the ones we meter (v1 and v2): BYOK users pay
+    # OpenAI directly, charging them credits too would be a double-bill.
     using_platform_key = not openai_key
     openai_key = openai_key or settings.openai_api_key
     if not openai_key:
@@ -2248,16 +2265,9 @@ async def realtime_voice_ws(
                 elif etype == "response.done":
                     response = event.get("response", {})
 
-                    # V2 metering: every response re-bills the accumulated
-                    # context, so this — not the mic stream — is the billing
-                    # unit. Platform-key sessions only (BYOK pays OpenAI).
-                    if _v2_active() and using_platform_key:
-                        _usage = response.get("usage") or {}
-                        _rid = response.get("id") or ""
-                        if _usage and _rid:
-                            _bg_tasks.append(asyncio.create_task(
-                                _meter_voice_turn(user_id, realtime_model(), _usage, _rid)
-                            ))
+                    _meter_t = _maybe_meter_response(user_id, response, using_platform_key)
+                    if _meter_t is not None:
+                        _bg_tasks.append(_meter_t)
                     # Extract final text from output items
                     full_text = response_text_accum
                     for item in response.get("output", []):

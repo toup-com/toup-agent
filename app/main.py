@@ -32,7 +32,7 @@ from app.api.ws_chat import router as ws_chat_router, set_ws_refs
 # Layer 6 routers
 from app.api.canvas import router as canvas_router
 from app.api.doctor import router as doctor_router
-from app.api.voice import router as voice_router, set_voice_refs
+from app.api.voice import router as voice_router
 # Dashboard proxy
 from app.api.dashboard_proxy import router as dashboard_proxy_router
 # Combined checkout

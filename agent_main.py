@@ -45,7 +45,7 @@ from app.api.ws_chat import router as ws_chat_router, set_ws_refs, broadcast_to_
 from app.api.api_v1 import router as api_v1_router
 from app.api.models import router as models_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
-from app.api.voice import router as voice_router, set_voice_refs
+from app.api.voice import router as voice_router
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.dashboard import router as dashboard_router
