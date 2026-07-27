@@ -1639,6 +1639,87 @@ async def _wait_stable(page, timeout: int = 3000):
 # Agentic browser loop
 # ---------------------------------------------------------------------------
 
+# W1.3 token efficiency: the loop used to resend the whole trajectory —
+# screenshots included (~1,100 tokens each at detail:high, 7 of 9 tools
+# attach one) — on every step. Each OpenAI call now gets an ELIDED VIEW of
+# the conversation: old tool results collapse to ~30-token stubs and only
+# the most recent screenshots survive. The canonical `conversation` list is
+# never mutated by the view helpers (elide_tool_results deep-copies).
+
+
+def _is_image_block(block: Any) -> bool:
+    return isinstance(block, dict) and block.get("type") in ("image_url", "image")
+
+
+def _strip_stale_screenshots(messages: List[Dict[str, Any]], keep_last: int = 2) -> List[Dict[str, Any]]:
+    """Drop image blocks from all but the last `keep_last` image-bearing
+    messages, in place. The system prompt instructs the model to act on the
+    CURRENT screenshot, so older frames are stale by design. Only call this
+    on the deep copy returned by elide_tool_results, never on the canonical
+    conversation list."""
+    image_indices = [
+        i for i, m in enumerate(messages)
+        if isinstance(m.get("content"), list) and any(_is_image_block(b) for b in m["content"])
+    ]
+    for i in (image_indices[:-keep_last] if keep_last > 0 else image_indices):
+        msg = messages[i]
+        msg["content"] = [b for b in msg["content"] if not _is_image_block(b)] + [
+            {"type": "text", "text": "[screenshot omitted — act on the most recent screenshot]"}
+        ]
+    return messages
+
+
+def _prepare_browser_llm_view(
+    conversation: List[Dict[str, Any]],
+    keep_recent_turns: int = 5,
+    keep_last_images: int = 2,
+) -> List[Dict[str, Any]]:
+    """Deep-copied, token-efficient view of the conversation for one LLM call
+    (OpenAI format)."""
+    from app.agent.tool_elision import elide_tool_results
+    view = elide_tool_results(conversation, keep_recent_turns=keep_recent_turns, format="openai")
+    return _strip_stale_screenshots(view, keep_last=keep_last_images)
+
+
+def _browser_cache_kwargs(provider: str, user_id: Optional[str], session_id: Optional[str]) -> Dict[str, Any]:
+    """OpenAI prompt-cache routing for the browser loop — key the trajectory
+    to this user+session so consecutive steps hit the same replica's cache.
+    Param names mirror agent_runner's; OpenAI-only (the Anthropic SDK
+    rejects unknown kwargs)."""
+    if provider != "openai" or not user_id or not session_id:
+        return {}
+    return {
+        "prompt_cache_key": f"browser:{user_id}:{session_id}",
+        "prompt_cache_retention": "24h",
+        "safety_identifier": user_id,
+    }
+
+
+def _collapse_finished_task(
+    conversation: List[Dict[str, Any]],
+    task_start: int,
+    user_message: str,
+    agent_response: str,
+) -> None:
+    """Replace a finished task's full trajectory (screenshots, tool spam)
+    with the plain user message + final summary — mirrors what gets
+    persisted to the DB — so the next task in this WS session starts from a
+    compact history."""
+    collapsed: List[Dict[str, Any]] = [{"role": "user", "content": user_message}]
+    if agent_response:
+        collapsed.append({"role": "assistant", "content": agent_response})
+    conversation[task_start:] = collapsed
+
+
+def _is_context_length_error(err: Exception) -> bool:
+    """Detect a context-window overflow without importing SDK error classes
+    (the bundle proxy re-raises with the upstream error body in the text)."""
+    if getattr(err, "code", None) == "context_length_exceeded":
+        return True
+    text = str(err).lower()
+    return any(s in text for s in ("context_length", "context length", "maximum context", "context window"))
+
+
 async def _run_browser_agent(
     websocket: WebSocket,
     page,
@@ -1670,10 +1751,14 @@ async def _run_browser_agent(
         return await _original_send(data, **kwargs)
     websocket.send_json = _capturing_send  # type: ignore
 
+    # Everything the task appends past this index gets collapsed once it ends.
+    _task_start = len(conversation)
+
     try:
         await _run_browser_agent_inner(
             websocket, page, tab_manager, browser_mod,
             user_message, conversation, overlay, model_override=model_override,
+            user_id=user_id_for_save, session_id=session_id,
         )
     except Exception as e:
         logger.exception("[WS Browser] Agent loop crashed")
@@ -1684,6 +1769,7 @@ async def _run_browser_agent(
             pass
     finally:
         websocket.send_json = _original_send  # type: ignore
+        _collapse_finished_task(conversation, _task_start, user_message, _agent_response)
         # Save agent response to DB
         if session_id and _agent_response and user_id_for_save:
             try:
@@ -1727,6 +1813,8 @@ async def _run_browser_agent_inner(
     conversation: List[Dict[str, Any]],
     overlay: AgentOverlay,
     model_override: str = None,
+    user_id: str = None,
+    session_id: str = None,
 ):
     import base64 as _b64mod
 
@@ -1783,6 +1871,8 @@ async def _run_browser_agent_inner(
         "play_media": "TodoWrite", "done": "Task",
     }
     _CC_TO_BROWSER = {v: k for k, v in _BROWSER_TO_CC.items()}
+
+    _cache_kwargs = _browser_cache_kwargs(_llm_provider, user_id, session_id)
 
     logger.warning("=" * 80)
     logger.warning("[BROWSER AGENT] NEW SESSION")
@@ -1907,18 +1997,52 @@ async def _run_browser_agent_inner(
                     )
                 else:
                     tc_mode = "required" if _force_required else "auto"
-                    response = await client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "system", "content": system_prompt}] + conversation,
-                        tools=BROWSER_TOOLS_OPENAI,
-                        tool_choice=tc_mode,
-                        max_completion_tokens=2048,
-                        temperature=0.2,
-                    )
+                    _send_messages = _prepare_browser_llm_view(conversation)
+                    try:
+                        response = await client.chat.completions.create(
+                            model=model,
+                            messages=[{"role": "system", "content": system_prompt}] + _send_messages,
+                            tools=BROWSER_TOOLS_OPENAI,
+                            tool_choice=tc_mode,
+                            max_completion_tokens=2048,
+                            temperature=0.2,
+                            **_cache_kwargs,
+                        )
+                    except Exception as _ctx_err:
+                        if not _is_context_length_error(_ctx_err):
+                            raise
+                        # Context overflow: retry once with a much tighter
+                        # elision window before giving up.
+                        logger.warning("[STEP %d] Context overflow — retrying with keep_recent_turns=2", step + 1)
+                        _send_messages = _prepare_browser_llm_view(conversation, keep_recent_turns=2)
+                        response = await client.chat.completions.create(
+                            model=model,
+                            messages=[{"role": "system", "content": system_prompt}] + _send_messages,
+                            tools=BROWSER_TOOLS_OPENAI,
+                            tool_choice=tc_mode,
+                            max_completion_tokens=2048,
+                            temperature=0.2,
+                            **_cache_kwargs,
+                        )
             except Exception as e:
                 logger.error("[STEP %d] LLM CALL FAILED: %s", step + 1, e)
                 await websocket.send_json({"type": "error", "message": f"LLM error: {e}"})
                 return
+
+            # Per-step token telemetry — greppable via `grep cache_read=`
+            try:
+                _u = response.usage
+                if _llm_provider == "anthropic":
+                    logger.info("[PERF] browser_step input=%s output=%s cache_read=%s model=%s",
+                                _u.input_tokens, _u.output_tokens,
+                                getattr(_u, "cache_read_input_tokens", 0) or 0, model)
+                else:
+                    _ptd = getattr(_u, "prompt_tokens_details", None)
+                    logger.info("[PERF] browser_step input=%s output=%s cache_read=%s model=%s",
+                                _u.prompt_tokens, _u.completion_tokens,
+                                getattr(_ptd, "cached_tokens", 0) or 0, model)
+            except Exception:
+                pass
 
             # Normalize response into provider-agnostic format
             if _llm_provider == "anthropic":
@@ -2048,9 +2172,8 @@ async def _run_browser_agent_inner(
                 # The agent's LLM calls already pass through the bundle
                 # proxy (`make_anthropic_client` / `make_openai_client` in
                 # this function) which deducts the message-credits cost.
-                # Adding a per-action flat fee here requires threading
-                # `user_id` through `_run_browser_agent_inner`'s signature
-                # (it isn't in scope at this layer today). Tracked as
+                # `user_id` is now threaded into this function (W1.3 cache
+                # keying), but the per-action flat fee itself remains a
                 # P2 follow-up — design.md §6.4.
 
                 # Log page URL after action (detect if navigation happened unexpectedly)
@@ -2677,14 +2800,18 @@ async def ws_browser(
             ).scalar_one_or_none()
             if _last:
                 _browser_session_id = _last.id
+                # W1.3(d): cap the reconnect seed at the LAST 20 messages —
+                # the old asc/limit(100) took the oldest 100 and reseeded
+                # the LLM with up to 100 turns of stale trajectory.
                 _hist = (
                     await _hdb.execute(
                         _sel(MsgModel)
                         .where(MsgModel.conversation_id == _browser_session_id)
-                        .order_by(MsgModel.created_at.asc())
-                        .limit(100)
+                        .order_by(MsgModel.created_at.desc())
+                        .limit(20)
                     )
                 ).scalars().all()
+                _hist = list(reversed(_hist))  # chronological order
                 if _hist:
                     _history_msgs = [
                         {"role": m.role, "content": m.content, "timestamp": m.created_at.isoformat()}
