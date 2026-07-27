@@ -22,7 +22,8 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
 
 
 def _support_model() -> Optional[str]:
-    """Model override for support ops; None ⇒ platform default (gpt-5.5)."""
+    """Model for support ops (config default gpt-4o-mini); None/"" ⇒
+    platform default (settings.agent_model, gpt-5.5)."""
     return getattr(settings, "support_agent_model", None) or None
 
 

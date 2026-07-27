@@ -476,10 +476,13 @@ class Settings(BaseSettings):
     # ── Maintenance / support agent (app.support) ────────────────────
     # Master switch. Off ⇒ every /api/support route 503s. Dark-launched.
     support_agent_enabled: bool = False
-    # Model for support classify/route/diagnose/implement LLM calls. None ⇒
-    # the platform default (settings.agent_model, gpt-5.5). Never pin Claude
-    # while Anthropic is deactivated.
-    support_agent_model: Optional[str] = None
+    # Model for support classify/route/diagnose/implement LLM calls. Pinned
+    # to gpt-4o-mini (2026-07 SOTA audit): None resolved to the platform
+    # default (settings.agent_model, gpt-5.5) for 4+ calls/ticket the day
+    # support_agent_enabled flips on. Env-overridable via
+    # SUPPORT_AGENT_MODEL; empty string ⇒ platform default. Never pin
+    # Claude while Anthropic is deactivated.
+    support_agent_model: Optional[str] = "gpt-4o-mini"
     # Intake size cap (chars) — 413 above this.
     support_intake_max_chars: int = 8000
     # Concurrency cap for diagnosis context-gathering fan-out (file IO /

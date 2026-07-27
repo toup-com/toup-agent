@@ -34,6 +34,7 @@ Usage (preferred):
 """
 
 import logging
+import sys
 import time
 import uuid
 from datetime import datetime
@@ -109,11 +110,18 @@ async def call_system_llm(
     # falling through. Does NOT block the call; this is detection,
     # not enforcement.
     if not (model or "").strip():
+        # Caller frame name — valid pre-first-await (direct awaits chain
+        # frames normally); a Task-wrapped call just yields the runner name.
+        try:
+            caller = sys._getframe(1).f_code.co_name
+        except Exception:
+            caller = "?"
         logger.warning(
-            "[internal_llm] model=None for operation_type=%s — resolving to user agent_model. "
+            "[internal_llm] model=None for operation_type=%s caller=%s — resolving to user agent_model. "
             "If this is a high-frequency or background call site, pin an explicit model "
             "(e.g. 'claude-haiku-4-5-20251001') to keep cost predictable.",
             operation_type,
+            caller,
         )
 
     resolved_model = (model or "").strip() or default_model()

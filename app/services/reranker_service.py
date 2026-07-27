@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 COHERE_RERANK_URL = "https://api.cohere.com/v2/rerank"
 COHERE_DEFAULT_MODEL = "rerank-v3.5"
 
+# Cost cap for the LLM (gpt-4o-mini) fallback only — memory-heavy users can
+# fan 60+ fused candidates into a single rerank call. Cohere is purpose-built
+# and cheap, so its path is uncapped.
+LLM_RERANK_MAX_DOCS = 30
+
 
 class RerankerService:
     """
@@ -196,6 +201,15 @@ class RerankerService:
         Uses OpenAI directly — the LLMService routes through Anthropic when
         ANTHROPIC_API_KEY is set, which can't handle gpt-4o-mini.
         """
+        # Cap the scoring input at LLM_RERANK_MAX_DOCS, keeping the
+        # highest-fused-score candidates (final_score from RRF).
+        if len(candidates) > LLM_RERANK_MAX_DOCS:
+            candidates = sorted(
+                candidates,
+                key=lambda c: c.get("final_score", 0.0),
+                reverse=True,
+            )[:LLM_RERANK_MAX_DOCS]
+
         # Build numbered document list
         doc_lines = []
         for i, c in enumerate(candidates):

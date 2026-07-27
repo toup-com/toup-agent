@@ -562,6 +562,21 @@ class AppBuilderSkill(Skill):
         self._app_manager = app_manager
         self._ws_broadcast = ws_broadcast
         self._skill_loader = skill_loader
+        # Visibility (2026-07 SOTA audit): planner/builder fall through to
+        # the chat model at up to 32k max_tokens/call — log what actually
+        # resolved so prod behaviour is greppable. Never break skill boot.
+        try:
+            from app.services.model_resolver import (
+                app_builder_planner_model,
+                app_builder_builder_model,
+            )
+            logger.info(
+                "[app_builder] models resolved: planner=%s builder=%s",
+                app_builder_planner_model(),
+                app_builder_builder_model(),
+            )
+        except Exception as exc:
+            logger.debug("[app_builder] model-resolution log skipped: %s", exc)
 
     def set_refs(self, app_manager=None, ws_broadcast=None, skill_loader=None):
         """Set references after construction (for late binding)."""
