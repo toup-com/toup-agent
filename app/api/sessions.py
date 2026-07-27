@@ -110,6 +110,30 @@ async def create_session(
     except Exception:
         pass
 
+    # SessionCreate.channel DEFAULTS to "api" — a channel governed by the
+    # partial unique index ix_conversations_system_channel_per_day. With a
+    # real day_chat_id stamped, a blind insert 500s on the user's 2nd
+    # default-channel create of the same local day (same bug class the
+    # runner hit, 543739ab). Route system channels through the canonical
+    # resolver: it reuses the day's existing thread and recovers from the
+    # insert race. Reuse still returns 201 with the existing row.
+    from app.agent.conversation_resolver import (
+        SYSTEM_CHANNELS,
+        resolve_or_create_day_conversation,
+    )
+    if request.channel in SYSTEM_CHANNELS and _day_chat_id is not None:
+        session = await resolve_or_create_day_conversation(
+            db,
+            user_id=current_user.id,
+            day_chat_id=_day_chat_id,
+            channel=request.channel,
+            title=request.title,
+            metadata=request.metadata,
+        )
+        await db.commit()
+        await db.refresh(session)
+        return _session_to_response(session)
+
     # Create session (Conversation model)
     session = Conversation(
         user_id=current_user.id,

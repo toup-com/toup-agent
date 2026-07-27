@@ -109,16 +109,21 @@ async def resolve_or_create_day_conversation(
         title=title,
         metadata_json=meta_json,
     )
-    db.add(conv)
     try:
-        await db.flush()
+        # Real SAVEPOINT around the optimistic INSERT: an IntegrityError
+        # rolls back only this insert. A bare db.rollback() here would be
+        # a FULL transaction rollback, silently discarding the caller's
+        # uncommitted work (pending messages, session mutations).
+        async with db.begin_nested():
+            db.add(conv)
+            await db.flush()
         return conv
     except IntegrityError:
-        # Lost the race against a concurrent fire. Roll the savepoint
-        # back so the session is reusable, then read the winner.
+        # Lost the race against a concurrent fire. begin_nested already
+        # rolled the savepoint back — the outer transaction is intact —
+        # so just read the winner.
         if not is_system or day_chat_id is None:
             raise
-        await db.rollback()
         logger.info(
             "[conversation_resolver] concurrent insert collision for "
             "user=%s day=%s channel=%s — re-fetching winner",

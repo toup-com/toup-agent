@@ -2468,8 +2468,14 @@ class AgentRunner:
         from app.agent.conversation_resolver import (
             resolve_or_create_day_conversation as _resolve_day_conv,
         )
+        # force_new is deliberately a NO-OP for these channels: channel and
+        # force_new are both client-controlled over /ws/chat, and honoring
+        # force_new here would resurrect the blind insert below — which the
+        # partial unique index rejects (a 2nd active row per (user, day,
+        # channel) is impossible). The resolver returns the day's existing
+        # thread instead of crashing the turn.
         _INDEXED_SYSTEM_CHANNELS = ("routine", "trigger", "api", "digest")
-        if _channel in _INDEXED_SYSTEM_CHANNELS and _day_chat_id is not None and not force_new:
+        if _channel in _INDEXED_SYSTEM_CHANNELS and _day_chat_id is not None:
             conv = await _resolve_day_conv(
                 db, user_id=user_id, day_chat_id=_day_chat_id, channel=_channel,
                 metadata=json.loads(_meta) if _meta else None,
