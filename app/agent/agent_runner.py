@@ -3678,7 +3678,10 @@ class AgentRunner:
                 "[[Option A]] [[Option B]] [[Option X]] [[Option Y]]\n\n"
                 "Keep button labels short (2-5 words). Use 2-4 buttons per question when relevant."
             )
-        else:
+        elif _channel_safe in ("telegram", "cron", "heartbeat"):
+            # 'cron' and 'heartbeat' turns deliver their output to the user's
+            # Telegram (cron_service / heartbeat_service push via the bot), so
+            # they keep the Telegram-shaped rules incl. button/reaction syntax.
             section_parts["formatting"] = (
                 "# Formatting Rules (IMPORTANT)\n"
                 "You are communicating via Telegram. Follow these rules strictly:\n"
@@ -3702,6 +3705,49 @@ class AgentRunner:
                 "Use buttons when offering clear choices, confirmations, or actions. "
                 "Example: [[button:Yes|confirm_yes]] [[button:No|confirm_no]]\n"
                 "Keep callback_data short (max 64 chars). Don't overuse buttons — only when genuinely helpful."
+            )
+        elif _channel_safe == "mobile":
+            # The native app RENDERS [[button:Label|value]] markers as
+            # quick-reply chips (ChatMarkdown.tsx parses both [[button:...]]
+            # and bare [[Label]]), so mobile keeps the button teaching —
+            # but not the Telegram framing and not [[reaction:...]], which
+            # the app does not render.
+            section_parts["formatting"] = (
+                "# Formatting Rules (IMPORTANT)\n"
+                "Follow these rules strictly:\n"
+                "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
+                "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
+                "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
+                "- Write fractions as a/b, not \\frac{a}{b}.\n"
+                "- Keep formatting light: plain text with at most **bold**, *italic*, `code`.\n"
+                "- Do NOT use tables or complex formatting.\n"
+                "- Keep responses concise and easy to read on a small screen.\n\n"
+                "# Quick-Reply Buttons\n"
+                "You can offer tappable choices by including [[button:LABEL|CALLBACK_DATA]] "
+                "markers. They are stripped from the text and rendered as buttons in the app. "
+                "Use them for clear choices, confirmations, or actions. "
+                "Example: [[button:Yes|confirm_yes]] [[button:No|confirm_no]]\n"
+                "Keep labels short (2-5 words); don't overuse buttons — only when genuinely helpful."
+            )
+        else:
+            # Neutral messaging-surface rules for every other channel
+            # (voice, extension, discord, slack, whatsapp, unknown).
+            # NEVER teach [[button:...]] / [[reaction:...]] here — those
+            # markers render only on Telegram and the native app; on any
+            # other surface they leak into the message body as literal text
+            # (whatsapp_helpers strips them defensively for exactly that
+            # reason). Channel-specific tone lives in the Runtime Context
+            # channel line above.
+            section_parts["formatting"] = (
+                "# Formatting Rules (IMPORTANT)\n"
+                "Follow these rules strictly:\n"
+                "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
+                "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
+                "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
+                "- Write fractions as a/b, not \\frac{a}{b}.\n"
+                "- Keep formatting light: plain text with at most **bold**, *italic*, `code`.\n"
+                "- Do NOT use tables or complex formatting.\n"
+                "- Keep responses concise and easy to read on a small screen."
             )
 
         # ── 8. Onboarding (CONDITIONAL) ────────────────────────────

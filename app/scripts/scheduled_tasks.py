@@ -165,43 +165,6 @@ async def run_retrieval_feedback_analysis():
     logger.info(f"Retrieval feedback analysis complete for {len(user_ids)} users")
 
 
-async def run_retrieval_feedback_analysis():
-    """
-    Weekly retrieval quality analysis for the self-improvement feedback loop (Phase 5).
-    Analyzes retrieval events, generates quality reports, and logs improvement suggestions.
-    """
-    logger.info("Starting weekly retrieval feedback analysis...")
-    
-    async with async_session_maker() as db:
-        result = await db.execute(
-            select(User.id).where(User.is_active == True)
-        )
-        user_ids = [row[0] for row in result.fetchall()]
-    
-    for user_id in user_ids:
-        try:
-            async with async_session_maker() as user_db:
-                from app.services.retrieval_feedback import get_retrieval_feedback
-                feedback = get_retrieval_feedback(user_db)
-                report = await feedback.generate_weekly_report(user_id)
-                
-                grade = report.get("health_grade", "N/A")
-                metrics = report.get("metrics", {})
-                suggestions = report.get("suggestions", [])
-                
-                logger.info(
-                    f"Feedback report for user {user_id}: "
-                    f"grade={grade}, events={metrics.get('total_events', 0)}, "
-                    f"recall={metrics.get('recall_estimate', 0):.1%}, "
-                    f"precision={metrics.get('precision_estimate', 0):.1%}, "
-                    f"suggestions={len(suggestions)}"
-                )
-        except Exception as e:
-            logger.error(f"Error running feedback analysis for user {user_id}: {e}")
-    
-    logger.info(f"Retrieval feedback analysis complete for {len(user_ids)} users")
-
-
 # Process-level lock guarding the archival pass. Prevents a second invocation
 # from starting while the previous one is still running (e.g. if an hourly run
 # is slow). Multi-worker deployments would need a DB advisory lock; a single
