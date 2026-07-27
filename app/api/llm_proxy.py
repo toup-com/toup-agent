@@ -441,6 +441,9 @@ class OpenAIBackend(LLMBackend):
                 if resp.status_code >= 400:
                     body_bytes = await resp.aread()
                     raise UpstreamProviderError(resp.status_code, body_bytes, "openai")
+                # W0.2b: the httpx response never leaves this generator, so
+                # the upstream cache/routing headers are only visible here.
+                _debug_log_upstream_cache_headers(resp.headers, body.get("model", ""))
                 async for chunk in resp.aiter_bytes():
                     yield chunk
 
@@ -672,6 +675,47 @@ def _extract_openai_usage(raw_bytes: bytes) -> tuple[int, int, int]:
     return input_tokens, output_tokens, cached_tokens
 
 
+# ── Cache observability (W0.2b) ──────────────────────────────────────
+# Read-only [CACHE] log lines that make OpenAI prompt-cache behavior
+# auditable per call: retention="24h" is verified sent end-to-end yet
+# prod measured 0 cache hits, so the proxy must produce the evidence
+# series (request-side key/retention + usage-side prompt/cached tokens)
+# a single platform-log grep for '[CACHE]' can aggregate per tenant
+# per day. No behavior change, no DB change.
+
+
+def _cache_log_fields(body: dict) -> tuple[bool, str, str]:
+    """Extract loggable cache fields from an outbound OpenAI chat body.
+
+    Returns (has_cache_key, key_hash_8, retention). The prompt_cache_key
+    itself is NEVER logged — only a stable 8-char sha256 prefix so calls
+    that should share a cache entry can be correlated across log lines.
+    """
+    key = body.get("prompt_cache_key")
+    has_key = isinstance(key, str) and bool(key)
+    key_hash = hashlib.sha256(key.encode()).hexdigest()[:8] if has_key else "none"
+    retention = body.get("prompt_cache_retention") or "none"
+    return has_key, key_hash, str(retention)
+
+
+def _debug_log_upstream_cache_headers(headers, model: str) -> None:
+    """Debug-level dump of cache/routing-related upstream response headers.
+
+    Evidence for the OpenAI escalation if retention proves dead
+    server-side: x-request-id lets OpenAI trace the exact request, and
+    any cache-* header shows what their edge reported. Auth headers can
+    never match the filter, so no key material is ever logged.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    interesting = {
+        k: v for k, v in headers.items()
+        if k.lower() in ("x-request-id", "cf-ray") or "cache" in k.lower()
+    }
+    if interesting:
+        logger.debug("[CACHE] upstream model=%s headers=%s", model, interesting)
+
+
 # ── Endpoints ────────────────────────────────────────────────────────
 
 
@@ -796,6 +840,16 @@ async def proxy_chat(
     else:
         is_fallback = False
 
+    # W0.2b: one request-side [CACHE] line per OpenAI chat call (after
+    # fallback resolution so it reflects the body actually sent upstream).
+    # Pairs with the usage-side [CACHE] line below for hit-ratio series.
+    has_cache_key, cache_key_hash, cache_retention = _cache_log_fields(body)
+    if backend.name == "openai":
+        logger.info(
+            "[CACHE] user=%s model=%s has_cache_key=%s cache_key_hash=%s retention=%s",
+            config.user_id[:8], model, has_cache_key, cache_key_hash, cache_retention,
+        )
+
     start_ts = time.time()
 
     if is_stream:
@@ -846,6 +900,14 @@ async def proxy_chat(
                     inp, out, cached = _extract_anthropic_usage(bytes(collected_bytes))
                 else:
                     inp, out, cached = _extract_openai_usage(bytes(collected_bytes))
+                    # W0.2b usage-side [CACHE] line: prompt+cached tokens
+                    # together so one grep yields the per-tenant ratio series.
+                    logger.info(
+                        "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
+                        "prompt_tokens=%s cached_tokens=%s",
+                        config.user_id[:8], model, has_cache_key, cache_retention,
+                        inp, cached,
+                    )
                 cost = _calc_cost_cents(model, inp, out)
                 # Do NOT reuse `db` here. It comes from Depends(get_db), and
                 # since FastAPI 0.106 the dependency AsyncExitStack is exited
@@ -924,6 +986,14 @@ async def proxy_chat(
             inp = usage.get("prompt_tokens", 0)
             out = usage.get("completion_tokens", 0)
             cached = _extract_openai_cached_tokens(usage)
+            # W0.2b usage-side [CACHE] line (non-stream twin of the SSE path).
+            logger.info(
+                "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
+                "prompt_tokens=%s cached_tokens=%s",
+                config.user_id[:8], model, has_cache_key, cache_retention,
+                inp, cached,
+            )
+            _debug_log_upstream_cache_headers(resp.headers, model)
 
         cost = _calc_cost_cents(model, inp, out)
         await _log_event(

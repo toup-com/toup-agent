@@ -17,6 +17,25 @@ from app.db.models.support import SupportIssue, SupportIssueEvent, SupportAttach
 from app.support.enums import SupportEventType, GRADE_ACTIONABLE
 
 
+
+async def _commit_and_reload(db: AsyncSession, issue: SupportIssue) -> None:
+    """Commit, re-read the row, then END the transaction the re-read opened.
+
+    `db.refresh()` AUTOBEGINS a fresh transaction — the engine sets
+    expire_on_commit=False, so that re-read is the only thing in it — and
+    leaves it open. A caller that then awaits something slow sits `idle in
+    transaction` for the whole wait, pinning a Supavisor server connection:
+    `run_diagnosis_pipeline` awaits THREE LLM round-trips between status
+    transitions. That is the resource-exhaustion shape that wedged the pooler
+    on 2026-07-25, and it is also what the 10-minute
+    idle_in_transaction_session_timeout would eventually kill mid-pipeline.
+    Nothing is pending at this point, and expire_on_commit=False keeps `issue`
+    usable after the final commit.
+    """
+    await db.commit()
+    await db.refresh(issue)
+    await db.commit()
+
 async def create_issue(
     db: AsyncSession,
     *,
@@ -49,8 +68,7 @@ async def create_issue(
         message=f"Issue intake via {channel}",
         detail={"severity": severity},
     )
-    await db.commit()
-    await db.refresh(issue)
+    await _commit_and_reload(db, issue)
     return issue
 
 
@@ -133,8 +151,7 @@ async def set_status(
         message=message or f"{prev} → {status_str}", detail=payload,
     )
     if commit:
-        await db.commit()
-        await db.refresh(issue)
+        await _commit_and_reload(db, issue)
     return issue
 
 
@@ -171,8 +188,7 @@ async def set_grade(
         detail={"verdict": verdict, "note": note},
     )
     if commit:
-        await db.commit()
-        await db.refresh(issue)
+        await _commit_and_reload(db, issue)
     return issue
 
 
