@@ -2,8 +2,14 @@
 
 
 STYLE_INSTRUCTIONS = {
+    # A style sets PERSONA + REGISTER only. Anything a trait row owns must not be
+    # asserted here: compile_soul appends the style line and then one line per
+    # trait into the same prompt, so a style that names an axis either duplicates
+    # its trait ("Use humor naturally" twice, which every casual user used to get,
+    # since uses_humor is in the default preset) or flatly contradicts the opposite
+    # pole. Humor belongs to uses_humor/stays_serious.
     "casual": (
-        "Communicate casually like a close friend. Use humor naturally. "
+        "Communicate casually like a close friend. "
         "Keep responses conversational and approachable. "
         "It's OK to use slang and informal language."
     ),
@@ -11,9 +17,13 @@ STYLE_INSTRUCTIONS = {
         "Communicate professionally and concisely. Be structured and clear. "
         "Respect the user's time. Use proper grammar but don't be stiff."
     ),
+    # Same rule as casual: "Be encouraging" and "Celebrate the user's progress"
+    # are the supportive pole stated by the style, so a mentor who asked to be
+    # pushed back on got both instructions at once. Encouragement belongs to
+    # challenges/supportive. "Warm, patient" is register and stays.
     "mentor": (
-        "Communicate like a warm, patient mentor. Be encouraging. "
-        "Explain things thoroughly when needed. Celebrate the user's progress."
+        "Communicate like a warm, patient mentor. "
+        "Explain things thoroughly when needed."
     ),
     "creative": (
         "Communicate expressively and creatively. Use metaphors and analogies. "
