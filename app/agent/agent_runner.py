@@ -678,13 +678,28 @@ class AgentRunner:
             # 2026-04-13 (audit A2-1).
             client_tz = await self._resolve_effective_tz(db, user_id, client_tz, channel)
             t_db = time.perf_counter()
-            session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz)
-            session_id = session.id
+            if prompt_profile == PromptProfile.SUBAGENT:
+                # W1.2(d): child runs never persist through this session —
+                # save flags are False and the announce-back writes its own
+                # row via write_subagent_message — so the Conversation
+                # insert here just left one orphan row per spawn. Keep the
+                # orchestrator's 'subagent:{job_id}' id as an in-memory
+                # sentinel: _load_history on it finds nothing (fresh
+                # history) and the tool ContextVar below only needs a
+                # non-parent id so a child tool call can't stamp the
+                # parent's conversation.
+                # ≤36 chars: agent_errors.session_id is VARCHAR(36) — a full
+                # 45-char "subagent:{uuid4}" silently drops error telemetry.
+                session_id = session_id or f"subagent:{uuid.uuid4().hex[:20]}"
+                logger.info("[AGENT] SUBAGENT run — no Conversation row, sentinel session_id=%s", session_id)
+            else:
+                session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz)
+                session_id = session.id
+                logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
             # Stamp the conversation onto the tool context and reset the
             # per-turn created-job list. Must be here, not with the other
-            # set_* calls above: session_id is only resolved on the line above.
+            # set_* calls above: session_id is only resolved above.
             self.tools.set_session_id(session_id)
-            logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
             # Load user's disabled tools from AgentConfig
             # AgentConfig is platform-only — may not exist in agent DBs
@@ -740,11 +755,20 @@ class AgentRunner:
             _day_chat_id = None
             _day_context = None
             _use_day_ctx = False
-            try:
-                from app.agent.day_chat_resolver import should_use_day_chat_context
-                _use_day_ctx = await should_use_day_chat_context()
-            except Exception:
-                pass
+            # W1.2(a): a sub-agent child must NOT inherit the parent's
+            # day history — the load below resent ~30k tokens of the
+            # user's day per child iteration (~300k/spawn). EXPLICIT
+            # profile check, not allows_post_builder_blocks: that is
+            # also False for AUTOPILOT, which deliberately KEEPS day
+            # context. The child starts from empty history (the
+            # _load_history fallback on its fresh session finds
+            # nothing); ambient context travels in the spawn task text.
+            if prompt_profile != PromptProfile.SUBAGENT:
+                try:
+                    from app.agent.day_chat_resolver import should_use_day_chat_context
+                    _use_day_ctx = await should_use_day_chat_context()
+                except Exception:
+                    pass
 
             if _use_day_ctx:
                 try:
@@ -1358,7 +1382,16 @@ class AgentRunner:
                     # On the Anthropic path both kwargs are
                     # accepted-and-ignored — cache_control already wires
                     # the prompt cache via TKT-LAT-001.
-                    _cache_scope = _day_chat_id or session_id
+                    # W1.2(b): SUBAGENT runs scope on their own session
+                    # sentinel ('subagent:{job_id}') — never the day
+                    # shard. A child's prefix diverges from the parent's
+                    # after the first iteration, so routing it to the
+                    # parent's day-keyed shard just pollutes that shard's
+                    # cache locality.
+                    if prompt_profile == PromptProfile.SUBAGENT:
+                        _cache_scope = session_id
+                    else:
+                        _cache_scope = _day_chat_id or session_id
                     _cache_key = f"{user_id}:{_cache_scope}" if user_id and _cache_scope else None
                     _idem_key = f"{user_id}:{session_id}" if user_id and session_id else None
 
@@ -2983,7 +3016,14 @@ class AgentRunner:
         # serialized memory tokens that would have hit the LLM input.
         t_memory = time.perf_counter()
         memory_sections = []
-        if _skip_deep_context:
+        # W1.2(c): same predicate as the pop/filter sites below — when the
+        # profile (e.g. SUBAGENT) forbids user_brain, the retrieval output
+        # is discarded anyway, so skip the hybrid_search + entity_search +
+        # portrait fan-out entirely instead of computing-then-dropping.
+        if "user_brain" not in _profile_sections:
+            self._memory_health["retrieved"] = 0
+            logger.info("[PERF] memory_retrieval_skipped reason=profile_no_user_brain")
+        elif _skip_deep_context:
             self._memory_health["retrieved"] = 0
             logger.info("[PERF] memory_retrieval_skipped reason=trivial_query")
         else:
@@ -3130,7 +3170,13 @@ class AgentRunner:
         # TKT-LAT-019: skip active_tasks load for trivial queries. The
         # block costs a DB query + ~200-500 tokens when present, and a
         # one-word answer doesn't need to know what threads are open.
-        if _skip_deep_context:
+        # W1.2(c): same predicate as the profile filter below — a profile
+        # without active_tasks (SUBAGENT) would drop the block anyway, so
+        # skip the DB load instead of computing-then-discarding.
+        if "active_tasks" not in _profile_sections:
+            self._memory_health["active_tasks"] = 0
+            logger.debug("[AGENT] active_tasks skipped (profile)")
+        elif _skip_deep_context:
             self._memory_health["active_tasks"] = 0
             logger.debug("[AGENT] active_tasks skipped (trivial query)")
         else:

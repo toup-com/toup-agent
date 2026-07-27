@@ -698,7 +698,10 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "outlast this chat — call start_mission for those instead. "
                 "The sub-agent has tools but cannot itself spawn further "
                 "sub-agents (no grandchildren) and cannot write to your "
-                "user's memory."
+                "user's memory. **The sub-agent starts with NO conversation "
+                "history** — it does not see this chat or the user's day. "
+                "Put every fact it needs (links, names, constraints, prior "
+                "findings from this conversation) directly into the task text."
             ),
             "input_schema": {
                 "type": "object",
