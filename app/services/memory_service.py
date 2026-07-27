@@ -248,22 +248,27 @@ class MemoryService:
         memory_data: MemoryCreate,
         source_message_id: Optional[str] = None,
         deduplicate: bool = True,
-        similarity_threshold: float = 0.9
+        similarity_threshold: float = 0.9,
+        embedding: Optional[List[float]] = None
     ) -> Memory:
         """Create a new memory with embedding, with deduplication support.
-        
+
         Args:
             user_id: The user ID
             memory_data: Memory creation data
             source_message_id: Optional source message ID
             deduplicate: If True, check for similar memories first
             similarity_threshold: Minimum similarity to consider as duplicate (default 0.9)
-            
+            embedding: Pre-computed embedding for memory_data.content (optional —
+                W1.4e: the dedup path already embedded the same string; passing
+                it here avoids a second identical embedding call)
+
         Returns:
             Memory: The created or reinforced memory
         """
-        # Generate embedding
-        embedding = self.embedding_service.embed(memory_data.content, api_key=self.api_key)
+        # Generate embedding (unless the caller already computed it)
+        if embedding is None:
+            embedding = await self.embedding_service.embed_async(memory_data.content, api_key=self.api_key)
         
         # Deduplication: Check for similar existing memories
         if deduplicate:
@@ -538,7 +543,7 @@ class MemoryService:
         
         # Generate new embedding if not provided
         if new_embedding is None:
-            new_embedding = self.embedding_service.embed(new_content, api_key=self.api_key)
+            new_embedding = await self.embedding_service.embed_async(new_content, api_key=self.api_key)
         
         # Update memory
         memory.content = new_content

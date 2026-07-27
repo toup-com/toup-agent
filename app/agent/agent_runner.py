@@ -309,6 +309,13 @@ class AgentRunner:
         self._disabled_tool_names: set = set()  # Per-session disabled tools
         # Phase 5: Track retrieved memories for feedback loop
         self._last_retrieved_memories: List[Dict[str, Any]] = []
+        # W1.4c: whether the current turn's user message was classified
+        # trivial by _build_system_prompt (greetings, acks). run() captures
+        # this into a closure-local before scheduling background
+        # post-processing — same Amendment-3 pattern as
+        # _last_retrieved_memories — so extraction can skip trivial turns
+        # without re-classifying.
+        self._last_query_trivial: bool = False
         # F6: per-turn memory health state captured during system_prompt
         # assembly. One structured log line is emitted from run() after
         # the prompt is built so operators have a single grep target for
@@ -832,6 +839,10 @@ class AgentRunner:
                 subagent_task_label=subagent_task_label,
                 turn_context_out=_turn_context_parts if _stable_layout else None,
             )
+            # W1.4c: capture THIS turn's trivial classification synchronously,
+            # before any other await can let a concurrent run overwrite the
+            # shared instance attribute (the runner is a process singleton).
+            _query_was_trivial = bool(getattr(self, "_last_query_trivial", False))
 
             # Post-builder appended blocks (today_so_far / reply_to_directive /
             # recent_days) are skipped when the profile doesn't want
@@ -1965,6 +1976,11 @@ class AgentRunner:
         # own and log them as the parent's retrieval feedback.
         # See the Phase 3 PR description for the audit detail.
         _retrieved_for_bg = list(self._last_retrieved_memories or [])
+        # W1.4c: the trivial-turn classification was captured race-free into
+        # the run-local _query_was_trivial immediately after
+        # _build_system_prompt returned (before the tool loop's awaits could
+        # let a concurrent run overwrite the singleton attribute).
+        _trivial_for_bg = _query_was_trivial
 
         async def _background_post_processing():
             try:
@@ -1976,6 +1992,7 @@ class AgentRunner:
                                 user_id=user_id,
                                 user_message=user_message,
                                 assistant_response=final_text,
+                                query_was_trivial=_trivial_for_bg,
                             )
                             logger.info(f"[AGENT] Background: extracted {mem_count} memories")
 
@@ -2956,9 +2973,13 @@ class AgentRunner:
         # blocks below. Saves ~5–15 k input tokens + 500–2000 ms
         # portrait generation on low-information turns.
         from app.services.query_classifier import is_trivial_query as _is_trivial_query
+        _query_is_trivial = bool(_is_trivial_query(user_message or ""))
+        # W1.4c: stash the raw classification for run()'s background
+        # extraction gate (independent of the context-trim flag below).
+        self._last_query_trivial = _query_is_trivial
         _skip_deep_context = bool(
             getattr(settings, "context_trim_for_trivial_queries", True)
-            and _is_trivial_query(user_message or "")
+            and _query_is_trivial
         )
         logger.info(
             "[PERF] context_depth=%s user_message_len=%d",
@@ -4141,8 +4162,16 @@ class AgentRunner:
         user_id: str,
         user_message: str,
         assistant_response: str,
+        query_was_trivial: bool = False,
     ) -> int:
         """Extract and store memories from the conversation. Returns count."""
+        # W1.4c: the trivial-query gate at prompt build covered retrieval
+        # only — extraction (and its relationship follow-up) still burned
+        # LLM calls on bare "thanks" turns. Caller threads the turn's
+        # classification; flag-gated so operators can restore old behavior.
+        if query_was_trivial and getattr(settings, "skip_extraction_for_trivial_queries", True):
+            logger.info("[AGENT] Memory extraction skipped — trivial turn")
+            return 0
         try:
             from app.services.memory_extractor import get_memory_extractor
             from app.services.memory_dedup_service import MemoryDedupService
@@ -4177,8 +4206,11 @@ class AgentRunner:
 
             dedup = MemoryDedupService(db, api_key=user_api_key)
             count = 0
-            for mem in extracted:
-                memory_data = MemoryCreate(
+            # W1.4d: ONE batched dedup pass for the whole turn — obvious
+            # cases resolve on similarity thresholds, the ambiguous ones
+            # share a single adjudication call instead of one per memory.
+            memory_datas = [
+                MemoryCreate(
                     content=mem.content,
                     summary=mem.summary,
                     brain_type=BrainType.USER,
@@ -4192,13 +4224,16 @@ class AgentRunner:
                     metadata=mem.metadata,
                     source_type="conversation",
                 )
-                stored, action = await dedup.smart_create_memory(
-                    new_memory=memory_data,
-                    user_id=user_id,
-                )
+                for mem in extracted
+            ]
+            stored_results = await dedup.smart_create_memories(
+                new_memories=memory_datas,
+                user_id=user_id,
+            )
+            for mem, (stored, action) in zip(extracted, stored_results):
                 logger.info(f"Memory {action}: {stored.content[:50]}...")
                 count += 1
-                
+
                 # Phase 4: Upsert entities with schema-enforced data + create EntityLinks
                 if mem.entities:
                     from app.services.memory_service import MemoryService as _MemSvc
@@ -4234,29 +4269,33 @@ class AgentRunner:
                                 ))
                     await db.flush()
             
-            # P3: Extract entity relationships and store them
-            try:
-                relationships = await extractor.extract_relationships_with_llm(
-                    user_message=user_message,
-                    assistant_response=assistant_response,
-                )
-                if relationships:
-                    from app.services.memory_service import MemoryService
-                    mem_service = MemoryService(db)
-                    for rel in relationships:
-                        await mem_service.store_entity_relationship(
-                            user_id=user_id,
-                            source_name=rel["source"],
-                            source_type=rel["source_type"],
-                            target_name=rel["target"],
-                            target_type=rel["target_type"],
-                            relationship=rel["relationship"],
-                            confidence=rel["confidence"],
-                            properties=rel.get("properties"),
-                        )
-                    logger.info(f"Extracted {len(relationships)} entity relationships")
-            except Exception as e:
-                logger.warning(f"Entity relationship extraction failed (non-fatal): {e}")
+            # P3: Extract entity relationships and store them.
+            # W1.4b: zero extracted memories means nothing worth linking was
+            # stated — skip the relationship LLM call instead of firing it
+            # unconditionally on the same low-information turn.
+            if extracted:
+                try:
+                    relationships = await extractor.extract_relationships_with_llm(
+                        user_message=user_message,
+                        assistant_response=assistant_response,
+                    )
+                    if relationships:
+                        from app.services.memory_service import MemoryService
+                        mem_service = MemoryService(db)
+                        for rel in relationships:
+                            await mem_service.store_entity_relationship(
+                                user_id=user_id,
+                                source_name=rel["source"],
+                                source_type=rel["source_type"],
+                                target_name=rel["target"],
+                                target_type=rel["target_type"],
+                                relationship=rel["relationship"],
+                                confidence=rel["confidence"],
+                                properties=rel.get("properties"),
+                            )
+                        logger.info(f"Extracted {len(relationships)} entity relationships")
+                except Exception as e:
+                    logger.warning(f"Entity relationship extraction failed (non-fatal): {e}")
 
             # Invalidate portrait cache if memories were created
             if count >= 3:

@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     memory_recall_limit: int = 15  # How many memories to recall per message
     auto_extract_memories: bool = True  # Auto-extract memories from conversations
     max_history_messages: int = 20  # Max conversation history to include
+    # W1.4a: pin the background extraction fan-out (fact extraction,
+    # relationship extraction, dedup adjudication, dedup merge) to a cheap
+    # model. LLMService.default_model resolves to settings.agent_model
+    # (gpt-5.5) whenever the Anthropic key is present (llm_service.py:69) —
+    # any unpinned call in this pipeline silently rides the premium chat
+    # model. Every call site passes this explicitly.
+    memory_extraction_model: str = "gpt-4o-mini"
+    # W1.4c: skip memory + relationship extraction on turns the
+    # trivial-query classifier flagged (greetings, acks, "thanks"). The
+    # context_trim_for_trivial_queries gate covered retrieval only —
+    # extraction still burned 2+ LLM calls on every trivial turn.
+    skip_extraction_for_trivial_queries: bool = True
     
     # Scheduler (for memory decay/consolidation)
     enable_scheduler: bool = True  # Set to False in multi-worker deployments

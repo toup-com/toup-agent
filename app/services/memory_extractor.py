@@ -11,6 +11,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
 
+from app.config import settings
 from app.schemas import MemoryCategory, MemoryType
 
 
@@ -43,7 +44,7 @@ class ExtractedEntity:
 _EXTRACTION_RETRY_BACKOFF_S = 1.5
 
 
-async def _complete_json_with_retry(llm, *, messages, temperature, max_tokens):
+async def _complete_json_with_retry(llm, *, messages, temperature, max_tokens, model=None):
     """Call ``llm.complete_with_json`` with ONE retry after a short backoff.
 
     A6-2: per-turn fact extraction is a single un-fallbacked LLM call — a
@@ -60,7 +61,8 @@ async def _complete_json_with_retry(llm, *, messages, temperature, max_tokens):
 
     try:
         response = await llm.complete_with_json(
-            messages=messages, temperature=temperature, max_tokens=max_tokens
+            messages=messages, temperature=temperature, max_tokens=max_tokens,
+            model=model,
         )
         return response, False
     except Exception as first_err:
@@ -72,7 +74,8 @@ async def _complete_json_with_retry(llm, *, messages, temperature, max_tokens):
         )
         await asyncio.sleep(_EXTRACTION_RETRY_BACKOFF_S)
         response = await llm.complete_with_json(
-            messages=messages, temperature=temperature, max_tokens=max_tokens
+            messages=messages, temperature=temperature, max_tokens=max_tokens,
+            model=model,
         )
         return response, True
 
@@ -691,6 +694,9 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                 messages=[{"role": "user", "content": extraction_prompt}],
                 temperature=0.3,
                 max_tokens=3000,
+                # W1.4a: explicit pin — LLMService.default_model resolves to
+                # the premium chat model when an Anthropic key is present.
+                model=settings.memory_extraction_model,
             )
 
             # Parse the response — strip markdown fences if present (Anthropic)
@@ -831,6 +837,8 @@ If no entity relationships are found, return {{"relationships": []}}."""
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=1000,
+                # W1.4a: explicit pin (see extract_memories_with_llm)
+                model=settings.memory_extraction_model,
             )
 
             raw = response.content.strip()

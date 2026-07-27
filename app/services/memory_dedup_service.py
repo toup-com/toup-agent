@@ -15,6 +15,7 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.services.memory_service import MemoryService
 from app.services.embedding_service import get_embedding_service
 from app.services.llm_service import get_llm_service
@@ -27,6 +28,12 @@ logger = logging.getLogger(__name__)
 # These are deliberately LOW to catch potential matches, LLM decides what to do
 CANDIDATE_THRESHOLD = 0.40  # Consider as potential match for LLM analysis
 MIN_THRESHOLD = 0.25        # Below this, definitely not related
+
+# W1.4d: threshold shortcut around the LLM adjudication — near-identical
+# vectors are duplicates, weak matches are new memories; only the ambiguous
+# middle band is worth an LLM call.
+AUTO_DUPLICATE_THRESHOLD = 0.90  # >= : reinforce existing without asking the LLM
+AUTO_NEW_THRESHOLD = 0.50        # best candidate below this: create without asking
 
 
 class MemoryDedupService:
@@ -76,24 +83,139 @@ class MemoryDedupService:
             - "skipped": Exact duplicate, no action taken (returns existing)
             - "reinforced": Same info, just strengthened existing
         """
-        # Step 1: Generate embedding for new content
-        new_embedding = self.embedding_service.embed(new_memory.content, api_key=self.api_key)
-        
+        # Step 1: Generate embedding for new content (async — the sync embed
+        # blocks the event loop on OpenAI HTTP; W1.4e)
+        new_embedding = await self.embedding_service.embed_async(new_memory.content, api_key=self.api_key)
+
+        # Step 2+3: Search for similar memories and filter candidates
+        candidates = await self._find_candidates(new_memory, new_embedding, user_id)
+
+        if not candidates:
+            # Nothing similar enough to consider
+            memory = await self.memory_service.create_memory(
+                user_id=user_id,
+                memory_data=new_memory,
+                deduplicate=False,  # We already checked
+                embedding=new_embedding
+            )
+            logger.info(f"Created new memory: {memory.id}")
+            return memory, "created"
+
+        # Step 4: Decide what to do with the best candidate (thresholds
+        # shortcut the LLM for the obvious cases; W1.4d)
+        top_match = candidates[0]
+        similarity = top_match.get('similarity_score', 0)
+        existing_content = top_match.get('content', '')
+
+        logger.info(f"Found candidate with similarity {similarity:.3f}: {existing_content[:50]}...")
+
+        decision = await self._decide_action(
+            similarity=similarity,
+            existing_content=existing_content,
+            new_content=new_memory.content,
+        )
+
+        logger.info(f"Dedup decision: {decision['action']} - {decision.get('reason', '')[:50]}")
+
+        return await self._apply_decision(
+            decision=decision,
+            top_match=top_match,
+            new_memory=new_memory,
+            user_id=user_id,
+            new_embedding=new_embedding,
+        )
+
+    async def smart_create_memories(
+        self,
+        new_memories: List[MemoryCreate],
+        user_id: str
+    ) -> List[Tuple[Memory, str]]:
+        """
+        Batch variant of smart_create_memory for one turn's extraction (W1.4d).
+
+        Auto-resolvable memories (no candidate, or best similarity >=
+        AUTO_DUPLICATE_THRESHOLD / < AUTO_NEW_THRESHOLD) are applied inline
+        so later memories in the batch can dedup against them; the ambiguous
+        middle band is adjudicated in ONE LLM call instead of one per memory.
+
+        Returns one (memory, action) tuple per input, in input order.
+        """
+        results: List[Optional[Tuple[Memory, str]]] = [None] * len(new_memories)
+        pending: List[Dict[str, Any]] = []
+
+        for i, new_memory in enumerate(new_memories):
+            new_embedding = await self.embedding_service.embed_async(
+                new_memory.content, api_key=self.api_key
+            )
+            candidates = await self._find_candidates(new_memory, new_embedding, user_id)
+
+            if not candidates:
+                memory = await self.memory_service.create_memory(
+                    user_id=user_id,
+                    memory_data=new_memory,
+                    deduplicate=False,
+                    embedding=new_embedding
+                )
+                logger.info(f"Created new memory: {memory.id}")
+                results[i] = (memory, "created")
+                continue
+
+            top_match = candidates[0]
+            similarity = top_match.get('similarity_score', 0)
+
+            if similarity >= AUTO_DUPLICATE_THRESHOLD or similarity < AUTO_NEW_THRESHOLD:
+                # Auto-resolvable — apply now so later batch members see it
+                decision = await self._decide_action(
+                    similarity=similarity,
+                    existing_content=top_match.get('content', ''),
+                    new_content=new_memory.content,
+                )
+                results[i] = await self._apply_decision(
+                    decision=decision,
+                    top_match=top_match,
+                    new_memory=new_memory,
+                    user_id=user_id,
+                    new_embedding=new_embedding,
+                )
+            else:
+                pending.append({
+                    "index": i,
+                    "top_match": top_match,
+                    "new_memory": new_memory,
+                    "embedding": new_embedding,
+                })
+
+        if pending:
+            decisions = await self._llm_decide_actions_batch([
+                (p["top_match"].get('content', ''), p["new_memory"].content)
+                for p in pending
+            ])
+            for p, decision in zip(pending, decisions):
+                logger.info(f"Dedup decision: {decision['action']} - {decision.get('reason', '')[:50]}")
+                results[p["index"]] = await self._apply_decision(
+                    decision=decision,
+                    top_match=p["top_match"],
+                    new_memory=p["new_memory"],
+                    user_id=user_id,
+                    new_embedding=p["embedding"],
+                )
+
+        return results  # type: ignore[return-value]
+
+    async def _find_candidates(
+        self,
+        new_memory: MemoryCreate,
+        new_embedding: List[float],
+        user_id: str
+    ) -> List[Dict[str, Any]]:
+        """Search similar memories and filter to candidates above CANDIDATE_THRESHOLD."""
         # Handle brain_type - can be enum or string
         brain_type_value = (
-            new_memory.brain_type.value 
-            if hasattr(new_memory.brain_type, 'value') 
+            new_memory.brain_type.value
+            if hasattr(new_memory.brain_type, 'value')
             else new_memory.brain_type
         ) if new_memory.brain_type else 'user'
-        
-        # Handle category - can be enum or string
-        category_value = (
-            new_memory.category.value 
-            if hasattr(new_memory.category, 'value') 
-            else new_memory.category
-        )
-        
-        # Step 2: Search for similar existing memories (cast wide net)
+
         similar_memories = await self.memory_service.search_memories_by_embedding(
             user_id=user_id,
             embedding=new_embedding,
@@ -102,45 +224,43 @@ class MemoryDedupService:
             brain_types=[brain_type_value] if brain_type_value else None,
             categories=None  # Search across ALL categories to find related memories
         )
-        
         if not similar_memories:
-            # No similar memories - create new
-            memory = await self.memory_service.create_memory(
-                user_id=user_id,
-                memory_data=new_memory,
-                deduplicate=False  # We already checked
-            )
-            logger.info(f"Created new memory: {memory.id}")
-            return memory, "created"
-        
-        # Step 3: Filter candidates above threshold
-        candidates = [m for m in similar_memories if m.get('similarity_score', 0) >= CANDIDATE_THRESHOLD]
-        
-        if not candidates:
-            # Nothing similar enough to consider
-            memory = await self.memory_service.create_memory(
-                user_id=user_id,
-                memory_data=new_memory,
-                deduplicate=False
-            )
-            logger.info(f"No candidates above threshold, created new memory: {memory.id}")
-            return memory, "created"
-        
-        # Step 4: Use LLM to decide what to do with the best candidate
-        top_match = candidates[0]
-        similarity = top_match.get('similarity_score', 0)
-        existing_content = top_match.get('content', '')
-        
-        logger.info(f"Found candidate with similarity {similarity:.3f}: {existing_content[:50]}...")
-        
-        # Ask LLM to decide: duplicate, merge, or new
-        decision = await self._llm_decide_action(
+            return []
+        return [m for m in similar_memories if m.get('similarity_score', 0) >= CANDIDATE_THRESHOLD]
+
+    async def _decide_action(
+        self,
+        similarity: float,
+        existing_content: str,
+        new_content: str
+    ) -> Dict[str, str]:
+        """Threshold shortcut around the LLM adjudication (W1.4d)."""
+        if similarity >= AUTO_DUPLICATE_THRESHOLD:
+            return {
+                "action": "duplicate",
+                "reason": f"auto: similarity {similarity:.2f} >= {AUTO_DUPLICATE_THRESHOLD}",
+            }
+        if similarity < AUTO_NEW_THRESHOLD:
+            return {
+                "action": "new",
+                "reason": f"auto: similarity {similarity:.2f} < {AUTO_NEW_THRESHOLD}",
+            }
+        return await self._llm_decide_action(
             existing_content=existing_content,
-            new_content=new_memory.content
+            new_content=new_content
         )
-        
-        logger.info(f"LLM decision: {decision['action']} - {decision.get('reason', '')[:50]}")
-        
+
+    async def _apply_decision(
+        self,
+        decision: Dict[str, str],
+        top_match: Dict[str, Any],
+        new_memory: MemoryCreate,
+        user_id: str,
+        new_embedding: Optional[List[float]] = None
+    ) -> Tuple[Memory, str]:
+        """Apply an adjudication verdict. Logic unchanged from the original
+        inline block in smart_create_memory — factored out so the batch path
+        (smart_create_memories) shares it."""
         if decision['action'] == 'duplicate':
             # Same information, just reinforce
             existing = await self._get_memory_by_id(top_match['id'])
@@ -169,6 +289,7 @@ class MemoryDedupService:
                     new_memory_data=new_memory,
                     user_id=user_id,
                     reason=decision.get('reason', 'Updated information'),
+                    new_embedding=new_embedding,
                 )
                 return superseded, "contradiction_updated"
             except Exception as e:
@@ -178,11 +299,12 @@ class MemoryDedupService:
         memory = await self.memory_service.create_memory(
             user_id=user_id,
             memory_data=new_memory,
-            deduplicate=False
+            deduplicate=False,
+            embedding=new_embedding
         )
         logger.info(f"Created new memory: {memory.id}")
         return memory, "created"
-    
+
     async def _get_memory_by_id(self, memory_id: str) -> Optional[Memory]:
         """Get a memory by ID without user check (internal use)."""
         from sqlalchemy import select
@@ -236,6 +358,7 @@ class MemoryDedupService:
         new_memory_data: MemoryCreate,
         user_id: str,
         reason: str = "Updated information",
+        new_embedding: Optional[List[float]] = None,
     ) -> Memory:
         """
         Mark old memory as superseded and create the replacement.
@@ -248,6 +371,7 @@ class MemoryDedupService:
             user_id=user_id,
             memory_data=new_memory_data,
             deduplicate=False,
+            embedding=new_embedding,
         )
 
         # Mark old memory as superseded
@@ -318,17 +442,24 @@ class MemoryDedupService:
             existing_content=existing_content,
             new_content=new_content
         )
-        
+
         # If merge didn't produce new content, just reinforce
         if merged_content.strip() == existing_content.strip():
             return await self._reinforce_existing_memory(existing, new_memory_data)
-        
+
+        # W1.4e: embed the merged content here (async) instead of letting
+        # merge_memory re-embed it with the loop-blocking sync path.
+        merged_embedding = await self.embedding_service.embed_async(
+            merged_content, api_key=self.api_key
+        )
+
         # Update the memory using memory_service method
         updated = await self.memory_service.merge_memory(
             memory_id=existing_memory_id,
             new_content=merged_content,
             change_summary=change_summary,
-            source_type=new_memory_data.source_type or "merge"
+            source_type=new_memory_data.source_type or "merge",
+            new_embedding=merged_embedding
         )
         
         # Update importance if new info is significant
@@ -413,6 +544,9 @@ Respond in JSON:
         try:
             response = await self.llm_service.complete_with_json(
                 messages=[{"role": "user", "content": prompt}],
+                # W1.4a: explicit pin — the service default rides the premium
+                # chat model whenever an Anthropic key is present.
+                model=settings.memory_extraction_model,
             )
 
             # Parse response — strip markdown fences if present
@@ -442,7 +576,116 @@ Respond in JSON:
             if self._is_same_information(existing_content, new_content):
                 return {"action": "duplicate", "reason": "Fallback: text similarity"}
             return {"action": "new", "reason": f"Fallback due to error: {e}"}
-    
+
+    def _heuristic_decision(self, existing_content: str, new_content: str) -> Dict[str, str]:
+        """Non-LLM fallback verdict — same heuristic as _llm_decide_action's
+        except-branch."""
+        if self._is_same_information(existing_content, new_content):
+            return {"action": "duplicate", "reason": "Fallback: text similarity"}
+        return {"action": "new", "reason": "Fallback: heuristic"}
+
+    async def _llm_decide_actions_batch(
+        self,
+        pairs: List[Tuple[str, str]]
+    ) -> List[Dict[str, str]]:
+        """
+        Adjudicate ALL ambiguous (existing, new) pairs of a turn in ONE LLM
+        call (W1.4d) — the per-pair template is ~483 tokens, so N separate
+        calls resend it N times.
+
+        Args:
+            pairs: list of (existing_content, new_content) tuples
+
+        Returns:
+            One decision dict ({"action", "reason"}) per pair, aligned by index.
+        """
+        if not pairs:
+            return []
+        if len(pairs) == 1:
+            # Single pair — the battle-tested single-pair prompt wins
+            return [await self._llm_decide_action(
+                existing_content=pairs[0][0], new_content=pairs[0][1]
+            )]
+
+        pair_blocks = []
+        for i, (existing_content, new_content) in enumerate(pairs):
+            pair_blocks.append(
+                f'PAIR {i}:\n'
+                f'EXISTING MEMORY:\n"{existing_content}"\n'
+                f'NEW INFORMATION:\n"{new_content}"'
+            )
+        pairs_doc = "\n\n".join(pair_blocks)
+
+        prompt = f"""You are a memory management system. For EACH numbered pair below, compare the two pieces of information and decide what to do.
+
+{pairs_doc}
+
+For each pair, decide ONE of these actions:
+
+1. "duplicate" - The new information says the EXACT SAME FACT, just worded differently.
+   Example: "I love pizza" vs "Pizza is my favorite food" → duplicate
+
+2. "merge" - The new information ADDS DETAILS to the SAME SPECIFIC TOPIC.
+   Example: "I love pizza" vs "I love pepperoni pizza from Dominos" → merge
+
+3. "contradiction_update" - The new information CONTRADICTS or SUPERSEDES the existing one.
+   The user's facts have changed (new job, moved cities, changed preference, updated a goal).
+   Example: "I work at Google" vs "I just joined Apple" → contradiction_update
+
+4. "new" - The information is about a DIFFERENT topic, even if about the same person.
+   Example: "My name is John" vs "I love pizza" → new (name vs food = different topics)
+
+CRITICAL: Just because two facts mention the same person does NOT mean they should merge.
+Only merge if they are about the SAME SPECIFIC TOPIC (e.g., both about food, both about sports, both about work).
+
+Respond in JSON with EXACTLY one decision per pair, in order:
+{{
+    "decisions": [
+        {{"index": 0, "action": "duplicate|merge|contradiction_update|new", "reason": "Brief explanation"}}
+    ]
+}}"""
+
+        try:
+            response = await self.llm_service.complete_with_json(
+                messages=[{"role": "user", "content": prompt}],
+                # W1.4a: explicit pin (see _llm_decide_action)
+                model=settings.memory_extraction_model,
+            )
+
+            if hasattr(response, 'content'):
+                import json as json_module
+                import re as re_module
+                raw = response.content.strip()
+                if raw.startswith("```"):
+                    raw = re_module.sub(r"^```(?:json)?\s*", "", raw)
+                    raw = re_module.sub(r"\s*```$", "", raw)
+                parsed = json_module.loads(raw)
+            else:
+                parsed = response
+
+            # Missing/garbled entries degrade to the heuristic, never crash
+            decisions = [
+                self._heuristic_decision(existing, new) for existing, new in pairs
+            ]
+            for item in parsed.get("decisions", []):
+                try:
+                    idx = int(item.get("index", -1))
+                except (TypeError, ValueError):
+                    continue
+                if not (0 <= idx < len(pairs)):
+                    continue
+                action = item.get("action", "new")
+                if action not in ["duplicate", "merge", "contradiction_update", "new"]:
+                    action = "new"
+                decisions[idx] = {"action": action, "reason": item.get("reason", "")}
+            return decisions
+
+        except Exception as e:
+            logger.error(f"Batch LLM adjudication failed: {e}")
+            return [
+                self._heuristic_decision(existing, new) for existing, new in pairs
+            ]
+
     async def _llm_merge_contents(
         self,
         existing_content: str,
@@ -482,6 +725,8 @@ Rules:
         try:
             response = await self.llm_service.complete_with_json(
                 messages=[{"role": "user", "content": prompt}],
+                # W1.4a: explicit pin (see _llm_decide_action)
+                model=settings.memory_extraction_model,
             )
 
             # Parse JSON response — strip markdown fences if present

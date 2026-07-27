@@ -27,9 +27,11 @@ class _FakeLLM:
         self.calls = 0
         self.failures = failures
         self._content = content
+        self.models: list = []  # model kwarg per call (W1.4a pin)
 
-    async def complete_with_json(self, messages, temperature, max_tokens):
+    async def complete_with_json(self, messages, temperature, max_tokens, model=None):
         self.calls += 1
+        self.models.append(model)
         if self.calls <= self.failures:
             raise RuntimeError("transient boom")
         return _FakeResponse(self._content)
