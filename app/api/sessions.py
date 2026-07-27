@@ -569,24 +569,19 @@ async def create_session_message(
             detail="Content is required"
         )
 
-    # Resolve day_chat_id from the CURRENT TIME first (mirrors
-    # AgentRunner._save_messages): session.day_chat_id points at the day
-    # the session was CREATED, so preferring it filed post-local-midnight
-    # voice messages into yesterday's day chat until UTC midnight. An
-    # explicit day_chat_id param still wins (caller intent); the session's
-    # stamp is only the degraded-path fallback.
-    _day_chat_id = day_chat_id
+    # Resolve day_chat_id: use provided value, or fall back to session's, or resolve fresh
+    _day_chat_id = day_chat_id or session.day_chat_id
     if not _day_chat_id:
-        from app.db.message_helpers import resolve_day_chat_id_for_now
-        _day_chat_id = await resolve_day_chat_id_for_now(
-            db, current_user.id,
-            tz_override=getattr(current_user, 'timezone', None),
-        )
-    if not _day_chat_id:
-        _day_chat_id = session.day_chat_id
-    # Backfill the session's day_chat_id if it was missing
-    if _day_chat_id and not session.day_chat_id:
-        session.day_chat_id = _day_chat_id
+        try:
+            from app.agent.day_chat_resolver import get_or_create_day_chat
+            _user_tz = getattr(current_user, 'timezone', None)
+            _dc = await get_or_create_day_chat(db, current_user.id, tz_name=_user_tz)
+            _day_chat_id = _dc.id
+            # Also backfill the session's day_chat_id if it was missing
+            if not session.day_chat_id:
+                session.day_chat_id = _day_chat_id
+        except Exception:
+            pass
 
     msg = Message(
         id=str(_uuid.uuid4()),
@@ -595,9 +590,6 @@ async def create_session_message(
         content=content.replace("\x00", ""),
         model_used=model_used,
         day_chat_id=_day_chat_id,
-        # Denormalized per-message channel (was left NULL on this path,
-        # so voice rows rendered channel-less in day history).
-        channel=session.channel,
     )
     db.add(msg)
 

@@ -152,22 +152,16 @@ async def _chat_complete(
     processing_time_ms = int((time.time() - start_time) * 1000)
     
     # 7. Save user message
-    # Day-stamp from the CURRENT time, not the (possibly reused, possibly
-    # stale) session row — mirrors AgentRunner._save_messages.
-    from app.db.message_helpers import resolve_day_chat_id_for_now
-    _msg_day_chat_id = await resolve_day_chat_id_for_now(db, current_user.id)
     user_msg = Message(
         conversation_id=session.id,
-        day_chat_id=_msg_day_chat_id,
         role="user",
         content=request.message
     )
     db.add(user_msg)
-
+    
     # 8. Save assistant message with metadata
     assistant_msg = Message(
         conversation_id=session.id,
-        day_chat_id=_msg_day_chat_id,
         role="assistant",
         content=llm_response.content,
         tokens_prompt=llm_response.tokens_prompt,
@@ -379,12 +373,8 @@ async def _chat_stream(
             max_tokens = request.max_tokens or settings.max_tokens
             
             # Save user message first
-            # Day-stamp per-now (mirrors _chat_complete / _save_messages).
-            from app.db.message_helpers import resolve_day_chat_id_for_now
-            _msg_day_chat_id = await resolve_day_chat_id_for_now(db, current_user.id)
             user_msg = Message(
                 conversation_id=session.id,
-                day_chat_id=_msg_day_chat_id,
                 role="user",
                 content=request.message
             )
@@ -419,7 +409,6 @@ async def _chat_stream(
             # Save assistant message
             assistant_msg = Message(
                 conversation_id=session.id,
-                day_chat_id=_msg_day_chat_id,
                 role="assistant",
                 content=full_response,
                 tokens_prompt=prompt_tokens,
@@ -562,25 +551,8 @@ async def _get_or_create_session(
         
         # Session not found, create new
         logger.warning(f"Session {session_id} not found, creating new")
-
-    # Create new session. 'api' is a SYSTEM channel governed by the partial
-    # unique index ix_conversations_system_channel_per_day (user_id,
-    # day_chat_id, channel) — a blind insert either litters NULL-day rows
-    # invisible to day context (the old behavior, NULLs evade the index) or,
-    # once stamped, crashes on the index for the day's 2nd session. Route
-    # through the canonical resolver, which reuses today's api thread and
-    # recovers from the insert race (same pattern as agent_runner).
-    from app.db.message_helpers import resolve_day_chat_id_for_now
-    day_chat_id = await resolve_day_chat_id_for_now(db, user_id)
-    if day_chat_id is not None:
-        from app.agent.conversation_resolver import resolve_or_create_day_conversation
-        session = await resolve_or_create_day_conversation(
-            db, user_id=user_id, day_chat_id=day_chat_id, channel="api",
-        )
-        return session, False
-
-    # Degraded path: day-chat resolution failed — legacy blind insert
-    # (day_chat_id NULL evades the unique index, so this cannot collide).
+    
+    # Create new session
     session = Conversation(
         user_id=user_id,
         title=None,  # Will be set later or by user
@@ -589,7 +561,7 @@ async def _get_or_create_session(
     )
     db.add(session)
     await db.flush()  # Get the ID
-
+    
     return session, True
 
 

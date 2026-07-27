@@ -1779,10 +1779,6 @@ async def _run_browser_agent(
                 from datetime import datetime as _dt
                 import uuid as _uuid
                 async with async_session_maker() as _pdb:
-                    # Day-stamp per-now (mirrors the user-message save above)
-                    # so the reply is visible to day context everywhere.
-                    from app.db.message_helpers import resolve_day_chat_id_for_now
-                    _day_chat_id = await resolve_day_chat_id_for_now(_pdb, user_id_for_save)
                     _save_content = _agent_response
                     # Append YouTube URL so the chat page auto-embeds the player
                     if _media_info and _media_info.get("video_id"):
@@ -1794,7 +1790,6 @@ async def _run_browser_agent(
                         conversation_id=session_id,
                         role="assistant",
                         content=_save_content,
-                        day_chat_id=_day_chat_id,
                     ))
                     await _pdb.execute(
                         _upd(Conversation)
@@ -2980,13 +2975,6 @@ async def ws_browser(
                         from app.db.models import Message as MsgModel, Conversation
                         import uuid as _uuid
                         async with async_session_maker() as _pdb:
-                            # Day-stamp: without day_chat_id these rows are
-                            # invisible to day context on every other channel.
-                            # 'web' is not in the system-channel unique index,
-                            # so stamping directly is safe. None on failure —
-                            # message still saves.
-                            from app.db.message_helpers import resolve_day_chat_id_for_now
-                            _day_chat_id = await resolve_day_chat_id_for_now(_pdb, user_id)
                             # Create or reuse a browser session for today
                             if not _browser_session_id:
                                 _bsess = Conversation(
@@ -2994,7 +2982,6 @@ async def ws_browser(
                                     title="Browser",
                                     channel="web",
                                     is_active=True,
-                                    day_chat_id=_day_chat_id,
                                 )
                                 _pdb.add(_bsess)
                                 await _pdb.commit()
@@ -3007,7 +2994,6 @@ async def ws_browser(
                                 conversation_id=_browser_session_id,
                                 role="user",
                                 content=message,
-                                day_chat_id=_day_chat_id,
                             ))
                             # Update session stats
                             from sqlalchemy import update as _upd
