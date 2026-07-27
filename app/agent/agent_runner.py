@@ -700,7 +700,18 @@ class AgentRunner:
                 session_id = session_id or f"subagent:{uuid.uuid4().hex[:20]}"
                 logger.info("[AGENT] SUBAGENT run — no Conversation row, sentinel session_id=%s", session_id)
             else:
-                session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz)
+                # AUTOPILOT ticks are headless — both save flags off, no
+                # session id — so a persisted Conversation would just be one
+                # empty row per ~5min tick (W1.7d litter). Ephemeral sentinel
+                # instead; terminal transitions write through the routine
+                # message-writer, never this session.
+                _ephemeral_session = (
+                    prompt_profile == PromptProfile.AUTOPILOT
+                    and not session_id
+                    and not save_user_message
+                    and not save_assistant_message
+                )
+                session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz, ephemeral=_ephemeral_session)
                 session_id = session.id
                 logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
             # Stamp the conversation onto the tool context and reset the
@@ -2357,9 +2368,24 @@ class AgentRunner:
         app_id: Optional[str] = None,
         force_new: bool = False,
         client_tz: Optional[str] = None,
+        ephemeral: bool = False,
     ):
         from sqlalchemy import select, and_
         from app.db.models import Conversation
+
+        # Headless runs never persist messages to this thread, so a real
+        # row would only litter the sidebar. In-memory sentinel — same
+        # shape, NEVER db.add()ed. Every downstream writer that stamps
+        # this id (context-budget log, error log, drop-time promotion)
+        # is try/except-wrapped non-fatal, and BuildJob.conversation_id
+        # has no FK.
+        if ephemeral:
+            return Conversation(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                channel=channel or "unknown",
+                is_active=True,
+            ), True
 
         # If Telegram, try to find an active session for this chat
         if telegram_chat_id and not session_id:

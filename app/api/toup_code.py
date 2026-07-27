@@ -846,6 +846,11 @@ async def _run_supervisor_loop(
                     system=SUPERVISOR_SYSTEM_PROMPT,
                     messages=session.messages,
                     timeout=120,
+                    # W1.0: session.messages only grows within a session —
+                    # a session-stable cache key lets the conversation
+                    # prefix self-cache on OpenAI (no-op on Anthropic).
+                    prompt_cache_key=f"toupcode:{session.conv_id}",
+                    safety_identifier=session.user_id,
                 )
             except Exception as e:  # pragma: no cover
                 await queue.put(_sse("error", {"message": f"Supervisor LLM error: {e!r}"}, role="agent"))

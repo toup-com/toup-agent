@@ -110,6 +110,9 @@ class LLMService:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        prompt_cache_key: Optional[str] = None,
+        prompt_cache_retention: Optional[str] = None,
+        safety_identifier: Optional[str] = None,
         **kwargs
     ) -> LLMResponse:
         """Generate a chat completion (Anthropic or OpenAI).
@@ -128,6 +131,17 @@ class LLMService:
         model = model or self.default_model
         temperature = temperature if temperature is not None else self.default_temperature
         max_tokens = max_tokens or self.default_max_tokens
+
+        # W1.0: OpenAI prompt-cache params — folded into kwargs only when
+        # set, so the request shape is unchanged for callers that don't
+        # opt in. The Anthropic route accepts-and-ignores them (its cache
+        # is wired via cache_control, see anthropic_service).
+        if prompt_cache_key:
+            kwargs["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache_retention:
+            kwargs["prompt_cache_retention"] = prompt_cache_retention
+        if safety_identifier:
+            kwargs["safety_identifier"] = safety_identifier
 
         # Decide route on model family, not just on which key is set.
         m = (model or "").lower()
@@ -218,6 +232,14 @@ class LLMService:
                 )
                 choice = response.choices[0]
                 usage = response.usage
+                # W1.0 telemetry parity: same [PERF] shape as the agent
+                # services so system calls show up in cache dashboards.
+                _details = getattr(usage, "prompt_tokens_details", None)
+                _cached = getattr(_details, "cached_tokens", 0) or 0 if _details is not None else 0
+                logger.info(
+                    "[PERF] system_llm cache_read=%s input=%s output=%s model=%s provider=openai",
+                    _cached, usage.prompt_tokens, usage.completion_tokens, response.model,
+                )
                 return LLMResponse(
                     content=choice.message.content or "",
                     model=response.model,
@@ -246,11 +268,15 @@ class LLMService:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        prompt_cache_key: Optional[str] = None,
+        prompt_cache_retention: Optional[str] = None,
+        safety_identifier: Optional[str] = None,
         **kwargs
     ) -> AsyncGenerator[StreamChunk, None]:
         """Generate a streaming chat completion (OpenAI only for now)."""
         if self._use_anthropic:
             # For Anthropic, fall back to non-streaming and yield result at once
+            # (cache params accepted-and-ignored on this branch — see complete()).
             resp = await self.complete(messages, model, temperature, max_tokens)
             yield StreamChunk(content=resp.content, is_final=True, finish_reason=resp.finish_reason)
             return
@@ -265,6 +291,12 @@ class LLMService:
             call_kwargs = dict(kwargs)
             if supports_custom_temperature(model):
                 call_kwargs["temperature"] = temperature
+            if prompt_cache_key:
+                call_kwargs["prompt_cache_key"] = prompt_cache_key
+            if prompt_cache_retention:
+                call_kwargs["prompt_cache_retention"] = prompt_cache_retention
+            if safety_identifier:
+                call_kwargs["safety_identifier"] = safety_identifier
             stream = await self._openai_client.chat.completions.create(
                 model=model, messages=messages,
                 max_tokens=max_tokens, stream=True, **call_kwargs,
@@ -286,15 +318,23 @@ class LLMService:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        prompt_cache_key: Optional[str] = None,
+        prompt_cache_retention: Optional[str] = None,
+        safety_identifier: Optional[str] = None,
         **kwargs
     ) -> LLMResponse:
         """Generate a completion expecting JSON response."""
         if self._use_anthropic:
             # Anthropic doesn't have response_format — the prompt already asks for JSON
+            # (cache params accepted-and-ignored on this branch — see complete()).
             return await self.complete(messages, model, temperature, max_tokens)
         return await self.complete(
             messages=messages, model=model, temperature=temperature,
-            max_tokens=max_tokens, response_format={"type": "json_object"}, **kwargs
+            max_tokens=max_tokens, response_format={"type": "json_object"},
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+            safety_identifier=safety_identifier,
+            **kwargs
         )
 
 

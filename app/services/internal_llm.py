@@ -64,6 +64,9 @@ async def call_system_llm(
     model: Optional[str] = None,
     timeout: int = 45,
     failure_out: Optional[Dict[str, str]] = None,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_retention: Optional[str] = None,
+    safety_identifier: Optional[str] = None,
 ) -> Optional[str]:
     """Call the active LLM for a system operation.
 
@@ -88,6 +91,11 @@ async def call_system_llm(
     `_classify_failure_reason` so callers that persist structured
     failure stubs (day_summarizer M3) can record WHY. Untouched on
     success.
+    W1.0: `prompt_cache_key` / `prompt_cache_retention` / `safety_identifier`
+    are optional OpenAI prompt-cache params, forwarded only when set (no
+    request-shape change for callers that don't opt in). The Anthropic
+    dispatch accepts-and-ignores them (its cache is cache_control-based),
+    but still forwards them to its transparent OpenAI fallback.
     """
     if not (operation_type.startswith("system.") or operation_type.startswith("user.")):
         raise ValueError(
@@ -141,6 +149,9 @@ async def call_system_llm(
             messages=messages,
             timeout=timeout,
             failure_out=failure_out,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+            safety_identifier=safety_identifier,
         )
     return await _system_call_anthropic(
         user_id=user_id,
@@ -151,6 +162,9 @@ async def call_system_llm(
         messages=messages,
         timeout=timeout,
         failure_out=failure_out,
+        prompt_cache_key=prompt_cache_key,
+        prompt_cache_retention=prompt_cache_retention,
+        safety_identifier=safety_identifier,
     )
 
 
@@ -214,6 +228,9 @@ async def _system_call_anthropic(
     messages: List[Dict[str, Any]],
     timeout: int,
     failure_out: Optional[Dict[str, str]] = None,
+    prompt_cache_key: Optional[str] = None,  # noqa: ARG001 — W1.0 signature parity; OpenAI-only, forwarded to the fallback below
+    prompt_cache_retention: Optional[str] = None,  # noqa: ARG001 — W1.0 signature parity; OpenAI-only
+    safety_identifier: Optional[str] = None,  # noqa: ARG001 — W1.0 signature parity; OpenAI-only
 ) -> Optional[str]:
     """Anthropic dispatch — bundle SDK when active, else direct API.
 
@@ -262,6 +279,14 @@ async def _system_call_anthropic(
                 if usage is not None:
                     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
                     output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+                    # W1.0 telemetry parity — same [PERF] shape as the
+                    # agent services so system calls show up in cache
+                    # dashboards.
+                    logger.info(
+                        "[PERF] system_llm cache_read=%s input=%s output=%s model=%s provider=anthropic",
+                        int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+                        input_tokens, output_tokens, model,
+                    )
                 blocks = getattr(resp, "content", None) or []
                 if blocks:
                     first = blocks[0]
@@ -352,6 +377,9 @@ async def _system_call_anthropic(
             messages=messages,
             timeout=timeout,
             failure_out=failure_out,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+            safety_identifier=safety_identifier,
         )
         # Both providers failed: surface the more diagnostic reason —
         # the Anthropic one wins unless it was generic (mirrors the M1
@@ -379,6 +407,9 @@ async def _system_call_openai(
     messages: List[Dict[str, Any]],
     timeout: int,
     failure_out: Optional[Dict[str, str]] = None,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_retention: Optional[str] = None,
+    safety_identifier: Optional[str] = None,
 ) -> Optional[str]:
     """OpenAI dispatch — bundle SDK when active, else direct API.
 
@@ -421,6 +452,14 @@ async def _system_call_openai(
                 token_kwarg: max_tokens,
                 "timeout": timeout,
             }
+            # W1.0: prompt-cache params — only set when the caller opted
+            # in, so the request shape is unchanged otherwise.
+            if prompt_cache_key:
+                kwargs["prompt_cache_key"] = prompt_cache_key
+            if prompt_cache_retention:
+                kwargs["prompt_cache_retention"] = prompt_cache_retention
+            if safety_identifier:
+                kwargs["safety_identifier"] = safety_identifier
             # Reasoning models (gpt-5.x, o-series) silently spend output
             # budget on hidden chain-of-thought BEFORE the visible answer.
             # For a summarisation job there's nothing to think hard about
@@ -449,6 +488,14 @@ async def _system_call_openai(
                 details = getattr(usage, "completion_tokens_details", None)
                 if details is not None:
                     reasoning_tokens = int(getattr(details, "reasoning_tokens", 0) or 0)
+                # W1.0 telemetry parity — same [PERF] shape as the agent
+                # services so system calls show up in cache dashboards.
+                _prompt_details = getattr(usage, "prompt_tokens_details", None)
+                logger.info(
+                    "[PERF] system_llm cache_read=%s input=%s output=%s model=%s provider=openai",
+                    int(getattr(_prompt_details, "cached_tokens", 0) or 0) if _prompt_details is not None else 0,
+                    input_tokens, output_tokens, model,
+                )
             choices = getattr(resp, "choices", None) or []
             finish_reason = None
             if choices:
@@ -486,6 +533,9 @@ async def _system_call_openai(
             chat_messages=chat_messages,
             token_kwarg=token_kwarg,
             timeout=timeout,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+            safety_identifier=safety_identifier,
         )
 
     latency_ms = int((time.time() - start) * 1000)
@@ -605,6 +655,9 @@ async def _direct_openai(
     chat_messages: List[Dict[str, Any]],
     token_kwarg: str,
     timeout: int,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_retention: Optional[str] = None,
+    safety_identifier: Optional[str] = None,
 ) -> tuple[Optional[str], int, int, str, str]:
     """BYOK direct-API OpenAI call. Returns (text, in_tokens, out_tokens, status, reason).
 
@@ -617,6 +670,19 @@ async def _direct_openai(
         logger.warning("[internal_llm] No OpenAI key for op=%s", operation_type)
         return None, 0, 0, "error", "no_keys"
 
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": chat_messages,
+        token_kwarg: max_tokens,
+    }
+    # W1.0: prompt-cache params — only set when the caller opted in.
+    if prompt_cache_key:
+        body["prompt_cache_key"] = prompt_cache_key
+    if prompt_cache_retention:
+        body["prompt_cache_retention"] = prompt_cache_retention
+    if safety_identifier:
+        body["safety_identifier"] = safety_identifier
+
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
@@ -625,11 +691,7 @@ async def _direct_openai(
                     "Authorization": f"Bearer {api_key}",
                     "content-type": "application/json",
                 },
-                json={
-                    "model": model,
-                    "messages": chat_messages,
-                    token_kwarg: max_tokens,
-                },
+                json=body,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -638,6 +700,14 @@ async def _direct_openai(
                 text = (
                     choices[0].get("message", {}).get("content")
                     if choices else None
+                )
+                # W1.0 telemetry parity (see _system_call_openai).
+                logger.info(
+                    "[PERF] system_llm cache_read=%s input=%s output=%s model=%s provider=openai",
+                    int((usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0),
+                    int(usage.get("prompt_tokens", 0) or 0),
+                    int(usage.get("completion_tokens", 0) or 0),
+                    model,
                 )
                 return (
                     text or None,
