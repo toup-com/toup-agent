@@ -411,6 +411,19 @@ class Settings(BaseSettings):
     # creation" behavior while STILL recording tombstones, so enabling this
     # later is safe — the history already exists. See email_canonical.py.
     free_grant_dedupe_enabled: bool = False
+    # W4.2 / gate G2 preparation (assessment A9-3 / F-11). The direct
+    # (manual-mode/BYOK) OpenAI metering path historically deduped credit
+    # deductions on a per-SESSION constant idempotency key (fallback: the
+    # now day-scoped prompt_cache_key) — every call after the first
+    # idempotent-hit the ledger and was never metered. When True, that
+    # path keys each deduction on the per-REQUEST OpenAI completion id
+    # (fresh UUID fallback) so every completed stream meters exactly once.
+    # FORWARD-only correctness: no retroactive charges, no pricing/tier
+    # changes; flag OFF keeps the legacy deduction path byte-identical
+    # (regression-tested in tests/test_metering_correctness_v2.py).
+    # DEFAULT OFF — flipping it changes user-visible metering and is
+    # gated on written approval; see docs/audits/2026-07-g2-billing-gate.md.
+    metering_correctness_v2: bool = False
     stripe_price_id_starter: str = ""
     stripe_price_id_builder: str = ""
     stripe_price_id_pro: str = ""

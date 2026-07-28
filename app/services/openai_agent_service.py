@@ -8,6 +8,7 @@ Emits the same StreamEvent interface so the agent runner works unchanged.
 import asyncio
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, Dict, Any, List, Optional
 
@@ -29,6 +30,33 @@ class StreamEvent:
     tool_input: Dict[str, Any] = field(default_factory=dict)
     stop_reason: str = ""
     usage: Dict[str, int] = field(default_factory=dict)
+
+
+def _metering_idempotency_key(
+    idempotency_key: Optional[str],
+    prompt_cache_key: Optional[str],
+    completion_id: Optional[str],
+) -> Optional[str]:
+    """Billing dedupe key for the direct (manual-mode/BYOK) OpenAI path.
+
+    Legacy (``metering_correctness_v2=False``, default): the per-session
+    constant agent_runner passes as ``idempotency_key``, falling back to
+    ``prompt_cache_key`` — byte-identical to the historical behavior.
+    Because that key is a per-SESSION constant (and the fallback is now
+    DAY-scoped after PR-1), every call after the first idempotent-hits
+    the credit ledger and is never metered (assessment A9-3 / F-11).
+
+    ``metering_correctness_v2=True`` (W4.2 / gate G2 preparation): a
+    per-REQUEST key — the OpenAI completion id when the stream carried
+    one, else a fresh UUID — so every completed stream meters exactly
+    once. Retries inside create_message_stream get a NEW completion id
+    per attempt, which is correct: OpenAI bills each request. Forward-
+    only; the flag flip is gated on written approval — see
+    docs/audits/2026-07-g2-billing-gate.md.
+    """
+    if getattr(settings, "metering_correctness_v2", False):
+        return f"oaireq:{completion_id or uuid.uuid4()}"
+    return idempotency_key or prompt_cache_key
 
 
 def _anthropic_tools_to_openai(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -170,8 +198,16 @@ class OpenAIAgentService:
                 tool_calls_in_progress: Dict[int, Dict[str, Any]] = {}
                 usage_data: Dict[str, int] = {}
                 finish_reason = ""
+                # W4.2: per-request OpenAI completion id ("chatcmpl-…"),
+                # identical across all chunks of one stream and fresh on
+                # each retry attempt. Only consumed when
+                # metering_correctness_v2 is on (per-request billing
+                # dedupe key); harmless capture otherwise.
+                completion_id = ""
 
                 async for chunk in stream:
+                    if not completion_id and getattr(chunk, "id", None):
+                        completion_id = chunk.id
                     # Usage comes in the final chunk
                     if chunk.usage:
                         # TKT-LAT-018: capture cached_tokens for the
@@ -281,10 +317,17 @@ class OpenAIAgentService:
                             provider="openai",
                             input_tokens=int(usage_data.get("input_tokens", 0) or 0),
                             output_tokens=int(usage_data.get("output_tokens", 0) or 0),
-                            # Billing dedupe key — kept per-session even now
-                            # that prompt_cache_key is day-stable (PR-1), so
-                            # metering semantics are byte-identical to before.
-                            idempotency_key=idempotency_key or prompt_cache_key,
+                            # Billing dedupe key. Flag OFF (default): the
+                            # per-session key, byte-identical to before —
+                            # which under-meters (~one ledger row/session,
+                            # A9-3/F-11). Flag ON (metering_correctness_v2,
+                            # gate G2): per-request completion id so every
+                            # completed stream meters exactly once.
+                            idempotency_key=_metering_idempotency_key(
+                                idempotency_key,
+                                prompt_cache_key,
+                                completion_id or None,
+                            ),
                             # F-7 / A9-1: cached hits were captured above but
                             # dropped at report time — forward them so the
                             # platform can persist cache telemetry.
