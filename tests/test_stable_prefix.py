@@ -378,3 +378,185 @@ class TestCanaryRetentionParity:
 
     def test_runner_threads_effective_flag_to_both_calls(self):
         assert _SRC.count("stable_prefix_active=_stable_prefix") >= 2  # primary + fallback
+
+
+# ── W2.4 — prefix edge-path hardening ─────────────────────────────────
+
+from app.agent.prefix_stability import tools_array_change, tools_wire_hash
+
+
+class TestToolsWireHash:
+    """W2.4(c): the fingerprint that turns tools-array churn from a
+    mystery cache miss into a logged [PERF] event."""
+
+    OPENAI_TOOL = {
+        "type": "function",
+        "function": {"name": "exec", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+    }
+
+    def test_identical_arrays_hash_identically(self):
+        assert tools_wire_hash(TOOLS) == tools_wire_hash([dict(t) for t in TOOLS])
+
+    def test_rename_reorder_add_remove_all_change_hash(self):
+        base = tools_wire_hash(TOOLS)
+        renamed = [dict(t) for t in TOOLS]
+        renamed[0] = {**renamed[0], "name": "exec2"}
+        assert tools_wire_hash(renamed) != base
+        assert tools_wire_hash(list(reversed(TOOLS))) != base
+        assert tools_wire_hash(TOOLS[:-1]) != base
+        assert tools_wire_hash(TOOLS + [{"name": "extra"}]) != base
+
+    def test_schema_growth_changes_hash(self):
+        with_schema = [{**TOOLS[0], "input_schema": {"type": "object", "properties": {"a": {"type": "string"}}}}]
+        grown = [{**TOOLS[0], "input_schema": {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "integer"}}}}]
+        assert tools_wire_hash(with_schema) != tools_wire_hash(grown)
+
+    def test_description_only_change_does_not_change_hash(self):
+        # Descriptions aren't part of the fingerprint (by design — the
+        # hash serializes names + schema lengths only, per the spec).
+        a = [{**TOOLS[0], "description": "one"}]
+        b = [{**TOOLS[0], "description": "two"}]
+        assert tools_wire_hash(a) == tools_wire_hash(b)
+
+    def test_openai_and_anthropic_shapes_both_fingerprint(self):
+        anthropic = {"name": "exec", "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}}
+        # Same name, same schema → same fingerprint across wire dialects.
+        assert tools_wire_hash([self.OPENAI_TOOL]) == tools_wire_hash([anthropic])
+
+
+class TestToolsArrayChange:
+    def test_first_turn_records_but_never_fires(self):
+        seen: dict = {}
+        assert tools_array_change(seen, "u1", TOOLS) is None
+        assert "u1" in seen
+
+    def test_identical_turn_does_not_fire(self):
+        seen: dict = {}
+        tools_array_change(seen, "u1", TOOLS)
+        assert tools_array_change(seen, "u1", [dict(t) for t in TOOLS]) is None
+
+    def test_changed_turn_fires_with_counts(self):
+        seen: dict = {}
+        tools_array_change(seen, "u1", TOOLS)
+        assert tools_array_change(seen, "u1", TOOLS[:-2]) == (len(TOOLS), len(TOOLS) - 2)
+
+    def test_per_user_isolation(self):
+        seen: dict = {}
+        tools_array_change(seen, "u1", TOOLS)
+        # u2's first sighting must not fire even though u1 has state
+        assert tools_array_change(seen, "u2", TOOLS[:-1]) is None
+        # and u1's unchanged next turn stays quiet
+        assert tools_array_change(seen, "u1", TOOLS) is None
+
+    def test_growth_guard_clears_without_breaking(self):
+        seen = {f"u{i}": ("h", 1) for i in range(1025)}
+        assert tools_array_change(seen, "fresh", TOOLS) is None
+        assert len(seen) == 1  # guard fired, fresh entry recorded
+
+    def test_runner_fingerprints_after_stable_tools_finalized(self):
+        # Source-pin: the fingerprint must run on the FINAL wire array
+        # (after the stable-tools branch may swap current_tools).
+        gate = _SRC.find("_tac = tools_array_change(self._last_tools_hash, user_id, current_tools)")
+        stable_swap = _SRC.find("current_tools = _stable_tools")
+        assert gate != -1, "runner no longer fingerprints the wire tools array"
+        assert stable_swap != -1 and stable_swap < gate
+        assert "[PERF] tools_array_changed old_n=%d new_n=%d" in _SRC
+
+
+class TestMcpRefetchDeterminism:
+    """W2.4(b): MCP tool defs serialize ahead of system+history — refresh
+    must sort by name and leave held references untouched on a no-op."""
+
+    class _FakeClient:
+        def __init__(self, tools):
+            self._tools = tools
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def list_tools(self):
+            return self._tools
+
+    class _FakeTool:
+        def __init__(self, name, description="d", schema=None):
+            self.name = name
+            self.description = description
+            self.inputSchema = schema or {"type": "object"}
+
+    def _cache(self, tools):
+        from app.agent.mcp_tools_cache import MCPToolsCache
+        return MCPToolsCache(self._FakeClient(tools))
+
+    def test_refresh_sorts_by_name(self):
+        import asyncio
+        cache = self._cache([self._FakeTool("zeta"), self._FakeTool("alpha"), self._FakeTool("mid")])
+        asyncio.run(cache.refresh())
+        assert cache.tools == ["alpha", "mid", "zeta"]
+        assert [d["name"] for d in cache.tool_defs] == ["alpha", "mid", "zeta"]
+
+    def test_noop_refresh_leaves_held_lists_untouched(self):
+        import asyncio
+
+        async def scenario():
+            cache = self._cache([self._FakeTool("b"), self._FakeTool("a")])
+            await cache.refresh()
+            held_names, held_defs = cache.tools, cache.tool_defs
+            inner_def_ids = [id(d) for d in cache.tool_defs]
+            cache.invalidate()
+            await cache.refresh()
+            assert cache.tools is held_names and cache.tool_defs is held_defs
+            # deep no-op: the inner def dicts were not rebuilt either
+            assert [id(d) for d in cache.tool_defs] == inner_def_ids
+
+        asyncio.run(scenario())
+
+    def test_reordered_upstream_same_content_is_noop(self):
+        import asyncio
+
+        async def scenario():
+            cache = self._cache([self._FakeTool("b"), self._FakeTool("a")])
+            await cache.refresh()
+            inner_def_ids = [id(d) for d in cache.tool_defs]
+            # upstream flips its list order — the sort makes it a no-op
+            cache._client = self._FakeClient([self._FakeTool("a"), self._FakeTool("b")])
+            cache.invalidate()
+            await cache.refresh()
+            assert [id(d) for d in cache.tool_defs] == inner_def_ids
+
+        asyncio.run(scenario())
+
+    def test_real_change_swaps_contents_in_place(self):
+        import asyncio
+
+        async def scenario():
+            cache = self._cache([self._FakeTool("a")])
+            await cache.refresh()
+            held = cache.tools
+            cache._client = self._FakeClient([self._FakeTool("a"), self._FakeTool("c")])
+            cache.invalidate()
+            await cache.refresh()
+            assert cache.tools is held  # in-place mutation preserved the reference
+            assert cache.tools == ["a", "c"]
+
+        asyncio.run(scenario())
+
+
+class TestEdgePathOrderingAndFallbacks:
+    """W2.4(a)+(d): source pins for the loader tiebreaker and the two
+    loud prefix-lineage fallbacks (behavior is exercised in
+    test_day_context.py's sqlite harness; these pin the code shape)."""
+
+    _DCL = (Path(__file__).resolve().parent.parent / "app" / "agent" / "day_context_loader.py").read_text()
+
+    def test_loader_orders_with_id_tiebreaker(self):
+        assert ".order_by(Message.created_at.asc(), Message.id.asc())" in self._DCL
+        assert ".order_by(Message.created_at.asc())\n" not in self._DCL
+
+    def test_day_ctx_check_failure_warns(self):
+        assert "day_chat_context_check_failed" in _SRC
+
+    def test_empty_gated_set_fallback_warns(self):
+        assert "stable_tools empty gated set" in _SRC

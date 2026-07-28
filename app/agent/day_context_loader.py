@@ -139,7 +139,10 @@ async def load_day_context(
         select(Message, Conversation.channel)
         .join(Conversation, Message.conversation_id == Conversation.id)
         .where(Message.day_chat_id == day_chat_id)
-        .order_by(Message.created_at.asc())
+        # W2.4(a): id tiebreaker — equal-microsecond inserts otherwise leave
+        # the order DB-dependent between loads, and a retroactive reorder of
+        # already-serialized history rewrites the cached prompt prefix.
+        .order_by(Message.created_at.asc(), Message.id.asc())
     )
     rows = result.all()
 

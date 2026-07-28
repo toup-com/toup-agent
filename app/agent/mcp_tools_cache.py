@@ -182,6 +182,11 @@ class MCPToolsCache:
         # The same `async with` lifecycle T1g uses on call_tool.
         async with self._client:
             tools = await self._client.list_tools()
+        # W2.4(b): sort by tool name — MCP list order is not guaranteed
+        # stable, and these defs serialize AHEAD of system+history in the
+        # cached prompt prefix. An order flip on a 60s refresh cycle used
+        # to invalidate the whole prefix with zero semantic change.
+        tools = sorted(tools, key=lambda t: t.name)
         new_names = [t.name for t in tools]
         new_defs = [
             {
@@ -192,10 +197,14 @@ class MCPToolsCache:
             for t in tools
         ]
         # In-place mutation — preserves references held by callers.
-        self.tools.clear()
-        self.tools.extend(new_names)
-        self.tool_defs.clear()
-        self.tool_defs.extend(new_defs)
+        # W2.4(b): swap contents ONLY on a real change; a no-op refresh
+        # must leave the held lists (and their inner def dicts) untouched.
+        changed = new_names != self.tools or new_defs != self.tool_defs
+        if changed:
+            self.tools.clear()
+            self.tools.extend(new_names)
+            self.tool_defs.clear()
+            self.tool_defs.extend(new_defs)
         now = time.monotonic()
         self._cached_at = now
         self.last_attempt_at = now
@@ -204,7 +213,8 @@ class MCPToolsCache:
         self.last_error = None
         self.consecutive_failures = 0
         logger.info(
-            "[mcp_tools_cache] refetched: %d tool(s)", len(self.tools),
+            "[mcp_tools_cache] refetched: %d tool(s) changed=%s",
+            len(self.tools), changed,
         )
 
 

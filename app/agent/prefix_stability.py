@@ -26,8 +26,10 @@ can pin the wire shapes without running the full agent loop.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Tuple
 
 # Channels where the vault confirmation card cannot render — mirror of
 # agent_runner.VAULT_TOOL_CHANNEL_BLOCK usage (single import site below).
@@ -183,3 +185,59 @@ def build_turn_context_message(parts: Sequence[str]) -> Optional[Dict[str, str]]
             "</turn_context>"
         ),
     }
+
+
+def tools_wire_hash(tools: Sequence[Dict[str, Any]]) -> str:
+    """sha256 fingerprint of the wire tools array: (name, serialized-
+    schema length) per tool, order-sensitive. Two turns with identical
+    arrays hash identically; any rename, reorder, add/remove, or schema
+    growth changes the digest. Cheap enough to run every turn — it only
+    serializes schemas, never descriptions.
+
+    Handles both Anthropic ({'input_schema': ...}) and OpenAI
+    ({'function': {'parameters': ...}}) tool shapes, same duality as
+    ``tool_name``.
+    """
+    sig = json.dumps(
+        [
+            [
+                tool_name(t),
+                len(json.dumps(
+                    t.get("input_schema")
+                    or (t.get("function", {}) or {}).get("parameters")
+                    or {},
+                    sort_keys=True,
+                    default=str,
+                )),
+            ]
+            for t in tools
+        ],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(sig.encode("utf-8")).hexdigest()
+
+
+def tools_array_change(
+    last_hashes: MutableMapping[str, Tuple[str, int]],
+    user_id: str,
+    tools: Sequence[Dict[str, Any]],
+) -> Optional[Tuple[int, int]]:
+    """W2.4(c) — record this turn's wire-array fingerprint for `user_id`
+    in `last_hashes` and return ``(old_n, new_n)`` when it differs from
+    the previous turn, else ``None``. Pure bookkeeping (no logging) so
+    unit tests can pin fire/no-fire without running the agent loop.
+
+    Tools serialize AHEAD of system+history in OpenAI's cached prefix,
+    so any change here busts the whole prefix — logging it lets genuine
+    mid-day mutations (app builds adding skill tools, connector
+    connects/disconnects, dashboard toggles) stop reading as mystery
+    cache misses.
+    """
+    new_hash = tools_wire_hash(tools)
+    prev = last_hashes.get(user_id)
+    if len(last_hashes) > 1024:  # unbounded-growth guard (multi-user procs)
+        last_hashes.clear()
+    last_hashes[user_id] = (new_hash, len(tools))
+    if prev is not None and prev[0] != new_hash:
+        return (prev[1], len(tools))
+    return None

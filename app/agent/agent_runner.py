@@ -53,6 +53,7 @@ from app.agent.prefix_stability import (
     render_time_lines,
     strip_tools_for_channel,
     tool_name as _tool_name,
+    tools_array_change,
 )
 from app.config import settings
 from app.services.openai_agent_service import OpenAIAgentService, StreamEvent
@@ -350,6 +351,11 @@ class AgentRunner:
         # [memory_health] line was already emitted. The line therefore
         # reports the previous turn's extraction outcome.
         self._last_extraction_ok: str = "-"
+        # W2.4(c): per-user fingerprint of the last finalized wire tools
+        # array — {user_id: (sha256, tool_count)} — so a genuine mid-day
+        # tools mutation is logged as [PERF] tools_array_changed instead
+        # of reading as a mystery prompt-cache miss.
+        self._last_tools_hash: Dict[str, tuple] = {}
 
     @property
     def tool_defs(self) -> list:
@@ -821,8 +827,17 @@ class AgentRunner:
                 try:
                     from app.agent.day_chat_resolver import should_use_day_chat_context
                     _use_day_ctx = await should_use_day_chat_context()
-                except Exception:
-                    pass
+                except Exception as _duce:
+                    # W2.4(d): loud, not silent — this fallback swaps the
+                    # prefix lineage for the run (session-scoped history AND
+                    # session-scoped prompt_cache_key instead of the shared
+                    # day prefix), which reads as a mystery cache miss.
+                    logger.warning(
+                        "[AGENT] day_chat_context_check_failed — falling back "
+                        "to session-scoped history/cache key for this run. "
+                        "user=%s channel=%s err=%s: %s",
+                        user_id[:8], channel, type(_duce).__name__, _duce,
+                    )
 
             if _use_day_ctx:
                 try:
@@ -1357,6 +1372,14 @@ class AgentRunner:
                 # here. A stable-array override would expose the full
                 # toolset where none was intended; keep legacy for this
                 # run (rare, and a cache miss is the lesser evil).
+                # W2.4(d): loud, not silent — this swaps the prefix
+                # lineage (legacy filtered array) for the run.
+                logger.warning(
+                    "[AGENT] stable_tools empty gated set — falling back to "
+                    "legacy filtered tools array for this run (prefix lineage "
+                    "changes, expect a cache miss). intent=%s channel=%s",
+                    query_intent.category, channel,
+                )
                 _stable_prefix = False
             else:
                 if _gated_names != _stable_names:
@@ -1368,6 +1391,19 @@ class AgentRunner:
                     len(_allowed_tool_names) if _allowed_tool_names else "all",
                     query_intent.category,
                 )
+
+        # W2.4(c): fingerprint the finalized wire array vs this user's
+        # previous turn — tools serialize ahead of system+history, so ANY
+        # change here busts the whole cached prefix. Observability only;
+        # never let it block the turn.
+        try:
+            _tac = tools_array_change(self._last_tools_hash, user_id, current_tools)
+            if _tac is not None:
+                logger.info(
+                    "[PERF] tools_array_changed old_n=%d new_n=%d", _tac[0], _tac[1],
+                )
+        except Exception:
+            pass
 
         logger.info(f"[AGENT] Using {active_model} via {'Anthropic' if _is_claude_model(active_model) else 'OpenAI'} with {len(messages)} messages")
 
