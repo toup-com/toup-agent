@@ -53,6 +53,7 @@ from app.agent.prefix_stability import (
     render_time_lines,
     strip_tools_for_channel,
     tool_name as _tool_name,
+    head_hashes,
     tools_array_change,
 )
 from app.config import settings
@@ -1414,6 +1415,23 @@ class AgentRunner:
                 logger.info(
                     "[PERF] tools_array_changed old_n=%d new_n=%d", _tac[0], _tac[1],
                 )
+        except Exception:
+            pass
+
+        # Prefix-head attribution (pair-probe follow-up 2026-07-28): a
+        # cache_read=0 on a warm turn is unactionable without knowing WHICH
+        # cacheable tier's bytes moved. One line per run — full-byte 8-hex
+        # hashes of the three tiers that head the provider prefix (history
+        # hashed BEFORE the volatile turn_context/user tail is appended).
+        # Diff two turns' lines and the mutating tier names itself.
+        try:
+            _h_tools, _h_sys, _h_hist = head_hashes(
+                current_tools, system_prompt, history
+            )
+            logger.info(
+                "[PERF] prefix_head tools=%s sys=%s hist=%s n_hist=%d",
+                _h_tools, _h_sys, _h_hist, len(history),
+            )
         except Exception:
             pass
 

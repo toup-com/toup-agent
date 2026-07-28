@@ -560,3 +560,38 @@ class TestEdgePathOrderingAndFallbacks:
 
     def test_empty_gated_set_fallback_warns(self):
         assert "stable_tools empty gated set" in _SRC
+
+
+class TestHeadHashes:
+    """Prefix-head attribution (pair-probe follow-up 2026-07-28)."""
+
+    def test_stable_inputs_stable_hashes(self):
+        from app.agent.prefix_stability import head_hashes
+        a = head_hashes(TOOLS, "sys", [{"role": "user", "content": "hi"}])
+        b = head_hashes([dict(t) for t in TOOLS], "sys", [{"role": "user", "content": "hi"}])
+        assert a == b
+        assert all(len(h) == 8 for h in a)
+
+    def test_each_tier_isolated(self):
+        from app.agent.prefix_stability import head_hashes
+        base = head_hashes(TOOLS, "sys", [{"role": "user", "content": "hi"}])
+        t2 = head_hashes(TOOLS[:-1], "sys", [{"role": "user", "content": "hi"}])
+        s2 = head_hashes(TOOLS, "sys2", [{"role": "user", "content": "hi"}])
+        h2 = head_hashes(TOOLS, "sys", [{"role": "user", "content": "hi2"}])
+        assert t2[0] != base[0] and t2[1] == base[1] and t2[2] == base[2]
+        assert s2[1] != base[1] and s2[0] == base[0] and s2[2] == base[2]
+        assert h2[2] != base[2] and h2[0] == base[0] and h2[1] == base[1]
+        # full-byte sensitivity: a description-only tool change moves the
+        # tools hash here (unlike tools_wire_hash, by design)
+        d2 = head_hashes([{**TOOLS[0], "description": "different"}] + list(TOOLS[1:]), "sys", [])
+        assert d2[0] != base[0]
+
+    def test_empty_inputs_do_not_raise(self):
+        from app.agent.prefix_stability import head_hashes
+        a, b, c = head_hashes([], "", [])
+        assert len(a) == len(b) == len(c) == 8
+
+    def test_runner_logs_prefix_head_before_stream(self):
+        assert '"[PERF] prefix_head tools=%s sys=%s hist=%s n_hist=%d"' in _SRC
+        # hashed from `history` (pre-tail), not `messages`
+        assert "head_hashes(\n                current_tools, system_prompt, history\n            )" in _SRC

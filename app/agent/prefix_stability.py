@@ -241,3 +241,25 @@ def tools_array_change(
     if prev is not None and prev[0] != new_hash:
         return (prev[1], len(tools))
     return None
+
+
+def head_hashes(
+    tools: Sequence[Dict[str, Any]],
+    system_prompt: str,
+    history: Sequence[Dict[str, Any]],
+) -> Tuple[str, str, str]:
+    """8-hex full-byte hashes of the three cacheable prefix tiers.
+
+    Unlike ``tools_wire_hash`` (names + schema lengths, cheap change
+    *detector*), these hash the complete serialized bytes of each tier so
+    a warm-turn cache miss can be *attributed*: diff two turns'
+    ``[PERF] prefix_head`` lines and the tier whose hash moved names the
+    culprit. History is hashed as passed — callers hash the persisted
+    history BEFORE appending the volatile turn_context/user tail.
+    """
+
+    def _h(payload: Any) -> str:
+        raw = json.dumps(payload, sort_keys=False, ensure_ascii=False, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+
+    return _h(list(tools or [])), _h(system_prompt or ""), _h(list(history or []))
