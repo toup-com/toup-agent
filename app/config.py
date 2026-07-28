@@ -1253,6 +1253,18 @@ class Settings(BaseSettings):
     # comfortably covers the ~90s happy path with margin for slow boots.
     rollout_canary_wait_minutes_default: int = 5
     rollout_batch_size: int = 5             # Post-canary parallel upgrades per batch
+    # Convergence sweep (2026-07-28 incident: rollout 01a945e2's driver was
+    # killed by its own merge's Railway redeploy; the re-drive d79584ea hit
+    # the bridge mid-restart — 502 — on tenant 2739b5c6, reported 'complete',
+    # and left a real beta user silently on the OLD image for ~40 min). When
+    # true, every reconciler tick with no active rollout compares eligible
+    # running tenants' image_tag against the most recent complete /
+    # complete_with_failures rollout's tag and re-drives only the divergent
+    # ones through a trigger='sweep' rollout — bounded at 3 sweeps per tag
+    # per 24h, then a critical alert. Default ON — this is a KILL SWITCH,
+    # not a rollout gate: flip via ROLLOUT_CONVERGENCE_SWEEP=false if a
+    # sweep ever misbehaves. Pinned in tests/test_rollout_convergence_sweep.py.
+    rollout_convergence_sweep: bool = True
     infra_alert_telegram_token: str = ""    # Dedicated infra bot (split from admin_alert_*)
     infra_alert_telegram_chat_id: str = ""
 

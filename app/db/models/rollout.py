@@ -31,8 +31,12 @@ from .base import Base
 ROLLOUT_STATUSES = {
     "pending",                 # row created, worker not yet picked up
     "running",                 # worker is actively upgrading tenants
-    "complete",                # all tenants processed (some may have failed)
+    "complete",                # all tenants processed, zero failures
+    "complete_with_failures",  # all tenants processed, ≥1 failed/rolled-back (sweep re-drives them)
     "aborted_canary_failed",   # canary failed; no further tenants touched
+    "aborted_orphan",          # reconciler/operator orphaned a dead driver's rollout (also
+                               # stamped by the orchestrator's own crash catch-all — a crash
+                               # must never read as 'complete': the sweep targets complete rows)
     "cancelled",               # operator cancelled mid-flight
 }
 
@@ -43,6 +47,7 @@ ROLLOUT_ATTEMPT_STATUSES = {
     "failed",                  # tenant upgrade failed, rollback not yet attempted
     "rolled_back",             # upgrade failed, rolled back to prior_tag successfully
     "rollback_failed",         # both upgrade AND rollback failed; manual intervention needed
+    "orphaned",                # driver died mid-'upgrading'; terminal state unknown
     "skipped_pinned",          # tenant had pin_image_tag set; not touched
     "skipped_canary",          # canary tenant skipped during Phase B (already upgraded in Phase A)
 }
@@ -51,6 +56,7 @@ ROLLOUT_TRIGGERS = {
     "ci",                      # GitHub Actions webhook after build
     "manual",                  # operator via admin UI or POST /api/admin/rollout/manual
     "rollback",                # operator-triggered rollback to a known-good SHA
+    "sweep",                   # reconciler convergence sweep re-driving divergent tenants
 }
 
 

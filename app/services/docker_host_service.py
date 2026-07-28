@@ -51,9 +51,11 @@ async def _latest_known_good_image_tag(db: AsyncSession) -> Optional[str]:
 
     The "last-good SHA" already running in the tenant fleet — what new
     tenants should be provisioned onto. Skips `aborted_canary_failed`,
-    `cancelled`, `pending`, and `running` rollouts; only `complete`
-    rollouts mean "this SHA passed canary + reached the rest of the
-    fleet healthily."
+    `cancelled`, `pending`, and `running` rollouts; `complete` and
+    `complete_with_failures` both mean "this SHA passed canary + reached
+    the fleet" — with_failures still put MOST of the fleet on the tag
+    (per-tenant failures are re-driven by the convergence sweep), so
+    excluding it would pin new provisions to an older SHA than the fleet.
 
     Returns None only on a fresh platform install with no rollout
     history. Callers fall back to settings.docker_agent_image in that
@@ -65,7 +67,7 @@ async def _latest_known_good_image_tag(db: AsyncSession) -> Optional[str]:
     """
     result = await db.execute(
         select(Rollout.image_tag)
-        .where(Rollout.status == "complete")
+        .where(Rollout.status.in_(["complete", "complete_with_failures"]))
         .order_by(Rollout.completed_at.desc())
         .limit(1)
     )

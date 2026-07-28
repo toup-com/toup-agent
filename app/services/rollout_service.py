@@ -33,7 +33,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -372,6 +372,13 @@ async def _upgrade_one(
 
         if bridge_outcome == "ok":
             attempt.status = "ok"
+            # Clear any stale error: a reconciler false-positive (heartbeat-
+            # stale orphan on a still-alive driver, observed 2026-07-25) may
+            # have stamped this row 'orphaned' + "driver died..." while we
+            # were awaiting the bridge. Our write wins on status — it must
+            # win on error too, or the permanent record reads
+            # status='ok' error='driver died...'.
+            attempt.error = None
             attempt.health_checks_passed = (bridge_result or {}).get("health_checks_passed", 0)
             attempt.duration_ms = (bridge_result or {}).get("duration_ms") or duration_ms
             attempt.completed_at = datetime.utcnow()
@@ -558,8 +565,19 @@ async def _run_rollout_task(rollout_id: str) -> None:
             # Shouldn't normally happen — _drive_rollout handles its own
             # per-tenant errors. Catch-all to ensure the rollout row is
             # always closed.
+            #
+            # Status MUST NOT be 'complete': a crash here can predate the
+            # canary observation (e.g. a transient DB error in the first
+            # statements of _drive_rollout), and 'complete' is load-bearing
+            # downstream — the convergence sweep picks the newest complete/
+            # complete_with_failures rollout as the fleet's target tag, and
+            # _latest_known_good_image_tag pins new provisions to it. A
+            # crash-stamped 'complete' would have the sweep batch-drive the
+            # whole fleet onto a tag whose canary never passed.
+            # 'aborted_orphan' is equally terminal (frees the lock) and the
+            # CI gate already handles it by re-firing once.
             logger.exception("[ROLLOUT] id=%s crashed: %s", rollout_id, e)
-            rollout.status = "complete"
+            rollout.status = "aborted_orphan"
             rollout.completed_at = datetime.utcnow()
             rollout.last_progress_at = datetime.utcnow()
             rollout.notes = (rollout.notes or "") + f"\nORCHESTRATOR CRASH: {type(e).__name__}: {str(e)[:500]}"
@@ -685,7 +703,13 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
         rollout.last_progress_at = datetime.utcnow()
         await db.commit()
 
-    rollout.status = "complete"
+    # Honest terminal status (2026-07-28 incident: re-drive d79584ea hit the
+    # bridge mid-restart on one tenant, reported 'complete', and left a real
+    # user silently on the old image for ~40 min). A rollout that failed any
+    # tenant is NOT 'complete' — 'complete_with_failures' is equally terminal
+    # (active_rollout only counts pending/running) but visible to operators
+    # and to the convergence sweep.
+    rollout.status = "complete" if total_fail == 0 else "complete_with_failures"
     rollout.completed_at = datetime.utcnow()
     rollout.last_progress_at = datetime.utcnow()
     rollout.phase = ""
@@ -908,6 +932,18 @@ async def rollout_reconciler_loop() -> None:
         except Exception:
             # Never let a tick exception kill the loop. Log and keep going.
             logger.exception("[ROLLOUT-RECONCILER] tick failed; will retry")
+        # Convergence sweep — separate try/except so a sweep failure can't
+        # mask (or be masked by) a reconcile failure. Lives in the LOOP, not
+        # in _reconcile_once: start_rollout runs _reconcile_once as its lock
+        # self-heal pass, and a sweep firing there would grab the lock the
+        # caller is about to check and 409 every CI push with divergence.
+        # Note the tick pauses while a sweep drives its batches (bounded by
+        # hard_timeout_s per batch) — acceptable: the sweep holds the rollout
+        # lock anyway, and its heartbeat keeps the row visibly alive.
+        try:
+            await _convergence_sweep_once()
+        except Exception:
+            logger.exception("[ROLLOUT-SWEEP] tick failed; will retry")
         # NOTE (bulletproof plan M): the legacy prewarm reconciler
         # (`reconcile_stuck_provisioning`) used to piggy-back here. It was
         # removed — `pool_service.reclaim_stranded_users` (180s tick in the
@@ -918,6 +954,371 @@ async def rollout_reconciler_loop() -> None:
         await asyncio.sleep(30)
 
 
+# ─── Convergence sweep (2026-07-28 incident) ──────────────────────
+#
+# Rollout 01a945e2's driver was killed by its own merge's Railway
+# redeploy; the reconciler orphaned it, and the re-drive d79584ea then
+# hit the bridge mid-restart (502 — the same merge touched
+# bridge/pool_addon.py, which restarts the bridge) on tenant 2739b5c6.
+# The re-drive reported 'complete' while a real beta user sat on the old
+# image until an operator noticed ~40 min later. The sweep closes that
+# class: after every rollout settles, compare what the fleet SHOULD be
+# on against what managed_containers says it IS on, and re-drive only
+# the divergent tenants. The sweep IS the retry for transient per-tenant
+# failures (bridge restarts, 502s) — _upgrade_one itself never retries.
+
+# Max sweep rollouts per (image_tag, 24h). A tenant that still diverges
+# after 3 sweeps has a real problem that retries won't fix — alert and
+# stop instead of hammering the bridge every 30s tick.
+_SWEEP_MAX_PER_TAG_24H = 3
+
+# Minimum spacing between consecutive sweeps of the same tag. The sweep
+# exists to retry transient bridge outages (deploy-bridge.yml restarts
+# span minutes), but the reconciler ticks every 30s and a failed sweep
+# completes in seconds — without spacing, all 3 budget slots burned in
+# ~90s against a bridge that was still restarting, and the tag was then
+# capped for 24h (the exact incident outcome, minus automation). Three
+# attempts spread ≥10 min apart outlast any bridge restart window.
+_SWEEP_MIN_GAP_MIN = 10
+
+# Tags whose exhausted-cap alert has already fired this process — the
+# sweep skips capped tags on every subsequent tick, and re-alerting
+# every 30s would flood Telegram. Process-local, same trade-off as
+# _resume_inflight; a new tag has a different key so it alerts again.
+_sweep_exhausted_alerted: set[str] = set()
+
+# Serializes the check-then-insert window of start_rollout and the sweep.
+# Both do `active_rollout()` → (several SELECTs) → INSERT with awaits in
+# between; without exclusion, a CI webhook landing inside the sweep's
+# window (build-agent.yml retries every 60s for 40 min, clustering in
+# exactly the divergence-heavy periods the sweep wakes for) passes its
+# own active-check and commits a second concurrent rollout — two drivers
+# then blue-green the same tenants to different tags. Process-local lock
+# is sufficient: only one platform-api instance runs (same assumption as
+# _resume_inflight), and it is held only across quick DB statements —
+# never across bridge/Telegram I/O.
+_rollout_creation_lock = asyncio.Lock()
+
+
+async def _convergence_sweep_once() -> None:
+    """One convergence-sweep pass. Runs only when no rollout is active.
+
+    Target = image_tag of the most recent rollout whose status is
+    'complete' or 'complete_with_failures' (by completed_at). Any tenant
+    eligible for rollouts (same `_running_tenants` filter — running, not
+    pinned, not pool-bound) whose managed_containers.image_tag differs is
+    driven through the existing `_upgrade_one` path under a fresh
+    Rollout(trigger='sweep'), so attempt rows, quarantine handling and
+    Telegram alerts all work unchanged.
+
+    Guard rails:
+      - Kill switch: settings.rollout_convergence_sweep (default ON).
+      - Newest-row guard: if the newest rollout row overall (any status,
+        by started_at) is NOT the target and carries a DIFFERENT tag, the
+        sweep stands down. Replaying the 2026-07-28 incident without this:
+        the reconciler orphans the NEW-tag rollout and the sweep fires in
+        the same loop iteration, sees target = the PREVIOUS tag, reads the
+        just-upgraded tenants as 'divergent', and blue-green DOWNGRADES
+        them while holding the lock the CI gate's re-fire needs (its 409
+        was silently swallowed). Same guard keeps cancel_rollout's
+        documented "does NOT revert already-upgraded tenants" true — the
+        newest row being 'cancelled' also stands the sweep down. The
+        newer tag's re-drive (CI gate re-fire, or the operator) owns the
+        fleet's intent; the sweep only converges toward settled history.
+      - Spacing: ≥ `_SWEEP_MIN_GAP_MIN` minutes between sweeps of the
+        same tag, so transient bridge outages get outlasted instead of
+        burning the whole budget in ~90s of consecutive ticks.
+      - Budget: at most `_SWEEP_MAX_PER_TAG_24H` sweep rollouts per tag
+        per 24h — after that, alert once and skip until a new tag ships.
+
+    Session discipline (pgbouncer txn-mode pooler): all DB checks + the
+    sweep-row insert happen under `_rollout_creation_lock` in one short
+    session; Telegram calls and the batch drive run with NO session open
+    and NO transaction pending — heartbeats/stamps use narrow sessions,
+    same contract as `_upgrade_one`.
+    """
+    if not settings.rollout_convergence_sweep:
+        return
+
+    sweep_id: Optional[str] = None
+    sweep_rollout: Optional[Rollout] = None
+    exhausted_prefixes: Optional[str] = None
+    target = ""
+    divergent: list[ManagedContainer] = []
+    prefixes = ""
+
+    async with async_session_maker() as db:
+        async with _rollout_creation_lock:
+            # Never sweep under an active rollout — the driver owns the fleet.
+            if await active_rollout(db) is not None:
+                return
+
+            target_rollout = (await db.execute(
+                select(Rollout)
+                .where(Rollout.status.in_(["complete", "complete_with_failures"]))
+                .order_by(Rollout.completed_at.desc())
+            )).scalars().first()
+            if target_rollout is None:
+                return  # fresh install; no rollout history to converge on
+            target = target_rollout.image_tag
+
+            # Newest-row guard (see docstring): a newer rollout row on a
+            # DIFFERENT tag that never completed (aborted_orphan, cancelled,
+            # aborted_canary_failed) means the fleet's intent is that newer
+            # tag — sweeping now would converge BACKWARD onto old history.
+            newest = (await db.execute(
+                select(Rollout).order_by(Rollout.started_at.desc()).limit(1)
+            )).scalars().first()
+            if (
+                newest is not None
+                and newest.id != target_rollout.id
+                and newest.image_tag != target
+            ):
+                logger.info(
+                    "[ROLLOUT-SWEEP] standing down: newest rollout %s "
+                    "(status=%s, tag=%s) is not the convergence target %s "
+                    "(tag=%s) — the newer tag's re-drive owns the fleet",
+                    newest.id, newest.status, newest.image_tag,
+                    target_rollout.id, target,
+                )
+                return
+
+            tenants = await _running_tenants(db)
+            divergent = [t for t in tenants if (t.image_tag or "") != target]
+            if not divergent:
+                return
+            prefixes = ", ".join(sorted(t.user_id[:8] for t in divergent))
+
+            # Budget: count prior sweeps for this tag in the last 24h BEFORE
+            # starting another. Uses started_at (creation time) — completed_at
+            # is NULL if a sweep itself died.
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            prior_sweeps = (await db.execute(
+                select(func.count()).select_from(Rollout).where(
+                    Rollout.trigger == "sweep",
+                    Rollout.image_tag == target,
+                    Rollout.started_at >= cutoff,
+                )
+            )).scalar() or 0
+            if prior_sweeps >= _SWEEP_MAX_PER_TAG_24H:
+                if target not in _sweep_exhausted_alerted:
+                    _sweep_exhausted_alerted.add(target)
+                    exhausted_prefixes = prefixes
+                # Close the read transaction before falling out to the
+                # (external HTTP) alert below — never hold a pooled
+                # connection idle-in-transaction across network I/O.
+                await db.rollback()
+            else:
+                # Spacing: skip this tick if the last sweep for this tag is
+                # too recent — a failed sweep completes in seconds while the
+                # bridge outage it hit spans minutes.
+                last_sweep_started = (await db.execute(
+                    select(Rollout.started_at).where(
+                        Rollout.trigger == "sweep",
+                        Rollout.image_tag == target,
+                        Rollout.started_at >= cutoff,
+                    ).order_by(Rollout.started_at.desc()).limit(1)
+                )).scalar_one_or_none()
+                if (
+                    last_sweep_started is not None
+                    and datetime.utcnow() - last_sweep_started
+                    < timedelta(minutes=_SWEEP_MIN_GAP_MIN)
+                ):
+                    logger.info(
+                        "[ROLLOUT-SWEEP] standing down: last sweep for %s "
+                        "started %s — waiting out the %d-min gap",
+                        target, last_sweep_started, _SWEEP_MIN_GAP_MIN,
+                    )
+                    return
+
+                # Created directly in 'running' — the sweep drives inline,
+                # there is no scheduler hop that a 'pending' state would
+                # represent. No canary phase: the target tag already passed
+                # canary in the rollout that made it the target (the crash
+                # catch-all no longer stamps 'complete'), and _upgrade_one's
+                # per-tenant health gate + rollback still applies.
+                rollout = Rollout(
+                    image_tag=target,
+                    status="running",
+                    trigger="sweep",
+                    canary_wait_minutes=0,
+                    phase="batching",
+                    notes=f"convergence sweep: {len(divergent)} divergent tenant(s): {prefixes}",
+                    last_progress_at=datetime.utcnow(),
+                )
+                db.add(rollout)
+                await db.commit()
+                # NOTE: no db.refresh() here — the id is client-generated
+                # (uuid4 default) and the sessionmaker runs
+                # expire_on_commit=False, so nothing needs reloading. The
+                # refresh this replaced opened a NEW transaction (SELECT
+                # autobegin) that then sat idle-in-transaction across the
+                # Telegram call and the entire first batch of bridge
+                # upgrades (~210s) — the exact pgbouncer anti-pattern
+                # purged in commit 6d173563.
+                sweep_id = rollout.id
+                sweep_rollout = rollout
+
+    # ── Session closed, lock released; everything below is I/O-heavy and
+    # runs with no DB transaction pending. ──
+
+    if exhausted_prefixes is not None:
+        await _send_telegram(
+            "critical",
+            f"convergence sweep exhausted for <code>{target}</code>: "
+            f"tenant(s) <code>{exhausted_prefixes}</code> still divergent",
+        )
+        return
+    if sweep_id is None:
+        return
+
+    logger.warning(
+        "[ROLLOUT-SWEEP] %d divergent tenant(s) [%s] vs target %s — starting sweep %s",
+        len(divergent), prefixes, target, sweep_id,
+    )
+    await _send_telegram(
+        "warning",
+        f"Convergence sweep started — {len(divergent)} tenant(s) "
+        f"<code>{prefixes}</code> diverged from <code>{target}</code>, re-driving",
+    )
+
+    # Same batch loop + heartbeat contract as _drive_rollout Phase B. The
+    # `divergent` containers and `sweep_rollout` are detached rows (their
+    # session is closed); `_upgrade_one` only reads loaded scalar attrs
+    # and opens its own narrow sessions. Progress stamps use narrow
+    # sessions too.
+    batch_size = settings.rollout_batch_size or 5
+    total_ok = 0
+    total_fail = 0
+    for i in range(0, len(divergent), batch_size):
+        batch = divergent[i : i + batch_size]
+        tasks = [_upgrade_one(None, sweep_rollout, c, target) for c in batch]
+        async with _heartbeating(sweep_id, "sweep-batch"):
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+        for r in results:
+            if r.status == "ok":
+                total_ok += 1
+            else:
+                total_fail += 1
+        async with async_session_maker() as db:
+            await db.execute(
+                update(Rollout).where(Rollout.id == sweep_id)
+                .values(last_progress_at=datetime.utcnow())
+            )
+            await db.commit()
+
+    async with async_session_maker() as db:
+        await db.execute(
+            update(Rollout).where(Rollout.id == sweep_id).values(
+                status="complete" if total_fail == 0 else "complete_with_failures",
+                completed_at=datetime.utcnow(),
+                last_progress_at=datetime.utcnow(),
+                phase="",
+                notes=(
+                    f"convergence sweep completed: {total_ok} ok, {total_fail} "
+                    f"failed/rolled-back of {len(divergent)} divergent"
+                ),
+            )
+        )
+        await db.commit()
+    await _send_telegram(
+        "info" if total_fail == 0 else "warning",
+        f"Convergence sweep <code>{target}</code> complete: "
+        f"{total_ok}/{len(divergent)} converged, {total_fail} failed",
+    )
+
+
+# Error stamped on attempt rows whose driver died mid-'upgrading'. The
+# bridge finishes a POSTed blue-green swap independently of the platform
+# driver, so the tenant may well be on the new tag (3 of the 4 stuck rows
+# from rollout 01a945e2 were) — the convergence sweep settles it either way.
+_ORPHANED_ATTEMPT_ERROR = (
+    "driver died; terminal state unknown (bridge may have completed the swap)"
+)
+
+
+async def _orphan_stuck_attempts(db: AsyncSession, rollout_id: str) -> int:
+    """Mark a dying rollout's in-flight attempts terminal.
+
+    Called when the reconciler orphans a rollout: any attempt row still in
+    status='upgrading' belongs to a driver presumed dead — left alone it
+    reads as in-flight forever (rollout 01a945e2 left FOUR such rows).
+
+    Single guarded UPDATE (`WHERE status='upgrading'`) executed in the
+    caller's transaction — the caller's commit flushes it alongside the
+    rollout row. The guard makes the interleaving with a still-alive
+    driver (heartbeat-stale false positive, observed 2026-07-25) safe in
+    both orders: if the driver's narrow-session write already landed a
+    real terminal outcome, this matches zero rows; if this lands first,
+    the driver's own unconditional write overwrites it with the truth
+    (and the 'ok' branch clears the stale error). The previous ORM
+    read-modify-write could clobber a driver outcome committed between
+    its SELECT and its flush.
+    """
+    result = await db.execute(
+        update(RolloutAttempt)
+        .where(
+            RolloutAttempt.rollout_id == rollout_id,
+            RolloutAttempt.status == "upgrading",
+        )
+        .values(
+            status="orphaned",
+            error=_ORPHANED_ATTEMPT_ERROR,
+            completed_at=datetime.utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount or 0
+
+
+async def _close_stuck_attempts_of_terminal_rollouts(db: AsyncSession) -> None:
+    """Heal 'upgrading' attempt rows whose parent rollout is already terminal.
+
+    Backfill companion to `_orphan_stuck_attempts`: rows orphaned BEFORE
+    this cleanup shipped (e.g. rollout 01a945e2's four), or whose rollout
+    was closed by a path that didn't run the in-line cleanup. Commits only
+    when something changed.
+
+    Age gate: only attempts older than the driver's hard per-attempt
+    timeout are touched. A terminal PARENT does not imply a dead DRIVER —
+    `cancel_rollout` deliberately lets the in-flight batch finish (up to
+    ~210s of live 'upgrading' rows under a status='cancelled' parent),
+    and a heartbeat-stale orphan can false-positive on a live driver.
+    Past hard_timeout_s(+30s margin) every driver has resolved its
+    attempt by construction, so anything still 'upgrading' is debris.
+    Same guarded-UPDATE shape as `_orphan_stuck_attempts` so a late
+    driver write is never clobbered.
+    """
+    hard_timeout_s = (settings.bridge_upgrade_timeout_s or 180) + 30
+    age_cutoff = datetime.utcnow() - timedelta(seconds=hard_timeout_s + 30)
+    result = await db.execute(
+        update(RolloutAttempt)
+        .where(
+            RolloutAttempt.status == "upgrading",
+            RolloutAttempt.started_at < age_cutoff,
+            RolloutAttempt.rollout_id.in_(
+                select(Rollout.id).where(
+                    Rollout.status.not_in(["pending", "running"])
+                )
+            ),
+        )
+        .values(
+            status="orphaned",
+            error=_ORPHANED_ATTEMPT_ERROR,
+            completed_at=datetime.utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    n = result.rowcount or 0
+    if not n:
+        return
+    await db.commit()
+    logger.warning(
+        "[ROLLOUT-RECONCILER] closed %d stuck 'upgrading' attempt(s) of terminal rollouts",
+        n,
+    )
+
+
 async def _reconcile_once(db: Optional[AsyncSession] = None) -> None:
     """One reconciler tick — split out so tests can call it deterministically.
 
@@ -925,11 +1326,17 @@ async def _reconcile_once(db: Optional[AsyncSession] = None) -> None:
     can run the reconcile pass inside their own transaction (lock self-heal
     before the active-rollout check). When called with no argument the loop
     creates its own session.
+
+    The stuck-attempt backfill runs here (not in `_reconcile_once_in_session`)
+    so it fires even when NO rollout is inflight — the rows it heals belong
+    to rollouts that are already terminal.
     """
     if db is None:
         async with async_session_maker() as own_db:
+            await _close_stuck_attempts_of_terminal_rollouts(own_db)
             await _reconcile_once_in_session(own_db)
     else:
+        await _close_stuck_attempts_of_terminal_rollouts(db)
         await _reconcile_once_in_session(db)
 
 
@@ -977,6 +1384,9 @@ async def _reconcile_once_in_session(db: AsyncSession) -> None:
                 f"({idle_min:.1f}min idle, age={age_min:.1f}min, "
                 f"phase={rollout.phase!r}, threshold={_STUCK_HEARTBEAT_MIN}min)"
             )
+            # Close the dead driver's in-flight attempt rows in the same
+            # commit — 01a945e2 left four 'upgrading' rows behind forever.
+            await _orphan_stuck_attempts(db, rollout.id)
             await db.commit()
             await _send_telegram(
                 "warning",
@@ -1023,6 +1433,8 @@ async def _reconcile_once_in_session(db: AsyncSession) -> None:
                 f"\nAuto-orphaned by reconciler at age={age_min:.1f}min "
                 f"(phase={rollout.phase!r}, threshold={_STUCK_ROLLOUT_THRESHOLD_MIN}min)"
             )
+            # Same in-flight-attempt cleanup as the heartbeat path above.
+            await _orphan_stuck_attempts(db, rollout.id)
             await db.commit()
             await _send_telegram(
                 "warning",
@@ -1120,12 +1532,20 @@ async def _resume_rollout_task(rollout_id: str) -> None:
             await db.commit()
             return
 
-        # Look up the canary's prior tag from its successful attempt row
-        prior = None
-        for a in (rollout.attempts or []):
-            if a.status == "ok":
-                prior = a.prior_tag
-                break
+        # Look up the canary's prior tag from its successful attempt row.
+        # Explicit query — NOT `rollout.attempts`: the relationship is
+        # lazy='select', and touching it on an async session raises
+        # MissingGreenlet, which crashed the resume task on the one path
+        # that runs after a redeploy kills the driver mid-observation
+        # (caught by _resume_with_cleanup, so it only surfaced as the
+        # rollout falling through to the heartbeat orphan). Exposed by
+        # test_resume_rollout_task_stamps_complete_with_failures_on_partial_failure.
+        prior = (await db.execute(
+            select(RolloutAttempt.prior_tag).where(
+                RolloutAttempt.rollout_id == rollout.id,
+                RolloutAttempt.status == "ok",
+            ).order_by(RolloutAttempt.started_at).limit(1)
+        )).scalar_one_or_none()
 
         agent_url = await _agent_url(db, canary)
         proceed = await _canary_observe_loop(db, rollout, canary, prior, agent_url)
@@ -1168,7 +1588,8 @@ async def _resume_rollout_task(rollout_id: str) -> None:
             rollout.last_progress_at = datetime.utcnow()
             await db.commit()
 
-        rollout.status = "complete"
+        # Honest terminal status — same rule as _drive_rollout's stamp.
+        rollout.status = "complete" if total_fail == 0 else "complete_with_failures"
         rollout.completed_at = datetime.utcnow()
         rollout.last_progress_at = datetime.utcnow()
         rollout.phase = ""
@@ -1221,27 +1642,32 @@ async def start_rollout(
     # the very first stuck rollout — operators had to manually cancel.
     await _reconcile_once(db)
 
-    active = await active_rollout(db)
-    if active:
-        raise RolloutInProgress(active.id, active.image_tag)
+    # Serialize the check-then-insert window with the convergence sweep
+    # (and concurrent webhook retries): both do active_rollout() → INSERT
+    # with awaits in between, and without exclusion two 'active' rollouts
+    # can be committed concurrently — two drivers then upgrade the same
+    # tenants to different tags. The lock covers only quick DB statements.
+    async with _rollout_creation_lock:
+        active = await active_rollout(db)
+        if active:
+            raise RolloutInProgress(active.id, active.image_tag)
 
-    wait_min = canary_wait_minutes
-    if wait_min is None:
-        wait_min = settings.rollout_canary_wait_minutes_default
-    wait_min = max(1, min(60, int(wait_min)))
+        wait_min = canary_wait_minutes
+        if wait_min is None:
+            wait_min = settings.rollout_canary_wait_minutes_default
+        wait_min = max(1, min(60, int(wait_min)))
 
-    rollout = Rollout(
-        image_tag=image_tag,
-        status="pending",
-        trigger=trigger,
-        triggered_by=triggered_by,
-        canary_wait_minutes=wait_min,
-        notes=notes,
-        last_progress_at=datetime.utcnow(),
-    )
-    db.add(rollout)
-    await db.commit()
-    await db.refresh(rollout)
+        rollout = Rollout(
+            image_tag=image_tag,
+            status="pending",
+            trigger=trigger,
+            triggered_by=triggered_by,
+            canary_wait_minutes=wait_min,
+            notes=notes,
+            last_progress_at=datetime.utcnow(),
+        )
+        db.add(rollout)
+        await db.commit()
 
     # Schedule the background driver via APScheduler. Import lazily to
     # avoid circular imports at module load time.

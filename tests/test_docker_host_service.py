@@ -55,6 +55,30 @@ async def test_latest_known_good_returns_most_recent_complete():
 
 
 @pytest.mark.asyncio
+async def test_latest_known_good_prefers_newer_complete_with_failures():
+    """`complete_with_failures` is a first-class known-good source (honest
+    terminal status, 2026-07-28): a with-failures rollout still put MOST
+    of the fleet on its tag, so excluding it would pin every new
+    provision/prewarm to an older SHA than the fleet — the exact
+    divergence class the convergence sweep exists to heal. A newer
+    `complete_with_failures` must shadow an older `complete`."""
+    older = datetime.utcnow() - timedelta(days=2)
+    newer = datetime.utcnow() - timedelta(hours=1)
+
+    async with async_session_maker() as db:
+        db.add(_rollout_row("ghcr.io/toup-com/toup-agent:older_clean", "complete", older))
+        db.add(_rollout_row(
+            "ghcr.io/toup-com/toup-agent:newer_with_failures",
+            "complete_with_failures", newer,
+        ))
+        await db.commit()
+
+        tag = await _latest_known_good_image_tag(db)
+
+    assert tag == "ghcr.io/toup-com/toup-agent:newer_with_failures"
+
+
+@pytest.mark.asyncio
 async def test_latest_known_good_ignores_aborted_canary_failed():
     """A more-recent `aborted_canary_failed` rollout must not shadow the older `complete`."""
     older_complete = datetime.utcnow() - timedelta(days=2)
