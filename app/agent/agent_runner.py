@@ -52,6 +52,7 @@ from app.agent.prefix_stability import (
     build_turn_context_message,
     render_time_lines,
     strip_tools_for_channel,
+    channel_banned_names,
     tool_name as _tool_name,
     head_hashes,
     tools_array_change,
@@ -1372,13 +1373,40 @@ class AgentRunner:
         # the tools tier re-caches on array change anyway — TKT-LAT-001.)
         _stable_prefix = _stable_layout and not _is_claude_model(active_model)
         _allowed_tool_names: Optional[List[str]] = None
+        _channel_converge = _stable_layout and bool(
+            getattr(settings, "channel_converge", False)
+        )
         if _stable_prefix:
-            _stable_tools = strip_tools_for_channel(
-                all_tools, channel,
-                strip_vault_tool_for_channel=strip_vault_tool_for_channel,
-            )
+            if _channel_converge:
+                # W2.3a: channel-INVARIANT wire array — web/Telegram/voice
+                # hops inside one day stop forking the tools tier (which
+                # heads the cached prefix). The channel policy the strips
+                # used to encode moves to (1) the allowed_tools restriction
+                # below and (2) the executor's disabled set — a banned call
+                # that slips past allowed_tools is refused at execute time.
+                _stable_tools = list(all_tools)
+                _channel_banned = channel_banned_names(
+                    all_tools, channel,
+                    strip_vault_tool_for_channel=strip_vault_tool_for_channel,
+                )
+                if _channel_banned:
+                    self.tools.user_disabled_tools = (
+                        set(self.tools.user_disabled_tools) | set(_channel_banned)
+                    )
+                    _RUN_DISABLED_TOOLS_CTX.set(
+                        (_RUN_DISABLED_TOOLS_CTX.get() or frozenset())
+                        | _channel_banned
+                    )
+            else:
+                _stable_tools = strip_tools_for_channel(
+                    all_tools, channel,
+                    strip_vault_tool_for_channel=strip_vault_tool_for_channel,
+                )
+                _channel_banned = frozenset()
             _stable_names = {_tool_name(t) for t in _stable_tools}
-            _gated_names = {_tool_name(t) for t in current_tools} & _stable_names
+            _gated_names = (
+                {_tool_name(t) for t in current_tools} & _stable_names
+            ) - _channel_banned
             if not _gated_names and query_intent.category != "full":
                 # Edge (review #10): the gated set is empty (e.g. every
                 # always-included tool disabled) — legacy sent tools=None
@@ -1514,6 +1542,14 @@ class AgentRunner:
                     # cache locality.
                     if prompt_profile == PromptProfile.SUBAGENT:
                         _cache_scope = session_id
+                    elif _channel_converge:
+                        # W2.3a: the key is a ROUTING hint, not a
+                        # correctness input — a per-day scope re-routed the
+                        # first turns of every new day away from the shard
+                        # that already holds the (identical) tools+system
+                        # head. One stable scope per user keeps midnight
+                        # from rotating it.
+                        _cache_scope = "all"
                     else:
                         _cache_scope = _day_chat_id or session_id
                     _cache_key = f"{user_id}:{_cache_scope}" if user_id and _cache_scope else None
@@ -1748,7 +1784,10 @@ class AgentRunner:
                                 # cache key on the failover provider too.
                                 # Same day-scoped cache key + per-session
                                 # billing key as the primary call (PR-1).
-                                _fb_scope = _day_chat_id or session_id
+                                _fb_scope = (
+                                    "all" if (_channel_converge and prompt_profile != PromptProfile.SUBAGENT)
+                                    else (_day_chat_id or session_id)
+                                )
                                 _fb_cache_key = f"{user_id}:{_fb_scope}" if user_id and _fb_scope else None
                                 _fb_idem_key = f"{user_id}:{session_id}" if user_id and session_id else None
                                 async for event in fallback_llm.create_message_stream(

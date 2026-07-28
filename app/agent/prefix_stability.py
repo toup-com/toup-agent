@@ -263,3 +263,28 @@ def head_hashes(
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
 
     return _h(list(tools or [])), _h(system_prompt or ""), _h(list(history or []))
+
+
+def channel_banned_names(
+    tools: Sequence[Dict[str, Any]],
+    channel: str,
+    *,
+    strip_vault_tool_for_channel,
+) -> frozenset:
+    """W2.3a — the tool names a channel is NOT allowed to use.
+
+    Defined as the set difference between the full array and
+    ``strip_tools_for_channel``'s output, so the ban list can never drift
+    from the strip rules it replaces. Under ``settings.channel_converge``
+    the wire array stays channel-invariant and this set is enforced twice:
+    subtracted from the ``allowed_tools`` restriction (the model cannot
+    pick a banned tool) and merged into the executor's disabled set (a
+    banned call that somehow slips through is refused at execute time).
+    """
+    kept = {
+        tool_name(t)
+        for t in strip_tools_for_channel(
+            tools, channel, strip_vault_tool_for_channel=strip_vault_tool_for_channel
+        )
+    }
+    return frozenset(tool_name(t) for t in tools) - kept

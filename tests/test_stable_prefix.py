@@ -595,3 +595,59 @@ class TestHeadHashes:
         assert '"[PERF] prefix_head tools=%s sys=%s hist=%s n_hist=%d"' in _SRC
         # hashed from `history` (pre-tail), not `messages`
         assert "head_hashes(\n                current_tools, system_prompt, history\n            )" in _SRC
+
+
+# ── W2.3a — channel convergence ────────────────────────────────────────
+
+from app.agent.prefix_stability import channel_banned_names
+
+
+class TestChannelConverge:
+    def test_flag_defaults_off(self):
+        assert Settings.model_fields["channel_converge"].default is False
+
+    def test_bridge_ships_the_flag(self):
+        bridge = (Path(__file__).resolve().parent.parent.parent / "bridge" / "pool_addon.py").read_text()
+        assert '"CHANNEL_CONVERGE"' in bridge
+
+    def _banned(self, channel):
+        return channel_banned_names(
+            TOOLS, channel, strip_vault_tool_for_channel=strip_vault_tool_for_channel,
+        )
+
+    def test_banned_mirrors_strip_rules_exactly(self):
+        # The definitional property: banned ∪ kept == all, disjoint — the
+        # ban list can never drift from the strips it replaces.
+        for channel in ("web", "telegram", "vibecoding", "app", "voice", "mobile"):
+            kept = {tool_name(t) for t in _strip(channel)}
+            banned = self._banned(channel)
+            assert banned | kept == {tool_name(t) for t in TOOLS}
+            assert not (banned & kept)
+
+    def test_channel_policies(self):
+        assert self._banned("vibecoding") >= {"app_builder__build_app"}
+        assert self._banned("app") >= {"app_builder__build_app", "write_file", "exec"}
+        # web keeps everything (vault card renders there)
+        assert self._banned("web") == frozenset()
+
+    def test_runner_converge_wiring(self):
+        # wire array is the full set; policy moves to allowed_tools +
+        # executor disabled-set; gated names subtract the banned set
+        assert "_stable_tools = list(all_tools)" in _SRC
+        assert "_channel_banned = channel_banned_names(" in _SRC
+        assert "self.tools.user_disabled_tools = (" in _SRC
+        assert ") - _channel_banned" in _SRC
+        # ContextVar union keeps the W2.2 race fix intact
+        assert "_RUN_DISABLED_TOOLS_CTX.set(\n                        (_RUN_DISABLED_TOOLS_CTX.get() or frozenset())\n                        | _channel_banned" in _SRC
+
+    def test_runner_cache_scope_user_wide(self):
+        # both the primary and fallback call sites collapse the scope
+        assert '_cache_scope = "all"' in _SRC
+        assert '"all" if (_channel_converge and prompt_profile != PromptProfile.SUBAGENT)' in _SRC
+        # subagent isolation survives converge
+        assert _SRC.index("if prompt_profile == PromptProfile.SUBAGENT:\n                        _cache_scope = session_id") < _SRC.index('_cache_scope = "all"')
+
+    def test_flag_off_keeps_legacy_paths(self):
+        # legacy per-channel strip + day-scoped key both still present
+        assert "_stable_tools = strip_tools_for_channel(" in _SRC
+        assert "_cache_scope = _day_chat_id or session_id" in _SRC

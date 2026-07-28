@@ -300,6 +300,21 @@ class Settings(BaseSettings):
     # (regression-pinned in tests/test_prompt_diet.py).
     prompt_diet: bool = False
 
+    # Channel convergence (token-efficiency W2.3a). Today every channel gets
+    # its own wire tools array (vault strip, vibecoding/app strips) — and
+    # tools serialize AHEAD of system+history, so web→Telegram→voice hops
+    # inside one Day-as-Chat day each start a separate provider cache
+    # lineage. When true (and the stable prefix layout is active):
+    #   - the wire tools array is the FULL channel-invariant set; the
+    #     channel policy moves to the allowed_tools restriction (not part
+    #     of the cached prefix) + executor-side refusal (defense in depth)
+    #   - prompt_cache_key scope collapses from {user}:{day_chat_id} to
+    #     {user}:all — the key is a routing hint, and a per-day key threw
+    #     away cross-midnight head reuse for zero benefit
+    # Default OFF: model-visible only via allowed_tools; flip after canary
+    # A/B (same recipe as PROMPT_DIET). Flag-off is byte-identical.
+    channel_converge: bool = False
+
     # Document Generation + Web Attachments (Phase 1+2 of doc-delivery feature)
     # When false: generate_* tools are not registered, attachment WS events are not emitted.
     # Frontend has its own localStorage gate (TOUP_DOC_ATTACHMENTS) for the two-pane UI.
