@@ -188,13 +188,26 @@ def test_agent_deduct_stores_cached_in_metadata_not_amount():
     assert "credits = _tokens_to_credits(body.model, body.input_tokens, body.output_tokens)" in src
 
 
-def test_calc_cost_cents_ignores_cached_tokens():
-    """A9-2 (cost overstatement on cache hits) is documented out of scope —
-    _calc_cost_cents must remain a pure fn of input/output."""
-    src = inspect.getsource(lp._calc_cost_cents)
-    assert "cached" not in src
+def test_calc_cost_cents_legacy_models_ignore_cached_tokens():
+    """A9-2 (cost overstatement on cache hits) stays out of scope for the
+    LIVE fleet: G1 prep added optional cached/cache-write kwargs to
+    _calc_cost_cents, but they may only act on models whose pricing entry
+    carries the cached_input/cache_write columns (gpt-5.6 family — dark).
+    For every current model the math must stay byte-identical, cached or
+    not."""
     sig = inspect.signature(lp._calc_cost_cents)
-    assert list(sig.parameters) == ["model", "input_tokens", "output_tokens"]
+    assert list(sig.parameters) == [
+        "model", "input_tokens", "output_tokens",
+        "cached_tokens", "cache_write_tokens",
+    ]
+    assert sig.parameters["cached_tokens"].default == 0
+    assert sig.parameters["cache_write_tokens"].default == 0
+    for model in ("gpt-5.5", "gpt-4o", "gpt-4o-mini", "claude-opus-4-6",
+                  "totally-unknown-model"):
+        base = lp._calc_cost_cents(model, 27_200, 500)
+        assert lp._calc_cost_cents(
+            model, 27_200, 500, cached_tokens=22_144, cache_write_tokens=5_000
+        ) == base, f"{model}: cache kwargs must be inert without cache pricing columns"
 
 
 # ── 4. Admin rollup endpoint ─────────────────────────────────────────

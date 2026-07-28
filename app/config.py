@@ -1271,8 +1271,21 @@ class Settings(BaseSettings):
     bundle_anthropic_daily_cap_cents: int = 100          # $1/day Anthropic soft cap (triggers fallback)
 
     # Pricing per 1K tokens (USD)
+    #
+    # `cached_input` / `cache_write` are OPTIONAL per-model columns (G1 prep,
+    # docs/audits/2026-07-g1-model-gate.md): the gpt-5.6 explicit-caching
+    # regime bills cache READS at the cached_input rate and cache WRITES at
+    # 1.25x the input rate (terra $3.125/M). Cost math (_calc_cost_cents,
+    # tokens_to_credits) only applies these columns when present, so every
+    # model WITHOUT them (all currently-live models) bills exactly as before.
+    # gpt-5.5-pro is deliberately ABSENT: it has NO cached-input rate at all
+    # ($30/$180) and is barred from chat/agent selection by the resolver
+    # guard (model_resolver.has_cached_input_rate).
     pricing_per_1k: dict[str, dict[str, float]] = {
         "gpt-5.5": {"input": 0.005, "output": 0.030},
+        "gpt-5.6-terra": {"input": 0.0025, "cached_input": 0.00025, "cache_write": 0.003125, "output": 0.015},
+        "gpt-5.6-sol": {"input": 0.005, "cached_input": 0.0005, "cache_write": 0.00625, "output": 0.030},
+        "gpt-5.6-luna": {"input": 0.001, "cached_input": 0.0001, "cache_write": 0.00125, "output": 0.006},
         "gpt-5.4": {"input": 0.003, "output": 0.012},
         "gpt-5": {"input": 0.003, "output": 0.012},
         "gpt-4.1": {"input": 0.002, "output": 0.008},

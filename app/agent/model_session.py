@@ -17,6 +17,12 @@ AVAILABLE_MODELS = {
     "claude-opus-4-6": {"provider": "anthropic", "cost_in": 15.0, "cost_out": 75.0, "context": 200000},
     "claude-sonnet-4-20250514": {"provider": "anthropic", "cost_in": 3.0, "cost_out": 15.0, "context": 200000},
     "gpt-5.5": {"provider": "openai", "cost_in": 5.0, "cost_out": 30.0, "context": 1050000},
+    # gpt-5.6 family (G1 prep — not selectable as fleet default yet; see
+    # docs/audits/2026-07-g1-model-gate.md). 5.6 bills cache writes at
+    # 1.25x input; the cache-aware rates live in settings.pricing_per_1k.
+    "gpt-5.6-terra": {"provider": "openai", "cost_in": 2.5, "cost_out": 15.0, "context": 1000000},
+    "gpt-5.6-sol": {"provider": "openai", "cost_in": 5.0, "cost_out": 30.0, "context": 1000000},
+    "gpt-5.6-luna": {"provider": "openai", "cost_in": 1.0, "cost_out": 6.0, "context": 1000000},
     "gpt-5.4": {"provider": "openai", "cost_in": 3.0, "cost_out": 12.0, "context": 1000000},
     "gpt-4o": {"provider": "openai", "cost_in": 2.5, "cost_out": 10.0, "context": 128000},
     "gpt-4o-mini": {"provider": "openai", "cost_in": 0.15, "cost_out": 0.60, "context": 128000},

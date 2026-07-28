@@ -128,41 +128,86 @@ def image_generation_cost_cents(
     return _q(cents, _DISPLAY_QUANTUM)
 
 
-def tokens_to_credits(model: str, input_tokens: int, output_tokens: int) -> Decimal:
+def _llm_token_cost_cents(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> Decimal:
+    """Underlying LLM cost in cents (Decimal, unfloored) for a call.
+
+    Shared by ``tokens_to_credits`` / ``tokens_to_credits_raw``. G1 prep
+    (docs/audits/2026-07-g1-model-gate.md): the optional ``cached_input``
+    / ``cache_write`` pricing columns (gpt-5.6 family — cache reads at
+    the cached rate, cache writes at 1.25x input) apply ONLY when present
+    on the model's pricing entry. Every model without them prices from
+    input/output alone — byte-identical to the pre-G1 math, so the extra
+    args are safe to pass unconditionally.
+    """
+    pricing = settings.pricing_per_1k.get(model)
+    if not pricing:
+        pricing = {"input": 0.003, "output": 0.015}
+    cached_rate = pricing.get("cached_input")
+    write_rate = pricing.get("cache_write")
+    # Cached-read and cache-write tokens are disjoint subsets of the
+    # prompt; clamp defensively so bogus provider usage can't go negative.
+    cached = min(max(int(cached_tokens or 0), 0), input_tokens) if cached_rate is not None else 0
+    written = min(max(int(cache_write_tokens or 0), 0), input_tokens - cached) if write_rate is not None else 0
+    base_input = input_tokens - cached - written
+    cost_usd = (
+        (Decimal(str(base_input)) * Decimal(str(pricing["input"])) / Decimal("1000"))
+        + (Decimal(str(output_tokens)) * Decimal(str(pricing["output"])) / Decimal("1000"))
+    )
+    if cached:
+        cost_usd += Decimal(str(cached)) * Decimal(str(cached_rate)) / Decimal("1000")
+    if written:
+        cost_usd += Decimal(str(written)) * Decimal(str(write_rate)) / Decimal("1000")
+    return cost_usd * Decimal("100")
+
+
+def tokens_to_credits(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> Decimal:
     """Compute credit cost for an LLM call from token counts.
 
     Uses Decimal math directly (not ``int(cost_usd*100)``) so sub-cent
     calls don't get rounded up to 1¢. This is what makes the design
     claim "0.2 credit per routine fire" actually true.
+
+    ``cached_tokens`` / ``cache_write_tokens`` only affect models whose
+    pricing entry carries the cache columns (gpt-5.6 family) — see
+    ``_llm_token_cost_cents``.
     """
-    pricing = settings.pricing_per_1k.get(model)
-    if not pricing:
-        pricing = {"input": 0.003, "output": 0.015}
-    cost_usd = (
-        (Decimal(str(input_tokens)) * Decimal(str(pricing["input"])) / Decimal("1000"))
-        + (Decimal(str(output_tokens)) * Decimal(str(pricing["output"])) / Decimal("1000"))
+    cost_cents = _llm_token_cost_cents(
+        model, input_tokens, output_tokens, cached_tokens, cache_write_tokens
     )
-    cost_cents = cost_usd * Decimal("100")
     # Floor at 0.1 credit so we never write zero-amount deduction rows.
     credits = max(Decimal("0.1"), cost_cents)
     return _q(credits, _DISPLAY_QUANTUM)
 
 
-def tokens_to_credits_raw(model: str, input_tokens: int, output_tokens: int) -> Decimal:
+def tokens_to_credits_raw(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> Decimal:
     """``tokens_to_credits`` without the 0.1-credit floor.
 
     For per-call accumulation inside the agent loop (mission budget
     hard-stop, 2026-07-16): a 40-iteration run floored at 0.1/call
     would inflate the ledger by up to 4 credits. Deduction rows keep
     using the floored ``tokens_to_credits``."""
-    pricing = settings.pricing_per_1k.get(model)
-    if not pricing:
-        pricing = {"input": 0.003, "output": 0.015}
-    cost_usd = (
-        (Decimal(str(input_tokens)) * Decimal(str(pricing["input"])) / Decimal("1000"))
-        + (Decimal(str(output_tokens)) * Decimal(str(pricing["output"])) / Decimal("1000"))
+    cost_cents = _llm_token_cost_cents(
+        model, input_tokens, output_tokens, cached_tokens, cache_write_tokens
     )
-    return _q(cost_usd * Decimal("100"), _DISPLAY_QUANTUM)
+    return _q(cost_cents, _DISPLAY_QUANTUM)
 
 
 # Flat-fee credit costs for non-LLM chargeable events.

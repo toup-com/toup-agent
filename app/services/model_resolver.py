@@ -49,6 +49,35 @@ _CANONICAL_ANTHROPIC_MODEL = "claude-opus-4-7"
 _CANONICAL_OPENAI_MODEL = "gpt-5.5"
 
 
+# ── G1 chat-model guard (no-cached-rate tier) ─────────────────────────
+# OpenAI's "-pro" reasoning tier has NO cached-input rate (gpt-5.5-pro is
+# $30/$180 flat) — routing the chat/agent hot path there forfeits the
+# entire prompt-cache discount the stable-prefix layout exists to earn.
+# The gate (docs/audits/2026-07-g1-model-gate.md) bars these ids from
+# ever resolving as the chat/agent model: `default_model` logs and falls
+# through to the next candidate instead of honouring the override.
+_NO_CACHED_INPUT_RATE_MODELS = frozenset({"gpt-5.5-pro", "o1-pro", "o3-pro"})
+
+
+def has_cached_input_rate(model: str | None) -> bool:
+    """False for models the provider bills with NO cached-input discount.
+
+    Matches the explicit denylist plus any OpenAI id ending in "-pro" so
+    future pro tiers (e.g. a gpt-5.6-pro) stay barred without a code
+    change. Unknown/Claude/empty ids return True — this guard exists only
+    to keep the known no-cache tier off the hot chat path, not to
+    validate arbitrary model ids.
+    """
+    if not model:
+        return True
+    m = model.lower().strip()
+    if m in _NO_CACHED_INPUT_RATE_MODELS:
+        return False
+    if is_openai_model(m) and m.endswith("-pro"):
+        return False
+    return True
+
+
 # ── Default-resolution functions ──────────────────────────────────────
 
 
@@ -58,12 +87,27 @@ def default_model(agent_config: object | None = None) -> str:
     Resolves: per-tenant `agent_config.agent_model` →
               `settings.agent_model` →
               canonical default.
+
+    G1 guard: a candidate with no cached-input rate (gpt-5.5-pro et al.)
+    is never honoured — it is logged and resolution falls through to the
+    next layer (ultimately the canonical default, which always has a
+    cached rate).
     """
-    return (
-        _cfg_attr(agent_config, "agent_model")
-        or _settings_attr("agent_model")
-        or _CANONICAL_AGENT_MODEL
-    )
+    for source, candidate in (
+        ("agent_config.agent_model", _cfg_attr(agent_config, "agent_model")),
+        ("settings.agent_model", _settings_attr("agent_model")),
+    ):
+        if not candidate:
+            continue
+        if not has_cached_input_rate(candidate):
+            logger.error(
+                "default_model: %r (from %s) has no cached-input rate and is "
+                "barred as the chat/agent model (G1 gate) — falling back",
+                candidate, source,
+            )
+            continue
+        return candidate
+    return _CANONICAL_AGENT_MODEL
 
 
 def default_fallback_model(agent_config: object | None = None) -> str:
@@ -216,7 +260,8 @@ def is_openai_model(model: str | None) -> bool:
 
 
 def supports_custom_temperature(model: str | None) -> bool:
-    """False for OpenAI reasoning models + gpt-5.x family — they only accept
+    """False for OpenAI reasoning models + gpt-5.x family (incl. the
+    gpt-5.6-* tiers) — they only accept
     temperature=1 (the default) and reject any explicit value with HTTP 400.
     Callers should omit the `temperature` kwarg from the API request entirely
     when this returns False.
@@ -232,7 +277,8 @@ def supports_custom_temperature(model: str | None) -> bool:
 
 
 def uses_max_completion_tokens(model: str | None) -> bool:
-    """True for OpenAI reasoning models + gpt-5.x family — they reject the
+    """True for OpenAI reasoning models + gpt-5.x family (incl. the
+    gpt-5.6-* tiers) — they reject the
     classic `max_tokens` parameter with HTTP 400 ("Unsupported parameter:
     'max_tokens' is not supported with this model. Use 'max_completion_tokens'
     instead.") and require `max_completion_tokens` instead.
@@ -253,7 +299,7 @@ def uses_max_completion_tokens(model: str | None) -> bool:
 
 def is_reasoning_model(model: str | None) -> bool:
     """True for OpenAI models that do internal chain-of-thought reasoning
-    (o-series + gpt-5 family).
+    (o-series + gpt-5 family, incl. the gpt-5.6-* tiers).
 
     These models silently spend output-token budget on hidden reasoning
     tokens BEFORE emitting any visible text. Burned the routine path: a

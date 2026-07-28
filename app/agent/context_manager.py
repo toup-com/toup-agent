@@ -22,6 +22,12 @@ CHARS_PER_TOKEN = 4
 # Model context windows (tokens)
 MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
     "gpt-5.5": 1_050_000,
+    # gpt-5.6 family — 1M window (G1 prep; bare "gpt-5.6" included so a
+    # tier-less id budgets correctly instead of the 128k default).
+    "gpt-5.6-terra": 1_000_000,
+    "gpt-5.6-sol": 1_000_000,
+    "gpt-5.6-luna": 1_000_000,
+    "gpt-5.6": 1_000_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.2": 400_000,
     "gpt-5": 128_000,

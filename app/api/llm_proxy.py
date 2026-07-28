@@ -213,13 +213,41 @@ async def _check_budget(config: AgentConfig, provider: str, db: AsyncSession) ->
 _MIN_IMAGE_CREDITS = Decimal("0.1")
 
 
-def _calc_cost_cents(model: str, input_tokens: int, output_tokens: int) -> int:
-    """Calculate cost in cents from token counts using the pricing table."""
+def _calc_cost_cents(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> int:
+    """Calculate cost in cents from token counts using the pricing table.
+
+    G1 prep (docs/audits/2026-07-g1-model-gate.md): cache-aware billing is
+    active ONLY for models whose pricing entry carries the optional
+    `cached_input` / `cache_write` columns (the gpt-5.6 family — reads at
+    the cached rate, writes at 1.25x input). For every model without those
+    columns the extra args are ignored and the math is byte-identical to
+    the pre-G1 pure input/output form (A9-2 stays out of scope for the
+    live fleet).
+    """
     pricing = settings.pricing_per_1k.get(model)
     if not pricing:
         # Fallback: use a conservative estimate
         pricing = {"input": 0.003, "output": 0.015}
-    cost_usd = (input_tokens * pricing["input"] / 1000) + (output_tokens * pricing["output"] / 1000)
+    cached_rate = pricing.get("cached_input")
+    write_rate = pricing.get("cache_write")
+    # Cached-read and cache-write tokens are disjoint subsets of
+    # prompt_tokens; clamp defensively so bogus provider usage can never
+    # produce a negative base.
+    cached = min(max(int(cached_tokens or 0), 0), input_tokens) if cached_rate is not None else 0
+    written = min(max(int(cache_write_tokens or 0), 0), input_tokens - cached) if write_rate is not None else 0
+    base_input = input_tokens - cached - written
+    cost_usd = (
+        (base_input * pricing["input"] / 1000)
+        + (cached * cached_rate / 1000 if cached else 0.0)
+        + (written * write_rate / 1000 if written else 0.0)
+        + (output_tokens * pricing["output"] / 1000)
+    )
     return max(1, int(cost_usd * 100))  # At least 1 cent per request
 
 
@@ -240,14 +268,24 @@ async def _log_event(
     status: str = "ok",
     operation_type: Optional[str] = None,
     cached_tokens: Optional[int] = None,
+    cache_write_tokens: Optional[int] = None,
 ):
     """Log an LLM usage event.
 
     `cached_tokens` (F-7 / A9-1): prompt-cache read hits reported by the
     provider (OpenAI usage.prompt_tokens_details.cached_tokens, Anthropic
-    cache_read_input_tokens). Telemetry-only — it does NOT participate in
-    cost_cents or credit math (A9-2 is documented out of scope). None means
-    the call site had no usage to inspect (error paths).
+    cache_read_input_tokens). Telemetry-only for the live fleet — it does
+    NOT participate in cost_cents or credit math for any model without the
+    optional cached_input/cache_write pricing columns (A9-2 stays out of
+    scope for those). None means the call site had no usage to inspect
+    (error paths).
+
+    `cache_write_tokens` (G1 prep): prompt-cache WRITE tokens — billed at
+    1.25x input on the gpt-5.6 family. Threaded into the credit charge
+    (tokens_to_credits) alongside cached_tokens; both are no-ops for
+    models whose pricing entry lacks the cache columns, so legacy billing
+    is byte-identical. Not persisted (no DB column) — cost_cents and the
+    [CACHE] log lines carry the evidence for the G1 canary.
 
     `operation_type` semantics (CRITICAL — do not change without updating _get_spend):
       - None or "user.*" → user-attributable, counts toward the user's cap.
@@ -293,7 +331,11 @@ async def _log_event(
                 credit_service, tokens_to_credits, BUCKET_MESSAGE,
             )
             from app.db.models import LEDGER_CHAT_MESSAGE
-            credits = tokens_to_credits(model, input_tokens, output_tokens)
+            credits = tokens_to_credits(
+                model, input_tokens, output_tokens,
+                cached_tokens=cached_tokens or 0,
+                cache_write_tokens=cache_write_tokens or 0,
+            )
             result = await credit_service.try_charge(
                 db, user_id, LEDGER_CHAT_MESSAGE, BUCKET_MESSAGE, credits,
                 idempotency_key=event.id, event_id=event.id, model=model,
@@ -651,6 +693,60 @@ def _extract_openai_cached_tokens(usage: dict) -> int:
         return 0
 
 
+def _extract_openai_cache_write_tokens(usage) -> int:
+    """Read prompt-cache WRITE tokens from an OpenAI usage payload (0 when absent).
+
+    G1 prep: the gpt-5.6 explicit-caching regime bills cache writes at
+    1.25x input, so the write count must reach _calc_cost_cents. The
+    field nests under prompt_tokens_details like cached_tokens, but the
+    exact name is unverified until the 5.6 canary (SDK docs list
+    `cache_write_tokens`; Anthropic-style `cache_creation_input_tokens`
+    is accepted as a fallback spelling). Coded defensively per the gate:
+    handles dict AND SDK-object shapes via getattr, returns 0 on any
+    miss/garbage — models without a cache_write price ignore it anyway.
+    """
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        details = usage.get("prompt_tokens_details") or {}
+    else:
+        details = getattr(usage, "prompt_tokens_details", None)
+    for field in ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens"):
+        if isinstance(details, dict):
+            value = details.get(field)
+        else:
+            value = getattr(details, field, None)
+        if value is None:
+            continue
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _extract_openai_cache_write_from_sse(raw_bytes: bytes) -> int:
+    """SSE twin of _extract_openai_cache_write_tokens (same skeleton as
+    _extract_openai_usage, kept separate so the pinned 3-tuple contract
+    of that extractor stays byte-stable)."""
+    import json
+    write_tokens = 0
+    for line in raw_bytes.decode("utf-8", errors="replace").split("\n"):
+        if not line.startswith("data: "):
+            continue
+        data = line[6:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            obj = json.loads(data)
+            usage = obj.get("usage")
+            if usage:
+                write_tokens = _extract_openai_cache_write_tokens(usage)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return write_tokens
+
+
 def _extract_openai_usage(raw_bytes: bytes) -> tuple[int, int, int]:
     """Extract usage (input, output, cached) from OpenAI SSE stream bytes."""
     import json
@@ -896,19 +992,24 @@ async def proxy_chat(
             finally:
                 # Log usage after stream completes
                 latency = int((time.time() - start_ts) * 1000)
+                cache_write = 0
                 if backend.name == "anthropic":
                     inp, out, cached = _extract_anthropic_usage(bytes(collected_bytes))
                 else:
                     inp, out, cached = _extract_openai_usage(bytes(collected_bytes))
+                    cache_write = _extract_openai_cache_write_from_sse(bytes(collected_bytes))
                     # W0.2b usage-side [CACHE] line: prompt+cached tokens
                     # together so one grep yields the per-tenant ratio series.
                     logger.info(
                         "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
-                        "prompt_tokens=%s cached_tokens=%s",
+                        "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s",
                         config.user_id[:8], model, has_cache_key, cache_retention,
-                        inp, cached,
+                        inp, cached, cache_write,
                     )
-                cost = _calc_cost_cents(model, inp, out)
+                cost = _calc_cost_cents(
+                    model, inp, out,
+                    cached_tokens=cached, cache_write_tokens=cache_write,
+                )
                 # Do NOT reuse `db` here. It comes from Depends(get_db), and
                 # since FastAPI 0.106 the dependency AsyncExitStack is exited
                 # BEFORE the response body streams — so by the time this
@@ -928,6 +1029,7 @@ async def proxy_chat(
                             _log_db, config.user_id, backend.name, model, "chat",
                             inp, out, cost, latency, is_fallback,
                             cached_tokens=cached,
+                            cache_write_tokens=cache_write,
                         )
 
                 try:
@@ -976,6 +1078,7 @@ async def proxy_chat(
 
         # Extract usage from response
         resp_data = resp.json()
+        cache_write = 0
         if backend.name == "anthropic":
             usage = resp_data.get("usage", {})
             inp = usage.get("input_tokens", 0)
@@ -986,20 +1089,25 @@ async def proxy_chat(
             inp = usage.get("prompt_tokens", 0)
             out = usage.get("completion_tokens", 0)
             cached = _extract_openai_cached_tokens(usage)
+            cache_write = _extract_openai_cache_write_tokens(usage)
             # W0.2b usage-side [CACHE] line (non-stream twin of the SSE path).
             logger.info(
                 "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
-                "prompt_tokens=%s cached_tokens=%s",
+                "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s",
                 config.user_id[:8], model, has_cache_key, cache_retention,
-                inp, cached,
+                inp, cached, cache_write,
             )
             _debug_log_upstream_cache_headers(resp.headers, model)
 
-        cost = _calc_cost_cents(model, inp, out)
+        cost = _calc_cost_cents(
+            model, inp, out,
+            cached_tokens=cached, cache_write_tokens=cache_write,
+        )
         await _log_event(
             db, config.user_id, backend.name, model, "chat",
             inp, out, cost, latency, is_fallback,
             cached_tokens=cached,
+            cache_write_tokens=cache_write,
         )
 
         # Use JSONResponse so we can attach the resolved-model header.
