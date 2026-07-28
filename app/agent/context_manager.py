@@ -258,34 +258,7 @@ async def compact_messages(
     )
 
     # Build a text summary of old messages
-    summary_parts = []
-    for msg in old_messages:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text_bits = []
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        text_bits.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use":
-                        text_bits.append(f"[Tool: {block.get('name', '?')}]")
-                    elif block.get("type") == "tool_result":
-                        result_preview = str(block.get("content", ""))[:100]
-                        text_bits.append(f"[Tool result: {result_preview}]")
-            text = " ".join(text_bits)
-        else:
-            text = str(content)
-
-        # Truncate individual messages in the summary
-        if len(text) > 200:
-            text = text[:200] + "..."
-        summary_parts.append(f"{role}: {text}")
-
-    summary_text = "\n".join(summary_parts)
+    summary_text = _build_span_transcript(old_messages, cache_aware=cache_aware)
 
     if cache_aware:
         # F-6: deterministic + idempotent. Reuse the persisted summary
@@ -300,7 +273,9 @@ async def compact_messages(
             summary_text = cached_summary
         else:
             if estimate_tokens(summary_text) > SUMMARY_MAX_TOKENS * 2:
-                summary_text = await _llm_summarize(summary_text, model, temperature=0.0)
+                summary_text = await _llm_summarize(
+                    summary_text, model, temperature=0.0, structured=True
+                )
             if conversation_id:
                 await _persist_summary(conversation_id, span_key, summary_text)
         if on_drop is not None and cached_summary is None:
@@ -338,6 +313,88 @@ async def compact_messages(
     }
 
     return head + [summary_msg] + recent_messages
+
+
+# W3.1 (remediation): transcript budget for the structured (cache-aware)
+# summarizer input. User/assistant text keeps far more per message than
+# tool chatter — the per-message 200-char cap of the legacy builder was
+# the recall hole: a long user message carrying five facts got cut at
+# 200 chars before the summarizer ever saw it.
+_TRANSCRIPT_CHAR_BUDGET = 8000
+_STRUCTURED_TEXT_CAP = 500
+_TOOL_PREVIEW_CAP = 100
+
+
+def _build_span_transcript(
+    old_messages: List[Dict[str, Any]], *, cache_aware: bool
+) -> str:
+    """Render the to-be-summarized span as a text transcript.
+
+    ``cache_aware=False`` reproduces the legacy builder byte-for-byte
+    (200-char cap on every line) — the flag-off path must not change.
+
+    ``cache_aware=True`` (W3.1 clear-before-compact): user/assistant text
+    keeps up to ``_STRUCTURED_TEXT_CAP`` chars; tool_use/tool_result lines
+    stay terse. If the whole transcript exceeds ``_TRANSCRIPT_CHAR_BUDGET``,
+    tool lines are dropped first (marked), then the OLDEST conversational
+    lines — never the newest user/assistant text — so the summarizer's
+    fixed input window is spent on recall-critical content instead of
+    tool chatter and truncation ellipses.
+    """
+
+    def _render(msg: Dict[str, Any], text_cap: int) -> tuple[str, bool]:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        has_tool = False
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text_bits = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_bits.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        has_tool = True
+                        text_bits.append(f"[Tool: {block.get('name', '?')}]")
+                    elif block.get("type") == "tool_result":
+                        has_tool = True
+                        result_preview = str(block.get("content", ""))[:_TOOL_PREVIEW_CAP]
+                        text_bits.append(f"[Tool result: {result_preview}]")
+            text = " ".join(text_bits)
+        else:
+            text = str(content)
+        if len(text) > text_cap:
+            text = text[:text_cap] + "..."
+        return f"{role}: {text}", has_tool
+
+    if not cache_aware:
+        return "\n".join(_render(m, 200)[0] for m in old_messages)
+
+    lines = [_render(m, _STRUCTURED_TEXT_CAP) for m in old_messages]
+
+    def _total(ls) -> int:
+        return sum(len(t) + 1 for t, _ in ls)
+
+    if _total(lines) > _TRANSCRIPT_CHAR_BUDGET:
+        # 1st pass: drop tool-bearing lines, oldest first.
+        kept = list(lines)
+        over = _total(kept) - _TRANSCRIPT_CHAR_BUDGET
+        for line in list(kept):
+            if over <= 0:
+                break
+            if line[1]:
+                kept.remove(line)
+                over -= len(line[0]) + 1
+        # 2nd pass: still over → drop oldest conversational lines.
+        while len(kept) > 1 and _total(kept) > _TRANSCRIPT_CHAR_BUDGET:
+            kept.pop(0)
+        dropped = len(lines) - len(kept)
+        lines = kept
+        if dropped:
+            lines = [(f"[{dropped} earlier/tool lines elided before summarization]", False)] + lines
+
+    return "\n".join(t for t, _ in lines)
 
 
 def _span_hash(span: List[Dict[str, Any]]) -> str:
@@ -464,11 +521,45 @@ async def _filter_unpromoted(
         return span
 
 
-async def _llm_summarize(text: str, model: str, temperature: float = 0.3) -> str:
+# W3.1 (remediation): structured compaction template for the cache-aware
+# path. LongMemEval-class failures come from summaries that narrate the
+# conversation instead of preserving retrievable state — the sections
+# force the summarizer to keep exactly what a later turn will need to
+# recall. Wording is fixed (part of the deterministic persisted-summary
+# contract); change it and previously persisted summaries stay valid but
+# newly generated ones differ.
+_STRUCTURED_SUMMARY_PROMPT = (
+    "Compress this conversation transcript into a handoff note for the "
+    "same assistant to continue from. Use EXACTLY these four sections, "
+    "each a terse dash-list (write 'none' when empty):\n"
+    "FACTS: user-stated facts, preferences, names, dates, numbers — keep "
+    "exact values verbatim.\n"
+    "DECISIONS: what was decided or concluded, with the deciding reason "
+    "when stated.\n"
+    "OPEN: unresolved questions, promised follow-ups, tasks in progress.\n"
+    "ACTIONS: tools/operations performed and their outcomes (one line "
+    "each).\n"
+    "No preamble, no narration, no information not present in the "
+    "transcript."
+)
+
+_LEGACY_SUMMARY_PROMPT = (
+    "Summarize this conversation transcript into a brief, dense paragraph. "
+    "Focus on: key facts discussed, decisions made, user requests, "
+    "tool actions taken, and important context. Be concise."
+)
+
+
+async def _llm_summarize(
+    text: str, model: str, temperature: float = 0.3, structured: bool = False
+) -> str:
     """Use the LLM to generate a concise conversation summary.
 
     ``temperature=0.0`` (the cache_aware_overflow path) makes the output
     deterministic for identical input so the persisted summary is stable.
+    ``structured=True`` (same path, W3.1) swaps the generic paragraph
+    prompt for the four-section handoff template; the legacy flag-off
+    path keeps the original prompt byte-for-byte.
     """
     try:
         from app.services.bundle_client import make_openai_client
@@ -484,9 +575,7 @@ async def _llm_summarize(text: str, model: str, temperature: float = 0.3) -> str
                 {
                     "role": "system",
                     "content": (
-                        "Summarize this conversation transcript into a brief, dense paragraph. "
-                        "Focus on: key facts discussed, decisions made, user requests, "
-                        "tool actions taken, and important context. Be concise."
+                        _STRUCTURED_SUMMARY_PROMPT if structured else _LEGACY_SUMMARY_PROMPT
                     ),
                 },
                 {"role": "user", "content": text[:8000]},  # Cap input

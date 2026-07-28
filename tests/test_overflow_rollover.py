@@ -383,3 +383,110 @@ class TestReviewFixes:
     def test_overflow_error_message_reflects_compaction_attempt(self):
         """pr3-#4: the raise says whether compaction was attempted."""
         assert "overflow surfaced before compaction could be attempted" in _RUN_SRC
+
+
+# ── W3.1 — structured compaction template + clear-before-compact ───────
+
+from app.agent.context_manager import (  # noqa: E402
+    _LEGACY_SUMMARY_PROMPT,
+    _STRUCTURED_SUMMARY_PROMPT,
+    _TRANSCRIPT_CHAR_BUDGET,
+    _build_span_transcript,
+)
+
+
+def _legacy_reference(old_messages):
+    """The pre-W3.1 builder, reimplemented verbatim as the byte oracle."""
+    parts = []
+    for msg in old_messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            bits = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        bits.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        bits.append(f"[Tool: {block.get('name', '?')}]")
+                    elif block.get("type") == "tool_result":
+                        bits.append(f"[Tool result: {str(block.get('content', ''))[:100]}]")
+            text = " ".join(bits)
+        else:
+            text = str(content)
+        if len(text) > 200:
+            text = text[:200] + "..."
+        parts.append(f"{role}: {text}")
+    return "\n".join(parts)
+
+
+class TestSpanTranscript:
+    MIXED = [
+        {"role": "user", "content": "short question"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "answer " * 60},
+            {"type": "tool_use", "name": "web_search"},
+            {"type": "tool_result", "content": "x" * 500},
+        ]},
+        {"role": "user", "content": "fact-heavy message: " + "detail " * 60},
+    ]
+
+    def test_legacy_path_byte_identical(self):
+        assert _build_span_transcript(self.MIXED, cache_aware=False) == \
+            _legacy_reference(self.MIXED)
+        # non-list/str content falls through str() identically
+        odd = [{"role": "user", "content": {"weird": 1}}]
+        assert _build_span_transcript(odd, cache_aware=False) == _legacy_reference(odd)
+
+    def test_cache_aware_keeps_more_user_text(self):
+        out = _build_span_transcript(self.MIXED, cache_aware=True)
+        legacy = _legacy_reference(self.MIXED)
+        # the fact-heavy user line survives past the legacy 200-char cut
+        assert "detail detail" in out
+        assert len(out.splitlines()[-1]) > len(legacy.splitlines()[-1])
+        # tool_result preview stays terse in both
+        assert "x" * 101 not in out
+
+    def test_over_budget_drops_tool_lines_first(self):
+        msgs = []
+        for i in range(40):
+            msgs.append({"role": "assistant", "content": [
+                {"type": "text", "text": f"tool step {i} " + "t" * 180},
+                {"type": "tool_use", "name": f"tool_{i}"},
+            ]})
+        msgs.append({"role": "user", "content": "FINAL-CRITICAL-FACT " + "f" * 400})
+        out = _build_span_transcript(msgs, cache_aware=True)
+        assert len(out) <= _TRANSCRIPT_CHAR_BUDGET + 100  # marker slack
+        assert "FINAL-CRITICAL-FACT" in out  # newest user text never dropped
+        assert "elided before summarization" in out
+
+    def test_over_budget_then_drops_oldest_conversational(self):
+        msgs = [{"role": "user", "content": f"MSG-{i:03d} " + "w" * 400} for i in range(40)]
+        out = _build_span_transcript(msgs, cache_aware=True)
+        assert len(out) <= _TRANSCRIPT_CHAR_BUDGET + 100
+        assert "MSG-039" in out       # newest kept
+        assert "MSG-000 " not in out  # oldest dropped
+        assert "elided before summarization" in out
+
+    def test_under_budget_no_marker(self):
+        out = _build_span_transcript(self.MIXED, cache_aware=True)
+        assert "elided before summarization" not in out
+
+
+class TestStructuredTemplate:
+    def test_prompts_differ_and_sections_present(self):
+        assert _STRUCTURED_SUMMARY_PROMPT != _LEGACY_SUMMARY_PROMPT
+        for section in ("FACTS:", "DECISIONS:", "OPEN:", "ACTIONS:"):
+            assert section in _STRUCTURED_SUMMARY_PROMPT
+        # legacy prompt is byte-frozen (flag-off path unchanged)
+        assert _LEGACY_SUMMARY_PROMPT.startswith("Summarize this conversation transcript")
+
+    def test_call_sites_route_by_flag(self):
+        src = (Path(__file__).resolve().parent.parent / "app" / "agent" / "context_manager.py").read_text()
+        assert "temperature=0.0, structured=True" in src
+        # the legacy (flag-off) call site must NOT pass structured
+        legacy_call = "summary_text = await _llm_summarize(summary_text, model)"
+        assert legacy_call in src
+        assert 'summary_text = _build_span_transcript(old_messages, cache_aware=cache_aware)' in src
