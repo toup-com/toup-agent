@@ -30,6 +30,7 @@ _dcl_spec.loader.exec_module(_dcl_mod)
 load_day_context = _dcl_mod.load_day_context
 annotate_message = _dcl_mod.annotate_message
 build_today_so_far_block = _dcl_mod.build_today_so_far_block
+should_inject_today_so_far = _dcl_mod.should_inject_today_so_far
 
 
 async def _make_engine():
@@ -42,7 +43,11 @@ async def _make_engine():
                 name VARCHAR(255), password_changed_at TIMESTAMP,
                 role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
                 updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50)
+                stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
+                email_verified_at TIMESTAMP, email_verification_token VARCHAR(255),
+                email_verification_sent_at TIMESTAMP, apple_refresh_token TEXT,
+                apple_sub VARCHAR(255), notification_preferences TEXT,
+                is_canary BOOLEAN DEFAULT 0
             )""",
             """CREATE TABLE IF NOT EXISTS day_chats (
                 id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) REFERENCES users(id),
@@ -51,6 +56,9 @@ async def _make_engine():
                 message_count INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
                 rolling_summary TEXT, summary_up_to_message_id VARCHAR(50),
                 summary_updated_at TIMESTAMP, summary_status VARCHAR(20) DEFAULT 'up_to_date',
+                summary_failure_count INTEGER DEFAULT 0,
+                summary_last_failure_at TIMESTAMP,
+                summary_last_failure_reason VARCHAR(50),
                 archival_summary TEXT,
                 archival_summary_generated_at TIMESTAMP,
                 archival_summary_status VARCHAR(20) DEFAULT 'not_needed',
@@ -66,10 +74,12 @@ async def _make_engine():
             )""",
             """CREATE TABLE IF NOT EXISTS messages (
                 id VARCHAR(50) PRIMARY KEY, conversation_id VARCHAR(36) REFERENCES conversations(id),
-                day_chat_id VARCHAR(36) REFERENCES day_chats(id), role VARCHAR(20),
+                day_chat_id VARCHAR(36) REFERENCES day_chats(id),
+                channel VARCHAR(50), source VARCHAR(50), role VARCHAR(20),
                 content TEXT, created_at TIMESTAMP, tokens_prompt INTEGER,
                 tokens_completion INTEGER, model_used VARCHAR(50),
                 memories_retrieved_json TEXT, processing_time_ms INTEGER,
+                reply_to_message_id VARCHAR(50), attachments TEXT,
                 metadata_json TEXT, embedding_json TEXT, embedding BLOB
             )""",
             """CREATE TABLE IF NOT EXISTS migration_status (
@@ -239,6 +249,108 @@ async def test_build_today_so_far_block():
     assert "</today_so_far>" in block
 
 
+async def test_history_is_complete_under_budget():
+    """W2.1b: under-budget load returns the FULL day verbatim →
+    history_is_complete=True, and the today_so_far gate must SKIP the
+    summary (it would duplicate messages the model already sees)."""
+    engine = await _make_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    dc_id, msgs = await _seed_day(sm, channels=["web"], msgs_per_conv=5)
+
+    # Give the day a rolling summary — the classic duplication setup
+    async with sm() as db:
+        dc = (await db.execute(select(DayChat).where(DayChat.id == dc_id))).scalar_one()
+        dc.rolling_summary = "User discussed project setup."
+        await db.commit()
+
+    async with sm() as db:
+        ctx = await load_day_context(db, dc_id, model_context_tokens=200_000)
+
+    assert ctx["history_is_complete"] is True
+    assert len(ctx["messages"]) == 5  # complete history, nothing elided
+    assert ctx["summary"]  # summary exists...
+    # ...but injecting it would be pure duplication → gate says NO
+    assert should_inject_today_so_far(ctx) is False
+
+    await engine.dispose()
+
+
+async def test_history_is_complete_over_budget():
+    """W2.1b: over-budget load truncates to summary + verbatim window →
+    history_is_complete=False and the summary MUST still inject (it
+    genuinely replaces the elided older messages)."""
+    engine = await _make_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    dc_id, msgs = await _seed_day(sm, channels=["web"], msgs_per_conv=50)
+
+    async with sm() as db:
+        dc = (await db.execute(select(DayChat).where(DayChat.id == dc_id))).scalar_one()
+        dc.rolling_summary = "Morning: user set up the project and picked PostgreSQL."
+        await db.commit()
+
+    # Tiny context window → forces the over-budget branch
+    async with sm() as db:
+        ctx = await load_day_context(db, dc_id, model_context_tokens=500)
+
+    assert ctx["history_is_complete"] is False
+    assert len(ctx["messages"]) <= 20  # verbatim window only
+    assert should_inject_today_so_far(ctx) is True
+    block = build_today_so_far_block(ctx["summary"])
+    assert "<today_so_far>" in block
+    assert "PostgreSQL" in block
+
+    await engine.dispose()
+
+
+async def test_history_is_complete_no_day_chat():
+    """Missing DayChat row → empty history is (vacuously) complete; no
+    summary → gate never fires."""
+    engine = await _make_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with sm() as db:
+        ctx = await load_day_context(db, str(uuid.uuid4()), model_context_tokens=200_000)
+
+    assert ctx["history_is_complete"] is True
+    assert ctx["messages"] == []
+    assert should_inject_today_so_far(ctx) is False
+
+    await engine.dispose()
+
+
+async def test_should_inject_today_so_far_pure():
+    """Gate truth table, including backward-compat for the pre-W2.1b
+    return shape (missing bit → inject, the historical behavior)."""
+    assert should_inject_today_so_far(None) is False
+    assert should_inject_today_so_far({}) is False
+    # No summary → nothing to inject regardless of the bit
+    assert should_inject_today_so_far({"summary": None, "history_is_complete": False}) is False
+    assert should_inject_today_so_far({"summary": "", "history_is_complete": False}) is False
+    # Complete history → summary is a duplicate → skip
+    assert should_inject_today_so_far({"summary": "x", "history_is_complete": True}) is False
+    # Truncated history → summary replaces elided messages → inject
+    assert should_inject_today_so_far({"summary": "x", "history_is_complete": False}) is True
+    # Old return shape without the bit → keep historical behavior (inject)
+    assert should_inject_today_so_far({"summary": "x"}) is True
+
+
+async def test_runner_routes_today_so_far_through_gate():
+    """Source-pin: agent_runner's injection block must consult
+    should_inject_today_so_far BEFORE building the block, and log the
+    [PERF] skip marker so the change is visible in prod logs. (The full
+    run() path is too DB-heavy for this harness — the decision itself is
+    covered by the pure/loader tests above.)"""
+    src = (Path(__file__).resolve().parent.parent / "app" / "agent" / "agent_runner.py").read_text()
+    gate = src.find("if not should_inject_today_so_far(_day_context):")
+    build = src.find("_tsf_block = build_today_so_far_block(_day_context[\"summary\"])")
+    assert gate != -1, "agent_runner no longer gates today_so_far on should_inject_today_so_far"
+    assert build != -1, "agent_runner no longer builds today_so_far via build_today_so_far_block"
+    assert gate < build, "gate must run before the block is built/injected"
+    assert "[PERF] today_so_far_skipped=1" in src, "skip must be observable in prod logs"
+
+
 async def test_fallback_when_backfill_incomplete():
     """Feature flag on + backfill in_progress → should_use_day_chat_context returns False.
 
@@ -405,6 +517,11 @@ if __name__ == "__main__":
             ("test_load_day_context_with_summary", test_load_day_context_with_summary),
             ("test_annotate_message", test_annotate_message),
             ("test_build_today_so_far_block", test_build_today_so_far_block),
+            ("test_history_is_complete_under_budget", test_history_is_complete_under_budget),
+            ("test_history_is_complete_over_budget", test_history_is_complete_over_budget),
+            ("test_history_is_complete_no_day_chat", test_history_is_complete_no_day_chat),
+            ("test_should_inject_today_so_far_pure", test_should_inject_today_so_far_pure),
+            ("test_runner_routes_today_so_far_through_gate", test_runner_routes_today_so_far_through_gate),
             ("test_annotations_never_saved_to_db", test_annotations_never_saved_to_db),
             ("test_fallback_when_backfill_incomplete", test_fallback_when_backfill_incomplete),
             ("test_summarizer_produces_output", test_summarizer_produces_output),

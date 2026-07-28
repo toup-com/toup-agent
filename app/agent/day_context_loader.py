@@ -101,6 +101,8 @@ async def load_day_context(
             "total_tokens": int,           # Estimated token count
             "summary_was_stale": bool,     # True if summary_status != 'up_to_date'
             "message_count": int,          # Total messages loaded
+            "history_is_complete": bool,   # True unless the over-budget branch
+                                           # truncated to summary + verbatim window
         }
     """
     from app.db.models import Message, Conversation
@@ -126,7 +128,8 @@ async def load_day_context(
             day_chat_id[:8] if day_chat_id else None, calling_channel,
         )
         return {"summary": None, "messages": [], "raw_messages": [], "total_tokens": 0,
-                "summary_was_stale": False, "message_count": 0}
+                "summary_was_stale": False, "message_count": 0,
+                "history_is_complete": True}
 
     summary = dc.rolling_summary
     summary_was_stale = dc.summary_status not in ("up_to_date", None)
@@ -223,6 +226,9 @@ async def load_day_context(
             "total_tokens": total_tokens,
             "summary_was_stale": summary_was_stale,
             "message_count": len(annotated_messages),
+            # W2.1b: full verbatim history — the rolling summary would be a
+            # pure duplicate, so callers skip <today_so_far> injection.
+            "history_is_complete": True,
         }
 
     # Over budget: use summary + recent verbatim window
@@ -239,7 +245,27 @@ async def load_day_context(
         "total_tokens": verbatim_tokens + _estimate_tokens(summary or ""),
         "summary_was_stale": True,  # We're over budget, summary needs regeneration
         "message_count": len(rows),
+        # W2.1b: older messages were elided to the summary + verbatim window
+        # — here the summary genuinely replaces history, so it MUST inject.
+        "history_is_complete": False,
     }
+
+
+def should_inject_today_so_far(day_context: Optional[Dict[str, Any]]) -> bool:
+    """Whether the <today_so_far> rolling-summary block should be injected.
+
+    W2.1b: on the under-budget path load_day_context returns the day's
+    COMPLETE verbatim history, so the rolling summary is a pure duplicate
+    of messages the model already sees — up to ~1,000 UNCACHED tokens per
+    turn (<turn_context> sits after history and is never prompt-cached).
+    Inject only when the loader actually truncated to the summary +
+    verbatim-window shape (history_is_complete=False), where the summary
+    genuinely replaces elided messages. A missing bit (older return shape)
+    keeps the historical behavior: inject.
+    """
+    if not day_context or not day_context.get("summary"):
+        return False
+    return not day_context.get("history_is_complete", False)
 
 
 def build_today_so_far_block(summary: Optional[str]) -> str:

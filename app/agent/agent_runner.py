@@ -919,16 +919,28 @@ class AgentRunner:
                 and _day_context
                 and _day_context.get("summary")
             ):
-                from app.agent.day_context_loader import build_today_so_far_block
-                _tsf_block = build_today_so_far_block(_day_context["summary"])
-                if _stable_layout:
-                    # PR-1: the rolling summary mutates whenever the
-                    # summarizer runs — appended to the system prompt it
-                    # invalidated the whole day-history cache behind it.
-                    _turn_context_parts["today_so_far"] = _tsf_block
+                from app.agent.day_context_loader import (
+                    build_today_so_far_block,
+                    should_inject_today_so_far,
+                )
+                if not should_inject_today_so_far(_day_context):
+                    # W2.1b: the loader returned the day's COMPLETE verbatim
+                    # history (the under-budget path — effectively always at
+                    # gpt-5.5's 630k budget), so the rolling summary would be
+                    # a pure duplicate: ≤1,000 uncached tokens re-billed
+                    # every turn. The summary still injects on the
+                    # over-budget path, where it replaces elided messages.
+                    logger.info("[PERF] today_so_far_skipped=1")
                 else:
-                    system_prompt += _tsf_block
-                self._memory_health["today_summary_present"] = True
+                    _tsf_block = build_today_so_far_block(_day_context["summary"])
+                    if _stable_layout:
+                        # PR-1: the rolling summary mutates whenever the
+                        # summarizer runs — appended to the system prompt it
+                        # invalidated the whole day-history cache behind it.
+                        _turn_context_parts["today_so_far"] = _tsf_block
+                    else:
+                        system_prompt += _tsf_block
+                    self._memory_health["today_summary_present"] = True
 
             # Reply-to directive: if the current user turn carries a <reply_to>
             # block, mirror the block into the system prompt so even if day
