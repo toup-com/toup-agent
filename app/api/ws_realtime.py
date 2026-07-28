@@ -968,6 +968,50 @@ async def _execute_tool(user_id: str, func_name: str, arguments: dict) -> str:
 
 
 # ── DB persistence helpers ────────────────────────────────────────────
+async def _get_user_tz_name(user_id: str) -> Optional[str]:
+    """User.timezone from the local DB (platform copy on the relay,
+    tenant row on the agent). None when unset/unreadable."""
+    try:
+        from sqlalchemy import select
+        from app.db.database import async_session_maker
+        from app.db.models import User
+        async with async_session_maker() as db:
+            tz = (await db.execute(
+                select(User.timezone).where(User.id == user_id)
+            )).scalar_one_or_none()
+            return tz or None
+    except Exception:
+        return None
+
+
+def _parse_utc_dt(raw) -> Optional[datetime]:
+    """Parse an ISO timestamp from the VPS API. Naive values are UTC
+    (Conversation.started_at is stored as naive utcnow)."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def _same_local_day(started_utc: datetime, now_utc: datetime, tz_name: Optional[str]) -> bool:
+    """Mirror of agent_runner.same_local_day (not imported — pulling
+    agent_runner into the platform relay would drag the whole agent
+    stack in). Unknown/invalid tz falls back to UTC, same as DayChat."""
+    tz = None
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = None
+    if tz is not None:
+        return started_utc.astimezone(tz).date() == now_utc.astimezone(tz).date()
+    return started_utc.date() == now_utc.date()
+
+
 async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) -> str:
     """Get existing session or create a new one on VPS. Returns session_id.
 
@@ -987,9 +1031,18 @@ async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) 
                 params={"include_messages": "false"},
             )
             if data and data.get("id"):
-                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                started = data.get("started_at", "") or data.get("updated_at", "")
-                if today_str in str(started):
+                # Reuse only when the session started TODAY in the user's
+                # LOCAL calendar day (same_local_day semantics) — the old
+                # UTC-date comparison stranded post-local-midnight voice
+                # transcripts in yesterday's session until UTC midnight.
+                started_dt = _parse_utc_dt(
+                    data.get("started_at") or data.get("updated_at")
+                )
+                if started_dt is not None and _same_local_day(
+                    started_dt,
+                    datetime.now(timezone.utc),
+                    await _get_user_tz_name(user_id),
+                ):
                     logger.info("[REALTIME] Reusing existing VPS session %s", session_id[:8])
                     return session_id
 

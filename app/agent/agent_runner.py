@@ -17,6 +17,7 @@ Features:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -87,6 +88,25 @@ from app.agent._user_tz_cache import (  # noqa: E402
     get_cached_user_tz as _get_cached_user_tz,
     set_cached_user_tz as _set_cached_user_tz,
     invalidate_cached_user_tz as _invalidate_cached_user_tz,
+)
+
+
+# W2.2: per-run disabled-tool set. Lives in a ContextVar (not the
+# `_disabled_tool_names` instance attr alone) because AgentRunner is a
+# process singleton shared between the parent agent loop and any
+# sub-agents it spawns — the exact twin of the ToolExecutor race fixed
+# after the 2026-05-25 incident (see tool_executor._DISABLED_TOOLS_CTX).
+# run() writes the merged user-config + profile set here; the tool_defs
+# property reads it at the tools capture, hundreds of ms later. With the
+# bare attr, a concurrent SUBAGENT run's write in that window disabled
+# `spawn` (and the memory-write mutators) in the PARENT's advertised
+# toolset — and a user run's write re-ENABLED them for the child.
+# ContextVars are per-asyncio-task, so each run's set is isolated.
+# Default None = "no run in flight on this task"; tool_defs falls back
+# to the instance attr so non-run callers (tests, boot-time
+# introspection) keep working.
+_RUN_DISABLED_TOOLS_CTX: contextvars.ContextVar[Optional[frozenset]] = contextvars.ContextVar(
+    "agent_runner_disabled_tools", default=None,
 )
 
 
@@ -306,7 +326,9 @@ class AgentRunner:
         self._session_model_override: Optional[str] = None  # Per-session model
         self._current_lane: str = 'main'  # Active execution lane
         self._idempotency_key: Optional[str] = None  # Current run idempotency key
-        self._disabled_tool_names: set = set()  # Per-session disabled tools
+        # Non-run fallback for the disabled-tools filter ONLY — run()
+        # writes _RUN_DISABLED_TOOLS_CTX instead (W2.2 singleton race).
+        self._disabled_tool_names: set = set()
         # Phase 5: Track retrieved memories for feedback loop
         self._last_retrieved_memories: List[Dict[str, Any]] = []
         # W1.4c: whether the current turn's user message was classified
@@ -363,11 +385,18 @@ class AgentRunner:
                 # one slips through, the executor's dispatch order
                 # (skills first) means the skill wins on call.
                 defs = defs + list(mcp_tool_defs)
-        # Apply per-session disabled filter (tools can be Anthropic or OpenAI format)
-        if self._disabled_tool_names:
+        # Apply per-session disabled filter (tools can be Anthropic or OpenAI format).
+        # W2.2: read the per-run ContextVar first — run() writes it per turn
+        # and it is isolated per asyncio task, so a concurrent run on this
+        # singleton cannot swap the set between run()'s write and this read.
+        # None (no run in flight on this task) falls back to the instance
+        # attr for non-run callers.
+        _ctx_disabled = _RUN_DISABLED_TOOLS_CTX.get()
+        disabled = _ctx_disabled if _ctx_disabled is not None else self._disabled_tool_names
+        if disabled:
             defs = [
                 t for t in defs
-                if (t.get("name") or t.get("function", {}).get("name")) not in self._disabled_tool_names
+                if (t.get("name") or t.get("function", {}).get("name")) not in disabled
             ]
         return defs
 
@@ -700,7 +729,18 @@ class AgentRunner:
                 session_id = session_id or f"subagent:{uuid.uuid4().hex[:20]}"
                 logger.info("[AGENT] SUBAGENT run — no Conversation row, sentinel session_id=%s", session_id)
             else:
-                session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz)
+                # AUTOPILOT ticks are headless — both save flags off, no
+                # session id — so a persisted Conversation would just be one
+                # empty row per ~5min tick (W1.7d litter). Ephemeral sentinel
+                # instead; terminal transitions write through the routine
+                # message-writer, never this session.
+                _ephemeral_session = (
+                    prompt_profile == PromptProfile.AUTOPILOT
+                    and not session_id
+                    and not save_user_message
+                    and not save_assistant_message
+                )
+                session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz, ephemeral=_ephemeral_session)
                 session_id = session.id
                 logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
             # Stamp the conversation onto the tool context and reset the
@@ -719,17 +759,24 @@ class AgentRunner:
                         _select(AgentConfig).where(AgentConfig.user_id == user_id)
                     )
                     _ac = _ac_result.scalars().first()
+                # W2.2: the runner-side set goes into _RUN_DISABLED_TOOLS_CTX,
+                # NOT self._disabled_tool_names — the bare attr on this
+                # process singleton let a concurrent run's write land between
+                # here and the tool_defs read at the tools capture. The
+                # executor-side write (`self.tools.user_disabled_tools`) is
+                # already ContextVar-backed (a property over
+                # tool_executor._DISABLED_TOOLS_CTX) and stays as-is.
                 if _ac and getattr(_ac, 'disabled_tools', None):
                     import json as _json
                     _user_disabled = set(_json.loads(_ac.disabled_tools))
                     self.tools.user_disabled_tools = _user_disabled
-                    self._disabled_tool_names = _user_disabled
+                    _RUN_DISABLED_TOOLS_CTX.set(frozenset(_user_disabled))
                 else:
                     self.tools.user_disabled_tools = set()
-                    self._disabled_tool_names = set()
+                    _RUN_DISABLED_TOOLS_CTX.set(frozenset())
             except Exception:
                 self.tools.user_disabled_tools = set()
-                self._disabled_tool_names = set()
+                _RUN_DISABLED_TOOLS_CTX.set(frozenset())
 
             # Sub-agent runs override the disabled set with the
             # memory-write defaults. The child cannot store user
@@ -742,9 +789,9 @@ class AgentRunner:
             from app.agent.prompt_profile import disabled_tools_for
             _profile_disabled = disabled_tools_for(prompt_profile)
             if _profile_disabled:
-                merged = self._disabled_tool_names | set(_profile_disabled)
+                merged = (_RUN_DISABLED_TOOLS_CTX.get() or frozenset()) | frozenset(_profile_disabled)
                 self.tools.user_disabled_tools = merged
-                self._disabled_tool_names = merged
+                _RUN_DISABLED_TOOLS_CTX.set(merged)
                 logger.info(
                     "[AGENT] sub-agent run — disabling %d additional tools "
                     "(memory-write + spawn + job/routine/trigger mutators)",
@@ -2357,9 +2404,24 @@ class AgentRunner:
         app_id: Optional[str] = None,
         force_new: bool = False,
         client_tz: Optional[str] = None,
+        ephemeral: bool = False,
     ):
         from sqlalchemy import select, and_
         from app.db.models import Conversation
+
+        # Headless runs never persist messages to this thread, so a real
+        # row would only litter the sidebar. In-memory sentinel — same
+        # shape, NEVER db.add()ed. Every downstream writer that stamps
+        # this id (context-budget log, error log, drop-time promotion)
+        # is try/except-wrapped non-fatal, and BuildJob.conversation_id
+        # has no FK.
+        if ephemeral:
+            return Conversation(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                channel=channel or "unknown",
+                is_active=True,
+            ), True
 
         # If Telegram, try to find an active session for this chat
         if telegram_chat_id and not session_id:
