@@ -2987,6 +2987,19 @@ class AgentRunner:
             "The whole point of you is: the user says what they want, you make it happen."
         )
 
+        # W2.1a prefix diet: swap in the compact platform map (drops the
+        # per-tool capability blurbs that restate tool schemas, compresses
+        # Decision rules to one-liners; Pages map + NEVER list kept). The
+        # owner fact + fencing appends below ride BOTH paths unchanged.
+        # Flag-off keeps the legacy literal above byte-identical.
+        from app.agent.prompt_diet import (
+            prompt_diet_enabled as _prompt_diet_enabled,
+            PLATFORM_KNOWLEDGE_DIET as _PLATFORM_KNOWLEDGE_DIET,
+            DOC_GENERATION_DIET as _DOC_GENERATION_DIET,
+        )
+        if _prompt_diet_enabled():
+            section_parts["platform_knowledge"] = _PLATFORM_KNOWLEDGE_DIET
+
         # Who owns/founded Toup — a static company fact appended to the
         # always-on platform map so every agent can answer "who's behind
         # Toup?" (only when asked). Distinct from identity_anchor's "who
@@ -3534,6 +3547,11 @@ class AgentRunner:
                 "User: \"Can you help me understand the difference between a linked list and an array?\"\n"
                 "→ do NOT generate a file. This is a conversational explanation. Answer in markdown."
             )
+            # W2.1a prefix diet: compact version keeps the tool-choice rules
+            # + the convert-vs-regenerate rule, drops the worked examples.
+            # Flag-off keeps the legacy literal above byte-identical.
+            if _prompt_diet_enabled():
+                section_parts["doc_generation"] = _DOC_GENERATION_DIET
 
         # ── 5b. Media Playback (web channel, only if intent includes media) ──
         # PR-1 stable layout: channel-gated only — intent gating would flip

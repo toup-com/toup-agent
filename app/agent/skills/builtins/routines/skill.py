@@ -106,6 +106,79 @@ def _routine_summary(r) -> Dict[str, Any]:
     }
 
 
+# W2.1a prefix diet (settings.prompt_diet): compact descriptions for the two
+# fattest routine schemas (routines__remind 998 tok, routines__create 766 tok
+# measured on the wire — docs/audits/2026-07-sota-assessment.md). Only
+# description strings shrink; properties/enums/required are byte-identical
+# to the full schemas (shape equality pinned in tests/test_prompt_diet.py).
+_DIET_TOOL_DESCRIPTIONS = {
+    "routines__create": (
+        "Create a scheduled routine (recurring agent work — \"every "
+        "morning\", \"weekdays at 7am\"). kind=`email_briefing` = Gmail "
+        "summary preset (config.mode `latest_n` + max_emails, or "
+        "`since_last_run`; no prompt_text). kind=`agent_task` = anything "
+        "else — REQUIRES a self-contained `prompt_text` (fires in a fresh "
+        "context). `schedule_cron_local` is 5-part cron in the user's local "
+        "tz (`30 6 * * *` = 06:30 daily; `0 7 * * 1-5` = 07:00 weekdays) — "
+        "confirm the time with the user first. Delivery is automatic to "
+        "chat + every connected channel: never ask where to send it; OMIT "
+        "`delivery_channels` unless the user explicitly restricts it."
+    ),
+    "routines__remind": (
+        "Create a reminder (kind=`reminder`) — literal text delivered at a "
+        "time, no LLM. Use this instead of `routines__create` for any "
+        "remind / alert / nudge request. Modes via `when`: `once` "
+        "(+`at_local`, then auto-disable), `daily` (+`daily_at_local`), "
+        "`every` (+`every_seconds`, optional `window_start_local`/"
+        "`window_end_local` daily window — without one the interval runs "
+        "24/7). All times are the user's local tz, resolved server-side. "
+        "Delivery is automatic to chat + every connected channel: never ask "
+        "where to send it; OMIT `delivery_channels` unless the user "
+        "explicitly restricts it."
+    ),
+}
+
+_DIET_PROPERTY_DESCRIPTIONS = {
+    "routines__create": {
+        "kind": "`email_briefing` = Gmail preset; `agent_task` = any other recurring prompt.",
+        "schedule_cron_local": "5-part cron, user's local tz, e.g. `30 6 * * *`.",
+        "name": "Short name (≤100 chars) shown in Mission Control.",
+        "prompt_text": (
+            "REQUIRED for kind=`agent_task`: self-contained instruction "
+            "executed at fire time (fresh context, no memory of this chat)."
+        ),
+        "delivery_channels": (
+            "OMIT for the default (chat + every connected channel). Set only "
+            "on explicit user restriction; `website` always included."
+        ),
+    },
+    "routines__remind": {
+        "reminder_text": "Literal text delivered at fire time, written for the user to read.",
+        "when": "`once` = one-shot + auto-disable; `daily` = same time every day; `every` = interval.",
+        "at_local": (
+            "Required when when=`once`: \"YYYY-MM-DD HH:MM\" or \"HH:MM\" "
+            "(today if still future, else tomorrow)."
+        ),
+        "daily_at_local": "Required when when=`daily`: \"HH:MM\" local.",
+        "every_seconds": "Required when when=`every`: interval seconds, min 60.",
+        "window_start_local": "Optional with `every`: \"HH:MM\" — fire only after this time each day.",
+        "window_end_local": (
+            "Optional with `every`: \"HH:MM\" window end; wraps midnight "
+            "if end < start."
+        ),
+        "name": "Optional short name for Mission Control (defaults from reminder_text).",
+        "delivery_channels": (
+            "OMIT for the default (chat + every connected channel). Set only "
+            "on explicit user restriction; `website` always included."
+        ),
+        "timezone": (
+            "IANA tz (e.g. \"America/Toronto\") — pass only after a "
+            "`NEEDS_TIMEZONE` error; remembered afterwards."
+        ),
+    },
+}
+
+
 class RoutinesSkill(Skill):
     """Expose routine CRUD to the agent itself.
 
@@ -134,7 +207,7 @@ class RoutinesSkill(Skill):
     # Tools
     # ------------------------------------------------------------------
     def get_tools(self) -> List[Dict[str, Any]]:
-        return [
+        tools = [
             {
                 "name": "routines__create",
                 "description": (
@@ -456,6 +529,16 @@ class RoutinesSkill(Skill):
                 },
             },
         ]
+        # W2.1a prefix diet — compact descriptions only; shapes untouched.
+        # Flag-off returns the list above byte-identical.
+        from app.agent.prompt_diet import (
+            prompt_diet_enabled, apply_tool_description_diet,
+        )
+        if prompt_diet_enabled():
+            apply_tool_description_diet(
+                tools, _DIET_TOOL_DESCRIPTIONS, _DIET_PROPERTY_DESCRIPTIONS,
+            )
+        return tools
 
     # ------------------------------------------------------------------
     # System prompt — guides when + how to call these tools

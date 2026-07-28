@@ -282,6 +282,24 @@ class Settings(BaseSettings):
     # are pure bug fixes and do NOT ride this flag.
     cache_aware_overflow: bool = False
 
+    # Prefix diet (token-efficiency W2.1a; docs/audits/2026-07-remediation.md,
+    # gap #6 in docs/audits/2026-07-sota-assessment.md — ~5,750 trimmable
+    # tokens of the measured 27.2k wire prefix). When true:
+    #   - app_builder's system-prompt essay (2,862 tok) is replaced by a
+    #     ~400-tok contract (the skill's tools carry the detail at build time)
+    #   - the 3 fattest tool schemas (routines__remind 998, routines__create
+    #     766, triggers__create 657) serve ~250-tok descriptions; arg shapes
+    #     (properties/enums/required) are byte-identical to the full schemas
+    #   - platform_knowledge drops the per-tool capability blurbs that
+    #     restate tool schemas and compresses Decision rules to one-liners
+    #     (Pages map + NEVER list + owner fact + fencing all kept)
+    #   - doc_generation shrinks 654 → ~200 tok (tool-choice rules + the
+    #     convert-vs-regenerate rule kept)
+    # Default OFF: model-visible prompt change — flip via PROMPT_DIET=true
+    # after canary validation. Flag-off output is byte-identical to today
+    # (regression-pinned in tests/test_prompt_diet.py).
+    prompt_diet: bool = False
+
     # Document Generation + Web Attachments (Phase 1+2 of doc-delivery feature)
     # When false: generate_* tools are not registered, attachment WS events are not emitted.
     # Frontend has its own localStorage gate (TOUP_DOC_ATTACHMENTS) for the two-pane UI.

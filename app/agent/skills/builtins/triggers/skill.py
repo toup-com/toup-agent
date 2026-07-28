@@ -113,6 +113,37 @@ def _trigger_summary(t) -> Dict[str, Any]:
     }
 
 
+# W2.1a prefix diet (settings.prompt_diet): compact description for the fat
+# triggers__create schema (657 tok measured on the wire —
+# docs/audits/2026-07-sota-assessment.md). Only description strings shrink;
+# properties/enums/required are byte-identical to the full schema (shape
+# equality pinned in tests/test_prompt_diet.py).
+_DIET_TOOL_DESCRIPTIONS = {
+    "triggers__create": (
+        "Create an event-driven trigger — the agent reacts WHEN something "
+        "happens (\"when I get an email\"), NOT on a schedule (that's "
+        "`routines__create`). v1 kind: `email_received` (user must have "
+        "Gmail connected). Actions: `summarize_and_post` = LLM summary to "
+        "Day-as-Chat (best default); `notify_only` = raw sender/subject/"
+        "snippet, no LLM; `forward_to_telegram` = summary + Telegram "
+        "fan-out. Optional `filter_json` rules, AND'd: `from_contains`, "
+        "`subject_contains`, `labels` (Gmail label ids), "
+        "`exclude_categories` (of promotions/social/updates/forums) — each "
+        "a list. Ask the user where to deliver (`delivery_channels`)."
+    ),
+}
+
+_DIET_PROPERTY_DESCRIPTIONS = {
+    "triggers__create": {
+        "kind": "v1: `email_received`.",
+        "action": "What each fire does — see tool description.",
+        "name": "Short name (≤100 chars) for Mission Control.",
+        "filter_json": "Optional filter rules (see tool description). Omit for match-all.",
+        "delivery_channels": "Where each fire's output goes; `website` always included server-side.",
+    },
+}
+
+
 class TriggersSkill(Skill):
     """Expose trigger CRUD + test-fire to the agent.
 
@@ -155,7 +186,7 @@ class TriggersSkill(Skill):
     # ── Tool schemas ─────────────────────────────────────────────
 
     def get_tools(self) -> List[Dict[str, Any]]:
-        return [
+        tools = [
             {
                 "name": "triggers__create",
                 "description": (
@@ -334,6 +365,16 @@ class TriggersSkill(Skill):
                 },
             },
         ]
+        # W2.1a prefix diet — compact descriptions only; shapes untouched.
+        # Flag-off returns the list above byte-identical.
+        from app.agent.prompt_diet import (
+            prompt_diet_enabled, apply_tool_description_diet,
+        )
+        if prompt_diet_enabled():
+            apply_tool_description_diet(
+                tools, _DIET_TOOL_DESCRIPTIONS, _DIET_PROPERTY_DESCRIPTIONS,
+            )
+        return tools
 
     # ── System-prompt augmentation ───────────────────────────────
 

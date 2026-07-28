@@ -543,6 +543,57 @@ def _slugify(name: str, suffix: str = "") -> str:
     return slug
 
 
+# W2.1a prefix diet (settings.prompt_diet): ~400-token contract that replaces
+# the full operating essay below when the flag is on. It keeps what the model
+# must know BEFORE any app_builder tool fires — the one critical invariant
+# (ALL app creation goes through app_builder__build_app), the layer order,
+# and the buttons contract. The step-by-step detail lives in the skill's own
+# tool results (research/gather return their questions verbatim; Layer-2
+# context messages carry the audit instructions), so the model re-reads it
+# at build time. Flag-off output is byte-identical to the legacy essay
+# (pinned in tests/test_prompt_diet.py).
+_PROMPT_DIET_SECTION = (
+    "# App Builder\n"
+    "## CRITICAL RULE\n"
+    "ALL app creation goes through the `app_builder__build_app` tool — NO "
+    "exceptions, however the user phrases it and whatever stack they name. "
+    "Never scaffold apps by hand (exec / write_file / edit_file / npx / "
+    "create-next-app / toup__create_spec / toup__scaffold) — the pipeline "
+    "guard blocks those. Apps build as React Native/Expo (iPhone, iPad, "
+    "Web), each with an Agent Placeholder you can dock into afterwards via "
+    "its `app_{slug}__*` tools.\n\n"
+    "## Pre-build flow — EXACT order, never skip a layer\n"
+    "1. **Layer 0 — directions**: vague idea → present exactly 3 distinct "
+    "directions, each with a unique `[[Short Title]]` button on the next "
+    "line. Skip only when the request is already specific and detailed.\n"
+    "2. **Layer 1A — research**: the moment a direction is picked, call "
+    "`app_builder__research_category` (original_idea + chosen_direction) — "
+    "ask nothing else yourself. Present its questions EXACTLY as returned; "
+    "match the user's answers to questions by content similarity (any "
+    "order, tolerant wording) and re-ask only genuinely unanswered ones.\n"
+    "3. **Layer 1B — technical**: after ALL research answers, call "
+    "`app_builder__gather_requirements` and present its questions exactly.\n"
+    "4. **Plan**: summarize name, screens, features, agent integration, "
+    "database, platforms. Ask \"Does this plan look good?\" "
+    "[[Build it!]] [[Change something]]\n"
+    "5. **Build** — ONLY after explicit approval: call "
+    "`app_builder__build_app` with the full context; point the user at the "
+    "**Jobs** tab. `app_builder__get_status` checks progress; "
+    "`app_builder__resume_build` resumes a token-paused build.\n"
+    "6. **Iterate**: share the preview, then `app_builder__modify_app` for "
+    "changes (regenerates only affected files — faster than a rebuild).\n\n"
+    "EVERY question in this flow gets 2-5 clickable `[[option]]` buttons on "
+    "the line right after it — never open-ended, never bullet lists; the "
+    "user completes the whole pre-build flow by clicking.\n\n"
+    "For Layer-2 customization of a built app (\"Customize this app\"): "
+    "silently audit 3-5 key files with `app_{slug}__read_file` first, ask "
+    "10+ questions grounded in concrete findings (never re-ask Layer-1 "
+    "basics — they're settled), then apply changes with "
+    "`app_{slug}__write_file` / `app_{slug}__query_db` — never "
+    "memory_store, and never expose internal operations or file paths."
+)
+
+
 class AppBuilderSkill(Skill):
     """Conversational app builder — asks questions, plans, builds, iterates."""
 
@@ -1229,6 +1280,11 @@ class AppBuilderSkill(Skill):
     # ── System Prompt ──────────────────────────────────────────────
 
     def get_system_prompt_section(self) -> Optional[str]:
+        # W2.1a prefix diet — compact contract (see _PROMPT_DIET_SECTION).
+        # Flag-off falls through to the legacy essay, byte-identical.
+        from app.agent.prompt_diet import prompt_diet_enabled
+        if prompt_diet_enabled():
+            return _PROMPT_DIET_SECTION
         return (
             "# App Builder\n"
             "## CRITICAL RULE — READ THIS FIRST\n"
