@@ -315,6 +315,20 @@ class Settings(BaseSettings):
     # A/B (same recipe as PROMPT_DIET). Flag-off is byte-identical.
     channel_converge: bool = False
 
+    # OpenAI wire API selection (gate G1 blocker; docs/audits/2026-07-g1-model-gate.md).
+    # gpt-5.6-* 400s on /v1/chat/completions when function tools are present
+    # ("use /v1/responses or set reasoning_effort to 'none'" — canary abort
+    # 2026-07-28). When 'responses', openai_agent_service routes through
+    # client.responses.create() in stateless mode (store=false, full input
+    # each turn, include=reasoning.encrypted_content) with the identical
+    # StreamEvent contract, [PERF] line, metering, and retry behavior; the
+    # platform proxy serves /openai/v1/responses with chat-parity accounting.
+    # Values: 'chat' | 'responses'.
+    # Default 'chat': flag-off request build is BYTE-IDENTICAL to today
+    # (regression-pinned in tests/test_openai_responses_wire.py) — flip via
+    # OPENAI_WIRE_API=responses per-tenant (canary 533354ce bound .env first).
+    openai_wire_api: str = "chat"
+
     # Document Generation + Web Attachments (Phase 1+2 of doc-delivery feature)
     # When false: generate_* tools are not registered, attachment WS events are not emitted.
     # Frontend has its own localStorage gate (TOUP_DOC_ATTACHMENTS) for the two-pane UI.

@@ -489,6 +489,42 @@ class OpenAIBackend(LLMBackend):
                 async for chunk in resp.aiter_bytes():
                     yield chunk
 
+    async def responses(self, body: dict, api_key: str) -> httpx.Response:
+        """Non-streaming /v1/responses twin of chat()."""
+        body["stream"] = False
+        async with httpx.AsyncClient(timeout=120) as client:
+            return await client.post(
+                f"{self.BASE_URL}/v1/responses",
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+            )
+
+    async def responses_stream(self, body: dict, api_key: str):
+        """Streaming /v1/responses passthrough. Unlike chat_stream we do
+        NOT inject stream_options — Responses streams always carry usage in
+        the response.completed event (their stream_options only controls
+        obfuscation); any client-sent value is forwarded untouched."""
+        body["stream"] = True
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream(
+                "POST",
+                f"{self.BASE_URL}/v1/responses",
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+            ) as resp:
+                if resp.status_code >= 400:
+                    body_bytes = await resp.aread()
+                    raise UpstreamProviderError(resp.status_code, body_bytes, "openai")
+                _debug_log_upstream_cache_headers(resp.headers, body.get("model", ""))
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+
     async def embeddings(self, body: dict, api_key: str) -> httpx.Response:
         async with httpx.AsyncClient(timeout=30) as client:
             return await client.post(
@@ -693,7 +729,7 @@ def _extract_openai_cached_tokens(usage: dict) -> int:
         return 0
 
 
-def _extract_openai_cache_write_tokens(usage) -> int:
+def _extract_openai_cache_write_tokens(usage, details_key: str = "prompt_tokens_details") -> int:
     """Read prompt-cache WRITE tokens from an OpenAI usage payload (0 when absent).
 
     G1 prep: the gpt-5.6 explicit-caching regime bills cache writes at
@@ -704,13 +740,18 @@ def _extract_openai_cache_write_tokens(usage) -> int:
     is accepted as a fallback spelling). Coded defensively per the gate:
     handles dict AND SDK-object shapes via getattr, returns 0 on any
     miss/garbage — models without a cache_write price ignore it anyway.
+
+    `details_key` (Responses wire): the Responses usage shape nests its
+    details under `input_tokens_details` instead — same 3 candidate write
+    spellings probed either way. The default keeps every existing chat
+    call site byte-identical.
     """
     if usage is None:
         return 0
     if isinstance(usage, dict):
-        details = usage.get("prompt_tokens_details") or {}
+        details = usage.get(details_key) or {}
     else:
-        details = getattr(usage, "prompt_tokens_details", None)
+        details = getattr(usage, details_key, None)
     for field in ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens"):
         if isinstance(details, dict):
             value = details.get(field)
@@ -745,6 +786,64 @@ def _extract_openai_cache_write_from_sse(raw_bytes: bytes) -> int:
         except (json.JSONDecodeError, KeyError):
             pass
     return write_tokens
+
+
+def _extract_responses_cached_tokens(usage) -> int:
+    """Responses twin of _extract_openai_cached_tokens: cached-read hits
+    nest under usage.input_tokens_details.cached_tokens. Dict AND object
+    shapes, garbage-safe int, 0 on any miss."""
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        details = usage.get("input_tokens_details") or {}
+    else:
+        details = getattr(usage, "input_tokens_details", None)
+    if isinstance(details, dict):
+        value = details.get("cached_tokens", 0)
+    else:
+        value = getattr(details, "cached_tokens", 0)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_responses_usage(raw_bytes: bytes) -> tuple[int, int, int, int]:
+    """Extract (input, output, cached, cache_write) tokens from Responses
+    SSE stream bytes.
+
+    Responses streams carry usage inside terminal `response.*` events
+    (`response.completed`, and usage-bearing `response.incomplete`) as
+    obj["response"]["usage"] with the input_tokens/output_tokens/
+    input_tokens_details.cached_tokens shape — NOT the chat-completions
+    prompt_tokens shape, which is why routing a Responses stream through
+    _extract_openai_usage would silently meter zeros. Last usage wins;
+    all-garbage input returns zeros.
+    """
+    import json
+    input_tokens = 0
+    output_tokens = 0
+    cached_tokens = 0
+    write_tokens = 0
+    for line in raw_bytes.decode("utf-8", errors="ignore").split("\n"):
+        if not line.startswith("data: "):
+            continue
+        data = line[6:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            obj = json.loads(data)
+            usage = obj.get("response", {}).get("usage")
+            if usage:
+                input_tokens = usage.get("input_tokens", 0) or 0
+                output_tokens = usage.get("output_tokens", 0) or 0
+                cached_tokens = _extract_responses_cached_tokens(usage)
+                write_tokens = _extract_openai_cache_write_tokens(
+                    usage, details_key="input_tokens_details"
+                )
+        except (json.JSONDecodeError, KeyError, AttributeError):
+            pass
+    return input_tokens, output_tokens, cached_tokens, write_tokens
 
 
 def _extract_openai_usage(raw_bytes: bytes) -> tuple[int, int, int]:
@@ -812,6 +911,37 @@ def _debug_log_upstream_cache_headers(headers, model: str) -> None:
         logger.debug("[CACHE] upstream model=%s headers=%s", model, interesting)
 
 
+# ── Tool-name dedup (shared by proxy_chat + proxy_responses) ─────────
+
+
+def _dedup_tool_names(tools: list) -> tuple[list, list]:
+    """First-wins dedup of tool definitions by their top-level `name`.
+
+    Defensive: Anthropic 400s the whole turn with "tools: Tool names must
+    be unique." on a name collision, and the agent assembles tools from
+    core + skills + (optional) MCP without dedup. First-wins is safer than
+    last-write-wins because core tools come first in the assembly order.
+    Anthropic chat tools and Responses flattened function tools both carry
+    a top-level `name`, so one helper serves both endpoints (tools without
+    one — e.g. nested chat-completions format — pass through untouched).
+    Returns (deduped, duplicate_names).
+    """
+    seen: set[str] = set()
+    deduped: list = []
+    dups: list[str] = []
+    for t in tools:
+        name = t.get("name") if isinstance(t, dict) else None
+        if not isinstance(name, str) or not name:
+            deduped.append(t)
+            continue
+        if name in seen:
+            dups.append(name)
+            continue
+        seen.add(name)
+        deduped.append(t)
+    return deduped, dups
+
+
 # ── Endpoints ────────────────────────────────────────────────────────
 
 
@@ -854,19 +984,7 @@ async def proxy_chat(
     # because core tools come first in the agent's assembly order.
     tools = body.get("tools")
     if isinstance(tools, list) and tools:
-        seen: set[str] = set()
-        deduped: list[dict] = []
-        dups: list[str] = []
-        for t in tools:
-            name = t.get("name") if isinstance(t, dict) else None
-            if not isinstance(name, str) or not name:
-                deduped.append(t)
-                continue
-            if name in seen:
-                dups.append(name)
-                continue
-            seen.add(name)
-            deduped.append(t)
+        deduped, dups = _dedup_tool_names(tools)
         if dups:
             logger.warning(
                 "[LLM-PROXY] dedup'd %d duplicate tool name(s) for user=%s model=%s: %s",
@@ -1145,6 +1263,258 @@ async def proxy_openai_chat_completions(
 ):
     """OpenAI SDK compatibility shim — body is already in OpenAI format."""
     return await proxy_chat(request, db)
+
+
+@router.post("/openai/v1/responses")
+async def proxy_openai_responses(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """OpenAI SDK compatibility shim — client.responses.create() POSTs
+    {base_url}/responses; body is already in Responses format. Serves the
+    agent's openai_wire_api="responses" path (G1: gpt-5.6-* requires
+    /v1/responses for function tools)."""
+    return await proxy_responses(request, db)
+
+
+async def proxy_responses(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Proxy an OpenAI Responses API request (SSE streaming or JSON) with the
+    same auth/budget/metering scaffolding as proxy_chat. A separate full
+    handler — NOT a shim into proxy_chat — because both the request body
+    (input/instructions vs messages) and the usage shape (input_tokens/
+    output_tokens under response.completed vs prompt_tokens on a usage
+    chunk) differ; routing a Responses stream through _extract_openai_usage
+    would silently meter zeros.
+
+    Metering parity with /chat: one llm_proxy_events row per request
+    (endpoint="responses", operation_type None → user-attributable), the
+    same _calc_cost_cents math, credit deduction keyed on the event id
+    inside _log_event, and _get_spend sums by provider so these rows count
+    toward the openai monthly budget automatically.
+    """
+    config = await _auth_agent(request, db)
+    body = await request.json()
+    requested_model = body.get("model")
+    # No claude-* default here — this endpoint is OpenAI-only, and letting
+    # _route_chat's unknown-prefix→Anthropic default apply would route a
+    # Responses body to the Anthropic Messages API.
+    if not requested_model:
+        raise HTTPException(422, "model is required")
+    model = _resolve_model_alias(requested_model)
+    body["model"] = model  # rewrite so the upstream call uses the real id
+    is_stream = body.get("stream", False)
+
+    if not str(model).lower().startswith(("gpt", "o1", "o3", "o4")):
+        raise HTTPException(400, "/responses is OpenAI-only")
+
+    # Defensive dedup of tool names (same rationale as proxy_chat).
+    # Responses flattened function tools carry a top-level `name`, so the
+    # shared first-wins helper applies verbatim.
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        deduped, dups = _dedup_tool_names(tools)
+        if dups:
+            logger.warning(
+                "[LLM-PROXY] dedup'd %d duplicate tool name(s) for user=%s model=%s: %s",
+                len(dups), config.user_id[:8], model, sorted(set(dups)),
+            )
+            body["tools"] = deduped
+
+    resolved_model_header = {} if settings.security_leak_filter else {"x-toup-resolved-model": model}
+
+    backend, api_key = _route_chat(model, config)
+    if backend.name != "openai":
+        # Unreachable given the prefix gate above; kept as defense in depth
+        # so a routing change can never send a Responses body elsewhere.
+        raise HTTPException(400, "/responses is OpenAI-only")
+
+    # Credit pre-flight: zero-balance gate (same contract as proxy_chat).
+    try:
+        from app.services.credit_service import (
+            credit_service, BUCKET_MESSAGE,
+            REASON_INSUFFICIENT_MESSAGE,
+        )
+        if getattr(settings, "credit_enforcement_enabled", False):
+            preflight = await credit_service.check_balance(
+                db, config.user_id, BUCKET_MESSAGE, Decimal("0.1"),
+            )
+            if not preflight.success:
+                raise HTTPException(
+                    402,
+                    detail={
+                        "error": "out_of_credits",
+                        "reason": preflight.reason or REASON_INSUFFICIENT_MESSAGE,
+                        "bucket": "message",
+                        "balance_after": str(preflight.balance_after),
+                    },
+                )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("[credits] pre-flight check failed for user=%s: %s",
+                       config.user_id[:8], e)
+
+    # Budget check (openai only — no Anthropic fallback on this endpoint)
+    budget_result = await _check_budget(config, "openai", db)
+    if budget_result == "monthly_exceeded":
+        raise HTTPException(429, "Monthly openai budget exceeded")
+
+    # W0.2b request-side [CACHE] line — Responses bodies use the same
+    # top-level prompt_cache_key/prompt_cache_retention names, so the
+    # shared field extractor works unchanged.
+    has_cache_key, cache_key_hash, cache_retention = _cache_log_fields(body)
+    logger.info(
+        "[CACHE] user=%s model=%s has_cache_key=%s cache_key_hash=%s retention=%s",
+        config.user_id[:8], model, has_cache_key, cache_key_hash, cache_retention,
+    )
+
+    start_ts = time.time()
+
+    if is_stream:
+        # Streaming: pre-pull the first chunk INSIDE try so an upstream
+        # non-2xx converts to a clean HTTPException BEFORE the
+        # StreamingResponse commits its 200 headers (same as proxy_chat).
+        gen = backend.responses_stream(body, api_key)
+        try:
+            first_chunk = await gen.__anext__()
+        except UpstreamProviderError as e:
+            await _log_event(
+                db, config.user_id, "openai", model, "responses",
+                0, 0, 0, int((time.time() - start_ts) * 1000), False, "error",
+            )
+            logger.warning(
+                "[LLM-PROXY] %s upstream %d for user=%s model=%s body=%r",
+                e.provider, e.status, config.user_id[:8], model, e.body,
+            )
+            try:
+                detail = e.body.decode("utf-8", errors="replace")
+            except Exception:
+                detail = str(e.body)
+            if settings.security_leak_filter:
+                from app.services.model_alias import scrub_provider_names
+                detail = scrub_provider_names(detail)
+            raise HTTPException(e.status, detail=detail)
+        except StopAsyncIteration:
+            first_chunk = b""
+
+        collected_bytes = bytearray(first_chunk)
+
+        async def stream_and_log():
+            try:
+                if first_chunk:
+                    yield first_chunk
+                async for chunk in gen:
+                    collected_bytes.extend(chunk)
+                    yield chunk
+            finally:
+                latency = int((time.time() - start_ts) * 1000)
+                inp, out, cached, cache_write = _extract_responses_usage(
+                    bytes(collected_bytes)
+                )
+                # W0.2b usage-side [CACHE] line (same format as /chat so the
+                # per-tenant hit-ratio grep spans both wires).
+                logger.info(
+                    "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
+                    "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s",
+                    config.user_id[:8], model, has_cache_key, cache_retention,
+                    inp, cached, cache_write,
+                )
+                cost = _calc_cost_cents(
+                    model, inp, out,
+                    cached_tokens=cached, cache_write_tokens=cache_write,
+                )
+                # Do NOT reuse `db` here — the Depends(get_db) session is
+                # closed before the response body streams (see the
+                # proxy_chat comment). Own a fresh session, and shield it:
+                # this finally is where a client disconnect delivers
+                # cancellation.
+                async def _log_usage() -> None:
+                    from app.db.database import async_session_maker
+                    async with async_session_maker() as _log_db:
+                        await _log_event(
+                            _log_db, config.user_id, "openai", model, "responses",
+                            inp, out, cost, latency, False,
+                            cached_tokens=cached,
+                            cache_write_tokens=cache_write,
+                        )
+
+                try:
+                    await asyncio.shield(asyncio.create_task(_log_usage()))
+                except Exception as e:
+                    logger.warning("Failed to log usage event: %s", e)
+
+        return StreamingResponse(
+            stream_and_log(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                **resolved_model_header,
+            },
+        )
+    else:
+        # Non-streaming
+        try:
+            resp = await backend.responses(body, api_key)
+        except Exception as e:
+            latency = int((time.time() - start_ts) * 1000)
+            await _log_event(
+                db, config.user_id, "openai", model, "responses",
+                0, 0, 0, latency, False, "error",
+            )
+            raise HTTPException(502, f"Provider error: {e}")
+        if resp.status_code >= 400:
+            body_bytes = resp.content
+            await _log_event(
+                db, config.user_id, "openai", model, "responses",
+                0, 0, 0, int((time.time() - start_ts) * 1000), False, "error",
+            )
+            try:
+                detail = body_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                detail = str(body_bytes)
+            if settings.security_leak_filter:
+                from app.services.model_alias import scrub_provider_names
+                detail = scrub_provider_names(detail)
+            raise HTTPException(resp.status_code, detail=detail)
+
+        latency = int((time.time() - start_ts) * 1000)
+
+        resp_data = resp.json()
+        usage = resp_data.get("usage", {})
+        inp = usage.get("input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+        cached = _extract_responses_cached_tokens(usage)
+        cache_write = _extract_openai_cache_write_tokens(
+            usage, details_key="input_tokens_details"
+        )
+        # W0.2b usage-side [CACHE] line (non-stream twin of the SSE path).
+        logger.info(
+            "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
+            "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s",
+            config.user_id[:8], model, has_cache_key, cache_retention,
+            inp, cached, cache_write,
+        )
+        _debug_log_upstream_cache_headers(resp.headers, model)
+
+        cost = _calc_cost_cents(
+            model, inp, out,
+            cached_tokens=cached, cache_write_tokens=cache_write,
+        )
+        await _log_event(
+            db, config.user_id, "openai", model, "responses",
+            inp, out, cost, latency, False,
+            cached_tokens=cached,
+            cache_write_tokens=cache_write,
+        )
+
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=resp_data, headers=resolved_model_header)
 
 
 @router.post("/openai/v1/embeddings")

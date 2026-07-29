@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, Dict, Any, List, Optional
 
@@ -79,6 +80,84 @@ def _anthropic_tools_to_openai(tools: List[Dict[str, Any]]) -> List[Dict[str, An
     return openai_tools
 
 
+def _anthropic_tools_to_responses(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert Anthropic-format tool definitions to Responses-API function format.
+
+    Anthropic:  { name, description, input_schema: {...} }
+    Responses:  { type: "function", name, description, parameters: {...}, strict }
+
+    Unlike chat completions there is NO nested "function" wrapper. `strict`
+    defaults to true on the Responses API — our tool schemas are not
+    strict-clean (missing additionalProperties:false etc.), so we send an
+    explicit False to keep today's chat-wire validation semantics.
+    """
+    responses_tools = []
+    for tool in tools:
+        responses_tools.append({
+            "type": "function",
+            "name": tool["name"],
+            "description": tool.get("description", ""),
+            "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+            "strict": False,
+        })
+    return responses_tools
+
+
+def _chat_tool_choice_to_responses(tool_choice: Any) -> Any:
+    """
+    Translate a chat-completions ``tool_choice`` into the Responses shape.
+
+    Strings ("auto" / "required" / "none") pass through unchanged. The two
+    dict shapes agent_runner / callers can produce need flattening:
+
+      chat allowed_tools:  {"type": "allowed_tools", "allowed_tools":
+                            {"mode": m, "tools": [{"type": "function",
+                             "function": {"name": n}}, ...]}}
+      responses:           {"type": "allowed_tools", "mode": m, "tools":
+                            [{"type": "function", "name": n}, ...]}
+
+      chat named function: {"type": "function", "function": {"name": n}}
+      responses:           {"type": "function", "name": n}
+
+    Unknown dict shapes pass through unchanged (forward-compat: if a caller
+    already sends the Responses shape, we must not double-translate).
+    """
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    tc_type = tool_choice.get("type")
+    if tc_type == "allowed_tools" and isinstance(tool_choice.get("allowed_tools"), dict):
+        allowed = tool_choice["allowed_tools"]
+        flat_tools: List[Dict[str, Any]] = []
+        for t in allowed.get("tools", []) or []:
+            if isinstance(t, dict) and isinstance(t.get("function"), dict):
+                flat_tools.append({"type": "function", "name": t["function"].get("name", "")})
+            else:
+                flat_tools.append(t)
+        return {
+            "type": "allowed_tools",
+            "mode": allowed.get("mode", "auto"),
+            "tools": flat_tools,
+        }
+    if tc_type == "function" and isinstance(tool_choice.get("function"), dict):
+        return {"type": "function", "name": tool_choice["function"].get("name", "")}
+    return tool_choice
+
+
+# Cap on the per-process call_id → reasoning-item cache used by the
+# Responses wire path (§ _create_responses_stream). Bounded so a
+# long-lived agent process can't grow it without limit, but sized to
+# make FIFO eviction impossible WITHIN a live run loop: history
+# rehydration is string-only (_load_history / day_context_loader), so
+# function_call resubmission only ever replays tool_use blocks from the
+# current in-process run() loop — worst case agent_max_tool_iterations
+# (40) × a parallel tool batch per iteration, times concurrent runs
+# (chat + routines/autopilot share the process). Evicting a live entry
+# would resubmit a function_call without its reasoning item, which
+# reasoning models reject (400). 2048 ≫ any realistic in-flight volume.
+_REASONING_CACHE_MAX = 2048
+
+
 class OpenAIAgentService:
     """
     OpenAI-based agent LLM service.
@@ -92,6 +171,13 @@ class OpenAIAgentService:
         self.client = None
         self.default_model = settings.agent_model
         self.default_max_tokens = settings.agent_max_tokens
+        # Responses wire path (openai_wire_api="responses"): call_id →
+        # reasoning output item (id/summary/encrypted_content) captured
+        # during streaming. Reasoning models reject a resubmitted
+        # function_call item without its reasoning item, and store=false
+        # means the only way to round-trip it is echoing the encrypted
+        # content back on the next turn's input. Bounded FIFO.
+        self._responses_reasoning: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._ensure_client()
 
     def _ensure_client(self):
@@ -144,6 +230,28 @@ class OpenAIAgentService:
         # cold start fail-opens; subsequent calls are gated.
         from app.services.credit_reporter import raise_if_exhausted
         raise_if_exhausted()
+
+        # G1 blocker (docs/audits/2026-07-g1-model-gate.md): gpt-5.6-*
+        # rejects /v1/chat/completions when function tools are present —
+        # the Responses API is the tools+reasoning wire for that family.
+        # Flag-gated second wire path; default "chat" leaves everything
+        # below this branch byte-identical to today.
+        if getattr(settings, "openai_wire_api", "chat") == "responses":
+            async for _ev in self._create_responses_stream(
+                messages=messages,
+                system=system,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                prompt_cache_key=prompt_cache_key,
+                safety_identifier=safety_identifier,
+                idempotency_key=idempotency_key,
+                stable_prefix_active=stable_prefix_active,
+            ):
+                yield _ev
+            return
 
         # Build OpenAI messages list
         oai_messages = self._build_openai_messages(system, messages)
@@ -353,6 +461,463 @@ class OpenAIAgentService:
                 # client with the fresh token, and retry ONCE. Bundle-only and
                 # first-attempt-only so a genuine BYOK bad key fails fast and
                 # surfaces the "finishing setup" friendly message instead.
+                if attempt == 0 and (getattr(settings, "llm_mode", "") == "bundle"):
+                    try:
+                        from app.services import runtime_identity as _ri
+                        _ri.reload()
+                        _ri.apply_to_settings(_ri.all_runtime_fields())
+                    except Exception as _re:
+                        logger.warning(f"[OPENAI] identity reload on 401 failed: {_re}")
+                    self._keys.refresh()
+                    self._ensure_client()
+                    logger.info("[OPENAI] bundle 401 — reloaded identity+token, retrying once")
+                    continue
+                raise
+            except RateLimitError:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"OpenAI rate-limited, retrying in {wait}s")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+            except APIConnectionError:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"OpenAI connection error, retrying in {wait}s")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
+    # ------------------------------------------------------------------
+    # Responses API wire path (openai_wire_api="responses")
+    # ------------------------------------------------------------------
+    def _remember_reasoning(self, call_id: str, reasoning_item: Dict[str, Any]) -> None:
+        """Cache a completed reasoning output item under the function call_id
+        that followed it, so the next turn's input build can echo it back
+        (stateless mode requires it — see _create_responses_stream). FIFO
+        capped so a long-lived process stays bounded."""
+        if not call_id:
+            return
+        self._responses_reasoning[call_id] = reasoning_item
+        while len(self._responses_reasoning) > _REASONING_CACHE_MAX:
+            self._responses_reasoning.popitem(last=False)
+
+    @staticmethod
+    def _reasoning_item_to_input(item: Any) -> Dict[str, Any]:
+        """Normalize a streamed reasoning output item (SDK model or dict)
+        into a plain input-item dict for resubmission."""
+        def _get(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        summary_out: List[Dict[str, Any]] = []
+        for s in _get(item, "summary", None) or []:
+            if isinstance(s, dict):
+                summary_out.append(s)
+            elif hasattr(s, "model_dump"):
+                summary_out.append(s.model_dump(exclude_none=True))
+        result: Dict[str, Any] = {
+            "type": "reasoning",
+            "id": _get(item, "id", "") or "",
+            "summary": summary_out,
+        }
+        encrypted = _get(item, "encrypted_content", None)
+        if encrypted:
+            result["encrypted_content"] = encrypted
+        return result
+
+    @staticmethod
+    def _responses_usage_dict(usage: Any) -> Dict[str, int]:
+        """Map a Responses usage object to the chat-path usage_data shape
+        (the dict agent_runner reads off message_end)."""
+        if usage is None:
+            return {}
+        _details = getattr(usage, "input_tokens_details", None)
+        _cached = getattr(_details, "cached_tokens", 0) or 0
+        return {
+            "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+            "cache_read_input_tokens": int(_cached),
+            "cache_creation_input_tokens": 0,
+        }
+
+    def _convert_message_responses(
+        self, msg: Dict[str, Any], seen_reasoning_ids: set
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert ONE agent_runner Anthropic-style message into Responses
+        input items. Sibling of _convert_message (chat wire) — same input
+        shapes, flattened-item output:
+
+        - plain string → {"role", "content"} message
+        - tool_result blocks → {"type": "function_call_output", ...} items
+        - user multi-modal parts → input_text / input_image parts
+        - assistant text + tool_use → assistant message (text, if any) then
+          one function_call item per tool_use, each preceded by its cached
+          reasoning item when we hold one (deduped per build by item id)
+        """
+        role = msg["role"]
+        content = msg["content"]
+
+        if isinstance(content, str):
+            return [{"role": role, "content": content}]
+
+        if isinstance(content, list):
+            # Tool results (from user role) → function_call_output items
+            if content and isinstance(content[0], dict) and content[0].get("type") == "tool_result":
+                return [
+                    {
+                        "type": "function_call_output",
+                        "call_id": block["tool_use_id"],
+                        "output": block.get("content", ""),
+                    }
+                    for block in content
+                    if block.get("type") == "tool_result"
+                ]
+
+            # User message with multi-modal content: chat-format parts are
+            # passed through untouched on the chat wire; Responses renames
+            # them (text→input_text, image_url→input_image w/ string URL).
+            if role == "user":
+                has_image = any(
+                    isinstance(b, dict) and b.get("type") in ("image_url", "image")
+                    for b in content
+                )
+                if has_image:
+                    parts: List[Dict[str, Any]] = []
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        btype = b.get("type")
+                        if btype == "text":
+                            parts.append({"type": "input_text", "text": b.get("text", "")})
+                        elif btype == "image_url":
+                            url = b.get("image_url")
+                            detail = None
+                            if isinstance(url, dict):
+                                detail = url.get("detail")
+                                url = url.get("url", "")
+                            part: Dict[str, Any] = {
+                                "type": "input_image",
+                                "image_url": url or "",
+                            }
+                            if detail:
+                                part["detail"] = detail
+                            parts.append(part)
+                        elif btype == "image":
+                            # Anthropic base64 spelling (browser screenshots)
+                            source = b.get("source") or {}
+                            if isinstance(source, dict) and source.get("data"):
+                                media = source.get("media_type", "image/png")
+                                parts.append({
+                                    "type": "input_image",
+                                    "image_url": f"data:{media};base64,{source['data']}",
+                                })
+                    return [{"role": "user", "content": parts}]
+
+            # Assistant message with text + tool_use blocks
+            items: List[Dict[str, Any]] = []
+            text_parts: List[str] = []
+            tool_use_blocks: List[Dict[str, Any]] = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        tool_use_blocks.append(block)
+
+            text = "\n".join(text_parts)
+            if text:
+                items.append({"role": "assistant", "content": text})
+            for block in tool_use_blocks:
+                call_id = block["id"]
+                reasoning = self._responses_reasoning.get(call_id)
+                if reasoning is not None:
+                    r_id = reasoning.get("id", "")
+                    if r_id and r_id not in seen_reasoning_ids:
+                        seen_reasoning_ids.add(r_id)
+                        items.append(reasoning)
+                items.append({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": block["name"],
+                    "arguments": json.dumps(block.get("input", {})),
+                })
+            return items
+
+        return [{"role": role, "content": str(content)}]
+
+    def _build_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert the full message list into a flat Responses input array.
+        The system prompt is NOT an input item — it rides the top-level
+        `instructions` param (equivalent placement to chat's system role)."""
+        items: List[Dict[str, Any]] = []
+        seen_reasoning_ids: set = set()
+        for msg in messages:
+            items.extend(self._convert_message_responses(msg, seen_reasoning_ids))
+        return items
+
+    async def _create_responses_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        system: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        model: str = "",
+        max_tokens: int = 0,
+        temperature: float = 0.7,
+        tool_choice: Optional[Any] = None,
+        prompt_cache_key: Optional[str] = None,
+        safety_identifier: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        stable_prefix_active: bool = False,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """
+        Stream a completion over the Responses API (/v1/responses), yielding
+        the EXACT StreamEvent sequence create_message_stream's chat path
+        produces: interleaved text + tool_use_start, all tool_use_end after
+        the wire stream ends (deterministic output_index order, partial args
+        never yielded), one trailing message_end with the same usage shape.
+
+        Stateless multi-turn: store=false + the full input array each turn —
+        no previous_response_id, no server-side conversation state, matching
+        today's stateless chat usage. include=reasoning.encrypted_content so
+        reasoning items can be echoed back next turn (the API rejects a
+        resubmitted function_call without its reasoning item on reasoning
+        models). No `reasoning` param is sent — parity with chat, where the
+        model's server-side default effort applies.
+        """
+        from app.services.model_resolver import supports_custom_temperature
+
+        kwargs: Dict[str, Any] = dict(
+            model=model,
+            input=self._build_responses_input(messages),
+            max_output_tokens=max_tokens,
+            stream=True,
+            store=False,
+            include=["reasoning.encrypted_content"],
+        )
+        if system:
+            kwargs["instructions"] = system
+        if supports_custom_temperature(model):
+            kwargs["temperature"] = temperature
+        # Same cache/abuse params as the chat wire (first-class Responses
+        # params, verified against SDK types — prompt_cache_retention is
+        # Literal["in-memory","24h"] on responses.create). Same effective
+        # per-turn gate as the chat path (see comment there). Responses
+        # streams always deliver usage in response.completed, so there is
+        # no stream_options={"include_usage": True} equivalent to send.
+        if prompt_cache_key:
+            kwargs["prompt_cache_key"] = prompt_cache_key
+        if stable_prefix_active:
+            kwargs["prompt_cache_retention"] = "24h"
+            if safety_identifier:
+                kwargs["safety_identifier"] = safety_identifier
+
+        if tools:
+            kwargs["tools"] = _anthropic_tools_to_responses(tools)
+            if tool_choice:
+                kwargs["tool_choice"] = _chat_tool_choice_to_responses(tool_choice)
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                stream = await self.client.responses.create(**kwargs)
+
+                # item_id ("fc_…") → in-flight function_call tracker. The
+                # yielded tool_id is ALWAYS the call_id ("call_…") — that's
+                # what agent_runner stores as the tool_use id and echoes as
+                # tool_result tool_use_id, and what the input builder reuses
+                # verbatim as function_call_output call_id.
+                fn_calls: Dict[str, Dict[str, Any]] = {}
+                usage_data: Dict[str, int] = {}
+                terminal_status = ""
+                incomplete_reason = ""
+                completion_id = ""  # "resp_…" — metering key (v2) only
+                pending_reasoning: Optional[Dict[str, Any]] = None
+
+                async for ev in stream:
+                    ev_type = getattr(ev, "type", "")
+
+                    if ev_type == "response.created":
+                        _resp = getattr(ev, "response", None)
+                        if not completion_id and getattr(_resp, "id", None):
+                            completion_id = _resp.id
+
+                    elif ev_type == "response.output_text.delta":
+                        delta = getattr(ev, "delta", "") or ""
+                        if delta:
+                            yield StreamEvent(type="text", text=delta)
+
+                    elif ev_type == "response.output_item.added":
+                        item = getattr(ev, "item", None)
+                        if getattr(item, "type", "") == "function_call":
+                            tracker = {
+                                "call_id": getattr(item, "call_id", "") or "",
+                                "name": getattr(item, "name", "") or "",
+                                "arguments": "",
+                                "order": getattr(ev, "output_index", len(fn_calls)),
+                            }
+                            fn_calls[getattr(item, "id", "") or ""] = tracker
+                            # Mirrors the chat path's name-arrival emit:
+                            # tool_use_start is live, args are buffered.
+                            yield StreamEvent(
+                                type="tool_use_start",
+                                tool_name=tracker["name"],
+                                tool_id=tracker["call_id"],
+                            )
+
+                    elif ev_type == "response.function_call_arguments.delta":
+                        tracker = fn_calls.get(getattr(ev, "item_id", "") or "")
+                        if tracker is not None:
+                            tracker["arguments"] += getattr(ev, "delta", "") or ""
+
+                    elif ev_type == "response.function_call_arguments.done":
+                        tracker = fn_calls.get(getattr(ev, "item_id", "") or "")
+                        if tracker is not None:
+                            # Authoritative overwrite of the accumulated deltas
+                            tracker["arguments"] = getattr(ev, "arguments", "") or ""
+
+                    elif ev_type == "response.output_item.done":
+                        item = getattr(ev, "item", None)
+                        item_type = getattr(item, "type", "")
+                        if item_type == "reasoning":
+                            pending_reasoning = self._reasoning_item_to_input(item)
+                        elif item_type == "function_call":
+                            tracker = fn_calls.get(getattr(item, "id", "") or "")
+                            if tracker is not None:
+                                if getattr(item, "call_id", None):
+                                    tracker["call_id"] = item.call_id
+                                if getattr(item, "name", None):
+                                    tracker["name"] = item.name
+                                if getattr(item, "arguments", None):
+                                    tracker["arguments"] = item.arguments
+                                if pending_reasoning is not None and tracker["call_id"]:
+                                    self._remember_reasoning(
+                                        tracker["call_id"], pending_reasoning
+                                    )
+                                    pending_reasoning = None
+
+                    elif ev_type == "response.completed":
+                        _resp = getattr(ev, "response", None)
+                        usage_data = self._responses_usage_dict(
+                            getattr(_resp, "usage", None)
+                        )
+                        terminal_status = "completed"
+
+                    elif ev_type == "response.incomplete":
+                        _resp = getattr(ev, "response", None)
+                        _usage = getattr(_resp, "usage", None)
+                        if _usage is not None:
+                            usage_data = self._responses_usage_dict(_usage)
+                        terminal_status = "incomplete"
+                        _details = getattr(_resp, "incomplete_details", None)
+                        incomplete_reason = getattr(_details, "reason", "") or ""
+
+                    elif ev_type in ("response.failed", "error"):
+                        if ev_type == "error":
+                            _code = getattr(ev, "code", "") or ""
+                            _message = getattr(ev, "message", "") or ""
+                        else:
+                            _err = getattr(getattr(ev, "response", None), "error", None)
+                            _code = getattr(_err, "code", "") or ""
+                            _message = getattr(_err, "message", "") or ""
+                        # Propagates like a generic APIError so agent_runner's
+                        # existing fallback logic engages.
+                        raise RuntimeError(
+                            f"openai responses stream failed: {_code}: {_message}"
+                        )
+
+                    # Everything else (response.in_progress, content_part.*,
+                    # output_text.done, reasoning summary deltas, obfuscation,
+                    # future event types) is ignored silently.
+
+                # After stream ends, emit tool_use_end per call in
+                # output_index order (chat parity: ends after the wire
+                # stream, deterministic order, parsed args).
+                for tracker in sorted(fn_calls.values(), key=lambda t: t["order"]):
+                    try:
+                        tool_input = (
+                            json.loads(tracker["arguments"])
+                            if tracker["arguments"] else {}
+                        )
+                    except json.JSONDecodeError:
+                        tool_input = {"raw": tracker["arguments"]}
+
+                    yield StreamEvent(
+                        type="tool_use_end",
+                        tool_name=tracker["name"],
+                        tool_id=tracker["call_id"],
+                        tool_input=tool_input,
+                    )
+
+                # Responses has no finish_reason; infer the chat-parity stop
+                # reason. The TERMINAL EVENT always wins — on the chat wire
+                # the latched finish_reason is authoritative, so a stream
+                # truncated mid-function-call maps "length"→"max_tokens"
+                # even though tool_calls were partially buffered, and
+                # agent_runner's exec gate (stop_reason == "tool_use") stays
+                # closed instead of executing a call with truncated args.
+                # Only a COMPLETED response with function_call items maps to
+                # "tool_use" (chat: finish_reason="tool_calls");
+                # incomplete/other (e.g. content_filter) maps to "end_turn"
+                # like the chat table; a stream that died without a terminal
+                # event maps to "" (chat: unlatched finish_reason) — in both
+                # cases buffered fn_calls are surfaced but never executed.
+                if terminal_status == "completed":
+                    mapped_stop = "tool_use" if fn_calls else "end_turn"
+                elif terminal_status == "incomplete":
+                    mapped_stop = (
+                        "max_tokens"
+                        if incomplete_reason == "max_output_tokens"
+                        else "end_turn"
+                    )
+                else:
+                    mapped_stop = ""
+
+                # Identical [PERF] shape to the chat path so the single
+                # cross-provider dashboard query keeps working.
+                logger.info(
+                    "[PERF] cache_read=%s cache_creation=0 input=%s output=%s model=%s provider=openai",
+                    usage_data.get("cache_read_input_tokens", 0),
+                    usage_data.get("input_tokens", 0),
+                    usage_data.get("output_tokens", 0),
+                    model,
+                )
+
+                # Credit metering — same contract as the chat path (same
+                # helper-derived idempotency key, same cached_tokens forward).
+                try:
+                    from app.services.credit_reporter import report_llm_usage
+                    from app.config import settings as _cr_settings
+                    user_id = getattr(_cr_settings, "user_id", "") or ""
+                    if user_id:
+                        await report_llm_usage(
+                            user_id=user_id,
+                            model=model,
+                            provider="openai",
+                            input_tokens=int(usage_data.get("input_tokens", 0) or 0),
+                            output_tokens=int(usage_data.get("output_tokens", 0) or 0),
+                            idempotency_key=_metering_idempotency_key(
+                                idempotency_key,
+                                prompt_cache_key,
+                                completion_id or None,
+                            ),
+                            cached_tokens=int(usage_data.get("cache_read_input_tokens", 0) or 0),
+                        )
+                except Exception:
+                    logger.exception("[credits] openai stream report failed")
+
+                yield StreamEvent(
+                    type="message_end",
+                    stop_reason=mapped_stop,
+                    usage=usage_data,
+                )
+                return  # Success, no retry
+
+            except AuthenticationError:
+                # Bundle 401 self-heal — identical to the chat path (the
+                # pool-bind race is wire-agnostic; see the comment there).
                 if attempt == 0 and (getattr(settings, "llm_mode", "") == "bundle"):
                     try:
                         from app.services import runtime_identity as _ri
