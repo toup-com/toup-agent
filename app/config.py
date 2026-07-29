@@ -1207,7 +1207,12 @@ class Settings(BaseSettings):
     bridge_client_cert: str = ""            # Client cert (PEM) platform presents for mTLS
     bridge_client_key: str = ""             # Client private key (PEM)
     bridge_request_timeout_s: int = 30      # default httpx timeout for non-upgrade calls
-    bridge_upgrade_timeout_s: int = 180     # upgrade endpoint can take longer (pull + recreate + health)
+    # Upgrade endpoint can take longer (pull + recreate + health). Must exceed
+    # the bridge's green-health ceiling (240 s as of 2026-07-28) + drain (60 s
+    # max) + pull/swap overhead: at 180 s the platform ReadTimeout'd while the
+    # bridge finished the swap anyway, recording false rolled_back attempts
+    # and burning a convergence-sweep slot (canary 533354ce, 2026-07-29).
+    bridge_upgrade_timeout_s: int = 330
 
     # ── Audio stream proxy (Phase 1, /api/media/{id}/audio_stream) ─
     # Per-tenant concurrent stream cap, enforced PER-REPLICA via an
