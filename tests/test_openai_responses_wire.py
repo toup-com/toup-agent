@@ -1221,3 +1221,39 @@ def test_proxy_responses_uses_fresh_session_and_shield():
     assert "_extract_responses_usage" in src
     # never the chat extractor — it meters zeros on a Responses stream
     assert "_extract_openai_usage(" not in src
+
+
+# ── prompt_cache_key 64-char limit (/v1/responses only) ─────────────────
+# The Responses endpoint rejects keys over 64 chars (string_above_max_length,
+# hit in production 2026-07-29 with a 73-char day-scoped key). Chat
+# completions never enforced a limit — its wire stays byte-identical.
+
+def test_responses_cache_key_short_passthrough():
+    from app.services.openai_agent_service import _responses_cache_key
+    assert _responses_cache_key("u1:day-1") == "u1:day-1"
+    exactly_64 = "k" * 64
+    assert _responses_cache_key(exactly_64) == exactly_64
+
+
+def test_responses_cache_key_long_is_64_deterministic_and_distinct():
+    from app.services.openai_agent_service import _responses_cache_key
+    long_a = "5deca34a:day:2026-07-29:" + "a" * 49  # 73 chars, like the incident
+    long_b = "5deca34a:day:2026-07-29:" + "b" * 49  # same 31-char prefix
+    ka, kb = _responses_cache_key(long_a), _responses_cache_key(long_b)
+    assert len(ka) == 64 and len(kb) == 64
+    assert ka == _responses_cache_key(long_a)          # deterministic
+    assert ka != kb                                    # full-key hash → no prefix collision
+    assert ka.startswith(long_a[:31])                  # readable routing prefix kept
+
+
+def test_responses_stream_shortens_long_cache_key_chat_source_untouched():
+    """The responses kwargs builder must route through _responses_cache_key;
+    the chat wire must NOT (its 400-free behavior with long keys is the
+    historical baseline the byte-identity suite pins)."""
+    import inspect as _inspect
+    from app.services import openai_agent_service as svc
+    responses_src = _inspect.getsource(svc.OpenAIAgentService._create_responses_stream)
+    assert "_responses_cache_key(" in responses_src
+    chat_src = _inspect.getsource(svc.OpenAIAgentService.create_message_stream)
+    chat_before_branch = chat_src.split("_create_responses_stream", 1)[0]
+    assert "_responses_cache_key(" not in chat_before_branch

@@ -6,6 +6,7 @@ Emits the same StreamEvent interface so the agent runner works unchanged.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -58,6 +59,24 @@ def _metering_idempotency_key(
     if getattr(settings, "metering_correctness_v2", False):
         return f"oaireq:{completion_id or uuid.uuid4()}"
     return idempotency_key or prompt_cache_key
+
+
+def _responses_cache_key(prompt_cache_key: str) -> str:
+    """Fit ``prompt_cache_key`` into the Responses API's 64-char limit.
+
+    ``/v1/responses`` rejects keys over 64 chars (``string_above_max_length``
+    — hit on the 2026-07-29 canary parity soak with a 73-char day-scoped
+    key); chat completions never enforced a limit, so the chat wire passes
+    keys through untouched. Keys within the limit are returned unchanged.
+    Longer keys keep a readable 31-char prefix and append a sha256 fragment
+    of the FULL key — deterministic (same key → same routing hint, which is
+    all the cache cares about) and collision-safe across scopes that share
+    a prefix.
+    """
+    if len(prompt_cache_key) <= 64:
+        return prompt_cache_key
+    digest = hashlib.sha256(prompt_cache_key.encode("utf-8")).hexdigest()[:32]
+    return f"{prompt_cache_key[:31]}-{digest}"
 
 
 def _anthropic_tools_to_openai(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -708,7 +727,7 @@ class OpenAIAgentService:
         # streams always deliver usage in response.completed, so there is
         # no stream_options={"include_usage": True} equivalent to send.
         if prompt_cache_key:
-            kwargs["prompt_cache_key"] = prompt_cache_key
+            kwargs["prompt_cache_key"] = _responses_cache_key(prompt_cache_key)
         if stable_prefix_active:
             kwargs["prompt_cache_retention"] = "24h"
             if safety_identifier:
