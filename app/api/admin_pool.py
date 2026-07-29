@@ -315,6 +315,25 @@ async def admin_bind(
     except Exception as e:
         logger.warning("[admin/bind] LLM key refresh failed (non-fatal): %s", e)
 
+    # 2c-2. Reset the embedding-provider cache. The agent_main boot
+    #     pre-load resolved the embedding provider while this container
+    #     was still in LOBBY mode (llm_mode="manual", no toup_token), so
+    #     the EmbeddingService singleton cached "local" — and bind always
+    #     loses that race because the bridge only calls /admin/bind after
+    #     lobby health reports ready (end of boot). This bind just flipped
+    #     llm_mode/toup_token on the live settings; without the reset the
+    #     provider stays "local" for the whole process lifetime and every
+    #     memory write on a freshly claimed / blue-green-recreated pool
+    #     container degrades to an unembedded row (dedup off, vector
+    #     recall blind — the silent follow-up to canary 533354ce). Reset →
+    #     the next embed re-resolves and lands on the proxy client.
+    try:
+        from app.services.embedding_service import EmbeddingService as _EmbSvc
+        _EmbSvc.reset_provider_cache()
+        logger.info("[admin/bind] Embedding provider cache reset")
+    except Exception as e:
+        logger.warning("[admin/bind] Embedding provider reset failed (non-fatal): %s", e)
+
     # 2d. Bootstrap the MCP connector-tools client. A pool container
     #     boots in lobby mode without agent_api_key, so the lifespan's
     #     MCP init was a no-op — this bind just supplied the key.

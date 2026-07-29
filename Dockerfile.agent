@@ -102,12 +102,20 @@ ENV EXEC_SANDBOX_USER=toup
 # with `No module named 'sentence_transformers'`, which silently
 # breaks BOTH automatic memory extraction and recall — so the agent's
 # Brain stays empty forever and `memory_search` always returns
-# "failed". OPENAI_API_KEY is reliably injected per-tenant by the
-# bridge, so default the agent image to OpenAI embeddings; settings
-# can still be overridden via .env if a tenant needs local.
+# "failed". EMBEDDING_PROVIDER=openai alone is NOT enough: bundle-mode
+# containers are KEYLESS (no OPENAI_API_KEY — chat rides TOUP_TOKEN
+# through the platform proxy), and EmbeddingService.provider resolves
+# "openai" only with a raw key OR the proxy escape hatch
+# (_proxy_embeddings_active). Without EMBEDDINGS_VIA_PROXY it silently
+# fell back to "local" and memory_store errored with the missing
+# import (canary 533354ce, 2026-07-28). Pin the proxy flag here so
+# embeddings ride the TOUP_TOKEN through /llm/openai/v1/embeddings —
+# the same OpenAI embeddings memory_create uses platform-side.
+# Settings can still be overridden via .env if a tenant needs local.
 ENV EMBEDDING_PROVIDER=openai \
     EMBEDDING_MODEL=text-embedding-3-small \
-    EMBEDDING_DIMENSION=1536
+    EMBEDDING_DIMENSION=1536 \
+    EMBEDDINGS_VIA_PROXY=true
 
 # Cross-day recall — without this, the agent's `recall_day` tool
 # returns "ERROR: recall_day is not enabled on this agent" and the

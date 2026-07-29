@@ -1855,6 +1855,26 @@ async def agent_health():
     except Exception:
         _db_ok, _db_recoveries = None, None
 
+    # Embedding degrade observability. Memory writes never fail on a broken
+    # embedding backend — they degrade to unembedded rows (dedup off, vector
+    # recall blind for those rows) with only a container-log WARNING. Surface
+    # the counter here so fleet-wide unembedded writes are visible in one
+    # health poll; `provider` reports the CACHED resolution only (never
+    # forces a resolve from a health probe). Diagnostic ONLY — law 1, nothing
+    # gates on it. Recovery lever: app/scripts/backfill_embeddings.py.
+    try:
+        from app.services.embedding_service import (
+            EmbeddingService as _EmbSvc,
+            embed_degrade_stats as _embed_degrade_stats,
+        )
+        _emb_inst = _EmbSvc._instance
+        _emb_provider = (
+            _emb_inst.__dict__.get("_resolved_provider") if _emb_inst is not None else None
+        ) or _EmbSvc._resolved_provider
+        _embeddings_status = {"provider": _emb_provider, **_embed_degrade_stats()}
+    except Exception:
+        _embeddings_status = None
+
     return {
         "status": "healthy",
         "version": _agent_version,
@@ -1867,6 +1887,7 @@ async def agent_health():
         # not just the raw settings field. Closes the gap where /agent/health
         # advertised a stale model after a settings.agent_model bump.
         "agent_model": default_model(),
+        "embeddings": _embeddings_status,
         "boot_progress": _boot_progress,
         "is_bound": _is_bound,
         "bound_user_id": _bound_uid,

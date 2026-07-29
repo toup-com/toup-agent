@@ -266,12 +266,28 @@ class MemoryService:
         Returns:
             Memory: The created or reinforced memory
         """
-        # Generate embedding (unless the caller already computed it)
+        # Generate embedding (unless the caller already computed it).
+        # W1.5 mirror (write path): an embedding failure must never error the
+        # memory write — agent images deliberately ship WITHOUT
+        # sentence-transformers, so a provider that resolves "local" raises
+        # ImportError, and the proxy/OpenAI path can fail transiently. Store
+        # the memory unembedded instead; keyword/graph retrieval still finds
+        # it, and dedup (which needs the vector) is skipped below.
         if embedding is None:
-            embedding = await self.embedding_service.embed_async(memory_data.content, api_key=self.api_key)
-        
+            try:
+                embedding = await self.embedding_service.embed_async(memory_data.content, api_key=self.api_key)
+            except Exception as e:
+                import logging
+                from app.services.embedding_service import record_embed_degrade
+                record_embed_degrade(e)
+                logging.getLogger(__name__).warning(
+                    f"[MEMORY] Embedding failed, storing memory without vector: {e}"
+                )
+                embedding = None
+
         # Deduplication: Check for similar existing memories
-        if deduplicate:
+        # (needs the vector — skipped when embedding degraded to None)
+        if deduplicate and embedding is not None:
             similar_memory = await self._find_similar_memory(
                 user_id=user_id,
                 embedding=embedding,
@@ -327,8 +343,10 @@ class MemoryService:
             consolidation_count=0,
             decay_rate=0.1,  # Default decay rate
             # Embedding and metadata
-            embedding=embedding,  # Native pgvector column
-            embedding_json=json.dumps(embedding),  # Backward compat (DEPRECATED)
+            embedding=embedding,  # Native pgvector column (nullable — see degrade above)
+            # Backward compat (DEPRECATED). None (not "null") when unembedded so
+            # `if memory.embedding_json:` guards in the fallback searches skip it.
+            embedding_json=json.dumps(embedding) if embedding is not None else None,
             tags_json=json.dumps(memory_data.tags) if memory_data.tags else None,
             metadata_json=json.dumps(memory_data.metadata) if memory_data.metadata else None,
             source_message_id=source_message_id,

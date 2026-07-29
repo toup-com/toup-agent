@@ -84,11 +84,19 @@ class MemoryDedupService:
             - "reinforced": Same info, just strengthened existing
         """
         # Step 1: Generate embedding for new content (async — the sync embed
-        # blocks the event loop on OpenAI HTTP; W1.4e)
-        new_embedding = await self.embedding_service.embed_async(new_memory.content, api_key=self.api_key)
+        # blocks the event loop on OpenAI HTTP; W1.4e).
+        # W1.5 mirror (write path): an embedding failure must degrade to an
+        # unembedded write, not error the memory_store tool — agent images
+        # deliberately ship WITHOUT sentence-transformers, so a provider that
+        # resolves "local" raises ImportError there.
+        new_embedding = await self._embed_or_none(new_memory.content)
 
         # Step 2+3: Search for similar memories and filter candidates
-        candidates = await self._find_candidates(new_memory, new_embedding, user_id)
+        # (no vector → nothing to compare against; go straight to create)
+        if new_embedding is None:
+            candidates = []
+        else:
+            candidates = await self._find_candidates(new_memory, new_embedding, user_id)
 
         if not candidates:
             # Nothing similar enough to consider
@@ -144,10 +152,12 @@ class MemoryDedupService:
         pending: List[Dict[str, Any]] = []
 
         for i, new_memory in enumerate(new_memories):
-            new_embedding = await self.embedding_service.embed_async(
-                new_memory.content, api_key=self.api_key
-            )
-            candidates = await self._find_candidates(new_memory, new_embedding, user_id)
+            # W1.5 mirror (write path) — see smart_create_memory
+            new_embedding = await self._embed_or_none(new_memory.content)
+            if new_embedding is None:
+                candidates = []
+            else:
+                candidates = await self._find_candidates(new_memory, new_embedding, user_id)
 
             if not candidates:
                 memory = await self.memory_service.create_memory(
@@ -201,6 +211,20 @@ class MemoryDedupService:
                 )
 
         return results  # type: ignore[return-value]
+
+    async def _embed_or_none(self, content: str) -> Optional[List[float]]:
+        """Embed content, degrading to None when the embedding backend is
+        unavailable (missing sentence-transformers on agent images, transient
+        proxy/OpenAI outage). Broad except on purpose — same reasoning as the
+        W1.5 read-path degrade in MemoryService.hybrid_search: a memory WRITE
+        must never fail because the vector could not be computed."""
+        try:
+            return await self.embedding_service.embed_async(content, api_key=self.api_key)
+        except Exception as e:
+            from app.services.embedding_service import record_embed_degrade
+            record_embed_degrade(e, site="dedup")
+            logger.warning(f"[MEMORY] Embedding failed, skipping dedup and storing without vector: {e}")
+            return None
 
     async def _find_candidates(
         self,

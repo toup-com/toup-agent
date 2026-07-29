@@ -6,7 +6,8 @@ Auto-falls back to local model when OpenAI key is unavailable.
 
 import json
 import logging
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 import numpy as np
 from functools import lru_cache
 
@@ -30,6 +31,38 @@ class EmbeddingService:
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
+
+    @classmethod
+    def reset_provider_cache(cls) -> None:
+        """Drop the resolved provider/client/model so the NEXT access
+        re-resolves against the current settings.
+
+        MUST be called wherever bind-critical settings change at runtime
+        (/admin/bind, tunnel config_update). Pool containers boot in LOBBY
+        mode (llm_mode="manual", no toup_token): the agent_main boot
+        pre-load touches `provider` at ~25% boot, which resolves and caches
+        "local" — and bind can only arrive AFTER boot finishes (the bridge
+        waits for lobby health `ready`). Without this reset, every freshly
+        claimed or blue-green-recreated pool container keeps provider
+        "local" for its whole process lifetime after bind flips
+        llm_mode/toup_token, so every memory write degrades to an
+        unembedded row (dedup off, vector recall blind) — the silent
+        follow-up to canary 533354ce.
+
+        Note the properties assign `self._resolved_provider = ...`, which
+        shadows the class attribute on the SINGLETON'S instance dict — so
+        clear the instance dict too, not just the class slots. Singleton
+        identity is preserved on purpose: long-lived holders
+        (MemoryService.embedding_service, MemoryDedupService, …) re-resolve
+        on their next use instead of keeping a stale instance.
+        """
+        cls._resolved_provider = None
+        cls._openai_client = None
+        cls._model = None
+        inst = cls._instance
+        if inst is not None:
+            for attr in ("_resolved_provider", "_openai_client", "_model"):
+                inst.__dict__.pop(attr, None)
 
     @staticmethod
     def _proxy_embeddings_active() -> bool:
@@ -206,3 +239,45 @@ class EmbeddingService:
 def get_embedding_service() -> EmbeddingService:
     """Get the singleton embedding service"""
     return EmbeddingService()
+
+
+# ── Degrade observability ────────────────────────────────────────────
+# Memory writes degrade to UNEMBEDDED rows when the vector cannot be
+# computed (memory_service.create_memory / memory_dedup_service.
+# _embed_or_none). The per-write signal is deliberately a quiet WARNING —
+# a memory write must never fail because of the vector — but the degrade
+# also swallows deterministic failures (proxy 429 monthly-budget, 401/403
+# token problems), which can silently strip vectors from EVERY write for
+# the rest of a billing month. This counter makes that countable:
+# /agent/health surfaces it so fleet-wide unembedded writes are observable
+# in one poll instead of buried in container logs. `last_error` carries the
+# exception type, so auth/budget failures (RateLimitError/
+# AuthenticationError/PermissionDeniedError) are distinguishable from the
+# expected slim-image ImportError. Recovery for accumulated NULL-embedding
+# rows = `python -m app.scripts.backfill_embeddings` (re-embeds them).
+_embed_degrade_stats: Dict[str, Any] = {
+    # Rows actually stored with embedding=None (create_memory's degrade —
+    # the only site that persists an unembedded row, so this is an exact
+    # row count, not an attempt count).
+    "degraded_writes": 0,
+    # Times the dedup pre-embed failed (dedup skipped for that write; the
+    # row itself is still counted above iff create_memory's retry also
+    # failed).
+    "dedup_skips": 0,
+    "last_error": None,
+    "last_at": None,
+}
+
+
+def record_embed_degrade(error: BaseException, *, site: str = "write") -> None:
+    """Count one embed degrade. site="write" → a row was stored without a
+    vector; site="dedup" → the dedup pre-embed failed (dedup skipped)."""
+    key = "degraded_writes" if site == "write" else "dedup_skips"
+    _embed_degrade_stats[key] += 1
+    _embed_degrade_stats["last_error"] = f"{type(error).__name__}: {error}"[:300]
+    _embed_degrade_stats["last_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def embed_degrade_stats() -> Dict[str, Any]:
+    """Snapshot of the degrade counter for /agent/health."""
+    return dict(_embed_degrade_stats)

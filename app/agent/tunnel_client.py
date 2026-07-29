@@ -302,6 +302,18 @@ class AgentTunnelClient:
         except Exception as e:
             logger.warning("[TUNNEL-CLIENT] KeyProvider refresh failed: %s", e)
 
+        # Reset the embedding-provider cache so the resolution tracks the
+        # freshly-changed settings. Same reasoning as the /admin/bind reset:
+        # EmbeddingService caches provider/client on the singleton forever,
+        # so a resolution made under pre-update settings (e.g. lobby-mode
+        # "local", or a proxy client built with a stale toup_token) would
+        # otherwise outlive every config_update for the process lifetime.
+        try:
+            from app.services.embedding_service import EmbeddingService
+            EmbeddingService.reset_provider_cache()
+        except Exception as e:
+            logger.warning("[TUNNEL-CLIENT] Embedding provider reset failed: %s", e)
+
         # Hot-restart Telegram bot if token changed
         try:
             import app.config
