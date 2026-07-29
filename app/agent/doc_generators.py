@@ -48,7 +48,11 @@ class Attachment:
 
 def _safe_filename(name: str, default_ext: str) -> str:
     """Strip directory traversal and ensure the requested extension."""
-    name = os.path.basename(name or "").strip() or f"document{default_ext}"
+    # Normalize Windows-style separators BEFORE basename — on POSIX,
+    # os.path.basename("..\\..\\etc\\x") returns the whole string, which
+    # would otherwise survive into the storage key as a literal filename.
+    name = (name or "").replace("\\", "/")
+    name = os.path.basename(name).strip() or f"document{default_ext}"
     if not name.lower().endswith(default_ext):
         name = f"{os.path.splitext(name)[0] or 'document'}{default_ext}"
     return name

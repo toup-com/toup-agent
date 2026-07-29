@@ -38,29 +38,57 @@ TOOLS_RECALL: FrozenSet[str] = frozenset({
     "recall_day",
 })
 
+# Document generation — PDF/DOCX/XLSX/PPTX/Markdown exports. Exposed in
+# EVERY work intent because a "make me a PDF of X" ask classifies by X's
+# vocabulary, not by the export format: the behavioral-suite prompt
+# "Make me a one-page PDF summarizing the water cycle" scored code
+# (make…page) on canary 533354ce (2026-07-28), generate_pdf was filtered
+# out, and the model satisfied the ask with the only file tool it was
+# offered — writing into the workspace ROOT, invisible to the document
+# pane, which only reads generated/. Same failure class as the
+# routines__remind incident below. The runtime gate
+# (settings.feature_doc_generation) still applies at tool registration,
+# so visibility here bypasses nothing.
+TOOLS_DOCGEN: FrozenSet[str] = frozenset({
+    "generate_pdf", "generate_docx", "generate_xlsx", "generate_pptx",
+    "generate_markdown", "generate_html_to_pdf", "convert_document",
+})
+
 TOOLS_MEMORY: FrozenSet[str] = frozenset({
     "memory_search", "memory_store", "memory_delete",
-}) | TOOLS_RECALL
+}) | TOOLS_RECALL | TOOLS_DOCGEN
 
 TOOLS_WEB: FrozenSet[str] = frozenset({
     "web_search", "web_fetch", "browser",
-}) | TOOLS_RECALL
+}) | TOOLS_RECALL | TOOLS_DOCGEN
 
 TOOLS_MEDIA: FrozenSet[str] = frozenset({
     "send_file", "send_photo", "analyze_image", "generate_image", "edit_image",
     "tts", "play_media", "tts_prefs", "canvas",
-}) | TOOLS_RECALL
+}) | TOOLS_RECALL | TOOLS_DOCGEN
 
 TOOLS_CODE: FrozenSet[str] = frozenset({
     "exec", "pty_exec", "read_file", "write_file", "edit_file",
     "grep", "find", "ls", "apply_patch",
-}) | TOOLS_RECALL
+    # Image generation rides along with code intent because the document
+    # nouns added to _CODE_PATTERNS_RE (presentation|slides|deck|report|
+    # invoice|document) pull compound doc+image asks — "make me a
+    # presentation with images", "make a slide deck with photos from my
+    # trip" — from media into code (ties break code-before-media, and a
+    # format keyword like "pdf" can outscore media outright). On main
+    # those asks classified media and exposed generate_image/edit_image;
+    # without this merge the code intent would hide both on turn 1 — the
+    # exact tool-hiding failure class of #310/routines__remind/A6-3 and
+    # of this file's TOOLS_DOCGEN merge above. Runtime gates still apply
+    # at tool registration, so visibility here bypasses nothing.
+    "generate_image", "edit_image",
+}) | TOOLS_RECALL | TOOLS_DOCGEN
 
 TOOLS_AGENT: FrozenSet[str] = frozenset({
     "spawn", "process", "sessions_list", "sessions_history",
     "sessions_send", "session_status", "agents_list", "lanes_status",
     "thread",
-}) | TOOLS_RECALL
+}) | TOOLS_RECALL | TOOLS_DOCGEN
 
 TOOLS_ADMIN: FrozenSet[str] = frozenset({
     "cron", "config_reload", "doctor", "moderate", "poll",
@@ -79,7 +107,7 @@ TOOLS_SCHEDULING: FrozenSet[str] = frozenset({
     # A "while I'm away, keep me updated" ask can read as scheduling —
     # keep the mission hand-off reachable from this intent.
     "start_mission",
-}) | TOOLS_RECALL
+}) | TOOLS_RECALL | TOOLS_DOCGEN
 
 # Composite sets for multi-intent categories
 TOOLS_CODE_FULL: FrozenSet[str] = TOOLS_CODE | TOOLS_WEB | TOOLS_MEMORY | TOOLS_ADMIN
@@ -270,11 +298,19 @@ _CODE_KEYWORDS = {
     "create app", "build app", "make app", "scaffold",
     "read file", "write file", "edit file",
     "ssh", "systemctl", "nginx", "cron",
+    # Document-export formats — a short "make me a PDF" (5 words) scored
+    # zero everywhere and fell to the tool-less question intent, so the
+    # generate_* tools were never offered (canary 533354ce, 2026-07-28).
+    # Code intent carries TOOLS_DOCGEN, so format words route there.
+    "pdf", "docx", "pptx", "xlsx", "spreadsheet", "slide deck", "powerpoint",
 }
 
 _CODE_PATTERNS_RE = re.compile(
     r'\b(?:create|build|make|scaffold|deploy|fix|debug|run|execute|install|write|read|edit|delete|remove|update|modify|change|add|implement|refactor)\b'
-    r'.*\b(?:app|code|script|function|class|file|server|service|database|api|endpoint|test|package|component|module|feature|bug|error|page|route|config)\b'
+    # Document-export nouns (pdf…invoice) live in this alternation so a
+    # verb+format ask ("write me an invoice", "create a slide deck")
+    # lands in code intent, which carries TOOLS_DOCGEN.
+    r'.*\b(?:app|code|script|function|class|file|server|service|database|api|endpoint|test|package|component|module|feature|bug|error|page|route|config|pdf|docx|pptx|xlsx|document|spreadsheet|presentation|slides|deck|report|invoice)\b'
     r'|```'  # Code blocks in message
     r'|\b(?:pip|npm|yarn|apt|brew|cargo|go)\s+(?:install|add|remove|update)\b'
     r'|\b(?:git|docker|kubectl|systemctl|nginx|crontab)\s+\w+',

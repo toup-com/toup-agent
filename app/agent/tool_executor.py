@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Set
 
@@ -783,6 +784,69 @@ class ToolExecutor:
     # 1. exec — shell command execution
     # ------------------------------------------------------------------
     async def _tool_exec(self, inp: Dict[str, Any]) -> str:
+        started = time.time()
+        result = await self._exec_run(inp)
+        note = self._sweep_root_documents(started)
+        return f"{result}\n{note}" if note else result
+
+    def _sweep_root_documents(self, started_at: float) -> Optional[str]:
+        """Relocate document files an exec/pty_exec left at the workspace ROOT.
+
+        _normalize_document_write_path closes the write_file path, but the
+        incident toolset also offered exec/pty_exec, and a shell/python
+        write ("python -c 'reportlab...'" or a heredoc) into the workspace
+        root is invisible to per-tool path interception. The placement
+        contract must hold against nondeterministic model tool choice, so
+        after every exec/pty_exec any file at the workspace TOP LEVEL with
+        a document extension and an mtime at-or-after tool start is moved
+        into generated/ (created on demand), reusing the write_file
+        exemptions: session workspaces own their layout, and files under
+        generated/ or outside the workspace are never touched. Collisions
+        uniquify (report-1.pdf) rather than clobber. Returns a note naming
+        the moved files (so the model cites the real location), or None.
+        """
+        if self._session_workspace:
+            return None
+        try:
+            ws = os.path.realpath(self._get_user_workspace())
+            entries = sorted(os.listdir(ws))
+        except Exception:
+            return None
+        gen_root = os.path.join(ws, "generated")
+        moved: List[str] = []
+        for name in entries:
+            if not name.lower().endswith(self._DOC_WRITE_EXTENSIONS):
+                continue
+            src = os.path.join(ws, name)
+            try:
+                if not os.path.isfile(src) or os.path.islink(src):
+                    continue
+                # 1s slack for coarse-mtime filesystems; pre-existing root
+                # files (older than this tool call) are left alone.
+                if os.path.getmtime(src) < started_at - 1.0:
+                    continue
+                os.makedirs(gen_root, exist_ok=True)
+                dst = os.path.join(gen_root, name)
+                if os.path.exists(dst):
+                    stem, ext = os.path.splitext(name)
+                    n = 1
+                    while os.path.exists(os.path.join(gen_root, f"{stem}-{n}{ext}")):
+                        n += 1
+                    dst = os.path.join(gen_root, f"{stem}-{n}{ext}")
+                os.replace(src, dst)
+                moved.append(f"generated/{os.path.basename(dst)}")
+                logger.info(f"[DOCGEN-PATH] swept root document: {src} -> {dst}")
+            except Exception:
+                continue
+        if not moved:
+            return None
+        return (
+            "[NOTE] Document outputs always land in the workspace generated/ "
+            f"directory — moved: {', '.join(moved)}. Use these paths when "
+            "referencing the files or telling the user where they are."
+        )
+
+    async def _exec_run(self, inp: Dict[str, Any]) -> str:
         command = inp.get("command", "").strip()
         if not command:
             return "ERROR: Empty command"
@@ -879,6 +943,12 @@ class ToolExecutor:
     # 1b. pty_exec — pseudo-terminal exec for TTY-requiring CLIs
     # ------------------------------------------------------------------
     async def _tool_pty_exec(self, inp: Dict[str, Any]) -> str:
+        started = time.time()
+        result = await self._pty_exec_run(inp)
+        note = self._sweep_root_documents(started)
+        return f"{result}\n{note}" if note else result
+
+    async def _pty_exec_run(self, inp: Dict[str, Any]) -> str:
         """Execute a command in a pseudo-terminal (for TTY-requiring CLIs like top, vim, etc.)."""
         self._ensure_workspace()
         command = inp.get("command", "")
@@ -1010,6 +1080,51 @@ class ToolExecutor:
     # ------------------------------------------------------------------
     # 3. write_file
     # ------------------------------------------------------------------
+
+    # Binary document extensions whose write_file targets are forced into
+    # the workspace generated/ directory — the document pane and the
+    # behavioral suite only look there (see _normalize_document_write_path).
+    _DOC_WRITE_EXTENSIONS = (".pdf", ".docx", ".pptx", ".xlsx")
+
+    def _normalize_document_write_path(self, path: str):
+        """Force document-type write_file targets into {workspace}/generated/.
+
+        Canary 533354ce (2026-07-28): the behavioral-suite doc_generation
+        scenario asked for a PDF and the model — offered write_file but not
+        generate_pdf by the intent filter — created the file at the
+        workspace ROOT, where the document pane and the eval harness never
+        look (both read only generated/). Model path choice is
+        nondeterministic, so placement is enforced HERE, tool-side: the
+        workspace-relative subpath is preserved under generated/
+        (drafts/report.pdf → generated/drafts/report.pdf) so two writes
+        to distinct model-supplied directories never collapse onto one
+        generated/ file and silently clobber each other — the harness
+        walk (files_newer_than) and the toup://report rel-path link both
+        handle nested paths. Exempt: session-workspace overrides
+        (vibecoding builds own their layout), paths already under
+        generated/, and paths outside the user workspace (/tmp scratch —
+        _guard_path has already jailed those to the allowed roots).
+
+        Returns (possibly-rewritten absolute path, redirected: bool).
+        """
+        if self._session_workspace:
+            return path, False
+        if not path.lower().endswith(self._DOC_WRITE_EXTENSIONS):
+            return path, False
+        try:
+            ws = os.path.realpath(self._get_user_workspace())
+            real = os.path.realpath(path)
+        except Exception:
+            return path, False
+        if real != ws and not real.startswith(ws + os.sep):
+            return path, False
+        gen_root = os.path.join(ws, "generated")
+        if real == gen_root or real.startswith(gen_root + os.sep):
+            return path, False
+        normalized = os.path.join(gen_root, os.path.relpath(real, ws))
+        logger.info(f"[DOCGEN-PATH] write_file target normalized: {path} -> {normalized}")
+        return normalized, True
+
     async def _tool_write_file(self, inp: Dict[str, Any]) -> str:
         self._ensure_workspace()
         path = self._resolve_path(inp.get("path", ""))
@@ -1020,11 +1135,25 @@ class ToolExecutor:
             logger.warning(f"[PIPELINE-GUARD] Blocked app-building write_file: {path}")
             return _PIPELINE_REDIRECT_MSG
 
+        # Document placement contract — see _normalize_document_write_path.
+        path, doc_redirected = self._normalize_document_write_path(path)
+
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
             result = f"Written {len(content)} bytes to {path}"
+            if doc_redirected:
+                try:
+                    _ws = os.path.realpath(self._get_user_workspace())
+                    _rel = os.path.relpath(os.path.realpath(path), _ws)
+                except Exception:
+                    _rel = os.path.join("generated", os.path.basename(path))
+                result += (
+                    f". Document outputs always land in the workspace generated/ "
+                    f"directory — the file is at {_rel}; "
+                    f"use that path when telling the user where it is"
+                )
             # Workspace files are user-openable via the mobile deep link
             # (toup://report → report overlay backed by /api/workspace/file).
             # Hand the model the exact link so it can make the file tappable
@@ -1821,11 +1950,19 @@ class ToolExecutor:
     # 10b. generate_* — produce formatted documents
     # ------------------------------------------------------------------
     async def _register_attachment(self, att) -> str:
-        """Append an Attachment to pending_attachments and return a summary string."""
+        """Append an Attachment to pending_attachments and return a summary string.
+
+        The summary names the REAL workspace-relative location
+        (generated/{storage_path}) so the model's confirmation matches
+        where the file actually is — the doc_generation eval flake
+        (canary 533354ce, 2026-07-28) was the agent describing a path
+        that didn't match the on-disk placement.
+        """
         d = att.to_dict() if hasattr(att, "to_dict") else dict(att)
         self.pending_attachments.append(d)
         return (
-            f"Generated {d['filename']} ({d['size_bytes']} bytes, {d['mime_type']}). "
+            f"Generated {d['filename']} ({d['size_bytes']} bytes, {d['mime_type']}) "
+            f"at workspace path generated/{d['storage_path']}. "
             f"File will appear in the document pane; agent_runner will emit the "
             f"attachment event after this tool call completes."
         )

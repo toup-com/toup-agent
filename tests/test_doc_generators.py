@@ -190,9 +190,13 @@ def test_tool_dispatch_and_pending_attachments():
 def test_doc_generation_tools_schema_count_and_names():
     schemas = get_doc_generation_tools()
     names = {s["name"] for s in schemas}
+    # convert_document (LibreOffice DOCX/PPTX→PDF) and navigate_to ship in
+    # the same gated block — this assertion went stale when they landed
+    # (the file wasn't CI-wired, so nothing caught it).
     assert names == {
         "generate_pdf", "generate_docx", "generate_xlsx",
         "generate_pptx", "generate_markdown", "generate_html_to_pdf",
+        "convert_document", "navigate_to",
     }
     # Each tool has required input schema
     for s in schemas:
