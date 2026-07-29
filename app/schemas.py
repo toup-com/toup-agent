@@ -6,90 +6,23 @@ from pydantic import BaseModel, Field, EmailStr
 from enum import Enum
 
 
-class BrainType(str, Enum):
-    """Types of brains in the Toup system"""
-    USER = "user"       # User's personal memories
-    AGENT = "agent"     # Hex agent's learned knowledge
-    WORK = "work"       # Workflows and operational processes
-
-
-class MemoryCategory(str, Enum):
-    """Memory categories for USER brain - organizing personal information"""
-    # Personal Profile
-    IDENTITY = "identity"           # Who the user is - name, age, background
-    PREFERENCES = "preferences"     # Likes, dislikes, favorites
-    BELIEFS = "beliefs"             # Values, opinions, worldview
-    EMOTIONS = "emotions"           # Emotional states, moods, feelings
-    
-    # Relationships
-    PEOPLE = "people"               # Friends, colleagues, contacts
-    PLACES = "places"               # Locations, addresses, venues
-    FAMILY = "family"               # Family members, relationships
-    
-    # Experiences
-    EXPERIENCES = "experiences"     # Past events, memories, stories
-    PROJECTS = "projects"           # Active or past projects
-    SCHEDULE = "schedule"           # Appointments, reminders, calendar
-    WORK = "work"                   # Job, career, professional
-    
-    # Knowledge
-    LEARNING = "learning"           # Skills being learned, courses
-    KNOWLEDGE = "knowledge"         # Facts, information, expertise
-    TOOLS = "tools"                 # Software, tools, configurations
-    MEDIA = "media"                 # Books, movies, music, articles
-    
-    # Lifestyle
-    HEALTH = "health"               # Medical, fitness, wellness
-    HABITS = "habits"               # Routines, habits, rituals
-    FOOD = "food"                   # Diet, recipes, restaurants
-    TRAVEL = "travel"               # Trips, destinations, travel plans
-    GOALS = "goals"                 # Objectives, aspirations, dreams
-    CONTEXT = "context"             # Conversation context, general
-
-
-class AgentCategory(str, Enum):
-    """Memory categories for AGENT brain - Hex's learned capabilities"""
-    AGENT_TOOLS = "agent_tools"           # 🛠️ Commands, APIs, skills Hex knows
-    AGENT_SKILLS = "agent_skills"         # 🎯 Learned capabilities and competencies
-    AGENT_SOUL = "agent_soul"             # 💫 Personality, values, communication style
-    AGENT_PROCEDURES = "agent_procedures" # 📋 How to do things, step-by-step guides
-    AGENT_PATTERNS = "agent_patterns"     # 🧠 Learned behaviors, recognition patterns
-    AGENT_DECISIONS = "agent_decisions"   # 📝 Past choices made, decision history
-
-
-class WorkCategory(str, Enum):
-    """Memory categories for WORK brain - operations"""
-    PROCESS = "process"             # ⚡ Business processes
-
-
-# Alias for backward compatibility
-BrainRegion = MemoryCategory
-
-
-class MemoryType(str, Enum):
-    FACT = "fact"
-    PREFERENCE = "preference"
-    TASK = "task"
-    EVENT = "event"
-    PERSON = "person"
-    PLACE = "place"
-    PROJECT = "project"
-    DECISION = "decision"
-    SKILL = "skill"
-    FILE = "file"
-    NOTE = "note"
-    CONVERSATION = "conversation"
-
-
-class MemoryLevel(str, Enum):
-    """
-    Cognitive hierarchy of memory levels.
-    Based on cognitive science: episodic → semantic consolidation.
-    """
-    EPISODIC = "episodic"       # Specific experiences with time/place context
-    SEMANTIC = "semantic"       # General facts/knowledge (consolidated)
-    PROCEDURAL = "procedural"   # How-to knowledge, skills, procedures
-    META = "meta"               # Knowledge about knowledge (metacognition)
+# ── Memory taxonomy ───────────────────────────────────────────────────
+# Re-exported from app.memory_taxonomy, the single source of truth. This
+# module used to declare its OWN copy of these enums with values that diverged
+# from app/db/models/enums.py (places/family/projects/schedule/learning/tools/
+# food/travel/context existed only here), which is why 28% of production rows
+# carried a category the mobile app had no label for and rendered as "Other".
+# Import them from here or from app.db.models.enums — same objects now.
+from app.memory_taxonomy import (  # noqa: E402,F401  (re-exported)
+    BrainType,
+    MemoryCategory,
+    AgentCategory,
+    WorkCategory,
+    MemoryType,
+    MemoryLevel,
+    normalize_category,
+    normalize_memory_type,
+)
 
 
 class MemoryEventType(str, Enum):
@@ -191,6 +124,10 @@ class MemoryCreate(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     related_memory_ids: Optional[List[str]] = None
     source_type: Optional[str] = None  # conversation, import, manual
+    # Temporal validity. None = never expires (correct for durable facts and
+    # for every manually-created memory). Set by the extractor for transient
+    # content — reminders, one-off errands, passing status.
+    expires_at: Optional[datetime] = None
 
 
 class MemoryUpdate(BaseModel):
@@ -229,6 +166,7 @@ class MemoryResponse(BaseModel):
     merged_from: Optional[List[str]] = None  # IDs of memories merged into this
     superseded_by: Optional[str] = None  # ID of memory this was merged into
     is_active: bool = True  # False if superseded/archived
+    expires_at: Optional[datetime] = None  # None = never expires
     # Timestamps
     created_at: datetime
     updated_at: datetime

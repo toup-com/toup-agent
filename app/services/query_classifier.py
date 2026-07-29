@@ -50,7 +50,7 @@ def classify_query(query: str) -> Dict:
         q,
     ):
         result["type"] = "identity"
-        result["categories"] = ["identity", "family", "places"]
+        result["categories"] = ["identity", "people", "locations"]
         result["strategies"] = ["vector", "keyword"]
 
     # --- Preference queries ---
@@ -60,7 +60,7 @@ def classify_query(query: str) -> Dict:
         q,
     ):
         result["type"] = "preference"
-        result["categories"] = ["preferences", "food", "media", "habits"]
+        result["categories"] = ["preferences", "media", "habits"]
 
     # --- People queries ---
     elif re.search(
@@ -70,7 +70,7 @@ def classify_query(query: str) -> Dict:
         q,
     ):
         result["type"] = "entity"
-        result["categories"] = ["people", "family", "work"]
+        result["categories"] = ["people", "relationships", "work"]
         result["strategies"] = ["vector", "keyword", "graph"]
         # Extract the entity name (skip possessives like "my")
         name_match = re.search(
@@ -90,7 +90,7 @@ def classify_query(query: str) -> Dict:
         q,
     ):
         result["type"] = "project"
-        result["categories"] = ["projects", "work", "goals"]
+        result["categories"] = ["work", "goals", "active_task"]
 
     # --- Goal queries ---
     elif re.search(
@@ -99,7 +99,7 @@ def classify_query(query: str) -> Dict:
         q,
     ):
         result["type"] = "goal"
-        result["categories"] = ["goals", "learning", "travel"]
+        result["categories"] = ["goals", "skills", "experiences"]
 
     # --- Work queries ---
     elif re.search(
@@ -108,7 +108,7 @@ def classify_query(query: str) -> Dict:
         q,
     ):
         result["type"] = "work"
-        result["categories"] = ["work", "projects", "identity"]
+        result["categories"] = ["work", "identity", "active_task"]
 
     # --- Health queries ---
     elif re.search(
@@ -126,7 +126,7 @@ def classify_query(query: str) -> Dict:
         q,
     ):
         result["type"] = "learning"
-        result["categories"] = ["learning", "knowledge", "goals"]
+        result["categories"] = ["skills", "knowledge", "goals"]
 
     return result
 

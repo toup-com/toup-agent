@@ -26,14 +26,20 @@ from app.db.models import Memory
 
 logger = logging.getLogger(__name__)
 
-# Categories that form the user portrait
+# Categories that form the user portrait. Canonical values only — see
+# app/memory_taxonomy.py. This was a stale copy of the taxonomy: it listed
+# `projects` (retired, now `work`) and omitted `locations`/`skills` entirely,
+# so a memory in either of those could reach the model through no path at all
+# on turns where the category filter also excluded it.
 PORTRAIT_CATEGORIES = {
     "identity": "Basic identity (name, age, background)",
-    "work": "Professional context",
+    "work": "Professional context and active projects",
     "goals": "Current goals and aspirations",
     "preferences": "Key preferences and style",
-    "knowledge": "Expertise and skills",
-    "projects": "Active projects",
+    "knowledge": "Expertise and domain knowledge",
+    "skills": "Abilities, education, what they're learning",
+    "people": "Important people in their life",
+    "locations": "Where they live and work",
 }
 
 # In-memory cache: {user_id: {"summary": str, "ts": float}}

@@ -783,6 +783,37 @@ async def init_db():
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_memories_ref_unique "
         "ON memories (user_id, ref_kind, ref_id) "
         "WHERE ref_id IS NOT NULL AND is_deleted = FALSE",
+        # Memory taxonomy/TTL work 2026-07-29. `expires_at` gives the memory
+        # system its first notion of temporal validity: before this, a
+        # "remind me in 2 minutes" row was indistinguishable from "the user's
+        # daughter is called Mira" and survived indefinitely. NULL = never
+        # expires, which is the correct default for every pre-existing row —
+        # this is purely additive and safe to run against live tenants.
+        # Partial index: the expiry sweep only ever scans rows that have one.
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
+        "CREATE INDEX IF NOT EXISTS ix_memories_expires_at "
+        "ON memories (user_id, expires_at) "
+        "WHERE expires_at IS NOT NULL AND is_active = TRUE",
+        # The tsvector column has existed since the decay migration but its
+        # maintenance trigger shipped ONLY in alembic — and agent containers
+        # boot via create_all, so 100% of tenant rows had search_vector NULL
+        # and the "keyword" leg of hybrid_search silently matched nothing.
+        # Installing it here is what actually turns hybrid search on.
+        """
+        CREATE OR REPLACE FUNCTION memories_search_vector_update() RETURNS trigger AS $$
+        BEGIN
+            NEW.search_vector :=
+                setweight(to_tsvector('english', coalesce(NEW.content, '')), 'A') ||
+                setweight(to_tsvector('english', coalesce(NEW.summary, '')), 'B');
+            RETURN NEW;
+        END
+        $$ LANGUAGE plpgsql
+        """,
+        "DROP TRIGGER IF EXISTS trg_memories_search_vector ON memories",
+        "CREATE TRIGGER trg_memories_search_vector BEFORE INSERT OR UPDATE OF content, summary "
+        "ON memories FOR EACH ROW EXECUTE FUNCTION memories_search_vector_update()",
+        "CREATE INDEX IF NOT EXISTS ix_memories_search_vector "
+        "ON memories USING gin (search_vector)",
         # Bug sweep 2026-05-13 / Ticket 1: enforce Reading-A invariant —
         # one Conversation per (user, day, channel) for system channels.
         # Predicate matches SYSTEM_CHANNELS in

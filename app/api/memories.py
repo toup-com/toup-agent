@@ -61,7 +61,11 @@ async def _proxy_memories(
     agent_url: str, agent_api_key: str, path: str,
     params: Optional[dict] = None, method: str = "GET", body: Optional[dict] = None,
 ):
-    """Proxy a memories request to the VPS agent.
+    """Proxy a memories READ to the VPS agent.
+
+    Returns None on any failure, which makes the caller fall back to the
+    platform DB. That is acceptable for reads (worst case: an empty list) but
+    NOT for writes — see `_proxy_memories_write`.
 
     TKT-LAT-007 (wave 3): shared agent_http client.
     """
@@ -86,6 +90,67 @@ async def _proxy_memories(
     except Exception as e:
         logger.warning("Agent memories proxy %s failed: %s", url, e)
     return None
+
+
+async def _proxy_memories_write(
+    agent_url: str, agent_api_key: str, path: str,
+    method: str, body: Optional[dict] = None, params: Optional[dict] = None,
+):
+    """Proxy a memories WRITE (POST/PATCH/DELETE) to the tenant agent.
+
+    Backlog BE-1. `memories` is an AGENT_ONLY table: it exists in the tenant
+    container's DB, not in the platform's Supabase DB. Reads have been proxied
+    for a while, but writes were not — so every PATCH/DELETE executed against a
+    database with no such table and could not possibly affect what the user
+    sees. That is why the mobile app shipped with FEATURE_FLAGS.MEMORY_WRITES
+    hard-off and no way to correct a wrong memory.
+
+    Unlike the read helper this NEVER falls back to the platform DB. A write
+    that cannot reach the tenant must surface as an error: silently "succeeding"
+    against the wrong database is how a user comes to believe they deleted
+    something that is still there. Raises HTTPException on failure; propagates
+    the agent's own status code when it returns one.
+    """
+    from app.services.agent_http import get_agent_http_client
+
+    url = f"{agent_url}/api/memories/{path}" if path else f"{agent_url}/api/memories"
+    try:
+        client = get_agent_http_client()
+        resp = await client.request(
+            method,
+            url,
+            headers={"X-Agent-Key": agent_api_key},
+            params=params or {},
+            json=body,
+            timeout=15.0,
+        )
+    except Exception as e:
+        logger.warning("Agent memories write proxy %s %s failed: %s", method, url, e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not reach your agent to save this change. Please try again.",
+        )
+
+    if resp.status_code in (200, 201, 204):
+        if resp.status_code == 204 or not resp.content:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return None
+
+    if resp.status_code == 404:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found"
+        )
+
+    logger.warning(
+        "Agent memories write proxy %s %s returned %s", method, url, resp.status_code
+    )
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="Your agent rejected this change. Please try again.",
+    )
 
 
 router = APIRouter(prefix="/memories", tags=["Memories"])
@@ -115,6 +180,7 @@ def memory_to_response(memory: Memory) -> MemoryResponse:
         merged_from=json.loads(memory.merged_from_json) if getattr(memory, 'merged_from_json', None) else None,
         superseded_by=getattr(memory, 'superseded_by', None),
         is_active=getattr(memory, 'is_active', True),
+        expires_at=getattr(memory, 'expires_at', None),
         # Timestamps
         created_at=memory.created_at,
         updated_at=memory.updated_at,
@@ -145,6 +211,23 @@ async def create_memory(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new memory"""
+    # BE-1: route to the tenant agent, where the memories table actually lives.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories_write(
+            proxy[0], proxy[1], "", "POST",
+            body=memory_data.model_dump(mode="json", exclude_none=True),
+        )
+        if data is None:
+            # The agent accepted the write but returned no body. The app types
+            # this response as a MemoryDetail, so returning `null` would crash
+            # the client — surface it as an error instead.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Your agent saved the memory but returned no details.",
+            )
+        return JSONResponse(content=data, status_code=status.HTTP_201_CREATED)
+
     _key = await _get_user_api_key(db, current_user.id)
     service = MemoryService(db, api_key=_key)
     memory = await service.create_memory(current_user.id, memory_data)
@@ -312,15 +395,23 @@ async def get_memory(
     db: AsyncSession = Depends(get_db)
 ):
     """Get a memory by ID"""
+    # This read never proxied, so opening a memory from search hit the platform
+    # DB and 404'd for every user with an active agent — i.e. all of them.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(proxy[0], proxy[1], memory_id)
+        if data is not None:
+            return JSONResponse(content=data)
+
     service = MemoryService(db)
     memory = await service.get_memory(memory_id, current_user.id)
-    
+
     if not memory:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Memory not found"
         )
-    
+
     return memory_to_response(memory)
 
 
@@ -373,15 +464,29 @@ async def update_memory(
     db: AsyncSession = Depends(get_db)
 ):
     """Update a memory"""
+    # BE-1: writes must reach the tenant DB — see _proxy_memories_write.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories_write(
+            proxy[0], proxy[1], memory_id, "PATCH",
+            body=update_data.model_dump(mode="json", exclude_none=True),
+        )
+        if data is None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Your agent saved the change but returned no details.",
+            )
+        return JSONResponse(content=data)
+
     service = MemoryService(db)
     memory = await service.update_memory(memory_id, current_user.id, update_data)
-    
+
     if not memory:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Memory not found"
         )
-    
+
     return memory_to_response(memory)
 
 
@@ -392,9 +497,17 @@ async def delete_memory(
     db: AsyncSession = Depends(get_db)
 ):
     """Delete a memory (soft delete)"""
+    # BE-1: writes must reach the tenant DB — see _proxy_memories_write.
+    # Deleting against the platform DB previously reported success while the
+    # memory stayed visible on the user's phone.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        await _proxy_memories_write(proxy[0], proxy[1], memory_id, "DELETE")
+        return
+
     service = MemoryService(db)
     deleted = await service.delete_memory(memory_id, current_user.id)
-    
+
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -520,10 +633,18 @@ async def reinforce_memory(
     and more resistant to decay. Useful when a memory is actively recalled
     or confirmed by the user.
     """
+    # BE-1: "Keep" on the Memory screen lands here; it must reach the tenant.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories_write(
+            proxy[0], proxy[1], f"{memory_id}/reinforce", "POST"
+        )
+        return JSONResponse(content=data or {"success": True, "memory_id": memory_id})
+
     from app.services.decay_service import DecayService
-    
+
     decay_service = DecayService(db)
-    
+
     memory = await decay_service.reinforce_memory(
         memory_id=memory_id,
         user_id=str(current_user.id),

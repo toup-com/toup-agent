@@ -342,21 +342,58 @@ class MemoryDedupService:
         memory: Memory,
         new_data: MemoryCreate
     ) -> Memory:
-        """Reinforce an existing memory with new occurrence."""
-        # Increase strength (capped at 1.0)
+        """Reinforce an existing memory with new occurrence.
+
+        This path used to be a one-way ratchet that quietly made decay
+        impossible (2026-07-29 audit):
+          * `importance` only ever increased, so an item restated a few times
+            drifted to the top and stayed there;
+          * `consolidation_count` was incremented on every RESTATEMENT even
+            though no consolidation had occurred — and DecayService reads that
+            field as a stability multiplier worth up to 2x
+            (`stability *= 1 + 0.2 * min(consolidation_count, 5)`).
+        Combined, a frequently-mentioned throwaway became the single most
+        decay-resistant thing in the brain. Both are corrected below.
+        """
+        # Increase strength (capped at 1.0) — this is the legitimate
+        # reinforcement signal and stays as-is.
         memory.strength = min(1.0, (memory.strength or 0.5) + 0.1)
-        
-        # Update importance if the new one is higher
-        if new_data.importance > (memory.importance or 0.5):
-            memory.importance = new_data.importance
-        
+
+        # Importance now MOVES TOWARD the new observation instead of taking the
+        # max, so a memory repeatedly restated as unimportant can drift back
+        # down. Weighted to the incumbent so a single odd reading can't
+        # discard an established judgement.
+        _old_importance = memory.importance if memory.importance is not None else 0.5
+        memory.importance = round(
+            min(1.0, max(0.0, 0.7 * _old_importance + 0.3 * new_data.importance)), 4
+        )
+
         # Update confidence if the new one is higher
         if new_data.confidence > (memory.confidence or 0.5):
             memory.confidence = new_data.confidence
-        
-        # Track reinforcement
+
+        # Expiry lease on a restatement:
+        #   - restated as DURABLE (no expires_at) -> promote to permanent.
+        #     "I'm working on the billing rewrite" (transient, 30d) followed by
+        #     "the billing rewrite is my main project" (durable) must not keep
+        #     the original lease — dedup returns the incumbent WITHOUT creating
+        #     a new row, so this is the only place the promotion can happen.
+        #     A later transient restatement can always re-stamp a horizon.
+        #   - restated as transient with a LATER horizon -> extend.
+        #   - restated as transient with an earlier horizon -> keep the longer.
+        if memory.expires_at is not None:
+            new_expiry = getattr(new_data, "expires_at", None)
+            if new_expiry is None:
+                memory.expires_at = None
+            elif new_expiry > memory.expires_at:
+                memory.expires_at = new_expiry
+
+        # Track reinforcement. NOTE: consolidation_count is deliberately NOT
+        # touched here — it means "times the consolidation service merged this
+        # into a semantic memory", and decay depends on that meaning. The
+        # reinforcement record lives in access_count, last_reinforced_at and
+        # history_json below.
         memory.last_reinforced_at = datetime.utcnow()
-        memory.consolidation_count = (memory.consolidation_count or 0) + 1
         memory.access_count = (memory.access_count or 0) + 1
         memory.updated_at = datetime.utcnow()
         

@@ -58,6 +58,25 @@ class Settings(BaseSettings):
     max_memories_per_message: int = 10
     similarity_threshold: float = 0.7
     
+    # Runtime memory retrieval (agent_runner's per-turn hybrid_search).
+    # Both were hardcoded at the call site until 2026-07-29: limit=15 and
+    # min_similarity=0.1. Retrieval telemetry rated only 7.3% of retrievals
+    # "good" (27 of 372) and nearly every query returned a full 15 rows —
+    # "say OK" retrieved 15 memories.
+    #
+    # The floor gates RAW COSINE in the vector path only (see
+    # MemoryService.hybrid_search: it is deliberately NOT applied to the
+    # RRF-fused set, so keyword/graph matches still surface at any cosine).
+    # 0.35 is calibrated against the real corpus, not guessed — all-pairs
+    # cosine over the 119 live memories on the founder's tenant:
+    #     p50 0.154 · p75 0.222 · p90 0.342 · p95 0.481 · p99 0.713
+    # The old 0.10 floor admitted 76% of ALL pairs, i.e. no floor at all.
+    # 0.35 sits at the p90 boundary and admits 9.6% — enough to fill k=10
+    # when genuinely relevant memories exist, and nothing when they don't.
+    # Re-measure before changing; tune against retrieval_events.
+    memory_retrieval_limit: int = 10
+    memory_retrieval_min_similarity: float = 0.35
+
     # Chat & Session Settings
     memory_recall_limit: int = 15  # How many memories to recall per message
     auto_extract_memories: bool = True  # Auto-extract memories from conversations
@@ -86,6 +105,13 @@ class Settings(BaseSettings):
     # True, agent_main's lifespan registers the same job entry points on
     # the tenant container's scheduler where those tables actually live.
     agent_memory_maintenance_enabled: bool = False
+
+    # Agent-brain reflection (2026-07-29). The ONLY producer of
+    # brain_type='agent' rows, which back the app's "Learned" tab — that tab
+    # was permanently empty because nothing wrote them. Costs one extra LLM
+    # call, but only on turns where a cheap regex gate detects a correction or
+    # a stated working preference, so typical turns are unaffected.
+    agent_reflection_enabled: bool = True
 
     # Proactive-notification dispatcher (Autopilot arc PR3). Runs on
     # EVERY replica — safety comes from per-row status CAS, not from
@@ -204,6 +230,27 @@ class Settings(BaseSettings):
     fetch_cache_enabled: bool = True
     fetch_cache_ttl_s: int = 720           # 12 min
     fetch_cache_max: int = 256
+
+    # ── web_search / web_fetch metering ──────────────────────────
+    # Until 2026-07 these two tools were the only priced-in-FLAT_FEES events
+    # with no charge call site anywhere: `_flat_fee_for_tool`'s web_search /
+    # web_fetch branches are reachable only from the connector dispatcher,
+    # which never sees those names. Result: zero `tool_call` rows in
+    # credit_ledger and no per-user view of internet usage at all.
+    #
+    # metering_enabled writes one ledger row per OUTBOUND call (cache hits
+    # are free and are never billed, only logged). metering_charge decides
+    # whether that row moves the balance:
+    #   False (default) → meter_only, amount=0, nobody is billed. The row
+    #                     still carries credits_quoted + meter_would_deny, so
+    #                     you get the full usage series AND a dry-run of the
+    #                     denial rate before switching pricing on.
+    #   True            → the FLAT_FEES amount is deducted for real.
+    # Landing charge=False is deliberate: CREDIT_ENFORCEMENT_ENABLED is true
+    # in production, so flipping both at once would start denying searches on
+    # the same deploy that first measures them.
+    web_tool_metering_enabled: bool = True
+    web_tool_metering_charge: bool = False
     # Kill-switch (default on): dedup near-duplicate URLs, drop empty results,
     # and BM25-rerank web_search results by relevance before the model sees them.
     # Pure-Python (no LLM/network), so no latency cost. Off → raw engine order.

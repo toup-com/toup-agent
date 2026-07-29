@@ -186,6 +186,22 @@ class DecayService:
 
         now = datetime.utcnow()
 
+        # An EXPLICIT user "Keep" cancels any expiry lease outright. This runs
+        # BEFORE the cooldown return below on purpose: tapping Keep must always
+        # save the memory, even if something reinforced it in the last hour.
+        #
+        # Without this the Memory screen lies. The user sees a card, taps Keep,
+        # gets a success response — and the TTL sweep archives it anyway,
+        # because reinforcement moved strength and last_reinforced_at but never
+        # touched expires_at. There is no restore route, so that is effectively
+        # irreversible from the user's side.
+        if access_context == "user_reinforce" and memory.expires_at is not None:
+            memory.expires_at = None
+            logger.info(
+                "[decay] user Keep cleared expiry lease on %s: %s",
+                memory.id, (memory.content or "")[:60],
+            )
+
         # Cooldown: skip reinforcement if last reinforced within 1 hour
         if memory.last_reinforced_at:
             hours_since = (now - memory.last_reinforced_at).total_seconds() / 3600

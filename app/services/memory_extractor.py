@@ -13,13 +13,26 @@ from enum import Enum
 
 from app.config import settings
 from app.schemas import MemoryCategory, MemoryType
+from app.memory_taxonomy import (
+    build_category_prompt_block,
+    describes_recurring_arrangement,
+    normalize_category,
+    normalize_memory_type,
+    resolve_ttl_days,
+)
 
 
 @dataclass
 class ExtractedMemory:
-    """Represents an extracted memory from text"""
+    """Represents an extracted memory from text.
+
+    `category` / `memory_type` hold canonical taxonomy STRINGS (the enums are
+    `str` subclasses, so existing callers that compared against enum members
+    keep working). `summary` is normally None — see the extractor's note on why
+    LLM-written summaries are no longer stored.
+    """
     content: str
-    summary: str
+    summary: Optional[str]
     category: MemoryCategory
     memory_type: MemoryType
     importance: float
@@ -27,6 +40,9 @@ class ExtractedMemory:
     entities: List[Dict[str, Any]]  # [{"name": "...", "type": "...", "schema_type": "...", "data": {...}}]
     tags: List[str]
     metadata: Dict[str, Any]
+    # None = never expires. Set when the model flags the memory transient and
+    # the category permits expiry (app.memory_taxonomy.resolve_ttl_days).
+    ttl_days: Optional[int] = None
 
 
 @dataclass
@@ -160,26 +176,31 @@ class MemoryExtractor:
     # Keywords for category classification
     CATEGORY_KEYWORDS = {
         MemoryCategory.IDENTITY: ["my name", "i am", "i'm", "years old", "born", "nationality", "background"],
-        MemoryCategory.PREFERENCES: ["like", "love", "enjoy", "prefer", "hate", "dislike", "favorite"],
+        MemoryCategory.PREFERENCES: ["like", "love", "enjoy", "prefer", "hate", "dislike", "favorite",
+                                     "food", "eat", "cook", "recipe", "restaurant", "meal", "cuisine"],
         MemoryCategory.BELIEFS: ["believe", "think", "opinion", "value", "important to me", "matters"],
         MemoryCategory.EMOTIONS: ["feel", "feeling", "happy", "sad", "angry", "excited", "anxious", "stressed"],
-        MemoryCategory.PEOPLE: ["friend", "colleague", "coworker", "contact", "person", "met"],
-        MemoryCategory.PLACES: ["location", "address", "city", "country", "place", "where"],
-        MemoryCategory.FAMILY: ["family", "mother", "father", "brother", "sister", "wife", "husband", "son", "daughter", "parent"],
-        MemoryCategory.EXPERIENCES: ["happened", "remember", "yesterday", "last", "event", "experience"],
-        MemoryCategory.PROJECTS: ["project", "build", "create", "develop", "working on", "app", "system"],
-        MemoryCategory.SCHEDULE: ["meeting", "appointment", "calendar", "remind", "schedule", "at", "deadline"],
-        MemoryCategory.WORK: ["work", "job", "office", "career", "professional", "company", "business"],
-        MemoryCategory.LEARNING: ["learn", "study", "course", "tutorial", "skill", "education"],
+        # `family` keywords merged into PEOPLE, `food` into PREFERENCES and
+        # `travel` into EXPERIENCES when the taxonomy was unified — those three
+        # categories no longer exist as distinct values, and a naive remap
+        # would have silently overwritten the surviving key's keyword list.
+        MemoryCategory.PEOPLE: ["friend", "colleague", "coworker", "contact", "person", "met",
+                                "family", "mother", "father", "brother", "sister", "wife",
+                                "husband", "son", "daughter", "parent"],
+        MemoryCategory.LOCATIONS: ["location", "address", "city", "country", "place", "where"],
+        MemoryCategory.EXPERIENCES: ["happened", "remember", "yesterday", "last", "event", "experience",
+                                     "travel", "trip", "vacation", "visit", "flight", "hotel", "destination"],
+        MemoryCategory.ACTIVE_TASK: ["meeting", "appointment", "calendar", "remind", "schedule", "deadline"],
+        MemoryCategory.WORK: ["work", "job", "office", "career", "professional", "company", "business",
+                              "project", "build", "create", "develop", "working on", "system"],
+        MemoryCategory.SKILLS: ["learn", "study", "course", "tutorial", "skill", "education"],
         MemoryCategory.KNOWLEDGE: ["know", "fact", "information", "definition", "meaning", "learned"],
-        MemoryCategory.TOOLS: ["tool", "software", "app", "application", "code", "programming", "config"],
+        MemoryCategory.POSSESSIONS: ["tool", "software", "app", "application", "code", "programming", "config"],
         MemoryCategory.MEDIA: ["book", "movie", "film", "show", "series", "podcast", "music", "article"],
         MemoryCategory.HEALTH: ["health", "exercise", "fitness", "doctor", "medicine", "sleep", "diet"],
         MemoryCategory.HABITS: ["routine", "habit", "always", "every day", "usually", "ritual"],
-        MemoryCategory.FOOD: ["food", "eat", "cook", "recipe", "restaurant", "meal", "cuisine"],
-        MemoryCategory.TRAVEL: ["travel", "trip", "vacation", "visit", "flight", "hotel", "destination"],
         MemoryCategory.GOALS: ["goal", "plan", "want to", "aspire", "dream", "objective", "target"],
-        MemoryCategory.CONTEXT: ["conversation", "chat", "discuss", "talk"],
+        MemoryCategory.OTHER: ["conversation", "chat", "discuss", "talk"],
     }
     
     # Entity type keywords
@@ -274,7 +295,7 @@ class MemoryExtractor:
                         content=f"Project: {content.strip()}",
                         original_text=content,
                         memory_type=MemoryType.PROJECT,
-                        category=MemoryCategory.PROJECTS,
+                        category=MemoryCategory.WORK,
                         importance=0.7
                     ))
         
@@ -302,7 +323,7 @@ class MemoryExtractor:
                         content=f"Food: {content.strip()}",
                         original_text=content,
                         memory_type=MemoryType.PREFERENCE,
-                        category=MemoryCategory.FOOD,
+                        category=MemoryCategory.PREFERENCES,
                         importance=0.5
                     ))
         
@@ -316,7 +337,7 @@ class MemoryExtractor:
                         content=f"Travel: {content.strip()}",
                         original_text=content,
                         memory_type=MemoryType.EVENT,
-                        category=MemoryCategory.TRAVEL,
+                        category=MemoryCategory.EXPERIENCES,
                         importance=0.6
                     ))
         
@@ -330,7 +351,7 @@ class MemoryExtractor:
                         content=f"Learning: {content.strip()}",
                         original_text=content,
                         memory_type=MemoryType.SKILL,
-                        category=MemoryCategory.LEARNING,
+                        category=MemoryCategory.SKILLS,
                         importance=0.6
                     ))
         
@@ -344,7 +365,7 @@ class MemoryExtractor:
                         content=f"Schedule: {content.strip()}",
                         original_text=content,
                         memory_type=MemoryType.TASK,
-                        category=MemoryCategory.SCHEDULE,
+                        category=MemoryCategory.ACTIVE_TASK,
                         importance=0.8
                     ))
         
@@ -416,7 +437,7 @@ class MemoryExtractor:
             return max_category
         
         # Default to context for general information
-        return MemoryCategory.CONTEXT
+        return MemoryCategory.OTHER
     
     # Alias for backward compatibility
     def classify_brain_region(self, text: str) -> MemoryCategory:
@@ -468,7 +489,7 @@ class MemoryExtractor:
         return ExtractedMemory(
             content=f"Conversation: {summary}",
             summary=summary[:100],
-            category=MemoryCategory.CONTEXT,
+            category=MemoryCategory.OTHER,
             memory_type=MemoryType.CONVERSATION,
             importance=0.4,
             confidence=1.0,
@@ -597,8 +618,12 @@ class MemoryExtractor:
         llm = LLMService(api_key=api_key) if api_key else get_llm_service()
         
         entity_schemas_doc = generate_entity_schemas_prompt()
-        
-        extraction_prompt = f"""You are a memory extraction system for a personal AI assistant. Your job is to extract EVERY piece of noteworthy information from this conversation that the user would want their AI to remember permanently.
+        # Generated from app.memory_taxonomy so the prompt can never drift from
+        # the enum again — this list used to be hand-maintained prose and had
+        # diverged from BOTH enum copies.
+        category_block = build_category_prompt_block()
+
+        extraction_prompt = f"""You are a memory extraction system for a personal AI assistant. Your job is to extract information from this conversation that will still be worth knowing about THIS USER weeks from now.
 
 USER MESSAGE:
 {user_message}
@@ -616,7 +641,7 @@ ASSISTANT RESPONSE:
 6. **Decisions made**: choices the user explicitly stated ("I decided to...", "I'm going with...")
 7. **Skills & expertise**: technologies they use, languages they speak, tools they know
 8. **Events & experiences**: things that happened, places visited, meetings attended
-9. **Schedules & tasks**: upcoming deadlines, reminders, appointments, todos
+9. **Schedules & tasks**: upcoming deadlines, reminders, appointments, todos — these are almost always TRANSIENT (see rule 8)
 10. **Relationships between entities**: "Alice works at Google", "Project X uses React", "My brother lives in Berlin"
 11. **Corrections**: If the user corrects the agent ("No, actually...", "That's wrong, I meant...", "I didn't say that"), extract the CORRECT fact as a memory with high importance (0.9). Tag it with "correction" so the system can update or supersede the old incorrect memory.
 
@@ -642,7 +667,8 @@ ASSISTANT RESPONSE:
 
 4. **Minimum quality bar:** If you read the memory 6 months from now with zero context, would it be useful and understandable? If not, don't extract it.
 
-5. **Category must be one of:** identity, preferences, beliefs, emotions, people, places, family, experiences, projects, schedule, work, learning, knowledge, tools, media, health, habits, food, travel, goals
+5. **Category must be EXACTLY one of these values** (use the definition to choose):
+{category_block}
 
 6. **Importance guide:**
    - 0.9-1.0: Core identity facts, major life decisions
@@ -650,6 +676,30 @@ ASSISTANT RESPONSE:
    - 0.5-0.6: Interesting facts, experiences, one-time events
    - 0.3-0.4: Minor preferences, casual mentions
    - Below 0.3: Don't bother extracting
+   Importance measures how much this matters to the user LONG-TERM. Urgency is
+   NOT importance: "urgently research X today" is a transient errand, not a
+   core fact — mark it transient and score it low.
+
+8. **Transience — decide this for EVERY memory.** Set `"transient": true` when the
+   statement stops being true or stops being useful after a while:
+   - Reminders, alarms, one-off errands ("remind me to eat tea in 2 minutes")
+   - Requests scoped to today/this week ("research the 3 best PM tools for me")
+   - Current status that will change ("I'm waiting on the deploy")
+   - Passing moods
+   Set `"transient": false` for durable facts: who they are, who they know, what
+   they believe, what they can do, what they own, lasting preferences.
+   When transient, add `"valid_for_days"` — your best estimate of how long it stays
+   useful. A 2-minute reminder is 1; a this-week errand is 7; an active project
+   status is 30. Omit `valid_for_days` when transient is false.
+   A durable preference revealed BY a transient request should be extracted as its
+   own separate, non-transient memory ("prefers tea in the afternoon").
+
+9. **Do NOT extract general world knowledge.** Facts about companies, shows, products
+   or public figures that would be true for everybody are NOT memories about this user
+   ("Anthropic develops Claude", "Better Call Saul is on Netflix"). Only keep such a
+   fact when the user's own relationship to it is the point ("the user is watching
+   Better Call Saul"). If you would not be surprised to find it in an encyclopedia,
+   skip it.
 
 7. **Schema-enforced entities**: For each entity, identify the best matching schema_type from the list above (PersonEntity, OrganizationEntity, ProjectEntity, PlaceEntity, EventEntity, TopicEntity, ToolEntity). Fill in as many fields as the conversation provides. If unsure, use "type" only (backward compatible).
 
@@ -658,11 +708,12 @@ Extract as many memories as the conversation warrants (up to {max_memories}). Do
   "memories": [
     {{
       "content": "Complete standalone sentence describing the memory",
-      "summary": "Brief summary (max 100 chars)",
-      "category": "one of the valid categories listed above",
+      "category": "one of the valid category values listed above",
       "memory_type": "fact|preference|task|event|person|place|project|decision|skill",
       "importance": 0.7,
       "confidence": 0.9,
+      "transient": false,
+      "valid_for_days": null,
       "entities": [
         {{
           "name": "Alice",
@@ -707,13 +758,6 @@ If the conversation is just casual chat, commands, or questions with nothing wor
             result = json.loads(raw)
             memories = []
 
-            valid_categories = {
-                "identity", "preferences", "beliefs", "emotions", "people",
-                "places", "family", "experiences", "projects", "schedule",
-                "work", "learning", "knowledge", "tools", "media", "health",
-                "habits", "food", "travel", "goals"
-            }
-
             for mem_data in result.get("memories", [])[:max_memories]:
                 content = mem_data.get("content", "").strip()
 
@@ -725,29 +769,68 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                 if content.endswith("?"):
                     continue
 
-                # Validate category
-                category_str = mem_data.get("category", "context").lower()
-                if category_str not in valid_categories:
-                    category_str = "context"
-                category = self._string_to_category(category_str)
+                # Canonicalise via the single taxonomy. Unknown values map to
+                # `other` instead of the old `context` sink — `context` was in
+                # no enum, so the app had no label for it and rendered "Other"
+                # anyway, just without the value being queryable.
+                # Kept as ENUM members, not plain strings. MemoryCategory /
+                # MemoryType are str-subclasses, so `==` against a string still
+                # works — but several consumers (api/chat.py:211,
+                # modules/chat/router.py:210) do an unguarded `mem.category.value`,
+                # which would raise AttributeError on a bare str. Returning the
+                # enum keeps every existing consumer working.
+                _category_str = normalize_category(
+                    mem_data.get("category"), brain_type=brain_type
+                )
+                try:
+                    category = MemoryCategory(_category_str)
+                except ValueError:
+                    # Non-user brain: the canonical value belongs to
+                    # AgentCategory/WorkCategory, so it has no MemoryCategory
+                    # member. The plain string is correct there; only the
+                    # user-brain consumers do `.value`.
+                    category = _category_str
+                memory_type = MemoryType(
+                    normalize_memory_type(mem_data.get("memory_type"))
+                )
 
-                type_str = mem_data.get("memory_type", "fact").lower()
-                memory_type = self._string_to_memory_type(type_str)
-
-                importance = float(mem_data.get("importance", 0.5))
+                try:
+                    importance = float(mem_data.get("importance", 0.5))
+                except (TypeError, ValueError):
+                    importance = 0.5
                 if importance < 0.3:
                     continue
 
+                # Transience → expiry horizon. resolve_ttl_days refuses to
+                # expire durable-fact categories even when the model says
+                # transient, so a misclassification cannot cost a real fact.
+                ttl_days = None
+                if bool(mem_data.get("transient")) and not describes_recurring_arrangement(content):
+                    # A standing arrangement ("a Gmail briefing every day at
+                    # 11:49") reads as a schedule and the model often flags it
+                    # transient, but it is a durable preference — expiring it
+                    # would stop the agent knowing about a routine the user
+                    # still relies on.
+                    ttl_days = resolve_ttl_days(
+                        category, mem_data.get("valid_for_days")
+                    )
+
+                # `summary` is deliberately NOT taken from the model. The
+                # mobile card renders `summary || content`, so an LLM
+                # abbreviation permanently outranked the full sentence — and
+                # summary was never updated on edit or merge. Leaving it NULL
+                # makes `content` the single rendered truth.
                 memories.append(ExtractedMemory(
                     content=content,
-                    summary=mem_data.get("summary", "")[:100],
+                    summary=None,
                     category=category,
                     memory_type=memory_type,
                     importance=importance,
-                    confidence=float(mem_data.get("confidence", 0.8)),
+                    confidence=float(mem_data.get("confidence", 0.8) or 0.8),
                     entities=mem_data.get("entities", []),
                     tags=mem_data.get("tags", []),
                     metadata={"brain_type": brain_type, "extracted_by": "llm"},
+                    ttl_days=ttl_days,
                 ))
 
             self.last_extraction_outcome = "retried" if _retried else "ok"
@@ -800,16 +883,30 @@ USER MESSAGE:
 ASSISTANT RESPONSE:
 {assistant_response}
 
+## The test every relationship must pass
+The USER, or someone/something in the USER's life, must be one end of the edge —
+or the edge must describe a connection the user themselves asserted about their
+own world. You are mapping THIS USER's world, not the world in general.
+
 ## What counts as a relationship:
 - Person → Organization: "works at", "founded", "studies at"
 - Person → Person: "is friend of", "is married to", "is sibling of", "manages"
 - Person → Place: "lives in", "was born in", "visited"
 - Person → Project: "works on", "created", "maintains"
-- Project → Technology: "uses", "built with", "deployed on"
-- Any meaningful connection between two named entities
+- Project → Technology: "uses", "built with", "deployed on" (the user's project)
+
+## NEVER extract (this is the most common mistake):
+- General world knowledge true for everybody, regardless of who is asking:
+  "Anthropic develops Claude", "Better Call Saul airs on Netflix",
+  "Paris is in France". These are encyclopedia entries, not memories about
+  the user. If the fact would be equally true for a stranger, DROP IT.
+- Anything whose only source is the ASSISTANT RESPONSE. The assistant
+  explaining a topic is not the user telling you about their life. Use the
+  assistant response ONLY to resolve pronouns and names in the user's message.
+- Relationships between two entities the user merely asked a question about.
 
 ## Rules:
-- Only extract relationships explicitly stated or very strongly implied by the USER
+- Only extract relationships explicitly stated by the USER
 - Each entity must have a name and type (person, organization, place, project, technology, event, topic, tool)
 - The relationship label should be a short verb phrase in snake_case
 - Include any additional properties about the relationship (e.g. since, role, context)
@@ -830,7 +927,8 @@ Return ONLY valid JSON:
   ]
 }}
 
-If no entity relationships are found, return {{"relationships": []}}."""
+If no entity relationships are found, return {{"relationships": []}}.
+Returning an empty list is the CORRECT answer for most conversations."""
 
         try:
             response = await llm.complete_with_json(
@@ -872,49 +970,17 @@ If no entity relationships are found, return {{"relationships": []}}."""
             return []
 
     def _string_to_category(self, category_str: str) -> MemoryCategory:
-        """Convert string to MemoryCategory enum."""
-        category_map = {
-            "identity": MemoryCategory.IDENTITY,
-            "preferences": MemoryCategory.PREFERENCES,
-            "beliefs": MemoryCategory.BELIEFS,
-            "emotions": MemoryCategory.EMOTIONS,
-            "people": MemoryCategory.PEOPLE,
-            "places": MemoryCategory.PLACES,
-            "family": MemoryCategory.FAMILY,
-            "experiences": MemoryCategory.EXPERIENCES,
-            "projects": MemoryCategory.PROJECTS,
-            "schedule": MemoryCategory.SCHEDULE,
-            "work": MemoryCategory.WORK,
-            "learning": MemoryCategory.LEARNING,
-            "knowledge": MemoryCategory.KNOWLEDGE,
-            "tools": MemoryCategory.TOOLS,
-            "media": MemoryCategory.MEDIA,
-            "health": MemoryCategory.HEALTH,
-            "habits": MemoryCategory.HABITS,
-            "food": MemoryCategory.FOOD,
-            "travel": MemoryCategory.TRAVEL,
-            "goals": MemoryCategory.GOALS,
-            "context": MemoryCategory.CONTEXT,
-        }
-        return category_map.get(category_str.lower(), MemoryCategory.CONTEXT)
-    
+        """Convert string to MemoryCategory enum.
+
+        Delegates to the canonical normaliser so the alias table lives in one
+        place (this used to be a fourth hand-maintained copy of the taxonomy).
+        """
+        return MemoryCategory(normalize_category(category_str))
+
+
     def _string_to_memory_type(self, type_str: str) -> MemoryType:
-        """Convert string to MemoryType enum."""
-        type_map = {
-            "fact": MemoryType.FACT,
-            "preference": MemoryType.PREFERENCE,
-            "task": MemoryType.TASK,
-            "event": MemoryType.EVENT,
-            "person": MemoryType.PERSON,
-            "place": MemoryType.PLACE,
-            "project": MemoryType.PROJECT,
-            "decision": MemoryType.DECISION,
-            "skill": MemoryType.SKILL,
-            "file": MemoryType.FILE,
-            "note": MemoryType.NOTE,
-            "conversation": MemoryType.CONVERSATION,
-        }
-        return type_map.get(type_str.lower(), MemoryType.FACT)
+        """Convert string to MemoryType enum (canonical normaliser)."""
+        return MemoryType(normalize_memory_type(type_str))
 
 
 def get_memory_extractor() -> MemoryExtractor:

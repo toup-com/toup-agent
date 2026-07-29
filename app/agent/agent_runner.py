@@ -24,7 +24,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone as _dt_timezone
+from datetime import datetime, timedelta, timezone as _dt_timezone
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except ImportError:  # pragma: no cover — VPS Python 3.12 has it
@@ -334,6 +334,12 @@ class AgentRunner:
         self._disabled_tool_names: set = set()
         # Phase 5: Track retrieved memories for feedback loop
         self._last_retrieved_memories: List[Dict[str, Any]] = []
+        # Real retrieval telemetry. `strategies_used` was hardcoded to
+        # ["vector","keyword","graph"] at the log site and `retrieval_time_ms`
+        # was never populated at all, so retrieval_events could not be used to
+        # compare strategies or spot a slow path — the two things it exists for.
+        self._last_retrieval_strategies: List[str] = []
+        self._last_retrieval_ms: Optional[int] = None
         # W1.4c: whether the current turn's user message was classified
         # trivial by _build_system_prompt (greetings, acks). run() captures
         # this into a closure-local before scheduling background
@@ -2128,6 +2134,11 @@ class AgentRunner:
         # own and log them as the parent's retrieval feedback.
         # See the Phase 3 PR description for the audit detail.
         _retrieved_for_bg = list(self._last_retrieved_memories or [])
+        # Same singleton-safety reasoning as above: capture the real strategy
+        # list and latency now, so a concurrent sub-agent run cannot overwrite
+        # them before this turn's feedback row is written.
+        _strategies_for_bg = list(self._last_retrieval_strategies or [])
+        _retrieval_ms_for_bg = self._last_retrieval_ms
         # W1.4c: the trivial-turn classification was captured race-free into
         # the run-local _query_was_trivial immediately after
         # _build_system_prompt returned (before the tool loop's awaits could
@@ -2148,6 +2159,32 @@ class AgentRunner:
                             )
                             logger.info(f"[AGENT] Background: extracted {mem_count} memories")
 
+                        # Agent-brain reflection — what the agent should do
+                        # differently for this user. Gated on a cheap regex so
+                        # the LLM call only fires on turns that actually look
+                        # like a correction or an instruction; a normal turn
+                        # costs one regex sweep. This is the only producer of
+                        # brain_type='agent' rows, which the app's "Learned"
+                        # tab reads.
+                        if settings.agent_reflection_enabled:
+                            try:
+                                from app.services.agent_reflection import reflect_on_turn
+                                # api_key omitted: reflect_on_turn resolves the
+                                # tenant's own key from AgentConfig, the same
+                                # way _extract_memories does.
+                                _reflected = await reflect_on_turn(
+                                    bg_db, user_id, user_message, final_text,
+                                )
+                                if _reflected:
+                                    await bg_db.commit()
+                                    logger.info(
+                                        f"[AGENT] Agent-brain reflections stored: {_reflected}"
+                                    )
+                            except Exception as _rf_err:
+                                logger.warning(
+                                    f"[AGENT] Agent reflection skipped: {_rf_err}"
+                                )
+
                         # Active task extraction (pattern-based, no LLM cost)
                         try:
                             from app.services.active_task_service import detect_active_tasks, store_active_task, decay_expired_tasks
@@ -2156,9 +2193,19 @@ class AgentRunner:
                                 await store_active_task(bg_db, user_id, task_text)
                             # Also decay expired tasks periodically
                             archived = await decay_expired_tasks(bg_db, user_id)
-                            if tasks_found or archived:
+                            # General TTL sweep for anything the extractor
+                            # flagged transient. Deliberately on this per-turn
+                            # path rather than the memory-maintenance
+                            # scheduler, which is behind a flag that has never
+                            # been enabled in production.
+                            from app.services.memory_expiry import expire_stale_memories
+                            expired = await expire_stale_memories(bg_db, user_id)
+                            if tasks_found or archived or expired:
                                 await bg_db.commit()
-                                logger.info(f"[AGENT] Active tasks: {len(tasks_found)} found, {archived} archived")
+                                logger.info(
+                                    f"[AGENT] Active tasks: {len(tasks_found)} found, "
+                                    f"{archived} archived; TTL expired: {len(expired)}"
+                                )
                         except Exception as _at_err:
                             logger.debug(f"[AGENT] Active task extraction skipped: {_at_err}")
 
@@ -2173,7 +2220,8 @@ class AgentRunner:
                                 retrieved_memories=_retrieved_for_bg,
                                 response=final_text,
                                 conversation_id=session_id,
-                                strategies_used=["vector", "keyword", "graph"],
+                                strategies_used=_strategies_for_bg,
+                                retrieval_time_ms=_retrieval_ms_for_bg,
                             )
                         except Exception as e:
                             logger.warning(f"[AGENT] Feedback logging failed (non-fatal): {e}")
@@ -3226,9 +3274,17 @@ class AgentRunner:
             logger.info("[PERF] memory_retrieval_skipped reason=profile_no_user_brain")
         elif _skip_deep_context:
             self._memory_health["retrieved"] = 0
+            # Reset the buffer too. It used to persist across turns, so a
+            # trivial turn reported the PREVIOUS turn's memories as this
+            # turn's retrieval — poisoning retrieval_events with rows that
+            # never happened.
+            self._last_retrieved_memories = []
+            self._last_retrieval_strategies = []
+            self._last_retrieval_ms = None
             logger.info("[PERF] memory_retrieval_skipped reason=trivial_query")
         else:
             try:
+                from app.memory_taxonomy import normalize_category
                 from app.services.memory_service import MemoryService
                 from app.services.query_classifier import classify_query
 
@@ -3238,15 +3294,38 @@ class AgentRunner:
                 logger.info(f'[PERF] query_classify: {(time.perf_counter()-_t0)*1000:.0f}ms — type={classification["type"]}')
 
                 search_strategies = classification.get("strategies") or ["vector", "keyword", "graph"]
-                search_categories = classification.get("categories")
+                # Normalise defensively. hybrid_search ANDs
+                # `Memory.category.in_(categories)` onto every strategy, so a
+                # single stale value here silently returns ZERO memories for a
+                # whole class of question rather than degrading. The classifier
+                # was a fifth copy of the taxonomy and did exactly that for
+                # identity and learning queries. Canonicalising at the point of
+                # use means a future drift costs recall, never correctness.
+                _raw_categories = classification.get("categories")
+                search_categories = (
+                    sorted({normalize_category(c) for c in _raw_categories})
+                    if _raw_categories
+                    else None
+                )
 
                 _t0 = time.perf_counter()
+                # min_similarity was 0.1 — effectively no threshold, so every
+                # turn returned a full k=15 regardless of relevance ("say OK"
+                # retrieved 15 memories). Production retrieval telemetry rated
+                # only 27 of 372 retrievals "good"; 202 were misses. The floor
+                # and the tighter k are settings-backed so they can be tuned
+                # against that same telemetry without a redeploy.
                 memories = await mem_svc.hybrid_search(
-                    user_id=user_id, query=user_message, limit=15,
-                    min_similarity=0.1, strategies=search_strategies,
+                    user_id=user_id, query=user_message,
+                    limit=settings.memory_retrieval_limit,
+                    min_similarity=settings.memory_retrieval_min_similarity,
+                    strategies=search_strategies,
                     categories=search_categories,
                 )
-                logger.info(f"[PERF] hybrid_search: {(time.perf_counter()-_t0)*1000:.0f}ms — {len(memories)} results")
+                _hybrid_ms = int((time.perf_counter() - _t0) * 1000)
+                self._last_retrieval_strategies = list(search_strategies)
+                self._last_retrieval_ms = _hybrid_ms
+                logger.info(f"[PERF] hybrid_search: {_hybrid_ms}ms — {len(memories)} results")
 
                 if classification.get("entity_hint"):
                     _t0 = time.perf_counter()
@@ -3264,9 +3343,20 @@ class AgentRunner:
                         logger.warning(f"Entity graph search failed: {e}")
 
                 user_memories = [m for m in memories if m.get("brain_type") == "user"]
+                # Agent-brain rows used to be silently DROPPED here, so even if
+                # something had produced them they could never reach the model.
+                # They ride the same query-conditioned retrieval as user
+                # memories — JIT and bounded, so they stay out of the cached
+                # system-prompt prefix (STABLE_PREFIX_LAYOUT).
+                agent_brain_memories = [
+                    m for m in memories if m.get("brain_type") == "agent"
+                ]
                 self._last_retrieved_memories = user_memories
                 self._memory_health["retrieved"] = len(user_memories)
-                logger.info(f"[AGENT] Found {len(user_memories)} relevant user memories (hybrid)")
+                logger.info(
+                    f"[AGENT] Found {len(user_memories)} relevant user memories "
+                    f"(hybrid), {len(agent_brain_memories)} agent-brain notes"
+                )
 
                 # A. User Portrait
                 _t0 = time.perf_counter()
@@ -3306,6 +3396,19 @@ class AgentRunner:
                     for m in user_memories:
                         score = m.get("similarity_score", 0)
                         logger.info(f"[AGENT]   Memory: [{m.get('category','')}] ({score:.2f}) {m.get('content','')[:80]}")
+
+                # C2. Agent-brain notes — corrections and working preferences
+                # this user has expressed. Rendered as directives because that
+                # is how they are written (see agent_reflection.py). Capped
+                # tighter than user memories: these are behavioural rules, and
+                # a long list of them reads as nagging rather than guidance.
+                if agent_brain_memories:
+                    memory_sections.append(
+                        "\n## How this user wants you to work "
+                        "(learned from their corrections — follow these)"
+                    )
+                    for m in agent_brain_memories[:5]:
+                        memory_sections.append(f"- {m.get('content', '')}")
 
                 # D. Related entities
                 try:
@@ -4408,6 +4511,16 @@ class AgentRunner:
                     tags=mem.tags,
                     metadata=mem.metadata,
                     source_type="conversation",
+                    # Transient memories get a hard expiry. Without this a
+                    # "remind me in 2 minutes" row outlived durable facts
+                    # indefinitely (17 of 19 task rows were >14 days old at
+                    # audit). Computed inline because W1.4d turned the
+                    # per-memory loop into a batched comprehension.
+                    expires_at=(
+                        datetime.utcnow() + timedelta(days=mem.ttl_days)
+                        if getattr(mem, "ttl_days", None)
+                        else None
+                    ),
                 )
                 for mem in extracted
             ]

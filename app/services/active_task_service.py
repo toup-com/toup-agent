@@ -104,6 +104,14 @@ async def store_active_task(
             mem.strength = 1.0  # Reset strength
             mem.content = content  # Update to latest phrasing
             mem.updated_at = datetime.utcnow()
+            # Renew the expires_at lease too, not just this module's own TTL
+            # clock. There are two expiry mechanisms over the same rows —
+            # decay_expired_tasks (which reads last_reinforced_at) and
+            # expire_stale_memories (which reads expires_at). Bumping only the
+            # former would let a task the user restates EVERY DAY still vanish,
+            # because the migration stamped expires_at once and nothing moved it.
+            if mem.expires_at is not None:
+                mem.expires_at = datetime.utcnow() + timedelta(days=ACTIVE_TASK_TTL_DAYS)
             await db.flush()
             logger.info("[active_task] Reinforced: %s", content[:60])
             return mem.id

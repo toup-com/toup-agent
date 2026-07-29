@@ -73,6 +73,14 @@ class Memory(Base):
     consolidation_count: Mapped[int] = mapped_column(Integer, default=0)
     decay_rate: Mapped[float] = mapped_column(Float, default=0.1)
 
+    # Temporal validity. NULL = this memory never expires, which is correct
+    # for durable facts and for every row written before 2026-07-29. Set only
+    # when the extractor flags a memory transient AND its category permits
+    # expiry (app.memory_taxonomy.resolve_ttl_days) — reminders, one-off
+    # errands, passing status. The expiry sweep ARCHIVES (is_active=False)
+    # rather than deleting, so nothing is ever lost.
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+
     # Temporal data
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

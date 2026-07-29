@@ -21,6 +21,7 @@ from app.schemas import (
     MemoryCreate, MemoryUpdate, MemoryResponse, MemoryWithScore,
     MemorySearchRequest, MemoryCategory, MemoryType, MemoryLevel, BrainType
 )
+from app.memory_taxonomy import category_for_relationship, normalize_category
 from app.services.embedding_service import get_embedding_service
 
 
@@ -286,24 +287,34 @@ class MemoryService:
                 embedding = None
 
         # Deduplication: Check for similar existing memories
+        # Resolve brain_type BEFORE the dedup check — the check must be scoped
+        # to the same brain, or an agent-brain write can be absorbed into a
+        # similar user-brain row.
+        _brain_type_for_dedup = (
+            memory_data.brain_type.value
+            if hasattr(memory_data.brain_type, 'value')
+            else memory_data.brain_type
+        ) if memory_data.brain_type else 'user'
+
         # (needs the vector — skipped when embedding degraded to None)
         if deduplicate and embedding is not None:
             similar_memory = await self._find_similar_memory(
                 user_id=user_id,
                 embedding=embedding,
-                threshold=similarity_threshold
+                threshold=similarity_threshold,
+                brain_type=_brain_type_for_dedup,
             )
             if similar_memory:
                 # Reinforce existing memory instead of creating duplicate
                 return await self._reinforce_memory(similar_memory, memory_data)
-        
+
         # Handle memory_level - can be MemoryLevel enum or string
         memory_level_value = (
-            memory_data.memory_level.value 
-            if hasattr(memory_data.memory_level, 'value') 
+            memory_data.memory_level.value
+            if hasattr(memory_data.memory_level, 'value')
             else memory_data.memory_level
         )
-        
+
         # Handle brain_type - can be BrainType enum or string
         brain_type_value = (
             memory_data.brain_type.value 
@@ -311,13 +322,17 @@ class MemoryService:
             else memory_data.brain_type
         ) if memory_data.brain_type else 'user'
         
-        # Handle category - can be string or enum
-        category_value = (
-            memory_data.category.value 
-            if hasattr(memory_data.category, 'value') 
-            else memory_data.category
+        # Handle category - can be string or enum. Normalised against the
+        # canonical taxonomy so a legacy value ("schedule", "projects") coming
+        # from an older client or a stale prompt lands on a category the app
+        # can actually label, instead of silently rendering as "Other".
+        category_value = normalize_category(
+            memory_data.category.value
+            if hasattr(memory_data.category, 'value')
+            else memory_data.category,
+            brain_type=brain_type_value,
         )
-        
+
         # Handle memory_type - can be MemoryType enum or string
         memory_type_value = (
             memory_data.memory_type.value 
@@ -350,6 +365,10 @@ class MemoryService:
             tags_json=json.dumps(memory_data.tags) if memory_data.tags else None,
             metadata_json=json.dumps(memory_data.metadata) if memory_data.metadata else None,
             source_message_id=source_message_id,
+            # NULL unless the extractor flagged this memory transient — see
+            # app.memory_taxonomy.resolve_ttl_days, which refuses to expire
+            # durable-fact categories even on a mislabel.
+            expires_at=getattr(memory_data, "expires_at", None),
             source_type=memory_data.source_type or ("conversation" if source_message_id else "manual"),
             # Memory Evolution fields
             canonical_content=memory_data.content,  # Initially same as content
@@ -393,24 +412,56 @@ class MemoryService:
         
         return memory
     
+    async def _relationship_was_forgotten(
+        self,
+        user_id: str,
+        relationship_content: str,
+    ) -> bool:
+        """True if this exact relationship memory was soft-deleted by the user.
+
+        Deletion is soft and there is no restore route, so re-creating a
+        forgotten memory is effectively irreversible from the user's side.
+        Exact content match is deliberate: relationship memories are generated
+        from a fixed template, so the same edge always produces the same string.
+        """
+        result = await self.db.execute(
+            select(Memory.id).where(
+                and_(
+                    Memory.user_id == user_id,
+                    Memory.brain_type == "user",
+                    Memory.source_type == "entity_extraction",
+                    Memory.content == relationship_content,
+                    Memory.is_deleted == True,
+                )
+            ).limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
     async def _find_similar_memory(
         self,
         user_id: str,
         embedding: List[float],
-        threshold: float = 0.9
+        threshold: float = 0.9,
+        brain_type: Optional[str] = None,
     ) -> Optional[Memory]:
         """
         Find an existing memory that is very similar to the new one.
         Uses pgvector for fast similarity search.
-        
+
         Args:
             user_id: User ID
             embedding: Embedding of the new memory content
             threshold: Minimum similarity to consider as duplicate
-            
+            brain_type: Scope the search to one brain. REQUIRED in practice —
+                without it a new agent-brain memory can match a semantically
+                similar user-brain row and reinforce that instead of being
+                stored, silently keeping the agent brain empty.
+
         Returns:
             The most similar existing memory if above threshold, else None
         """
+        brain_filter = [Memory.brain_type == brain_type] if brain_type else []
+
         # Use pgvector if the Memory model has a native embedding column
         if hasattr(Memory, 'embedding') and Memory.embedding is not None:
             try:
@@ -426,6 +477,7 @@ class MemoryService:
                             Memory.user_id == user_id,
                             Memory.is_deleted == False,
                             Memory.embedding.isnot(None),
+                            *brain_filter,
                         )
                     )
                     .order_by(Memory.embedding.cosine_distance(embedding_vec))
@@ -444,12 +496,13 @@ class MemoryService:
             select(Memory).where(
                 and_(
                     Memory.user_id == user_id,
-                    Memory.is_deleted == False
+                    Memory.is_deleted == False,
+                    *brain_filter,
                 )
             )
         )
         memories = result.scalars().all()
-        
+
         best_match = None
         best_similarity = threshold
         
@@ -484,18 +537,36 @@ class MemoryService:
         """
         # Increase strength (capped at 1.0)
         memory.strength = min(1.0, memory.strength + 0.1)
-        
-        # Update importance if the new one is higher
-        if new_data.importance > memory.importance:
-            memory.importance = new_data.importance
-        
+
+        # Importance moves TOWARD the new observation rather than only ever
+        # climbing. See the matching note in
+        # MemoryDedupService._reinforce_existing_memory: the old max() rule
+        # combined with consolidation_count inflation made frequently-restated
+        # throwaways the most decay-resistant rows in the brain.
+        _old_importance = memory.importance if memory.importance is not None else 0.5
+        memory.importance = round(
+            min(1.0, max(0.0, 0.7 * _old_importance + 0.3 * new_data.importance)), 4
+        )
+
         # Update confidence if the new one is higher
         if new_data.confidence > memory.confidence:
             memory.confidence = new_data.confidence
-        
-        # Track reinforcement
+
+        # Expiry lease on a restatement — mirrors
+        # MemoryDedupService._reinforce_existing_memory: a restatement with no
+        # horizon promotes the memory to permanent; one with a later horizon
+        # extends it.
+        if memory.expires_at is not None:
+            _new_expiry = getattr(new_data, "expires_at", None)
+            if _new_expiry is None:
+                memory.expires_at = None
+            elif _new_expiry > memory.expires_at:
+                memory.expires_at = _new_expiry
+
+        # Track reinforcement. consolidation_count is NOT incremented here —
+        # it is read by DecayService as a stability multiplier and must mean
+        # "actually consolidated", not "mentioned again".
         memory.last_reinforced_at = datetime.utcnow()
-        memory.consolidation_count += 1
         memory.access_count += 1
         memory.updated_at = datetime.utcnow()
         
@@ -571,8 +642,15 @@ class MemoryService:
         if hasattr(memory, 'embedding'):
             memory.embedding = new_embedding  # Native pgvector
         memory.updated_at = datetime.utcnow()
+        # A merge IS a real consolidation (two memories became one), so unlike
+        # the reinforce path this increment is legitimate — DecayService reads
+        # it as genuine stability.
         memory.consolidation_count += 1
-        
+        # Drop any stale summary. `summary` was write-once: merge rewrote
+        # content while leaving summary untouched, and the card renders summary
+        # first — so a merged memory kept displaying its pre-merge text forever.
+        memory.summary = None
+
         # Log UPDATED event
         await self._log_memory_event(
             memory_id=memory.id,
@@ -1326,11 +1404,22 @@ class MemoryService:
         user_id: str,
         content: str,
         limit: int = 5,
-        min_similarity: float = 0.7
+        min_similarity: float = 0.7,
+        brain_type: Optional[str] = None,
     ) -> List[Tuple[Memory, float]]:
-        """Find memories similar to given content. Uses pgvector when available."""
+        """Find memories similar to given content. Uses pgvector when available.
+
+        `brain_type` scopes the search to one brain. It matters: this method
+        backs `create_memory`'s dedup check, and without the filter a new
+        agent-brain memory ("the user corrected me about X") could match and
+        silently reinforce a semantically similar USER-brain row instead of
+        being stored — which is one reason the agent brain never accumulated
+        anything. Callers that genuinely want a cross-brain search pass None.
+        """
         embedding = self.embedding_service.embed(content, api_key=self.api_key)
-        
+
+        brain_filter = [Memory.brain_type == brain_type] if brain_type else []
+
         # Try pgvector-accelerated search
         if hasattr(Memory, 'embedding') and Memory.embedding is not None:
             try:
@@ -1346,6 +1435,7 @@ class MemoryService:
                             Memory.user_id == user_id,
                             Memory.is_deleted == False,
                             Memory.embedding.isnot(None),
+                            *brain_filter,
                         )
                     )
                     .order_by(Memory.embedding.cosine_distance(embedding_vec))
@@ -1353,7 +1443,7 @@ class MemoryService:
                 )
                 result = await self.db.execute(query)
                 rows = result.all()
-                
+
                 similar = []
                 for memory, similarity in rows:
                     if similarity >= min_similarity:
@@ -1361,13 +1451,14 @@ class MemoryService:
                 return similar
             except Exception:
                 pass  # Fall through to Python-side search
-        
+
         # Fallback: Python-side cosine similarity
         result = await self.db.execute(
             select(Memory).where(
                 and_(
                     Memory.user_id == user_id,
-                    Memory.is_deleted == False
+                    Memory.is_deleted == False,
+                    *brain_filter,
                 )
             )
         )
@@ -1447,8 +1538,18 @@ class MemoryService:
             content=relationship_content,
             limit=1,
             min_similarity=0.85,
+            brain_type="user",
         )
-        
+
+        # A relationship the user has explicitly forgotten must stay forgotten.
+        # find_similar_memories excludes soft-deleted rows, so without this
+        # check the next mention of the same edge would resurrect it as a
+        # brand-new memory — and there is no restore route to undo that.
+        if not existing and await self._relationship_was_forgotten(
+            user_id, relationship_content
+        ):
+            return
+
         if existing:
             mem, _ = existing[0]
             mem.access_count += 1
@@ -1462,9 +1563,17 @@ class MemoryService:
                 id=str(uuid.uuid4()),
                 user_id=user_id,
                 content=relationship_content,
-                summary=f"{source_name} → {relationship} → {target_name}",
+                # summary was `f"{source} → {rel} → {target}"`. The mobile card
+                # renders `summary || content`, so that machine format was what
+                # users actually saw ("Bunker → performed_by → Baltazar") even
+                # though the readable sentence sat on the same row. The triple
+                # is still fully preserved, structured, in metadata_json below.
+                summary=None,
                 brain_type="user",
-                category="people" if source_type == "person" else "knowledge",
+                # was: "people" if source_type == "person" else "knowledge" —
+                # a hardcoded binary that produced two of the three categories
+                # ever seen in production.
+                category=category_for_relationship(source_type, target_type),
                 memory_type="fact",
                 memory_level="episodic",
                 embedding_json=json.dumps(embedding),
