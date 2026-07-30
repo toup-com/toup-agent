@@ -9,6 +9,7 @@ This service handles memory strength decay based on cognitive science principles
 """
 
 import json
+import logging
 import math
 import uuid
 from datetime import datetime, timedelta
@@ -17,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_
 
 from app.db.models import Memory, MemoryEvent, MemoryEventType
+
+logger = logging.getLogger(__name__)
 
 
 class DecayService:

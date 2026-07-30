@@ -21,7 +21,11 @@ from app.schemas import (
     MemoryCreate, MemoryUpdate, MemoryResponse, MemoryWithScore,
     MemorySearchRequest, MemoryCategory, MemoryType, MemoryLevel, BrainType
 )
-from app.memory_taxonomy import category_for_relationship, normalize_category
+from app.memory_taxonomy import (
+    category_for_relationship,
+    humanize_relationship,
+    normalize_category,
+)
 from app.services.embedding_service import get_embedding_service
 
 
@@ -415,22 +419,32 @@ class MemoryService:
     async def _relationship_was_forgotten(
         self,
         user_id: str,
-        relationship_content: str,
+        *relationship_contents: str,
     ) -> bool:
-        """True if this exact relationship memory was soft-deleted by the user.
+        """True if this relationship memory was soft-deleted by the user.
 
         Deletion is soft and there is no restore route, so re-creating a
         forgotten memory is effectively irreversible from the user's side.
         Exact content match is deliberate: relationship memories are generated
         from a fixed template, so the same edge always produces the same string.
+
+        Takes SEVERAL candidate strings because that template changed. Rows
+        written before `humanize_relationship` carry the raw predicate form
+        ("Better Call Saul play on Netflix"); rows written after carry prose
+        ("Better Call Saul is available on Netflix"). Matching only the current
+        form would silently resurrect every relationship a user forgot before
+        the change — the exact irreversibility this guard exists to prevent.
         """
+        candidates = [c for c in relationship_contents if c]
+        if not candidates:
+            return False
         result = await self.db.execute(
             select(Memory.id).where(
                 and_(
                     Memory.user_id == user_id,
                     Memory.brain_type == "user",
                     Memory.source_type == "entity_extraction",
-                    Memory.content == relationship_content,
+                    Memory.content.in_(candidates),
                     Memory.is_deleted == True,
                 )
             ).limit(1)
@@ -1523,7 +1537,9 @@ class MemoryService:
                 source_entity_id=source_entity.id,
                 target_entity_id=target_entity.id,
                 relationship_type=relationship,
-                relationship_label=f"{source_name} {relationship.replace('_', ' ')} {target_name}",
+                relationship_label=humanize_relationship(
+                    source_name, relationship, target_name
+                ),
                 confidence=confidence,
                 mention_count=1,
                 first_seen_at=datetime.utcnow(),
@@ -1532,7 +1548,18 @@ class MemoryService:
             self.db.add(new_rel)
         
         # Also maintain backward-compatible relationship memory for vector search
-        relationship_content = f"{source_name} {relationship.replace('_', ' ')} {target_name}"
+        #
+        # `content` is what the user READS on the Memory screen (the card shows
+        # content, and summary is None for these rows) and what gets embedded.
+        # It used to be `predicate.replace("_", " ")` spliced between the two
+        # entity names, which is grammatical only by accident — `performed_by`
+        # reads fine, `play_on` produced "Better Call Saul play on Netflix".
+        # The triple itself is untouched: it stays structured in metadata_json
+        # below and in the entity_relationships edge.
+        relationship_content = humanize_relationship(
+            source_name, relationship, target_name
+        )
+        legacy_content = f"{source_name} {relationship.replace('_', ' ')} {target_name}"
         existing = await self.find_similar_memories(
             user_id=user_id,
             content=relationship_content,
@@ -1545,8 +1572,9 @@ class MemoryService:
         # find_similar_memories excludes soft-deleted rows, so without this
         # check the next mention of the same edge would resurrect it as a
         # brand-new memory — and there is no restore route to undo that.
+        # Both phrasings are checked: see _relationship_was_forgotten.
         if not existing and await self._relationship_was_forgotten(
-            user_id, relationship_content
+            user_id, relationship_content, legacy_content
         ):
             return
 

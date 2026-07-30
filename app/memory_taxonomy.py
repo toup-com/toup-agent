@@ -468,6 +468,134 @@ def describes_recurring_arrangement(content: Optional[str]) -> bool:
     return bool(content and _RECURRING.search(content))
 
 
+# ── Relationship phrasing ─────────────────────────────────────────────
+#
+# Knowledge-graph edges are stored as (source, predicate, target) triples and
+# the triple is preserved verbatim in metadata_json. What a PERSON reads must
+# be a sentence.
+#
+# The predicate is invented by the LLM per extraction, so the vocabulary is
+# unbounded and inconsistent — one live tenant carried 40 distinct predicates
+# including connects_to/connected_to, chats_with/has_chat_with/chatted_with,
+# sends_to/sent_to and scheduled_in_timezone/scheduled_in_time_zone. Rendering
+# `predicate.replace("_", " ")` is only accidentally grammatical: `performed_by`
+# reads fine, `play_on` produces "Better Call Saul play on Netflix".
+#
+# So: normalise the predicate to a canonical key, then render from a template.
+# Unknown predicates fall back to a repaired verb phrase rather than raw text.
+
+_PREDICATE_ALIASES: Dict[str, str] = {
+    "connected_to": "connects_to",
+    "connects_to": "connects_to",
+    "chatted_with": "chats_with",
+    "has_chat_with": "chats_with",
+    "chats_with": "chats_with",
+    "sent_to": "sends_to",
+    "sends_to": "sends_to",
+    "is_recipient_of": "receives",
+    "receives_daily": "receives",
+    "receives": "receives",
+    "fetches_messages_from": "fetches_from",
+    "fetches_from": "fetches_from",
+    "are_from": "is_from",
+    "is_from": "is_from",
+    "scheduled_in_time_zone": "scheduled_in_timezone",
+    "scheduled_in_timezone": "scheduled_in_timezone",
+    "avoids_repeating_quotes_from": "avoid_repeating_quotes_from",
+    "avoid_repeating_quotes_from": "avoid_repeating_quotes_from",
+    "play_on": "available_on",
+    "available_on": "available_on",
+    "owner_of": "owns",
+    "owns": "owns",
+    "reconnect_using": "reconnects_using",
+    "reconnects_using": "reconnects_using",
+    "summarizes_new_messages_from": "summarizes",
+    "summarizes": "summarizes",
+}
+
+# "{s}" = source, "{t}" = target.
+_PREDICATE_TEMPLATES: Dict[str, str] = {
+    "available_on": "{s} is available on {t}",
+    "located_in": "{s} is in {t}",
+    "happens_in": "{s} takes place in {t}",
+    "is_included_in": "{s} is included in {t}",
+    "is_about": "{s} is about {t}",
+    "is_from": "{s} comes from {t}",
+    "owns": "{s} owns {t}",
+    "develops": "{s} develops {t}",
+    "created": "{s} created {t}",
+    "created_content_about": "{s} created content about {t}",
+    "works_on": "{s} works on {t}",
+    "researches": "{s} is researching {t}",
+    "reviews": "{s} reviews {t}",
+    "uses": "{s} uses {t}",
+    "can_use": "{s} can use {t}",
+    "has_account_on": "{s} has an account on {t}",
+    "affiliated_with": "{s} is affiliated with {t}",
+    "connects_to": "{s} is connected to {t}",
+    "reconnects_using": "{s} reconnects to {t}",
+    "chats_with": "{s} chats with {t}",
+    "sends_to": "{s} sends {t}",
+    "receives": "{s} receives {t}",
+    "fetches_from": "{s} fetches messages from {t}",
+    "summarizes": "{s} summarises {t}",
+    "performed_by": "{t} performs {s}",
+    "is_agent_of": "{s} is {t}'s assistant",
+    "scheduled_in_timezone": "{s} is scheduled in {t}",
+    "should_be_sent_via": "{s} should be sent via {t}",
+    "should_not_be_sent_via": "{s} should not be sent via {t}",
+    "avoid_repeating_quotes_from": "{s} should not repeat quotes from {t}",
+    "has_attraction_toward": "{s} is attracted to {t}",
+    "has_childhood_connection_with": "{s} knew {t} in childhood",
+    "is_drawn_to": "{s} is drawn to {t}",
+    "has_to_call": "{s} needs to call {t}",
+    "reconnects": "{s} reconnects to {t}",
+}
+
+# Predicates already in third-person singular ("develops", "owns") need no
+# repair; bare stems ("play", "connect") read as imperatives after a subject.
+_THIRD_PERSON = re.compile(r"(?:s|ed|ing)$", re.IGNORECASE)
+
+
+def humanize_relationship(
+    source_name: str,
+    relationship: str,
+    target_name: str,
+) -> str:
+    """Render a knowledge-graph edge as a sentence a person can read.
+
+    The triple itself is never lost — callers keep it in `metadata_json`. This
+    governs only what a human sees on the Memory screen and what gets embedded
+    for search, both of which are better served by prose than by predicate-ese.
+    """
+    source = (source_name or "").strip()
+    target = (target_name or "").strip()
+    raw = (relationship or "").strip()
+    if not raw:
+        return f"{source} — {target}".strip(" —")
+
+    key = raw.lower().replace(" ", "_")
+    key = _PREDICATE_ALIASES.get(key, key)
+
+    template = _PREDICATE_TEMPLATES.get(key)
+    if template:
+        return template.format(s=source, t=target).strip()
+
+    # Unknown predicate. Repair the verb so the result is at least a sentence:
+    # a bare stem gets "-s", anything already inflected is left alone.
+    words = key.split("_")
+    head = words[0]
+    if head and not _THIRD_PERSON.search(head):
+        if head.endswith(("s", "x", "z", "ch", "sh")):
+            head += "es"
+        elif head.endswith("y") and len(head) > 1 and head[-2] not in "aeiou":
+            head = head[:-1] + "ies"
+        else:
+            head += "s"
+    phrase = " ".join([head] + words[1:])
+    return f"{source} {phrase} {target}".strip()
+
+
 def resolve_ttl_days(
     category: str,
     explicit_days: Optional[float] = None,

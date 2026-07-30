@@ -143,11 +143,30 @@ async def store_active_task(
 async def decay_expired_tasks(db: AsyncSession, user_id: str) -> int:
     """Archive active_task memories that haven't been reinforced within TTL.
 
+    Two rules guard this, because it is the ONLY archiver that acts on
+    `category` alone and it predates `expires_at`:
+
+    1. A standing arrangement is never a task. "Send me a Gmail briefing every
+       day at 11:49" is phrased like a schedule but is a durable preference the
+       user still relies on. It has no last_reinforced_at of its own — the
+       ROUTINE fires, not the memory — so the age rule below would archive it
+       on the first turn after 7 days.
+    2. When `expires_at` is set it is authoritative. `expire_stale_memories`
+       owns that lease, `_reinforce_memory` and the Keep button renew or clear
+       it, and archiving ahead of it would silently overrule all three.
+
+    Both matter because the taxonomy migration remapped the legacy `schedule`
+    category onto `active_task`. Before that remap those rows were invisible to
+    this function; after it they are in scope, so the exemption the migration
+    applied to `expires_at` has to be honoured here too or it means nothing.
+
     Returns count of archived tasks.
     """
     from app.db.models.memory import Memory
+    from app.memory_taxonomy import describes_recurring_arrangement
 
-    cutoff = datetime.utcnow() - timedelta(days=ACTIVE_TASK_TTL_DAYS)
+    now = datetime.utcnow()
+    cutoff = now - timedelta(days=ACTIVE_TASK_TTL_DAYS)
 
     result = await db.execute(
         select(Memory).where(
@@ -163,13 +182,23 @@ async def decay_expired_tasks(db: AsyncSession, user_id: str) -> int:
 
     archived = 0
     for task in tasks:
-        # Use last_reinforced_at if available, otherwise created_at
-        last_active = task.last_reinforced_at or task.created_at
-        if last_active and last_active < cutoff:
-            task.is_active = False
-            task.strength = 0.0
-            archived += 1
-            logger.info("[active_task] Archived (TTL expired): %s", task.content[:60])
+        if describes_recurring_arrangement(task.content):
+            continue
+
+        if task.expires_at is not None:
+            # The lease decides. Only archive once it has actually run out.
+            if task.expires_at > now:
+                continue
+        else:
+            # No lease: fall back to the original age rule.
+            last_active = task.last_reinforced_at or task.created_at
+            if not (last_active and last_active < cutoff):
+                continue
+
+        task.is_active = False
+        task.strength = 0.0
+        archived += 1
+        logger.info("[active_task] Archived (TTL expired): %s", task.content[:60])
 
     if archived:
         await db.flush()

@@ -551,25 +551,182 @@ def test_agent_runner_normalizes_classifier_categories_defensively():
     assert "normalize_category(c) for c in _raw_categories" in src
 
 
+# ── 5b. Relationship rows read as sentences, not predicate-ese ────────
+
+def test_relationship_rendering_never_leaks_a_raw_predicate():
+    """"never show raw `play_on` predicates to a user" — the founder's brief.
+
+    #375 removed the arrow form from `summary`, but `content` — which is what
+    the card actually renders now that summary is None — was still
+    `predicate.replace("_", " ")` spliced between two entity names. That is
+    grammatical only by accident: `performed_by` reads fine, `play_on` gave
+    "Better Call Saul play on Netflix". These are real predicates from a live
+    tenant (40 distinct ones on toup-agent-871bac24 alone).
+    """
+    from app.memory_taxonomy import humanize_relationship
+
+    assert (
+        humanize_relationship("Better Call Saul", "play_on", "Netflix")
+        == "Better Call Saul is available on Netflix"
+    )
+    assert (
+        humanize_relationship("Bunker", "performed_by", "Baltazar")
+        == "Baltazar performs Bunker"
+    )
+    assert (
+        humanize_relationship("Shops at Don Mills", "located_in", "Toronto")
+        == "Shops at Don Mills is in Toronto"
+    )
+    # Aliases collapse the vocabulary drift the extractor produces.
+    assert humanize_relationship("Nariman", "owner_of", "Toup") == \
+        humanize_relationship("Nariman", "owns", "Toup")
+    assert humanize_relationship("User", "connected_to", "Gmail") == \
+        humanize_relationship("User", "connects_to", "Gmail")
+
+    # An unknown predicate must still produce a sentence, not a bare stem.
+    assert humanize_relationship("User", "frobnicate", "Widget") == \
+        "User frobnicates Widget"
+    assert humanize_relationship("User", "carry", "Bag") == "User carries Bag"
+    # Already-inflected verbs are left alone rather than double-suffixed.
+    assert humanize_relationship("User", "watches", "Netflix") == \
+        "User watches Netflix"
+
+
+def test_forgotten_relationships_stay_forgotten_across_the_phrasing_change():
+    """The soft-delete guard matches content EXACTLY, and the template moved.
+
+    Rows forgotten before humanize_relationship carry the raw predicate form.
+    If the guard only checked the new prose form, every one of them would be
+    resurrected on the next mention — and there is no restore route, so the
+    user cannot undo it a second time.
+    """
+    import inspect
+
+    from app.services.memory_service import MemoryService
+
+    src = inspect.getsource(MemoryService.store_entity_relationship)
+    assert "legacy_content" in src, (
+        "the pre-humanize phrasing is no longer checked against soft-deletes"
+    )
+    guard = inspect.getsource(MemoryService._relationship_was_forgotten)
+    assert "in_(candidates)" in guard
+
+
 # ── 5c. Expiry leases respect explicit user intent ────────────────────
 
-def test_user_keep_clears_the_expiry_lease():
+async def test_user_keep_clears_the_expiry_lease():
     """Tapping Keep must actually save the memory.
 
     Reinforcement moved strength and last_reinforced_at but never expires_at,
     so a memory the user explicitly kept was still archived by the sweep —
     and there is no restore route.
-    """
-    import inspect
 
+    This test EXECUTES the path. The previous version only asserted the source
+    text contained the right lines, which is why it stayed green while the
+    branch raised `NameError: logger` on every real Keep: decay_service.py
+    called logger.info() in a module that never imported logging. A source
+    assertion cannot catch an undefined name — only running the code can.
+    """
+    from app.db.models.memory import Memory
     from app.services.decay_service import DecayService
 
-    src = inspect.getsource(DecayService.reinforce_memory)
-    assert 'access_context == "user_reinforce"' in src
-    assert "memory.expires_at = None" in src
-    # Must run BEFORE the 1-hour cooldown early-return, or Keep silently
-    # no-ops for a recently-reinforced memory.
-    assert src.index("memory.expires_at = None") < src.index("Cooldown")
+    engine, Session = await _memory_session()
+    try:
+        async with Session() as db:
+            mem = Memory(
+                id="keep-1",
+                user_id="u-keep",
+                content="The user wants a daily Gmail briefing at 11:49.",
+                category="active_task",
+                brain_type="user",
+                memory_type="fact",
+                memory_level="episodic",
+                importance=0.6,
+                confidence=0.8,
+                strength=1.0,
+                # Recently reinforced ON PURPOSE: Keep must win over the
+                # 1-hour cooldown early-return, not be skipped by it.
+                last_reinforced_at=datetime.utcnow() - timedelta(minutes=5),
+                expires_at=datetime.utcnow() + timedelta(days=3),
+            )
+            db.add(mem)
+            await db.flush()
+
+            svc = DecayService(db)
+            returned = await svc.reinforce_memory(
+                "keep-1", "u-keep", access_context="user_reinforce"
+            )
+
+            assert returned is not None, "Keep could not load the memory"
+            assert mem.expires_at is None, (
+                "Keep must clear the expiry lease; the memory is still on a "
+                "countdown and the sweep will archive it anyway."
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_recurring_arrangements_survive_the_active_task_archiver():
+    """decay_expired_tasks archives on category alone — it must not eat routines.
+
+    The taxonomy migration remapped legacy `schedule` onto `active_task` and
+    deliberately left recurring arrangements without an expires_at. That
+    exemption is worthless unless THIS archiver honours it too: a standing
+    "daily Gmail briefing" has no reinforcement of its own (the routine fires,
+    not the memory), so the plain age rule archived four of the founder's real
+    routines on the day of the rollout.
+    """
+    from app.db.models.memory import Memory
+    from app.services.active_task_service import decay_expired_tasks
+
+    old = datetime.utcnow() - timedelta(days=30)
+    engine, Session = await _memory_session()
+    try:
+        async with Session() as db:
+            recurring = Memory(
+                id="rec-1", user_id="u-rec",
+                content="The user wants a daily email routine at 1:43 PM to "
+                        "summarize the last five Gmail messages.",
+                category="active_task", brain_type="user", memory_type="fact",
+                memory_level="episodic", importance=0.6, confidence=0.8,
+                strength=1.0, created_at=old, last_reinforced_at=old,
+                expires_at=None,
+            )
+            one_off = Memory(
+                id="task-1", user_id="u-rec",
+                content="The user asked to be reminded to call their brother.",
+                category="active_task", brain_type="user", memory_type="fact",
+                memory_level="episodic", importance=0.4, confidence=0.8,
+                strength=1.0, created_at=old, last_reinforced_at=old,
+                expires_at=None,
+            )
+            leased = Memory(
+                id="task-2", user_id="u-rec",
+                content="The user is comparing project-management tools.",
+                category="active_task", brain_type="user", memory_type="fact",
+                memory_level="episodic", importance=0.4, confidence=0.8,
+                strength=1.0, created_at=old, last_reinforced_at=old,
+                # Old enough for the age rule, but the lease has NOT run out.
+                expires_at=datetime.utcnow() + timedelta(days=2),
+            )
+            db.add_all([recurring, one_off, leased])
+            await db.flush()
+
+            archived = await decay_expired_tasks(db, "u-rec")
+
+            assert recurring.is_active is True, (
+                "a standing daily routine was archived by the active-task TTL"
+            )
+            assert leased.is_active is True, (
+                "expires_at is authoritative; archiving ahead of it overrules "
+                "the sweep, the reinforce path and the Keep button"
+            )
+            assert one_off.is_active is False, (
+                "a genuinely stale one-off task should still be archived"
+            )
+            assert archived == 1
+    finally:
+        await engine.dispose()
 
 
 def test_durable_restatement_promotes_a_transient_memory():
@@ -635,3 +792,154 @@ def test_write_routes_proxy_to_the_tenant():
     ):
         src = inspect.getsource(fn)
         assert "_proxy_memories_write" in src, f"{fn.__name__} does not proxy writes"
+
+
+# ── 7. D-mem-B: MCP memory writes must reach the tenant ───────────────
+
+def test_mcp_memory_writes_proxy_to_the_tenant():
+    """D-mem-B (2026-07-29 remediation tracker).
+
+    `memory_update` on an id the agent had just been handed returned
+    "Memory not found". Root cause: the MCP tools run on the PLATFORM and were
+    bound to the platform session, but `memories` is AGENT_ONLY — the row is
+    real, it is simply in the tenant's database. #375 fixed this class for the
+    REST routes and missed this surface.
+
+    Parsed from source: importing mcp_server needs fastmcp, which is not
+    installed in every environment.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path("app/mcp_server.py").read_text()
+    tree = ast.parse(src)
+
+    names = {
+        n.name: n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+    }
+    assert "_proxy_memory_write_to_tenant" in names
+
+    # memory_create was missing from this loop, and so was the proxy: the
+    # agent's own memory_create tool wrote tenant-private content into the
+    # SHARED platform DB, where its owner can never read it back. Worse after
+    # #377 — update and delete proxy to a tenant that has no such row, so the
+    # stranded row is also un-editable and un-deletable.
+    for tool in ("memory_create", "memory_update", "memory_delete"):
+        body = ast.unparse(names[tool])
+        assert "_proxy_memory_write_to_tenant" in body, (
+            f"{tool} does not route to the tenant — it will 404 on every real id"
+        )
+        # The tenant must be consulted BEFORE the local session, or the
+        # platform's empty table answers first and we are back to the bug.
+        assert body.index("_proxy_memory_write_to_tenant") < body.index(
+            "MemoryService(db)"
+        ), f"{tool} consults the platform session before the tenant"
+
+    # memory_list is a READ, so it may fall back to the platform session — but
+    # it has to ASK the tenant first. Listing the platform DB does not error,
+    # it returns an empty list, so an agent checking what it already knows
+    # about someone is told "nothing" while their memories sit in the tenant.
+    assert "_proxy_memory_list_from_tenant" in names
+    list_body = ast.unparse(names["memory_list"])
+    assert "_proxy_memory_list_from_tenant" in list_body, (
+        "memory_list reads the platform DB and will report zero memories"
+    )
+    assert list_body.index("_proxy_memory_list_from_tenant") < list_body.index(
+        "MemoryService(db)"
+    ), "memory_list consults the platform session before the tenant"
+
+
+def test_remaining_mcp_tools_on_agent_only_tables_are_known():
+    """Guard rail: this surface is not fully proxied yet, and that is tracked.
+
+    memory_create/update/delete/list now route to the tenant. The rest of the
+    MCP tools still run against the platform session while their tables are
+    AGENT_ONLY — `entities`, `entity_relationships`, `conversations`. Fixing
+    those needs agent-side REST routes that do not exist yet (there is no
+    app/api/entities.py to proxy to), so it is a separate change.
+
+    This test fails if that set GROWS or SHRINKS, so the gap cannot quietly
+    widen and cannot be silently forgotten once the routes land.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path("app/mcp_server.py").read_text()
+    tree = ast.parse(src)
+
+    unproxied = set()
+    for n in ast.walk(tree):
+        if not isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        if not any("mcp.tool" in ast.unparse(d) for d in n.decorator_list):
+            continue
+        body = ast.unparse(n)
+        if "async_session_maker()" in body and "_from_tenant" not in body \
+                and "_to_tenant" not in body:
+            unproxied.add(n.name)
+
+    assert unproxied == {
+        "memory_search",          # has a builtin in tool_executor; never hits MCP
+        "session_create", "session_list",
+        "entity_search", "graph_traverse", "entity_relationship_create",
+        "identity_get", "identity_update",
+    }, f"the unproxied MCP surface changed: {sorted(unproxied)}"
+
+
+# ── 8. Corrective backfill (scripts/repair_memory_regressions.py) ──────
+
+def test_dead_reminder_regex_matches_the_extractor_s_actual_phrasing():
+    """The repair script's sub-hour detector must match REAL content.
+
+    A prefix-only pattern ("in N minutes") looks right and catches nothing:
+    the extractor overwhelmingly writes the SUFFIX form ("... 2 minutes after
+    the request"). Every string below is verbatim from a live tenant.
+    """
+    import importlib
+
+    mod = importlib.import_module("scripts.repair_memory_regressions")
+    rx = mod._SUBHOUR_HORIZON
+
+    dead = [
+        "The user wants to be reminded to eat tea 2 minutes after the request.",
+        "The user wants to be reminded two minutes after the request to call "
+        "their brother.",
+        "The user asked to be reminded here in chat in 2 minutes to drink "
+        "water, rather than through Telegram",
+        "The user requested a reminder to wake up two minutes later.",
+    ]
+    durable = [
+        "The user is researching UofT future-student events",
+        "The user wants a daily Gmail briefing every day at 10:58 AM "
+        "America/Toronto time",
+        "The user wants a recurring daily 2:27 PM briefing with their latest "
+        "5 Gmail messages",
+        "The user wants to be reminded on 2026-05-21 when they wake up to "
+        "work on the mobile app",
+    ]
+    for c in dead:
+        assert rx.search(c), f"dead reminder not detected: {c!r}"
+    for c in durable:
+        assert not rx.search(c), f"durable memory wrongly flagged: {c!r}"
+
+
+def test_repair_never_resurrects_a_user_archived_row():
+    """Restoring routines must not undo a deliberate user action.
+
+    Re-activating a row the user archived by hand is the same
+    irreversibility trap as re-creating a memory they forgot.
+    """
+    import inspect
+    import importlib
+
+    mod = importlib.import_module("scripts.repair_memory_regressions")
+    src = inspect.getsource(mod.restore_archived_routines)
+    assert "_touched_by_automation" in src
+    guard = inspect.getsource(mod._touched_by_automation)
+    assert 'startswith("user")' in guard
+    # And the whole script must be dry-run-capable with no default mutation.
+    main_src = inspect.getsource(mod.main)
+    assert "required=True" in main_src, "apply must never be the default"
+    assert "await session.rollback()" in main_src

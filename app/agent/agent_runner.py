@@ -69,6 +69,13 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 2
 RETRY_DELAY = 2.0  # seconds
 
+# How many agent-brain notes ("you corrected me about X") may ride a single
+# turn when the query was category-classified and the main retrieval could not
+# surface them. Deliberately much smaller than memory_retrieval_limit: this is
+# behavioural guidance, not recall, and it must not crowd out the user's own
+# memories or inflate the per-turn payload outside the cached prefix.
+AGENT_BRAIN_RETRIEVAL_LIMIT = 3
+
 # Idempotent, read-only tools that are safe to execute concurrently when the
 # model emits several in one assistant turn. Everything NOT in this set —
 # stateful browser_* sessions, mutating tools, and any unknown/new tool —
@@ -3351,6 +3358,29 @@ class AgentRunner:
                 agent_brain_memories = [
                     m for m in memories if m.get("brain_type") == "agent"
                 ]
+
+                # ...but only when the query was NOT category-classified.
+                # `categories` is ANDed onto every strategy inside
+                # hybrid_search, and AgentCategory is disjoint from the user
+                # categories the classifier emits (they overlap only on
+                # `preferences`). So on a classified query the search above
+                # can never return an agent row, and the guidance the user
+                # gave by correcting us was silently dropped on exactly the
+                # turns where it is most specific. Second bounded leg, same
+                # JIT contract, capped small so it cannot displace the user's
+                # own memories or grow the turn payload.
+                if search_categories and not agent_brain_memories:
+                    try:
+                        agent_brain_memories = await mem_svc.hybrid_search(
+                            user_id=user_id, query=user_message,
+                            limit=AGENT_BRAIN_RETRIEVAL_LIMIT,
+                            min_similarity=settings.memory_retrieval_min_similarity,
+                            strategies=search_strategies,
+                            brain_types=["agent"],
+                        )
+                    except Exception as e:
+                        logger.warning(f"Agent-brain retrieval failed: {e}")
+                        agent_brain_memories = []
                 self._last_retrieved_memories = user_memories
                 self._memory_health["retrieved"] = len(user_memories)
                 logger.info(

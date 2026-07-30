@@ -17,6 +17,7 @@ from app.schemas import (
     MemoryEventResponse, MemoryEventsResponse
 )
 from app.api.auth import get_current_user
+from app.memory_taxonomy import normalize_category
 from app.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -321,15 +322,37 @@ async def search_memories_get(
 
     from app.schemas import MemorySearchRequest, BrainType
     
-    # Parse categories if provided
+    # Parse categories if provided.
+    # Normalize first, and drop anything still unrecognised. A bare
+    # `MemoryCategory(c)` raises ValueError -> 500 on any retired value, and
+    # retired values are exactly what old clients send: the web Brain page's
+    # filter bar still enumerates the pre-unification names. A stale filter
+    # should degrade, not crash the search.
     category_list = None
     if categories:
-        category_list = [MemoryCategory(c.strip()) for c in categories.split(",") if c.strip()]
-    
+        category_list = []
+        for raw in categories.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                category_list.append(MemoryCategory(normalize_category(raw)))
+            except ValueError:
+                logger.info(
+                    "[memories] ignoring unrecognised category filter %r", raw
+                )
+        category_list = category_list or None
+
     # Parse brain_type if provided
     brain_type_enum = None
     if brain_type:
-        brain_type_enum = BrainType(brain_type)
+        try:
+            brain_type_enum = BrainType(brain_type)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unknown brain_type {brain_type!r}.",
+            )
     
     # Build search request
     request = MemorySearchRequest(

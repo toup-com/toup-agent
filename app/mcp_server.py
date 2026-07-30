@@ -10,12 +10,15 @@ for authentication. Each tool operates on the authenticated user's data.
 Mounted at /api/mcp in platform_main.py via FastMCP's integration.
 """
 
+import logging
 from typing import Optional
 from fastmcp import FastMCP
 
 from app.config import settings
 from app.db.database import async_session_maker
 from app.services.memory_service import MemoryService
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "Toup Platform",
@@ -28,6 +31,84 @@ mcp = FastMCP(
 
 
 # ── Helper: resolve user_id from context ──────────────────────────────
+
+# Sentinel: "this user has no tenant agent, use the local session".
+# Distinguished from None, which means "the tenant answered, nothing found".
+_NO_TENANT = object()
+
+
+async def _proxy_memory_write_to_tenant(
+    db,
+    user_id: str,
+    memory_id: str,
+    method: str,
+    body: Optional[dict] = None,
+):
+    """Route an MCP memory write to the tenant agent that owns the row.
+
+    D-mem-B (2026-07-29): `memories` is an AGENT_ONLY table. It exists in each
+    tenant container's own Postgres, NOT in the platform DB this MCP server is
+    bound to. So `memory_update` on an id the agent had just been handed
+    returned "Memory not found" — the row is real, it is simply in another
+    database. #375 fixed this for the REST routes in `app/api/memories.py` but
+    missed this MCP surface.
+
+    Returns `_NO_TENANT` when the user has no active agent (caller falls back
+    to the local session), None when the tenant reports 404, else the decoded
+    body. Never raises: an MCP tool must return a structured error, not a 500.
+    """
+    from app.api.memories import _get_agent_proxy_info, _proxy_memories_write
+
+    try:
+        proxy = await _get_agent_proxy_info(user_id, db)
+    except Exception:
+        return _NO_TENANT
+    if not proxy:
+        return _NO_TENANT
+
+    try:
+        return await _proxy_memories_write(
+            proxy[0], proxy[1], memory_id, method, body=body
+        )
+    except Exception as e:
+        # _proxy_memories_write raises HTTPException(404) when the tenant does
+        # not have the row, and 502 when it is unreachable. Both collapse to
+        # "not found" for the tool's caller, which is the honest answer.
+        if getattr(e, "status_code", None) == 404:
+            return None
+        logger.warning(
+            "[mcp] memory write proxy %s %s failed: %s", method, memory_id, e
+        )
+        return None
+
+
+async def _proxy_memory_list_from_tenant(
+    db,
+    user_id: str,
+    params: Optional[dict] = None,
+):
+    """Read a memory list from the tenant agent that actually holds the rows.
+
+    Read counterpart to `_proxy_memory_write_to_tenant`. Returns None when
+    there is no tenant agent or the tenant is unreachable — for a READ that is
+    an acceptable fall-back to the platform session, which is the deliberate
+    asymmetry documented on `_proxy_memories`. Never raises.
+    """
+    from app.api.memories import _get_agent_proxy_info, _proxy_memories
+
+    try:
+        proxy = await _get_agent_proxy_info(user_id, db)
+    except Exception:
+        return None
+    if not proxy:
+        return None
+
+    try:
+        return await _proxy_memories(proxy[0], proxy[1], "", params=params or {})
+    except Exception as e:
+        logger.warning("[mcp] memory list proxy failed: %s", e)
+        return None
+
 
 def _get_user_id() -> str:
     """Resolve the MCP request's user_id.
@@ -175,12 +256,60 @@ async def memory_create(
 
     user_id = _get_user_id()
 
-    # Upsert path: when ref_kind+ref_id are set, look up the existing
-    # memory and UPDATE it. This is the Ticket 2 fix: routines + triggers
-    # that change schedule update their canonical memory instead of
-    # producing N stale rows.
-    if ref_kind and ref_id:
-        async with async_session_maker() as db:
+    memory_data = MemoryCreate(
+        content=content,
+        category=category,
+        brain_type=brain_type,
+        memory_type=memory_type,
+        memory_level=memory_level,
+        importance=importance,
+        tags=tags or [],
+        metadata=metadata or {},
+    )
+
+    async with async_session_maker() as db:
+        # The tenant decides FIRST — before any query against this session.
+        #
+        # Same reason as memory_update/memory_delete below: `memories` is an
+        # AGENT_ONLY table living in the tenant's own Postgres, not in the
+        # platform DB this MCP server is bound to. #377 proxied update and
+        # delete but left create writing locally, which is worse than a plain
+        # bug: the row lands in the shared platform DB (exactly what
+        # AGENT_ONLY_TABLES exists to prevent), the owner never sees it —
+        # tenant hybrid_search and the Memory screen read the tenant DB — and
+        # once update/delete proxy, it can no longer be edited or removed.
+        #
+        # The ref_kind/ref_id upsert below stays on the no-tenant branch on
+        # purpose. It queries `memories` directly, so against a tenant-having
+        # user it would be interrogating the wrong database — the lookup that
+        # is supposed to PREVENT duplicate rows would miss every time and
+        # create them instead. MemoryCreate carries no ref_kind/ref_id (the
+        # REST surface never had them), so the tenant cannot be asked to do
+        # the upsert either without a schema change and a fleet rollout;
+        # until then a tenant-backed create falls back to the semantic dedup
+        # inside MemoryService.create_memory, which this tool's own docstring
+        # already describes as the weaker path.
+        proxied = await _proxy_memory_write_to_tenant(
+            db, user_id, "", "POST",
+            body=memory_data.model_dump(mode="json", exclude_none=True),
+        )
+        if proxied is not _NO_TENANT:
+            if proxied is None:
+                # Unreachable tenant. Do NOT fall through to the local session:
+                # reporting success against a database the agent never reads is
+                # how a user comes to believe something was saved when it was
+                # not. Reads may fall back; writes must not.
+                return {"error": "Could not reach your agent to save this memory."}
+            if ref_kind and ref_id:
+                proxied = {**proxied, "ref_kind": ref_kind, "ref_id": ref_id}
+            return {**proxied, "action": "created"}
+
+        # ── no tenant agent: legacy platform-local path ──────────────
+        # Upsert path: when ref_kind+ref_id are set, look up the existing
+        # memory and UPDATE it. This is the Ticket 2 fix: routines + triggers
+        # that change schedule update their canonical memory instead of
+        # producing N stale rows.
+        if ref_kind and ref_id:
             existing = (await db.execute(
                 _select(_Memory).where(
                     _Memory.user_id == user_id,
@@ -209,18 +338,6 @@ async def memory_create(
                         "action": "updated",
                     }
 
-    memory_data = MemoryCreate(
-        content=content,
-        category=category,
-        brain_type=brain_type,
-        memory_type=memory_type,
-        memory_level=memory_level,
-        importance=importance,
-        tags=tags or [],
-        metadata=metadata or {},
-    )
-
-    async with async_session_maker() as db:
         svc = MemoryService(db)
         memory = await svc.create_memory(user_id, memory_data)
         # Stamp ref linkage if provided. Service-level path doesn't know
@@ -268,6 +385,21 @@ async def memory_update(
         update_data.tags = tags
 
     async with async_session_maker() as db:
+        # D-mem-B: `memories` is AGENT_ONLY — it lives in the tenant
+        # container's DB, not in the platform's. Running this against the
+        # platform session returned "Memory not found" for every id the agent
+        # had just been handed, because the row genuinely is not here. Same
+        # class as the REST write routes fixed in #375; this MCP surface was
+        # missed. Route to the tenant, exactly as api/memories.py does.
+        proxied = await _proxy_memory_write_to_tenant(
+            db, user_id, memory_id, "PATCH",
+            body=update_data.model_dump(mode="json", exclude_none=True),
+        )
+        if proxied is not _NO_TENANT:
+            if proxied is None:
+                return {"error": "Memory not found", "id": memory_id}
+            return {**proxied, "updated": True}
+
         svc = MemoryService(db)
         memory = await svc.update_memory(memory_id, user_id, update_data)
         if not memory:
@@ -286,6 +418,13 @@ async def memory_delete(memory_id: str) -> dict:
     """Delete a memory by ID (soft delete)."""
     user_id = _get_user_id()
     async with async_session_maker() as db:
+        # See memory_update: the row lives in the tenant DB, not here.
+        proxied = await _proxy_memory_write_to_tenant(
+            db, user_id, memory_id, "DELETE"
+        )
+        if proxied is not _NO_TENANT:
+            return {"id": memory_id, "deleted": True}
+
         svc = MemoryService(db)
         deleted = await svc.delete_memory(memory_id, user_id)
         return {"id": memory_id, "deleted": deleted}
@@ -304,6 +443,40 @@ async def memory_list(
     """
     user_id = _get_user_id()
     async with async_session_maker() as db:
+        # Ask the tenant first — `memories` is AGENT_ONLY, so listing against
+        # the platform session queries the wrong database. It does not error;
+        # it returns an EMPTY list, so an agent asking "what do I already know
+        # about this person?" concludes "nothing" while their real memories sit
+        # in the tenant DB. Unlike the write paths this MAY fall back (worst
+        # case is an empty list either way) — but it has to try first.
+        proxied = await _proxy_memory_list_from_tenant(
+            db, user_id,
+            params={
+                k: v for k, v in {
+                    "limit": min(limit, 100),
+                    "brain_type": brain_type,
+                    "category": category,
+                    "min_importance": min_importance,
+                }.items() if v is not None
+            },
+        )
+        if isinstance(proxied, dict) and isinstance(proxied.get("memories"), list):
+            rows = proxied["memories"]
+            return {
+                "memories": [
+                    {
+                        "id": str(m.get("id")),
+                        "content": m.get("content"),
+                        "summary": m.get("summary"),
+                        "category": m.get("category"),
+                        "importance": float(m.get("importance") or 0.0),
+                        "created_at": m.get("created_at"),
+                    }
+                    for m in rows
+                ],
+                "total": proxied.get("total", len(rows)),
+            }
+
         svc = MemoryService(db)
         memories, total = await svc.list_memories(
             user_id,
