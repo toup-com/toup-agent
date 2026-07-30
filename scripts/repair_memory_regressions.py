@@ -79,10 +79,17 @@ from app.db.models import Memory, MemoryEvent  # noqa: E402
 from app.memory_taxonomy import (  # noqa: E402
     _PREDICATE_ALIASES,
     _PREDICATE_TEMPLATES,
+    AUTHORITATIVE_TYPE_PREDICATES,
+    CATEGORY_BEARING_PREDICATES,
+    ENTITY_TYPE_TO_CATEGORY,
     category_for_relationship,
     describes_recurring_arrangement,
+    entity_type_hints,
     humanize_relationship,
 )
+
+# Mirrors memory_service._VAGUE_ENTITY_TYPES — "we could not place this".
+_VAGUE_ENTITY_TYPES = frozenset({"unknown", "topic", "note", "conversation", ""})
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("repair_memory_regressions")
@@ -346,7 +353,7 @@ async def recategorize_relationship_rows(
 
     stats = {
         "scanned": 0, "recategorized": 0, "unchanged": 0,
-        "entity_type_unknown": 0,
+        "entity_type_unknown": 0, "uncurated_predicate_skipped": 0,
     }
 
     ents = (await session.execute(select(Entity))).scalars().all()
@@ -378,6 +385,34 @@ async def recategorize_relationship_rows(
             stats["entity_type_unknown"] += 1
             continue
 
+        # ONLY predicates in _PREDICATE_ENTITY_HINTS may drive a bulk rewrite.
+        #
+        # Entity types cannot tell you what a SENTENCE is about, and correcting
+        # the types (the `retype` step) does not change that. With types fixed,
+        # the clean cases came out right — "Better Call Saul is available on
+        # Netflix" -> media, "Drake artist of 0-100" -> media, "Shops at Don
+        # Mills is in Toronto" -> locations, "User owns Toup" -> work. But rows
+        # whose subject is not either endpoint still came out wrong:
+        #
+        #   "Majid Tajik and Sarah Rostami are people in <chat>"  person/tool
+        #       -> possessions. A memory explicitly ABOUT people, losing People.
+        #   "When handling Gmail, including during the daily briefing, ..."
+        #       tool/tool -> possessions. That is an instruction; `interaction`.
+        #   "Church's Texas Chicken offers a chicken wrap"  organization/topic
+        #       -> work. That is a food preference.
+        #
+        # A curated predicate is a statement about a relation whose category is
+        # a property OF that relation ("is available on", "is in", "performed"),
+        # which is exactly the set where the types are sufficient. Everything
+        # else keeps the category it has.
+        pkey = (predicate_raw := str(meta.get("relationship_type")
+                                     or meta.get("relationship") or "")).strip()
+        pkey = pkey.lower().replace(" ", "_")
+        pkey = _PREDICATE_ALIASES.get(pkey, pkey)
+        if pkey not in CATEGORY_BEARING_PREDICATES:
+            stats["uncurated_predicate_skipped"] += 1
+            continue
+
         want = category_for_relationship(st, tt)
         if want == mem.category:
             stats["unchanged"] += 1
@@ -398,7 +433,90 @@ async def recategorize_relationship_rows(
     return stats
 
 
+async def retype_vague_entities(
+    session: AsyncSession, apply: bool
+) -> Dict[str, int]:
+    """Upgrade entities stuck on a vague type, using their own edges as evidence.
+
+    This is the prerequisite for `recategorize`. Entity types decide the
+    category of every relationship memory they take part in, and the extraction
+    prompt used to offer only 8 of the 20 types with NO media types at all — so
+    "Better Call Saul" could only be typed `topic` and a song `project`. On top
+    of that, `_upsert_entity` only replaced a type when the stored one was
+    literally "unknown", which made the first bad guess permanent.
+
+    No guessing here: the predicate is evidence the extractor already produced.
+    `performed_by` means its source is a work and its target a performer;
+    `available_on` means its source is something you watch. Only entities
+    currently carrying a vague type are touched, so a concrete type is never
+    overwritten.
+    """
+    from app.db.models import Entity, EntityRelationship
+
+    stats = {
+        "edges": 0, "retyped": 0, "already_specific": 0, "no_hint": 0,
+        "corrected_specific": 0,
+    }
+
+    ents = {
+        e.id: e for e in
+        (await session.execute(select(Entity))).scalars().all()
+    }
+    edges = (await session.execute(select(EntityRelationship))).scalars().all()
+
+    for edge in edges:
+        stats["edges"] += 1
+        predicate = edge.relationship_type or ""
+        src_hint, tgt_hint = entity_type_hints(predicate)
+        if src_hint is None and tgt_hint is None:
+            stats["no_hint"] += 1
+            continue
+
+        key = predicate.strip().lower().replace(" ", "_")
+        key = _PREDICATE_ALIASES.get(key, key)
+        authoritative = key in AUTHORITATIVE_TYPE_PREDICATES
+
+        for ent_id, hint in (
+            (edge.source_entity_id, src_hint),
+            (edge.target_entity_id, tgt_hint),
+        ):
+            ent = ents.get(ent_id)
+            if ent is None or hint is None:
+                continue
+            current = (ent.entity_type or "").strip().lower()
+            if current == hint:
+                continue
+
+            vague = current in _VAGUE_ENTITY_TYPES
+            if not vague:
+                # Only a predicate that DEFINES the type may correct a specific
+                # one, and only when the category actually moves. "Bunker" typed
+                # `project` is a song filed under Work; `Gmail` typed `tool`
+                # against a `software` hint is the same Possessions either way,
+                # so rewriting it is churn.
+                same_category = (
+                    ENTITY_TYPE_TO_CATEGORY.get(current)
+                    is ENTITY_TYPE_TO_CATEGORY.get(hint)
+                )
+                if not authoritative or same_category:
+                    stats["already_specific"] += 1
+                    continue
+                stats["corrected_specific"] += 1
+
+            logger.info(
+                "  %-8s -> %-12s %s  (via %s%s)",
+                current or "''", hint, (ent.name or "")[:34], predicate,
+                "" if vague else ", authoritative",
+            )
+            if apply:
+                ent.entity_type = hint
+            stats["retyped"] += 1
+
+    return stats
+
+
 STEPS = {
+    "retype": ("retype vague entities from their edges", retype_vague_entities),
     "restore": ("restore wrongly-archived routines", restore_archived_routines),
     "humanize": ("humanize legacy relationship content", humanize_relationship_rows),
     "reminders": ("re-anchor dead reminder leases", rearchive_dead_reminders),
@@ -427,7 +545,7 @@ STEPS = {
 # same person/project pair produces both "User owns Toup" and "Drake artist of
 # 0-100". Fixing entity typing is the prerequisite, and that is separate work.
 # Reachable deliberately with `--only recategorize` once it lands.
-DEFAULT_STEPS = ("restore", "humanize", "reminders")
+DEFAULT_STEPS = ("retype", "restore", "humanize", "reminders")
 
 
 async def main() -> int:

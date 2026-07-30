@@ -15,8 +15,10 @@ from app.config import settings
 from app.schemas import MemoryCategory, MemoryType
 from app.memory_taxonomy import (
     build_category_prompt_block,
+    build_entity_type_prompt_block,
     describes_recurring_arrangement,
     normalize_category,
+    normalize_entity_type,
     normalize_memory_type,
     resolve_ttl_days,
 )
@@ -204,12 +206,30 @@ class MemoryExtractor:
     }
     
     # Entity type keywords
+    # Keys MUST be canonical entity types (see ENTITY_TYPE_TO_CATEGORY) — a
+    # guess is written straight to Entity.entity_type, and an invalid one is
+    # not rejected, it silently resolves to Knowledge in
+    # category_for_relationship. `date` was such a key: not a type at all.
+    # Media keywords were absent entirely, which is the regex-path half of why
+    # shows and songs never got a media type.
     ENTITY_KEYWORDS = {
-        "person": ["he", "she", "they", "friend", "colleague", "boss", "family"],
-        "place": ["city", "country", "location", "address", "where", "at"],
-        "organization": ["company", "corporation", "organization", "team", "group"],
-        "project": ["project", "app", "system", "product", "service"],
-        "date": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january", "february"],
+        "person": ["he", "she", "they", "friend", "colleague", "boss", "family",
+                   "brother", "sister", "wife", "husband", "partner", "manager"],
+        "place": ["city", "country", "location", "address", "where", "at",
+                  "restaurant", "cafe", "office", "mall", "store"],
+        "organization": ["company", "corporation", "organization", "team", "group",
+                         "startup", "employer", "client"],
+        "project": ["project", "system", "product", "launch", "roadmap"],
+        "software": ["app", "website", "platform", "service", "api", "dashboard"],
+        "tool": ["tool", "library", "framework", "device", "cli"],
+        "show": ["series", "season", "episode", "tv show", "sitcom"],
+        "movie": ["movie", "film"],
+        "music": ["song", "album", "track", "playlist", "artist", "band"],
+        "book": ["book", "novel", "author", "chapter"],
+        "event": ["monday", "tuesday", "wednesday", "thursday", "friday",
+                  "saturday", "sunday", "january", "february", "meeting",
+                  "appointment", "birthday", "deadline"],
+        "skill": ["learning", "studying", "practising", "practicing", "course"],
     }
     
     def extract_memories(
@@ -872,9 +892,17 @@ If the conversation is just casual chat, commands, or questions with nothing wor
           "properties": {{"role": "engineer", "since": "2023"}}}}]
         """
         from app.services.llm_service import get_llm_service
-        
+
         llm = get_llm_service()
-        
+
+        # GENERATED from ENTITY_TYPE_TO_CATEGORY, not hand-listed. The previous
+        # hardcoded list held 8 of the 20 types and no media types at all, so a
+        # TV show could only be typed `topic` and a song `project` — which is
+        # how category_for_relationship came to file "Better Call Saul is
+        # available on Netflix" under Knowledge and "Drake artist of 0-100"
+        # under Work.
+        entity_type_block = build_entity_type_prompt_block()
+
         prompt = f"""Analyze this conversation and extract ALL entity-to-entity relationships mentioned by the user.
 
 USER MESSAGE:
@@ -907,7 +935,10 @@ own world. You are mapping THIS USER's world, not the world in general.
 
 ## Rules:
 - Only extract relationships explicitly stated by the USER
-- Each entity must have a name and type (person, organization, place, project, technology, event, topic, tool)
+- Each entity must have a name and a type from this list, grouped by what it
+  says about the user. Pick the MOST SPECIFIC type that fits — `topic` is the
+  fallback for things that are genuinely just subjects, not a default:
+  {entity_type_block}
 - The relationship label should be a short verb phrase in snake_case
 - Include any additional properties about the relationship (e.g. since, role, context)
 - Confidence: 0.9+ for explicit statements, 0.6-0.8 for strong implications

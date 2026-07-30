@@ -23,7 +23,7 @@ SQLAlchemy model.
 
 import re
 from enum import Enum
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 
 class BrainType(str, Enum):
@@ -399,6 +399,256 @@ ENTITY_TYPE_TO_CATEGORY: Dict[str, MemoryCategory] = {
     "note": MemoryCategory.OTHER,
     "conversation": MemoryCategory.OTHER,
 }
+
+# Entity types the extractor may emit. THIS MAP IS THE VOCABULARY — the prompt
+# is generated from it by build_entity_type_prompt_block().
+#
+# It used to be a hardcoded list in the prompt ("person, organization, place,
+# project, technology, event, topic, tool") holding 8 of these 20, with no media
+# types at all. So "Better Call Saul" could only be typed `topic` and a song
+# could only be `project`, which is why category_for_relationship filed a TV
+# show under Knowledge and a song under Work. Same drift that put six copies of
+# the category taxonomy in the tree: a prompt carrying its own divergent copy of
+# an enum.
+ENTITY_TYPES: Tuple[str, ...] = tuple(sorted(ENTITY_TYPE_TO_CATEGORY))
+
+# Synonyms the LLM reaches for anyway. Folding them is strictly better than
+# letting them fall through to `topic` (-> Knowledge), which is where every
+# unrecognised type silently ends up.
+ENTITY_TYPE_ALIASES: Dict[str, str] = {
+    # media
+    "song": "music",
+    "track": "music",
+    "album": "music",
+    "artist": "person",
+    "band": "music",
+    "tv show": "show",
+    "tv_show": "show",
+    "tv series": "show",
+    "series": "show",
+    "episode": "show",
+    "film": "movie",
+    "podcast": "media",
+    "video": "media",
+    "game": "media",
+    "article": "media",
+    # tools / software
+    "technology": "tool",
+    "app": "software",
+    "application": "software",
+    "website": "software",
+    "platform": "software",
+    "service": "software",
+    "api": "software",
+    "library": "software",
+    "framework": "tool",
+    "device": "tool",
+    "product": "tool",
+    # work. `company` is deliberately absent: it is already a canonical type in
+    # ENTITY_TYPE_TO_CATEGORY (also -> WORK), and aliasing a real type is how a
+    # vocabulary grows two names for one thing. _assert_entity_vocabulary_sane
+    # rejects it.
+    "employer": "organization",
+    "team": "organization",
+    "client": "organization",
+    "job": "organization",
+    "role": "skill",
+    # people / places
+    "human": "person",
+    "contact": "person",
+    "family": "person",
+    "friend": "person",
+    "colleague": "person",
+    "city": "place",
+    "country": "place",
+    "venue": "place",
+    "address": "place",
+    "restaurant": "place",
+    "store": "place",
+    "shop": "place",
+    # time-ish things the old keyword table emitted as a bare "date", which is
+    # not a valid type at all — it fell through to Knowledge every time.
+    "date": "event",
+    "meeting": "event",
+    "appointment": "event",
+    "trip": "event",
+    # misc
+    "concept": "topic",
+    "subject": "topic",
+    "idea": "topic",
+    "document": "file",
+    "goal": "topic",
+}
+
+
+def _assert_entity_vocabulary_sane() -> None:
+    """An alias pointing at a non-type would silently degrade to Knowledge."""
+    bad = sorted(
+        f"{k} -> {v}" for k, v in ENTITY_TYPE_ALIASES.items()
+        if v not in ENTITY_TYPE_TO_CATEGORY
+    )
+    if bad:
+        raise RuntimeError(
+            f"memory_taxonomy: ENTITY_TYPE_ALIASES point at unknown types: {bad}"
+        )
+    shadowed = sorted(set(ENTITY_TYPE_ALIASES) & set(ENTITY_TYPE_TO_CATEGORY))
+    if shadowed:
+        raise RuntimeError(
+            f"memory_taxonomy: entity aliases shadow real types: {shadowed}"
+        )
+
+
+_assert_entity_vocabulary_sane()
+
+
+def normalize_entity_type(value: Optional[str]) -> str:
+    """Fold an extractor-supplied entity type onto the canonical vocabulary.
+
+    Returns "topic" for anything unrecognised — the same Knowledge-bucket
+    behaviour as before, but now reached deliberately rather than by accident.
+    """
+    raw = (value or "").strip().lower().replace("-", " ")
+    if not raw:
+        return "topic"
+    if raw in ENTITY_TYPE_TO_CATEGORY:
+        return raw
+    alias = ENTITY_TYPE_ALIASES.get(raw) or ENTITY_TYPE_ALIASES.get(
+        raw.replace(" ", "_")
+    )
+    if alias:
+        return alias
+    # Trailing plural is common ("movies", "tools").
+    if raw.endswith("s"):
+        singular = raw[:-1]
+        if singular in ENTITY_TYPE_TO_CATEGORY:
+            return singular
+        alias = ENTITY_TYPE_ALIASES.get(singular)
+        if alias:
+            return alias
+    return "topic"
+
+
+# What a predicate proves about the entities on each end, as
+# (source_type, target_type). Either side may be None when the predicate says
+# nothing about it.
+#
+# Only for REPAIRING entities that currently carry a vague type — the predicate
+# is evidence the extractor already produced, so this adds no guessing. Every
+# entry below is derived from a predicate observed on a live tenant; do not
+# speculate here, because a wrong hint rewrites real rows.
+_PREDICATE_ENTITY_HINTS: Dict[str, Tuple[Optional[str], Optional[str]]] = {
+    # "Bunker performed by Baltazar" — a work and its performer.
+    "performed_by": ("music", "person"),
+    # "Arash performed Dooset Daram" — the SAME relation with the ends swapped.
+    # Both forms occur on one tenant, so both need an entry; folding them onto
+    # each other would invert the pair.
+    "performed": ("person", "music"),
+    # "Drake artist of 0-100"
+    "artist_of": ("person", "music"),
+    "sings": ("person", "music"),
+    "composed": ("person", "music"),
+    # "Better Call Saul play on Netflix" / "available on"
+    "available_on": ("show", "organization"),
+    "airs_on": ("show", "organization"),
+    "streams_on": ("show", "organization"),
+    # "Shops at Don Mills located in Toronto"
+    "located_in": ("place", "place"),
+    "happens_in": ("event", "place"),
+    # "user uses Gmail"
+    "has_account_on": ("person", "software"),
+    "chats_with": ("person", "person"),
+    "reconnects_using": ("software", None),
+    "fetches_from": ("software", "software"),
+}
+
+
+# Predicates whose MEANING fixes the type of their subject, so they may correct
+# a confidently-wrong stored type rather than only filling in a vague one.
+#
+# Narrow on purpose. "X performed_by Y" cannot be true unless X is a work — the
+# extractor typed both "Bunker" and "0-100" as `project` (-> Work) when they are
+# songs, and a vague-only rule cannot reach a wrong-but-specific type. Contrast
+# `reconnect_using`, which is NOT here: it says Gmail is involved, not what
+# Gmail is, and `tool` vs `software` both resolve to Possessions anyway.
+AUTHORITATIVE_TYPE_PREDICATES: Set[str] = {
+    "performed_by",
+    "performed",
+    "artist_of",
+    "sings",
+    "composed",
+    "available_on",
+    "airs_on",
+    "streams_on",
+}
+
+# Predicates whose relation DETERMINES the category of the memory describing it,
+# so a bulk recategorisation may act on them.
+#
+# Deliberately a subset of _PREDICATE_ENTITY_HINTS, because those are answers to
+# a different question. `reconnects_using` and `fetches_from` prove Gmail is
+# software — useful for typing — but they do not make the memory ABOUT a
+# possession: "When handling Gmail, including during the daily briefing, say so
+# when there are no new messages" is an instruction, and recategorising it to
+# `possessions` on the strength of its endpoints was wrong.
+#
+# What is left is the set where the category is a property of the relation
+# itself: something performed is media, something located somewhere is a place.
+CATEGORY_BEARING_PREDICATES: Set[str] = {
+    "performed_by",
+    "performed",
+    "artist_of",
+    "sings",
+    "composed",
+    "available_on",
+    "airs_on",
+    "streams_on",
+    "located_in",
+    "happens_in",
+    # Ownership and work are about the THING, not the person holding it — which
+    # is the whole of Symptom 2: "User owns Toup" filed under People. These two
+    # are category-bearing without being type-bearing (owning something proves
+    # nothing about what it is), so they are deliberately NOT in
+    # _PREDICATE_ENTITY_HINTS.
+    "owns",
+    "works_on",
+}
+
+
+def _assert_predicate_hints_sane() -> None:
+    """A hint naming a non-type would rewrite entities into the Knowledge bucket."""
+    bad = sorted(
+        f"{k} -> {t}" for k, pair in _PREDICATE_ENTITY_HINTS.items()
+        for t in pair if t is not None and t not in ENTITY_TYPE_TO_CATEGORY
+    )
+    if bad:
+        raise RuntimeError(
+            f"memory_taxonomy: _PREDICATE_ENTITY_HINTS name unknown types: {bad}"
+        )
+
+
+_assert_predicate_hints_sane()
+
+
+def entity_type_hints(
+    relationship: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """What this predicate proves about its two ends, after alias folding."""
+    key = (relationship or "").strip().lower().replace(" ", "_")
+    key = _PREDICATE_ALIASES.get(key, key)
+    return _PREDICATE_ENTITY_HINTS.get(key, (None, None))
+
+
+def build_entity_type_prompt_block() -> str:
+    """The type list for the extraction prompt, grouped so the LLM can see the
+    media types exist at all — the old hardcoded list omitted every one."""
+    by_category: Dict[str, List[str]] = {}
+    for etype in ENTITY_TYPES:
+        cat = ENTITY_TYPE_TO_CATEGORY[etype].value
+        by_category.setdefault(cat, []).append(etype)
+    return "; ".join(
+        f"{cat}: {', '.join(sorted(types))}"
+        for cat, types in sorted(by_category.items())
+    )
 
 # A relationship's category should say what the edge is ABOUT.
 #

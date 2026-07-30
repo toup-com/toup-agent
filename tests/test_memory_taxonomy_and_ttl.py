@@ -1049,9 +1049,17 @@ def test_recategorize_is_not_in_the_default_repair_run():
 
     assert "recategorize" in mod.STEPS, "keep it reachable via --only"
     assert "recategorize" not in mod.DEFAULT_STEPS, (
-        "recategorize must not run by default — entity typing is the blocker"
+        "recategorize stays opt-in: it rewrites the category of every "
+        "relationship row, so it should be run deliberately after `retype` and "
+        "after reading the dry-run, not as a side effect of a routine repair"
     )
-    assert set(mod.DEFAULT_STEPS) == {"restore", "humanize", "reminders"}
+    assert set(mod.DEFAULT_STEPS) == {
+        "retype", "restore", "humanize", "reminders",
+    }
+    # `retype` supplies the evidence `recategorize` reads, so it must come
+    # first in a default run — recategorising against stale types is exactly
+    # what made the first attempt degrade 8 rows.
+    assert mod.DEFAULT_STEPS.index("retype") == 0
 
 
 # ── 9. Category breakdown (the filter bar's data source) ───────────────
@@ -1099,3 +1107,103 @@ def test_breakdown_normalizes_legacy_categories_before_counting():
     assert "Memory.is_active == True" in src
     # And it must reach the tenant: `memories` is AGENT_ONLY.
     assert "_proxy_memories" in src
+
+
+# ── 10. Entity typing (the prerequisite for correct categories) ────────
+
+def test_entity_type_vocabulary_is_generated_not_hand_listed():
+    """The prompt's type list must come from ENTITY_TYPE_TO_CATEGORY.
+
+    It was a hardcoded prose list holding 8 of the 20 types with NO media types
+    at all, so a TV show could only be typed `topic` and a song `project` —
+    which is how category_for_relationship filed "Better Call Saul is available
+    on Netflix" under Knowledge and "Drake artist of 0-100" under Work. Exactly
+    the drift that put six copies of the CATEGORY taxonomy in the tree.
+    """
+    import pathlib
+
+    from app.memory_taxonomy import (
+        ENTITY_TYPE_TO_CATEGORY, build_entity_type_prompt_block,
+    )
+
+    block = build_entity_type_prompt_block()
+    for etype in ENTITY_TYPE_TO_CATEGORY:
+        assert etype in block, f"{etype} absent from the generated prompt block"
+    for media in ("show", "movie", "music", "book"):
+        assert media in block, f"{media} missing — shows/songs mistype again"
+
+    src = pathlib.Path("app/services/memory_extractor.py").read_text()
+    assert "{entity_type_block}" in src, "prompt no longer interpolates the block"
+    assert "person, organization, place, project, technology, event, topic, tool" \
+        not in src, "the hardcoded 8-type list is back"
+
+
+def test_entity_keyword_keys_are_all_canonical_types():
+    """A non-type key is written straight to Entity.entity_type.
+
+    `date` was such a key. It is not in ENTITY_TYPE_TO_CATEGORY, so
+    category_for_relationship silently resolved it to Knowledge — no error, just
+    a wrong category forever.
+    """
+    from app.memory_taxonomy import ENTITY_TYPE_TO_CATEGORY
+    from app.services.memory_extractor import MemoryExtractor
+
+    bad = sorted(
+        k for k in MemoryExtractor.ENTITY_KEYWORDS
+        if k not in ENTITY_TYPE_TO_CATEGORY
+    )
+    assert not bad, f"ENTITY_KEYWORDS keys are not canonical entity types: {bad}"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("song", "music"), ("album", "music"), ("artist", "person"),
+        ("tv show", "show"), ("series", "show"), ("film", "movie"),
+        ("technology", "tool"), ("app", "software"), ("city", "place"),
+        ("date", "event"),          # was emitted as a bare non-type
+        ("movies", "movie"),        # trailing plural
+        ("Show", "show"),           # case
+        ("wharrgarbl", "topic"), (None, "topic"), ("", "topic"),
+    ],
+)
+def test_normalize_entity_type(raw, expected):
+    from app.memory_taxonomy import normalize_entity_type
+
+    assert normalize_entity_type(raw) == expected
+
+
+def test_vague_entity_types_can_be_upgraded_but_specific_ones_cannot():
+    """`topic` must be as replaceable as `unknown`.
+
+    _upsert_entity only replaced a type when the stored one was literally
+    "unknown", so "Better Call Saul" typed `topic` on first mention stayed
+    `topic` forever — the first guess won permanently.
+    """
+    import inspect
+
+    from app.services.memory_service import MemoryService, _VAGUE_ENTITY_TYPES
+
+    assert "topic" in _VAGUE_ENTITY_TYPES
+    assert "unknown" in _VAGUE_ENTITY_TYPES
+    assert "show" not in _VAGUE_ENTITY_TYPES
+    assert "person" not in _VAGUE_ENTITY_TYPES
+
+    src = inspect.getsource(MemoryService._upsert_entity)
+    assert "normalize_entity_type(entity_type)" in src, (
+        "an unfolded synonym reaches the DB and files the row under Knowledge"
+    )
+    assert "_VAGUE_ENTITY_TYPES" in src
+
+
+def test_predicate_hints_only_claim_what_the_predicate_proves():
+    from app.memory_taxonomy import entity_type_hints
+
+    assert entity_type_hints("performed_by") == ("music", "person")
+    assert entity_type_hints("artist_of") == ("person", "music")
+    # play_on folds onto available_on before the lookup.
+    assert entity_type_hints("play_on") == ("show", "organization")
+    assert entity_type_hints("located_in") == ("place", "place")
+    # An unknown predicate must claim NOTHING rather than guess.
+    assert entity_type_hints("frobnicate") == (None, None)
+    assert entity_type_hints("") == (None, None)

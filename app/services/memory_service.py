@@ -25,7 +25,12 @@ from app.memory_taxonomy import (
     category_for_relationship,
     humanize_relationship,
     normalize_category,
+    normalize_entity_type,
 )
+
+# Types that mean "we could not place this". An entity carrying one of these is
+# a candidate for upgrade the moment a concrete type shows up.
+_VAGUE_ENTITY_TYPES = frozenset({"unknown", "topic", "note", "conversation", ""})
 from app.services.embedding_service import get_embedding_service
 
 
@@ -1649,10 +1654,16 @@ class MemoryService:
         attributes: Optional[Dict[str, Any]] = None,
     ) -> Entity:
         """Find or create an entity by name and type.
-        
+
         Phase 4: Now accepts schema_type (e.g. 'PersonEntity') and
         structured attributes dict to deep-merge into attributes_json.
         """
+        # The type decides the CATEGORY of every relationship memory this entity
+        # takes part in (see category_for_relationship), so an unfolded synonym
+        # is not cosmetic — "song" or "tv show" would fall through to `topic`
+        # and file the row under Knowledge.
+        entity_type = normalize_entity_type(entity_type)
+
         result = await self.db.execute(
             select(Entity).where(
                 and_(
@@ -1662,12 +1673,21 @@ class MemoryService:
             )
         )
         entity = result.scalar_one_or_none()
-        
+
         if entity:
             entity.mention_count += 1
             entity.last_seen_at = datetime.utcnow()
-            # Update type if we have a more specific one
-            if entity_type != "unknown" and entity.entity_type == "unknown":
+            # Upgrade to a more specific type when one arrives.
+            #
+            # This used to require the stored type to be literally "unknown",
+            # which made a mistyped entity permanent: "Better Call Saul" typed
+            # `topic` on first mention stayed `topic` forever, even once the
+            # extractor learned to say `show`. `topic` is the vocabulary's
+            # fallback — "we could not place this" — so it has to be as
+            # replaceable as "unknown", or the first guess wins for good.
+            if entity_type not in _VAGUE_ENTITY_TYPES and (
+                entity.entity_type in _VAGUE_ENTITY_TYPES or not entity.entity_type
+            ):
                 entity.entity_type = entity_type
             # Update schema_type if provided and not set yet
             if schema_type and not entity.schema_type:
