@@ -321,12 +321,16 @@ def test_relationship_category_is_not_a_hardcoded_binary():
 @pytest.mark.parametrize(
     "source_type,target_type,expected",
     [
-        ("person", "organization", "people"),
+        # These three CHANGED. The original table asserted PEOPLE-wins, which
+        # is the behaviour the founder reported as a bug ("User -> owns -> Toup
+        # categorized People"). See
+        # test_relationship_category_describes_the_object_not_the_person.
+        ("person", "organization", "work"),   # was "people"
+        ("show", "organization", "media"),    # was "work"
+        ("book", "person", "media"),          # was "people"
         ("person", "person", "people"),
         ("project", "tool", "work"),
-        ("show", "organization", "work"),
         ("topic", "topic", "knowledge"),
-        ("book", "person", "people"),
         (None, None, "knowledge"),
     ],
 )
@@ -925,21 +929,126 @@ def test_dead_reminder_regex_matches_the_extractor_s_actual_phrasing():
         assert not rx.search(c), f"durable memory wrongly flagged: {c!r}"
 
 
-def test_repair_never_resurrects_a_user_archived_row():
+def test_repair_never_resurrects_a_forgotten_or_superseded_row():
     """Restoring routines must not undo a deliberate user action.
 
-    Re-activating a row the user archived by hand is the same
-    irreversibility trap as re-creating a memory they forgot.
+    The signal is the COLUMN, not the event log. Verified on a live tenant:
+    the only trigger_source values that exist are `api`, `conversation`,
+    `taxonomy_migration`, `memory_expiry` and `conversation_backfill` — there
+    is no user-archive event at all, and `decay_expired_tasks` writes none
+    either. An earlier version keyed off trigger_source and rejected all 11
+    real candidates, because `api/reinforced` (906 of them) is automated
+    reinforcement during retrieval, not a user action.
+
+    A user forgetting a memory sets `is_deleted=True`; archival sets
+    `is_active=False`. Filtering on both already excludes user deletions. The
+    remaining exclusion is dedup supersession, whose loser is also deactivated
+    but whose content is still live under `superseded_by`.
     """
     import inspect
     import importlib
 
     mod = importlib.import_module("scripts.repair_memory_regressions")
     src = inspect.getsource(mod.restore_archived_routines)
-    assert "_touched_by_automation" in src
-    guard = inspect.getsource(mod._touched_by_automation)
-    assert 'startswith("user")' in guard
+
+    assert "Memory.is_deleted == False" in src, (
+        "a memory the user forgot must be excluded by column, not by heuristic"
+    )
+    assert "mem.superseded_by" in src, (
+        "restoring a dedup loser resurrects a duplicate of a live row"
+    )
+    assert "describes_recurring_arrangement" in src
+    # The retired trigger_source heuristic must not come back.
+    assert "_AUTOMATED_TRIGGERS" not in inspect.getsource(mod)
+
     # And the whole script must be dry-run-capable with no default mutation.
     main_src = inspect.getsource(mod.main)
     assert "required=True" in main_src, "apply must never be the default"
     assert "await session.rollback()" in main_src
+
+
+def test_humanize_step_keeps_richer_prose():
+    """Only rows whose content IS the old machine format may be rewritten.
+
+    Many entity_extraction rows carry real prose from another write path —
+    "When handling Gmail, including during the user's daily briefing, ..." for
+    a reconnect_using edge. Re-rendering those from the bare triple would
+    DESTROY content to fix formatting that was never broken.
+    """
+    import inspect
+    import importlib
+
+    mod = importlib.import_module("scripts.repair_memory_regressions")
+    src = inspect.getsource(mod.humanize_relationship_rows)
+
+    assert "richer_content_kept" in src
+    assert 'legacy = f"{source} {str(predicate).replace(\'_\', \' \')} {target}"' in src
+    # The real metadata keys, read off live rows. Guessing source_name made
+    # this whole step a silent no-op across 75 rows.
+    assert "source_entity" in src and "target_entity" in src
+    assert "relationship_type" in src
+
+
+def test_humanizer_never_inflects_a_modal_verb():
+    """The verb-repair fallback must not mangle finite verbs.
+
+    `might_cause_problems_in` is a real predicate from a live tenant. Blindly
+    appending "-s" to the head word turned "Rampage might cause problems in
+    Canada" into "Rampage mights cause problems in Canada" — worse than the raw
+    form this function exists to improve. Found by dry-running the backfill
+    against production before applying it.
+    """
+    from app.memory_taxonomy import humanize_relationship as h
+
+    assert h("Rampage", "might_cause_problems_in", "Canada") == \
+        "Rampage might cause problems in Canada"
+    assert h("X", "can_use", "Y") == "X can use Y"
+    assert h("X", "should_be_sent_via", "Y") == "X should be sent via Y"
+    # US spelling, matching the rest of the codebase.
+    assert h("email routine", "summarizes", "Gmail") == \
+        "email routine summarizes Gmail"
+    # And the genuinely-broken case still gets repaired.
+    assert h("User", "frobnicate", "Widget") == "User frobnicates Widget"
+
+
+def test_relationship_category_describes_the_object_not_the_person():
+    """"User -> owns -> Toup categorized People" — the founder's Symptom 2.
+
+    PEOPLE must win only when BOTH ends are people. The first version of this
+    table put PEOPLE first, reasoning that "person -> works_at -> organization
+    is about the person". That is backwards: when a person is one end, the
+    OTHER end is the subject matter. 24 of 72 relationship rows on the
+    founder's tenant had collapsed into PEOPLE for that reason.
+    """
+    from app.memory_taxonomy import category_for_relationship as c
+
+    assert c("person", "organization") == "work"      # User owns Toup
+    assert c("person", "person") == "people"          # Nariman chatted with majid
+    assert c("person", "skill") == "skills"           # the user's skill, not the user
+    assert c("person", "place") == "locations"
+    assert c("show", "organization") == "media"       # the show, not the streamer
+    assert c("place", "location") == "locations"
+    # Unknown on both ends stays honest rather than guessing.
+    assert c(None, None) == "knowledge"
+    assert c("wharrgarbl", "flimflam") == "knowledge"
+
+
+def test_recategorize_is_not_in_the_default_repair_run():
+    """Its logic is right; bulk-applying it to legacy rows makes data worse.
+
+    It depends on entity TYPES, and those are unreliable upstream — "Better
+    Call Saul" is typed `topic`, songs are typed `project`. Measured on the
+    founder's tenant: ~5 rows improved, ~8 degraded. And no subset of type
+    pairs separates them, because the same person/project pair produces both
+    "User owns Toup" (correctly -> work) and "Drake artist of 0-100"
+    (wrongly -> work, should be media).
+    """
+    import importlib
+
+    mod = importlib.import_module("scripts.repair_memory_regressions")
+
+    assert "recategorize" in mod.STEPS, "keep it reachable via --only"
+    assert "recategorize" not in mod.DEFAULT_STEPS, (
+        "recategorize must not run by default — entity typing is the blocker"
+    )
+    assert set(mod.DEFAULT_STEPS) == {"restore", "humanize", "reminders"}

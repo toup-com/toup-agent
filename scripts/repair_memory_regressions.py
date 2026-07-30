@@ -17,14 +17,19 @@ That script did the taxonomy work; this one repairs what it got wrong.
      recurring arrangements it had deliberately exempted from `expires_at`
      into that archiver's blast radius — and a standing "daily Gmail briefing"
      has no reinforcement of its own, because the ROUTINE fires, not the
-     memory. Four of the founder's real routines were archived on the day of
-     the rollout. The code fix stops it recurring; this restores the rows.
+     memory. The code fix stops it recurring; this restores the rows.
 
-     Scoped hard: only rows that are (a) inactive, (b) recurring by
-     describes_recurring_arrangement, and (c) carry a MemoryEvent proving the
-     migration or the archiver touched them. A row the USER archived by hand
-     is never resurrected — that is the same irreversibility trap as
-     re-creating a forgotten memory.
+     Measured on the founder's tenant: 11 archived recurring rows, but 9 are
+     dedup SUPERSESSIONS whose content is still live under `superseded_by`.
+     Only 2 are genuine losses. Worth stating plainly, because the raw
+     "archived recurring rows" count overstates the harm by 5x.
+
+     Scoped hard: only rows that are (a) `is_active=False` AND
+     `is_deleted=False`, (b) recurring by describes_recurring_arrangement, and
+     (c) not a dedup loser (`superseded_by IS NULL`). A memory the USER forgot
+     sets `is_deleted=True` — a different column — so it is excluded by (a)
+     and can never be resurrected here. See restore_archived_routines for why
+     the event log cannot be used for this.
 
   2. HUMANIZE LEGACY RELATIONSHIP CONTENT
 
@@ -72,6 +77,9 @@ from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
 from app.db.database import async_session_maker  # noqa: E402
 from app.db.models import Memory, MemoryEvent  # noqa: E402
 from app.memory_taxonomy import (  # noqa: E402
+    _PREDICATE_ALIASES,
+    _PREDICATE_TEMPLATES,
+    category_for_relationship,
     describes_recurring_arrangement,
     humanize_relationship,
 )
@@ -80,14 +88,6 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("repair_memory_regressions")
 
 TRIGGER = "memory_regression_repair"
-
-# Events that prove an automated path archived the row, as opposed to the user.
-_AUTOMATED_TRIGGERS = {
-    "taxonomy_migration",
-    "memory_expiry",
-    "active_task_service",
-    "decay_service",
-}
 
 # A horizon under an hour is never a durable fact. It must name the unit, so
 # "remind me in two minutes" matches and "the user is researching UofT events"
@@ -117,27 +117,32 @@ def _event(memory: Memory, user_id: str, action: str, before: dict) -> MemoryEve
     )
 
 
-async def _touched_by_automation(session: AsyncSession, memory_id: str) -> bool:
-    """True if an automated path — not the user — last changed this row."""
-    rows = (await session.execute(
-        select(MemoryEvent.trigger_source).where(
-            MemoryEvent.memory_id == memory_id
-        )
-    )).scalars().all()
-    sources = {r for r in rows if r}
-    if not sources:
-        return False
-    # A hand delete/archive shows up as a user-triggered event. If ANY user
-    # event exists we leave the row alone rather than guess at ordering.
-    if any(s.startswith("user") or s == "api" for s in sources):
-        return False
-    return bool(sources & _AUTOMATED_TRIGGERS)
-
-
 async def restore_archived_routines(
     session: AsyncSession, apply: bool
 ) -> Dict[str, int]:
-    stats = {"candidates": 0, "restored": 0, "skipped_user_archived": 0}
+    """Re-activate recurring arrangements that an automated path archived.
+
+    Distinguishing "the user got rid of this" from "our archiver ate it" does
+    NOT come from the event log. Verified against a live tenant: the only
+    trigger_source values that exist are `api` (created/reinforced),
+    `conversation`, `taxonomy_migration`, `memory_expiry` and
+    `conversation_backfill`. There is no user-archive event at all — and
+    `decay_expired_tasks` writes no event either, so the archival that caused
+    this is invisible in the log. An earlier version of this function keyed off
+    trigger_source and rejected all 11 candidates as "user-archived", because
+    `api/reinforced` (906 rows of it) is automated reinforcement during
+    retrieval, not a user action.
+
+    The real signal is the COLUMN, not the log:
+      - a user forgetting a memory sets `is_deleted = True`
+      - archival sets `is_active = False`
+    so `is_active=False AND is_deleted=False` is already exclusively automated.
+
+    The one case that still must be excluded is dedup supersession, which also
+    deactivates the loser — restoring it would resurrect a duplicate of a row
+    that is still live under `superseded_by`.
+    """
+    stats = {"candidates": 0, "restored": 0, "skipped_superseded": 0}
     rows = (await session.execute(
         select(Memory).where(
             Memory.is_active == False,  # noqa: E712
@@ -149,9 +154,12 @@ async def restore_archived_routines(
         if not describes_recurring_arrangement(mem.content):
             continue
         stats["candidates"] += 1
-        if not await _touched_by_automation(session, mem.id):
-            stats["skipped_user_archived"] += 1
-            logger.info("  SKIP (user-archived): %s", (mem.content or "")[:70])
+        if mem.superseded_by:
+            stats["skipped_superseded"] += 1
+            logger.info(
+                "  SKIP (superseded by %s): %s",
+                mem.superseded_by, (mem.content or "")[:60],
+            )
             continue
 
         before = {"is_active": False, "strength": float(mem.strength or 0.0)}
@@ -172,7 +180,11 @@ async def restore_archived_routines(
 async def humanize_relationship_rows(
     session: AsyncSession, apply: bool
 ) -> Dict[str, int]:
-    stats = {"scanned": 0, "rewritten": 0, "reembedded": 0, "unchanged": 0}
+    stats = {
+        "scanned": 0, "rewritten": 0, "reembedded": 0, "unchanged": 0,
+        "no_triple": 0, "richer_content_kept": 0,
+        "uncurated_predicate_skipped": 0,
+    }
     rows = (await session.execute(
         select(Memory).where(
             Memory.source_type == "entity_extraction",
@@ -188,12 +200,44 @@ async def humanize_relationship_rows(
             meta = json.loads(mem.metadata_json) if mem.metadata_json else {}
         except (TypeError, ValueError):
             meta = {}
-        source = meta.get("source_name") or meta.get("source")
-        target = meta.get("target_name") or meta.get("target")
-        predicate = meta.get("relationship") or meta.get("relationship_type")
+        # Real key names, read off live rows: source_entity / target_entity /
+        # relationship_type (plus extracted_by). Guessing source_name/
+        # relationship matched nothing and made this step a silent no-op.
+        source = meta.get("source_entity") or meta.get("source_name")
+        target = meta.get("target_entity") or meta.get("target_name")
+        predicate = meta.get("relationship_type") or meta.get("relationship")
         if not (source and target and predicate):
             # Without the structured triple there is nothing authoritative to
             # re-render from, and guessing at the split would corrupt content.
+            stats["no_triple"] += 1
+            continue
+
+        # ONLY rewrite rows whose content IS the old machine format. Many
+        # entity_extraction rows carry richer prose written by another path —
+        # "When handling Gmail, including during the user's daily briefing, ..."
+        # for a reconnect_using edge, or "Church's Texas Chicken offers a
+        # chicken wrap, and ..." for an offers edge. Re-rendering those from
+        # the bare triple would DESTROY content to fix formatting that was
+        # never broken. The legacy format is exactly
+        # f"{source} {predicate.replace('_',' ')} {target}".
+        legacy = f"{source} {str(predicate).replace('_', ' ')} {target}"
+        if (mem.content or "").strip() != legacy.strip():
+            stats["richer_content_kept"] += 1
+            continue
+
+        # Only CURATED predicates may rewrite existing content. The verb-repair
+        # fallback in humanize_relationship is a reasonable default for a NEW
+        # write, but it is too blunt to run over rows that already exist: on the
+        # first dry-run it turned "Rampage might cause problems in Canada" into
+        # "Rampage mights cause problems in Canada". The modal bug is fixed, but
+        # the general lesson stands — an uncurated guess is not worth overwriting
+        # a row that already reads as English. `play_on`, `performed_by`,
+        # `owner_of`, `located_in` are in the tables precisely because someone
+        # decided what they should say.
+        pkey = str(predicate).lower().replace(" ", "_")
+        pkey = _PREDICATE_ALIASES.get(pkey, pkey)
+        if pkey not in _PREDICATE_TEMPLATES:
+            stats["uncurated_predicate_skipped"] += 1
             continue
 
         wanted = humanize_relationship(source, predicate, target)
@@ -227,13 +271,19 @@ async def humanize_relationship_rows(
 async def rearchive_dead_reminders(
     session: AsyncSession, apply: bool
 ) -> Dict[str, int]:
-    stats = {"candidates": 0, "reanchored": 0, "already_past": 0}
+    stats = {"candidates": 0, "reanchored": 0, "already_past": 0, "had_no_lease": 0}
     now = datetime.utcnow()
+    # NOT filtered on `expires_at IS NOT NULL`. A sub-hour reminder with NO
+    # lease is the worse case, not the safe one — it never expires at all.
+    # Rows reach that state legitimately (the Keep path and the durable-
+    # restatement promotion both clear the lease deliberately) and, in at least
+    # one case, because verifying the Keep fix in production cleared the lease
+    # on a dead reminder: DecayService.reinforce_memory commits internally, so
+    # a probe that rolls back afterwards has already changed the row.
     rows = (await session.execute(
         select(Memory).where(
             Memory.is_active == True,  # noqa: E712
             Memory.is_deleted == False,  # noqa: E712
-            Memory.expires_at.is_not(None),
         )
     )).scalars().all()
 
@@ -243,11 +293,13 @@ async def rearchive_dead_reminders(
         if describes_recurring_arrangement(mem.content):
             continue
         stats["candidates"] += 1
+        if mem.expires_at is None:
+            stats["had_no_lease"] += 1
         anchor = mem.created_at or now
         # A sub-hour reminder is dead the day it was made. One day of grace so
         # it stays visible for the rest of that day, matching resolve_ttl_days.
         horizon = anchor + timedelta(days=1)
-        if mem.expires_at and mem.expires_at <= horizon:
+        if mem.expires_at is not None and mem.expires_at <= horizon:
             continue
         age = (now - anchor).days
         logger.info(
@@ -270,11 +322,112 @@ async def rearchive_dead_reminders(
     return stats
 
 
+async def recategorize_relationship_rows(
+    session: AsyncSession, apply: bool
+) -> Dict[str, int]:
+    """Re-derive the category of legacy relationship rows from entity types.
+
+    Before the taxonomy work, `store_entity_relationship` hardcoded
+    `"people" if source_type == "person" else "knowledge"` — a binary that
+    produced exactly two of the twenty categories. It still shows: 48
+    `knowledge` + 24 `people` and nothing else across 72 relationship rows on
+    the founder's tenant, which is why "User owns Toup" is filed under People.
+
+    The row itself cannot answer this: `metadata_json` records
+    source_entity / target_entity / relationship_type / extracted_by — names
+    but NOT types. The types live on the `entities` table, so recover them by
+    name and then apply `category_for_relationship`, exactly as a fresh write
+    would.
+
+    Category is a display and filter concern, fully reversible, and the event
+    records the previous value.
+    """
+    from app.db.models import Entity
+
+    stats = {
+        "scanned": 0, "recategorized": 0, "unchanged": 0,
+        "entity_type_unknown": 0,
+    }
+
+    ents = (await session.execute(select(Entity))).scalars().all()
+    # Entity names are what the triple stores; fold case so "User"/"user" match.
+    by_name = {}
+    for e in ents:
+        nm = (getattr(e, "name", None) or "").strip().lower()
+        et = getattr(e, "entity_type", None) or getattr(e, "type", None)
+        if nm and et and nm not in by_name:
+            by_name[nm] = et
+
+    rows = (await session.execute(
+        select(Memory).where(
+            Memory.source_type == "entity_extraction",
+            Memory.is_deleted == False,  # noqa: E712
+        )
+    )).scalars().all()
+
+    for mem in rows:
+        stats["scanned"] += 1
+        try:
+            meta = json.loads(mem.metadata_json) if mem.metadata_json else {}
+        except (TypeError, ValueError):
+            meta = {}
+        src = (meta.get("source_entity") or meta.get("source_name") or "").strip().lower()
+        tgt = (meta.get("target_entity") or meta.get("target_name") or "").strip().lower()
+        st, tt = by_name.get(src), by_name.get(tgt)
+        if not (st or tt):
+            stats["entity_type_unknown"] += 1
+            continue
+
+        want = category_for_relationship(st, tt)
+        if want == mem.category:
+            stats["unchanged"] += 1
+            continue
+
+        logger.info(
+            "  %-14s -> %-14s (%s/%s) %s",
+            mem.category, want, st or "?", tt or "?", (mem.content or "")[:44],
+        )
+        if apply:
+            session.add(_event(
+                mem, mem.user_id, "recategorize_relationship",
+                {"category": mem.category},
+            ))
+            mem.category = want
+        stats["recategorized"] += 1
+
+    return stats
+
+
 STEPS = {
     "restore": ("restore wrongly-archived routines", restore_archived_routines),
     "humanize": ("humanize legacy relationship content", humanize_relationship_rows),
     "reminders": ("re-anchor dead reminder leases", rearchive_dead_reminders),
+    "recategorize": (
+        "re-derive relationship categories from entity types",
+        recategorize_relationship_rows,
+    ),
 }
+
+# `recategorize` is NOT in the default run. Its logic is right, but bulk-applying
+# it to legacy rows makes the data worse, because it depends on entity TYPES and
+# those are unreliable upstream. Measured on the founder's tenant: ~5 rows
+# clearly improved ("User owns Toup" people -> work, "Shops at Don Mills is in
+# Toronto" knowledge -> locations) and ~8 clearly degraded, all from bad typing
+# rather than bad precedence:
+#
+#   "Better Call Saul is available on Netflix"      topic/organization -> work
+#       (the show is typed `topic`, so MEDIA never enters the running)
+#   "Arash performed Dooset Daram"                  person/project     -> work
+#   "Drake artist of 0-100"                         person/project     -> work
+#       (songs are typed `project`)
+#   "Church's Texas Chicken offers a chicken wrap"  organization/topic -> work
+#       (should be preferences)
+#
+# No subset of entity-type pairs separates the good cases from the bad — the
+# same person/project pair produces both "User owns Toup" and "Drake artist of
+# 0-100". Fixing entity typing is the prerequisite, and that is separate work.
+# Reachable deliberately with `--only recategorize` once it lands.
+DEFAULT_STEPS = ("restore", "humanize", "reminders")
 
 
 async def main() -> int:
@@ -288,7 +441,7 @@ async def main() -> int:
     )
     args = parser.parse_args()
     apply = bool(args.apply)
-    chosen = args.only or sorted(STEPS)
+    chosen = args.only or list(DEFAULT_STEPS)
 
     logger.info("=== memory regression repair (%s) ===",
                 "APPLY" if apply else "DRY RUN")

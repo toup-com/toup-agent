@@ -400,20 +400,34 @@ ENTITY_TYPE_TO_CATEGORY: Dict[str, MemoryCategory] = {
     "conversation": MemoryCategory.OTHER,
 }
 
-# Most-specific-wins. A "person → works_at → organization" edge is about the
-# person; a "project → uses → tool" edge is about the work. Order encodes that
-# precedence, so the pair is resolved deterministically regardless of which
-# side the extractor happened to put first.
+# A relationship's category should say what the edge is ABOUT.
+#
+# PEOPLE is LAST on purpose, so it wins only when it is the sole candidate —
+# i.e. when BOTH ends are people. An earlier version put it first, reasoning
+# that "person -> works_at -> organization is about the person". That is
+# backwards: when a person is one end, the OTHER end is the subject matter.
+# The founder pointed at the symptom directly — "User owns Toup" filed under
+# People — and 24 of 72 relationship rows on that tenant had collapsed into
+# PEOPLE for the same reason.
+#
+#   person/organization -> work        ("User owns Toup")
+#   person/person       -> people      ("Nariman chatted with majid")
+#   person/skill        -> skills      (the user's skill, not the user)
+#   show/organization   -> media       ("Better Call Saul is available on Netflix")
+#
+# MEDIA and LOCATIONS sit ahead of WORK because `organization` is the broadest
+# bucket in ENTITY_TYPE_TO_CATEGORY — a streaming service or a mall would
+# otherwise swallow the more specific side of the edge.
 _RELATIONSHIP_CATEGORY_PRECEDENCE = (
-    MemoryCategory.PEOPLE,
-    MemoryCategory.WORK,
-    MemoryCategory.SKILLS,
-    MemoryCategory.LOCATIONS,
     MemoryCategory.MEDIA,
+    MemoryCategory.LOCATIONS,
+    MemoryCategory.SKILLS,
+    MemoryCategory.WORK,
     MemoryCategory.POSSESSIONS,
     MemoryCategory.EXPERIENCES,
     MemoryCategory.BELIEFS,
     MemoryCategory.KNOWLEDGE,
+    MemoryCategory.PEOPLE,
 )
 
 
@@ -538,7 +552,7 @@ _PREDICATE_TEMPLATES: Dict[str, str] = {
     "sends_to": "{s} sends {t}",
     "receives": "{s} receives {t}",
     "fetches_from": "{s} fetches messages from {t}",
-    "summarizes": "{s} summarises {t}",
+    "summarizes": "{s} summarizes {t}",
     "performed_by": "{t} performs {s}",
     "is_agent_of": "{s} is {t}'s assistant",
     "scheduled_in_timezone": "{s} is scheduled in {t}",
@@ -555,6 +569,17 @@ _PREDICATE_TEMPLATES: Dict[str, str] = {
 # Predicates already in third-person singular ("develops", "owns") need no
 # repair; bare stems ("play", "connect") read as imperatives after a subject.
 _THIRD_PERSON = re.compile(r"(?:s|ed|ing)$", re.IGNORECASE)
+
+# Words that must NEVER be given a third-person "-s". Modals and auxiliaries
+# are already finite, and the extractor does emit them inside predicates —
+# `might_cause_problems_in` on a live tenant became "Rampage mights cause
+# problems in Canada", which is worse than the raw form this function exists
+# to improve.
+_NEVER_INFLECT = frozenset({
+    "might", "may", "can", "could", "shall", "should", "will", "would",
+    "must", "ought", "is", "are", "was", "were", "be", "been", "being",
+    "has", "have", "had", "does", "do", "did", "cannot", "wont",
+})
 
 
 def humanize_relationship(
@@ -585,7 +610,7 @@ def humanize_relationship(
     # a bare stem gets "-s", anything already inflected is left alone.
     words = key.split("_")
     head = words[0]
-    if head and not _THIRD_PERSON.search(head):
+    if head and head.lower() not in _NEVER_INFLECT and not _THIRD_PERSON.search(head):
         if head.endswith(("s", "x", "z", "ch", "sh")):
             head += "es"
         elif head.endswith("y") and len(head) > 1 and head[-2] not in "aeiou":
