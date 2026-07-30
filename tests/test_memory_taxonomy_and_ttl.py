@@ -1052,3 +1052,50 @@ def test_recategorize_is_not_in_the_default_repair_run():
         "recategorize must not run by default — entity typing is the blocker"
     )
     assert set(mod.DEFAULT_STEPS) == {"restore", "humanize", "reminders"}
+
+
+# ── 9. Category breakdown (the filter bar's data source) ───────────────
+
+def test_breakdown_route_is_declared_before_the_id_route():
+    """`/memories/breakdown` must not be swallowed by `/memories/{memory_id}`.
+
+    FastAPI matches in declaration order, so a path param declared first would
+    turn every breakdown request into a lookup for a memory whose id is
+    literally "breakdown" — a 404, or worse a 500 from the uuid parse. The
+    file already carries this hazard for `/search`; the note there is why.
+    """
+    import inspect
+    import re
+
+    from app.api import memories as memories_api
+
+    src = inspect.getsource(memories_api)
+    order = re.findall(r'@router\.get\("(/[^"]*)"', src)
+
+    assert "/breakdown" in order, "the breakdown route is not registered"
+    assert order.index("/breakdown") < order.index("/{memory_id}"), (
+        "/breakdown is declared after /{memory_id} and will be shadowed"
+    )
+
+
+def test_breakdown_normalizes_legacy_categories_before_counting():
+    """Counts must fold legacy values, or the filter bar shows both.
+
+    A tenant mid-migration can hold `schedule` and `active_task` at once. Two
+    chips for one category — with the counts split between them — is worse than
+    no chip at all, because tapping either shows a partial list.
+    """
+    import inspect
+
+    from app.api import memories as memories_api
+
+    src = inspect.getsource(memories_api.memory_breakdown)
+    assert "normalize_category" in src, (
+        "breakdown counts raw category values and will double-count legacy rows"
+    )
+    # Counting must exclude what the user cannot see, or the chips will not add
+    # up to the "N remembered" header.
+    assert "Memory.is_deleted == False" in src
+    assert "Memory.is_active == True" in src
+    # And it must reach the tenant: `memories` is AGENT_ONLY.
+    assert "_proxy_memories" in src

@@ -287,6 +287,66 @@ async def list_memories(
     }
 
 
+# NOTE: must be defined BEFORE /{memory_id} or the path param shadows it.
+@router.get("/breakdown", response_model=dict)
+async def memory_breakdown(
+    brain_type: Optional[str] = Query(None, description="Restrict counts to one brain"),
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """How many memories sit in each category, for the filter bar.
+
+    The Memory screen filters on brain_type only, because twenty categories is
+    too many for a phone tab bar. The consequence is that the taxonomy is
+    invisible: the founder's list opens on Knowledge / People / Knowledge and
+    reads exactly like the "only three categories" bug it was, even though ten
+    categories are in use. Counts make the spread visible and let the app offer
+    a real category filter.
+
+    Cheap by construction — a GROUP BY over one indexed column, no embeddings
+    and no per-row work, so it can sit next to the list request.
+    """
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        params = {"brain_type": brain_type} if brain_type else {}
+        data = await _proxy_memories(proxy[0], proxy[1], "breakdown", params)
+        if data is not None:
+            return JSONResponse(content=data)
+
+    from sqlalchemy import func
+
+    conditions = [
+        Memory.user_id == current_user.id,
+        Memory.is_deleted == False,  # noqa: E712
+        Memory.is_active == True,  # noqa: E712
+    ]
+    if brain_type:
+        conditions.append(Memory.brain_type == brain_type)
+
+    rows = (await db.execute(
+        select(Memory.category, Memory.brain_type, func.count(Memory.id))
+        .where(*conditions)
+        .group_by(Memory.category, Memory.brain_type)
+    )).all()
+
+    categories: dict = {}
+    brains: dict = {}
+    for cat, brain, n in rows:
+        key = normalize_category(cat, brain_type=brain or "user")
+        categories[key] = categories.get(key, 0) + n
+        brains[brain or "user"] = brains.get(brain or "user", 0) + n
+
+    return {
+        # Descending so the app can render the filter bar in a useful order
+        # without re-sorting, and so a long tail stays at the far end.
+        "categories": dict(
+            sorted(categories.items(), key=lambda kv: (-kv[1], kv[0]))
+        ),
+        "brains": brains,
+        "total": sum(categories.values()),
+    }
+
+
 # NOTE: /search routes must be defined BEFORE /{memory_id} to prevent route shadowing
 @router.get("/search", response_model=MemorySearchResponse)
 async def search_memories_get(
