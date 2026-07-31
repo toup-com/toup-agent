@@ -33,6 +33,41 @@ from app.services.workspace_perms import share_path, shared_makedirs
 
 logger = logging.getLogger(__name__)
 
+
+# ── Search fallback observability ──────────────────────────────────────
+# Silent degradation is precisely how Brave stayed disconnected from every
+# tenant for months: an unset key skipped the primary tier with no log line
+# at all, so each search quietly cost 4-6s on the headless-browser tier and
+# nothing in the system ever said why. Metering records the tier that SERVED;
+# these record the tiers that were SKIPPED, which is the half that was
+# missing. Grep `degraded skipped=` to see every downgrade.
+def _search_degraded(*, skipped: str, reason: str, query: str) -> None:
+    logger.warning(
+        "[web_search] degraded skipped=%s reason=%s q=%r",
+        skipped, reason, query[:60],
+    )
+
+
+# Once per process, deliberately. A missing key is a CONFIGURATION defect,
+# not a per-query event — logging it on every search would bury the very
+# signal it exists to raise, and at fleet scale would dominate the log spend.
+_brave_unconfigured_warned = False
+
+
+def _warn_brave_unconfigured() -> None:
+    global _brave_unconfigured_warned
+    if _brave_unconfigured_warned:
+        return
+    _brave_unconfigured_warned = True
+    logger.warning(
+        "[web_search] degraded skipped=brave_api reason=no_api_key — "
+        "BRAVE_API_KEY is unset on this container, so EVERY search on this "
+        "agent falls through to the scrape tiers (~4-6s vs ~200ms). Set it on "
+        "platform-api; docker_host_service forwards it to every tenant on the "
+        "next rollout. Logged once per process."
+    )
+
+
 # Teach Pillow to decode HEIC/HEIF (iPhone photos) so edit_image can normalize a
 # genuine .heic source to PNG. Optional dep — a no-op if it's not installed.
 try:
@@ -1362,6 +1397,10 @@ class ToolExecutor:
 
     # ------------------------------------------------------------------
     # Web-tool metering — one credit_ledger row per OUTBOUND web call.
+    #
+    # See also `_search_degraded` / `_warn_brave_unconfigured` at module
+    # scope: metering records which tier SERVED, those record which tiers
+    # were skipped and why. You need both to explain a slow search.
     # ------------------------------------------------------------------
     async def _meter_web_tool(
         self, tool: str, *, tier: str, engine: str, started: float,
@@ -1479,8 +1518,12 @@ class ToolExecutor:
                         started=started, query=query,
                     )
                     return result
+                _search_degraded(skipped="brave_api", reason="empty_result", query=query)
             except Exception as exc:
+                _search_degraded(skipped="brave_api", reason=f"error:{type(exc).__name__}", query=query)
                 logger.warning("[web_search] Brave API failed: %s", exc)
+        else:
+            _warn_brave_unconfigured()
 
         # Secondary: multi-engine httpx scrape (free, no key) — fast when it works,
         # but search engines IP-block datacenters, so this often returns empty.
@@ -1492,7 +1535,9 @@ class ToolExecutor:
                     started=started, query=query,
                 )
                 return result
+            _search_degraded(skipped="httpx_race", reason="empty_or_blocked", query=query)
         except Exception as exc:
+            _search_degraded(skipped="httpx_race", reason=f"error:{type(exc).__name__}", query=query)
             logger.warning("[web_search] Smart search failed: %s", exc)
 
         # Last resort: our own headless browser searching Brave (no API key).
@@ -1512,11 +1557,19 @@ class ToolExecutor:
                         started=started, query=query,
                     )
                     return result
+                _search_degraded(skipped="browser_brave", reason="empty_result", query=query)
             except Exception as exc:
+                _search_degraded(skipped="browser_brave", reason=f"error:{type(exc).__name__}", query=query)
                 logger.warning("[web_search] Browser search also failed: %s", exc)
+        else:
+            _search_degraded(skipped="browser_brave", reason="disabled_by_flag", query=query)
 
         # Every tier came back empty. Nothing useful was delivered, so nothing
         # is metered — the outbound attempts are visible in the logs instead.
+        logger.error(
+            "[web_search] ALL TIERS EMPTY q=%r — the user got no results at all",
+            query[:60],
+        )
         return "No search results found."
 
     async def _brave_search_fallback(self, query: str, count: int) -> str:
