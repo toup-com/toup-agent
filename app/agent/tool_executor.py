@@ -48,40 +48,98 @@ def _search_degraded(*, skipped: str, reason: str, query: str) -> None:
     )
 
 
-# ── Search throttling lives on the platform, not here ──────────────────
-# There used to be a per-tenant token bucket and a 429 cooldown at this spot.
-# Both moved to app/api/search_proxy.py when search moved behind the platform
-# gateway, and this comment is here so nobody adds them back.
+# ── Brave client-side throttle ─────────────────────────────────────────
+# Brave's 50 req/s is an ACCOUNT ceiling, shared across every key and so
+# across every tenant on the platform's one shared key. One runaway agent loop
+# can starve all of them.
 #
-# The reason is not tidiness. Brave's 50 req/s is an ACCOUNT ceiling shared by
-# every key on the plan and therefore by every tenant. 42 containers each
-# holding their own bucket cannot add up to one account ceiling — they have no
-# shared memory, and the old code said so itself. The gateway is that missing
-# coordinator: it is one process, it sees every tenant's call, and it reads
-# Brave's own `x-ratelimit-remaining` header, which is the only fleet-wide
-# number that actually exists.
-#
-# What stays here is `_search_degraded` (below), because tiers 2 and 3 still
-# run from this container and their downgrades are still ours to log.
+# What is NOT possible here: a true fleet-wide limiter. Agents are separate
+# containers with no shared memory, so a global 50 r/s would need a
+# coordinator (Redis, or routing search through platform-api) that does not
+# exist. What IS enforceable in-process is a per-tenant bound — the half that
+# actually stops one tenant eating the whole quota. Bursts are real, not
+# hypothetical: AgentRunner.PARALLEL_SAFE_TOOLS pre-executes several
+# web_search calls concurrently from a single turn.
+class _TokenBucket:
+    """Monotonic token bucket.
+
+    Deliberately not thread-safe: the agent's tool calls run on one asyncio
+    loop, so there is no cross-thread contention to guard and a lock would
+    only cost time on the hot path.
+    """
+
+    __slots__ = ("_rate", "_burst", "_tokens", "_last")
+
+    def __init__(self, rate: float, burst: float) -> None:
+        self._rate = max(0.01, float(rate))
+        self._burst = max(1.0, float(burst))
+        self._tokens = self._burst
+        self._last = time.monotonic()
+
+    def take(self) -> bool:
+        now = time.monotonic()
+        self._tokens = min(
+            self._burst, self._tokens + (now - self._last) * self._rate
+        )
+        self._last = now
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return True
+        return False
 
 
-# Once per process, deliberately. Missing gateway config is a CONFIGURATION
-# defect, not a per-query event — logging it on every search would bury the
-# very signal it exists to raise, and at fleet scale would dominate log spend.
-_gateway_unconfigured_warned = False
+_brave_bucket: Optional["_TokenBucket"] = None
+_brave_cooldown_until: float = 0.0
 
 
-def _warn_gateway_unconfigured() -> None:
-    global _gateway_unconfigured_warned
-    if _gateway_unconfigured_warned:
-        return
-    _gateway_unconfigured_warned = True
+def _brave_allowed() -> tuple:
+    """May this container call Brave right now? Returns (ok, why_not)."""
+    global _brave_bucket
+    if time.monotonic() < _brave_cooldown_until:
+        return False, "cooldown_after_429"
+    if _brave_bucket is None:
+        _brave_bucket = _TokenBucket(
+            getattr(settings, "brave_rate_per_sec", 2.0),
+            getattr(settings, "brave_burst", 5),
+        )
+    if not _brave_bucket.take():
+        return False, "tenant_rate_limit"
+    return True, ""
+
+
+def _brave_note_429() -> None:
+    """Brave rate-limited us — stop asking for a while.
+
+    Without a cooldown every later search still pays a full Brave round-trip
+    before falling through, turning a rate-limit into added latency on EVERY
+    query rather than one clean downgrade to the next tier.
+    """
+    global _brave_cooldown_until
+    cooldown = float(getattr(settings, "brave_cooldown_s", 30.0))
+    _brave_cooldown_until = time.monotonic() + cooldown
     logger.warning(
-        "[web_search] degraded skipped=brave_api reason=no_gateway_credential — "
-        "TOUP_TOKEN or PLATFORM_API_URL is unset on this container, so EVERY "
-        "search on this agent falls through to the scrape tiers (~4-6s vs "
-        "~200ms). Both are provisioned with the container; an agent missing "
-        "them has lost LLM bundle access too. Logged once per process."
+        "[web_search] Brave returned 429 — skipping the Brave tier for %.0fs",
+        cooldown,
+    )
+
+
+# Once per process, deliberately. A missing key is a CONFIGURATION defect,
+# not a per-query event — logging it on every search would bury the very
+# signal it exists to raise, and at fleet scale would dominate the log spend.
+_brave_unconfigured_warned = False
+
+
+def _warn_brave_unconfigured() -> None:
+    global _brave_unconfigured_warned
+    if _brave_unconfigured_warned:
+        return
+    _brave_unconfigured_warned = True
+    logger.warning(
+        "[web_search] degraded skipped=brave_api reason=no_api_key — "
+        "BRAVE_API_KEY is unset on this container, so EVERY search on this "
+        "agent falls through to the scrape tiers (~4-6s vs ~200ms). Set it on "
+        "platform-api; docker_host_service forwards it to every tenant on the "
+        "next rollout. Logged once per process."
     )
 
 
@@ -1415,13 +1473,9 @@ class ToolExecutor:
     # ------------------------------------------------------------------
     # Web-tool metering — one credit_ledger row per OUTBOUND web call.
     #
-    # Covers tiers 2 and 3 only. Tier 1 (Brave) is metered by the platform
-    # gateway from its own observation — see app/api/search_proxy.py — so
-    # metering it here too would double-count.
-    #
-    # See also `_search_degraded` at module scope: metering records which tier
-    # SERVED, that records which tiers were skipped and why. You need both to
-    # explain a slow search.
+    # See also `_search_degraded` / `_warn_brave_unconfigured` at module
+    # scope: metering records which tier SERVED, those record which tiers
+    # were skipped and why. You need both to explain a slow search.
     # ------------------------------------------------------------------
     async def _meter_web_tool(
         self, tool: str, *, tier: str, engine: str, started: float,
@@ -1524,33 +1578,44 @@ class ToolExecutor:
             logger.info("[PERF] web_search cache=hit(tier0) q=%r", query[:60])
             return cached
 
-        # ── Primary: the platform SEARCH GATEWAY — instant (~200ms upstream),
-        # clean JSON, the same index our browser scrapes but ~30x faster. The
-        # httpx scrape below is reliably CAPTCHA/challenge-blocked on datacenter
-        # IPs (DDG 202-challenge, Bing CAPTCHA), so this is the path that
-        # actually serves users fast.
-        #
-        # This container does NOT hold a Brave key and must not be given one.
-        # We authenticate to our own platform with TOUP_TOKEN — the same
-        # Toup-issued credential the LLM proxy uses — and the platform holds
-        # the single shared upstream key. That is what makes rotation one
-        # server-side variable, keeps a container compromise from leaking the
-        # fleet's key, and lets rate limiting and metering be *enforced* at a
-        # chokepoint instead of self-reported from here. See
-        # app/api/search_proxy.py.
-        #
-        # The gateway degrades rather than denies: a 200 with served=False
-        # means "I throttled or upstream failed, use your own lower tiers",
-        # and only that keeps a rate limit from becoming a missing answer.
-        gw = await self._gateway_search(query, count)
-        if gw is not None:
-            served, result, reason = gw
-            if served and result:
-                _sf_search.cache_set(query, count, result)
-                # NOT metered here: the gateway already wrote the row from its
-                # own observation. Metering both sides would double-count.
-                return result
-            _search_degraded(skipped="brave_api", reason=reason or "unserved", query=query)
+        # ── Primary: Brave Search API — instant (~200ms), clean JSON, the same
+        # index our browser scrapes but ~30x faster. Platform-level key (one key,
+        # all tenants). The httpx scrape below is reliably CAPTCHA/challenge-blocked
+        # on datacenter IPs (DDG 202-challenge, Bing CAPTCHA), so when the key is
+        # present this is the path that actually serves users fast.
+        if settings.brave_api_key:
+            _ok, _why = _brave_allowed()
+            if not _ok:
+                # Throttled or cooling down. Fall through to the next tier
+                # rather than fail — a rate limit must degrade the result,
+                # never deny the user an answer.
+                _search_degraded(skipped="brave_api", reason=_why, query=query)
+            else:
+                try:
+                    result = await self._brave_search_fallback(query, count)
+                    if result and result.strip() != "No results found.":
+                        _sf_search.cache_set(query, count, result)
+                        await self._meter_web_tool(
+                            "web_search", tier="brave_api", engine="brave",
+                            started=started, query=query,
+                        )
+                        return result
+                    _search_degraded(skipped="brave_api", reason="empty_result", query=query)
+                except Exception as exc:
+                    # A 429 means the ACCOUNT ceiling is hit — shared with
+                    # every other tenant — so back off for everyone on this
+                    # container instead of retrying into the same wall.
+                    _status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if _status == 429:
+                        _brave_note_429()
+                    _search_degraded(
+                        skipped="brave_api",
+                        reason=f"http_{_status}" if _status else f"error:{type(exc).__name__}",
+                        query=query,
+                    )
+                    logger.warning("[web_search] Brave API failed: %s", exc)
+        else:
+            _warn_brave_unconfigured()
 
         # Secondary: multi-engine httpx scrape (free, no key) — fast when it works,
         # but search engines IP-block datacenters, so this often returns empty.
@@ -1599,81 +1664,33 @@ class ToolExecutor:
         )
         return "No search results found."
 
-    async def _gateway_search(self, query: str, count: int):
-        """Ask the platform search gateway. Returns (served, text, reason) or None.
-
-        None means "the gateway is not reachable/configured from here" — a
-        different condition from "the gateway declined", and the caller treats
-        both the same way: fall to the next tier. It is never an error the user
-        sees.
-
-        There is deliberately no retry. The gateway's whole job is to protect a
-        shared upstream ceiling; a client that retries into a throttle is the
-        thing it exists to prevent. The lower tiers are the retry.
-        """
-        token = (getattr(settings, "toup_token", "") or "").strip()
-        if not token:
-            _warn_gateway_unconfigured()
-            return None
-
-        base = (getattr(settings, "platform_api_url", "") or "").strip().rstrip("/")
-        if not base:
-            _warn_gateway_unconfigured()
-            return None
-        # Tenants provisioned before the /api suffix was normalised hit the SPA
-        # catch-all and get HTML with a 200 — the same trap credit_reporter
-        # documents at _platform_endpoint.
-        if not base.endswith("/api"):
-            base = f"{base}/api"
-
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(
-                    f"{base}/search/web",
-                    json={
-                        "query": query,
-                        "count": count,
-                        "channel": (self._current_channel or None),
-                    },
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/json",
-                        # Cloudflare fronts toup.ai and challenges unfamiliar
-                        # client signatures; bundle_client hits the same wall.
-                        "User-Agent": "toup-agent/1.0 (search-gateway)",
-                    },
-                )
-        except Exception as exc:
-            logger.warning("[web_search] gateway unreachable: %s", exc)
-            return (False, None, f"gateway_error:{type(exc).__name__}")
-
-        if resp.status_code == 401:
-            # The tenant's TOUP_TOKEN does not resolve. Loud, because it means
-            # this agent has silently lost fast search entirely.
-            logger.error("[web_search] gateway rejected our token (401) — this tenant has no fast search")
-            return (False, None, "gateway_unauthorized")
-        if resp.status_code >= 400:
-            logger.warning("[web_search] gateway HTTP %d", resp.status_code)
-            return (False, None, f"gateway_http_{resp.status_code}")
-
-        try:
+    async def _brave_search_fallback(self, query: str, count: int) -> str:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                # extra_snippets returns up to 5 extra passages pulled from each
+                # result page — enough context that the model can often answer
+                # WITHOUT a slow web_fetch, cutting the fetch count. Harmless on
+                # plans that don't support it (the field is just absent).
+                params={"q": query, "count": count, "extra_snippets": "true"},
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip",
+                    "X-Subscription-Token": settings.brave_api_key,
+                },
+            )
+            resp.raise_for_status()
             data = resp.json()
-        except ValueError:
-            logger.warning("[web_search] gateway returned non-JSON (SPA catch-all?)")
-            return (False, None, "gateway_bad_body")
 
-        if not data.get("served"):
-            return (False, None, data.get("degraded_reason") or "unserved")
-
-        results = data.get("results") or []
+        results = data.get("web", {}).get("results", [])
         if not results:
-            return (False, None, "empty_result")
+            return "No results found."
 
         lines = []
         for i, r in enumerate(results[:count], 1):
             lines.append(f"{i}. {r.get('title', '')}")
             lines.append(f"   {r.get('url', '')}")
-            desc = r.get("description") or ""
+            desc = r.get("description", "") or ""
             if desc:
                 lines.append(f"   {desc}")
             # Surface the richer passages so snippet-first reasoning has more to
@@ -1682,7 +1699,7 @@ class ToolExecutor:
                 if snip:
                     lines.append(f"   {snip}")
             lines.append("")
-        return (True, "\n".join(lines), None)
+        return "\n".join(lines)
 
     async def _ddg_search_fallback(self, query: str, count: int) -> str:
         """Last-resort search via DuckDuckGo HTML (no API key, no browser)."""
