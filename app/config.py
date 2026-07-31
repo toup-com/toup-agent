@@ -277,6 +277,13 @@ class Settings(BaseSettings):
     # Off → files revert to root-owned 0644 and the agent's own shell cannot
     # edit what the agent wrote. See services/workspace_perms.
     workspace_shared_perms_enabled: bool = True
+    # Kill-switch (default on): when a streaming LLM call fails AFTER it has
+    # already handed text/tool events to the consumer, raise instead of
+    # restarting the request. The retry loop wraps the whole stream, so a
+    # restart appends a second, independently-generated answer to the one the
+    # user is already reading — and that doubled text is what gets persisted
+    # and re-billed (F-12). Off -> pre-2026-07-31 replay behavior.
+    llm_stream_duplicate_guard: bool = True
     # Kill-switch (default on): dedup near-duplicate URLs, drop empty results,
     # and BM25-rerank web_search results by relevance before the model sees them.
     # Pure-Python (no LLM/network), so no latency cost. Off → raw engine order.

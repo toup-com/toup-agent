@@ -21,6 +21,39 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _abort_rather_than_replay(emitted_any: bool, exc: Exception, attempt: int) -> bool:
+    """F-12. True when a mid-stream failure must be raised instead of retried.
+
+    Both streaming paths put their retry loop AROUND the `async for`, so a
+    connection error at chunk 500 restarts the request and yields a second,
+    independently-generated answer into the SAME consumer, appended to the
+    text the caller already received. The user reads a doubled reply, that
+    doubled text is what gets persisted and what memory extraction later
+    reads, and the whole prompt is re-billed.
+
+    Resuming is not available to us: the model is regenerating from scratch
+    and the new text does not continue the old prefix, so no amount of
+    de-duplication reconstructs one coherent answer. Failing the turn is the
+    honest outcome — the streaming-recover path already handles a raised
+    error, and a visible failure beats silent corruption.
+
+    Retries BEFORE any output (the common case: connect/rate-limit at
+    request time) are untouched.
+
+    Kill switch: settings.llm_stream_duplicate_guard = False restores the
+    pre-2026-07-31 replay behaviour.
+    """
+    if not emitted_any:
+        return False
+    if not getattr(settings, "llm_stream_duplicate_guard", True):
+        return False
+    logger.warning(
+        "[OPENAI] %s after partial output on attempt %d — aborting instead of "
+        "replaying the stream (F-12)", type(exc).__name__, attempt,
+    )
+    return True
+
+
 # Re-use the same event dataclasses so agent_runner doesn't change
 @dataclass
 class StreamEvent:
@@ -331,6 +364,11 @@ class OpenAIAgentService:
                 # metering_correctness_v2 is on (per-request billing
                 # dedupe key); harmless capture otherwise.
                 completion_id = ""
+                # F-12: has this attempt already handed output to the
+                # consumer? The retry wraps the whole `async for`, so a
+                # restart after partial output replays text the caller
+                # already has. See _abort_or_retry.
+                emitted_any = False
 
                 async for chunk in stream:
                     if not completion_id and getattr(chunk, "id", None):
@@ -363,6 +401,7 @@ class OpenAIAgentService:
 
                     # --- text delta ---
                     if delta and delta.content:
+                        emitted_any = True
                         yield StreamEvent(type="text", text=delta.content)
 
                     # --- tool call deltas ---
@@ -385,6 +424,7 @@ class OpenAIAgentService:
                                 if tc_delta.function.name:
                                     tc["name"] = tc_delta.function.name
                                     # Emit tool_use_start
+                                    emitted_any = True
                                     yield StreamEvent(
                                         type="tool_use_start",
                                         tool_name=tc["name"],
@@ -492,14 +532,18 @@ class OpenAIAgentService:
                     logger.info("[OPENAI] bundle 401 — reloaded identity+token, retrying once")
                     continue
                 raise
-            except RateLimitError:
+            except RateLimitError as e:
+                if _abort_rather_than_replay(emitted_any, e, attempt):
+                    raise
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
                     logger.warning(f"OpenAI rate-limited, retrying in {wait}s")
                     await asyncio.sleep(wait)
                 else:
                     raise
-            except APIConnectionError:
+            except APIConnectionError as e:
+                if _abort_rather_than_replay(emitted_any, e, attempt):
+                    raise
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
                     logger.warning(f"OpenAI connection error, retrying in {wait}s")
@@ -754,6 +798,8 @@ class OpenAIAgentService:
                 incomplete_reason = ""
                 completion_id = ""  # "resp_…" — metering key (v2) only
                 pending_reasoning: Optional[Dict[str, Any]] = None
+                # F-12: see _abort_rather_than_replay.
+                emitted_any = False
 
                 async for ev in stream:
                     ev_type = getattr(ev, "type", "")
@@ -766,6 +812,7 @@ class OpenAIAgentService:
                     elif ev_type == "response.output_text.delta":
                         delta = getattr(ev, "delta", "") or ""
                         if delta:
+                            emitted_any = True
                             yield StreamEvent(type="text", text=delta)
 
                     elif ev_type == "response.output_item.added":
@@ -780,6 +827,7 @@ class OpenAIAgentService:
                             fn_calls[getattr(item, "id", "") or ""] = tracker
                             # Mirrors the chat path's name-arrival emit:
                             # tool_use_start is live, args are buffered.
+                            emitted_any = True
                             yield StreamEvent(
                                 type="tool_use_start",
                                 tool_name=tracker["name"],
@@ -949,14 +997,18 @@ class OpenAIAgentService:
                     logger.info("[OPENAI] bundle 401 — reloaded identity+token, retrying once")
                     continue
                 raise
-            except RateLimitError:
+            except RateLimitError as e:
+                if _abort_rather_than_replay(emitted_any, e, attempt):
+                    raise
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
                     logger.warning(f"OpenAI rate-limited, retrying in {wait}s")
                     await asyncio.sleep(wait)
                 else:
                     raise
-            except APIConnectionError:
+            except APIConnectionError as e:
+                if _abort_rather_than_replay(emitted_any, e, attempt):
+                    raise
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
                     logger.warning(f"OpenAI connection error, retrying in {wait}s")
