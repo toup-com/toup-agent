@@ -45,7 +45,7 @@ from app.api.ws_chat import router as ws_chat_router, set_ws_refs, broadcast_to_
 from app.api.api_v1 import router as api_v1_router
 from app.api.models import router as models_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
-from app.api.voice import router as voice_router, set_voice_refs
+from app.api.voice import router as voice_router
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.dashboard import router as dashboard_router
@@ -1847,6 +1847,26 @@ async def agent_health():
     except Exception:
         _db_ok, _db_recoveries = None, None
 
+    # Embedding degrade observability. Memory writes never fail on a broken
+    # embedding backend — they degrade to unembedded rows (dedup off, vector
+    # recall blind for those rows) with only a container-log WARNING. Surface
+    # the counter here so fleet-wide unembedded writes are visible in one
+    # health poll; `provider` reports the CACHED resolution only (never
+    # forces a resolve from a health probe). Diagnostic ONLY — law 1, nothing
+    # gates on it. Recovery lever: app/scripts/backfill_embeddings.py.
+    try:
+        from app.services.embedding_service import (
+            EmbeddingService as _EmbSvc,
+            embed_degrade_stats as _embed_degrade_stats,
+        )
+        _emb_inst = _EmbSvc._instance
+        _emb_provider = (
+            _emb_inst.__dict__.get("_resolved_provider") if _emb_inst is not None else None
+        ) or _EmbSvc._resolved_provider
+        _embeddings_status = {"provider": _emb_provider, **_embed_degrade_stats()}
+    except Exception:
+        _embeddings_status = None
+
     return {
         "status": "healthy",
         "version": _agent_version,
@@ -1859,6 +1879,7 @@ async def agent_health():
         # not just the raw settings field. Closes the gap where /agent/health
         # advertised a stale model after a settings.agent_model bump.
         "agent_model": default_model(),
+        "embeddings": _embeddings_status,
         "boot_progress": _boot_progress,
         "is_bound": _is_bound,
         "bound_user_id": _bound_uid,
