@@ -131,6 +131,19 @@ class AgentTaskHandler:
                 # saves (channel=routine), which is what the user
                 # actually wants to see.
                 save_user_message=False,
+                # ...and for the SAME reason, do not mine this turn for
+                # memories. save_user_message=False and
+                # disable_post_processing are independent gates: without this
+                # one the extractor still received `prompt_text` as
+                # `user_message`, so the routine's own instruction was read
+                # back as something the user said — every day, on a schedule.
+                # That is where "5:06 PM motivational quote routine is
+                # scheduled in America/Toronto", "Gmail briefing fetches
+                # messages from Gmail" and ten more rows describing the
+                # platform's own plumbing came from. The routine already
+                # exists as a first-class Routine record; re-encoding it as
+                # user memories adds nothing and crowds out real ones.
+                disable_post_processing=True,
             )
         except Exception as e:
             logger.exception(

@@ -1148,11 +1148,25 @@ async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: 
         for mem in extracted:
             cat = mem.category.value if hasattr(mem.category, "value") else mem.category
             try:
+                # ttl_days MUST cross the tunnel. The extractor computes it
+                # for exactly the transient case ("play Ebi's music", "remind
+                # me in 2 minutes"), and dropping it here is why the founder's
+                # brain holds permanent rows like "The user requested to play
+                # the song 'Setarehaye Sorbi'" with access_count=20 — media
+                # requests are overwhelmingly a voice behaviour, and this is
+                # the voice write path. Without a horizon they are immortal
+                # and outrank real preferences in retrieval forever.
                 result = await send_tool_call(user_id, "memory_store", {
                     "content": mem.content,
                     "category": cat,
                     "brain_type": "user",
                     "importance": mem.importance,
+                    "ttl_days": getattr(mem, "ttl_days", None),
+                    "memory_type": (
+                        mem.memory_type.value
+                        if hasattr(mem.memory_type, "value") else mem.memory_type
+                    ),
+                    "confidence": mem.confidence,
                 })
                 if not result.startswith("ERROR"):
                     pushed += 1

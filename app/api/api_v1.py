@@ -302,6 +302,20 @@ async def internal_agent_turn(req: ChatRequest, request: Request):
             channel="voice",
             save_user_message=req.save,
             save_assistant_message=req.save,
+            # `save=False` means the realtime handler is persisting this turn
+            # itself — so this run is not the turn of record, and must not mine
+            # memories either. Persistence and post-processing are independent
+            # gates in run(), and only the first was being set: a voice turn
+            # therefore wrote memories with NO row in `messages`, from a
+            # `user_message` that is not the user's utterance at all but the
+            # `task` string the realtime model synthesised for its `think`
+            # tool. That is exactly how five encyclopedia entries about 409A
+            # valuations — restated from the agent's own spoken answer —
+            # landed in the founder's brain on 2026-07-30.
+            #
+            # Voice memories still get extracted, once, on the platform side
+            # (ws_realtime._extract_voice_memories) from the real transcript.
+            disable_post_processing=not req.save,
         )
         _resp_model = response.model
         if settings.security_leak_filter and _resp_model:
@@ -556,6 +570,10 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                 channel="voice",
                 save_user_message=req.save,
                 save_assistant_message=req.save,
+                # Same reasoning as the blocking sibling above — this is the
+                # path voice actually takes when tool events are enabled, so
+                # omitting it here would leave the defect fully live.
+                disable_post_processing=not req.save,
                 on_status=on_status,
                 on_tool_start=on_tool_start,
                 on_tool_event=on_tool_event,

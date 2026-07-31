@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -33,6 +34,13 @@ from app.memory_taxonomy import (
 _VAGUE_ENTITY_TYPES = frozenset({"unknown", "topic", "note", "conversation", ""})
 from app.services.embedding_service import get_embedding_service
 
+# Module-level, deliberately. This file previously had only two FUNCTION-LOCAL
+# `logger = logging.getLogger(__name__)` bindings, so any `logger.` call added
+# outside those two functions was a NameError waiting for the first user who
+# hit that branch. That is not hypothetical: PR #375 shipped exactly this bug
+# in decay_service.py and every tap of the Keep button raised NameError in
+# production before the commit. One module-level binding removes the trap.
+logger = logging.getLogger(__name__)
 
 
 def extract_temporal_filters(query: str) -> dict:
@@ -1496,6 +1504,45 @@ class MemoryService:
         similar.sort(key=lambda x: x[1], reverse=True)
         return similar[:limit]
     
+    async def _user_aliases(self, user_id: str) -> List[str]:
+        """Names this user may appear under as one end of a graph edge.
+
+        The extractor writes edges under whatever name the conversation used —
+        "User", "user", "Nariman", "Nariman HOSSEINI" — so the gate needs the
+        real display name to recognise `Nariman --owns--> Toup` as being about
+        the user. Generic self-referents ("user", "me") are handled inside the
+        gate; this supplies only the tenant-specific part.
+
+        Cached per service instance and fail-soft: a lookup failure must never
+        block a memory write, it just makes the gate slightly stricter.
+        """
+        cached = getattr(self, "_alias_cache", None)
+        if cached is not None:
+            return cached
+
+        aliases: List[str] = []
+        try:
+            from app.db.models.user import User
+            row = await self.db.execute(
+                select(User.name, User.email).where(User.id == user_id)
+            )
+            found = row.first()
+            if found:
+                name, email = found
+                if name:
+                    aliases.append(name)
+                    # "Nariman HOSSEINI" also appears as bare "Nariman".
+                    first = name.strip().split()[0] if name.strip() else ""
+                    if first and first.lower() != name.strip().lower():
+                        aliases.append(first)
+                if email:
+                    aliases.append(email.split("@")[0])
+        except Exception as exc:
+            logger.debug("[memory_gate] alias lookup failed (non-fatal): %s", exc)
+
+        self._alias_cache = aliases
+        return aliases
+
     async def store_entity_relationship(
         self,
         user_id: str,
@@ -1565,6 +1612,31 @@ class MemoryService:
             source_name, relationship, target_name
         )
         legacy_content = f"{source_name} {relationship.replace('_', ' ')} {target_name}"
+
+        # ── Write-time gate on the Memory MIRROR only ────────────────────
+        # The graph edge above is already committed and is NOT gated: every
+        # traversal, entity map and graph query keeps full fidelity. What is
+        # gated is whether this edge also becomes a row the user reads on the
+        # Memory screen and that competes for space in the retrieval corpus.
+        #
+        # 59 of the 73 junk memories on the founder's tenant came through
+        # here, because this path had no quality check of any kind — it
+        # rendered whatever triple the LLM emitted and INSERTed it.
+        from app.services.memory_gate import relationship_gate_reason
+
+        gate_reason = relationship_gate_reason(
+            source_name,
+            relationship,
+            target_name,
+            user_aliases=await self._user_aliases(user_id),
+            rendered=relationship_content,
+        )
+        if gate_reason:
+            logger.info(
+                "[memory_gate] relationship not mirrored (%s): %s",
+                gate_reason, relationship_content[:80],
+            )
+            return
         existing = await self.find_similar_memories(
             user_id=user_id,
             content=relationship_content,

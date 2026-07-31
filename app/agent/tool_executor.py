@@ -1259,29 +1259,48 @@ class ToolExecutor:
     # ------------------------------------------------------------------
     async def _tool_memory_store(self, inp: Dict[str, Any]) -> str:
         content = inp.get("content", "")
-        category = inp.get("category", "context")
+        # "context" is in NO enum — it was the pre-unification sink value, so
+        # this default wrote a category the app cannot label and that
+        # query_classifier's `category.in_(...)` can never match.
+        category = inp.get("category") or "other"
         brain_type = inp.get("brain_type", "user")
         importance = float(inp.get("importance", 0.5))
-        
+
         if not content:
             return "ERROR: content is required"
-        
+
         try:
+            from datetime import datetime, timedelta
             from app.db.database import async_session_maker
             from app.services.memory_dedup_service import MemoryDedupService
             from app.schemas import MemoryCreate, BrainType, MemoryType, MemoryLevel
-            
+            from app.memory_taxonomy import normalize_memory_type
+
+            # Transient memories arriving over the voice tunnel used to lose
+            # their horizon here and become permanent. Accepted as an optional
+            # field so older callers that omit it behave exactly as before.
+            try:
+                _ttl = inp.get("ttl_days")
+                _ttl = int(_ttl) if _ttl not in (None, "") else None
+            except (TypeError, ValueError):
+                _ttl = None
+
             memory_data = MemoryCreate(
                 content=content,
                 summary=content[:100],
                 brain_type=BrainType(brain_type),
                 category=category,
-                memory_type=MemoryType.FACT,
+                memory_type=MemoryType(
+                    normalize_memory_type(inp.get("memory_type") or "fact")
+                ),
                 importance=importance,
-                confidence=0.9,
+                confidence=float(inp.get("confidence") or 0.9),
                 memory_level=MemoryLevel.EPISODIC,
                 emotional_salience=0.5,
                 source_type="agent_tool",
+                expires_at=(
+                    datetime.utcnow() + timedelta(days=_ttl) if _ttl else None
+                ),
             )
             
             async with async_session_maker() as db:

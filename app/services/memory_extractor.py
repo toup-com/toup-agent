@@ -13,6 +13,7 @@ from enum import Enum
 
 from app.config import settings
 from app.schemas import MemoryCategory, MemoryType
+from app.services.memory_gate import memory_gate_reason
 from app.memory_taxonomy import (
     build_category_prompt_block,
     build_entity_type_prompt_block,
@@ -758,6 +759,12 @@ If the conversation is just casual chat, commands, or questions with nothing wor
         # A6-2: outcome of this extraction, surfaced on the next turn's
         # [memory_health] line — "ok" / "retried" / "failed".
         self.last_extraction_outcome = None
+        # Reasons the write-time gate rejected a proposed memory this turn.
+        # Surfaced so an operator can tell "the model proposed nothing" apart
+        # from "the model proposed six things and all six were junk" — the
+        # two look identical from the outside and mean opposite things.
+        _gated: List[str] = []
+        self.last_gated_reasons = _gated
 
         try:
             response, _retried = await _complete_json_with_retry(
@@ -787,6 +794,22 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                 if content.count(" ") < 3:
                     continue
                 if content.endswith("?"):
+                    continue
+
+                # Deterministic screen. Rule 9 of the prompt above already
+                # says "Do NOT extract general world knowledge" and rule 3
+                # says "Only extract information STATED BY THE USER" — both
+                # were live on the fleet for twelve hours before the model
+                # wrote five encyclopedia entries about 409A valuations,
+                # restated from its own answer, into a user's brain. Prose
+                # does not bind; this does.
+                gate_reason = memory_gate_reason(
+                    content,
+                    user_message=user_message,
+                    assistant_response=assistant_response,
+                )
+                if gate_reason:
+                    _gated.append(gate_reason)
                     continue
 
                 # Canonicalise via the single taxonomy. Unknown values map to
@@ -854,6 +877,12 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                 ))
 
             self.last_extraction_outcome = "retried" if _retried else "ok"
+            if _gated:
+                import logging
+                logging.getLogger(__name__).info(
+                    "[memory_gate] kept %d, rejected %d this turn: %s",
+                    len(memories), len(_gated), ",".join(sorted(set(_gated))),
+                )
             return memories
 
         except Exception as e:

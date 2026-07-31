@@ -111,6 +111,24 @@ class MemoryDedupService:
 
         # Step 4: Decide what to do with the best candidate (thresholds
         # shortcut the LLM for the obvious cases; W1.4d)
+        # Rank by SIMILARITY, not by the caller's blended relevance score.
+        # find_similar_memories sorts by `final_score`, in which similarity is
+        # only 40% of the weight against strength (0.25), importance (0.2),
+        # emotional_salience (0.15) and a recency boost. Since create_memory
+        # always sets strength=1.0, a hot, frequently-retrieved row could
+        # outrank a genuinely nearer duplicate by a wide margin and take the
+        # top slot — so dedup read `similarity_score` off the WRONG row, landed
+        # in the ambiguous band, and asked the LLM to compare a pair that was
+        # never the closest one. The real duplicate was never adjudicated.
+        #
+        # That is self-reinforcing, and it is exactly the profile of the seven
+        # near-duplicate Persian-music rows on the founder's tenant
+        # (access_count 20/23/12): the more a junk memory is retrieved, the
+        # more reliably it hijacks the comparison and shields the true
+        # duplicate from ever being seen.
+        candidates = sorted(
+            candidates, key=lambda c: c.get('similarity_score', 0), reverse=True
+        )
         top_match = candidates[0]
         similarity = top_match.get('similarity_score', 0)
         existing_content = top_match.get('content', '')
