@@ -627,11 +627,21 @@ class MemoryExtractor:
         brain_type: str = "user",
         max_memories: int = 15,
         api_key: Optional[str] = None,
+        explicit_save_requested: bool = False,
     ) -> List[ExtractedMemory]:
         """
         Extract memories using LLM for more sophisticated understanding.
         Phase 4: Uses schema-enforced entity extraction with typed attributes.
         Falls back to rule-based extraction on failure.
+
+        explicit_save_requested (D-mem-C, 2026-07-29): the caller detected
+        explicit remember-phrasing in the user message ("please remember:",
+        "for my records", "note this down"). Adds one rule to the prompt
+        mandating verbatim capture of the requested fact — the base rules
+        otherwise read a token-like payload ("memqa-…-lock-ece9") as a code
+        snippet to SKIP — and relaxes the length/importance noise filters for
+        this call only. The harness measured 5/8 explicit save requests
+        dropped by exactly those two mechanisms.
         """
         from app.services.llm_service import get_llm_service, LLMService
         from app.services.extraction_schemas import generate_entity_schemas_prompt
@@ -643,6 +653,14 @@ class MemoryExtractor:
         # the enum again — this list used to be hand-maintained prose and had
         # diverged from BOTH enum copies.
         category_block = build_category_prompt_block()
+
+        # D-mem-C: one extra numbered item, only on explicit-save turns, so
+        # the base prompt stays byte-identical for every other call.
+        explicit_save_block = ""
+        if explicit_save_requested:
+            explicit_save_block = """
+12. **EXPLICITLY REQUESTED SAVE (ACTIVE THIS TURN)**: The user explicitly asked for something to be remembered ("remember this", "for my records", "note this down", "save this"). You MUST extract every fact the user asked to save, preserving its exact value VERBATIM — including token-like values, codes, passphrases, IDs and nicknames that would otherwise look like noise or code snippets (rule 2's code-snippet skip does NOT apply to them). Phrase each as a complete standalone sentence naming what the value is for, set importance to at least 0.8, and set transient to false unless the user gave an explicit expiry.
+"""
 
         extraction_prompt = f"""You are a memory extraction system for a personal AI assistant. Your job is to extract information from this conversation that will still be worth knowing about THIS USER weeks from now.
 
@@ -665,7 +683,7 @@ ASSISTANT RESPONSE:
 9. **Schedules & tasks**: upcoming deadlines, reminders, appointments, todos — these are almost always TRANSIENT (see rule 8)
 10. **Relationships between entities**: "Alice works at Google", "Project X uses React", "My brother lives in Berlin"
 11. **Corrections**: If the user corrects the agent ("No, actually...", "That's wrong, I meant...", "I didn't say that"), extract the CORRECT fact as a memory with high importance (0.9). Tag it with "correction" so the system can update or supersede the old incorrect memory.
-
+{explicit_save_block}
 ## Entity Schema Types (IMPORTANT — use these for structured entity extraction)
 
 {entity_schemas_doc}
@@ -788,11 +806,18 @@ If the conversation is just casual chat, commands, or questions with nothing wor
             for mem_data in result.get("memories", [])[:max_memories]:
                 content = mem_data.get("content", "").strip()
 
-                # Quality filters — skip garbage
-                if not content or len(content) < 15:
+                # Quality filters — skip garbage. On an explicit-save turn the
+                # length gates are relaxed (D-mem-C): the model is instructed
+                # to write full sentences, but a short verbatim output like
+                # "Parking code: memqa-x" must be kept, not silently dropped —
+                # it is the exact fact the user just asked us to save.
+                if not content:
                     continue
-                if content.count(" ") < 3:
-                    continue
+                if not explicit_save_requested:
+                    if len(content) < 15:
+                        continue
+                    if content.count(" ") < 3:
+                        continue
                 if content.endswith("?"):
                     continue
 
@@ -841,7 +866,9 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                     importance = float(mem_data.get("importance", 0.5))
                 except (TypeError, ValueError):
                     importance = 0.5
-                if importance < 0.3:
+                # A fact the user explicitly asked to save is never "not
+                # worth extracting", whatever the model scored it (D-mem-C).
+                if importance < 0.3 and not explicit_save_requested:
                     continue
 
                 # Transience → expiry horizon. resolve_ttl_days refuses to

@@ -4483,11 +4483,24 @@ class AgentRunner:
         query_was_trivial: bool = False,
     ) -> int:
         """Extract and store memories from the conversation. Returns count."""
+        # D-mem-C (2026-07-29): an explicit save ask ("please remember: …",
+        # "for my records: …") must ALWAYS reach extraction — the harness
+        # measured 5/8 such requests dropped, and background extraction is
+        # the only capture path when the model doesn't call memory_store.
+        # The predicate also rides into the extractor as a hint so token-like
+        # payloads (codes, passphrases) survive its noise filters.
+        from app.services.query_classifier import is_explicit_remember_request
+        explicit_save = is_explicit_remember_request(user_message)
+
         # W1.4c: the trivial-query gate at prompt build covered retrieval
         # only — extraction (and its relationship follow-up) still burned
         # LLM calls on bare "thanks" turns. Caller threads the turn's
         # classification; flag-gated so operators can restore old behavior.
-        if query_was_trivial and getattr(settings, "skip_extraction_for_trivial_queries", True):
+        if (
+            query_was_trivial
+            and not explicit_save
+            and getattr(settings, "skip_extraction_for_trivial_queries", True)
+        ):
             logger.info("[AGENT] Memory extraction skipped — trivial turn")
             return 0
         try:
@@ -4515,6 +4528,7 @@ class AgentRunner:
                 brain_type="user",
                 max_memories=15,
                 api_key=user_api_key,
+                explicit_save_requested=explicit_save,
             )
             # A6-2: surface the extraction outcome on the next turn's
             # [memory_health] line (Y=ok, N=failed, R=retried-then-ok).

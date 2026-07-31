@@ -13,10 +13,15 @@ import logging
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime
 
+from sqlalchemy import and_, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.services.memory_service import MemoryService
+from app.services.memory_service import (
+    MemoryService,
+    conflicts_on_value,
+    value_tokens,
+)
 from app.services.embedding_service import get_embedding_service
 from app.services.llm_service import get_llm_service
 from app.schemas import MemoryCreate, MemoryResponse, BrainType
@@ -34,6 +39,11 @@ MIN_THRESHOLD = 0.25        # Below this, definitely not related
 # middle band is worth an LLM call.
 AUTO_DUPLICATE_THRESHOLD = 0.90  # >= : reinforce existing without asking the LLM
 AUTO_NEW_THRESHOLD = 0.50        # best candidate below this: create without asking
+
+
+class SupersedeRaceError(RuntimeError):
+    """Another writer superseded the same row first. The loser's replacement
+    is rolled back; _apply_decision retries it as a plain create."""
 
 
 class MemoryDedupService:
@@ -278,6 +288,29 @@ class MemoryDedupService:
     ) -> Dict[str, str]:
         """Threshold shortcut around the LLM adjudication (W1.4d)."""
         if similarity >= AUTO_DUPLICATE_THRESHOLD:
+            # D-mem-A (2026-07-29): near-identical vectors are NOT always the
+            # same fact. "…passphrase is kestrel-dbf7" restated as
+            # "…kestrel-13b4" embeds >= 0.90, and the unconditional
+            # "duplicate" verdict here reinforced the OLD row and threw the
+            # conflicting new value away — the user could not change a stored
+            # fact. When the two texts share their shape but disagree on a
+            # value token, fall through to the LLM adjudicator, whose
+            # contradiction_update verdict routes to the existing supersede
+            # path (_supersede_with_new: new row created, old row gets
+            # superseded_by + is_active=False, id trail preserved). True
+            # paraphrase duplicates keep the cheap shortcut — a value
+            # conflict requires HIGH token overlap plus a differing token,
+            # which a mere rewording fails (see _conflicts_on_value).
+            # Kill switch: settings.memory_supersede_on_conflict (changes
+            # write semantics for restated facts).
+            if (
+                getattr(settings, "memory_supersede_on_conflict", True)
+                and self._conflicts_on_value(existing_content, new_content)
+            ):
+                return await self._llm_decide_action(
+                    existing_content=existing_content,
+                    new_content=new_content,
+                )
             return {
                 "action": "duplicate",
                 "reason": f"auto: similarity {similarity:.2f} >= {AUTO_DUPLICATE_THRESHOLD}",
@@ -444,48 +477,96 @@ class MemoryDedupService:
 
         Used when new information contradicts the old (e.g., user changed jobs).
         The old memory is kept for history but excluded from active search.
+
+        ATOMIC (2026-07-31). This used to be TWO transactions: create_memory
+        committed the replacement, then the old row was deactivated and
+        committed separately. A crash, a lost connection or a pgbouncer reset
+        in between left BOTH conflicting values active and retrievable — the
+        exact state supersede exists to prevent — and two concurrent writers
+        each left a stray active duplicate. Now the replacement is only
+        FLUSHED (commit=False) and the deactivation rides the same
+        transaction, so the pair is all-or-nothing. The deactivation itself is
+        an optimistic `UPDATE … WHERE is_active = true`: a concurrent
+        superseder wins, and the loser rolls its replacement back and is
+        retried by the caller (_apply_decision falls through to a plain
+        create) instead of leaving a duplicate behind.
         """
-        # Create the new memory
+        # Read the old row FIRST — its pre-supersede content is what goes into
+        # the history entry, and there is no point writing a replacement for a
+        # row that has already gone.
+        old_memory = await self._get_memory_by_id(old_memory_id)
+
+        # Create the new memory (flush only — this transaction stays open)
         new_memory = await self.memory_service.create_memory(
             user_id=user_id,
             memory_data=new_memory_data,
             deduplicate=False,
             embedding=new_embedding,
+            commit=False,
         )
 
-        # Mark old memory as superseded
-        old_memory = await self._get_memory_by_id(old_memory_id)
-        if old_memory:
-            old_memory.superseded_by = new_memory.id
-            old_memory.is_active = False
-            old_memory.strength = max((old_memory.strength or 0.5) * 0.3, 0.1)
-            old_memory.updated_at = datetime.utcnow()
+        try:
+            if old_memory is not None:
+                now = datetime.utcnow()
+                history = json.loads(old_memory.history_json) if old_memory.history_json else []
+                history.append({
+                    "date": now.isoformat(),
+                    "content": old_memory.canonical_content or old_memory.content,
+                    "source": "contradiction_update",
+                    "action": "superseded",
+                    "change_summary": reason,
+                    "superseded_by": new_memory.id,
+                })
 
-            # Add to history
-            history = json.loads(old_memory.history_json) if old_memory.history_json else []
-            history.append({
-                "date": datetime.utcnow().isoformat(),
-                "content": old_memory.canonical_content or old_memory.content,
-                "source": "contradiction_update",
-                "action": "superseded",
-                "change_summary": reason,
-                "superseded_by": new_memory.id,
-            })
-            old_memory.history_json = json.dumps(history)
+                # Optimistic guard: only the writer that finds the row still
+                # active gets to supersede it.
+                result = await self.db.execute(
+                    sa_update(Memory)
+                    .where(and_(Memory.id == old_memory_id, Memory.is_active == True))
+                    .values(
+                        superseded_by=new_memory.id,
+                        is_active=False,
+                        strength=max((old_memory.strength or 0.5) * 0.3, 0.1),
+                        updated_at=now,
+                        history_json=json.dumps(history),
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if (result.rowcount or 0) == 0:
+                    raise SupersedeRaceError(
+                        f"memory {old_memory_id} was already superseded by another writer"
+                    )
 
-            # Track lineage on the new memory
-            merged_from = json.loads(new_memory.merged_from_json) if new_memory.merged_from_json else []
-            if old_memory_id not in merged_from:
-                merged_from.append(old_memory_id)
-                new_memory.merged_from_json = json.dumps(merged_from)
+                # Keep the in-session copy consistent with the row we just
+                # wrote (synchronize_session=False leaves it stale, and
+                # sessions built with expire_on_commit=False would keep
+                # serving the pre-update values to this request).
+                old_memory.superseded_by = new_memory.id
+                old_memory.is_active = False
+                old_memory.strength = max((old_memory.strength or 0.5) * 0.3, 0.1)
+                old_memory.updated_at = now
+                old_memory.history_json = json.dumps(history)
+
+                # Track lineage on the new memory
+                merged_from = json.loads(new_memory.merged_from_json) if new_memory.merged_from_json else []
+                if old_memory_id not in merged_from:
+                    merged_from.append(old_memory_id)
+                    new_memory.merged_from_json = json.dumps(merged_from)
 
             await self.db.commit()
-            await self.db.refresh(new_memory)
+        except Exception:
+            # Never leave the replacement behind without the deactivation.
+            await self.db.rollback()
+            raise
 
+        await self.db.refresh(new_memory)
+        # create_memory's own post-commit follow-up, which commit=False skipped
+        await self.memory_service._update_brain_stats(user_id)
+
+        if old_memory is not None:
             logger.info(
                 f"Superseded memory {old_memory_id} → {new_memory.id}: {reason}"
             )
-
         return new_memory
 
     async def _merge_memories(
@@ -558,15 +639,28 @@ class MemoryDedupService:
             return ' '.join(s.lower().split())
         
         n1, n2 = normalize(content1), normalize(content2)
-        
+
         # If one contains the other, they might have the same info
         if n1 in n2 or n2 in n1:
             # If lengths are similar, probably same info
             if abs(len(n1) - len(n2)) < 20:
                 return True
-        
+
         return n1 == n2
-    
+
+    @staticmethod
+    def _value_tokens(content: str) -> set:
+        """Thin alias — the implementation is shared with
+        MemoryService.create_memory's own dedup shortcut (memory_service.py)."""
+        return value_tokens(content)
+
+    @staticmethod
+    def _conflicts_on_value(existing_content: str, new_content: str) -> bool:
+        """D-mem-A value-conflict guard. Shared with the REST/MCP create
+        surface — see memory_service.conflicts_on_value for the rules and for
+        why the containment shortcut no longer gates it."""
+        return conflicts_on_value(existing_content, new_content)
+
     async def _llm_decide_action(
         self,
         existing_content: str,
@@ -599,20 +693,31 @@ Decide ONE of these actions:
    Example: "I love pizza" vs "I love pepperoni pizza from Dominos" → merge (both about pizza preference)
    Example: "I play basketball" vs "I play basketball as point guard on Saturdays" → merge (both about basketball)
 
-3. "contradiction_update" - The new information CONTRADICTS or SUPERSEDES the existing one.
-   The user's facts have changed (new job, moved cities, changed preference, updated a goal).
+3. "contradiction_update" - The SAME THING's value has changed, so the old statement is now WRONG.
+   The subject must be the SAME specific entity in both statements.
    Example: "I work at Google" vs "I just joined Apple" → contradiction_update
    Example: "I live in NYC" vs "I moved to London" → contradiction_update
    Example: "My goal is to learn Python" vs "I've mastered Python, now learning Rust" → contradiction_update
+   Example: "My front door code is 1234" vs "I changed the front door code to 9876" → contradiction_update (same door)
 
-4. "new" - The information is about a DIFFERENT topic, even if about the same person.
+4. "new" - The information is about a DIFFERENT topic OR a DIFFERENT THING, even if worded almost identically.
    Example: "My name is John" vs "I love pizza" → new (name vs food = different topics)
    Example: "I love pizza" vs "I have a dog named Max" → new (food vs pet = different topics)
    Example: "I play basketball" vs "My favorite movie is Inception" → new (sport vs movie = different topics)
    Example: "My birthday is Feb 19" vs "I work as an engineer" → new (birthday vs job = different topics)
+   Example: "My front door code is 1234" vs "My garage door code is 9876" → new (TWO DIFFERENT DOORS)
+   Example: "My work laptop is a ThinkPad" vs "My personal laptop is a MacBook" → new (two different laptops)
 
 CRITICAL: Just because two facts mention the same person does NOT mean they should merge.
 Only merge if they are about the SAME SPECIFIC TOPIC (e.g., both about food, both about sports, both about work).
+
+CRITICAL: DIFFERENT INSTANCES OF THE SAME KIND OF THING ARE "new", NEVER contradiction_update.
+Front door vs garage door, work laptop vs personal laptop, home wifi vs office wifi, storage locker
+vs gym locker — these are separate facts that must BOTH be kept. Two sentences can share almost every
+word and still be about different things; check WHICH THING each one is about before deciding.
+Choose contradiction_update ONLY when the SAME named thing's value has changed. When unsure between
+"new" and "contradiction_update", choose "new" — contradiction_update RETIRES the existing memory and
+the user cannot get it back.
 
 Respond in JSON:
 {{
@@ -707,15 +812,23 @@ For each pair, decide ONE of these actions:
 2. "merge" - The new information ADDS DETAILS to the SAME SPECIFIC TOPIC.
    Example: "I love pizza" vs "I love pepperoni pizza from Dominos" → merge
 
-3. "contradiction_update" - The new information CONTRADICTS or SUPERSEDES the existing one.
-   The user's facts have changed (new job, moved cities, changed preference, updated a goal).
+3. "contradiction_update" - The SAME THING's value has changed, so the old statement is now WRONG.
+   The subject must be the SAME specific entity in both statements.
    Example: "I work at Google" vs "I just joined Apple" → contradiction_update
+   Example: "My front door code is 1234" vs "I changed the front door code to 9876" → contradiction_update (same door)
 
-4. "new" - The information is about a DIFFERENT topic, even if about the same person.
+4. "new" - The information is about a DIFFERENT topic OR a DIFFERENT THING, even if worded almost identically.
    Example: "My name is John" vs "I love pizza" → new (name vs food = different topics)
+   Example: "My front door code is 1234" vs "My garage door code is 9876" → new (TWO DIFFERENT DOORS)
 
 CRITICAL: Just because two facts mention the same person does NOT mean they should merge.
 Only merge if they are about the SAME SPECIFIC TOPIC (e.g., both about food, both about sports, both about work).
+
+CRITICAL: DIFFERENT INSTANCES OF THE SAME KIND OF THING ARE "new", NEVER contradiction_update.
+Front door vs garage door, work laptop vs personal laptop, storage locker vs gym locker — separate facts
+that must BOTH be kept. Two sentences can share almost every word and still be about different things.
+Choose contradiction_update ONLY when the SAME named thing's value has changed; when unsure, choose "new"
+— contradiction_update RETIRES the existing memory and the user cannot get it back.
 
 Respond in JSON with EXACTLY one decision per pair, in order:
 {{

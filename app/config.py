@@ -93,6 +93,25 @@ class Settings(BaseSettings):
     # context_trim_for_trivial_queries gate covered retrieval only —
     # extraction still burned 2+ LLM calls on every trivial turn.
     skip_extraction_for_trivial_queries: bool = True
+    # D-mem-A (2026-07-29, canary 533354ce): the dedup auto-duplicate shortcut
+    # (similarity >= 0.90) reinforced the EXISTING row and discarded the new
+    # content unconditionally — "…passphrase is kestrel-dbf7" restated as
+    # "…kestrel-13b4" embeds >= 0.90, so users could never change a stored
+    # fact. With this ON, a high-similarity pair whose texts disagree on a
+    # value token is sent to the LLM adjudicator, whose contradiction_update
+    # verdict supersedes the old row (memories.superseded_by, is_active=False)
+    # instead of throwing the new value away. True paraphrase duplicates keep
+    # the cheap no-LLM shortcut. Kill switch because this changes WRITE
+    # semantics for restated facts: OFF restores unconditional reinforcement.
+    memory_supersede_on_conflict: bool = True
+    # D-mem-C (2026-07-29): explicit remember-phrasing ("please remember:",
+    # "for my records", "note this down", "save this") now boosts the memory
+    # intent in query classification, so the save ask gets the memory prompt
+    # sections/tool set even when its payload collides with code keywords
+    # ("…my parking spot CODE is …" used to tie into code intent). Kill
+    # switch: OFF restores the old intent scoring. (memory_store/memory_search
+    # exposure itself is unaffected — those are always-included tools.)
+    memory_tools_on_remember: bool = True
     
     # Scheduler (for memory decay/consolidation)
     enable_scheduler: bool = True  # Set to False in multi-worker deployments

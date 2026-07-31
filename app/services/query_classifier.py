@@ -249,3 +249,47 @@ def is_trivial_query(text: str) -> bool:
     if len(stripped.split()) <= _TRIVIAL_MAX_WORDS and _TRIVIAL_RE.match(stripped + "?"):
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Explicit remember-phrasing (D-mem-C, 2026-07-29)
+# ---------------------------------------------------------------------------
+# A user telling the assistant to SAVE something ("Please remember: my
+# assigned parking spot code is …", "For my records: …", "Note this down: …").
+# The memory-quality harness measured 5 of 8 such explicit requests silently
+# dropped (retrieval_events logged has_extraction_gap=true): the phrasing does
+# not make the model call memory_store, so capture rides entirely on
+# background extraction — which must therefore never be skipped, and must be
+# told the save was explicit, on exactly these turns.
+#
+# Shared by three consumers (single definition on purpose):
+#   * query_intent.classify_query_intent — boosts memory-intent scoring so the
+#     ask isn't stolen by a keyword collision ("…spot CODE is…" ties into code
+#     intent); flag-gated there via settings.memory_tools_on_remember.
+#   * agent_runner._extract_memories — bypasses the trivial-turn skip gate for
+#     very short remember-asks.
+#   * agent_runner → memory_extractor.extract_memories_with_llm — threads
+#     explicit_save_requested=True so token-like payloads (codes, passphrases)
+#     are not discarded as noise.
+#
+# Deliberately NOT matched: "remember to <do something>" — that is reminder
+# phrasing owned by the routines pipeline, not a fact-save.
+_EXPLICIT_REMEMBER_RE = re.compile(
+    r"\bplease\s+remember\b(?!\s+to\b)"          # "please remember (this|:|it) …"
+    r"|\bremember\s+(?:this|that|it)\b"          # "remember this: …"
+    r"|\bremember\s*:"                           # "remember: my … is …"
+    r"|\bfor\s+(?:my|the|your)\s+records?\b"     # "for my records: …"
+    r"|\bnote\s+(?:this|that|it)\s+down\b"       # "note this down: …"
+    r"|\bnote\s+down\b"                          # "note down: …"
+    r"|\b(?:save|store)\s+(?:this|that)\b"       # "save this: …"
+    r"|\bdon'?t\s+forget\s*:",                   # "don't forget: …"
+    re.IGNORECASE,
+)
+
+
+def is_explicit_remember_request(text: Optional[str]) -> bool:
+    """True iff the message explicitly asks the assistant to remember/save a
+    fact. See the block comment above for consumers and design constraints."""
+    if not text:
+        return False
+    return bool(_EXPLICIT_REMEMBER_RE.search(text))

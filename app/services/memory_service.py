@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete, func, and_, or_, text
 from sqlalchemy.orm import selectinload
 
+from app.config import settings
 from app.db.models import (
     Memory, Entity, EntityLink, EntityRelationship, BrainStats,
     MemoryEvent, MemoryEventType, memory_relationships,
@@ -41,6 +42,57 @@ from app.services.embedding_service import get_embedding_service
 # in decay_service.py and every tap of the Keep button raised NameError in
 # production before the commit. One module-level binding removes the trap.
 logger = logging.getLogger(__name__)
+
+
+def value_tokens(content: str) -> set:
+    """Lowercased tokens with EDGE punctuation stripped. Inner punctuation
+    survives on purpose — "kestrel-13b4" must stay ONE token, or a value swap
+    would read as a shared prefix plus two differing suffixes."""
+    return {
+        t.strip(".,;:!?\"'()[]{}")
+        for t in (content or "").lower().split()
+    } - {""}
+
+
+def conflicts_on_value(existing_content: str, new_content: str) -> bool:
+    """True when two near-identical texts look like the SAME fact carrying a
+    DIFFERENT value ("…passphrase is kestrel-dbf7" vs "…kestrel-13b4").
+
+    Lives here (not on MemoryDedupService) because BOTH write surfaces need
+    it: the dedup service's AUTO_DUPLICATE shortcut *and*
+    MemoryService.create_memory's own `_find_similar_memory → _reinforce`
+    shortcut, which is what the REST POST /api/memories handler and #379's
+    MCP memory_create actually run. memory_dedup_service imports this module,
+    so the helper cannot live the other way round.
+
+    Deliberately conservative — the shortcut must keep skipping the LLM for
+    plain rewordings:
+      - each side must carry at least one token the other lacks; a strict
+        subset is ADDED DETAIL ("I play basketball on Saturdays"), never a
+        conflicting value, and identical texts trivially have neither;
+      - the two token sets must mostly overlap (same sentence shape).
+        "I love pizza" vs "pizza is my favorite food" shares 1 of 7 tokens
+        and stays on the duplicate shortcut.
+
+    NOTE (2026-07-31): the token check runs INDEPENDENTLY of the
+    `_is_same_information` containment shortcut it used to sit behind. That
+    shortcut calls two texts identical whenever one normalized string
+    CONTAINS the other with a length delta < 20 chars — which is exactly the
+    shape of a typo fix or a truncation ("gate code is 991" → "…9911",
+    "hunter2" → "hunter22"). Abstaining there sent every one-character
+    correction straight back to the reinforce path that swallowed it.
+    """
+    tokens_existing = value_tokens(existing_content)
+    tokens_new = value_tokens(new_content)
+    if not tokens_existing or not tokens_new:
+        return False
+    only_existing = tokens_existing - tokens_new
+    only_new = tokens_new - tokens_existing
+    if not only_existing or not only_new:
+        return False
+    union = tokens_existing | tokens_new
+    overlap = len(tokens_existing & tokens_new) / len(union)
+    return overlap >= 0.5
 
 
 def extract_temporal_filters(query: str) -> dict:
@@ -267,7 +319,8 @@ class MemoryService:
         source_message_id: Optional[str] = None,
         deduplicate: bool = True,
         similarity_threshold: float = 0.9,
-        embedding: Optional[List[float]] = None
+        embedding: Optional[List[float]] = None,
+        commit: bool = True,
     ) -> Memory:
         """Create a new memory with embedding, with deduplication support.
 
@@ -280,6 +333,13 @@ class MemoryService:
             embedding: Pre-computed embedding for memory_data.content (optional —
                 W1.4e: the dedup path already embedded the same string; passing
                 it here avoids a second identical embedding call)
+            commit: When False, the row is FLUSHED (so it has an id) but the
+                transaction is left open for the caller to commit — the caller
+                also owns _link_memories/_update_brain_stats, both of which
+                commit. Used by MemoryDedupService._supersede_with_new so that
+                "new row created" and "old row deactivated" land in ONE
+                transaction instead of two (a crash between the two commits
+                left both conflicting values active and retrievable).
 
         Returns:
             Memory: The created or reinforced memory
@@ -322,8 +382,37 @@ class MemoryService:
                 brain_type=_brain_type_for_dedup,
             )
             if similar_memory:
-                # Reinforce existing memory instead of creating duplicate
-                return await self._reinforce_memory(similar_memory, memory_data)
+                # D-mem-A on the REST/MCP surface (2026-07-31). This shortcut
+                # is a SECOND, independent copy of the dedup service's
+                # AUTO_DUPLICATE rule: POST /api/memories (and #379's MCP
+                # memory_create, which lands on that handler through the
+                # platform proxy) calls create_memory with the defaults, so it
+                # never sees MemoryDedupService._decide_action's guard.
+                # _reinforce_memory never reads new_data.content, so a >=0.90
+                # similar row whose VALUE disagrees ("…kestrel-dbf7" restated
+                # as "…kestrel-13b4") had the correction silently discarded.
+                #
+                # On a value conflict, fall THROUGH to the normal insert: the
+                # correction is stored and retrievable. Deliberately NOT an
+                # automatic supersede — this path has no adjudicator, and
+                # conflicts_on_value alone cannot tell a corrected value from
+                # two different instances of the same kind of fact ("front
+                # door code" vs "garage door code"), where deactivating the
+                # old row would destroy an unrelated, unrecoverable fact.
+                # Kill switch: settings.memory_supersede_on_conflict.
+                _existing_text = similar_memory.canonical_content or similar_memory.content or ""
+                if (
+                    getattr(settings, "memory_supersede_on_conflict", True)
+                    and conflicts_on_value(_existing_text, memory_data.content)
+                ):
+                    logger.info(
+                        "[MEMORY] value conflict with %s — storing correction as a "
+                        "new row instead of reinforcing",
+                        similar_memory.id,
+                    )
+                else:
+                    # Reinforce existing memory instead of creating duplicate
+                    return await self._reinforce_memory(similar_memory, memory_data)
 
         # Handle memory_level - can be MemoryLevel enum or string
         memory_level_value = (
@@ -416,17 +505,23 @@ class MemoryService:
             },
             trigger_source="api"
         )
-        
+
+        if not commit:
+            # Caller owns the transaction (see the `commit` arg): the row is
+            # flushed and carries its id, but nothing is durable yet. Skip the
+            # two follow-ups as well — both commit.
+            return memory
+
         await self.db.commit()
         await self.db.refresh(memory)
-        
+
         # Link related memories
         if memory_data.related_memory_ids:
             await self._link_memories(memory.id, memory_data.related_memory_ids)
-        
+
         # Update brain stats
         await self._update_brain_stats(user_id)
-        
+
         return memory
     
     async def _relationship_was_forgotten(
@@ -503,6 +598,12 @@ class MemoryService:
                         and_(
                             Memory.user_id == user_id,
                             Memory.is_deleted == False,
+                            # D-mem-A companion: superseded/expired rows are
+                            # is_active=False. Without this filter a freshly
+                            # superseded row could be matched here and
+                            # "reinforced" — swallowing the new value into a
+                            # row no retrieval path will ever surface again.
+                            Memory.is_active == True,
                             Memory.embedding.isnot(None),
                             *brain_filter,
                         )
@@ -524,6 +625,9 @@ class MemoryService:
                 and_(
                     Memory.user_id == user_id,
                     Memory.is_deleted == False,
+                    # D-mem-A companion — same reasoning as the pgvector
+                    # branch above: never dedup against a superseded row.
+                    Memory.is_active == True,
                     *brain_filter,
                 )
             )
@@ -908,6 +1012,60 @@ class MemoryService:
         
         return memories, total_count
 
+    async def _resolve_active_head(self, memory: Memory, user_id: str) -> Memory:
+        """Walk `superseded_by` from an archived row to the live one.
+
+        Dedup archives a superseded row (is_active=False + superseded_by) and
+        the reinforce path already returns the SUCCESSOR's id, so an id that
+        was handed out before a supersede must keep resolving to the same
+        logical memory afterwards — otherwise an edit lands on a tombstone no
+        retrieval path reads.
+
+        Bounded and cycle-safe: superseded_by is a plain column with no FK
+        guarantee of acyclicity, and a self-reference or an A→B→A pair would
+        otherwise spin forever. Any dead end (missing row, deleted successor,
+        loop) returns the best row reached so far — strictly no worse than
+        today's behaviour, never an exception on the write path.
+        """
+        seen = {memory.id}
+        current = memory
+        for _ in range(10):
+            if current.is_active or not current.superseded_by:
+                return current
+            successor_id = current.superseded_by
+            if successor_id in seen:
+                logger.warning(
+                    "[MEMORY] supersede cycle at %s — updating in place", current.id
+                )
+                return current
+            seen.add(successor_id)
+            result = await self.db.execute(
+                select(Memory).where(
+                    and_(
+                        Memory.id == successor_id,
+                        Memory.user_id == user_id,
+                        Memory.is_deleted == False,
+                    )
+                )
+            )
+            successor = result.scalar_one_or_none()
+            if successor is None:
+                logger.warning(
+                    "[MEMORY] superseded_by %s missing for %s — updating in place",
+                    successor_id, current.id,
+                )
+                return current
+            logger.info(
+                "[MEMORY] update on superseded %s redirected to active head %s",
+                current.id, successor.id,
+            )
+            current = successor
+        logger.warning(
+            "[MEMORY] supersede chain too long from %s — updating %s in place",
+            memory.id, current.id,
+        )
+        return current
+
     async def update_memory(
         self,
         memory_id: str,
@@ -918,25 +1076,78 @@ class MemoryService:
         memory = await self.get_memory(memory_id, user_id)
         if not memory:
             return None
-        
+
+        # Follow the supersede chain to the row retrieval can actually see.
+        # get_memory filters is_deleted ONLY, so an update against a
+        # superseded id (the model routinely holds an id from an earlier turn
+        # or an earlier search) used to succeed against a tombstone: the write
+        # returned 200, and retrieval — which filters is_active — kept serving
+        # the SUCCESSOR's old value forever, with no surface that could show
+        # the user their edit had gone nowhere.
+        memory = await self._resolve_active_head(memory, user_id)
+
         update_dict = update_data.model_dump(exclude_unset=True)
         old_values = {}  # Track changes for audit
-        
+
         # Update content and regenerate embedding if content changed
         if "content" in update_dict:
             old_values["content"] = memory.content[:100]  # Truncate for audit
-            embedding = self.embedding_service.embed(update_dict["content"], api_key=self.api_key)
-            memory.embedding_json = json.dumps(embedding)  # Backward compat
-            if hasattr(memory, 'embedding'):
-                memory.embedding = embedding  # Native pgvector
+            # W1.5 mirror (write path) + W1.4e: the old sync
+            # `embedding_service.embed(...)` blocked the event loop and raised
+            # on agent images without sentence-transformers — the ONE write
+            # path that could still fail on a missing vector. Degrade to a
+            # content-only update instead of 500ing.
+            embedding = None
+            try:
+                embedding = await self.embedding_service.embed_async(
+                    update_dict["content"], api_key=self.api_key
+                )
+            except Exception as e:
+                from app.services.embedding_service import record_embed_degrade
+                record_embed_degrade(e, site="update")
+                logger.warning(
+                    f"[MEMORY] Embedding failed on update, clearing stale vector: {e}"
+                )
+            if embedding is not None:
+                memory.embedding_json = json.dumps(embedding)  # Backward compat
+                if hasattr(memory, 'embedding'):
+                    memory.embedding = embedding  # Native pgvector
+            else:
+                # 2026-07-31: the degrade used to KEEP the old vector. A vector
+                # that describes text the row no longer contains is worse than
+                # no vector: search surfaces the row for its pre-update meaning
+                # and misses it for the new one, and the repair job
+                # (scripts/backfill_embeddings) only re-embeds rows whose
+                # embedding IS NULL, so it could never notice. Clearing matches
+                # the create-path degrade — keyword/graph retrieval still finds
+                # the row, and the backfill can fix it.
+                memory.embedding_json = None
+                if hasattr(memory, 'embedding'):
+                    memory.embedding = None
             memory.content = update_dict["content"]
-        
+            # D-mem-A companion: dedup adjudicates against `canonical_content
+            # or content` and the mobile card renders `summary || content`, so
+            # an update that left canonical_content/summary stale kept BOTH
+            # future dedup decisions and the UI anchored to the pre-update
+            # text. Same consistency contract as merge_memory.
+            memory.canonical_content = update_dict["content"]
+            if "summary" not in update_dict:
+                memory.summary = None  # stale abbreviation must not outrank new content
+
         if "summary" in update_dict:
             old_values["summary"] = memory.summary
             memory.summary = update_dict["summary"]
         if "category" in update_dict:
             old_values["category"] = memory.category
-            memory.category = update_dict["category"].value
+            # MemoryUpdate.category is a plain Optional[str] (schemas.py) —
+            # the old `.value` access raised AttributeError on EVERY
+            # category-carrying update. Normalize through the single taxonomy
+            # (brain-scoped) so aliases/retired values degrade instead of 500.
+            _raw_category = update_dict["category"]
+            memory.category = normalize_category(
+                _raw_category.value if hasattr(_raw_category, "value") else _raw_category,
+                brain_type=memory.brain_type or "user",
+            )
         if "memory_type" in update_dict:
             old_values["memory_type"] = memory.memory_type
             memory.memory_type = update_dict["memory_type"].value

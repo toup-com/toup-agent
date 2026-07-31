@@ -23,7 +23,23 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import FrozenSet, Set
 
+# Shared explicit-remember predicate (D-mem-C) — single definition, also used
+# by the extraction gate in agent_runner. query_classifier is a leaf module
+# (stdlib-only imports), so this cannot cycle.
+from app.services.query_classifier import is_explicit_remember_request
+
 logger = logging.getLogger(__name__)
+
+
+def _remember_boost_enabled() -> bool:
+    """settings.memory_tools_on_remember, resolved lazily so this module keeps
+    importing without app.config on the hot path (and tests can monkeypatch
+    the flag)."""
+    try:
+        from app.config import settings
+        return bool(getattr(settings, "memory_tools_on_remember", True))
+    except Exception:
+        return True
 
 # ---------------------------------------------------------------------------
 # Tool name sets by category
@@ -546,6 +562,18 @@ def classify_query_intent(message: str) -> QueryIntent:
             scores["memory"] += 2
     if _MEMORY_PATTERNS_RE.search(normalized):
         scores["memory"] += 3
+    # Explicit remember-phrasing — D-mem-C (2026-07-29), #371 TOOLS_DOCGEN
+    # precedent: realistic save asks scored memory=2 at most, and any payload
+    # containing a _CODE_KEYWORDS word tied them into code intent on the
+    # priority order ("Please remember: my assigned parking spot CODE is …"
+    # → code). Tool EXPOSURE was never the gap (memory_store/memory_search
+    # are always-included) — but intent drives the prompt sections and the
+    # allowed-tools restriction under the stable-prefix layout, so an
+    # explicit save request must land in memory intent. +4 beats a keyword
+    # collision (2) without outscoring a real work ask (patterns 3 + stacked
+    # keywords). Kill switch: settings.memory_tools_on_remember.
+    if _remember_boost_enabled() and is_explicit_remember_request(normalized):
+        scores["memory"] += 4
 
     # Media
     for kw in _MEDIA_KEYWORDS:
