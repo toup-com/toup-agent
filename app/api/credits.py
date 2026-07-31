@@ -459,7 +459,16 @@ async def agent_charge(
     # Bundle-mode guard — the proxy already charged this event inline, so skip
     # the agent-side charge but return the real balance/enforcement so the
     # agent's CreditState stays accurate. Mirrors the /agent-deduct guard.
-    if (cfg.llm_mode or "").strip().lower() == "bundle":
+    #
+    # meter_only is EXEMPT, and the exemption is load-bearing. A metered row
+    # carries amount=0 and never touches the balance, so it cannot produce the
+    # double charge this guard exists to prevent. Without the exemption the
+    # guard returns before writing anything, and web_search / web_fetch usage
+    # is invisible for every bundle tenant — currently 100% of the fleet (42
+    # of 42). Those are direct outbound calls from the agent to Brave; the LLM
+    # proxy never sees them, so they were never charged inline in the first
+    # place and there is nothing to double-count.
+    if (cfg.llm_mode or "").strip().lower() == "bundle" and not body.meter_only:
         view = await credit_service.get_balance_view(db, body.user_id)
         await db.commit()
         remaining = float(view.message_credits_remaining)
