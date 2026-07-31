@@ -222,6 +222,30 @@ def scaffolding_reason(
     return None
 
 
+# Identities a freshly-provisioned tenant carries before onboarding writes the
+# real ones. An alias set containing only these tells us nothing about who the
+# user is, and must not be mistaken for "the user is not involved".
+_PLACEHOLDER_ALIASES = frozenset({
+    "agent owner", "agent", "owner", "user", "toup user", "new user",
+    "unknown", "none", "test user",
+})
+
+
+def _identity_is_known(aliases: Set[str]) -> bool:
+    """True only when we hold at least one alias that identifies a real person.
+
+    Bare hex prefixes ("3134fece", from a "<prefix>@agent.local" placeholder
+    email) are excluded too — they are provisioning artefacts, not names.
+    """
+    for alias in aliases:
+        if alias in _PLACEHOLDER_ALIASES:
+            continue
+        if re.fullmatch(r"[0-9a-f]{6,}", alias):
+            continue
+        return True
+    return False
+
+
 def _is_user_endpoint(name: Optional[str], aliases: Set[str]) -> bool:
     n = _norm(name)
     if not n:
@@ -296,6 +320,21 @@ def relationship_gate_reason(
 
     aliases = {_norm(a) for a in (user_aliases or ()) if _norm(a)}
     if _is_user_endpoint(source, aliases) or _is_user_endpoint(target, aliases):
+        return None
+
+    # FAIL OPEN when we do not know who the user is.
+    #
+    # Tenant DBs are provisioned with a PLACEHOLDER identity — name "Agent
+    # Owner", email "<prefix>@agent.local" — until onboarding fills in the real
+    # one. On such a tenant the alias lookup yields nothing usable, so an edge
+    # naming the user by their actual name ("Nariman owns Toup") reads as
+    # having no user endpoint and gets dropped. Found on live tenant 3134fece,
+    # where this rule would have archived exactly that row.
+    #
+    # Dropping a real fact is far worse than keeping a marginal one, so when
+    # identity is unknown this rule abstains. The tautology, scaffolding and
+    # agent-self rules above still apply — they need no identity at all.
+    if not _identity_is_known(aliases):
         return None
 
     # Dedup MERGES relationship rows: the row keeps its original (now stale)

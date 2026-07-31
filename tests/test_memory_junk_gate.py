@@ -308,3 +308,42 @@ def test_dedup_adjudicates_the_most_similar_candidate():
     assert "key=lambda c: c.get('similarity_score', 0)" in src, (
         "dedup is still adjudicating whichever row won the relevance blend"
     )
+
+
+# ── Placeholder-identity fail-open ────────────────────────────────────────
+
+def test_no_user_endpoint_abstains_when_the_tenant_identity_is_a_placeholder():
+    """Found on live tenant 3134fece AFTER the first version shipped.
+
+    Tenant DBs are provisioned with name="Agent Owner" /
+    "<prefix>@agent.local" until onboarding writes the real identity. With no
+    usable alias, "Nariman owns Toup" reads as having no user endpoint — and
+    the backfill dry-run on that tenant proposed archiving exactly that row,
+    plus "Nariman created Toup". Dropping a real fact is worse than keeping a
+    marginal one, so the rule must abstain when identity is unknown.
+    """
+    placeholder = ["Agent Owner", "3134fece"]
+    for s, p, t in [("Nariman", "owns", "Toup"), ("Nariman", "created", "Toup")]:
+        assert relationship_gate_reason(s, p, t, user_aliases=placeholder) is None, (
+            f"{s} --{p}--> {t} dropped on a tenant with a placeholder identity"
+        )
+
+    # Identity-free rules must STILL fire on such a tenant, or the fail-open
+    # would silently disable the whole gate wherever onboarding is incomplete.
+    assert relationship_gate_reason(
+        "Sub-agent 1", "researches", "Top AI Papers", user_aliases=placeholder
+    ) is not None
+    assert relationship_gate_reason(
+        "video about X", "is_about", "X", user_aliases=placeholder
+    ) is not None
+    assert relationship_gate_reason(
+        "Assistant", "summarizes", "Gmail", user_aliases=placeholder
+    ) is not None
+
+
+def test_real_identity_still_enforces_the_user_endpoint_rule():
+    """The fail-open must not leak into tenants where we DO know the user."""
+    assert relationship_gate_reason(
+        "Better Call Saul", "play_on", "Netflix",
+        user_aliases=["Nariman", "nariman@toup.ai"],
+    ) == "no_user_endpoint"
