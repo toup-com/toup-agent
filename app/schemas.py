@@ -710,6 +710,21 @@ class SessionCreate(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class SessionMessageCreate(BaseModel):
+    """Request to append one message to a session.
+
+    The route also still reads these as query parameters, which is how every
+    caller reached it before this model existed. Voice transcripts can be
+    multi-kilobyte and non-Latin (a Farsi reply is 6 URL-encoded chars per
+    character), which overruns the URL well before it overruns a body — so the
+    body is the supported form and the query params are compatibility only.
+    """
+    role: Optional[str] = None
+    content: Optional[str] = None
+    model_used: Optional[str] = None
+    day_chat_id: Optional[str] = None
+
+
 class SessionResponse(BaseModel):
     """Response with session details"""
     id: str

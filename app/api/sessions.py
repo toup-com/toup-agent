@@ -31,7 +31,7 @@ import httpx
 from app.db import get_db, Conversation, Message, User, AgentConfig
 from app.schemas import (
     SessionCreate, SessionResponse, SessionWithMessages, SessionListResponse,
-    ChatMessageResponse
+    ChatMessageResponse, SessionMessageCreate
 )
 from app.api.auth import get_current_user
 
@@ -532,6 +532,7 @@ async def get_session_messages(
 @router.post("/{session_id}/messages", response_model=ChatMessageResponse, status_code=status.HTTP_201_CREATED)
 async def create_session_message(
     session_id: str,
+    body: Optional[SessionMessageCreate] = None,
     role: str = "user",
     content: str = "",
     model_used: Optional[str] = None,
@@ -544,8 +545,19 @@ async def create_session_message(
 
     Used by the platform voice route to persist voice messages
     on the user's VPS database (not platform DB).
+
+    Accepts the fields either as a JSON body or as query parameters. The
+    query form is what shipped originally; the body was added because voice
+    transcripts are too long (and too often non-Latin) to survive a URL. Body
+    wins when both are present.
     """
     import uuid as _uuid
+
+    if body is not None:
+        role = body.role or role
+        content = body.content or content
+        model_used = body.model_used or model_used
+        day_chat_id = body.day_chat_id or day_chat_id
 
     # Verify session ownership
     session_query = select(Conversation).where(

@@ -45,6 +45,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 import websockets
@@ -712,10 +713,26 @@ async def _vps_api(
         else:
             resp = await client.post(
                 url, headers={"X-Agent-Key": agent_api_key},
-                json=json_body or {}, timeout=timeout,
+                params=params or {}, json=json_body or {}, timeout=timeout,
             )
-        if resp.status_code == 200:
-            return resp.json()
+        # Any 2xx, not just 200. Every write route on the agent answers 201
+        # Created (POST /api/sessions, POST /api/sessions/{id}/messages, POST
+        # /api/identity), so a 200-only check discarded the response body of
+        # each one. That is how voice transcripts were lost: session creation
+        # really did succeed with 201, this returned None anyway, and
+        # _get_or_create_voice_session fell through to a locally-invented UUID
+        # that exists on no agent — so every later message POST 404'd.
+        if 200 <= resp.status_code < 300:
+            if not resp.content:
+                return {}
+            try:
+                return resp.json()
+            except ValueError:
+                logger.warning(
+                    "[REALTIME] VPS API %s %s → %s, non-JSON body",
+                    method, path, resp.status_code,
+                )
+                return None
         logger.warning("[REALTIME] VPS API %s %s → %s", method, path, resp.status_code)
     except Exception as e:
         logger.warning("[REALTIME] VPS API %s %s failed: %s", method, path, e)
@@ -1061,6 +1078,36 @@ async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) 
     return fallback_id
 
 
+# Ceiling for the query-parameter compatibility shim below. Measured against a
+# live agent rather than assumed: 64 KB of encoded content still returned 201,
+# and the request only failed to complete somewhere before 100 KB. 16 KB keeps
+# a 4x margin under the proven-good point, and still covers ~2,600 characters
+# of Farsi (~6 encoded bytes each) — longer than any spoken turn.
+_QUERY_SHIM_MAX = 16000
+
+
+def _message_payload(role: str, content: str, model: Optional[str] = None):
+    """Build (json_body, query_params) for POST /api/sessions/{id}/messages.
+
+    Agent images that predate the body-aware route read role/content as QUERY
+    parameters; newer ones prefer the JSON body. Sending both in ONE request
+    satisfies either build — the old one reads the query and ignores the body,
+    the new one lets the body win — so a platform deploy heals the whole fleet
+    without waiting on an agent rollout.
+
+    The shim is dropped when the encoded content would overrun a URL. A Farsi
+    reply encodes to ~6 chars per character, so a long one blows past the
+    request-line limit; body-only still works on any agent new enough to read
+    it, and the caller logs the loss if that agent isn't.
+    """
+    body = {"role": role, "content": content}
+    if model:
+        body["model_used"] = model
+    if len(quote(content)) > _QUERY_SHIM_MAX:
+        return body, None
+    return body, dict(body)
+
+
 async def _save_voice_messages(
     user_id: str,
     session_id: str,
@@ -1087,27 +1134,36 @@ async def _save_voice_messages(
         return
 
     agent_url, agent_api_key = vps
-    count = 0
+    saved = 0
+    lost = 0
 
-    if user_text:
+    for _role, _text, _model in (
+        ("user", user_text, None),
+        ("assistant", assistant_text, model),
+    ):
+        if not _text:
+            continue
+        body, params = _message_payload(_role, _text, _model)
         result = await _vps_api(
             agent_url, agent_api_key, "POST",
             f"/api/sessions/{session_id}/messages",
-            json_body={"role": "user", "content": user_text},
+            params=params, json_body=body,
         )
         if result:
-            count += 1
+            saved += 1
+        else:
+            lost += 1
 
-    if assistant_text:
-        result = await _vps_api(
-            agent_url, agent_api_key, "POST",
-            f"/api/sessions/{session_id}/messages",
-            json_body={"role": "assistant", "content": assistant_text, "model_used": model},
+    if lost:
+        # ERROR, not INFO. This is the only thing that persists a spoken turn —
+        # `think` deliberately calls the agent with save=False to avoid a
+        # duplicate day-chat entry, so a failure here loses the transcript
+        # outright rather than degrading it.
+        logger.error(
+            "[REALTIME] LOST %d voice message(s) for session %s — transcript NOT persisted",
+            lost, session_id[:8],
         )
-        if result:
-            count += 1
-
-    logger.info("[REALTIME] Saved %d message(s) to VPS session %s via API", count, session_id[:8])
+    logger.info("[REALTIME] Saved %d message(s) to VPS session %s via API", saved, session_id[:8])
 
 
 # ── Background memory extraction (mirrors agent_runner._extract_memories) ──

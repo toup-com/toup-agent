@@ -67,7 +67,20 @@ class Conversation(Base):
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="conversations")
     day_chat: Mapped[Optional["DayChat"]] = relationship("DayChat", back_populates="conversations")
-    messages: Mapped[List["Message"]] = relationship("Message", back_populates="conversation", order_by="Message.created_at")
+    # delete-orphan is load-bearing: deleting a Conversation has to take its
+    # messages with it. Without it SQLAlchemy's default is to NULL out
+    # messages.conversation_id, which is NOT NULL — so DELETE /api/sessions/{id}
+    # raised IntegrityError and answered 500 for every session that had ever
+    # carried a message. Empty sessions deleted fine, which is how a route
+    # documented as "delete a session and all its messages" stayed broken.
+    # Account deletion is unaffected: user_deletion.py removes messages with
+    # raw SQL rather than through this relationship.
+    messages: Mapped[List["Message"]] = relationship(
+        "Message",
+        back_populates="conversation",
+        order_by="Message.created_at",
+        cascade="all, delete-orphan",
+    )
 
 
 class Message(Base):
