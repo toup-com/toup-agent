@@ -270,6 +270,19 @@ class Settings(BaseSettings):
     # the same deploy that first measures them.
     web_tool_metering_enabled: bool = True
     web_tool_metering_charge: bool = False
+    # Brave's 50 req/s is an ACCOUNT ceiling shared by every key and therefore
+    # by every tenant on the platform's shared key, so one runaway agent loop
+    # can starve the whole fleet. These bound ONE tenant's share, enforced in
+    # its own container (agents share no memory, so a true fleet-wide limiter
+    # would need a coordinator that does not exist yet).
+    # 2/s sustained with a burst of 5 comfortably covers a real turn — even
+    # one that fans out several parallel web_search calls — while capping a
+    # runaway loop far below the shared ceiling.
+    brave_rate_per_sec: float = 2.0
+    brave_burst: int = 5
+    # After a 429 the account ceiling is already hit; retrying into it just
+    # adds a wasted round-trip to every subsequent search.
+    brave_cooldown_s: float = 30.0
     # Kill-switch (default on): keep the tenant workspace writable by BOTH the
     # root agent and the uid-1000 exec sandbox it drops children to. Replaces
     # the post-rollout manual `chmod -R a+rwX workspace/generated` that had to

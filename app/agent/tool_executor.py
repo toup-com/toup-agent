@@ -48,6 +48,81 @@ def _search_degraded(*, skipped: str, reason: str, query: str) -> None:
     )
 
 
+# ── Brave client-side throttle ─────────────────────────────────────────
+# Brave's 50 req/s is an ACCOUNT ceiling, shared across every key and so
+# across every tenant on the platform's one shared key. One runaway agent loop
+# can starve all of them.
+#
+# What is NOT possible here: a true fleet-wide limiter. Agents are separate
+# containers with no shared memory, so a global 50 r/s would need a
+# coordinator (Redis, or routing search through platform-api) that does not
+# exist. What IS enforceable in-process is a per-tenant bound — the half that
+# actually stops one tenant eating the whole quota. Bursts are real, not
+# hypothetical: AgentRunner.PARALLEL_SAFE_TOOLS pre-executes several
+# web_search calls concurrently from a single turn.
+class _TokenBucket:
+    """Monotonic token bucket.
+
+    Deliberately not thread-safe: the agent's tool calls run on one asyncio
+    loop, so there is no cross-thread contention to guard and a lock would
+    only cost time on the hot path.
+    """
+
+    __slots__ = ("_rate", "_burst", "_tokens", "_last")
+
+    def __init__(self, rate: float, burst: float) -> None:
+        self._rate = max(0.01, float(rate))
+        self._burst = max(1.0, float(burst))
+        self._tokens = self._burst
+        self._last = time.monotonic()
+
+    def take(self) -> bool:
+        now = time.monotonic()
+        self._tokens = min(
+            self._burst, self._tokens + (now - self._last) * self._rate
+        )
+        self._last = now
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return True
+        return False
+
+
+_brave_bucket: Optional["_TokenBucket"] = None
+_brave_cooldown_until: float = 0.0
+
+
+def _brave_allowed() -> tuple:
+    """May this container call Brave right now? Returns (ok, why_not)."""
+    global _brave_bucket
+    if time.monotonic() < _brave_cooldown_until:
+        return False, "cooldown_after_429"
+    if _brave_bucket is None:
+        _brave_bucket = _TokenBucket(
+            getattr(settings, "brave_rate_per_sec", 2.0),
+            getattr(settings, "brave_burst", 5),
+        )
+    if not _brave_bucket.take():
+        return False, "tenant_rate_limit"
+    return True, ""
+
+
+def _brave_note_429() -> None:
+    """Brave rate-limited us — stop asking for a while.
+
+    Without a cooldown every later search still pays a full Brave round-trip
+    before falling through, turning a rate-limit into added latency on EVERY
+    query rather than one clean downgrade to the next tier.
+    """
+    global _brave_cooldown_until
+    cooldown = float(getattr(settings, "brave_cooldown_s", 30.0))
+    _brave_cooldown_until = time.monotonic() + cooldown
+    logger.warning(
+        "[web_search] Brave returned 429 — skipping the Brave tier for %.0fs",
+        cooldown,
+    )
+
+
 # Once per process, deliberately. A missing key is a CONFIGURATION defect,
 # not a per-query event — logging it on every search would bury the very
 # signal it exists to raise, and at fleet scale would dominate the log spend.
@@ -1509,19 +1584,36 @@ class ToolExecutor:
         # on datacenter IPs (DDG 202-challenge, Bing CAPTCHA), so when the key is
         # present this is the path that actually serves users fast.
         if settings.brave_api_key:
-            try:
-                result = await self._brave_search_fallback(query, count)
-                if result and result.strip() != "No results found.":
-                    _sf_search.cache_set(query, count, result)
-                    await self._meter_web_tool(
-                        "web_search", tier="brave_api", engine="brave",
-                        started=started, query=query,
+            _ok, _why = _brave_allowed()
+            if not _ok:
+                # Throttled or cooling down. Fall through to the next tier
+                # rather than fail — a rate limit must degrade the result,
+                # never deny the user an answer.
+                _search_degraded(skipped="brave_api", reason=_why, query=query)
+            else:
+                try:
+                    result = await self._brave_search_fallback(query, count)
+                    if result and result.strip() != "No results found.":
+                        _sf_search.cache_set(query, count, result)
+                        await self._meter_web_tool(
+                            "web_search", tier="brave_api", engine="brave",
+                            started=started, query=query,
+                        )
+                        return result
+                    _search_degraded(skipped="brave_api", reason="empty_result", query=query)
+                except Exception as exc:
+                    # A 429 means the ACCOUNT ceiling is hit — shared with
+                    # every other tenant — so back off for everyone on this
+                    # container instead of retrying into the same wall.
+                    _status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if _status == 429:
+                        _brave_note_429()
+                    _search_degraded(
+                        skipped="brave_api",
+                        reason=f"http_{_status}" if _status else f"error:{type(exc).__name__}",
+                        query=query,
                     )
-                    return result
-                _search_degraded(skipped="brave_api", reason="empty_result", query=query)
-            except Exception as exc:
-                _search_degraded(skipped="brave_api", reason=f"error:{type(exc).__name__}", query=query)
-                logger.warning("[web_search] Brave API failed: %s", exc)
+                    logger.warning("[web_search] Brave API failed: %s", exc)
         else:
             _warn_brave_unconfigured()
 
