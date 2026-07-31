@@ -283,6 +283,34 @@ class Settings(BaseSettings):
     # After a 429 the account ceiling is already hit; retrying into it just
     # adds a wasted round-trip to every subsequent search.
     brave_cooldown_s: float = 30.0
+    # Fleet headroom floor. Brave reports remaining requests against the
+    # shared per-second ACCOUNT ceiling on every response; the gateway sheds
+    # to lower tiers while that number sits at or below this. It is the only
+    # fleet-wide signal available — there is no Redis, and platform-api runs
+    # more than one replica, so no counter of ours can see the whole fleet.
+    brave_fleet_floor: int = 5
+
+    # Search-quota monitor (app/services/search_quota_monitor.py). Brave's
+    # monthly rate-limit bucket reports limit 0 / remaining 0 on this plan, so
+    # remaining credits CANNOT be read off a response header — the monthly
+    # alarm is our own count of search_events rows that reached Brave, checked
+    # against a budget stated here. If the plan changes, this number is the
+    # only thing that knows.
+    search_quota_monitor_enabled: bool = True
+    search_quota_check_interval_s: int = 3600
+    # Look-back for the rate-based alarms, and the sample floor below which a
+    # rate is noise rather than signal.
+    search_alert_window_h: int = 3
+    search_alert_min_samples: int = 20
+    # Operator-stated monthly allowance. Nothing can discover it for us.
+    brave_monthly_budget: int = 2000
+    brave_monthly_warn_pct: float = 80.0
+    brave_monthly_critical_pct: float = 95.0
+    # Share of calls shed to slower tiers over the window.
+    search_throttle_warn_pct: float = 25.0
+    search_throttle_critical_pct: float = 50.0
+    # Share of readings at or below brave_fleet_floor.
+    search_headroom_warn_pct: float = 10.0
     # Kill-switch (default on): keep the tenant workspace writable by BOTH the
     # root agent and the uid-1000 exec sandbox it drops children to. Replaces
     # the post-rollout manual `chmod -R a+rwX workspace/generated` that had to
@@ -769,7 +797,10 @@ class Settings(BaseSettings):
     exec_env_scrub_keys: list[str] = [
         "POOL_ADMIN_TOKEN",          # platform pool-admin bearer (cross-tenant)
         "AGENT_API_KEY",             # the agent's own inbound auth key
-        "BRAVE_API_KEY",             # platform-shared search key
+        "BRAVE_API_KEY",             # tenant BYOK only — the platform key no
+                                     # longer ships to containers (search
+                                     # gateway holds it); kept for containers
+                                     # that still carry a stale or BYOK value
         "TOUP_TOKEN",                # LLM-proxy bearer (agent process only)
         "OPENAI_API_KEY",            # provider keys — used by the process, not shells
         "ANTHROPIC_API_KEY",

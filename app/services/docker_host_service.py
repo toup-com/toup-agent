@@ -279,31 +279,19 @@ def _agent_config_to_bridge_body(agent_config: Optional[AgentConfig]) -> dict:
     # was caused by this field never being forwarded.
     if getattr(agent_config, "llm_mode", None):
         out["llm_mode"] = agent_config.llm_mode
-    # Service keys (Brave search, ElevenLabs TTS).
+    # Service keys (Brave search, ElevenLabs TTS) — TENANT columns only.
+    # The PLATFORM Brave key is deliberately no longer forwarded here: it now
+    # lives only in the search gateway (app/api/search_proxy.py), which every
+    # container reaches with the TOUP_TOKEN it already holds, so the fleet
+    # secret exists in one process instead of 42 .env files.
+    # Caveat worth knowing before someone "fixes" a tenant's missing results:
+    # a tenant's OWN brave_api_key still ships but is currently INERT — the
+    # agent's direct-Brave call was removed with the gateway, so nothing in
+    # the container reads BRAVE_API_KEY any more.
     for field in ("brave_api_key", "elevenlabs_api_key"):
         val = getattr(agent_config, field, None)
         if val:
             out[field] = val
-    # Brave is documented as a PLATFORM-shared key ("one key, all tenants" —
-    # config.brave_api_key, and it's in exec_env_scrub_keys as
-    # "platform-shared search key"), but the only delivery path above is the
-    # per-tenant column. Nobody ever backfilled it, so every tenant shipped
-    # with an empty key and web_search silently degraded to its slowest tier:
-    # a headless Chromium scraping search.brave.com at ~4-6s instead of a
-    # ~200ms JSON call. Falling back to the platform's own key makes setting
-    # BRAVE_API_KEY once on platform-api enough to serve every tenant.
-    # A tenant-specific key (BYOK) still wins.
-    #
-    # DELIVERY IS NOT AUTOMATIC — this function is called from exactly one
-    # place, provision_container. `upgrade_tenant_image` sends only
-    # {image_tag, rollout_id}, so an image ROLLOUT does not re-send env and a
-    # newly-set platform key reaches nobody. Running containers pick it up
-    # only when something re-provisions them: a tenant config save, or the
-    # operator sweep POST /api/admin/infrastructure/resync-env.
-    if not out.get("brave_api_key"):
-        platform_brave = (getattr(settings, "brave_api_key", "") or "").strip()
-        if platform_brave:
-            out["brave_api_key"] = platform_brave
     # WhatsApp (Cloud API / Path A — BYOA Meta App).
     for field in (
         "whatsapp_phone_number_id", "whatsapp_access_token",

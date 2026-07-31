@@ -68,7 +68,6 @@ PLATFORM_API_URL={settings.platform_api_url}
 OPENAI_API_KEY={settings.openai_api_key or ""}
 ANTHROPIC_API_KEY={settings.anthropic_api_key or ""}
 AGENT_MODEL={settings.agent_model}
-BRAVE_API_KEY={settings.brave_api_key or ""}
 
 # Embedding (same as platform for vector compatibility)
 EMBEDDING_PROVIDER={settings.embedding_provider}

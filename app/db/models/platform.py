@@ -1,10 +1,11 @@
 """Platform-specific models — VPS provisioning, invites, LLM billing."""
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional, List
 import uuid
 
-from sqlalchemy import String, Text, DateTime, Float, Integer, Boolean, ForeignKey, Index
+from sqlalchemy import String, Text, DateTime, Float, Integer, Boolean, ForeignKey, Index, Numeric
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
 from .base import Base
@@ -195,6 +196,79 @@ class LLMProxyEvent(Base):
         Index("ix_llm_proxy_user_created", "user_id", "created_at"),
         Index("ix_llm_proxy_user_provider_created", "user_id", "provider", "created_at"),
         Index("ix_llm_proxy_operation_type", "operation_type"),
+    )
+
+
+class SearchEvent(Base):
+    """One row per search served through the platform search gateway.
+
+    Deliberately NOT folded into ``llm_proxy_events``: that table's
+    ``provider``/``endpoint`` are String(20) and would have to carry tier
+    semantics they were never named for. And deliberately not left in
+    ``credit_ledger`` alone — that table is an immutable billing audit trail
+    shared by 18 event types, so per-search telemetry there is a JSONB scan
+    (``metadata->>'tier'``) with no index, which is how "searches per user per
+    day" became a full ledger scan.
+
+    Every column here is a real typed column so the five questions the founder
+    asked — how many searches per user per day, how slow, which tier answered,
+    what was throttled or fell back, and what did it cost whom — are each one
+    indexed query.
+
+    ``query_sha256`` is a 16-hex truncation, never the query text. A search
+    query is the most sensitive string a private agent handles; the hash exists
+    only to spot a runaway loop repeating one query, which is the failure this
+    telemetry is for.
+    """
+    __tablename__ = "search_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    # Which rung of the ladder actually produced the answer.
+    # brave_api | cache | httpx_race | browser_brave | none
+    tier: Mapped[str] = mapped_column(String(20), nullable=False)
+    engine: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+
+    # ok | throttled | error
+    status: Mapped[str] = mapped_column(String(16), default="ok", nullable=False)
+    # Why Brave did not serve this one: tenant_rate_limit | fleet_headroom |
+    # cooldown_after_429 | http_429 | unconfigured | upstream_error | empty_result
+    degraded_reason: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    # True when a rung BELOW brave_api answered — the founder's "fallback event".
+    was_fallback: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    result_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Cost attribution. `credits` is the unit users are billed in.
+    # `cost_cents` is our own upstream cost and is RESERVED, not populated:
+    # Brave is flat-rate per query on this plan, so there is no per-call figure
+    # to record. A metered per-call engine would fill it; do not read it as
+    # zero-cost. `charged` is False while metering is in dry-run
+    # (web_tool_metering_charge), so the usage series exists before the billing
+    # does — the same meter_only pattern the credit ledger already uses.
+    credits: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 4), nullable=True)
+    cost_cents: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 4), nullable=True)
+    charged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # voice | chat | job | routine | trigger — which surface asked.
+    channel: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    query_sha256: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+
+    # Fleet headroom Brave itself reported on this call (x-ratelimit-remaining,
+    # first bucket). This is the ONLY fleet-wide view of the shared 50 rps
+    # account ceiling that exists — Brave computes it across every key on the
+    # plan, so no coordinator of ours can reproduce it. Recording it is what
+    # makes quota alerting possible without a second source of truth.
+    brave_remaining: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_search_events_user_created", "user_id", "created_at"),
+        Index("ix_search_events_created", "created_at"),
+        Index("ix_search_events_status_created", "status", "created_at"),
     )
 
 

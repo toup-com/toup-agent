@@ -128,6 +128,10 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "llm_bundle_allocations",
     "llm_usage_records",
     "llm_proxy_events",
+    # Search gateway telemetry. Platform-only by construction: the whole point
+    # of the gateway is that the tenant container no longer sees the upstream
+    # call, so it has nothing to write here.
+    "search_events",
     # Streaming credentials (platform stores, agent fetches via API)
     "streaming_credentials",
     "credential_access_log",

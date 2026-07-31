@@ -601,27 +601,36 @@ async def resync_env(
     _=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Push the current agent_config to tenants, so PLATFORM-level keys land.
+    """Re-push a tenant's own agent_config env to its container.
 
-    This exists because a platform-shared secret had no delivery path. The
-    only call site of ``_agent_config_to_bridge_body`` is
-    ``provision_container``; ``upgrade_tenant_image`` sends just
-    ``{image_tag, rollout_id}``. So an image rollout does NOT re-send env, and
-    a newly-set platform key (BRAVE_API_KEY) reaches exactly nobody until
-    something re-provisions each tenant. That is why every one of 42 tenants
-    ran with an empty Brave key while `web_search` silently degraded to a
-    ~4-6s headless-browser scrape.
+    ORIGINAL REASON TO EXIST — GONE. This was built as the delivery path for
+    the platform-shared Brave key: ``_agent_config_to_bridge_body`` is called
+    only from ``provision_container`` and ``upgrade_tenant_image`` sends just
+    ``{image_tag, rollout_id}``, so a newly-set platform key reached nobody
+    until something re-provisioned each tenant. No container needs a Brave key
+    any more — the search gateway (``app/api/search_proxy.py``) holds the only
+    one and containers call it with their existing TOUP_TOKEN. Kept because it
+    is still the only tool that re-pushes the ~25 OTHER per-tenant env fields
+    ``_agent_config_to_bridge_body`` forwards (llm_mode, channel tokens,
+    whatsapp_*, connect_token, elevenlabs), which have the same
+    no-automatic-delivery problem.
 
-    ``dry_run`` defaults to TRUE on purpose. A real run re-provisions
-    containers, and a container recreate kills whatever that tenant's agent
-    was doing — the same class of interruption that shows up to users as
-    "This task stopped when your agent restarted". Pool-backed tenants take
-    the warm ``/v1/pool/refresh-config`` path inside ``update_container_env``
-    and keep their state; dedicated tenants are recreated. Sequential by
-    design: 42 concurrent recreates would hammer the bridge, and this is an
-    operator action measured in minutes, not a hot path.
+    DO NOT RUN THIS FLEET-WIDE. Founder's standing instruction, and it stands
+    until graceful drain ships: a real run re-provisions containers, and a
+    container recreate kills whatever that tenant's agent was mid-way through
+    — the interruption users read as "This task stopped when your agent
+    restarted". Single-tenant runs (``user_id=...``) are the intended use.
+
+    ``dry_run`` defaults to TRUE on purpose. Pool-backed tenants take the warm
+    ``/v1/pool/refresh-config`` path inside ``update_container_env`` and keep
+    their state; dedicated tenants are recreated. Sequential by design: 42
+    concurrent recreates would hammer the bridge, and this is an operator
+    action measured in minutes, not a hot path.
     """
-    from app.services.docker_host_service import update_container_env
+    from app.services.docker_host_service import (
+        _agent_config_to_bridge_body,
+        update_container_env,
+    )
 
     q = select(AgentConfig)
     if user_id:
@@ -630,14 +639,13 @@ async def resync_env(
     if limit > 0:
         configs = configs[:limit]
 
-    platform_key_set = bool((getattr(settings, "brave_api_key", "") or "").strip())
     results = []
     for cfg in configs:
         row = {
             "user_id": cfg.user_id[:8],
-            "tenant_brave_key": bool(cfg.brave_api_key),
-            # What the tenant will actually end up with once pushed.
-            "will_have_brave": bool(cfg.brave_api_key) or platform_key_set,
+            # How many env fields this push would actually carry — the honest
+            # answer to "is there anything to sync for this tenant".
+            "env_fields": len(_agent_config_to_bridge_body(cfg)),
         }
         if dry_run:
             row["status"] = "dry_run"
@@ -655,8 +663,6 @@ async def resync_env(
 
     return {
         "dry_run": dry_run,
-        "platform_brave_key_set": platform_key_set,
         "tenants": len(results),
-        "would_have_brave": sum(1 for r in results if r["will_have_brave"]),
         "results": results,
     }

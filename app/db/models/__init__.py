@@ -56,7 +56,7 @@ from .trigger import (
 from .soul_config import SoulConfig
 
 # Platform (VPS, invites, billing)
-from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent, PlatformSetting
+from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent, SearchEvent, PlatformSetting
 
 # Maintenance / support agent (platform-only — admin maintenance system)
 from .support import SupportIssue, SupportIssueEvent, SupportAttachment
@@ -180,7 +180,7 @@ __all__ = [
     "Trigger", "TriggerEvent",
     "TRIGGER_KINDS", "TRIGGER_ACTIONS", "TRIGGER_STATUSES", "TRIGGER_EVENT_STATUSES",
     "SoulConfig",
-    "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord", "LLMProxyEvent", "PlatformSetting",
+    "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord", "LLMProxyEvent", "SearchEvent", "PlatformSetting",
     "Rollout", "RolloutAttempt",
     "ROLLOUT_STATUSES", "ROLLOUT_ATTEMPT_STATUSES", "ROLLOUT_TRIGGERS",
     "StreamingCredential", "CredentialAccessLog",
