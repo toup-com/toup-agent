@@ -398,11 +398,16 @@ class AgentChargeRequest(BaseModel):
     """Posted by the tenant agent to charge an EXPLICIT per-event credit
     amount that is NOT derived from token counts.
 
-    Used for tools priced per-event rather than per-token — today, image
-    generation (gpt-image-1), which is priced per image by (size, quality).
-    ``credits`` is the already-converted amount to deduct;
-    ``underlying_cost_cents`` is stored for audit. ``idempotency_key`` should
-    uniquely identify the event (a fresh UUID per image is fine).
+    Used for tools priced per-event rather than per-token — image generation
+    (gpt-image-1, priced per image by size/quality) and the web tools
+    (web_search / web_fetch, flat-fee per call). ``credits`` is the
+    already-converted amount to deduct; ``underlying_cost_cents`` is stored
+    for audit. ``idempotency_key`` should uniquely identify the event (a
+    fresh UUID per event is fine).
+
+    ``meter_only=True`` records the ledger row WITHOUT touching the balance
+    and always returns success — the landing mode for a newly-priced event.
+    See ``CreditService.try_charge`` for the full contract.
     """
     user_id: str
     event_type: str = "image_generation"
@@ -413,6 +418,7 @@ class AgentChargeRequest(BaseModel):
     underlying_cost_cents: Optional[float] = None
     idempotency_key: Optional[str] = None
     metadata: Optional[dict] = None
+    meter_only: bool = False
 
 
 @router.post("/agent-charge", response_model=AgentDeductResponse)
@@ -477,6 +483,7 @@ async def agent_charge(
         provider=body.provider,
         underlying_cost_cents=body.underlying_cost_cents,
         metadata={"surface": "agent_charge", **(body.metadata or {})},
+        meter_only=body.meter_only,
     )
     view = await credit_service.get_balance_view(db, body.user_id)
     await db.commit()
@@ -485,7 +492,13 @@ async def agent_charge(
     return AgentDeductResponse(
         success=result.success,
         bucket=bucket,
-        amount_charged=float(credits) if result.success else 0.0,
+        # meter_only never moves the balance, so it never "charged" anything —
+        # reporting a non-zero amount here would double-count in any caller
+        # that sums amount_charged.
+        amount_charged=(
+            0.0 if body.meter_only
+            else (float(credits) if result.success else 0.0)
+        ),
         balance_after=float(result.balance_after),
         enforcement_enabled=bool(getattr(_settings, "credit_enforcement_enabled", False)),
         reason=result.reason,
