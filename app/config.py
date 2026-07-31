@@ -289,6 +289,13 @@ class Settings(BaseSettings):
     # fleet-wide signal available — there is no Redis, and platform-api runs
     # more than one replica, so no counter of ours can see the whole fleet.
     brave_fleet_floor: int = 5
+    # platform-api replica count (railway.json deploy.numReplicas). Rate-limit
+    # buckets in search_proxy are per PROCESS, so this is what makes
+    # brave_rate_per_sec/brave_burst mean their stated value fleet-wide rather
+    # than N times it. Measured 2026-07-31: with this unset, a configured burst
+    # of 5 let 10 requests through in 762ms across 2 replicas.
+    # KEEP IN SYNC with railway.json.
+    platform_replicas: int = 2
 
     # Search-quota monitor (app/services/search_quota_monitor.py). Brave's
     # monthly rate-limit bucket reports limit 0 / remaining 0 on this plan, so

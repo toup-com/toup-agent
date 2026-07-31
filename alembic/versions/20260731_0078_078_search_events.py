@@ -26,12 +26,28 @@ platform DB and needs no mirrored ``ADD COLUMN IF NOT EXISTS`` in
 change the tenant container never performs the upstream call, so it has
 nothing to record.
 
-NOTE ON REACH — ``alembic upgrade head`` runs on boot in BOTH images
-(``Dockerfile`` for platform-api and ``Dockerfile.agent`` for every tenant), so
-this revision is executed against agent databases too. The ``users`` guard
-below is the house pattern for that (see revision 074) and must not be
-removed: without it a failing revision here would halt an agent's migration
-chain at 078 and silently strand every later one.
+NOTE ON REACH — this bit is load-bearing, and the first version of this
+revision got it wrong in production.
+
+``alembic upgrade head`` runs on boot in BOTH images (``Dockerfile`` for
+platform-api and ``Dockerfile.agent`` for every tenant), so a revision here
+executes against agent databases too. The house guard for that (revision 074)
+is "skip if ``users`` is absent" — but ``users`` is a SHARED table and DOES
+exist in every agent DB, so that guard does not skip anything. The first
+version of this revision therefore created ``search_events`` inside the canary
+tenant's agent database, and:
+
+  * ``CREATE TABLE … REFERENCES users`` takes a lock on ``users``;
+  * a blue/green upgrade runs the NEW container against the SAME database the
+    OLD one is still serving from;
+  * so green sat in ``green_health_wait`` for 258 s with 0 health checks
+    passed, the bridge rolled it back, and CI gated the rollout
+    (``aborted_canary_failed``, image ``bd1411770ad6``).
+
+The gate below is therefore ``settings.run_mode``, the same signal
+``init_db`` partitions on — not a table-presence heuristic. A PLATFORM_ONLY
+table must never be created by a migration running in an agent container, for
+the same reason ``init_db`` excludes it from ``create_all``.
 """
 from __future__ import annotations
 
@@ -50,14 +66,36 @@ logger = logging.getLogger("alembic.078")
 _TABLE = "search_events"
 
 
+def _is_platform_db() -> bool:
+    """True only where a PLATFORM_ONLY table belongs.
+
+    Reads ``settings.run_mode`` — the same signal ``init_db`` uses to decide
+    which tables to create — so the migration and the ORM cannot disagree.
+    "monolith" is included because legacy single-database installs hold every
+    table. If the setting cannot be read at all, skip: creating this table
+    where it does not belong is the failure mode that cost a rollout, and not
+    creating it merely means search telemetry waits for the next boot.
+    """
+    try:
+        from app.config import settings
+        return (settings.run_mode or "").strip().lower() in ("platform", "monolith")
+    except Exception:
+        logger.warning("[alembic.078] run_mode unreadable; skipping to stay safe")
+        return False
+
+
 def upgrade() -> None:
+    if not _is_platform_db():
+        logger.info("[alembic.078] not a platform DB; skipping (search_events is PLATFORM_ONLY)")
+        return
+
     conn = op.get_bind()
     insp = sa.inspect(conn)
     insp.clear_cache()
 
     tables = set(insp.get_table_names())
     if "users" not in tables:
-        logger.info("[alembic.078] users absent; skipping (not a platform DB)")
+        logger.info("[alembic.078] users absent; skipping")
         return
     if _TABLE in tables:
         logger.info("[alembic.078] %s already present", _TABLE)

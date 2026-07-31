@@ -148,7 +148,18 @@ async def auth_agent_user_id(request: Request, db: AsyncSession) -> str:
 
 
 class _TokenBucket:
-    """Per-tenant share of the fleet ceiling. Bounds one runaway loop."""
+    """Per-tenant share of the fleet ceiling. Bounds one runaway loop.
+
+    Held per PROCESS, so with N replicas a tenant gets N buckets. Measured on
+    production 2026-07-31: a 10-request burst inside 762 ms was served in full
+    against a configured burst of 5, and Brave's own remaining counter fell
+    49 -> 40, confirming all ten reached upstream. ``_effective_rate`` divides
+    the configured numbers by ``platform_replicas`` so the config value means
+    what it says fleet-wide. That division is an approximation — it assumes
+    even load balancing — which is why it is the *secondary* bound. The
+    primary one is ``_FleetGuard``, which needs no such assumption because it
+    reads Brave's own fleet-wide number.
+    """
 
     __slots__ = ("_rate", "_burst", "_tokens", "_last")
 
@@ -233,13 +244,22 @@ _buckets: dict[str, _TokenBucket] = {}
 _fleet = _FleetGuard()
 
 
+def _effective_rate() -> tuple[float, int]:
+    """Per-process share of the configured per-tenant rate.
+
+    See ``_TokenBucket``: buckets are per process, so the configured value has
+    to be divided by the replica count to mean anything fleet-wide.
+    """
+    replicas = max(1, int(getattr(settings, "platform_replicas", 1)))
+    rate = float(getattr(settings, "brave_rate_per_sec", 2.0)) / replicas
+    burst = max(1, int(getattr(settings, "brave_burst", 5)) // replicas)
+    return rate, burst
+
+
 def _tenant_allowed(user_id: str) -> tuple[bool, Optional[str]]:
     bucket = _buckets.get(user_id)
     if bucket is None:
-        bucket = _TokenBucket(
-            getattr(settings, "brave_rate_per_sec", 2.0),
-            getattr(settings, "brave_burst", 5),
-        )
+        bucket = _TokenBucket(*_effective_rate())
         _buckets[user_id] = bucket
     if not bucket.take():
         return False, "tenant_rate_limit"

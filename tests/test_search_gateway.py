@@ -55,13 +55,17 @@ def _isolate_gateway_state(monkeypatch):
     drained bucket would otherwise leak into every test that ran after it. The
     route reads each through the module global at call time, so rebinding the
     name is enough. `sp.settings` is its own Settings instance (config.py's
-    get_settings() constructs a new one per call), so patching it here does not
-    touch anything else's view of config.
+    monkeypatch restores it after each test.
     """
     monkeypatch.setattr(sp, "_TOKEN_CACHE", {})
     monkeypatch.setattr(sp, "_buckets", {})
     monkeypatch.setattr(sp, "_fleet", sp._FleetGuard())
     monkeypatch.setattr(sp.settings, "brave_api_key", _TEST_KEY)
+    # One process, so the configured per-tenant burst IS the effective burst.
+    # In production platform_replicas divides it (railway.json numReplicas=2);
+    # pinning 1 here keeps every rate-limit assertion about the bucket maths
+    # rather than about the replica divisor.
+    monkeypatch.setattr(sp.settings, "platform_replicas", 1)
 
 
 class _FakeBrave:
@@ -763,3 +767,42 @@ async def test_empty_query_is_rejected(gw, brave, tenant):
     )
     assert res.status_code == 422, res.text
     assert not brave.requests
+
+
+# ── The replica divisor ──────────────────────────────────────────────
+#
+# Every test above pins platform_replicas=1 so its assertions are about the
+# bucket maths. This one is about the divisor itself, which exists because a
+# production burst of 10 inside 762ms was served in full against a configured
+# burst of 5 (two replicas, two buckets, Brave's own counter 49 -> 40).
+
+
+def test_effective_rate_divides_by_replica_count(monkeypatch):
+    monkeypatch.setattr(sp.settings, "brave_rate_per_sec", 2.0)
+    monkeypatch.setattr(sp.settings, "brave_burst", 5)
+
+    monkeypatch.setattr(sp.settings, "platform_replicas", 1)
+    assert sp._effective_rate() == (2.0, 5)
+
+    monkeypatch.setattr(sp.settings, "platform_replicas", 2)
+    assert sp._effective_rate() == (1.0, 2)
+
+
+def test_effective_rate_never_returns_a_zero_bucket(monkeypatch):
+    """A burst that divides below 1 must still admit one call.
+
+    Without the floor, raising the replica count past the configured burst
+    would silently take fast search away from every tenant rather than
+    slowing it — the degrade-never-deny contract broken by arithmetic.
+    """
+    monkeypatch.setattr(sp.settings, "brave_burst", 3)
+    monkeypatch.setattr(sp.settings, "brave_rate_per_sec", 2.0)
+    monkeypatch.setattr(sp.settings, "platform_replicas", 8)
+    rate, burst = sp._effective_rate()
+    assert burst == 1
+    assert rate > 0
+
+    # And a nonsense value cannot produce a divide-by-zero or a negative rate.
+    monkeypatch.setattr(sp.settings, "platform_replicas", 0)
+    rate, burst = sp._effective_rate()
+    assert rate == 2.0 and burst == 3
