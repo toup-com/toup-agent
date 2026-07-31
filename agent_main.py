@@ -19,7 +19,7 @@ import os
 from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, Response
 
 # Configure logging so agent_runner [PERF] and [AGENT] logs show in journalctl
@@ -45,7 +45,7 @@ from app.api.ws_chat import router as ws_chat_router, set_ws_refs, broadcast_to_
 from app.api.api_v1 import router as api_v1_router
 from app.api.models import router as models_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
-from app.api.voice import router as voice_router
+from app.api.voice import router as voice_router, set_voice_refs
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.dashboard import router as dashboard_router
@@ -603,79 +603,71 @@ async def lifespan(app: FastAPI):
         set_agent_runner(agent_runner, ws_broadcast=broadcast_to_user)
         set_ws_browser_refs(agent_runner, skill_loader)
 
-        # ── Clean up orphaned build jobs from previous crash/restart ──
+        # ── Recover jobs orphaned by a previous crash/restart ─────────
+        # Logic + rationale live in app/agent/job_recovery.py (extracted so
+        # it is unit-testable; see tests/test_job_recovery.py). Summary:
+        # `queued` untouched, `running` re-queued only where a drain loop
+        # exists, everything else terminalised honestly.
         try:
             from app.db.database import async_session_maker
-            from app.db.models import BuildJob, App as AppModel
-            from sqlalchemy import select as _sel
+            from app.agent.job_recovery import recover_orphaned_jobs
 
-            async with async_session_maker() as _jdb:
-                # Find all jobs stuck in running/queued state (orphaned by restart)
-                result = await _jdb.execute(
-                    _sel(BuildJob).where(BuildJob.status.in_(["running", "queued"]))
+            _rec = await recover_orphaned_jobs(async_session_maker)
+            _interrupted = _rec.interrupted
+            _gave_up = _rec.gave_up
+            if _rec.touched:
+                print(
+                    f"🧹 Restart recovery: re-queued {_rec.requeued}, "
+                    f"interrupted {len(_interrupted)}, gave up {len(_gave_up)}"
                 )
-                orphaned_jobs = result.scalars().all()
 
-                # Capture identity before commit so we can end each job's
-                # phone Live Activity after — a restart-orphaned card would
-                # otherwise linger on the lock screen showing stale
-                # progress until it expires (≤8h). Mirrors job_reaper.
-                _orphan_cards = [
-                    (job.id, job.title or "", job.user_id) for job in orphaned_jobs
-                ]
+            # ── Live Activity / notification reconciliation ───────────
+            #
+            # A Live Activity card is ONLY closed by a terminal
+            # notification (`mission_completed` / `mission_failed` →
+            # alerting update + event=end; see
+            # app/services/live_activity_service.py). A job row going
+            # terminal in the DB does NOT touch the card. So every row we
+            # terminalise here MUST emit a terminal notification, or its
+            # lock screen / Dynamic Island card lingers for hours showing
+            # stale progress.
+            #
+            # RE-QUEUED jobs get NO notification at all. Two reasons, both
+            # load-bearing:
+            #   1. They are still going to run, so a terminal event would
+            #      end their card on a lie.
+            #   2. Re-queueing is restricted to source_kind='trigger', and
+            #      the trigger runner never emits `mission_started` — so a
+            #      trigger job HAS no Live Activity card. Sending a
+            #      `progress` row would not "heal" anything; the lane's
+            #      restart-if-missing behaviour would CREATE a lock screen
+            #      card for a background Gmail fire the user never asked to
+            #      see. Silence is the correct output here.
+            try:
+                from app.agent.subagent_orchestrator import _notify_job_event
 
-                for job in orphaned_jobs:
-                    job.status = "failed"
-                    job.error_message = "Agent restarted during execution"
-                    job.completed_at = datetime.utcnow()
-                    logger.info("[SWEEP] Marking orphan job %s (%s) as failed — was %s", job.id[:8], job.title[:40], job.status)
-
-                    # Mark any in-progress steps as failed with correct duration
-                    try:
-                        steps = json.loads(job.steps_json) if job.steps_json else []
-                        for s in steps:
-                            if s.get("status") == "running":
-                                s["status"] = "failed"
-                                started = s.get("started_at")
-                                if started:
-                                    try:
-                                        start_dt = datetime.fromisoformat(started)
-                                        s["duration_ms"] = int(
-                                            (datetime.utcnow() - start_dt).total_seconds() * 1000
-                                        )
-                                    except Exception:
-                                        pass
-                        job.steps_json = json.dumps(steps)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                    # Also fix the parent app status
-                    if job.app_id:
-                        app = await _jdb.get(AppModel, job.app_id)
-                        if app and app.status == "building":
-                            app.status = "error"
-
-                if orphaned_jobs:
-                    await _jdb.commit()
-                    print(f"🧹 Cleaned up {len(orphaned_jobs)} orphaned build job(s)")
-
-            # End each orphaned job's phone card honestly (best-effort,
-            # capped so a mass-orphan boot can't flood the outbox). Writes
-            # to the durable notify outbox — safe pre-bind; flushes later.
-            if _orphan_cards:
-                try:
-                    from app.agent.subagent_orchestrator import _notify_job_event
-                    for _jid, _title, _uid in _orphan_cards[:20]:
-                        await _notify_job_event(
-                            job_id=_jid, label=_title, kind="mission_failed",
-                            title=f"⚠️ Didn't finish: {(_title or 'background task')[:150]}",
-                            body="Stopped when the agent restarted. Ask me to pick it up again.",
-                            dismiss_after_s=900, dedup_suffix="restart_orphan",
-                        )
-                except Exception as _ne:
-                    logger.debug("[SWEEP] orphan card notify skipped: %s", _ne)
+                for _jid, _title, _uid in _interrupted[:20]:
+                    await _notify_job_event(
+                        job_id=_jid, label=_title, kind="mission_failed",
+                        title=f"Stopped: {(_title or 'background task')[:150]}",
+                        body="Your agent restarted. Tap to run it again.",
+                        dismiss_after_s=900, dedup_suffix="restart_interrupted",
+                        # Background housekeeping at boot — a 3am container
+                        # roll must not bypass quiet hours.
+                        urgent=False,
+                    )
+                for _jid, _title, _uid in _gave_up[:20]:
+                    await _notify_job_event(
+                        job_id=_jid, label=_title, kind="mission_failed",
+                        title=f"⚠️ Didn't finish: {(_title or 'background task')[:150]}",
+                        body="We've been notified and are looking into it.",
+                        dismiss_after_s=900, dedup_suffix="restart_orphan",
+                        urgent=False,
+                    )
+            except Exception as _ne:
+                logger.debug("[SWEEP] orphan card notify skipped: %s", _ne)
         except Exception as e:
-            print(f"⚠️ Orphan job cleanup skipped: {e}")
+            print(f"⚠️ Orphan job recovery skipped: {e}")
 
         _boot_progress.update(percent=50, phase="agent_pipeline")
         # ── App Manager + App Builder Skill ────────────────────
@@ -1855,26 +1847,6 @@ async def agent_health():
     except Exception:
         _db_ok, _db_recoveries = None, None
 
-    # Embedding degrade observability. Memory writes never fail on a broken
-    # embedding backend — they degrade to unembedded rows (dedup off, vector
-    # recall blind for those rows) with only a container-log WARNING. Surface
-    # the counter here so fleet-wide unembedded writes are visible in one
-    # health poll; `provider` reports the CACHED resolution only (never
-    # forces a resolve from a health probe). Diagnostic ONLY — law 1, nothing
-    # gates on it. Recovery lever: app/scripts/backfill_embeddings.py.
-    try:
-        from app.services.embedding_service import (
-            EmbeddingService as _EmbSvc,
-            embed_degrade_stats as _embed_degrade_stats,
-        )
-        _emb_inst = _EmbSvc._instance
-        _emb_provider = (
-            _emb_inst.__dict__.get("_resolved_provider") if _emb_inst is not None else None
-        ) or _EmbSvc._resolved_provider
-        _embeddings_status = {"provider": _emb_provider, **_embed_degrade_stats()}
-    except Exception:
-        _embeddings_status = None
-
     return {
         "status": "healthy",
         "version": _agent_version,
@@ -1887,7 +1859,6 @@ async def agent_health():
         # not just the raw settings field. Closes the gap where /agent/health
         # advertised a stale model after a settings.agent_model bump.
         "agent_model": default_model(),
-        "embeddings": _embeddings_status,
         "boot_progress": _boot_progress,
         "is_bound": _is_bound,
         "bound_user_id": _bound_uid,

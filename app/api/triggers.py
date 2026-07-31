@@ -933,7 +933,13 @@ async def test_trigger(trigger_id: str):
     job = await JobRunner().create_job(
         job_type="trigger_run",
         spec=spec,
-        title=f"Trigger fire: {dedupe[:40]}",
+        # Human name, never the dedupe id. The old
+        # `f"Trigger fire: {dedupe[:40]}"` put a raw uuid hex on the
+        # user's Activity board ("Trigger fire: test:f2bdfda3add9…").
+        # The "Test" suffix is honest: this IS a real production job,
+        # minted by the user tapping Test — it is not test-suite leakage,
+        # so it must be labelled rather than hidden.
+        title=f"{(trig.name or '').strip() or trig.kind} (test)",
         idempotency_key=dedupe,
     )
 

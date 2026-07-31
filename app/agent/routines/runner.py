@@ -889,7 +889,17 @@ class RoutineRunner:
             _title = f"Autopilot: {routine.name or 'mission'} — tick {_tick_no}"
         else:
             _job_type = "routine_run"
-            _title = f"Routine fire: {routine.kind} {local_date}"
+            # Use the routine's human name — the same thing the Scheduled
+            # tab and the Day-as-Chat message title already show. The old
+            # `f"Routine fire: {routine.kind} {local_date}"` leaked the
+            # kind discriminator, and because the dedupe key is scoped to
+            # ONE routine_id, N distinct routines of the same kind each
+            # minted a row with a BYTE-IDENTICAL title. That is the entire
+            # "duplicate routine fires" defect: verified 2026-07-29 on the
+            # founder's tenant, every `Routine fire: agent_task <date>`
+            # triple mapped to three different routine_ids. The autopilot
+            # branch above already got this right.
+            _title = (routine.name or "").strip() or f"Scheduled {routine.kind}"
         try:
             # Reminder fires: the job's user turn is the reminder text —
             # without it the job detail screen rendered an EMPTY 'YOU'
@@ -1055,7 +1065,26 @@ class RoutineRunner:
                 # Emit metric hook (string log for now; real collector wired later).
                 logger.info("[metric] routine.run.%s kind=%s", last_result.status, routine.kind)
                 return last_result
-            # status == "failed" → retry until the budget is exhausted.
+
+            # status == "failed" → retry ONLY if the error is transient.
+            # This loop used to retry every failure blindly, which is how
+            # the founder's `Routine fire: agent_task 2026-06-02` reached
+            # attempt=3 against a zero credit balance — re-entering the
+            # LLM ladder (itself 3 attempts + a cross-provider failover)
+            # on each pass and re-billing tokens for an error that no
+            # retry could ever clear.
+            from app.agent.job_status import DISPOSITION_RETRY, classify
+
+            _verdict = classify(
+                f"{last_result.error_class or ''}: {last_result.error_detail or ''}"
+            )
+            if _verdict.disposition != DISPOSITION_RETRY:
+                logger.info(
+                    "[routine_run] non-retryable kind=%s run_id=%s class=%s "
+                    "disposition=%s — skipping remaining attempts",
+                    routine.kind, run_id, _verdict.error_class, _verdict.disposition,
+                )
+                return last_result
 
         logger.info("[metric] routine.run.failed kind=%s", routine.kind)
         return last_result  # final failed result after exhausting retries

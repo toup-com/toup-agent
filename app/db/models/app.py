@@ -170,6 +170,40 @@ class BuildJob(Base):
         Float, nullable=False, server_default="0.0", default=0.0,
     )
 
+    # ── Error taxonomy (Mission Control overhaul, 2026-07-29) ────────
+    # Replaces the single free-text ``error_message`` as the user-facing
+    # surface. Audit finding: a raw Python ``repr(exc)`` travelled five
+    # hops from the handler to a React Native <Text> node with zero
+    # mapping, so users read 402 JSON blobs and AttributeError reprs.
+    #
+    # Contract — see app/agent/job_status.py:
+    #   error_class      closed enum, the routing key
+    #   user_message     humanized copy; the ONLY field the client renders.
+    #                    NULL means "show nothing" (infrastructure the user
+    #                    should never learn about, e.g. a restart re-queue).
+    #   technical_detail INTERNAL ONLY. Never added to JobResponse, never
+    #                    proxied, never pushed. Carries exception type +
+    #                    truncated message; no message bodies, no PII.
+    # ``error_message`` is retained (not dropped) so the migration is
+    # reversible and legacy rows keep their history.
+    error_class: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    user_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    technical_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Soft-retirement for the Activity feed. Archived rows stay queryable
+    # (history is never destroyed) but drop out of the default lists. The
+    # audit found NO retention of any kind: 79-day-old corpses of an
+    # already-fixed bug were still rendering on the founder's board.
+    archived_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+    )
+
+    # Coarse progress for the "2/5" the Now tab renders. steps_json can
+    # hold this, but a re-queued job needs progress that survives a
+    # steps rebuild.
+    progress_step: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    progress_total: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
 
 class JobEvent(Base):
     """One material event emitted during a job's lifecycle.

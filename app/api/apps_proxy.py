@@ -598,6 +598,8 @@ async def _proxy(
             resp = await client.get(url, headers=headers, timeout=timeout)
         elif method == "POST":
             resp = await client.post(url, headers=headers, json=body or {}, timeout=timeout)
+        elif method == "PATCH":
+            resp = await client.patch(url, headers=headers, json=body or {}, timeout=timeout)
         elif method == "DELETE":
             resp = await client.delete(url, headers=headers, timeout=timeout)
         else:
@@ -814,6 +816,37 @@ async def jobs_events_proxy(
 async def get_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     agent_url, key, _ = _require(await _get_agent(current_user.id, db))
     return await _proxy(agent_url, key, f"jobs/{job_id}")
+
+
+# ── Job write-side ───────────────────────────────────────────────────
+#
+# `POST /jobs/` and `PATCH /jobs/{id}` were never proxied, so from the
+# phone the Mission Control task composer and every "move"/archive action
+# 404'd — the buttons had been dead for as long as they had existed
+# (mission-control audit, 2026-07-29). The agent has implemented both all
+# along; only the platform hop was missing.
+
+
+@router.post("/jobs/")
+async def create_job_proxy(
+    body: dict,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
+    # 60s: creation kicks off the dashboard-task runner inline.
+    return await _proxy(agent_url, key, "jobs/", method="POST", body=body, timeout=60.0)
+
+
+@router.patch("/jobs/{job_id}")
+async def update_job_proxy(
+    job_id: str,
+    body: dict,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    agent_url, key, _ = _require(await _get_agent(current_user.id, db))
+    return await _proxy(agent_url, key, f"jobs/{job_id}", method="PATCH", body=body)
 
 
 @router.post("/jobs/{job_id}/fix")

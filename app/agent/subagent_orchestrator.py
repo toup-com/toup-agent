@@ -632,6 +632,47 @@ async def _notify_job_event(
         )
 
 
+#: `required_action.type` values that are a yes/no gate rather than a
+#: request for information. Drives which notify kind the card gets.
+_APPROVAL_ACTIONS = frozenset({"purchase_approval", "permission"})
+
+
+async def notify_job_needs_user(
+    *,
+    job_id: str,
+    label: Optional[str],
+    summary: str,
+    action_type: str,
+    cta_label: Optional[str] = None,
+) -> None:
+    """Announce that a job has parked on the user (``waiting_on_user``).
+
+    Deliberately NOT ``mission_failed``: that kind sends an alerting
+    update followed by ``event=end``, which would tear down the Live
+    Activity. ``needs_input`` / ``needs_approval`` update the card's
+    content-state and alert at priority 10 while **keeping the activity
+    alive** — which is the honest presentation, because the job resumes
+    the moment the user acts (see live_activity_service.py's kind table).
+
+    Best-effort by contract: a job must never fail on notification
+    plumbing.
+    """
+    kind = "needs_approval" if action_type in _APPROVAL_ACTIONS else "needs_input"
+    await _notify_job_event(
+        job_id=job_id,
+        label=label,
+        kind=kind,
+        title=(label or "Background task")[:150],
+        body=(f"{summary} {cta_label}." if cta_label else summary)[:300],
+        # No dismiss_after_s — a waiting card must persist until resolved.
+        priority="high",
+        dedup_suffix=f"waiting:{action_type}",
+        # The user is being asked for something; this is the one class of
+        # background event that legitimately interrupts.
+        urgent=True,
+    )
+
+
 async def _finalize(
     *,
     job_id: str,

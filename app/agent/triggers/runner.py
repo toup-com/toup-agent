@@ -313,6 +313,21 @@ class TriggerRunner:
                     job_id, attempt_idx, e,
                 )
                 last_error_text = repr(e)[:1000]
+                # Only retry genuinely transient classes. This loop used
+                # to retry ANY exception, so a 402 out_of_credits — which
+                # no amount of retrying can fix — burned every attempt and
+                # re-billed tokens each time. Needs-user and terminal
+                # classes break out immediately and are finalised below.
+                from app.agent.job_status import DISPOSITION_RETRY, classify
+
+                _verdict = classify(e)
+                if _verdict.disposition != DISPOSITION_RETRY:
+                    logger.info(
+                        "[trigger_runner] non-retryable job_id=%s class=%s "
+                        "disposition=%s — skipping remaining attempts",
+                        job_id, _verdict.error_class, _verdict.disposition,
+                    )
+                    break
             if attempt_idx < len(self._retry_delays) - 1:
                 try:
                     await asyncio.sleep(delay)
@@ -347,15 +362,58 @@ class TriggerRunner:
                 # set. This is the same race-safe pattern _dispatch_one
                 # uses on step 1 (claim).
                 return
+            # Classify before writing. Pre-2026-07-29 this wrote
+            # `"all_retries_exhausted: " + repr(exc)` straight into
+            # error_message, which the app rendered verbatim — that is
+            # how `all_retries_exhausted: AttributeError("'BuildJob'
+            # object has no attribute 'event_dedupe_id'")` reached the
+            # founder's phone. error_message is still written so legacy
+            # readers and internal debugging keep working; user_message
+            # is what the client renders.
+            from app.agent.job_status import (
+                DISPOSITION_NEEDS_USER, STATUS_WAITING_ON_USER, classify,
+            )
+
+            _verdict = classify(error_detail)
+            _terminal_status = (
+                STATUS_WAITING_ON_USER
+                if _verdict.disposition == DISPOSITION_NEEDS_USER
+                else "failed"
+            )
             await db.execute(
                 update(BuildJob)
                 .where(BuildJob.id == job_id)
                 .values(
-                    status="failed",
+                    status=_terminal_status,
                     error_message=("all_retries_exhausted: " + error_detail)[:1000],
-                    completed_at=now,
+                    error_class=_verdict.error_class,
+                    user_message=_verdict.user_message,
+                    technical_detail=("all_retries_exhausted: " + error_detail)[:2000],
+                    # A job parked on the user is NOT finished — leaving
+                    # completed_at NULL keeps it out of "Recent".
+                    completed_at=(
+                        None if _terminal_status == STATUS_WAITING_ON_USER else now
+                    ),
                 )
             )
+
+            # A job parked on the user must announce itself, or the only
+            # trace is a row nobody is looking at. `needs_input` keeps the
+            # Live Activity card ALIVE (unlike mission_failed, which ends
+            # it) — correct, because this job resumes when the user acts.
+            if _terminal_status == STATUS_WAITING_ON_USER and _verdict.required_action:
+                try:
+                    from app.agent.subagent_orchestrator import notify_job_needs_user
+
+                    await notify_job_needs_user(
+                        job_id=job_id,
+                        label=job.title,
+                        summary=_verdict.user_message or "Your agent needs your input.",
+                        action_type=_verdict.required_action,
+                    )
+                except Exception as _ne:  # noqa: BLE001
+                    logger.debug("[trigger_runner] waiting notify skipped: %s", _ne)
+
             trigger = await db.get(Trigger, job.source_id)
             if trigger is not None:
                 await db.execute(

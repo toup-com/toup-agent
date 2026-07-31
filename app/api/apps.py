@@ -104,7 +104,24 @@ class JobResponse(BaseModel):
     steps: List[Dict[str, Any]]
     model: str = ""
     total_tokens: int = 0
+    # DEPRECATED as a display field. Retained so legacy clients that
+    # already render it keep working during the mobile rollout; new
+    # clients MUST render `user_message` instead. Scheduled for removal
+    # once the App Store build carrying the taxonomy is the floor.
     error_message: Optional[str] = None
+    # ── Error taxonomy (Mission Control overhaul) ────────────────────
+    # `technical_detail` is deliberately ABSENT from this model and must
+    # never be added: it is internal-only telemetry. If you find yourself
+    # wanting it client-side, the correct move is to widen `user_message`
+    # copy or add a taxonomy class — not to ship the exception text.
+    error_class: Optional[str] = None
+    user_message: Optional[str] = None
+    #: Set when status == 'waiting_on_user'. Drives the detail screen's
+    #: primary CTA. See docs/audits/mission-control-design.md §2.
+    required_action: Optional[Dict[str, Any]] = None
+    progress_step: Optional[int] = None
+    progress_total: Optional[int] = None
+    archived_at: Optional[str] = None
     paused_at: Optional[str] = None
     resume_after: Optional[str] = None
     layer: int = 1
@@ -193,6 +210,31 @@ async def _app_to_response(app: App) -> AppResponse:
     )
 
 
+def _taxonomy_fields(job: BuildJob) -> Dict[str, Any]:
+    """Resolve `error_class` / `user_message` for one job row.
+
+    Prefers the stored values; falls back to classifying `error_message`
+    on read. The fallback is what lets pre-taxonomy rows — including the
+    79-day-old corpses on the founder's board — render humanized copy
+    with no data migration and no risk of a backfill going wrong.
+
+    `technical_detail` is NEVER returned. See JobResponse.
+    """
+    from app.agent.job_status import classify
+
+    stored_class = getattr(job, "error_class", None)
+    stored_msg = getattr(job, "user_message", None)
+    if stored_class:
+        return {"error_class": stored_class, "user_message": stored_msg}
+
+    raw = getattr(job, "error_message", None)
+    if not raw:
+        return {"error_class": None, "user_message": None}
+
+    verdict = classify(raw)
+    return {"error_class": verdict.error_class, "user_message": verdict.user_message}
+
+
 def _job_to_response(job: BuildJob) -> JobResponse:
     """Convert BuildJob model to response."""
     steps = []
@@ -227,6 +269,18 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         model=_job_model,
         total_tokens=job.total_tokens or 0,
         error_message=job.error_message,
+        # Classify on read for rows written before the taxonomy landed
+        # (and for any writer not yet migrated), so the client NEVER has
+        # to fall back to `error_message`. `classify` is a handful of
+        # pre-compiled regexes over a short string — cheap enough for a
+        # list serializer, and it means the 79-day-old legacy corpses
+        # render with humanized copy without a data migration.
+        **_taxonomy_fields(job),
+        progress_step=getattr(job, 'progress_step', None),
+        progress_total=getattr(job, 'progress_total', None),
+        archived_at=(
+            job.archived_at.isoformat() if getattr(job, 'archived_at', None) else None
+        ),
         paused_at=job.paused_at.isoformat() if getattr(job, 'paused_at', None) else None,
         resume_after=job.resume_after.isoformat() if getattr(job, 'resume_after', None) else None,
         layer=getattr(job, 'layer', 1) or 1,
@@ -659,20 +713,54 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
                 logger.error(f"[DASHBOARD] Task {job_id[:8]} failed: {e}")
                 await blog.error(f"Task failed: {e}")
                 await blog.persist()
+                from app.agent.job_status import (
+                    DISPOSITION_NEEDS_USER, STATUS_WAITING_ON_USER, classify,
+                    technical_detail,
+                )
+
+                _v = classify(e)
+                _st = (
+                    STATUS_WAITING_ON_USER
+                    if _v.disposition == DISPOSITION_NEEDS_USER
+                    else "failed"
+                )
                 async with async_session_maker() as db:
                     j = await db.get(BuildJob, job_id)
                     if j:
-                        j.status = "failed"
+                        j.status = _st
                         j.error_message = str(e)[:500]
-                        j.completed_at = datetime.utcnow()
+                        j.error_class = _v.error_class
+                        j.user_message = _v.user_message
+                        j.technical_detail = technical_detail(e)
+                        j.completed_at = (
+                            None if _st == STATUS_WAITING_ON_USER else datetime.utcnow()
+                        )
                         await db.commit()
                 if _ws_broadcast:
+                    # The frame carried `str(e)[:200]` — a raw exception on a
+                    # live socket straight into the chat UI. Ship taxonomy only.
                     await _ws_broadcast(user_id, {
                         "type": "job_update",
                         "job_id": job_id,
-                        "status": "failed",
-                        "error_message": str(e)[:200],
+                        "status": _st,
+                        "error_class": _v.error_class,
+                        "user_message": _v.user_message,
                     })
+                # Keep the lock screen / Dynamic Island honest. Without
+                # this the card spins on stale progress forever: only a
+                # notification closes or re-states a Live Activity, and a
+                # DB write alone never touches it.
+                if _st == STATUS_WAITING_ON_USER and _v.required_action:
+                    try:
+                        from app.agent.subagent_orchestrator import notify_job_needs_user
+
+                        await notify_job_needs_user(
+                            job_id=job_id, label=title,
+                            summary=_v.user_message or "Your agent needs your input.",
+                            action_type=_v.required_action,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug("[DASHBOARD] waiting notify skipped")
 
         asyncio.create_task(_run_dashboard_task())
 
@@ -680,21 +768,37 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
 
 
 class UpdateJobStatusRequest(BaseModel):
-    status: str  # queued, running, completed, failed
+    #: Any value in `job_status.ALL_STATUSES`. Do NOT re-inline a tuple here —
+    #: the hard-coded 4-value tuple this replaced 400'd on `waiting_on_user`
+    #: and on the `cancelled`/`timeout`/`budget_exhausted` the sub-agent arc
+    #: already writes. Optional so a request can archive without a status change.
+    status: Optional[str] = None
+    #: Soft-retire from the Activity feed. Archiving NEVER deletes: it stamps
+    #: `archived_at`, and the list endpoints filter on it. The audit found no
+    #: retention of any kind, so 79-day-old corpses of an already-fixed bug
+    #: were still rendering on the founder's board.
+    archived: Optional[bool] = None
 
 
 @router.patch("/jobs/{job_id}")
 async def update_job_status(job_id: str, req: UpdateJobStatusRequest) -> JobResponse:
-    """Update a job's status (e.g. drag between kanban columns)."""
-    if req.status not in ("queued", "running", "completed", "failed"):
+    """Update a job's status and/or archive it."""
+    from app.agent.job_status import ALL_STATUSES, STATUS_COMPLETED
+
+    if req.status is not None and req.status not in ALL_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid status")
+    if req.status is None and req.archived is None:
+        raise HTTPException(status_code=400, detail="Nothing to update")
     async with async_session_maker() as db:
         job = await db.get(BuildJob, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-        job.status = req.status
-        if req.status == "completed" and not job.completed_at:
-            job.completed_at = datetime.utcnow()
+        if req.status is not None:
+            job.status = req.status
+            if req.status == STATUS_COMPLETED and not job.completed_at:
+                job.completed_at = datetime.utcnow()
+        if req.archived is not None:
+            job.archived_at = datetime.utcnow() if req.archived else None
         await db.commit()
         await db.refresh(job)
         return _job_to_response(job)

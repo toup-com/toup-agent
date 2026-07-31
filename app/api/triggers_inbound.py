@@ -351,10 +351,21 @@ async def _idempotent_insert(
         source_kind="trigger",
         source_id=trigger_id,
     )
+    # Human name, never the dedupe id. `event_dedupe_id` is the raw
+    # provider message id, so the old title put "Trigger fire:
+    # 19e654e571e344a9" on the user's Activity board. One PK get on a
+    # session we already hold — negligible next to the SELECT above.
+    from app.db.models import Trigger
+
+    _trig = await db.get(Trigger, trigger_id)
+    _title = (getattr(_trig, "name", None) or "").strip() or (
+        getattr(_trig, "kind", None) or "Automation"
+    )
+
     job = await JobRunner().create_job(
         job_type="trigger_run",
         spec=spec,
-        title=f"Trigger fire: {event_dedupe_id[:40]}",
+        title=_title,
         idempotency_key=event_dedupe_id,
     )
     # JobRunner.create_job handles its own commit; we don't write
