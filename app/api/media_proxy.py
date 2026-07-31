@@ -417,6 +417,47 @@ def _cached_extract(video_id: str) -> dict:
     return result
 
 
+# In-flight extractions, keyed by video_id. `_EXTRACT_CACHE` only coalesces
+# calls that arrive AFTER one finished; concurrent callers all missed the cache
+# and each ran their own yt-dlp. That is the normal case, not a rare race: the
+# mobile client fires `/audio_url` (the pre-warm) and `/audio_stream` (the play)
+# for the same track in the same tick, so every cold first play paid for two
+# full extractions — two subprocesses and two round trips through the single
+# residential proxy, whose uplink is the bottleneck the user is waiting on.
+# The remux builder already coalesces this way (`_remux_tasks`); extraction did
+# not.
+_extract_inflight: dict[str, "asyncio.Future[dict]"] = {}
+
+
+async def _extract_coalesced(video_id: str) -> dict:
+    """`_cached_extract` off the event loop, with one extraction per video.
+
+    Shielded so a caller that gives up (its own `wait_for` timeout, or a client
+    disconnect) cancels only its own wait — the extraction keeps running for
+    everyone else joined to it, and the result still lands in `_EXTRACT_CACHE`.
+    """
+    task = _extract_inflight.get(video_id)
+    if task is None or task.done():
+        # `run_in_executor` already returns an awaitable Future — do NOT wrap it
+        # in `create_task`, which demands a coroutine and raises TypeError on a
+        # Future. That mistake makes every extraction fail with a 502 rather
+        # than merely failing to coalesce.
+        task = asyncio.get_event_loop().run_in_executor(
+            None, _cached_extract, video_id,
+        )
+        _extract_inflight[video_id] = task
+        # Pop by identity: a later extraction for the same video may already
+        # own the slot by the time this one finishes.
+        task.add_done_callback(
+            lambda t, v=video_id: (
+                _extract_inflight.pop(v, None) if _extract_inflight.get(v) is t else None
+            )
+        )
+    else:
+        logger.info("[media_proxy] extract JOINED in-flight video_id=%s", video_id)
+    return await asyncio.shield(task)
+
+
 # ── Audio-only remux cache (fast first-play + skip) ───────────────────────
 # itag 18 — the only progressive container iOS plays off a plain URL — carries
 # 360p VIDEO we never show. In song mode AVPlayer still buffers the interleaved
@@ -945,7 +986,7 @@ async def get_audio_url(
     """
     try:
         result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, _cached_extract, video_id),
+            _extract_coalesced(video_id),
             timeout=_AUDIO_EXTRACT_TIMEOUT_SECS,
         )
     except asyncio.TimeoutError:
@@ -1182,13 +1223,20 @@ async def stream_audio(
             if resp is not None:
                 logger.info("[media_proxy] audio_stream remux BUILT (prefetch) video_id=%s", video_id)
                 return resp
-    # Immediate play (or prefetch build failed) — background-build for next time
-    # and serve the itag-18 proxy progressively now (fast first byte, fail-open).
-    asyncio.create_task(_ensure_remux_bg(video_id))
-
+    # Immediate play (or prefetch build failed) — serve the itag-18 proxy
+    # progressively now (fast first byte, fail-open).
+    #
+    # The background remux build that used to start HERE is deferred to the end
+    # of the response body instead. It pulls ~11.8MB of itag-18 through the same
+    # single residential proxy this response is streaming through, and that
+    # proxy's uplink is the bottleneck (~1MB/s, less under load). Racing the
+    # build against the bytes the user is waiting to hear made the cold first
+    # play measurably slower to sound — the build wins nothing, because nothing
+    # can read the remux until it is finished anyway. Deferred, the cache still
+    # warms for the next play and the ⏭, which is all it was ever for.
     try:
         result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, _cached_extract, video_id),
+            _extract_coalesced(video_id),
             timeout=_AUDIO_EXTRACT_TIMEOUT_SECS,
         )
     except asyncio.TimeoutError:
@@ -1258,6 +1306,12 @@ async def stream_audio(
             await upstream.aclose()
             await client.aclose()
             _release()
+            # Warm the remux cache now that this response is no longer competing
+            # with it for the residential proxy's uplink. Runs on client
+            # disconnect too, which is correct: a track skipped after 5 seconds
+            # is still one the station may come back to. `_ensure_remux_bg`
+            # dedupes against an in-flight build and no-ops when one is cached.
+            asyncio.create_task(_ensure_remux_bg(video_id))
 
     return StreamingResponse(
         _body(),

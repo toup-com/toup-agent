@@ -278,3 +278,78 @@ async def test_audio_url_requires_bearer_token(unauth_client):
 
     assert r.status_code == 401
     ext.assert_not_called()
+
+
+# ── Extraction coalescing ────────────────────────────────────────────────
+# `_EXTRACT_CACHE` only helps callers that arrive after an extraction has
+# FINISHED. The mobile client's two calls for a cold track — `/audio_url`
+# (pre-warm) and `/audio_stream` (the play) — arrive in the same tick, so both
+# missed the cache and both ran yt-dlp: two subprocesses and two trips through
+# the single residential proxy whose uplink is what the user is waiting on.
+async def test_concurrent_extractions_run_yt_dlp_once():
+    from app.api import media_proxy
+
+    calls: list[str] = []
+
+    def slow(vid: str) -> dict:
+        calls.append(vid)
+        time.sleep(0.15)  # blocking, like the real extractor
+        return _wrap_with_helpers(_fake_info_ok())
+
+    media_proxy._EXTRACT_CACHE.clear()
+    media_proxy._extract_inflight.clear()
+    with patch("app.api.media_proxy._extract_audio", side_effect=slow):
+        results = await asyncio.gather(*[
+            media_proxy._extract_coalesced("abc123def45") for _ in range(4)
+        ])
+
+    assert len(calls) == 1, f"expected one extraction, ran {len(calls)}"
+    assert all(r["url"] == _FAKE_URL for r in results)
+
+
+async def test_a_caller_giving_up_does_not_cancel_the_others():
+    """A `wait_for` timeout must cancel only that caller's wait.
+
+    The two callers have different budgets (`/audio_url` and `/audio_stream`
+    both use `_AUDIO_EXTRACT_TIMEOUT_SECS`, but a client disconnect cancels a
+    request at any point). Without the shield, the first one to give up would
+    cancel the shared task and take every joined caller down with it —
+    converting one slow extraction into a failed play.
+    """
+    from app.api import media_proxy
+
+    calls: list[str] = []
+
+    def slow(vid: str) -> dict:
+        calls.append(vid)
+        time.sleep(0.3)
+        return _wrap_with_helpers(_fake_info_ok())
+
+    media_proxy._EXTRACT_CACHE.clear()
+    media_proxy._extract_inflight.clear()
+    with patch("app.api.media_proxy._extract_audio", side_effect=slow):
+        patient = asyncio.create_task(media_proxy._extract_coalesced("abc123def45"))
+        await asyncio.sleep(0.05)  # let the first caller own the slot
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                media_proxy._extract_coalesced("abc123def45"), timeout=0.1,
+            )
+        result = await patient
+
+    assert len(calls) == 1
+    assert result["url"] == _FAKE_URL
+
+
+async def test_the_inflight_slot_is_released_after_completion():
+    """Otherwise a stale finished task would be re-awaited forever, pinning the
+    first extraction's signed URL past its expiry."""
+    from app.api import media_proxy
+
+    media_proxy._EXTRACT_CACHE.clear()
+    media_proxy._extract_inflight.clear()
+    with patch("app.api.media_proxy._extract_audio",
+               side_effect=lambda vid: _wrap_with_helpers(_fake_info_ok())):
+        await media_proxy._extract_coalesced("abc123def45")
+
+    await asyncio.sleep(0)  # let the done-callback run
+    assert "abc123def45" not in media_proxy._extract_inflight

@@ -210,7 +210,26 @@ async def build_station(
         return ytm.get_watch_playlist(videoId=seed, limit=limit)
 
     try:
-        raw = await asyncio.to_thread(_fetch)
+        # Bounded, like every other network call in this module
+        # (_build_station_fallback: 8s, find_topic_version/find_music_video: 6s).
+        # This one was the exception, and it is the one on the critical path:
+        # the refill extend runs BEFORE the next track is broadcast, so a hung
+        # call here is dead air for the listener. The local ytmusicapi branch
+        # of `_fetch` uses blocking `requests` with no timeout configured
+        # anywhere, so without this a stalled socket parks the handler
+        # coroutine forever — and since it was launched with create_task,
+        # nothing would ever log it.
+        #
+        # 30s, NOT 20s. `_fetch` is two attempts in sequence: `_yt_remote`
+        # (httpx, its own 20s budget) and then, only if that fails, the local
+        # ytmusicapi call. An outer budget equal to the inner one fires at the
+        # same instant the remote gives up, so the local fallback would never
+        # get to run at all — the timeout would silently delete the recovery
+        # path it is wrapped around. The outer bound has to exceed the inner
+        # one to be a bound on the WHOLE ladder rather than a cap on its first
+        # rung. (wait_for won't kill the worker thread; it just stops us
+        # waiting, and the result is discarded.)
+        raw = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=30.0)
     except Exception as e:
         print(
             f"[radio/playlist] build_station failed seed={seed} "

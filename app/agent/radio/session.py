@@ -75,6 +75,11 @@ class RadioSession:
     current_station_track: Optional[StationTrack] = None
     consecutive_failures: int = 0
     last_activity_ts: float = field(default_factory=time.time)
+    # When we last told this session's client the station ran dry. Both clients
+    # render `radio_notice` as a modal alert and neither de-duplicates repeats,
+    # so an exhausted station being skipped repeatedly would stack one dialog
+    # per tap. Throttled in ws_chat._advance_and_broadcast_next.
+    last_exhaustion_notice_ts: float = 0.0
 
     def to_broadcast_dict(self) -> dict:
         return {

@@ -142,6 +142,15 @@ def _warn_brave_unconfigured() -> None:
         "next rollout. Logged once per process."
     )
 
+# play_media query → (video_id, title, resolved_at). Resolving a song name is
+# two live network tiers (a YouTube results scrape, then a yt-dlp subprocess)
+# and was repeated in full for every single ask, including the same ask twice.
+# One process serves one tenant, so this stays small by construction; the bound
+# and the TTL are here so a long-lived container can't grow it without limit or
+# keep serving an id for a video that has since been pulled.
+_MEDIA_RESOLVE_CACHE: Dict[str, tuple] = {}
+_MEDIA_RESOLVE_TTL_S = 6 * 3600
+_MEDIA_RESOLVE_MAX = 256
 
 # Teach Pillow to decode HEIC/HEIF (iPhone photos) so edit_image can normalize a
 # genuine .heic source to PNG. Optional dep — a no-op if it's not installed.
@@ -5020,6 +5029,7 @@ class ToolExecutor:
     async def _tool_play_media(self, inp: Dict[str, Any]) -> str:
         import re as _re
         import json as _json
+        import time as _time
 
         query = (inp.get("query") or "").strip()
         channel = (inp.get("channel") or "youtube").strip().lower()
@@ -5034,10 +5044,33 @@ class ToolExecutor:
         video_id = None
         video_title = "YouTube Video"
 
+        # 0. Resolution cache.
+        #
+        # Tiers 2 and 3 are a live YouTube scrape (httpx, timeout=10) and a
+        # yt-dlp subprocess (timeout=15) — so an uncached miss is 0.5-2s
+        # typical and ~25s worst case, paid EVERY time even for the same query.
+        # That is the whole latency budget for a spoken "play me X", where the
+        # tool call is already several hops in (speech end → realtime model →
+        # think → HTTP to the tenant agent → this).
+        #
+        # A query→(id,title) map is the cheapest possible fix: the mapping is
+        # stable for hours, the entries are two short strings, and a repeat ask
+        # ("play emsho shoshe again") becomes a dict lookup. Bounded and TTL'd
+        # so it can't grow without limit or pin a video that got taken down.
+        _now = _time.time()
+        _key = query.casefold()
+        _cache_hit = False
+        _hit = _MEDIA_RESOLVE_CACHE.get(_key)
+        if _hit and _now - _hit[2] < _MEDIA_RESOLVE_TTL_S:
+            video_id, video_title = _hit[0], _hit[1]
+            _cache_hit = True
+            logger.info("[play_media] resolve cache HIT %s -> %s", query, video_id)
+
         # 1. Direct YouTube URL
-        yt_match = _re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})', query)
-        if yt_match:
-            video_id = yt_match.group(1)
+        if not video_id:
+            yt_match = _re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})', query)
+            if yt_match:
+                video_id = yt_match.group(1)
 
         # 2. httpx scrape of YouTube search results
         if not video_id:
@@ -5082,6 +5115,29 @@ class ToolExecutor:
 
         if not video_id:
             return f"Could not find a video for '{query}'. Try a different search term."
+
+        # Remember the resolution so the next ask for this song skips the
+        # scrape entirely.
+        #
+        # NOT on a cache hit: re-stamping the entry we just read would refresh
+        # its timestamp on every use, so a query asked more often than once
+        # every 6 hours would never expire — the TTL would apply to exactly the
+        # entries that don't need it and never to the hot ones that do.
+        #
+        # NOT for the placeholder title either. "YouTube Video" is the value
+        # `video_title` starts at, and tier 2 sets an id without a title
+        # whenever its separate title regex misses. Caching that pins a
+        # meaningless name onto the song for six hours — and the title is not
+        # cosmetic here: it is what seeds the radio station and what the
+        # station-extend fallback searches on.
+        if not _cache_hit and video_title and video_title != "YouTube Video":
+            # Insertion-ordered eviction: oldest first, which for a per-tenant
+            # agent is a fine approximation of LRU. Re-insert on refresh so an
+            # updated entry moves to the back.
+            _MEDIA_RESOLVE_CACHE.pop(_key, None)
+            _MEDIA_RESOLVE_CACHE[_key] = (video_id, video_title, _time.time())
+            if len(_MEDIA_RESOLVE_CACHE) > _MEDIA_RESOLVE_MAX:
+                _MEDIA_RESOLVE_CACHE.pop(next(iter(_MEDIA_RESOLVE_CACHE)), None)
 
         yt_url = f"https://www.youtube.com/watch?v={video_id}"
 

@@ -776,6 +776,42 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
 
+# Radio control frames the mid-turn stop-watcher must forward rather than eat.
+#
+# `radio_toggle` is deliberately EXCLUDED. It rebuilds the station from a new
+# seed, and mid-turn is exactly when the agent is about to broadcast its own
+# `media_play` for the song it just found — letting a toggle race that produces
+# two stations for one request. Both clients already defer their toggle to the
+# end of the turn for this reason (mobile: `pendingReseedRef`), so forwarding it
+# here would undo a deliberate client-side decision. The frames below are all
+# operations on the station that ALREADY exists.
+_MID_TURN_PASSTHROUGH = frozenset({
+    "media_ended", "radio_skip_next", "radio_skip_prev", "radio_display_mode",
+})
+
+
+async def _dispatch_radio_frame(user_id: str, msg: dict) -> None:
+    """Route one radio control frame to its handler.
+
+    Shared by the main receive loop and the mid-turn stop-watcher so the two
+    paths cannot drift — the drift is what produced the swallowed-frame bug in
+    the first place.
+    """
+    t = msg.get("type")
+    try:
+        if t == "media_ended":
+            await _handle_media_ended(user_id, msg)
+        elif t == "radio_skip_next":
+            await _handle_radio_skip_next(user_id, msg)
+        elif t == "radio_skip_prev":
+            await _handle_radio_skip_prev(user_id, msg)
+        elif t == "radio_display_mode":
+            await _handle_radio_display_mode(user_id, msg)
+    except Exception as e:  # noqa: BLE001
+        # Never let a radio frame take down the turn that is carrying it.
+        logger.warning("[radio] mid-turn %s failed: %s", t, e)
+
+
 async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger: str) -> bool:
     """Shared path for media_ended + skip_next: advance the playlist (possibly
     extending it first), apply Song-mode Topic lookup if set, record in history,
@@ -814,7 +850,35 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
             flush=True,
         )
         if extend_seed:
-            _seed_meta, new_tracks = await build_station(extend_seed, limit=50)
+            # Thread the title/artist through, exactly as the toggle handler
+            # does. build_station's search-based recovery (_build_station_fallback)
+            # keys entirely on `f"{title} {artist}"` and returns (None, []) the
+            # moment that string is empty — so without this the fallback is
+            # unreachable on EVERY extend, and the seeds it exists to rescue
+            # (regional / non-catalog music: its docstring names Persian tracks)
+            # get one short search-built queue and then die at the first refill.
+            # Prefer the track we're extending FROM — it carries a real artist —
+            # and fall back to the session's original seed.
+            _cur = sess.current_station_track
+            _ext_title = (_cur.title if _cur else "") or (
+                sess.seed_track.title if sess.seed_track else ""
+            )
+            _ext_artist = _cur.artist if _cur else ""
+            # A placeholder title is WORSE than none. `_tool_play_media`
+            # initialises `video_title` to "YouTube Video" and leaves it there
+            # whenever its title regex misses, and that string can reach the
+            # session as the seed title. Searching YT Music for "YouTube Video"
+            # returns real songs — arbitrary ones — so the fallback would
+            # cheerfully extend the station with tracks unrelated to anything
+            # the user asked for. Empty makes the fallback decline instead,
+            # which is the honest outcome.
+            if _ext_title.strip().casefold() in ("", "youtube video"):
+                _ext_title = ""
+                _ext_artist = ""
+            _seed_meta, new_tracks = await build_station(
+                extend_seed, limit=50,
+                seed_title=_ext_title, seed_artist=_ext_artist,
+            )
             if new_tracks:
                 mgr.extend_playlist(sess, new_tracks)
         if next_track is None:
@@ -834,6 +898,30 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
                 "enabled": False,
                 "error": "no_more_tracks",
             })
+        # Tell the user on EVERY exhaustion, not only the third.
+        #
+        # `record_failure` disables at MAX_CONSECUTIVE_FAILURES (3), but from
+        # natural playback that counter can never get past 1: it only advances
+        # when a media_ended arrives, a media_ended only arrives after a track
+        # plays, and a track only plays after a SUCCESSFUL advance — which
+        # resets the counter to 0. So the first exhaustion returned False with
+        # nothing broadcast at all: the player had no next track, no further
+        # media_ended could ever be generated, and the session sat enabled
+        # forever with the radio pill lit over a station that would never move
+        # again. Silence, and no way for the user to find out why.
+        #
+        # The notice is unconditional; the `radio_state` above stays gated on
+        # an actual disable, so a transient extend failure informs without
+        # tearing the station down (a manual skip can still retry it).
+        #
+        # THROTTLED, because the clients render it as a modal alert and the
+        # mobile skip queue does not drop repeats: hold ⏭ on an exhausted
+        # station and every tap is another exhaustion, i.e. another dialog
+        # stacked on the last. One notice per minute per session says the same
+        # thing without making the user dismiss a queue of them.
+        _now_ts = time.time()
+        if _now_ts - sess.last_exhaustion_notice_ts >= 60.0:
+            sess.last_exhaustion_notice_ts = _now_ts
             await broadcast_to_user(user_id, {
                 "type": "radio_notice",
                 "channel": channel,
@@ -2613,6 +2701,26 @@ async def ws_chat(
                                     )
                                 else:
                                     await websocket.send_json({"type": "turn_ended"})
+                            elif m2.get("type") in _MID_TURN_PASSTHROUGH:
+                                # Radio control frames must NOT be eaten here.
+                                #
+                                # This task owns the socket's single receive
+                                # stream for the whole turn, so anything it
+                                # doesn't handle is read and dropped — it never
+                                # reaches the main dispatcher. For `media_ended`
+                                # that is fatal rather than merely lossy: it is
+                                # the ONLY thing that advances a station, so a
+                                # track finishing while the agent happened to be
+                                # talking ended the station outright. Nothing
+                                # queued, no further media_ended possible (none
+                                # can be produced without a track playing), and
+                                # the radio pill still lit over a station that
+                                # would never move again.
+                                #
+                                # Dispatched as tasks so a slow YT Music call
+                                # inside a handler cannot stall the stop-watcher
+                                # — a user pressing Stop must still be heard.
+                                asyncio.create_task(_dispatch_radio_frame(user_id, m2))
                     except asyncio.CancelledError:
                         pass
                     except WebSocketDisconnect:

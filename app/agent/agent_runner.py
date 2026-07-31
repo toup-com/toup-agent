@@ -3872,6 +3872,37 @@ class AgentRunner:
             if _prompt_diet_enabled():
                 section_parts["doc_generation"] = _DOC_GENERATION_DIET
 
+        # ── 5b-voice. Media Playback (live voice) ────────────────────────────
+        # Voice turns arrive here through the realtime relay's `think` tool with
+        # channel="voice". They were previously excluded from every media
+        # instruction below while STILL carrying `play_media` in the tool array
+        # — the worst of both: the model can see the tool but knows none of the
+        # rules, so "play me X" typically became a web_search for X.
+        #
+        # Its own section rather than joining the ("web","app") gate, because
+        # most of that one is wrong here: there is no browser to play "in", and
+        # the [[button]] affordance it insists on is unclickable in a voice
+        # call. What voice needs is only the part that matters — call the tool,
+        # don't search first, and say something short while it starts.
+        if channel == "voice" and (
+            intent.include_media_section or intent.category == "full" or _stable
+        ):
+            section_parts["media"] = (
+                "# Media Playback (IMPORTANT — read carefully)\n"
+                "You have a `play_media` tool that starts music on the device the user is "
+                "talking to you from.\n"
+                "Rules:\n"
+                "1. Call `play_media` IMMEDIATELY when the user asks to play something.\n"
+                "2. NEVER call web_search or web_fetch first. The tool searches internally.\n"
+                "3. For a vague request ('play something chill') pick a specific track "
+                "yourself and call `play_media` with it. Do not ask which one.\n"
+                "4. Say one short line while it starts — the music follows on its own, and "
+                "the user is listening to a speaker, not reading a screen. Do NOT list "
+                "alternatives and do NOT use [[button]] markup; neither exists in voice.\n"
+                "5. Playback continues after the track ends, in the same style, without you "
+                "doing anything. Never claim you cannot keep playing music."
+            )
+
         # ── 5b. Media Playback (web channel, only if intent includes media) ──
         # PR-1 stable layout: channel-gated only — intent gating would flip
         # the section between turns of the same (web/app) session.
