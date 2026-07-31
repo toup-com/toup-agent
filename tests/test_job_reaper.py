@@ -50,7 +50,20 @@ async def _make_job(user_id: str, *, age: timedelta, status: str = "running",
 
 
 @pytest.mark.asyncio
-async def test_stalled_running_job_is_failed_and_notified(test_user_id, notify_calls):
+async def test_stalled_running_job_is_stopped_and_notified(test_user_id, notify_calls):
+    """A stall is `cancelled`, not `failed`.
+
+    Changed deliberately 2026-07-31. The dominant cause of a stall is a turn
+    that went away mid-flight — the voice relay cancels its SSE generator the
+    instant the caller hangs up — by which point the agent has usually already
+    delivered the answer out loud. Calling that "Failed" is the exact lie this
+    pipeline exists to remove.
+
+    The notification KIND stays `mission_failed`: only a terminal notification
+    closes a Live Activity card and `KNOWN_NOTIFY_KINDS` is a closed enum
+    validated at ingest, so it is the only terminal lane besides
+    `mission_completed`. The user-facing COPY is what changed.
+    """
     from app.agent.job_reaper import sweep_stalled_jobs
     from app.db import async_session_maker
     from app.db.models import BuildJob
@@ -62,14 +75,22 @@ async def test_stalled_running_job_is_failed_and_notified(test_user_id, notify_c
 
     async with async_session_maker() as db:
         job = await db.get(BuildJob, job_id)
-        assert job.status == "failed"
-        assert "Stalled" in (job.error_message or "")
+        assert job.status == "cancelled"
         assert job.completed_at is not None
+        # Taxonomy fields must be populated, or the API's read-time
+        # classification falls through to `unknown` — "Something went wrong.
+        # We've been notified" — which is worse than the text it replaced.
+        assert job.error_class == "turn_interrupted"
+        assert "conversation ended" in (job.user_message or "").lower()
+        # Operator detail is kept, but never on a user-facing field.
+        assert "Stalled" in (job.technical_detail or "")
+        assert "Stalled" not in (job.user_message or "")
 
     (call,) = [c for c in notify_calls if c["data"]["mission_id"] == job_id]
-    assert call["event_kind"] == "mission_failed"
+    assert call["event_kind"] == "mission_failed", "the only terminal card-closing lane"
     assert call["dedup_key"] == f"{job_id}:stalled"
     assert call["data"]["dismiss_after_s"] == 900
+    assert "Didn't finish" not in call["data"].get("title", "")
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,8 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
     from app.db.database import async_session_maker
     from app.db.models import BuildJob, JobEvent
 
+    from app.agent.job_status import STATUS_CANCELLED, turn_interrupted
+
     now = now or datetime.utcnow()
     cutoff = now - STALE_AFTER
     stale_minutes = int(STALE_AFTER.total_seconds() // 60)
@@ -71,11 +73,20 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
             last_alive = last_event_ts.get(job.id) or job.created_at
             if last_alive and last_alive >= cutoff:
                 continue
-            job.status = "failed"
-            job.error_message = (
+            # `cancelled`, not `failed`. The dominant cause of a stall is a
+            # turn that went away mid-flight — the voice relay cancels its SSE
+            # generator the moment the caller hangs up — and the agent has
+            # usually already delivered the answer. Calling that "Failed" is
+            # the exact lie this pipeline exists to remove; the work stopped,
+            # it did not break.
+            verdict = turn_interrupted()
+            job.status = STATUS_CANCELLED
+            job.error_class = verdict.error_class
+            job.user_message = verdict.user_message
+            # Kept verbatim for operators; never serialized to a client.
+            job.technical_detail = (
                 f"Stalled: no progress for {stale_minutes} minutes — "
-                "stopped so progress surfaces stay honest. Ask the "
-                "agent to pick it up again."
+                "reaped so progress surfaces stay honest."
             )
             job.completed_at = now
             reaped.append((job.id, job.title or "", job.user_id))
@@ -96,7 +107,7 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
                 "type": "job_update",
                 "job_id": job_id,
                 "name": title,
-                "status": "failed",
+                "status": STATUS_CANCELLED,
             })
         except Exception:  # noqa: BLE001 — reaping must never crash
             pass
@@ -107,14 +118,21 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
             await _notify_job_event(
                 job_id=job_id,
                 label=title,
+                # `mission_failed` is the only terminal lane besides
+                # `mission_completed` (KNOWN_NOTIFY_KINDS is a closed enum
+                # validated at ingest), and ONLY a terminal notification closes
+                # a Live Activity card — a DB write does nothing to it. So the
+                # kind stays; the copy stops shouting failure at work the agent
+                # very likely already delivered.
                 kind="mission_failed",
-                title=f"⚠️ Didn't finish: {(title or 'background task')[:150]}",
+                title=f"Stopped: {(title or 'background task')[:150]}",
                 body=(
-                    f"It stalled with no progress for {stale_minutes} "
-                    "minutes, so I stopped it. Ask me to pick it up again."
+                    "This stopped before it finished. Ask me to pick it up "
+                    "again."
                 ),
                 dismiss_after_s=900,
                 dedup_suffix="stalled",
+                urgent=False,
             )
         except Exception:  # noqa: BLE001
             pass

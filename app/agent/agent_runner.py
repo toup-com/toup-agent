@@ -525,7 +525,136 @@ class AgentRunner:
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
-    async def run(
+    async def run(self, *args, **kwargs) -> "AgentResponse":
+        """Public entrypoint — guarantees created-job finalization.
+
+        `_run_inner` closes the jobs the `create_job` tool made this turn, but
+        only on the happy path: there is no try/finally anywhere between the
+        top of that method and its finalizer, so an exception, an early return,
+        or a CANCELLATION skips it and the rows sit in `running` forever.
+
+        Cancellation is not hypothetical — it is how a voice turn normally
+        ends. `api_v1.internal_agent_turn_stream` runs the turn as a task whose
+        SSE generator does `call_later(1.5, task.cancel)` in its `finally` the
+        moment the client disconnects, i.e. every time the caller stops talking
+        or hangs up. Observed 2026-07-31: two voice jobs stranded at 0/3 and
+        1/3 for 19 minutes, Live Activity frozen on "Starting…", until the
+        30-minute reaper closed them with a false "Didn't finish" for work the
+        agent had already delivered aloud.
+
+        The happy-path finalizer CONSUMES the id list, so on success this
+        `finally` sees an empty tuple and does nothing. Jobs handed off to
+        `spawn` / `start_mission` are consumed there too and stay open, which
+        is correct — something else owns them.
+        """
+        try:
+            return await self._run_inner(*args, **kwargs)
+        finally:
+            self._sweep_unclosed_created_jobs(
+                kwargs.get("user_id") or (args[1] if len(args) > 1 else None)
+            )
+
+    def _sweep_unclosed_created_jobs(self, user_id: Optional[str]) -> None:
+        """Close jobs this turn created but never finished. Never awaits.
+
+        Deliberately synchronous and fire-and-forget. It runs inside a
+        `finally` that is usually reached *because the task is being
+        cancelled*, and an `await` there raises CancelledError immediately —
+        the cleanup would be skipped by the very condition that makes it
+        necessary. A detached task survives; the 30-minute reaper stays the
+        backstop for a process that dies before it is scheduled.
+        """
+        try:
+            ids = (self.tools.take_created_job_ids()
+                   if hasattr(self.tools, "take_created_job_ids") else ())
+            if not ids:
+                return
+            if not user_id:
+                user_id = getattr(self.tools, "_current_user_id", None)
+            if not user_id:
+                logger.warning(
+                    "[job-finalize] %d job(s) left open with no user_id — "
+                    "leaving them to the reaper", len(ids),
+                )
+                return
+            asyncio.create_task(self._close_interrupted_jobs(tuple(ids), user_id))
+        except Exception:  # noqa: BLE001 — cleanup must never mask the real error
+            logger.exception("[job-finalize] sweep failed")
+
+    async def _close_interrupted_jobs(self, job_ids: tuple, user_id: str) -> None:
+        """Terminalise abandoned inline jobs and CLOSE their phone cards.
+
+        Status is `cancelled`, not `failed`: the turn was cut short, which is
+        not the same as the work failing, and "Failed" on a task the agent
+        answered out loud is exactly the lie this pipeline exists to remove.
+        """
+        from sqlalchemy import update as _upd
+        from app.agent.job_status import (
+            ERR_TURN_INTERRUPTED, STATUS_CANCELLED, STATUS_RUNNING,
+            turn_interrupted,
+        )
+        from app.db.database import async_session_maker
+        from app.db.models import BuildJob as _BJ
+
+        # NOT `classify(ERR_TURN_INTERRUPTED)` — classify() matches error TEXT
+        # against the rule table, and the bare class name matches nothing, so
+        # that would silently hand back the `unknown` copy.
+        msg = turn_interrupted().user_message
+        closed: List[tuple] = []
+        try:
+            _now = datetime.utcnow()
+            async with async_session_maker() as db:
+                for jid in job_ids:
+                    # Guarded UPDATE, same contract as the happy-path
+                    # finalizer: `update_job` or the reaper may have driven the
+                    # row terminal while we were being cancelled.
+                    res = await db.execute(
+                        _upd(_BJ)
+                        .where(_BJ.id == jid, _BJ.user_id == user_id,
+                               _BJ.status == STATUS_RUNNING)
+                        .values(status=STATUS_CANCELLED, completed_at=_now,
+                                error_class=ERR_TURN_INTERRUPTED,
+                                user_message=msg)
+                        .returning(_BJ.id, _BJ.title)
+                    )
+                    row = res.first()
+                    if row:
+                        closed.append((row[0], row[1] or ""))
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("[job-finalize] could not close interrupted jobs")
+            return
+
+        for jid, title in closed:
+            logger.info("[job-finalize] closed abandoned job %s (%s)",
+                        jid[:8], title[:60])
+            try:
+                from app.api.ws_chat import broadcast_to_user
+                await broadcast_to_user(user_id, {
+                    "type": "job_update", "job_id": jid,
+                    "name": title, "status": STATUS_CANCELLED,
+                })
+            except Exception:  # noqa: BLE001
+                pass
+            # A Live Activity card is closed ONLY by a terminal notification —
+            # a DB write does nothing to it. `mission_failed` is the only
+            # terminal lane besides `mission_completed` (KNOWN_NOTIFY_KINDS is
+            # a closed enum validated at ingest), so the kind stays but the
+            # copy tells the truth instead of shouting failure.
+            try:
+                from app.agent.subagent_orchestrator import _notify_job_event
+                await _notify_job_event(
+                    job_id=jid, label=title, kind="mission_failed",
+                    title=f"Stopped: {(title or 'background task')[:150]}",
+                    body="The conversation ended before this finished. "
+                         "Ask me to pick it up again.",
+                    dismiss_after_s=600, dedup_suffix="turn-interrupted",
+                    urgent=False,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _run_inner(
         self,
         user_message: str,
         user_id: str,
@@ -4881,3 +5010,13 @@ class AgentRunner:
                 await db.commit()
         except Exception as e:
             logger.warning(f"Failed to log agent error to DB: {e}")
+
+
+# `run()` is a thin *args/**kwargs guard around `_run_inner` (see its docstring:
+# it guarantees created-job finalization on cancellation, which is how every
+# voice turn ends). Six suites introspect the public entrypoint —
+# `inspect.signature(AgentRunner.run).parameters` — to assert params like
+# `current_job_id`, `on_status` and `credit_budget` exist. `signature()` follows
+# `__wrapped__`, so pointing it at the real method keeps that contract intact
+# instead of reporting a bare (*args, **kwargs).
+AgentRunner.run.__wrapped__ = AgentRunner._run_inner

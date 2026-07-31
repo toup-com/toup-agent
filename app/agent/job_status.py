@@ -94,6 +94,13 @@ ERR_INFRA_RESTART = "infra_restart"
 #: ends. User-visible with honest copy and a working Retry instead of a
 #: silent loss.
 ERR_INFRA_INTERRUPTED = "infra_interrupted"
+#: The conversation turn that created this job ended before the job did.
+#: Distinct from a restart: the container is healthy, the TURN went away —
+#: the voice relay cancels its SSE generator the moment the caller hangs up
+#: (api_v1.internal_agent_turn_stream), which takes the agent loop with it.
+#: A job created by the `create_job` tool is narration for work the model
+#: does inline, so when the turn dies nothing else will ever advance it.
+ERR_TURN_INTERRUPTED = "turn_interrupted"
 ERR_INFRA_UNRECOVERABLE = "infra_unrecoverable"
 ERR_CREDITS_TOUP = "credits_toup"
 ERR_CREDITS_UPSTREAM = "credits_upstream"
@@ -144,6 +151,22 @@ def _rule(name: str, pattern: str, c: ErrorClassification) -> None:
 RESUMABLE_SOURCE_KINDS = frozenset({"trigger"})
 
 
+def turn_interrupted() -> ErrorClassification:
+    """The verdict for a job whose creating turn died before it finished.
+
+    An accessor rather than a `classify()` call: classify() matches error
+    TEXT against the rule table, so passing the bare class name silently
+    falls through to the `unknown` copy — "Something went wrong. We've been
+    notified" — on a task the user just watched the agent answer out loud.
+    """
+    return ErrorClassification(
+        ERR_TURN_INTERRUPTED,
+        "This stopped when the conversation ended before it finished. "
+        "You can run it again.",
+        DISPOSITION_TERMINAL,
+    )
+
+
 def restart_verdict(source_kind: Optional[str]) -> ErrorClassification:
     """How to treat a job orphaned by an agent restart.
 
@@ -172,6 +195,21 @@ _rule(
         ERR_INFRA_INTERRUPTED,
         "This task stopped when your agent restarted. Nothing was lost — "
         "you can run it again.",
+        DISPOSITION_TERMINAL,
+    ),
+)
+
+# The turn died, not the container. Matched ahead of the generic rules so
+# the reaper's own stall text lands here rather than in `unknown` — a job
+# the user watched the agent answer out loud must never read "Something
+# went wrong. We've been notified."
+_rule(
+    "turn_interrupted",
+    r"conversation ended|turn (was )?cancell?ed|no progress for \d+ minutes|stalled",
+    ErrorClassification(
+        ERR_TURN_INTERRUPTED,
+        "This stopped when the conversation ended before it finished. "
+        "You can run it again.",
         DISPOSITION_TERMINAL,
     ),
 )
