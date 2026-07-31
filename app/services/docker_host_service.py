@@ -291,8 +291,15 @@ def _agent_config_to_bridge_body(agent_config: Optional[AgentConfig]) -> dict:
     # with an empty key and web_search silently degraded to its slowest tier:
     # a headless Chromium scraping search.brave.com at ~4-6s instead of a
     # ~200ms JSON call. Falling back to the platform's own key makes setting
-    # BRAVE_API_KEY once on platform-api reach every container on its next
-    # rollout. A tenant-specific key (BYOK) still wins.
+    # BRAVE_API_KEY once on platform-api enough to serve every tenant.
+    # A tenant-specific key (BYOK) still wins.
+    #
+    # DELIVERY IS NOT AUTOMATIC — this function is called from exactly one
+    # place, provision_container. `upgrade_tenant_image` sends only
+    # {image_tag, rollout_id}, so an image ROLLOUT does not re-send env and a
+    # newly-set platform key reaches nobody. Running containers pick it up
+    # only when something re-provisions them: a tenant config save, or the
+    # operator sweep POST /api/admin/infrastructure/resync-env.
     if not out.get("brave_api_key"):
         platform_brave = (getattr(settings, "brave_api_key", "") or "").strip()
         if platform_brave:

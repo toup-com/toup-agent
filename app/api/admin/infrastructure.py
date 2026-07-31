@@ -591,3 +591,72 @@ async def container_details(
         "created_at": container.created_at.isoformat() if container.created_at else None,
         "started_at": container.started_at.isoformat() if container.started_at else None,
     }
+
+
+@router.post("/resync-env")
+async def resync_env(
+    user_id: Optional[str] = None,
+    dry_run: bool = True,
+    limit: int = 0,
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Push the current agent_config to tenants, so PLATFORM-level keys land.
+
+    This exists because a platform-shared secret had no delivery path. The
+    only call site of ``_agent_config_to_bridge_body`` is
+    ``provision_container``; ``upgrade_tenant_image`` sends just
+    ``{image_tag, rollout_id}``. So an image rollout does NOT re-send env, and
+    a newly-set platform key (BRAVE_API_KEY) reaches exactly nobody until
+    something re-provisions each tenant. That is why every one of 42 tenants
+    ran with an empty Brave key while `web_search` silently degraded to a
+    ~4-6s headless-browser scrape.
+
+    ``dry_run`` defaults to TRUE on purpose. A real run re-provisions
+    containers, and a container recreate kills whatever that tenant's agent
+    was doing — the same class of interruption that shows up to users as
+    "This task stopped when your agent restarted". Pool-backed tenants take
+    the warm ``/v1/pool/refresh-config`` path inside ``update_container_env``
+    and keep their state; dedicated tenants are recreated. Sequential by
+    design: 42 concurrent recreates would hammer the bridge, and this is an
+    operator action measured in minutes, not a hot path.
+    """
+    from app.services.docker_host_service import update_container_env
+
+    q = select(AgentConfig)
+    if user_id:
+        q = q.where(AgentConfig.user_id == user_id)
+    configs = (await db.execute(q)).scalars().all()
+    if limit > 0:
+        configs = configs[:limit]
+
+    platform_key_set = bool((getattr(settings, "brave_api_key", "") or "").strip())
+    results = []
+    for cfg in configs:
+        row = {
+            "user_id": cfg.user_id[:8],
+            "tenant_brave_key": bool(cfg.brave_api_key),
+            # What the tenant will actually end up with once pushed.
+            "will_have_brave": bool(cfg.brave_api_key) or platform_key_set,
+        }
+        if dry_run:
+            row["status"] = "dry_run"
+        else:
+            try:
+                container = await update_container_env(db, cfg.user_id, cfg)
+                row["status"] = container.status if container else "no_container"
+            except Exception as exc:  # noqa: BLE001
+                # One tenant's bridge failure must not abort the sweep.
+                row["status"] = f"error:{type(exc).__name__}"
+                logger.warning(
+                    "[resync-env] tenant %s failed: %s", cfg.user_id[:8], exc,
+                )
+        results.append(row)
+
+    return {
+        "dry_run": dry_run,
+        "platform_brave_key_set": platform_key_set,
+        "tenants": len(results),
+        "would_have_brave": sum(1 for r in results if r["will_have_brave"]),
+        "results": results,
+    }
