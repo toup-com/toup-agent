@@ -270,6 +270,13 @@ class Settings(BaseSettings):
     # the same deploy that first measures them.
     web_tool_metering_enabled: bool = True
     web_tool_metering_charge: bool = False
+    # Kill-switch (default on): keep the tenant workspace writable by BOTH the
+    # root agent and the uid-1000 exec sandbox it drops children to. Replaces
+    # the post-rollout manual `chmod -R a+rwX workspace/generated` that had to
+    # be re-run by hand on every hardened tenant after every recreate.
+    # Off → files revert to root-owned 0644 and the agent's own shell cannot
+    # edit what the agent wrote. See services/workspace_perms.
+    workspace_shared_perms_enabled: bool = True
     # Kill-switch (default on): dedup near-duplicate URLs, drop empty results,
     # and BM25-rerank web_search results by relevance before the model sees them.
     # Pure-Python (no LLM/network), so no latency cost. Off → raw engine order.

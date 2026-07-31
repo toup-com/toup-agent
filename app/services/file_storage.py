@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Protocol, BinaryIO, AsyncIterator
 
 from app.config import settings
+from app.services.workspace_perms import share_path, shared_makedirs
 
 
 class StorageBackend(Protocol):
@@ -66,9 +67,13 @@ class LocalDiskBackend:
 
     async def put(self, key: str, data: bytes) -> str:
         full = self._full(key)
-        os.makedirs(os.path.dirname(full), exist_ok=True)
+        # The agent writes as root; every exec/PTY child is dropped to uid
+        # 1000, so a default-umask file here is one the agent's own shell
+        # cannot edit or delete (see services/workspace_perms).
+        shared_makedirs(os.path.dirname(full))
         with open(full, "wb") as f:
             f.write(data)
+        share_path(full)
         return key
 
     def open(self, key: str) -> BinaryIO:

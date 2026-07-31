@@ -409,6 +409,22 @@ async def lifespan(app: FastAPI):
             "[boot-restore] failed — continuing with env identity"
         )
 
+    # ── Workspace permissions (replaces the manual post-rollout chmod) ──
+    # The agent runs as root; every exec/PTY child drops to uid 1000. Files
+    # root wrote in a previous container life are unwritable to that uid, so
+    # a human had to run `chmod -R a+rwX workspace/generated` on each
+    # hardened tenant after EVERY recreate. The container can do this for
+    # itself (chmod needs no capability when you own the file), so it does.
+    try:
+        from app.services.workspace_perms import sweep_workspace_perms
+        _perm_summary = sweep_workspace_perms()
+        if _perm_summary.get("changed"):
+            print(f"🔧 Workspace perms: {_perm_summary}")
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "[workspace-perms] boot sweep failed — continuing"
+        )
+
     # ── Blue-green passive-boot gate ──────────────────────────
     # When the bridge does a blue-green upgrade, it spawns this
     # container as `toup-agent-<prefix>-bg` alongside the still-running

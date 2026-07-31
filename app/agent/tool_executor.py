@@ -29,6 +29,7 @@ import httpx
 
 from app.config import settings
 from app.services.exec_env import scrubbed_environ, sandbox_preexec
+from app.services.workspace_perms import share_path, shared_makedirs
 
 logger = logging.getLogger(__name__)
 
@@ -1139,9 +1140,12 @@ class ToolExecutor:
         path, doc_redirected = self._normalize_document_write_path(path)
 
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # Root writes, uid-1000 exec edits — keep both able to (see
+            # services/workspace_perms; replaces the manual post-rollout chmod).
+            shared_makedirs(os.path.dirname(path))
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
+            share_path(path)
             result = f"Written {len(content)} bytes to {path}"
             if doc_redirected:
                 try:
