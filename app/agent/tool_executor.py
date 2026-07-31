@@ -1361,6 +1361,83 @@ class ToolExecutor:
             return f"ERROR: {exc}"
 
     # ------------------------------------------------------------------
+    # Web-tool metering — one credit_ledger row per OUTBOUND web call.
+    # ------------------------------------------------------------------
+    async def _meter_web_tool(
+        self, tool: str, *, tier: str, engine: str, started: float,
+        query: Optional[str] = None, url: Optional[str] = None,
+    ) -> None:
+        """Record one metered ``web_search`` / ``web_fetch`` call.
+
+        Lands in ``credit_ledger`` as ``event_type='tool_call'``,
+        ``bucket='integration'`` — the identical shape connector calls
+        already use, so a single GROUP BY covers every kind of per-user
+        internet usage.
+
+        ``tier``/``engine``/``latency_ms`` are the operationally interesting
+        part: they say which of the three fallback tiers actually served,
+        which no upstream provider's dashboard can tell you.
+
+        Two invariants:
+          * Cache hits are NEVER metered — nothing left the box.
+          * Fail-open. Any error here is swallowed; a metering outage must
+            not turn into a failed search.
+
+        Privacy: the query is stored only as a truncated SHA-256 and URLs are
+        reduced to a hostname. That measures repeat-rate and cache
+        effectiveness without parking a per-user search history in the
+        billing ledger.
+        """
+        if not settings.web_tool_metering_enabled:
+            return
+        user_id = self._current_user_id or ""
+        if not user_id:
+            return
+        try:
+            import hashlib
+            import uuid as _uuid
+            from urllib.parse import urlparse
+
+            from app.db.models import LEDGER_TOOL_CALL
+            from app.services.credit_reporter import report_flat_charge
+            from app.services.credit_service import FLAT_FEES
+
+            fee = FLAT_FEES.get(tool)
+            credits = float(fee["credits"]) if fee else 1.0
+            meta: Dict[str, Any] = {
+                "tool": tool,
+                "tier": tier,
+                "engine": engine,
+                "channel": self._current_channel or "unknown",
+                "latency_ms": int((time.monotonic() - started) * 1000),
+            }
+            if query:
+                meta["query_sha256"] = hashlib.sha256(
+                    " ".join(query.split()).lower().encode("utf-8")
+                ).hexdigest()[:16]
+            if url:
+                try:
+                    meta["host"] = (urlparse(url).hostname or "")[:120]
+                except Exception:
+                    pass
+
+            await report_flat_charge(
+                user_id=user_id,
+                event_type=LEDGER_TOOL_CALL,
+                credits=credits,
+                bucket="integration",
+                provider=(engine or None),
+                idempotency_key=f"{tool}:{_uuid.uuid4()}",
+                metadata=meta,
+                meter_only=not settings.web_tool_metering_charge,
+                log_label=tool,
+            )
+        except Exception:
+            logger.debug(
+                "[metering] %s metering failed (non-fatal)", tool, exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
     # 7. web_search  (uses platform's stealth browser API)
     # ------------------------------------------------------------------
     async def _tool_web_search(self, inp: Dict[str, Any]) -> str:
@@ -1372,6 +1449,21 @@ class ToolExecutor:
         if not query:
             return "ERROR: query is required"
 
+        started = time.monotonic()
+
+        # ── Tier 0: the shared result cache, consulted BEFORE the Brave API.
+        # The cache used to live inside `toup_search` (tier 2), which meant a
+        # configured Brave key bypassed it entirely and every repeat query
+        # burned another paid API call. Hoisting the read here fronts all
+        # three tiers with one 7-minute cache; `smart_fetch.search.cache_key`
+        # keeps both call sites on an identical key. Cache hits are free —
+        # they are logged but never metered, because nothing left the box.
+        from app.agent.smart_fetch import search as _sf_search
+        cached = _sf_search.cache_get(query, count)
+        if cached is not None:
+            logger.info("[PERF] web_search cache=hit(tier0) q=%r", query[:60])
+            return cached
+
         # ── Primary: Brave Search API — instant (~200ms), clean JSON, the same
         # index our browser scrapes but ~30x faster. Platform-level key (one key,
         # all tenants). The httpx scrape below is reliably CAPTCHA/challenge-blocked
@@ -1381,6 +1473,11 @@ class ToolExecutor:
             try:
                 result = await self._brave_search_fallback(query, count)
                 if result and result.strip() != "No results found.":
+                    _sf_search.cache_set(query, count, result)
+                    await self._meter_web_tool(
+                        "web_search", tier="brave_api", engine="brave",
+                        started=started, query=query,
+                    )
                     return result
             except Exception as exc:
                 logger.warning("[web_search] Brave API failed: %s", exc)
@@ -1388,9 +1485,12 @@ class ToolExecutor:
         # Secondary: multi-engine httpx scrape (free, no key) — fast when it works,
         # but search engines IP-block datacenters, so this often returns empty.
         try:
-            from app.agent.smart_fetch.search import toup_search
-            result = await toup_search(query, count)
+            result, engine, _hit = await _sf_search.toup_search_meta(query, count)
             if result and "No search results" not in result:
+                await self._meter_web_tool(
+                    "web_search", tier="httpx_race", engine=engine or "unknown",
+                    started=started, query=query,
+                )
                 return result
         except Exception as exc:
             logger.warning("[web_search] Smart search failed: %s", exc)
@@ -1406,10 +1506,17 @@ class ToolExecutor:
                 # discard a real result block whose title/snippet contains the
                 # phrase "no results".
                 if result and result.strip() != "No results found.":
+                    _sf_search.cache_set(query, count, result)
+                    await self._meter_web_tool(
+                        "web_search", tier="browser_brave", engine="brave",
+                        started=started, query=query,
+                    )
                     return result
             except Exception as exc:
                 logger.warning("[web_search] Browser search also failed: %s", exc)
 
+        # Every tier came back empty. Nothing useful was delivered, so nothing
+        # is metered — the outbound attempts are visible in the logs instead.
         return "No search results found."
 
     async def _brave_search_fallback(self, query: str, count: int) -> str:
@@ -1510,11 +1617,24 @@ class ToolExecutor:
         except ValueError as _ssrf:
             return f"ERROR: {_ssrf}"
 
+        started = time.monotonic()
+
+        # Cache probe before any tier, so a cached page is never metered —
+        # same rule as web_search: we bill outbound calls, not memory reads.
+        from app.agent.smart_fetch import reader as _sf_reader
+        cached = _sf_reader.page_cache_get(url, max_chars)
+        if cached is not None:
+            return cached
+
         # ── API-first: httpx + readability extraction (no browser, no CAPTCHA) ──
         try:
             from app.agent.smart_fetch.reader import toup_read_page
             text = await toup_read_page(url, max_chars)
             if text:  # Non-empty = success; empty = JS-rendered, needs browser
+                await self._meter_web_tool(
+                    "web_fetch", tier="httpx_reader", engine="trafilatura",
+                    started=started, url=url,
+                )
                 return text
             logger.info("[web_fetch] Page appears JS-rendered, trying browser")
         except Exception as exc:
@@ -1530,6 +1650,10 @@ class ToolExecutor:
                 if text and not text.startswith("(failed"):
                     if len(text) > max_chars:
                         text = text[:max_chars] + "\n... (truncated)"
+                    await self._meter_web_tool(
+                        "web_fetch", tier="browser_render", engine="chromium",
+                        started=started, url=url,
+                    )
                     return text
             except Exception as exc:
                 logger.warning("[web_fetch] Browser read_page also failed: %s", exc)

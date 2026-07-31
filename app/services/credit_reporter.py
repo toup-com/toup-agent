@@ -500,25 +500,34 @@ async def report_llm_usage(
     return outcome
 
 
-async def report_image_charge(
+async def report_flat_charge(
     *,
     user_id: str,
+    event_type: str,
     credits: float,
-    underlying_cost_cents: Optional[float] = None,
-    model: str = "gpt-image-1",
     bucket: str = "message",
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    underlying_cost_cents: Optional[float] = None,
     idempotency_key: Optional[str] = None,
     metadata: Optional[dict] = None,
+    meter_only: bool = False,
+    log_label: str = "flat",
 ) -> DeductOutcome:
-    """POST an explicit per-image credit charge to ``/credits/agent-charge``.
+    """POST an explicit per-event credit charge to ``/credits/agent-charge``.
 
     Mirrors :func:`report_llm_usage` but carries an already-computed credit
-    amount (image generation is priced per image, not per token) instead of
-    token counts. Fail-open: a reporting outage never breaks image generation.
-    In bundle mode the platform proxy already charged, so the endpoint returns
-    idempotent_hit without deducting — calling this is still safe and refreshes
-    CreditState. Updates the module CreditState so raise_if_exhausted() reflects
-    the latest server view.
+    amount (per-image, per-search, per-fetch — anything priced per event
+    rather than per token) instead of token counts. Fail-open: a reporting
+    outage never breaks the tool that triggered it. In bundle mode the
+    platform proxy may already have charged, so the endpoint returns
+    idempotent_hit without deducting — calling this is still safe and
+    refreshes CreditState. Updates the module CreditState so
+    raise_if_exhausted() reflects the latest server view.
+
+    ``meter_only=True`` asks the platform to record the row without moving
+    the balance — how a newly-priced tool lands in production before anyone
+    is billed for it.
     """
     url = _platform_endpoint("/credits/agent-charge")
     agent_key = _agent_key()
@@ -527,12 +536,15 @@ async def report_image_charge(
 
     payload: dict = {
         "user_id": user_id,
-        "event_type": "image_generation",
+        "event_type": event_type,
         "credits": float(credits),
         "bucket": bucket,
-        "provider": "openai",
-        "model": model,
+        "meter_only": bool(meter_only),
     }
+    if provider:
+        payload["provider"] = provider
+    if model:
+        payload["model"] = model
     if underlying_cost_cents is not None:
         payload["underlying_cost_cents"] = float(underlying_cost_cents)
     if idempotency_key:
@@ -572,9 +584,10 @@ async def report_image_charge(
     )
     if not outcome.idempotent_hit:
         logger.info(
-            "[credits] image charged user=%s model=%s credits=%.2f "
+            "[credits] %s %s user=%s model=%s credits=%.2f "
             "balance_after=%.2f success=%s",
-            (user_id or "?")[:8], model, float(credits),
+            log_label, "metered" if meter_only else "charged",
+            (user_id or "?")[:8], model or "-", float(credits),
             outcome.balance_after, outcome.success,
         )
 
@@ -585,6 +598,10 @@ async def report_image_charge(
             deduct_period_end = datetime.fromisoformat(pe_raw.replace("Z", "+00:00"))
         except Exception:
             deduct_period_end = None
+    # meter_only responses carry the real balance/enforcement view, but the
+    # call itself deducted nothing. Recording it is still correct — it keeps
+    # CreditState fresh — and success is always True so it can never trip
+    # raise_if_exhausted() on its own.
     _state.record_deduct(
         outcome,
         period_end=deduct_period_end,
@@ -592,6 +609,33 @@ async def report_image_charge(
         plan_display_name=data.get("plan_display_name"),
     )
     return outcome
+
+
+async def report_image_charge(
+    *,
+    user_id: str,
+    credits: float,
+    underlying_cost_cents: Optional[float] = None,
+    model: str = "gpt-image-1",
+    bucket: str = "message",
+    idempotency_key: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> DeductOutcome:
+    """Per-image charge. Thin wrapper over :func:`report_flat_charge` kept as
+    a named entry point because image generation is the one event whose
+    provider/model/event_type are fixed."""
+    return await report_flat_charge(
+        user_id=user_id,
+        event_type="image_generation",
+        credits=credits,
+        bucket=bucket,
+        provider="openai",
+        model=model,
+        underlying_cost_cents=underlying_cost_cents,
+        idempotency_key=idempotency_key,
+        metadata=metadata,
+        log_label="image",
+    )
 
 
 async def _refresh_status_metadata(user_id: str) -> None:

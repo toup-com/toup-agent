@@ -101,7 +101,9 @@ def test_c_cache_repeat_query(monkeypatch):
     async def fake_race(query, count=5):
         calls["n"] += 1
         await asyncio.sleep(PER_OP)
-        return "1. R\n   http://x\n   snip\n"
+        # (formatted, engine) — the tier contract since web-tool metering
+        # needed to attribute each result to a concrete upstream.
+        return "1. R\n   http://x\n   snip\n", "duckduckgo"
 
     monkeypatch.setattr(S, "_toup_search_race", fake_race)
     monkeypatch.setattr(S.settings, "search_engine_race", True)

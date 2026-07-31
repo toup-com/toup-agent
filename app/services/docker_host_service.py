@@ -284,6 +284,19 @@ def _agent_config_to_bridge_body(agent_config: Optional[AgentConfig]) -> dict:
         val = getattr(agent_config, field, None)
         if val:
             out[field] = val
+    # Brave is documented as a PLATFORM-shared key ("one key, all tenants" —
+    # config.brave_api_key, and it's in exec_env_scrub_keys as
+    # "platform-shared search key"), but the only delivery path above is the
+    # per-tenant column. Nobody ever backfilled it, so every tenant shipped
+    # with an empty key and web_search silently degraded to its slowest tier:
+    # a headless Chromium scraping search.brave.com at ~4-6s instead of a
+    # ~200ms JSON call. Falling back to the platform's own key makes setting
+    # BRAVE_API_KEY once on platform-api reach every container on its next
+    # rollout. A tenant-specific key (BYOK) still wins.
+    if not out.get("brave_api_key"):
+        platform_brave = (getattr(settings, "brave_api_key", "") or "").strip()
+        if platform_brave:
+            out["brave_api_key"] = platform_brave
     # WhatsApp (Cloud API / Path A — BYOA Meta App).
     for field in (
         "whatsapp_phone_number_id", "whatsapp_access_token",

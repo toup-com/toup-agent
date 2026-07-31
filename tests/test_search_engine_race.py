@@ -68,10 +68,11 @@ def test_race_returns_fastest_engine_and_cancels_slow_losers(monkeypatch):
     monkeypatch.setattr(S, "_search_bing", _engine(2.0, "bing", completed=completed))
 
     t0 = time.perf_counter()
-    out = asyncio.run(_toup_search_race("q", 5))
+    out, engine = asyncio.run(_toup_search_race("q", 5))
     elapsed = time.perf_counter() - t0
 
     assert "ddg-0" in out, "fastest engine's results should be returned"
+    assert engine == "ddg", "the winning engine is reported for usage attribution"
     assert elapsed < 0.5, f"should finish in ~0.05s (winner), not ~2s (losers); got {elapsed:.2f}s"
     assert "ddg" in completed
     assert "whoogle" not in completed and "bing" not in completed, "losers must be cancelled"
@@ -85,10 +86,10 @@ def test_dead_whoogle_does_not_block_the_race(monkeypatch):
     monkeypatch.setattr(S, "_search_bing", _engine(2.0, "bing"))
 
     t0 = time.perf_counter()
-    out = asyncio.run(_toup_search_race("q", 5))
+    out, engine = asyncio.run(_toup_search_race("q", 5))
     elapsed = time.perf_counter() - t0
 
-    assert "ddg-0" in out
+    assert "ddg-0" in out and engine == "ddg"
     assert elapsed < 0.5, f"dead Whoogle must not add latency; got {elapsed:.2f}s"
 
 
@@ -99,15 +100,17 @@ def test_mojeek_is_last_resort_when_all_primaries_empty(monkeypatch):
     monkeypatch.setattr(S, "_search_bing", _engine(0.0, "bing", empty=True))
     monkeypatch.setattr(S, "_search_mojeek", _engine(0.02, "mojeek"))
 
-    out = asyncio.run(_toup_search_race("q", 5))
+    out, engine = asyncio.run(_toup_search_race("q", 5))
     assert "mojeek-0" in out, "Mojeek should be used when primaries yield nothing"
+    assert engine == "mojeek"
 
 
 def test_race_returns_no_results_when_everything_fails(monkeypatch):
     for name in ("_search_google_whoogle", "_search_duckduckgo", "_search_bing", "_search_mojeek"):
         monkeypatch.setattr(S, name, _engine(0.0, name, empty=True))
-    out = asyncio.run(_toup_search_race("q", 5))
+    out, engine = asyncio.run(_toup_search_race("q", 5))
     assert out == "No search results found across all engines."
+    assert engine == "", "no engine served, so nothing is attributed (and nothing is metered)"
 
 
 def test_first_with_results_skips_empty_and_errored(monkeypatch):
@@ -129,13 +132,15 @@ def test_flag_off_uses_sequential_path(monkeypatch):
     """GATE: default (flag off) preserves the legacy sequential behavior."""
     calls = []
 
+    # The tier fns return (formatted, engine) since web-tool metering needed
+    # to attribute each result to a concrete upstream.
     async def fake_seq(q, c=5):
         calls.append("seq")
-        return "SEQ"
+        return "SEQ", "mojeek"
 
     async def fake_race(q, c=5):
         calls.append("race")
-        return "RACE"
+        return "RACE", "ddg"
 
     monkeypatch.setattr(S, "_toup_search_sequential", fake_seq)
     monkeypatch.setattr(S, "_toup_search_race", fake_race)
@@ -197,8 +202,11 @@ def test_priority_winner_among_cocompleting_engines(monkeypatch):
     monkeypatch.setattr(S, "_search_google_whoogle", _engine(0.0, "whoogle"))
     monkeypatch.setattr(S, "_search_duckduckgo", _engine(0.0, "ddg"))
     monkeypatch.setattr(S, "_search_bing", _engine(0.0, "bing"))
-    out = asyncio.run(_toup_search_race("q", 5))
+    out, engine = asyncio.run(_toup_search_race("q", 5))
     assert "whoogle-0" in out and "ddg-0" not in out
+    # The fake engine stamps `source` with the label it was built with; the
+    # real `_search_google_whoogle` reports "google".
+    assert engine == "whoogle"
 
 
 # ── Structural: lock invariants ─────────────────────────────────────────

@@ -70,10 +70,13 @@ def test_ttlcache_clear():
 
 # ── web_search cache ────────────────────────────────────────────────────
 
-def _fake_search(calls, payload="1. R\n   http://x\n   snip\n"):
+def _fake_search(calls, payload="1. R\n   http://x\n   snip\n", engine="duckduckgo"):
+    # The internal tier functions return (formatted, engine) since the
+    # web-tool metering work — `toup_search_meta` needs to attribute a result
+    # to a concrete upstream. `toup_search` still returns text only.
     async def fn(query, count=5):
         calls["n"] += 1
-        return payload
+        return payload, engine
     return fn
 
 
@@ -187,9 +190,23 @@ def test_perf_logging_present():
     assert "[PERF] web_fetch cache=miss" in _READER_SRC
 
 
-def test_caches_are_flag_gated():
-    assert "if settings.search_cache_enabled:" in _SEARCH_SRC
+def test_caches_are_flag_gated(monkeypatch):
+    # The search gate moved out of an inline `if` in toup_search and into the
+    # cache_get/cache_set helpers when the cache was hoisted above the Brave
+    # API tier, so assert the gate BEHAVES rather than grepping for a literal
+    # that a refactor can move. The reader still gates inline.
+    assert "settings.search_cache_enabled" in _SEARCH_SRC
     assert "if settings.fetch_cache_enabled:" in _READER_SRC
+
+    monkeypatch.setattr(S.settings, "search_cache_enabled", True)
+    S.cache_set("gated query", 5, "1. R\n   http://x\n   snip\n")
+    assert S.cache_get("gated query", 5) is not None
+
+    monkeypatch.setattr(S.settings, "search_cache_enabled", False)
+    assert S.cache_get("gated query", 5) is None, "flag off must bypass reads"
+    S.cache_set("other query", 5, "payload")
+    monkeypatch.setattr(S.settings, "search_cache_enabled", True)
+    assert S.cache_get("other query", 5) is None, "flag off must bypass writes"
 
 
 def test_cache_flags_default_on_killswitch():

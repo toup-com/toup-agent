@@ -327,21 +327,52 @@ async def _first_with_results(
     return winner
 
 
-async def _toup_search_sequential(query: str, count: int = 5) -> str:
-    """Legacy behavior: try engines in priority order, first non-empty wins."""
+_NO_RESULTS = "No search results found across all engines."
+
+
+def cache_key(query: str, count: int) -> tuple:
+    """Canonical cache key. Exported so callers that front this cache with
+    their own earlier tier (see ``ToolExecutor._tool_web_search``) hash the
+    query exactly the way ``toup_search`` does — a divergent key would make
+    the two tiers cache-miss each other forever."""
+    return (" ".join(query.split()).lower(), count)
+
+
+def cache_get(query: str, count: int) -> Optional[str]:
+    """Read-through for callers ahead of this module in the fallback chain.
+    Returns None when caching is disabled or on a miss."""
+    if not settings.search_cache_enabled:
+        return None
+    return _SEARCH_CACHE.get(cache_key(query, count))
+
+
+def cache_set(query: str, count: int, result: str) -> None:
+    """Store a result produced by an earlier tier. No-ops on empty/no-result
+    payloads so a transient outage can't be cached for 7 minutes."""
+    if not settings.search_cache_enabled:
+        return
+    if not result or result.startswith("No search results"):
+        return
+    _SEARCH_CACHE.set(cache_key(query, count), result)
+
+
+async def _toup_search_sequential(query: str, count: int = 5) -> tuple[str, str]:
+    """Legacy behavior: try engines in priority order, first non-empty wins.
+    Returns ``(formatted, engine)``; engine is "" when nothing produced."""
     engines = [_search_google_whoogle, _search_duckduckgo, _search_bing, _search_mojeek]
     for engine in engines:
         resp = await engine(query, count)
         if resp.results:
-            return _format_results(_ranked(resp.results, query), count)
-    return "No search results found across all engines."
+            return _format_results(_ranked(resp.results, query), count), resp.source
+    return _NO_RESULTS, ""
 
 
-async def _toup_search_race(query: str, count: int = 5) -> str:
+async def _toup_search_race(query: str, count: int = 5) -> tuple[str, str]:
     """Race the primary engines (Whoogle/DuckDuckGo/Bing) concurrently over one
     shared pooled client; first non-empty result wins and the losers are
     cancelled, so a dead or slow backend can't stall the chain. Mojeek stays a
-    sequential last resort, used only if all primaries come back empty."""
+    sequential last resort, used only if all primaries come back empty.
+    Returns ``(formatted, engine)``."""
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         winner = await _first_with_results(
             [_search_google_whoogle, _search_duckduckgo, _search_bing],
@@ -352,8 +383,32 @@ async def _toup_search_race(query: str, count: int = 5) -> str:
             if resp.results:
                 winner = resp
         if winner is not None and winner.results:
-            return _format_results(_ranked(winner.results, query), count)
-    return "No search results found across all engines."
+            return _format_results(_ranked(winner.results, query), count), winner.source
+    return _NO_RESULTS, ""
+
+
+async def toup_search_meta(query: str, count: int = 5) -> tuple[str, str, bool]:
+    """:func:`toup_search` plus provenance — returns
+    ``(formatted, engine, cache_hit)``.
+
+    ``engine`` is the winning engine's name ("duckduckgo", "mojeek", …) or ""
+    when every engine came back empty. Callers use it to attribute usage to a
+    concrete upstream; see the web-tool metering in ``tool_executor``.
+    """
+    cached = cache_get(query, count)
+    if cached is not None:
+        logger.info("[PERF] web_search cache=hit q=%r", query[:60])
+        return cached, "cache", True
+
+    if settings.search_engine_race:
+        result, engine = await _toup_search_race(query, count)
+    else:
+        result, engine = await _toup_search_sequential(query, count)
+
+    if result and not result.startswith("No search results"):
+        cache_set(query, count, result)
+        logger.info("[PERF] web_search cache=miss q=%r engine=%s", query[:60], engine or "-")
+    return result, engine, False
 
 
 async def toup_search(query: str, count: int = 5) -> str:
@@ -369,21 +424,9 @@ async def toup_search(query: str, count: int = 5) -> str:
     Results are served from a short-lived per-tenant TTL+LRU cache (kill-switch
     ``settings.search_cache_enabled``); a repeat query within the TTL returns
     with zero network calls. Empty/no-result responses are never cached.
+
+    Text-only wrapper over :func:`toup_search_meta` for callers that don't
+    care which engine served.
     """
-    key = None
-    if settings.search_cache_enabled:
-        key = (" ".join(query.split()).lower(), count)
-        cached = _SEARCH_CACHE.get(key)
-        if cached is not None:
-            logger.info("[PERF] web_search cache=hit q=%r", query[:60])
-            return cached
-
-    if settings.search_engine_race:
-        result = await _toup_search_race(query, count)
-    else:
-        result = await _toup_search_sequential(query, count)
-
-    if key is not None and result and not result.startswith("No search results"):
-        _SEARCH_CACHE.set(key, result)
-        logger.info("[PERF] web_search cache=miss q=%r", query[:60])
+    result, _engine, _cached = await toup_search_meta(query, count)
     return result

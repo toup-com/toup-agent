@@ -961,11 +961,24 @@ class CreditService:
         input_tokens: Optional[int] = None, output_tokens: Optional[int] = None,
         underlying_cost_cents: Optional[Decimal | float | int] = None,
         metadata: Optional[dict] = None,
+        meter_only: bool = False,
     ) -> ChargeResult:
         """Instant deduction. Atomic, idempotent.
 
         When ``settings.credit_enforcement_enabled=False`` always succeeds
         but still writes the ledger row (shadow mode).
+
+        ``meter_only=True`` is per-CALL shadow mode, independent of the
+        global enforcement flag: the row is written with ``amount=0``, the
+        balance is never touched, and the result is always ``success=True``
+        so the caller is never blocked. The would-be cost is preserved in
+        ``metadata.credits_quoted`` and, when the balance WOULD have been
+        insufficient, ``metadata.meter_would_deny`` records the reason. That
+        pair is what makes a new priced event (web_search, web_fetch)
+        landable in production without a billing change — you get the full
+        per-user usage series and a dry-run of the denial rate first, then
+        flip one flag to start charging. Same shape as the admin-unlimited
+        path below, which has always written zero-amount audit rows.
         """
         amount_q = _q(amount, _AMOUNT_QUANTUM)
         if amount_q <= 0:
@@ -1029,7 +1042,10 @@ class CreditService:
 
         enforcement = getattr(settings, "credit_enforcement_enabled", False)
 
-        if deny_reason and enforcement:
+        # meter_only never denies — it falls through to the write-and-return
+        # path below so a metered event is recorded even when the user could
+        # not actually have afforded it (that's the dry-run signal).
+        if deny_reason and enforcement and not meter_only:
             ledger = CreditLedger(
                 user_id=user_id, event_type=event_type, bucket=bucket,
                 amount=Decimal("0"), balance_after=_bucket_remaining(balance, bucket),
@@ -1063,7 +1079,12 @@ class CreditService:
             )
 
         # Unlimited (admin) charges never deduct — the row stays put.
-        will_deduct = ((deny_reason is None) or (not enforcement)) and not is_unlimited
+        # meter_only is the same deal, chosen per call instead of per user.
+        will_deduct = (
+            ((deny_reason is None) or (not enforcement))
+            and not is_unlimited
+            and not meter_only
+        )
         if will_deduct:
             _apply_delta(balance, bucket, -amount_q)
             actual_amount = -amount_q
@@ -1080,6 +1101,8 @@ class CreditService:
                 **(metadata or {}),
                 **({"shadow_would_deny": deny_reason} if (deny_reason and not enforcement) else {}),
                 **({"admin_unlimited": True} if is_unlimited else {}),
+                **({"meter_only": True, "credits_quoted": str(amount_q)} if meter_only else {}),
+                **({"meter_would_deny": deny_reason} if (meter_only and deny_reason) else {}),
             } or None,
         )
         try:
