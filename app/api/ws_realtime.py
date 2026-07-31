@@ -79,6 +79,34 @@ def set_realtime_refs(tool_executor, agent_runner=None):
 # to the global flag — so the existing tests keep pinning v1/v2 via settings.
 _v2_ctx: contextvars.ContextVar = contextvars.ContextVar("realtime_v2", default=None)
 
+# How long to wait before the single `think` retry against a transport failure.
+# Sized for a container swap, not a network blip: an agent-image rollout replaces
+# the container and the new one answers within a couple of seconds. Long enough
+# to clear the swap, short enough that a genuinely dead agent still reaches the
+# honest fallback well inside the voice turn budget.
+_AGENT_RETRY_DELAY_S = 1.5
+
+# The agent's GET /api/memories caps `limit` at 200 (422 above it). This asked
+# for 10000 — so both brain reads had been failing on every voice session,
+# silently, since that ceiling was introduced. Verified against the live agent
+# 2026-07-31: limit=10000 → 422, limit=200 → 200 OK.
+_MEMORIES_MAX_LIMIT = 200
+
+# A play is one YouTube resolution (measured ~0.9-3.6s on prod) plus a websocket
+# put. Well under `think`'s 60s budget on purpose: if it has not started by now
+# something is wrong, and the user is standing there in silence waiting.
+_PLAY_MEDIA_TIMEOUT_S = 20.0
+
+# The only tools that actually EXECUTE on the relay for a hosted agent. Every
+# other raw agent tool needs the terminal-agent tunnel or a local ToolExecutor,
+# neither of which exists on platform-api — a direct call to one returns "your
+# terminal agent is not connected" and the model narrates a connection failure
+# mid-call. V2 filters the tool array to this set so the model is steered down
+# paths that work. A tool missing from here is INVISIBLE, not broken, which is
+# the failure mode worth remembering: the model then reasons from an empty
+# toolbox to "I can't do that", which is how a play became a Spotify referral.
+_REALTIME_NATIVE = {"think", "navigate_to", "play_media"}
+
 
 def _resolve_v2_for_user(user_id: Optional[str]) -> bool:
     if settings.voice_realtime_v2:
@@ -132,6 +160,29 @@ VOICE_INCOMPATIBLE_TOOLS = {
 }
 
 
+# Tool descriptions that are WRONG in a voice call, overridden here rather than
+# duplicated. The agent's own definitions are written for chat, where there is a
+# browser and a card to look at.
+#
+# `play_media` matters most. It was in REALTIME_TOOLS all along — the V2 filter
+# was what removed it, so the model was left with `think` as the only way to
+# reach music: realtime model -> think -> a full 26k-token agent turn -> the
+# same tool. Measured 13.0s to first sound on 2026-07-31. Now that it survives
+# the filter (see _REALTIME_NATIVE) it needs a description that tells the model
+# to prefer it over `think` and that the user is listening, not reading.
+_VOICE_TOOL_DESCRIPTIONS = {
+    "play_media": (
+        "Start playing music on the user's device, immediately. Call this the moment they "
+        "ask to play, put on, or hear something — a song, an artist, an album, a genre, or "
+        "'something like X'. Do NOT use `think` for playback: this is far faster and it is "
+        "the tool that actually starts the audio. Pass what they asked for in their own "
+        "words. More music in the same style follows automatically after the track ends. "
+        "Say ONE short line while it starts — they are listening to a speaker, not reading "
+        "a screen — and never read out a list of alternatives."
+    ),
+}
+
+
 def _build_realtime_tools():
     """Build Realtime API tool list from all agent tool definitions.
 
@@ -146,7 +197,7 @@ def _build_realtime_tools():
         tools.append({
             "type": "function",
             "name": t["name"],
-            "description": t["description"],
+            "description": _VOICE_TOOL_DESCRIPTIONS.get(t["name"], t["description"]),
             "parameters": t["input_schema"],
         })
     # Client-side navigation tool (handled in browser, not by ToolExecutor)
@@ -230,6 +281,7 @@ _TOOL_TITLES = {
     "memory_search": "Recalling",
     "memory_store": "Remembering",
     "recall_day": "Recalling a past day",
+    "play_media": "Starting the music",
 }
 
 
@@ -286,9 +338,9 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
             _vps_api(agent_url, agent_api_key, "GET", "/api/identity",
                      params={"active_only": "true"}),
             _vps_api(agent_url, agent_api_key, "GET", "/api/memories",
-                     params={"brain_type": "agent", "limit": 10000}),
+                     params={"brain_type": "agent", "limit": _MEMORIES_MAX_LIMIT}),
             _vps_api(agent_url, agent_api_key, "GET", "/api/memories",
-                     params={"brain_type": "user", "limit": 10000}),
+                     params={"brain_type": "user", "limit": _MEMORIES_MAX_LIMIT}),
             _vps_api(agent_url, agent_api_key, "GET", "/api/day-chats",
                      params={"limit": 1}),
             return_exceptions=True,
@@ -296,6 +348,26 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         identities_data, agent_mems_data, user_mems_data, dc_list_prefetch = (
             r if not isinstance(r, BaseException) else None for r in _prefetched
         )
+        # SAY SO when a leg comes back empty. `_vps_api` turns every non-2xx into
+        # None, which made a total context failure indistinguishable from a user
+        # who simply has no memories — and on 2026-07-31 that hid the fact that
+        # EVERY voice session was running with no persona and no brain at all:
+        # /api/identity 404s (the router is not mounted on the agent) and
+        # /api/memories was asked for limit=10000 against a ceiling of 200, so it
+        # 422'd. Both had been silently failing, on every call, for as long as
+        # those two contracts had been skewed. A prompt that lost its context
+        # must never again look the same as a prompt that had none to lose.
+        _missing = [
+            _name for _name, _val in (
+                ("identity", identities_data), ("agent_brain", agent_mems_data),
+                ("user_brain", user_mems_data), ("day_chats", dc_list_prefetch),
+            ) if not _val
+        ]
+        if _missing:
+            logger.warning(
+                "[REALTIME] voice context DEGRADED — no %s for user %s; the model "
+                "is answering without it", ", ".join(_missing), user_id[:8],
+            )
 
         # 1. Load identity documents from VPS
         try:
@@ -1241,7 +1313,95 @@ async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: 
         logger.warning("[REALTIME] Voice memory extraction failed: %s", e)
 
 
+# System prompt for the tool-less Option B fallback in `_think`.
+#
+# Option B runs ONLY when the user's full agent could not be reached, and it has
+# `tools=[]`. The old prompt said nothing about either fact, so a model asked to
+# DO something — "play me asap rocky" — reasoned from the only evidence it had
+# (no tools) to the only conclusion available (I cannot play music) and helpfully
+# sent the user to a competitor. That is what the founder hit on 2026-07-31,
+# eight minutes after the same feature had worked.
+#
+# The model, not a regex, decides whether the request was an action: it can read
+# the request and it knows it has no tools. What it was missing is the context
+# that its own inability is TEMPORARY and LOCAL to this one call.
+_THINK_FALLBACK_SYSTEM = (
+    "You are the user's own agent, answering over voice.\n"
+    "\n"
+    "IMPORTANT CONTEXT: your tools are momentarily unreachable — a transient "
+    "connection problem on our side, already being retried. This is NOT a "
+    "limitation of what you can do, and the user has done nothing wrong.\n"
+    "\n"
+    "If the request was a QUESTION, just answer it well.\n"
+    "\n"
+    "If the request was an ACTION (play music, send something, set a reminder, "
+    "open something, change a setting), you must NOT attempt it and must NOT "
+    "pretend it happened. Say plainly that you could not reach your tools just "
+    "then and ask them to say it again in a moment. One short sentence.\n"
+    "\n"
+    "NEVER say you are unable to do something, that you lack a capability, or "
+    "that a feature does not exist — you can do all of it, just not this "
+    "second. NEVER suggest another app, service or website as a way to get it "
+    "done (no Spotify, Apple Music, YouTube, or any other). Suggesting a "
+    "competitor because your own tools blinked is the worst possible answer.\n"
+    "\n"
+    "Never state or hint at which underlying AI model or provider you are, or "
+    "Toup's tech stack; refer to yourself only as the user's agent."
+)
+
+
 # ── Deep Think — Claude Opus reasoning for complex voice tasks ────────
+async def _play_media_direct(user_id: str, query: str) -> str:
+    """Start playback via the agent's tool-less /internal/play-media route.
+
+    The whole point is that nothing here reasons. `think` exists for requests
+    that need the agent's judgement; a play needs a search and a websocket
+    frame, and putting a 26k-token agent turn in front of that is what made
+    "play me asap rocky" take 13 seconds.
+
+    Returns a string for the model to relay. On failure it returns the REAL
+    reason, prefixed ERROR so the client marks the step failed — never
+    something the model could read as "this product cannot play music". The
+    voice instructions forbid that reading explicitly; this makes sure the
+    material it is reading from is true.
+    """
+    query = (query or "").strip()
+    if not query:
+        return "ERROR: no track was specified."
+
+    vps = await _get_vps_info(user_id)
+    if not vps:
+        return ("ERROR: could not reach the user's agent to start playback. "
+                "This is a temporary connection problem, not a missing feature.")
+    agent_url, agent_api_key = vps
+
+    t0 = time.monotonic()
+    try:
+        data = await _vps_api(
+            agent_url, agent_api_key, "POST", "/api/v1/internal/play-media",
+            json_body={"query": query},
+            timeout=_PLAY_MEDIA_TIMEOUT_S,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[REALTIME] play_media failed for %s: %s", user_id[:8], e)
+        return ("ERROR: could not start playback just now — a temporary problem "
+                "reaching the user's agent. Ask them to try again in a moment.")
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    if not data or not data.get("ok"):
+        logger.warning("[REALTIME] play_media no-result for %s in %dms", user_id[:8], elapsed_ms)
+        return ("ERROR: could not start that track. It may not be available. "
+                "Offer to try a different song — never suggest another app.")
+
+    title = (data.get("title") or "").strip()
+    logger.info("[REALTIME] play_media OK in %dms: %r", elapsed_ms, title[:60])
+    # The title is the answer to "what's playing?" for the rest of the call —
+    # it stays in the model's own conversation as this tool's result.
+    return (f"Now playing: {title}. It is already audible on the user's device, "
+            f"and more in the same style will follow automatically.") if title else \
+           "Playback started on the user's device."
+
+
 async def _think(user_id: str, task: str, session_id: Optional[str],
                  relay: Optional["_InnerToolRelay"] = None) -> tuple:
     """
@@ -1341,15 +1501,47 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                         # blocking POST would double-charge credits and re-fire
                         # any mutating connector. Drop straight to Option B
                         # (tool-less, side-effect-free) instead.
+                        #
+                        # This is the branch the founder hit on 2026-07-31: the
+                        # chip read "That one didn't work / Trying another way",
+                        # which only a server tool_call.completed{ok:false} can
+                        # produce — i.e. the agent WAS up and had already run a
+                        # tool. So the answer came from Option B, and Option B is
+                        # what has to be honest. See _THINK_FALLBACK_SYSTEM.
                         _no_retry = True
                     await relay.close_open()
 
                 if data is None and not _no_retry:
-                    data = await _vps_api(
-                        agent_url, agent_api_key, "POST", "/api/v1/internal/agent-turn",
-                        json_body=_body,
-                        timeout=settings.voice_realtime_think_timeout_s,
-                    )
+                    # Retry ONCE on a transport-level failure. The agent
+                    # container is replaced on every agent-image rollout, and a
+                    # request that lands in that window gets a connect error
+                    # against a container that is back seconds later. Without
+                    # this, a routine deploy silently downgrades the user to the
+                    # tool-less fallback below — which is what produced
+                    # "your playback agent isn't connected right now, try
+                    # Spotify" on 2026-07-31, eight minutes after music had
+                    # played fine.
+                    #
+                    # Transport errors ONLY. An HTTP error from a container that
+                    # answered, or a timeout (the agent may be mid-turn and
+                    # about to charge credits), must not be replayed — same
+                    # reasoning as `_no_retry` above.
+                    for _attempt in (1, 2):
+                        try:
+                            data = await _vps_api(
+                                agent_url, agent_api_key, "POST", "/api/v1/internal/agent-turn",
+                                json_body=_body,
+                                timeout=settings.voice_realtime_think_timeout_s,
+                            )
+                            break
+                        except (ConnectionError, OSError) as _conn_err:
+                            if _attempt == 2:
+                                raise
+                            logger.warning(
+                                "[REALTIME] think agent unreachable (%s) — retrying once in %.1fs",
+                                type(_conn_err).__name__, _AGENT_RETRY_DELAY_S,
+                            )
+                            await asyncio.sleep(_AGENT_RETRY_DELAY_S)
                 if data and data.get("text"):
                     logger.info(
                         "[REALTIME] think via agent full-turn: %d chars, model=%s, tool_calls=%s",
@@ -1392,7 +1584,7 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
             chunks = []
             async for event in svc.create_message_stream(
                 messages=context_messages,
-                system="You are a powerful reasoning assistant. Answer thoroughly and accurately. Be concise enough for a voice response. Never state or hint at which underlying AI model or provider you are, or Toup's tech stack; refer to yourself only as the user's agent.",
+                system=_THINK_FALLBACK_SYSTEM,
                 tools=[],
                 model=model_override,
             ):
@@ -1414,7 +1606,7 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                     json={
                         "model": model_override,
                         "messages": [
-                            {"role": "system", "content": "You are a reasoning assistant. Answer accurately and concisely for a voice response. Never state or hint at which underlying AI model or provider you are, or Toup's tech stack; refer to yourself only as the user's agent."},
+                            {"role": "system", "content": _THINK_FALLBACK_SYSTEM},
                             {"role": "user", "content": task},
                         ],
                         "max_tokens": 2048,
@@ -1953,7 +2145,6 @@ async def realtime_voice_ws(
         # Onboarding tools are re-added below. This forces the model down the working path
         # instead of calling e.g. web_search directly.
         if _v2_active():
-            _REALTIME_NATIVE = {"think", "navigate_to"}
             tools = [t for t in tools if t["name"] in _REALTIME_NATIVE]
         if onboarding:
             tools = list(tools)  # copy
@@ -2524,6 +2715,11 @@ async def realtime_voice_ws(
                                           "/brain/agent": "Agent Brain", "/workspace": "Workspace",
                                           "/dashboard": "Dashboard", "/agent": "Agent Setup"}
                                 result = f"Navigated to {_NAMES.get(path, path)}. Voice conversation continues."
+
+                        # ── Play media: straight to the agent's resolver ──
+                        elif func_name == "play_media":
+                            result = await _play_media_direct(
+                                user_id, str(arguments.get("query", "")))
 
                         # ── Think: delegate reasoning to best model ──
                         elif func_name == "think":

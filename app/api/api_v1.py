@@ -257,6 +257,75 @@ async def api_chat(
         raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
 
 
+class PlayMediaRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=300)
+    channel: str = Field(default="youtube", max_length=32)
+
+
+@router.post("/internal/play-media", include_in_schema=False)
+async def internal_play_media(req: PlayMediaRequest, request: Request):
+    """Resolve a track and start it. NO LLM, NO agent turn.
+
+    Why this exists. A voice "play me X" used to be routed through `think`,
+    which runs a FULL agent turn on this container: load the session, the agent
+    config and the day's context, embed a memory query, assemble ~26k tokens of
+    prompt and the entire tool array, call the model so it emits one tool call
+    with one string argument, run the tool, then call the model AGAIN to say one
+    short sentence. Measured on prod for the founder on 2026-07-31: 13.0s to the
+    media_play frame, of which 79% was inside this process and only 3.5s was
+    inference — the two model calls produced 66 output tokens between them.
+
+    The agent contributes exactly two things to a play: query → video_id, and
+    pushing the frame to the phone. That is what this route does, and nothing
+    else. Anything genuinely ambiguous ("something like that song from the
+    film") still belongs on `think`, which keeps every skill and connector.
+
+    Returns the resolved title so the caller can say what it started and answer
+    "what's playing?" without another round trip.
+    """
+    if settings.run_mode != "agent":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    if not _agent_runner:
+        raise HTTPException(status_code=503, detail="Agent not available")
+    user_id = settings.user_id
+    if not user_id:
+        raise HTTPException(status_code=503, detail="Agent user not configured")
+
+    tools = getattr(_agent_runner, "tools", None)
+    if tools is None:
+        raise HTTPException(status_code=503, detail="Tool executor not available")
+
+    # `_tool_play_media` reads BOTH of these off the executor: the user id to
+    # broadcast to, and the channel to seed the radio station on. 'app' — not
+    # 'voice' — because RADIO_ALLOWED_CHANNELS has no voice member, so seeding
+    # on 'voice' would resolve the track and then silently decline to build a
+    # station, and the music would stop after one song.
+    # Per-call state is ContextVar-backed and per-asyncio-task (see
+    # ToolExecutor's class docstring), and this handler owns its own task — so
+    # setting it here cannot leak into a concurrent agent run, and there is
+    # nothing to restore. Use the setters; `_current_*` are read-only properties.
+    tools.set_user_id(user_id)
+    tools.set_channel("app")
+    result = await tools._tool_play_media({"query": req.query, "channel": req.channel})
+
+    text = str(result or "")
+    if text.upper().startswith("ERROR") or text.startswith("Could not find"):
+        # Surface the real reason. The caller turns this into something the user
+        # can act on; it must never become "I can't play music".
+        raise HTTPException(status_code=502, detail=text[:300])
+
+    last = getattr(tools, "_last_media", None) or {}
+    return {
+        "ok": True,
+        "title": last.get("title") or "",
+        "video_id": last.get("video_id") or "",
+        "detail": text[:300],
+    }
+
+
 @router.post("/internal/agent-turn", response_model=ChatResponse, include_in_schema=False)
 async def internal_agent_turn(req: ChatRequest, request: Request):
     """Internal-only: run a FULL agent turn (every tool/skill/connector) for the
