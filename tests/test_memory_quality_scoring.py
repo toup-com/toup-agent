@@ -100,6 +100,59 @@ def test_build_scenarios_every_store_is_marker_scoped():
                 assert st.get("expect_all") or st.get("require_absence")
 
 
+def test_refusal_is_not_an_absence_cue():
+    # A capability refusal and an honest absence are different things. The
+    # 2026-08-01 run conflated them: the models refused to store passphrases,
+    # the token never reached memory, and the suite reported a MEMORY defect.
+    assert mq.looks_like_refusal("I can't save passphrases. Use a password manager.")
+    assert mq.looks_like_refusal("I can’t retain Priya’s desk access code.")
+    assert mq.looks_like_refusal("I cannot store account numbers.")
+    assert not mq.looks_like_refusal("I don't have that stored.")
+    assert not mq.looks_like_refusal("Saved.")
+    # ...and an honest absence must still score as one.
+    assert mq.score_query("I don't have that stored.", [], ["memqa-z"],
+                          require_absence=True)["pass"]
+
+
+def test_no_seeded_fact_is_credential_shaped():
+    """Regression guard for the 2026-08-01 invalid run.
+
+    Both gpt-5.5 and gpt-5.6-terra refuse to store credential-shaped values
+    ("I can't save passphrases -- keep it in a password manager"). A refusal
+    reaches the scorer as a missing token, so a credential-shaped seed makes
+    the suite report a memory failure for something that never got near
+    memory. Seeds must stay ordinary identifiers.
+    """
+    banned = ("passphrase", "password", "door code", "access code",
+              "account number", "membership number", "security word")
+    for s in mq.build_scenarios("memqa-test1234"):
+        for st in s["steps"]:
+            if st["kind"] != "store":
+                continue
+            low = st["message"].lower()
+            for b in banned:
+                assert b not in low, f"{s['id']}/{st['label']} seeds a '{b}'"
+
+
+def test_cleanup_sweeps_the_transcript_not_just_memories():
+    """Regression guard: a seeded fact lives in `messages` too.
+
+    Sweeping only `memories` leaves every marker token retrievable from
+    conversation history, so a later run can answer with an earlier run's
+    value. Measured 2026-08-01: 0 marker memories, 55 marker messages, and a
+    temporal_ordering failure that was really the previous run's bicycle.
+    """
+    labels = [lbl for lbl, _t, _s in mq.MESSAGE_CLEANUP_STATEMENTS]
+    tables = [t for _l, t, _s in mq.MESSAGE_CLEANUP_STATEMENTS]
+    assert "messages" in tables
+    # The nullable back-reference must be unlinked BEFORE the delete, or the
+    # delete trips memories.source_message_id (no ON DELETE in this subsystem).
+    assert labels.index("memories.source_message_id (unlink)") < labels.index("messages")
+    assert "ILIKE $1" in mq.MESSAGE_ID_LOOKUP_SQL
+    for _l, _t, sql in mq.MESSAGE_CLEANUP_STATEMENTS:
+        assert "::text[]" in sql, "ids are TEXT columns — casts are required"
+
+
 def test_build_scenarios_update_tokens_share_shape_but_differ():
     # v1/v2 must be near-identical restatements (kestrel-dbf7 vs kestrel-13b4
     # shape) so the >=0.90 auto-duplicate path (D-mem-A) is really exercised.
