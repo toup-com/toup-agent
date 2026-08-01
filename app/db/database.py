@@ -28,7 +28,7 @@ def _build_engine(database_url: str) -> AsyncEngine:
             database_url,
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
-            echo=settings.debug,
+            echo=settings.sql_echo,
         )
     if settings.run_mode in ("platform", "agent"):
         _db_url = database_url
@@ -56,7 +56,7 @@ def _build_engine(database_url: str) -> AsyncEngine:
             _pool_kwargs = {"poolclass": NullPool}
         return create_async_engine(
             _db_url,
-            echo=settings.debug,
+            echo=settings.sql_echo,
             pool_pre_ping=True,
             connect_args={
                 "statement_cache_size": 0,
@@ -68,7 +68,7 @@ def _build_engine(database_url: str) -> AsyncEngine:
         )
     return create_async_engine(
         database_url,
-        echo=settings.debug,
+        echo=settings.sql_echo,
         pool_size=10,
         max_overflow=20,
         pool_pre_ping=True,

@@ -9,6 +9,23 @@ class Settings(BaseSettings):
     app_name: str = "Toup Agent Platform"
     debug: bool = True
 
+    # SQLAlchemy statement echo. Deliberately NOT tied to `debug`.
+    #
+    # `debug` defaults True and the agent containers never set DEBUG, so
+    # `echo=settings.debug` meant every one of the 55 tenant agents ran with
+    # full statement echo in production. That is not just noise:
+    #   - echo logs BOUND PARAMETERS, so `INSERT INTO messages (... content ...)`
+    #     wrote the user's message body verbatim into the container log
+    #     (confirmed on a live tenant, 2026-08-01);
+    #   - every statement was emitted twice (echo's own handler plus root
+    #     propagation), ~6k log lines per 20 min on one container, which is
+    #     what makes a real incident unreadable;
+    #   - it formats every statement and its parameters on the hot path.
+    #
+    # Echo is a debugging tool that exposes user data, so it must be opted
+    # into explicitly (SQL_ECHO=true) and never ride on a general dev flag.
+    sql_echo: bool = False
+
     # Deployment environment. Drives the sk_live_ / sk_test_ guard below.
     # Anything other than "production" treats the deployment as non-prod and
     # forbids live Stripe keys. Set via ENVIRONMENT env var.

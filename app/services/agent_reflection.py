@@ -257,6 +257,32 @@ async def reflect_on_turn(
         return 0
     if api_key is None:
         api_key = await _resolve_tenant_api_key(db, user_id)
+
+    # Release the pooled connection BEFORE the LLM round-trip — same defect as
+    # #407 fixed in day_summarizer, reached by a different path so that scan's
+    # `call_system_llm` predicate could not match it (this goes through
+    # LLMService.complete_with_json). _resolve_tenant_api_key above is a read,
+    # and a read autobegins a transaction that pins the connection until the
+    # session commits; store_agent_reflections below simply re-acquires one.
+    #
+    # It matters here for the same reason it mattered there, and more often:
+    # the caller is agent_runner's _background_post_processing, fire-and-forget
+    # on every turn, on a path that dies routinely (a voice caller hanging up
+    # cancels the parent 1.5s later). A death mid-call left the connection
+    # checked out forever -> GC terminated it -> the pool degraded -> later
+    # turns died on PendingRollbackError -> 500 from /internal/agent-turn.
+    #
+    # Best-effort: releasing the connection is an optimisation, and this
+    # function's whole contract is "safe to call on every turn". A failed
+    # release must not become a raised exception the caller has to absorb.
+    try:
+        await db.commit()
+    except Exception as e:
+        logger.warning(
+            "[agent_reflection] could not release the connection before the LLM "
+            "call (continuing, connection stays pinned): %s", e,
+        )
+
     notes = await extract_agent_reflections(user_message, assistant_response, api_key=api_key)
     if not notes:
         return 0

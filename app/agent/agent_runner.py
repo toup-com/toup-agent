@@ -143,6 +143,27 @@ _RUN_MAX_ITER_CTX: contextvars.ContextVar[Optional[int]] = contextvars.ContextVa
 )
 
 
+# Strong refs for fire-and-forget work, mirroring api.auth._spawn_background
+# and support.pipeline.spawn.
+#
+# The event loop keeps only a WEAK reference to a running task, so a bare
+# asyncio.create_task(...) whose result nobody stores can be garbage-collected
+# mid-await — the hazard CPython's own docs warn about. Both call sites below
+# open a DB session and then await an LLM, so a task that vanishes mid-call is
+# exactly the cancellation that leaked a pooled connection and degraded the
+# canary's pool on 2026-08-01. Releasing the connection first (see
+# _extract_memories / agent_reflection.reflect_on_turn) makes that death
+# harmless; keeping a reference stops it happening at all, and also stops the
+# post-processing silently not running.
+_background_tasks: set = set()
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 def _is_claude_model(model: str) -> bool:
     """Check if a model name refers to an Anthropic Claude model."""
     return model.startswith("claude-")
@@ -2428,7 +2449,7 @@ class AgentRunner:
                 logger.warning(f"[AGENT] Background session error (non-fatal): {e}")
 
         if not disable_post_processing:
-            asyncio.create_task(_background_post_processing())
+            _spawn_background(_background_post_processing())
         else:
             logger.debug(
                 "[AGENT] background post-processing SKIPPED "
@@ -2441,7 +2462,7 @@ class AgentRunner:
         if not disable_post_processing and _use_day_ctx and _day_chat_id:
             try:
                 from app.services.day_summarizer import run_summarizer_if_needed
-                asyncio.create_task(run_summarizer_if_needed(async_session_maker, _day_chat_id))
+                _spawn_background(run_summarizer_if_needed(async_session_maker, _day_chat_id))
             except Exception as _sum_err:
                 logger.warning("[AGENT] Summarizer scheduling failed (non-fatal): %s", _sum_err)
 
@@ -4784,6 +4805,40 @@ class AgentRunner:
                     user_api_key = result.scalar_one_or_none()
             except Exception:
                 pass
+
+            # Release the pooled connection BEFORE the LLM round-trip. The read
+            # above autobegins a transaction (the begin_nested SAVEPOINT ends,
+            # but the OUTER transaction it sits in does not), and that is what
+            # pins the connection — an open session holds nothing, an open
+            # transaction holds a connection.
+            #
+            # Same defect #407 fixed in day_summarizer. Its scan missed this
+            # site because it keyed on `call_system_llm`, and extraction reaches
+            # the model through LLMService.complete_with_json instead. This one
+            # is the hotter of the two: the summarizer is debounced, whereas
+            # extraction runs on every non-trivial turn — and both ride
+            # _background_post_processing, which is fire-and-forget on a path
+            # that dies routinely (a voice caller hanging up cancels the parent
+            # 1.5s later). A death mid-call left the connection checked out
+            # forever, the GC terminated it, the pool degraded, and later turns
+            # died on PendingRollbackError -> 500 from /internal/agent-turn.
+            #
+            # Safe: everything above is reads, and the dedup/entity writes below
+            # simply re-acquire a connection (expire_on_commit=False keeps the
+            # loaded objects usable).
+            #
+            # Best-effort, and deliberately its own try — same shape as the read
+            # above. Releasing the connection is an optimisation; extraction is
+            # the user's memories. A release that fails must cost them a pinned
+            # connection, never the turn's memories, so this may not fall into
+            # the outer handler and skip the extraction below.
+            try:
+                await db.commit()
+            except Exception as _rel_err:
+                logger.warning(
+                    "[AGENT] Could not release the connection before extraction "
+                    "(continuing, connection stays pinned for the call): %s", _rel_err,
+                )
 
             extractor = get_memory_extractor()
             extracted = await extractor.extract_memories_with_llm(
