@@ -616,6 +616,33 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
         )
         return
 
+    # ── Phase A-0: let the bridge finish recycling the pool ────────
+    # The PREVIOUS rollout's completion told the bridge to refresh the pool
+    # image, and the bridge recycles every member from there — 49 of 50 inside
+    # 30 minutes, measured 2026-08-01. Starting the canary upgrade inside that
+    # window is what killed five consecutive rollouts (ConnectError / stale
+    # heartbeat -> aborted_orphan / 0 health checks in 259s), on diffs that
+    # could not fail a boot. See wait_for_pool_quiescence for the timeline.
+    #
+    # Heartbeat throughout: this legitimately takes minutes and the reconciler
+    # orphans at 3. On timeout we PROCEED and record it — the canary gate is
+    # still there to catch a genuinely bad image.
+    rollout.phase = "pool_quiesce"
+    rollout.last_progress_at = datetime.utcnow()
+    await db.commit()
+
+    async def _beat_once() -> None:
+        rollout.last_progress_at = datetime.utcnow()
+        await db.commit()
+
+    from app.services.pool_service import wait_for_pool_quiescence
+    _quiet, _why = await wait_for_pool_quiescence(
+        settings.rollout_pool_quiesce_timeout_s, heartbeat=_beat_once,
+    )
+    logger.info("[ROLLOUT] %s pool quiescence: quiet=%s (%s)", rollout.id, _quiet, _why)
+    if not _quiet:
+        rollout.notes = ((rollout.notes or "") + f"\npool NOT quiescent at canary start: {_why}").strip()
+
     rollout.canary_prefix = canary.user_id[:8]
     rollout.phase = "canary_upgrading"
     rollout.last_progress_at = datetime.utcnow()

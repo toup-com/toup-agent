@@ -1418,6 +1418,16 @@ class Settings(BaseSettings):
     # comfortably covers the ~90s happy path with margin for slow boots.
     rollout_canary_wait_minutes_default: int = 5
     rollout_batch_size: int = 5             # Post-canary parallel upgrades per batch
+    # How long a rollout waits for the bridge's pool to stop recycling before
+    # it touches the canary. A COMPLETED rollout notifies the bridge to refresh
+    # the pool image, and the bridge then recycles every pool member — measured
+    # 2026-08-01, 49 of 50 members inside 30 minutes. A rollout that starts in
+    # that window contends with it and its canary upgrade dies in whichever way
+    # the contention bites: ConnectError, a stale heartbeat -> aborted_orphan,
+    # or 0 health checks in 259s. 15 min covers the observed churn; on timeout
+    # the rollout PROCEEDS and says so, because a late rollout beats a wedged
+    # one. Set 0 to disable the wait entirely.
+    rollout_pool_quiesce_timeout_s: int = 900
     # Convergence sweep (2026-07-28 incident: rollout 01a945e2's driver was
     # killed by its own merge's Railway redeploy; the re-drive d79584ea hit
     # the bridge mid-restart — 502 — on tenant 2739b5c6, reported 'complete',

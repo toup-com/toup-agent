@@ -28,8 +28,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from sqlalchemy import select
@@ -433,6 +434,102 @@ async def notify_pool_image_refresh(image_tag: str) -> bool:
     except Exception as e:
         logger.warning("[pool_service] bridge refresh-image unreachable: %s", e)
         return False
+
+
+_POOL_QUIESCE_POLL_S = 15.0
+
+
+async def pool_churn_snapshot() -> Optional[dict]:
+    """How much of the pool is mid-recycle right now, per the bridge.
+
+    Returns None when the bridge can't be reached or answers oddly. The caller
+    must treat None as UNKNOWN and proceed — never as "busy" — so losing
+    telemetry can never wedge a rollout.
+    """
+    from app.services.docker_host_service import _bridge_client
+    try:
+        async with _bridge_client() as client:
+            resp = await client.get("/v1/pool/health")
+            if resp.status_code != 200:
+                logger.warning("[pool_service] pool health %s", resp.status_code)
+                return None
+            data = resp.json()
+        summary = data.get("last_reconciler_summary") or {}
+        members = data.get("members") or {}
+        return {
+            "upgrading": list(summary.get("assigned_upgrading") or []),
+            "stale": int(summary.get("assigned_stale") or 0),
+            "spawning": int(members.get("spawning") or 0),
+            "draining": int(members.get("draining") or 0),
+        }
+    except Exception as e:
+        logger.warning("[pool_service] pool churn snapshot unavailable: %s", e)
+        return None
+
+
+def pool_is_busy(snap: dict) -> bool:
+    return bool(snap["upgrading"]) or snap["stale"] > 0 or snap["spawning"] > 0 or snap["draining"] > 0
+
+
+async def wait_for_pool_quiescence(
+    timeout_s: float,
+    heartbeat: Optional[Any] = None,
+) -> tuple[bool, str]:
+    """Block until the bridge has stopped recycling pool containers.
+
+    WHY THIS EXISTS (measured on production 2026-08-01)
+
+    A rollout that COMPLETES calls notify_pool_image_refresh, and the bridge
+    then recycles every pool member — 49 of 50 within 30 minutes, in batches of
+    3 assigned upgrades plus generic drains, each spawning a transient extra
+    container. The NEXT rollout's canary upgrade lands inside that window and
+    loses to it, in whichever way the contention happens to bite:
+
+        17:15  ConnectError after 8.9s
+        17:19  heartbeat stale       -> aborted_orphan
+        17:27  0 health checks/259s  -> aborted_canary_failed
+
+    Five consecutive rollouts died there, on diffs that were a config int, a
+    prompt string and one db.commit() — nothing that can fail a boot. The same
+    image then upgraded the same canary in 97s with 3 health checks once the
+    pool had settled. Merges arrive in bursts (5 PRs in ~45 min that day), so
+    every rollout after the first was landing in its predecessor's churn.
+
+    Returns (quiet, reason). Never raises. A timeout returns quiet=False so the
+    caller can record it and PROCEED — a late rollout beats a wedged one, and
+    the canary gate still protects the fleet if it turns out to be a bad time.
+
+    `heartbeat`, if given, is awaited each poll so the reconciler's 3-minute
+    orphan timer doesn't kill a rollout that is legitimately waiting.
+    """
+    if timeout_s <= 0:
+        return True, "wait disabled"
+
+    deadline = time.time() + timeout_s
+    first = await pool_churn_snapshot()
+    if first is None:
+        return True, "bridge unreachable — proceeding without the check"
+    if not pool_is_busy(first):
+        return True, "pool already quiescent"
+
+    logger.info("[pool_service] waiting for pool quiescence: %s", first)
+    while time.time() < deadline:
+        await asyncio.sleep(_POOL_QUIESCE_POLL_S)
+        if heartbeat is not None:
+            try:
+                await heartbeat()
+            except Exception:
+                pass
+        snap = await pool_churn_snapshot()
+        if snap is None:
+            return True, "bridge went unreachable mid-wait — proceeding"
+        if not pool_is_busy(snap):
+            waited = int(timeout_s - (deadline - time.time()))
+            logger.info("[pool_service] pool quiescent after %ss", waited)
+            return True, f"quiescent after {waited}s"
+
+    last = await pool_churn_snapshot()
+    return False, f"still busy after {int(timeout_s)}s: {last}"
 
 
 async def release_pool_member(prefix: Optional[str] = None, user_id: Optional[str] = None) -> bool:
