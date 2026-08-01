@@ -142,6 +142,61 @@ def _warn_brave_unconfigured() -> None:
         "next rollout. Logged once per process."
     )
 
+
+# ── Search gateway: local breaker ──────────────────────────────────────
+# The gateway is tried BEFORE the in-container Brave key, so if it is
+# unreachable every search would pay a full timeout before falling through —
+# turning an outage of the fast path into added latency on the slow one. After
+# _GW_FAIL_MAX consecutive transport failures the tier is skipped outright for
+# _GW_COOLDOWN_S, and one success resets it.
+#
+# Deliberately counts TRANSPORT failures only. A 200 with served=false is the
+# gateway working exactly as designed — it throttled us and told us to use our
+# own lower tiers — and must never open the breaker, or a busy minute would
+# disable fast search for the next one.
+_GW_FAIL_MAX = 3
+_GW_COOLDOWN_S = 60.0
+_gw_fails = 0
+_gw_skip_until = 0.0
+_gateway_unconfigured_warned = False
+
+
+def _gateway_allowed() -> bool:
+    return time.monotonic() >= _gw_skip_until
+
+
+def _gateway_note_ok() -> None:
+    global _gw_fails, _gw_skip_until
+    _gw_fails = 0
+    _gw_skip_until = 0.0
+
+
+def _gateway_note_fail() -> None:
+    global _gw_fails, _gw_skip_until
+    _gw_fails += 1
+    if _gw_fails >= _GW_FAIL_MAX:
+        _gw_skip_until = time.monotonic() + _GW_COOLDOWN_S
+        _gw_fails = 0
+        logger.warning(
+            "[web_search] search gateway unreachable %d times — skipping that "
+            "tier for %.0fs", _GW_FAIL_MAX, _GW_COOLDOWN_S,
+        )
+
+
+def _warn_gateway_unconfigured() -> None:
+    """TOUP_TOKEN missing. Once per process, same reasoning as above."""
+    global _gateway_unconfigured_warned
+    if _gateway_unconfigured_warned:
+        return
+    _gateway_unconfigured_warned = True
+    logger.warning(
+        "[web_search] degraded skipped=search_gateway reason=no_toup_token — "
+        "TOUP_TOKEN is unset on this container, so searches cannot use the "
+        "platform gateway. An agent missing it has lost LLM bundle access too, "
+        "so this is almost certainly a provisioning defect, not a search one. "
+        "Logged once per process."
+    )
+
 # play_media query → (video_id, title, resolved_at). Resolving a song name is
 # two live network tiers (a YouTube results scrape, then a yt-dlp subprocess)
 # and was repeated in full for every single ask, including the same ask twice.
@@ -1587,11 +1642,50 @@ class ToolExecutor:
             logger.info("[PERF] web_search cache=hit(tier0) q=%r", query[:60])
             return cached
 
-        # ── Primary: Brave Search API — instant (~200ms), clean JSON, the same
-        # index our browser scrapes but ~30x faster. Platform-level key (one key,
-        # all tenants). The httpx scrape below is reliably CAPTCHA/challenge-blocked
-        # on datacenter IPs (DDG 202-challenge, Bing CAPTCHA), so when the key is
-        # present this is the path that actually serves users fast.
+        # ── Tier 1: the PLATFORM SEARCH GATEWAY ─────────────────────────
+        # We authenticate to our own platform with TOUP_TOKEN — the same
+        # Toup-issued credential the LLM proxy already uses — and the platform
+        # holds the one shared Brave key server-side. That is what makes
+        # rotation a single server-side variable, stops a container compromise
+        # from leaking the fleet's key, and lets rate limiting, quota and
+        # metering be ENFORCED at a chokepoint instead of self-reported from
+        # here. See app/api/search_proxy.py.
+        #
+        # This tier is ahead of the container key on purpose, and it is why
+        # every tenant now has fast search: 42/42 carry TOUP_TOKEN, while
+        # BRAVE_API_KEY is injected only at container-create time
+        # (bridge/pool_addon.py) — so any container created before that key
+        # existed has been falling through to the 4-6s scrape tiers for its
+        # whole life, silently, because a degraded search is never metered.
+        #
+        # The gateway DEGRADES rather than denies: 200 with served=false means
+        # "I throttled, or upstream failed — use your own lower tiers". Only
+        # that keeps a rate limit from becoming a missing answer.
+        if _gateway_allowed():
+            gw = await self._gateway_search(query, count)
+            if gw is not None:
+                served, gw_result, gw_reason = gw
+                if served and gw_result:
+                    _sf_search.cache_set(query, count, gw_result)
+                    # NOT metered here: search_proxy already wrote the row from
+                    # its own observation. Metering both sides double-counts.
+                    return gw_result
+                _search_degraded(
+                    skipped="search_gateway",
+                    reason=gw_reason or "unserved", query=query,
+                )
+        else:
+            _search_degraded(skipped="search_gateway", reason="breaker_open", query=query)
+
+        # ── Tier 1b: the container's own Brave key, if it still has one.
+        # Legacy path, kept as a FALLBACK only. It is the topology the gateway
+        # replaces — one fleet-wide secret in 42 places, rotation by container
+        # recreation, and limits the container reports rather than the platform
+        # enforces — so it must never be the tier that normally serves. It
+        # stays because removing both the key and the gateway in one step would
+        # leave a tenant with no fast search if the gateway is down, and
+        # because a BYOK tenant's own key still belongs to them. Once the
+        # gateway is proven across the fleet, this block and BRAVE_API_KEY go.
         if settings.brave_api_key:
             _ok, _why = _brave_allowed()
             if not _ok:
@@ -1672,6 +1766,116 @@ class ToolExecutor:
             query[:60],
         )
         return "No search results found."
+
+    async def _gateway_search(self, query: str, count: int):
+        """Ask the platform search gateway. Returns (served, text, reason) or None.
+
+        None means "not configured from here" — a different condition from "the
+        gateway declined" — but the caller treats both the same way: fall to the
+        next tier. Neither is ever an error the user sees.
+
+        There is deliberately NO RETRY. The gateway exists to protect a shared
+        upstream ceiling, and a client that retries into a throttle is the exact
+        thing it is protecting against. The lower tiers are the retry.
+
+        The timeout is deliberately tighter than the direct-Brave client's 15s.
+        This tier runs FIRST, so its timeout is latency every search pays before
+        falling through; 8s is well past the 0.6-2.5s a served call takes and
+        still bounded. Repeated transport failures open the local breaker.
+        """
+        token = (getattr(settings, "toup_token", "") or "").strip()
+        if not token:
+            _warn_gateway_unconfigured()
+            return None
+
+        base = (getattr(settings, "platform_api_url", "") or "").strip().rstrip("/")
+        if not base:
+            _warn_gateway_unconfigured()
+            return None
+        # Tenants provisioned before the /api suffix was normalised hit the SPA
+        # catch-all and get HTML with a 200 — the same trap credit_reporter
+        # documents at _platform_endpoint.
+        if not base.endswith("/api"):
+            base = f"{base}/api"
+
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(
+                    f"{base}/search/web",
+                    json={
+                        "query": query,
+                        "count": count,
+                        # A property, but read defensively: this runs on the hot
+                        # path of every search and must not be the thing that
+                        # raises inside a tier whose whole contract is "never
+                        # deny an answer".
+                        "channel": getattr(self, "_current_channel", None) or None,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/json",
+                        # Cloudflare fronts toup.ai and challenges unfamiliar
+                        # client signatures; bundle_client hits the same wall.
+                        "User-Agent": "toup-agent/1.0 (search-gateway)",
+                    },
+                )
+        except Exception as exc:
+            _gateway_note_fail()
+            logger.warning("[web_search] gateway unreachable: %s", exc)
+            return (False, None, f"gateway_error:{type(exc).__name__}")
+
+        if resp.status_code == 401:
+            # This tenant's TOUP_TOKEN does not resolve. Loud: it means the
+            # agent has silently lost fast search, and almost certainly its LLM
+            # bundle with it. Counts as a failure so the breaker stops us
+            # hammering a credential that will not start working by itself.
+            _gateway_note_fail()
+            logger.error(
+                "[web_search] gateway rejected our token (401) — this tenant "
+                "has no fast search and probably no bundle either"
+            )
+            return (False, None, "gateway_unauthorized")
+        if resp.status_code >= 500:
+            _gateway_note_fail()
+            logger.warning("[web_search] gateway HTTP %d", resp.status_code)
+            return (False, None, f"gateway_http_{resp.status_code}")
+        if resp.status_code >= 400:
+            # 4xx that is not 401 is our own bad request — a bug on this side,
+            # not an outage. Do NOT open the breaker: skipping the tier for a
+            # minute would hide it rather than fix it.
+            logger.warning("[web_search] gateway HTTP %d", resp.status_code)
+            return (False, None, f"gateway_http_{resp.status_code}")
+
+        try:
+            data = resp.json()
+        except ValueError:
+            _gateway_note_fail()
+            logger.warning("[web_search] gateway returned non-JSON (SPA catch-all?)")
+            return (False, None, "gateway_bad_body")
+
+        # Reached the gateway and got a well-formed answer. Whether it SERVED or
+        # shed load, the transport is healthy — reset the breaker.
+        _gateway_note_ok()
+
+        if not data.get("served"):
+            return (False, None, data.get("degraded_reason") or "unserved")
+
+        results = data.get("results") or []
+        if not results:
+            return (False, None, "empty_result")
+
+        lines = []
+        for i, r in enumerate(results[:count], 1):
+            lines.append(f"{i}. {r.get('title', '')}")
+            lines.append(f"   {r.get('url', '')}")
+            desc = r.get("description") or ""
+            if desc:
+                lines.append(f"   {desc}")
+            for snip in (r.get("extra_snippets") or [])[:3]:
+                if snip:
+                    lines.append(f"   {snip}")
+            lines.append("")
+        return (True, "\n".join(lines), None)
 
     async def _brave_search_fallback(self, query: str, count: int) -> str:
         async with httpx.AsyncClient(timeout=15) as client:
