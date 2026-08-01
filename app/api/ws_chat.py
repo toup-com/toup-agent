@@ -539,9 +539,46 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
             id_matches = _re_mod.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
             if id_matches:
                 video_id = id_matches[0]
-                title_m = _re_mod.search(r'"title":\{"runs":\[\{"text":"([^"]+)"\}', resp.text)
+                # Take the title from the SAME result block as the id we chose.
+                # These two regexes used to run independently — first id on the
+                # page, first title on the page — which are not the same result
+                # whenever YouTube puts a shelf, an ad, or a "people also
+                # watched" entry between them. On 2026-07-31 that paired
+                # Kendrick Lamar's HUMBLE (correct video) with the title of a
+                # Rakim reaction video, and because the title is what feeds both
+                # the [SYSTEM] line below AND the radio seed, the user got the
+                # right song followed by a station built from a stranger.
+                # Anchoring on the id keeps the same video and makes the title
+                # honest.
+                # `(?:(?!"videoId":")[\s\S])` — consume anything EXCEPT the
+                # start of another result. Without that guard, a bounded `.*?`
+                # window still crosses into the next videoRenderer whenever our
+                # own block happens to carry no title, and we are right back to
+                # showing one video under another's name — the bug this is here
+                # to fix, just rarer and harder to spot.
+                title_m = _re_mod.search(
+                    _re_mod.escape(f'"videoId":"{video_id}"')
+                    + r'(?:(?!"videoId":")[\s\S]){0,3000}?'
+                    + r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"',
+                    resp.text,
+                )
                 if title_m:
-                    video_title = title_m.group(1)
+                    raw_title = title_m.group(1)
+                    try:
+                        # Decode YouTube's JSON escapes (& for & is in a
+                        # large share of music titles).
+                        video_title = json.loads(f'"{raw_title}"')
+                    except Exception:
+                        video_title = raw_title
+                else:
+                    # No title in this id's block. Use what the user asked for
+                    # rather than some other result's title — a generic label is
+                    # merely unhelpful, a WRONG one actively misdirects the
+                    # agent's reply and the station seed.
+                    video_title = query
+                    logger.warning(
+                        "[FAST-MEDIA] no title block for %s — falling back to the query", video_id
+                    )
 
         if not video_id:
             logger.warning("[FAST-MEDIA] No video found for: %s", query)
@@ -554,6 +591,10 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
             "video_id": video_id,
             "title": video_title,
             "url": f"https://www.youtube.com/watch?v={video_id}",
+            # Always send artwork — see the note in tool_executor's identical
+            # broadcast. Derived from the id, so it costs nothing and can never
+            # be blank.
+            "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
         }
         broadcast_queue.put_nowait(event)
         logger.info("[FAST-MEDIA] Broadcast media_play in fast-path: %s - %s", video_id, video_title)
@@ -1144,7 +1185,40 @@ async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str,
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
 
+# A track that became current less than this long ago has not ended — nothing a
+# user asks for is 15 seconds long. Absolute floor, applied when we have no
+# duration for the track.
+_MIN_TRACK_PLAY_SEC = 30.0
+# …and when we DO know the duration, require a real fraction of it. A 4-minute
+# song does not end at 45s. Kept well below 1.0 so a fade-out, a short outro or
+# a client that stops reporting near the end still advances normally.
+_MIN_TRACK_PLAY_FRACTION = 0.5
+# Two ends for the same video inside this window are the same physical event.
+_MEDIA_ENDED_DEDUP_SEC = 20.0
+# One advance at a time per user. `_handle_media_ended` is dispatched with
+# `asyncio.create_task` from two independent places (the main receive loop and
+# the mid-turn stop-watcher), so without this two copies interleave: both read
+# the pre-advance state, both pass their guards, and both pop a track — one
+# physical track-end moving the cursor twice.
+_media_ended_locks: dict = {}
+
+
+def _media_ended_lock(user_id: str, channel: str) -> asyncio.Lock:
+    key = (user_id, channel)
+    lock = _media_ended_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _media_ended_locks[key] = lock
+    return lock
+
+
 async def _handle_media_ended(user_id: str, msg: dict) -> None:
+    channel_pre = (msg.get("channel") or "").strip().lower()
+    async with _media_ended_lock(user_id, channel_pre):
+        await _handle_media_ended_locked(user_id, msg)
+
+
+async def _handle_media_ended_locked(user_id: str, msg: dict) -> None:
     from app.agent.radio import get_radio_manager, RadioSessionManager
 
     channel = (msg.get("channel") or "").strip().lower()
@@ -1220,6 +1294,59 @@ async def _handle_media_ended(user_id: str, msg: dict) -> None:
             "[radio] ended_video_id=%s != current=%s but in_session=true — advancing",
             ended_video_id, sess.current_track_id,
         )
+
+    # ── Idempotency ──────────────────────────────────────────────────
+    # One physical track-end can reach us more than once: a second connected
+    # client, a reconnect replay, or the two dispatch paths (main receive loop
+    # and the mid-turn stop-watcher) racing as separate tasks. Each duplicate
+    # used to pop another track, which is how a single ended event could jump
+    # the station by two and leave the phone's card and its lock screen showing
+    # different songs.
+    now = time.time()
+    if (
+        ended_video_id
+        and ended_video_id == sess.last_ended_video_id
+        and now - sess.last_ended_ts < _MEDIA_ENDED_DEDUP_SEC
+    ):
+        logger.info(
+            "[radio] media_ended duplicate video=%s within %.1fs — no-op",
+            ended_video_id, now - sess.last_ended_ts,
+        )
+        return
+
+    # ── Track pinning ────────────────────────────────────────────────
+    # A track that became current seconds ago has not ENDED. Nothing the user
+    # asks for is 15 seconds long, so an "ended" this early is a client-side
+    # artefact — a stalled stream, a player replaced mid-load, a WebView torn
+    # down by backgrounding — and honoring it silently replaces the song the
+    # user explicitly asked for. That is exactly what happened on 2026-07-31:
+    # "Love The Way You Lie" was preempted ~18s in by an advance the user never
+    # requested, and a minute of failed loads walked a Kendrick Lamar request
+    # down someone else's station.
+    #
+    # Deliberately scoped to media_ended, the only PASSIVE advance trigger. An
+    # explicit `radio_skip_next` is authoritative and is never gated: the user
+    # may skip whenever they like.
+    if sess.current_track_started_ts:
+        elapsed = now - sess.current_track_started_ts
+        # Proportional floor when we know the length (a 4-minute track cannot
+        # end at 45s), absolute floor when we don't.
+        floor = _MIN_TRACK_PLAY_SEC
+        if sess.current_track_length_sec > 0:
+            floor = max(floor, sess.current_track_length_sec * _MIN_TRACK_PLAY_FRACTION)
+        if elapsed < floor:
+            logger.info(
+                "[radio] media_ended too early video=%s elapsed=%.1fs floor=%.1fs "
+                "(len=%.0fs) — track pinned, not advancing",
+                ended_video_id, elapsed, floor, sess.current_track_length_sec,
+            )
+            # Re-anchor the client on what the session actually holds, so a
+            # phone that lost its stream re-syncs instead of drifting.
+            await broadcast_to_user(user_id, sess.to_broadcast_dict())
+            return
+
+    sess.last_ended_video_id = ended_video_id
+    sess.last_ended_ts = now
 
     await _advance_and_broadcast_next(user_id, channel, sess, trigger="media_ended")
 

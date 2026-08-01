@@ -88,24 +88,57 @@ def _yt_remote(
         body["filter"] = filter
     if limit:
         body["limit"] = limit
-    try:
-        import httpx
-        resp = httpx.post(
-            f"{base}/internal/radio/yt",
-            headers={"X-Agent-Key": key},
-            json=body,
-            timeout=20.0,
-        )
-    except Exception as e:
-        print(f"[radio/playlist] yt_remote op={op} err={type(e).__name__}: {e} — local fallback", flush=True)
-        return None
-    if resp.status_code != 200:
-        print(f"[radio/playlist] yt_remote op={op} http={resp.status_code} — local fallback", flush=True)
-        return None
-    try:
-        return resp.json().get("result")
-    except Exception:
-        return None
+    # The route lives under the API prefix (`/api/internal/radio/yt`), but a
+    # tenant's PLATFORM_API_URL is not reliably set with the `/api` suffix —
+    # caught live for this tenant on 2026-05-24, where the container's OS env
+    # had it and `settings.platform_api_url` still resolved without it. Posting
+    # to the unprefixed path lands on the SPA catch-all, which serves index.html
+    # for GET and answers **405** for POST, so this helper returned None every
+    # single time and EVERY station silently fell back to the agent-local
+    # ytmusicapi call — the one that is anti-bot-blocked from Contabo IPs, i.e.
+    # the exact failure this helper exists to prevent. Measured on 2026-07-31:
+    # 23 consecutive 405s across one evening, which is how "play me Kendrick
+    # Lamar" ended up seeding a station off a text-search fallback.
+    #
+    # Same both-layouts idiom `tool_executor` and `subagent_dispatcher` already
+    # use for their platform callbacks; this helper was simply never given it.
+    candidates = [f"{base}/internal/radio/yt"]
+    if not base.endswith("/api"):
+        candidates.append(f"{base}/api/internal/radio/yt")
+    last_status = 0
+    for url in candidates:
+        try:
+            import httpx
+            resp = httpx.post(
+                url,
+                headers={"X-Agent-Key": key},
+                json=body,
+                timeout=20.0,
+            )
+        except Exception as e:
+            print(f"[radio/playlist] yt_remote op={op} err={type(e).__name__}: {e} — local fallback", flush=True)
+            return None
+        if resp.status_code != 200:
+            last_status = resp.status_code
+            continue
+        # Guard against the SPA HTML fallback answering 200 on an unknown path:
+        # only trust JSON. Without this a 200 text/html would parse-fail below
+        # and look like an empty station rather than a misroute.
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if "application/json" not in ctype:
+            print(
+                f"[radio/playlist] yt_remote op={op} non-JSON ({ctype or 'no ctype'}) from {url} "
+                "— PLATFORM_API_URL likely missing /api suffix",
+                flush=True,
+            )
+            last_status = resp.status_code
+            continue
+        try:
+            return resp.json().get("result")
+        except Exception:
+            return None
+    print(f"[radio/playlist] yt_remote op={op} http={last_status} — local fallback", flush=True)
+    return None
 
 
 @dataclass

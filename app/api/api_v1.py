@@ -318,10 +318,23 @@ async def internal_play_media(req: PlayMediaRequest, request: Request):
         raise HTTPException(status_code=502, detail=text[:300])
 
     last = getattr(tools, "_last_media", None) or {}
+    # Consume it. `_last_media` is a one-slot mailbox that AgentRunner._save_messages
+    # captures-and-clears when it persists a turn — so a value left here by a
+    # voice play gets stapled onto the NEXT chat turn's assistant message, which
+    # then renders a media card for a song nobody mentioned. This path never runs
+    # an agent turn, so nothing else will ever drain it.
+    try:
+        tools._last_media = None
+    except Exception:
+        pass
     return {
         "ok": True,
         "title": last.get("title") or "",
         "video_id": last.get("video_id") or "",
+        "thumbnail_url": (
+            f"https://i.ytimg.com/vi/{last.get('video_id')}/hqdefault.jpg"
+            if last.get("video_id") else ""
+        ),
         "detail": text[:300],
     }
 

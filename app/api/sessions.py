@@ -561,11 +561,13 @@ async def create_session_message(
     """
     import uuid as _uuid
 
+    media = None
     if body is not None:
         role = body.role or role
         content = body.content or content
         model_used = body.model_used or model_used
         day_chat_id = body.day_chat_id or day_chat_id
+        media = body.media or None
 
     # Verify session ownership
     session_query = select(Conversation).where(
@@ -618,6 +620,10 @@ async def create_session_message(
         # Denormalized per-message channel (was left NULL on this path,
         # so voice rows rendered channel-less in day history).
         channel=session.channel,
+        # Same shape AgentRunner._save_messages writes, so the clients need no
+        # new rendering path: a voice-started song gets the same Toup card a
+        # chat-started one does.
+        metadata_json=json.dumps({"media": media}) if media else None,
     )
     db.add(msg)
 

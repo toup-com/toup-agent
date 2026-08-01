@@ -80,6 +80,50 @@ class RadioSession:
     # so an exhausted station being skipped repeatedly would stack one dialog
     # per tap. Throttled in ws_chat._advance_and_broadcast_next.
     last_exhaustion_notice_ts: float = 0.0
+    # ── Track pinning (2026-07-31) ───────────────────────────────────
+    # When the current track became current. A `media_ended` arriving a few
+    # seconds after that cannot be a track ENDING — no song is 15s long — so it
+    # is a client-side artefact (a stalled stream, a replaced player, a dying
+    # WebView) and must not advance the station. Without this the user's
+    # explicitly requested song was always one spurious frame away from being
+    # replaced: "Love The Way You Lie" was preempted ~18s in, and a minute of
+    # failed loads walked a Kendrick request all the way to a stranger's track.
+    current_track_started_ts: float = 0.0
+    # Length of the current track in seconds when known (from YT Music
+    # metadata), so the guard can be proportional as well as absolute.
+    current_track_length_sec: float = 0.0
+    # Last honored end, for idempotency. The client debounces per videoId, but
+    # duplicates still arrive from a second connected client, a reconnect
+    # replay, or two dispatch paths racing — and each duplicate used to pop
+    # another track.
+    last_ended_video_id: str = ""
+    last_ended_ts: float = 0.0
+
+    @staticmethod
+    def parse_length_sec(length: str) -> float:
+        """YT Music gives durations as "4:18" / "1:02:33". Return seconds, or
+        0.0 when absent or unparseable (the guard then falls back to its
+        absolute floor)."""
+        parts = (length or "").strip().split(":")
+        if not parts or not all(p.isdigit() for p in parts) or len(parts) > 3:
+            return 0.0
+        total = 0.0
+        for p in parts:
+            total = total * 60 + int(p)
+        return total
+
+    def mark_current_track(self, video_id: Optional[str], length_sec: float = 0.0) -> None:
+        """Set the current track AND start its play clock.
+
+        Every writer of `current_track_id` must go through here — the clock is
+        what makes the pinning guard in `_handle_media_ended` meaningful, and a
+        writer that sets the id without it leaves a track whose apparent start
+        is whatever the previous one was (or 0, i.e. "playing since 1970",
+        which passes every elapsed check and pins nothing).
+        """
+        self.current_track_id = video_id
+        self.current_track_started_ts = time.time()
+        self.current_track_length_sec = max(0.0, float(length_sec or 0.0))
 
     def to_broadcast_dict(self) -> dict:
         return {
@@ -150,7 +194,7 @@ class RadioSessionManager:
         sess.enabled = True
         sess.seed_intent = seed_intent or sess.seed_intent
         sess.seed_track = seed_track
-        sess.current_track_id = seed_track.video_id
+        sess.mark_current_track(seed_track.video_id)
         sess.consecutive_failures = 0
         sess.playlist = list(station)
         sess.playlist_cursor = 0
@@ -213,7 +257,7 @@ class RadioSessionManager:
             )
         sess.seed_intent = seed_intent
         sess.seed_track = seed_track
-        sess.current_track_id = seed_track.video_id
+        sess.mark_current_track(seed_track.video_id)
         sess.consecutive_failures = 0
         # Reset station state — it gets rebuilt on next enable.
         sess.playlist = []
@@ -232,7 +276,7 @@ class RadioSessionManager:
         history_cursor to the new end. Called after playlist advances — NOT
         called on skip_prev (which re-plays a prior entry)."""
         prev = sess.current_track_id
-        sess.current_track_id = track.video_id
+        sess.mark_current_track(track.video_id, sess.parse_length_sec(track.length))
         sess.current_station_track = track
         sess.played_track_ids.add(track.video_id)
         sess.played_history.append(track)
@@ -264,7 +308,7 @@ class RadioSessionManager:
         prev = sess.current_track_id
         sess.history_cursor -= 1
         track = sess.played_history[sess.history_cursor]
-        sess.current_track_id = track.video_id
+        sess.mark_current_track(track.video_id, sess.parse_length_sec(track.length))
         sess.current_station_track = track
         sess.last_activity_ts = time.time()
         logger.info(
@@ -283,7 +327,7 @@ class RadioSessionManager:
             prev = sess.current_track_id
             sess.history_cursor += 1
             track = sess.played_history[sess.history_cursor]
-            sess.current_track_id = track.video_id
+            sess.mark_current_track(track.video_id, sess.parse_length_sec(track.length))
             sess.current_station_track = track
             sess.last_activity_ts = time.time()
             logger.info(

@@ -180,7 +180,15 @@ _VOICE_TOOL_DESCRIPTIONS = {
         "the tool that actually starts the audio. Pass what they asked for in their own "
         "words. More music in the same style follows automatically after the track ends. "
         "Say ONE short line while it starts — they are listening to a speaker, not reading "
-        "a screen — and never read out a list of alternatives."
+        "a screen — and never read out a list of alternatives.\n"
+        "ONE exception to acting immediately: you must actually have heard WHAT to play. "
+        "If the request came through garbled, or was cut off before the name, or you are "
+        "guessing at an unfamiliar or non-English artist name, do NOT substitute an artist "
+        "you happen to know and do NOT fall back to whatever was playing earlier in this "
+        "call — ask one short question ('Who, sorry?' / 'Rihanna, right?') and call this "
+        "tool as soon as they answer. Asking a three-word question is not refusing and is "
+        "not a list of alternatives; playing the wrong artist is a worse failure than "
+        "taking one extra second. If you did hear the name clearly, do not ask — just play."
     ),
 }
 
@@ -337,8 +345,7 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         # order is unchanged. (_vps_api never raises — it returns None — but
         # return_exceptions guards refactors.)
         _prefetched = await asyncio.gather(
-            _vps_api(agent_url, agent_api_key, "GET", "/api/identity",
-                     params={"active_only": "true"}),
+            _load_identities_local(user_id),
             _vps_api(agent_url, agent_api_key, "GET", "/api/memories",
                      params={"brain_type": "agent", "limit": _MEMORIES_MAX_LIMIT}),
             _vps_api(agent_url, agent_api_key, "GET", "/api/memories",
@@ -745,6 +752,49 @@ async def _get_agent_name(user_id: str) -> Optional[str]:
 
 
 # ── VPS helpers — all personal data lives on user's VPS, never platform ──
+
+async def _load_identities_local(user_id: str) -> Optional[dict]:
+    """The user's identity documents (soul, instructions, user profile, tools).
+
+    Read straight from the PLATFORM database, because that is where they live.
+    This used to be `GET /api/identity` against the user's AGENT container, and
+    it 404'd on every single voice session for as long as the call existed: the
+    identity router is mounted only in platform_main (`app.include_router(
+    identity_router, ...)`), the agent never had that table, and the relay
+    already runs inside the platform process. So every voice call was built on
+    a prompt with no soul, no behavioural guidelines and nothing about the user
+    — invisibly, because `_vps_api` folds every non-2xx into None and an empty
+    result is indistinguishable from a user who simply has none.
+
+    Returned in the same {"identities": [...]} shape the HTTP route produced, so
+    the consumer below is unchanged.
+    """
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import Identity
+
+        async with async_session_maker() as db:
+            rows = (await db.execute(
+                select(Identity).where(
+                    Identity.user_id == user_id,
+                    Identity.is_active.is_(True),
+                )
+            )).scalars().all()
+        return {
+            "identities": [
+                {
+                    "identity_type": r.identity_type,
+                    "content": r.content,
+                    "priority": r.priority or 0,
+                }
+                for r in rows
+            ]
+        }
+    except Exception as e:  # noqa: BLE001
+        # Same failure shape as the old call so the DEGRADED warning still fires.
+        logger.warning("[REALTIME] identity load failed for %s: %s", user_id[:8], e)
+        return None
+
 
 async def _get_vps_info(user_id: str) -> Optional[tuple]:
     """Return (agent_url, agent_api_key) for the user's VPS agent."""
@@ -1160,7 +1210,12 @@ async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) 
 _QUERY_SHIM_MAX = 16000
 
 
-def _message_payload(role: str, content: str, model: Optional[str] = None):
+def _message_payload(
+    role: str,
+    content: str,
+    model: Optional[str] = None,
+    media: Optional[dict] = None,
+):
     """Build (json_body, query_params) for POST /api/sessions/{id}/messages.
 
     Agent images that predate the body-aware route read role/content as QUERY
@@ -1177,6 +1232,13 @@ def _message_payload(role: str, content: str, model: Optional[str] = None):
     body = {"role": role, "content": content}
     if model:
         body["model_used"] = model
+    if media:
+        # Body-only from here: a nested object cannot ride the query shim, and
+        # an agent old enough to only read query params has no media column
+        # handling anyway — it stores the text and drops this, which is exactly
+        # today's behaviour rather than a regression.
+        body["media"] = media
+        return body, None
     if len(quote(content)) > _QUERY_SHIM_MAX:
         return body, None
     return body, dict(body)
@@ -1188,6 +1250,7 @@ async def _save_voice_messages(
     user_text: str,
     assistant_text: str,
     model: str = "gpt-4o-realtime",
+    media: Optional[dict] = None,
 ) -> None:
     """Persist a user/assistant message pair to VPS via HTTP API.
 
@@ -1211,13 +1274,15 @@ async def _save_voice_messages(
     saved = 0
     lost = 0
 
-    for _role, _text, _model in (
-        ("user", user_text, None),
-        ("assistant", assistant_text, model),
+    for _role, _text, _model, _media in (
+        ("user", user_text, None, None),
+        # Media rides the ASSISTANT row, matching how a chat turn persists a
+        # play — the card belongs to the reply that started it.
+        ("assistant", assistant_text, model, media),
     ):
         if not _text:
             continue
-        body, params = _message_payload(_role, _text, _model)
+        body, params = _message_payload(_role, _text, _model, _media)
         result = await _vps_api(
             agent_url, agent_api_key, "POST",
             f"/api/sessions/{session_id}/messages",
@@ -1361,20 +1426,21 @@ async def _play_media_direct(user_id: str, query: str) -> str:
     frame, and putting a 26k-token agent turn in front of that is what made
     "play me asap rocky" take 13 seconds.
 
-    Returns a string for the model to relay. On failure it returns the REAL
-    reason, prefixed ERROR so the client marks the step failed — never
+    Returns (text_for_the_model, media_dict_or_None). On failure the text is
+    the REAL reason, prefixed ERROR so the client marks the step failed — never
     something the model could read as "this product cannot play music". The
     voice instructions forbid that reading explicitly; this makes sure the
-    material it is reading from is true.
+    material it is reading from is true. `media` is None on every failure path,
+    so a failed play can never persist a card for a song that isn't playing.
     """
     query = (query or "").strip()
     if not query:
-        return "ERROR: no track was specified."
+        return "ERROR: no track was specified.", None
 
     vps = await _get_vps_info(user_id)
     if not vps:
         return ("ERROR: could not reach the user's agent to start playback. "
-                "This is a temporary connection problem, not a missing feature.")
+                "This is a temporary connection problem, not a missing feature."), None
     agent_url, agent_api_key = vps
 
     t0 = time.monotonic()
@@ -1387,21 +1453,35 @@ async def _play_media_direct(user_id: str, query: str) -> str:
     except Exception as e:  # noqa: BLE001
         logger.warning("[REALTIME] play_media failed for %s: %s", user_id[:8], e)
         return ("ERROR: could not start playback just now — a temporary problem "
-                "reaching the user's agent. Ask them to try again in a moment.")
+                "reaching the user's agent. Ask them to try again in a moment."), None
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     if not data or not data.get("ok"):
         logger.warning("[REALTIME] play_media no-result for %s in %dms", user_id[:8], elapsed_ms)
         return ("ERROR: could not start that track. It may not be available. "
-                "Offer to try a different song — never suggest another app.")
+                "Offer to try a different song — never suggest another app."), None
 
     title = (data.get("title") or "").strip()
+    video_id = (data.get("video_id") or "").strip()
     logger.info("[REALTIME] play_media OK in %dms: %r", elapsed_ms, title[:60])
+    # Hand the caller what it needs to persist a real media card, in the same
+    # shape a chat turn writes (AgentRunner._save_messages → metadata_json
+    # {"media": ...}). A voice play used to leave only plain text in the thread,
+    # so a song the agent genuinely started looked, on reopening the app, like
+    # nothing had happened.
+    media = {
+        "type": "youtube",
+        "video_id": video_id,
+        "title": title,
+        "thumbnail_url": (data.get("thumbnail_url") or "")
+        or (f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""),
+    } if video_id else None
     # The title is the answer to "what's playing?" for the rest of the call —
     # it stays in the model's own conversation as this tool's result.
-    return (f"Now playing: {title}. It is already audible on the user's device, "
+    text = (f"Now playing: {title}. It is already audible on the user's device, "
             f"and more in the same style will follow automatically.") if title else \
            "Playback started on the user's device."
+    return text, media
 
 
 async def _think(user_id: str, task: str, session_id: Optional[str],
@@ -1718,36 +1798,40 @@ async def _finalize_onboarding(user_id: str) -> str:
                 ("user_profile", "User Profile", identity_content, 90),
             ]:
                 try:
-                    # Delete existing identity of this type first
-                    existing = await _vps_api(
-                        agent_url, agent_api_key, "GET", "/api/identity",
-                        params={"identity_type": id_type},
-                    )
-                    if existing:
-                        id_list = existing.get("identities", existing) if isinstance(existing, dict) else existing
-                        if isinstance(id_list, list):
-                            for old_id in id_list:
-                                old_id_val = old_id.get("id", "")
-                                if old_id_val:
-                                    # TKT-LAT-007 (wave 3): shared agent_http client.
-                                    from app.services.agent_http import get_agent_http_client
-                                    _id_client = get_agent_http_client()
-                                    await _id_client.delete(
-                                        f"{agent_url}/api/identity/{old_id_val}",
-                                        headers={"X-Agent-Key": agent_api_key},
-                                        timeout=10.0,
-                                    )
+                    # Written to the PLATFORM database, not the agent.
+                    #
+                    # These three calls all targeted the agent's /api/identity,
+                    # which does not exist there — the identity router is only
+                    # ever mounted in platform_main, so every onboarding upsert
+                    # 404'd and was swallowed by the warning below. Verified
+                    # live 2026-08-01: GET {agent}/api/identity -> 404 while
+                    # /api/soul and /api/memories both -> 200. Writing here puts
+                    # the rows exactly where _load_identities_local now reads
+                    # them, so a user's onboarding persona reaches their voice
+                    # prompt instead of vanishing.
+                    from app.db.database import async_session_maker
+                    from app.db.models import Identity
 
-                    # Create new identity
-                    await _vps_api(agent_url, agent_api_key, "POST", "/api/identity", json_body={
-                        "identity_type": id_type,
-                        "name": id_name,
-                        "content": id_content,
-                        "priority": id_priority,
-                        "is_active": True,
-                    })
+                    async with async_session_maker() as _db:
+                        old = (await _db.execute(
+                            select(Identity).where(
+                                Identity.user_id == user_id,
+                                Identity.identity_type == id_type,
+                            )
+                        )).scalars().all()
+                        for row in old:
+                            await _db.delete(row)
+                        _db.add(Identity(
+                            user_id=user_id,
+                            identity_type=id_type,
+                            name=id_name,
+                            content=id_content,
+                            priority=id_priority,
+                            is_active=True,
+                        ))
+                        await _db.commit()
                 except Exception as e:
-                    logger.warning("[REALTIME] Failed to push Identity %s to VPS: %s", id_type, e)
+                    logger.warning("[REALTIME] Failed to save Identity %s: %s", id_type, e)
 
             logger.info("[REALTIME] Pushed Identity records to VPS for user %s", user_id[:8])
 
@@ -2523,6 +2607,11 @@ async def realtime_voice_ws(
     # ── 7. Bidirectional relay ────────────────────────────────
     # Track state for transcript accumulation and persistence
     response_text_accum = ""
+    # Media this turn started, attached to the assistant row when it persists so
+    # the day thread renders a real Toup card instead of bare text. Survives the
+    # function-call response (which carries no spoken text) and is consumed by
+    # the spoken response that follows it.
+    pending_media = None
     last_user_text = ""  # Track last user message for memory extraction
     # V1 kept the legacy "gpt-4o-realtime" label; V2 reports the real slug.
     default_turn_model = realtime_model() if _v2_active() else "gpt-4o-realtime"
@@ -2690,6 +2779,42 @@ async def realtime_voice_ws(
                         await openai_ws.send(json.dumps({"type": "response.create"}))
                         logger.info("[REALTIME] Injected text: %s", inject_content[:60])
 
+                elif msg_type == "now_playing":
+                    # The station moved on. Tell the model what is audible NOW.
+                    #
+                    # Radio advances are pushed over the CHAT websocket to the
+                    # phone; this relay has no subscription to them, so the
+                    # model's belief about what is playing was frozen at the
+                    # last play_media result "for the rest of the call". The
+                    # founder hit exactly that on 2026-07-31: the track had
+                    # changed and the agent still named the previous song.
+                    #
+                    # Injected WITHOUT response.create on purpose. This is a
+                    # context correction, not a turn — the model must quietly
+                    # know the new title, not announce it. Announcing every
+                    # station advance mid-call would be unbearable.
+                    _np_title = str(msg.get("title") or "").strip()[:200]
+                    if _np_title:
+                        try:
+                            await openai_ws.send(json.dumps({
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{
+                                        "type": "input_text",
+                                        "text": (
+                                            f"[System note, do not reply: the music moved on. "
+                                            f"Now playing: {_np_title}. If asked what is playing, "
+                                            f"say this.]"
+                                        ),
+                                    }],
+                                },
+                            }))
+                            logger.info("[REALTIME] now_playing → %s", _np_title[:60])
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("[REALTIME] now_playing inject failed: %s", e)
+
                 elif msg_type == "played":
                     # V2 barge-in truncation: the client reports how many ms of
                     # the interrupted reply it actually played. Truncating the
@@ -2726,6 +2851,7 @@ async def realtime_voice_ws(
     async def openai_to_client():
         """Relay OpenAI Realtime API events → browser."""
         nonlocal response_text_accum, db_session_id, last_user_text, turn_model
+        nonlocal pending_media
         try:
             async for raw_msg in openai_ws:
                 event = json.loads(raw_msg)
@@ -2807,9 +2933,19 @@ async def realtime_voice_ws(
                                 logger.warning("[REALTIME] Session still unresolved at assistant persist — skipping this turn")
                         if db_session_id:
                             try:
-                                await _save_voice_messages(user_id, db_session_id, "", full_text, model=turn_model)
+                                await _save_voice_messages(
+                                    user_id, db_session_id, "", full_text,
+                                    model=turn_model, media=pending_media,
+                                )
                             except Exception as e:
                                 logger.exception("[REALTIME] Failed to save assistant message")
+                        # Consumed. Cleared HERE and not with the other per-turn
+                        # resets below, because a tool turn fires response.done
+                        # TWICE: once for the function-call response (no spoken
+                        # text, so no persist) and again for the spoken reply
+                        # that follows it. Clearing on the first would drop the
+                        # card before the row that should carry it is written.
+                        pending_media = None
 
                         # Auto-extract memories from this conversation turn (background)
                         if last_user_text and full_text and settings.auto_extract_memories:
@@ -2905,8 +3041,13 @@ async def realtime_voice_ws(
 
                         # ── Play media: straight to the agent's resolver ──
                         elif func_name == "play_media":
-                            result = await _play_media_direct(
+                            result, _played = await _play_media_direct(
                                 user_id, str(arguments.get("query", "")))
+                            # Carried to this turn's assistant persist so the
+                            # thread gets the same Toup media card a chat play
+                            # produces. Cleared after the persist below.
+                            if _played:
+                                pending_media = _played
 
                         # ── Think: delegate reasoning to best model ──
                         elif func_name == "think":

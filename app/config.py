@@ -1593,6 +1593,40 @@ class Settings(BaseSettings):
     }
 
     @model_validator(mode="after")
+    def _normalize_platform_api_url(self) -> "Settings":
+        """Guarantee `platform_api_url` ends with the API prefix.
+
+        Every agent→platform callback is built as f"{platform_api_url}/...",
+        and every one of those routes is mounted under `api_prefix`. When the
+        configured base omits it the request lands on the SPA catch-all, which
+        serves index.html for GET and **405** for POST — a failure that reads
+        like a broken feature rather than a broken URL.
+
+        This has bitten three separate subsystems. `tool_executor` and
+        `subagent_dispatcher` each grew their own local retry-with-/api after
+        being caught by it (see the 2026-05-24 note in tool_executor), and on
+        2026-07-31 it silently broke radio station building for an entire
+        evening — 23 consecutive 405s, every one falling back to the YouTube
+        Music call that is anti-bot-blocked from agent IPs, which is the whole
+        reason the platform RPC exists. The code default is correct
+        ("https://toup.ai/api"); the deployed value is not, and the
+        provisioning bridge that sets it is not reachable from here. Fixing it
+        at load time repairs every call site at once, including ones not yet
+        written.
+
+        Appends `api_prefix` rather than a hard-coded "/api" so a deployment
+        that serves the API under a different prefix stays correct, and no-ops
+        when the base already ends with it.
+        """
+        base = (self.platform_api_url or "").strip().rstrip("/")
+        prefix = (self.api_prefix or "").strip().rstrip("/")
+        if base and prefix and not base.endswith(prefix):
+            object.__setattr__(self, "platform_api_url", f"{base}{prefix}")
+        elif base != (self.platform_api_url or ""):
+            object.__setattr__(self, "platform_api_url", base)
+        return self
+
+    @model_validator(mode="after")
     def _strip_api_keys(self) -> "Settings":
         for field in self._KEY_FIELDS:
             val = getattr(self, field, None)

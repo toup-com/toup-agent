@@ -68,7 +68,7 @@ async def test_a_play_never_runs_an_agent_turn(v2_on, monkeypatch):
         return {"ok": True, "title": "A$AP Rocky - Praise The Lord", "video_id": "abc12345678"}
     monkeypatch.setattr(rt, "_vps_api", _fake_api)
 
-    result = await rt._play_media_direct("user-1", "asap rocky")
+    result, media = await rt._play_media_direct("user-1", "asap rocky")
 
     assert len(calls) == 1, f"expected exactly one hop, got {calls}"
     method, path, body, timeout = calls[0]
@@ -81,6 +81,9 @@ async def test_a_play_never_runs_an_agent_turn(v2_on, monkeypatch):
     # second round trip — it is already in the model's own context.
     assert "A$AP Rocky - Praise The Lord" in result
     assert not result.upper().startswith("ERROR")
+    # …and the same play leaves a renderable card in the chat thread.
+    assert media["video_id"] == "abc12345678"
+    assert media["thumbnail_url"], "a card without artwork is its own bug"
 
 
 @pytest.mark.parametrize("failure", ["unreachable", "no_result"])
@@ -100,8 +103,10 @@ async def test_a_failed_play_states_the_real_cause_and_names_no_competitor(
         return {"ok": False}
     monkeypatch.setattr(rt, "_vps_api", _fake_api)
 
-    result = await rt._play_media_direct("user-1", "asap rocky")
+    result, media = await rt._play_media_direct("user-1", "asap rocky")
     low = result.lower()
+    # A failed play must not persist a card for a song that never started.
+    assert media is None
 
     # Marked failed, so the phone shows the step as failed rather than done.
     assert result.upper().startswith("ERROR")
@@ -121,6 +126,7 @@ async def test_an_empty_query_never_reaches_the_agent(v2_on, monkeypatch):
         return ("https://u.agents.toup.ai", "k")
     monkeypatch.setattr(rt, "_get_vps_info", _vps)
 
-    result = await rt._play_media_direct("user-1", "   ")
+    result, media = await rt._play_media_direct("user-1", "   ")
     assert result.upper().startswith("ERROR")
+    assert media is None
     assert not called, "an empty query should not cost a network hop"

@@ -723,6 +723,13 @@ class SessionMessageCreate(BaseModel):
     content: Optional[str] = None
     model_used: Optional[str] = None
     day_chat_id: Optional[str] = None
+    # Media the turn started, persisted into Message.metadata_json as
+    # {"media": ...} — the exact shape AgentRunner._save_messages writes for a
+    # chat turn and the only thing the mobile client renders a media card from.
+    # Without it a voice play left nothing but plain text in the thread, so a
+    # song the agent actually started looked, on reopening the app, like it had
+    # never happened. Body-only (a nested object can't ride the query shim).
+    media: Optional[dict] = None
 
 
 class SessionResponse(BaseModel):

@@ -5401,6 +5401,16 @@ class ToolExecutor:
                     "video_id": video_id,
                     "title": video_title,
                     "url": yt_url,
+                    # Artwork is NOT optional. This payload used to carry no
+                    # thumbnail at all, which is why every voice-initiated play
+                    # reached the lock screen and Dynamic Island with blank
+                    # cover art (founder recording, 2026-07-31). YouTube's
+                    # thumbnail URL is derivable from the id, so there is never
+                    # a reason to send nothing and no lookup is needed.
+                    # hqdefault is the largest size that exists for EVERY video
+                    # (maxresdefault 404s on many), so it can't regress to a
+                    # broken image.
+                    "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
                 })
                 logger.info("[play_media] Broadcast media_play: %s - %s", video_id, video_title)
                 asyncio.create_task(_check_age_and_swap(video_id, user_id))
