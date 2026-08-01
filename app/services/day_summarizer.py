@@ -310,6 +310,26 @@ async def generate_summary(
             f"Keep the summary under {TARGET_SUMMARY_TOKENS} tokens."
         )
 
+    # Release the pooled connection BEFORE the LLM round-trip.
+    #
+    # Everything above is reads, and `_try_summarize` takes no session — it
+    # only needs `dc.user_id` and the prompt string. Without this commit the
+    # connection stays checked out, idle-in-transaction, for the whole Haiku
+    # call (observed 3.3 s on a plain error, longer whenever the Anthropic
+    # 503 → gpt-4o-mini fallback engages). This function is invoked
+    # fire-and-forget (`asyncio.create_task` in agent_runner), and a voice
+    # turn cancels its task as a matter of course, so a cancellation here
+    # left the connection checked out FOREVER — the GC then terminated it
+    # ("non-checked-in connection … will be terminated"), the pool degraded,
+    # and later turns died on PendingRollbackError → HTTP 500 from
+    # /internal/agent-turn. Measured on the canary 2026-08-01 under sustained
+    # load: turn latency climbed 14 s → 148 s, then every turn 500'd.
+    #
+    # Same defect class as 6d173563 (support agent). `expire_on_commit=False`
+    # on the sessionmaker means `dc` and friends stay usable after the commit,
+    # and the caller's writes simply re-acquire a connection.
+    await db.commit()
+
     # Call Haiku (with OpenAI fallback) and surface the (text, reason) tuple
     # to the caller — see _try_summarize for fallback semantics.
     return await _try_summarize(dc.user_id, user_prompt)
@@ -426,6 +446,14 @@ async def generate_archival_summary(
         f"Local date: {dc.local_date.isoformat()}.\n\n"
         f"Messages (chronological, across all channels):\n\n{messages_text}"
     )
+
+    # Release the pooled connection before the LLM round-trip — same reason
+    # as generate_summary above: everything before this point is reads, and
+    # holding the connection across the call pins it idle-in-transaction (and
+    # leaks it outright if this task is cancelled mid-call). The archival
+    # summary reads MORE messages than the rolling one, so it is the longer
+    # of the two holds.
+    await db.commit()
 
     # Prefer Anthropic Haiku (cheap, strong at structured summarization).
     # W0.4b: unified path — bundle-aware and metered. call_system_llm

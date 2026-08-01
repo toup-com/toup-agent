@@ -565,6 +565,59 @@ async def test_w04b_archival_routes_through_call_system_llm():
     print("OK test_w04b_archival_routes_through_call_system_llm")
 
 
+
+# ── Connection lifetime: the pooled session must NOT be held across the LLM ──
+
+async def _assert_released_before_llm(fn_name: str, patched: str):
+    """Shared body: the session must have no open transaction when the LLM
+    call is made.
+
+    Holding a pooled connection across a multi-second LLM round-trip pins it
+    idle-in-transaction; and because run_summarizer_if_needed is invoked
+    fire-and-forget (asyncio.create_task) on a path that cancels routinely
+    (voice turns), a cancellation mid-call leaked the connection outright.
+    The GC then terminated it ("non-checked-in connection ... will be
+    terminated"), the pool degraded, and later turns died on
+    PendingRollbackError -> HTTP 500 from /internal/agent-turn. Measured on
+    the canary 2026-08-01: turn latency 14s -> 148s, then every turn 500'd.
+    Same defect class as 6d173563 (support agent).
+    """
+    engine = await _make_orm_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    _, dc_id = await _seed_day(sm)
+
+    holder = {}
+    seen = {}
+
+    async def _probe(**kwargs):
+        # in_transaction() is sync on AsyncSession and reports whether a
+        # connection is currently checked out for this session.
+        seen["in_transaction"] = holder["db"].in_transaction()
+        return "summary text"
+
+    with patch(patched, _probe):
+        async with sm() as db:
+            holder["db"] = db
+            await getattr(_sumr, fn_name)(db, dc_id)
+
+    assert "in_transaction" in seen, f"{fn_name}: LLM was never called"
+    assert seen["in_transaction"] is False, (
+        f"{fn_name} held the pooled connection across the LLM call "
+        "(idle-in-transaction; leaks outright if the task is cancelled)"
+    )
+    await engine.dispose()
+    print(f"OK connection released before LLM in {fn_name}")
+
+
+async def test_generate_summary_releases_connection_before_llm():
+    await _assert_released_before_llm(
+        "generate_summary", "app.services.internal_llm.call_system_llm")
+
+
+async def test_archival_releases_connection_before_llm():
+    await _assert_released_before_llm(
+        "generate_archival_summary", "app.services.internal_llm.call_system_llm")
+
 # ── Run all ──
 
 if __name__ == "__main__":
@@ -580,4 +633,6 @@ if __name__ == "__main__":
     asyncio.run(test_w04b_generate_summary_uses_metered_path())
     asyncio.run(test_w04b_generate_summary_failure_reason_propagates())
     asyncio.run(test_w04b_archival_routes_through_call_system_llm())
+    asyncio.run(test_generate_summary_releases_connection_before_llm())
+    asyncio.run(test_archival_releases_connection_before_llm())
     print("\nALL FF-B.2 TESTS PASSED")
