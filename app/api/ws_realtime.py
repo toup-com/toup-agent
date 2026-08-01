@@ -42,6 +42,7 @@ import asyncio
 import json
 import contextvars
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -54,6 +55,7 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.agent.tool_definitions import get_agent_tools, get_extended_tools
+from app.api.voice import detect_script_language
 
 logger = logging.getLogger(__name__)
 
@@ -1773,7 +1775,158 @@ def realtime_url() -> str:
     return f"wss://api.openai.com/v1/realtime?model={realtime_model()}"
 
 
-def build_session_config(instr: str, tools: list, voice: str) -> dict:
+# ── Transcription language hint ───────────────────────────────────────
+# Whisper re-detects the language of EVERY utterance independently, and on a
+# short one carrying an English proper noun it reliably guesses wrong: measured
+# 2026-07-31, Persian audio for "برام ASAP Rocky بذار" came back from whisper-1
+# as "Badom asap rocky bizzare.", and production has seen the same speaker land
+# in Devanagari. The realtime model hears the AUDIO and answers correctly, but
+# the inner agent turn reads the TEXT — so a mis-detected utterance makes the
+# agent answer a question the user never asked.
+#
+# Pinning `language` once per session fixes that (same measurement, same audio,
+# language=fa → "برام ای سپ را کی بزار"). But a WRONG pin is far worse than no
+# pin: English audio forced to fa returned "درست کنید که با کندرک لامار…",
+# hallucinated Persian bearing no relation to the input. Hence: resolve from
+# evidence, and return None whenever the evidence is thin.
+#
+# It must NOT be inferred from locale/timezone. There is no language column on
+# User, AgentConfig or SoulConfig, and every non-UTC User.timezone in production
+# is America/Toronto — including the Persian speaker's — so timezone resolves
+# him to English, i.e. straight into the hallucination case above.
+_LANG_HINT_ENV = "VOICE_TRANSCRIPTION_LANGUAGE_HINT"
+# Days of history to scan, newest first. Only days the agent reports as having
+# voice traffic are fetched, so this is a ceiling, not a cost.
+_LANG_WINDOW_DAYS = 5
+# A message counts as evidence only if one non-Latin script owns this share of
+# its letters and appears at least this many times — one quoted foreign song
+# title inside an English sentence must not be read as the speaker's language.
+_LANG_MSG_MIN_SHARE = 0.30
+_LANG_MSG_MIN_CHARS = 6
+# Fire on PRESENCE, not majority. The bug destroys its own evidence: it turns
+# spoken Persian into Latin gibberish, so on the account in the bug report only
+# 2 of 122 recent user messages survive in Persian script (12.5% once narrowed
+# to voice). A majority rule would never fire for the very user it is meant to
+# fix. Two script-dominant messages is already decisive, because a speaker who
+# does not use the script produces zero, never two.
+_LANG_MIN_MESSAGES = 2
+_LANG_MIN_SHARE = 0.10
+# Which language someone speaks does not change within a call, or usually ever;
+# the TTL exists so a genuine switch is picked up without a restart.
+_LANG_CACHE_TTL = 30 * 60.0
+_lang_cache: dict = {}
+
+
+def _lang_hint_enabled() -> bool:
+    """Kill switch. Defaults ON; set VOICE_TRANSCRIPTION_LANGUAGE_HINT=false to
+    disable on a running deploy if the hint regresses somebody."""
+    return os.getenv(_LANG_HINT_ENV, "true").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+async def _detect_voice_language(user_id: str) -> Optional[str]:
+    """Language code for `user_id`'s voice, from their own transcript history.
+
+    Scoped to the voice channel because that is the only place the evidence is
+    honest: this user types English on mobile (IELTS practice, technical
+    questions) and speaks Persian, so whole-history detection reports English.
+    Assistant turns count too — they are the model's own text, never passed
+    through Whisper, so they are the one part of a voice transcript the bug
+    cannot corrupt.
+    """
+    vps = await _get_vps_info(user_id)
+    if not vps:
+        return None
+    agent_url, agent_api_key = vps
+
+    days = await _vps_api(
+        agent_url, agent_api_key, "GET", "/api/day-chats", params={"limit": 30},
+    )
+    if not isinstance(days, list):
+        return None
+    # channels_active rides the list payload, so days with no voice traffic are
+    # skipped without paying a request for their messages.
+    voice_days = [
+        d.get("local_date") for d in days
+        if d.get("message_count") and "voice" in (d.get("channels_active") or [])
+    ][:_LANG_WINDOW_DAYS]
+    voice_days = [d for d in voice_days if d]
+    if not voice_days:
+        return None
+
+    fetched = await asyncio.gather(*[
+        _vps_api(
+            agent_url, agent_api_key, "GET",
+            f"/api/day-chats/{d}/messages", params={"limit": 500},
+        )
+        for d in voice_days
+    ], return_exceptions=True)
+
+    counts: dict = {}
+    window = 0
+    for result in fetched:
+        if not isinstance(result, list):
+            continue
+        for m in result:
+            if m.get("channel") != "voice":
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            window += 1
+            code = detect_script_language(
+                content,
+                min_share=_LANG_MSG_MIN_SHARE,
+                min_chars=_LANG_MSG_MIN_CHARS,
+            )
+            if code:
+                counts[code] = counts.get(code, 0) + 1
+
+    if not counts:
+        return None
+    code, hits = max(counts.items(), key=lambda kv: kv[1])
+    if hits < _LANG_MIN_MESSAGES or hits < _LANG_MIN_SHARE * window:
+        logger.info(
+            "[REALTIME] No language hint for %s — best=%s %d/%d below floor",
+            user_id[:8], code, hits, window,
+        )
+        return None
+    logger.info(
+        "[REALTIME] Language hint %s for %s (%d/%d voice messages)",
+        code, user_id[:8], hits, window,
+    )
+    return code
+
+
+def _cached_voice_language(user_id: str) -> Optional[str]:
+    """The already-resolved hint, or None. Never does I/O — this is what the
+    first session.update reads, so a cold cache costs the connect path nothing."""
+    entry = _lang_cache.get(user_id)
+    if entry and (time.monotonic() - entry[1]) < _LANG_CACHE_TTL:
+        return entry[0]
+    return None
+
+
+async def resolve_voice_language(user_id: str) -> Optional[str]:
+    """Cached `_detect_voice_language`. None means "unknown" — leave Whisper on
+    auto-detect, which is strictly today's behavior."""
+    if not _lang_hint_enabled():
+        return None
+    # Reads the entry rather than calling _cached_voice_language, which cannot
+    # tell "cached as None" from "never resolved". Most users ARE None, and
+    # conflating the two would re-read their history on every single connect.
+    entry = _lang_cache.get(user_id)
+    if entry and (time.monotonic() - entry[1]) < _LANG_CACHE_TTL:
+        return entry[0]
+    code = await _detect_voice_language(user_id)
+    _lang_cache[user_id] = (code, time.monotonic())
+    return code
+
+
+def build_session_config(
+    instr: str, tools: list, voice: str, language: Optional[str] = None,
+) -> dict:
     """The session.update payload. Module-level (not a closure) so tests can
     pin the exact V1/V2 shapes without a socket."""
     v2 = _v2_active()
@@ -1798,6 +1951,8 @@ def build_session_config(instr: str, tools: list, voice: str) -> dict:
             "silence_duration_ms": 700,
         }
         transcription = {"model": "whisper-1"}
+    if language:
+        transcription["language"] = language
     session: dict = {
         "type": "realtime",
         "output_modalities": ["audio"],
@@ -2119,6 +2274,13 @@ async def realtime_voice_ws(
             logger.exception("[REALTIME] Failed to build instructions")
             return None
 
+    async def _lang_step() -> Optional[str]:
+        try:
+            return await resolve_voice_language(user_id)
+        except Exception:
+            logger.exception("[REALTIME] Failed to resolve transcription language")
+            return None
+
     async def _tools_step() -> list:
         tools = REALTIME_TOOLS
         try:
@@ -2181,7 +2343,8 @@ async def realtime_voice_ws(
     _instructions_t = asyncio.create_task(_instructions_step())
     _tools_t = asyncio.create_task(_tools_step())
     _health_t = asyncio.create_task(_health_step())
-    _bg_tasks = [_session_t, _instructions_t, _tools_t, _health_t]
+    _lang_t = asyncio.create_task(_lang_step())
+    _bg_tasks = [_session_t, _instructions_t, _tools_t, _health_t, _lang_t]
 
     def _cancel_bg() -> None:
         # Tap-and-close must not leave tasks poking a cold agent for 25s.
@@ -2224,8 +2387,8 @@ async def realtime_voice_ws(
         return
 
     # ── 6. Configure session: cached-or-base config now, full context behind ──
-    def _session_config(instr: str, tools: list) -> dict:
-        return build_session_config(instr, tools, voice)
+    def _session_config(instr: str, tools: list, language: Optional[str] = None) -> dict:
+        return build_session_config(instr, tools, voice, language)
 
     _cached = _instr_cache.get(user_id)
     _cache_hit = bool(
@@ -2238,9 +2401,19 @@ async def realtime_voice_ws(
     else:
         _first_instructions, _first_tools = _base_voice_instructions(), []
 
+    # Cache-only read: a first-ever connect goes out on auto-detect and the
+    # hint lands with the full-context update below, rather than holding
+    # `ready` behind history reads.
+    _first_language = _cached_voice_language(user_id) if _lang_hint_enabled() else None
+
     try:
-        await openai_ws.send(json.dumps(_session_config(_first_instructions, _first_tools)))
-        logger.info("[REALTIME] Session configured (voice=%s, cache_hit=%s)", voice, _cache_hit)
+        await openai_ws.send(json.dumps(
+            _session_config(_first_instructions, _first_tools, _first_language)
+        ))
+        logger.info(
+            "[REALTIME] Session configured (voice=%s, cache_hit=%s, language=%s)",
+            voice, _cache_hit, _first_language or "auto",
+        )
     except Exception as e:
         _cancel_bg()
         logger.exception("[REALTIME] Failed to configure session")
@@ -2289,19 +2462,25 @@ async def realtime_voice_ws(
         # next connect. _cancel_bg reaps everything at session end.
         instr: Optional[str] = None
         tools: list = list(_first_tools) if _first_tools else list(REALTIME_TOOLS)
+        language: Optional[str] = _first_language
         try:
             instr = await asyncio.wait_for(asyncio.shield(_instructions_t), timeout=40.0)
             tools = await asyncio.wait_for(asyncio.shield(_tools_t), timeout=10.0)
         except Exception:
             logger.warning("[REALTIME] Context build timed out — session continues on base config")
         try:
+            language = await asyncio.wait_for(asyncio.shield(_lang_t), timeout=10.0) or _first_language
+        except Exception:
+            logger.warning("[REALTIME] Language hint timed out — transcription stays on auto-detect")
+        try:
             final_instr = instr or _first_instructions
-            await openai_ws.send(json.dumps(_session_config(final_instr, tools)))
+            await openai_ws.send(json.dumps(_session_config(final_instr, tools, language)))
             if instr:
                 _instr_cache[user_id] = (instr, tools, time.monotonic())
             logger.info(
-                "[REALTIME] Full context applied at +%.0fms (%d chars, %d tools)",
+                "[REALTIME] Full context applied at +%.0fms (%d chars, %d tools, language=%s)",
                 (time.monotonic() - _t0) * 1000, len(final_instr), len(tools),
+                language or "auto",
             )
         except Exception as e:
             logger.warning("[REALTIME] Full-context session.update failed: %s", e)

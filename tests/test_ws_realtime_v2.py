@@ -41,6 +41,9 @@ def test_v1_session_config_unchanged(v2_off):
         "prefix_padding_ms": 300,
         "silence_duration_ms": 700,
     }
+    # No `language` key at all when the hint is unknown — an ABSENT key is what
+    # leaves Whisper on auto-detect. Sending language=null would be equivalent
+    # to the API, but the absence is the contract the rest of the suite pins.
     assert session["audio"]["input"]["transcription"] == {"model": "whisper-1"}
     assert session["audio"]["output"]["voice"] == "coral"
     assert "truncation" not in session
@@ -257,3 +260,211 @@ def test_v2_per_user_allowlist(monkeypatch):
     assert rt._resolve_v2_for_user(None) is False
     monkeypatch.setattr(settings, "voice_realtime_v2", True)
     assert rt._resolve_v2_for_user("u-999") is True
+
+
+# ── Transcription language hint ───────────────────────────────────────
+# Regression cover for the Persian-voice bug: Whisper re-detects language per
+# utterance, so a short Persian utterance carrying an English proper noun came
+# back as "Premi is Sabroki." and the inner agent turn answered the garbage
+# rather than the request. The pin is session-level and evidence-gated —
+# guessing wrong is worse than not guessing, so "unknown" must stay unset.
+
+FA_UTTERANCE = "خب باستم آهنگ یه آهنگ دیگه ازش رو پلی کن."
+FA_MIXED = "الان آهنگ Praise The Lord از A$AP Rocky داره پخش می‌شه."
+EN_UTTERANCE = "Play me the new track by Kendrick Lamar tomorrow morning."
+
+
+def _voice_msg(content, role="user", channel="voice"):
+    return {"role": role, "channel": channel, "content": content}
+
+
+@pytest.fixture
+def hint_on(monkeypatch):
+    monkeypatch.setenv(rt._LANG_HINT_ENV, "true")
+    rt._lang_cache.clear()
+    yield
+    rt._lang_cache.clear()
+
+
+def _stub_vps(monkeypatch, days, messages_by_date):
+    """Stand in for the user's agent: a day-chat list plus per-day messages."""
+    async def fake_vps_info(user_id):
+        return ("https://agent.test", "key")
+
+    async def fake_vps_api(url, key, method, path, params=None, json_body=None, timeout=15.0):
+        if path == "/api/day-chats":
+            return days
+        for date, msgs in messages_by_date.items():
+            if path == f"/api/day-chats/{date}/messages":
+                return msgs
+        return None
+
+    monkeypatch.setattr(rt, "_get_vps_info", fake_vps_info)
+    monkeypatch.setattr(rt, "_vps_api", fake_vps_api)
+
+
+# ── The pin itself lands in the session payload ───────────────────────
+
+def test_language_absent_when_unknown_v1_and_v2(v2_off):
+    """No hint ⇒ byte-identical to today. This is the no-regression pin."""
+    v1 = rt.build_session_config("I", [], "coral")["session"]
+    assert "language" not in v1["audio"]["input"]["transcription"]
+    assert rt.build_session_config("I", [], "coral", None)["session"] == v1
+
+
+def test_language_present_when_known(v2_on):
+    tr = rt.build_session_config("I", [], "marin", "fa")["session"]["audio"]["input"]["transcription"]
+    assert tr == {"model": settings.voice_realtime_transcription_model, "language": "fa"}
+
+
+def test_language_pins_on_v1_whisper_too(v2_off):
+    tr = rt.build_session_config("I", [], "coral", "fa")["session"]["audio"]["input"]["transcription"]
+    assert tr == {"model": "whisper-1", "language": "fa"}
+
+
+# ── Per-message script detection ──────────────────────────────────────
+
+def test_script_detection_ignores_a_quoted_foreign_title():
+    """A Persian song title inside an English sentence is not a Persian speaker."""
+    assert rt.detect_script_language(
+        "Play the song آ please", min_share=0.30, min_chars=6,
+    ) is None
+    assert rt.detect_script_language(EN_UTTERANCE, min_share=0.30, min_chars=6) is None
+
+
+def test_script_detection_accepts_persian_with_inline_latin():
+    """Mixed Persian + Latin proper nouns is the normal shape of these turns."""
+    assert rt.detect_script_language(FA_UTTERANCE, min_share=0.30, min_chars=6) == "fa"
+    assert rt.detect_script_language(FA_MIXED, min_share=0.30, min_chars=6) == "fa"
+
+
+# ── Resolution from history ───────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_resolves_fa_from_minority_of_voice_messages(monkeypatch, hint_on):
+    """PRESENCE, not majority. The bug corrupts most Persian turns into Latin
+    gibberish, so only a minority survive in script — 2 of 16 here. A majority
+    rule would never fire for the user this exists to fix."""
+    msgs = [_voice_msg(FA_UTTERANCE), _voice_msg(FA_MIXED, role="assistant")]
+    msgs += [_voice_msg("Play me shot mirror") for _ in range(14)]
+    _stub_vps(
+        monkeypatch,
+        [{"local_date": "2026-07-31", "message_count": 44, "channels_active": ["mobile", "voice"]}],
+        {"2026-07-31": msgs},
+    )
+    assert await rt.resolve_voice_language("u-fa") == "fa"
+
+
+@pytest.mark.asyncio
+async def test_english_only_speaker_gets_no_hint(monkeypatch, hint_on):
+    """The no-regression case: forcing fa onto English audio produces
+    hallucinated Persian, so an English speaker must resolve to None."""
+    _stub_vps(
+        monkeypatch,
+        [{"local_date": "2026-07-31", "message_count": 20, "channels_active": ["voice"]}],
+        {"2026-07-31": [_voice_msg(EN_UTTERANCE) for _ in range(20)]},
+    )
+    assert await rt.resolve_voice_language("u-en") is None
+
+
+@pytest.mark.asyncio
+async def test_single_foreign_message_is_below_the_floor(monkeypatch, hint_on):
+    """One Persian turn in a long English window is a song title, not a speaker."""
+    msgs = [_voice_msg(FA_UTTERANCE)] + [_voice_msg(EN_UTTERANCE) for _ in range(19)]
+    _stub_vps(
+        monkeypatch,
+        [{"local_date": "2026-07-31", "message_count": 20, "channels_active": ["voice"]}],
+        {"2026-07-31": msgs},
+    )
+    assert await rt.resolve_voice_language("u-one") is None
+
+
+@pytest.mark.asyncio
+async def test_typed_channels_are_not_evidence(monkeypatch, hint_on):
+    """Scoped to voice: this user types English and speaks Persian, so counting
+    mobile/web turns reports the wrong language."""
+    _stub_vps(
+        monkeypatch,
+        [{"local_date": "2026-07-31", "message_count": 4, "channels_active": ["voice"]}],
+        {"2026-07-31": [
+            _voice_msg(FA_UTTERANCE, channel="mobile"),
+            _voice_msg(FA_UTTERANCE, channel="mobile"),
+            _voice_msg(EN_UTTERANCE),
+            _voice_msg(EN_UTTERANCE),
+        ]},
+    )
+    assert await rt.resolve_voice_language("u-typed") is None
+
+
+@pytest.mark.asyncio
+async def test_days_without_voice_are_never_fetched(monkeypatch, hint_on):
+    """channels_active rides the list payload, so silent days cost no request."""
+    fetched = []
+
+    async def fake_vps_info(user_id):
+        return ("https://agent.test", "key")
+
+    async def fake_vps_api(url, key, method, path, params=None, json_body=None, timeout=15.0):
+        if path == "/api/day-chats":
+            return [
+                {"local_date": "2026-07-31", "message_count": 4, "channels_active": ["voice"]},
+                {"local_date": "2026-07-30", "message_count": 0, "channels_active": []},
+                {"local_date": "2026-07-29", "message_count": 6, "channels_active": ["mobile"]},
+            ]
+        fetched.append(path)
+        return [_voice_msg(FA_UTTERANCE), _voice_msg(FA_MIXED, role="assistant")]
+
+    monkeypatch.setattr(rt, "_get_vps_info", fake_vps_info)
+    monkeypatch.setattr(rt, "_vps_api", fake_vps_api)
+    assert await rt.resolve_voice_language("u-days") == "fa"
+    assert fetched == ["/api/day-chats/2026-07-31/messages"]
+
+
+@pytest.mark.asyncio
+async def test_no_agent_means_no_hint(monkeypatch, hint_on):
+    async def no_vps(user_id):
+        return None
+    monkeypatch.setattr(rt, "_get_vps_info", no_vps)
+    assert await rt.resolve_voice_language("u-novps") is None
+
+
+# ── Kill switch + caching ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_kill_switch_disables_without_a_deploy(monkeypatch):
+    rt._lang_cache.clear()
+    monkeypatch.setenv(rt._LANG_HINT_ENV, "false")
+
+    async def boom(user_id):
+        raise AssertionError("must not touch the agent when disabled")
+
+    monkeypatch.setattr(rt, "_get_vps_info", boom)
+    assert await rt.resolve_voice_language("u-off") is None
+    assert rt._lang_hint_enabled() is False
+    monkeypatch.setenv(rt._LANG_HINT_ENV, "true")
+    assert rt._lang_hint_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_resolution_is_per_session_not_per_utterance(monkeypatch, hint_on):
+    """Resolved once and cached: a voice call must not re-read history per turn."""
+    calls = []
+    _stub_vps(
+        monkeypatch,
+        [{"local_date": "2026-07-31", "message_count": 4, "channels_active": ["voice"]}],
+        {"2026-07-31": [_voice_msg(FA_UTTERANCE), _voice_msg(FA_MIXED, role="assistant")]},
+    )
+    real = rt._detect_voice_language
+
+    async def counting(user_id):
+        calls.append(user_id)
+        return await real(user_id)
+
+    monkeypatch.setattr(rt, "_detect_voice_language", counting)
+    assert await rt.resolve_voice_language("u-cache") == "fa"
+    assert await rt.resolve_voice_language("u-cache") == "fa"
+    assert await rt.resolve_voice_language("u-cache") == "fa"
+    assert len(calls) == 1
+    # The cache is also what the first session.update reads, with no I/O.
+    assert rt._cached_voice_language("u-cache") == "fa"
+    assert rt._cached_voice_language("u-never-seen") is None

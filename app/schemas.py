@@ -794,6 +794,15 @@ class ChatMessageResponse(BaseModel):
     # {id, filename, mime_type, size_bytes, created_at}. storage_path
     # is stripped server-side — it's an internal key.
     attachments: Optional[List[dict]] = None
+    # Which surface this row came from ("voice", "telegram", "web", …).
+    # api/day_chats.py has always sent this; these session routes did not, and
+    # the mobile client falls back to /api/sessions/by-date/{date}/messages
+    # whenever day-chats fails — so on that path every voice row arrived
+    # indistinguishable from typed web chat and the day chat's voice-session
+    # divider silently disappeared. Null when neither the conversation nor the
+    # row records one; the client applies its own default rather than the API
+    # guessing (see agent/channel_util.py).
+    channel: Optional[str] = None
     # Job card fields (role == 'job')
     job_id: Optional[str] = None
     job_name: Optional[str] = None

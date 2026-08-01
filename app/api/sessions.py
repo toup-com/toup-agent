@@ -330,7 +330,10 @@ async def get_session(
                 build_jobs[bj.id] = bj
         from app.agent.reply_quote import resolve_reply_targets_for_serialization
         reply_targets = await resolve_reply_targets_for_serialization(db, messages)
-        response_dict["messages"] = [_message_to_response(m, build_jobs, reply_targets) for m in messages]
+        _channels = {session.id: session.channel}
+        response_dict["messages"] = [
+            _message_to_response(m, build_jobs, reply_targets, _channels) for m in messages
+        ]
     else:
         response_dict["messages"] = []
     
@@ -475,19 +478,21 @@ async def get_session_messages(
                 return JSONResponse(content=data)
 
     # Verify session ownership
-    session_query = select(Conversation.id).where(
+    session_query = select(Conversation.id, Conversation.channel).where(
         and_(
             Conversation.id == session_id,
             Conversation.user_id == current_user.id
         )
     )
     session_result = await db.execute(session_query)
-    if not session_result.scalar_one_or_none():
+    session_row = session_result.first()
+    if not session_row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Session not found"
         )
-    
+    conversation_channels = {session_row[0]: session_row[1]}
+
     # Get messages
     query = (
         select(Message)
@@ -526,7 +531,10 @@ async def get_session_messages(
     from app.agent.reply_quote import resolve_reply_targets_for_serialization
     reply_targets = await resolve_reply_targets_for_serialization(db, messages)
 
-    return [_message_to_response(m, build_jobs, reply_targets) for m in messages]
+    return [
+        _message_to_response(m, build_jobs, reply_targets, conversation_channels)
+        for m in messages
+    ]
 
 
 @router.post("/{session_id}/messages", response_model=ChatMessageResponse, status_code=status.HTTP_201_CREATED)
@@ -619,7 +627,7 @@ async def create_session_message(
     await db.commit()
     await db.refresh(msg)
 
-    return _message_to_response(msg)
+    return _message_to_response(msg, None, None, {session.id: session.channel})
 
 
 def _session_to_response(session: Conversation) -> SessionResponse:
@@ -650,6 +658,7 @@ def _message_to_response(
     message: Message,
     build_jobs: dict = None,
     reply_targets: Optional[dict] = None,
+    conversation_channels: Optional[dict] = None,
 ) -> ChatMessageResponse:
     """Convert Message model to ChatMessageResponse.
 
@@ -658,6 +667,13 @@ def _message_to_response(
     Optional — single-message callers (POST .../messages) pass None and
     the resulting row just won't have a ``reply_to`` payload (the path
     doesn't carry one anyway).
+
+    ``conversation_channels`` is ``{conversation_id: channel}``. It exists
+    because ``Message.channel`` is only written for system senders (routine /
+    trigger / subagent / app_builder) — a voice turn leaves it NULL and carries
+    "voice" on its Conversation. Conversation first is also what
+    api/day_chats.py serializes, so the two paths agree on every row instead of
+    the fallback quietly reporting a different channel than the primary.
     """
     memories_retrieved = None
     if message.memories_retrieved_json:
@@ -711,6 +727,10 @@ def _message_to_response(
         processing_time_ms=message.processing_time_ms,
         media=msg_metadata.get("media") if msg_metadata else None,
         attachments=attachments_list,
+        channel=(
+            (conversation_channels or {}).get(message.conversation_id)
+            or getattr(message, "channel", None)
+        ),
         reply_to_message_id=getattr(message, "reply_to_message_id", None),
         reply_to=(reply_targets or {}).get(message.id),
     )
@@ -782,7 +802,7 @@ async def get_messages_by_date(
 
     try:
         sessions_result = await db.execute(
-            select(Conversation.id)
+            select(Conversation.id, Conversation.channel)
             .where(
                 and_(
                     Conversation.user_id == current_user.id,
@@ -798,7 +818,8 @@ async def get_messages_by_date(
         # Roll back and return empty so the chat shell renders normally.
         await db.rollback()
         return JSONResponse(content=[])
-    session_ids = [r[0] for r in sessions_result.fetchall()]
+    conversation_channels = {r[0]: r[1] for r in sessions_result.fetchall()}
+    session_ids = list(conversation_channels.keys())
 
     if not session_ids:
         return JSONResponse(content=[])
@@ -839,5 +860,6 @@ async def get_messages_by_date(
     reply_targets = await resolve_reply_targets_for_serialization(db, messages)
 
     return JSONResponse(content=[
-        _message_to_response(m, build_jobs, reply_targets).model_dump(mode="json") for m in messages
+        _message_to_response(m, build_jobs, reply_targets, conversation_channels).model_dump(mode="json")
+        for m in messages
     ])
