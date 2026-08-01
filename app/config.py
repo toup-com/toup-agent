@@ -220,6 +220,13 @@ class Settings(BaseSettings):
     app_builder_builder_model: Optional[str] = None
     agent_max_tokens: int = 16000  # Max output tokens for agent
     agent_max_tool_iterations: int = 40  # Max tool call loops before forcing stop
+    # Voice's own ceiling. The realtime relay abandons a `think` call at
+    # voice_realtime_think_timeout_s (60s), and a measured voice research turn
+    # ran 17 tool calls in 113s — a correct answer delivered after the caller
+    # had already been handed the tool-less fallback. 8 is enough for a search,
+    # a few reads and a synthesis; the model is told the number so it plans to
+    # it rather than being cut off. Raise only alongside the relay timeout.
+    voice_max_tool_iterations: int = 8
     # Max idempotent read-only tools (web_search/web_fetch/extension_*) run
     # concurrently within a single assistant turn. Bounds outbound load so a
     # multi-fetch turn finishes in ~max(individual) latency, not sum.

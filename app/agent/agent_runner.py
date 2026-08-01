@@ -119,6 +119,29 @@ _RUN_DISABLED_TOOLS_CTX: contextvars.ContextVar[Optional[frozenset]] = contextva
     "agent_runner_disabled_tools", default=None,
 )
 
+# Per-run tool-iteration ceiling, same ContextVar reasoning as above and for the
+# same reason: `self.max_iterations` is set once in __init__ on a PROCESS
+# SINGLETON, so writing it per turn would leak one channel's ceiling into every
+# concurrent run.
+#
+# Voice needs its own. Measured 2026-08-01 on the founder's agent, asking (in
+# Farsi) the exact question that failed the night before: the answer was
+# correct and genuinely good — four real U of T professors with departments and
+# research areas — and it took 113 SECONDS across 17 tool calls. The voice
+# relay gives `think` 60s (settings.voice_realtime_think_timeout_s), so that
+# turn would have been abandoned mid-flight and the caller would have got the
+# tool-less fallback. Right answer, delivered nowhere.
+#
+# A ceiling rather than a deadline, deliberately. The credit-budget checkpoint
+# in the loop shows what a hard stop costs: it breaks with `final_text or
+# text_buf`, i.e. whatever partial text happens to exist — fine for a budget
+# breach, useless for a spoken answer. A lower ceiling instead makes the model
+# CONVERGE: it is told the number in Runtime Context, so it plans a shorter
+# research arc and still lands a real synthesis.
+_RUN_MAX_ITER_CTX: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "agent_runner_max_iterations", default=None,
+)
+
 
 def _is_claude_model(model: str) -> bool:
     """Check if a model name refers to an Anthropic Claude model."""
@@ -521,6 +544,13 @@ class AgentRunner:
 
             logger.info(f"[VIBE] Registered vibecoding session: app={app_id[:8]} job={job_id[:8]} slug={slug} dir={app_dir}")
             return job_id, app_id, app_dir
+
+    def _effective_max_iterations(self) -> int:
+        """This run's tool-iteration ceiling. ContextVar first — see
+        _RUN_MAX_ITER_CTX — then the instance default, so non-run callers
+        (tests, boot-time introspection) keep working unchanged."""
+        return _RUN_MAX_ITER_CTX.get() or self.max_iterations
+
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -953,6 +983,18 @@ class AgentRunner:
             # create_job/update_job/spawn — the tools that move work out of the
             # live turn and into a card the user is not looking at. See
             # prompt_profile.VOICE_DISABLED_TOOLS for the incident this closes.
+            # Voice turns get a tighter research arc. See _RUN_MAX_ITER_CTX:
+            # the relay abandons `think` at voice_realtime_think_timeout_s, so a
+            # 17-tool-call, 113-second answer is not a slow answer — it is no
+            # answer. Told the number in Runtime Context, the model plans a
+            # shorter arc instead of being cut off mid-way.
+            if (channel or "").strip().lower() == "voice":
+                _vmax = int(getattr(settings, "voice_max_tool_iterations", 8) or 8)
+                _RUN_MAX_ITER_CTX.set(max(2, _vmax))
+                logger.info("[AGENT] channel=voice — tool-iteration ceiling %d", max(2, _vmax))
+            else:
+                _RUN_MAX_ITER_CTX.set(None)
+
             _channel_disabled = disabled_tools_for_channel(channel)
             if _channel_disabled:
                 merged = (_RUN_DISABLED_TOOLS_CTX.get() or frozenset()) | frozenset(_channel_disabled)
@@ -1623,8 +1665,9 @@ class AgentRunner:
         logger.info(f"[AGENT] Using {active_model} via {'Anthropic' if _is_claude_model(active_model) else 'OpenAI'} with {len(messages)} messages")
 
         text_buf = ""
-        for iteration in range(self.max_iterations):
-            logger.info(f"[AGENT] Iteration {iteration + 1}/{self.max_iterations}")
+        _max_iter = self._effective_max_iterations()
+        for iteration in range(_max_iter):
+            logger.info(f"[AGENT] Iteration {iteration + 1}/{_max_iter}")
 
             # Budget checkpoint B: a breach discovered after tool
             # execution must never start another LLM call. Redundant
@@ -4165,7 +4208,7 @@ class AgentRunner:
             _time_lines["runtime"],
             f"- Channel: {_channel_safe} — {_channel_guidance}",
             f"- Workspace directory: {settings.agent_workspace_dir}",
-            f"- Max tool iterations: {self.max_iterations}",
+            f"- Max tool iterations: {self._effective_max_iterations()}",
             f"- You have FULL terminal/shell access via the `exec` tool. You can run any command, install packages, write scripts, manage files, use git, curl, python, node, etc.",
             f"- You can read and write files using `read_file` and `write_file` tools.",
             f"- When you create a report or document for the user, end your reply with a markdown link [Open <name>](toup://report?path=<workspace-relative-path>) so they can tap to open it (the write_file result includes the exact link).",
