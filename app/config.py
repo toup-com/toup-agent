@@ -226,7 +226,15 @@ class Settings(BaseSettings):
     # had already been handed the tool-less fallback. 8 is enough for a search,
     # a few reads and a synthesis; the model is told the number so it plans to
     # it rather than being cut off. Raise only alongside the relay timeout.
-    voice_max_tool_iterations: int = 8
+    #
+    # Re-measured after the ceiling AND the search gateway shipped: the same
+    # Farsi research question went 113s/17 calls -> 56.3s/9 calls. Inside the
+    # 60s relay budget, but by 3.7s — a coin flip, not a fix, and 56s is still
+    # a bad spoken experience. Dropped to 5 and paired with a snippet-first
+    # instruction in the voice channel guidance, because Brave returns
+    # extra_snippets precisely so an answer does not need a web_fetch per
+    # source, and web_fetch is where the seconds actually go.
+    voice_max_tool_iterations: int = 5
     # Max idempotent read-only tools (web_search/web_fetch/extension_*) run
     # concurrently within a single assistant turn. Bounds outbound load so a
     # multi-fetch turn finishes in ~max(individual) latency, not sum.
