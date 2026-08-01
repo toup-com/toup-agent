@@ -125,27 +125,61 @@ class TestWait:
         probe.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_heartbeat_fires_every_poll(self):
-        """The reconciler orphans a rollout after 3 minutes without progress —
-        which is exactly how 17:19:24 died. A wait that does not heartbeat
-        would replace one failure mode with the other."""
-        beats = {"n": 0}
+    async def test_a_WEDGED_pool_is_not_waited_on(self):
+        """The bug the first cut shipped.
 
-        async def _beat():
-            beats["n"] += 1
-
-        with patch.object(PS, "pool_churn_snapshot", AsyncMock(side_effect=[BUSY, BUSY, QUIET])):
-            await PS.wait_for_pool_quiescence(900, heartbeat=_beat)
-        assert beats["n"] == 2, f"expected a beat per poll, got {beats['n']}"
+        `assigned_upgrading: ["26"]` / `assigned_stale: 1` was reported
+        UNCHANGED at 18:40 and again at 19:23 on 2026-08-01 — slot 26 was
+        wedged, not recycling. Waiting on that blocks every rollout for the
+        whole timeout, because the condition never clears. An unchanging
+        snapshot is stuck, not busy."""
+        with patch.object(PS, "pool_churn_snapshot", AsyncMock(return_value=BUSY)):
+            quiet, why = await PS.wait_for_pool_quiescence(900)
+        assert quiet is False
+        assert "wedged" in why, why
 
     @pytest.mark.asyncio
-    async def test_a_raising_heartbeat_does_not_abort_the_wait(self):
-        async def _bad_beat():
-            raise RuntimeError("db went away")
+    async def test_real_churn_is_still_waited_on(self):
+        """The guard must not defeat the feature: a pool whose state MOVES is
+        genuinely recycling, and the wait has to hold through it even for more
+        polls than the stuck threshold."""
+        moving = [
+            {"upgrading": ["26"], "stale": 5, "spawning": 0, "draining": 0},
+            {"upgrading": ["27"], "stale": 4, "spawning": 1, "draining": 0},
+            {"upgrading": ["28"], "stale": 3, "spawning": 0, "draining": 1},
+            {"upgrading": ["29"], "stale": 2, "spawning": 0, "draining": 0},
+            {"upgrading": ["30"], "stale": 1, "spawning": 0, "draining": 0},
+            QUIET,
+        ]
+        with patch.object(PS, "pool_churn_snapshot", AsyncMock(side_effect=moving)):
+            quiet, why = await PS.wait_for_pool_quiescence(900)
+        assert quiet is True and "quiescent after" in why
 
-        with patch.object(PS, "pool_churn_snapshot", AsyncMock(side_effect=[BUSY, QUIET])):
-            quiet, _ = await PS.wait_for_pool_quiescence(900, heartbeat=_bad_beat)
-        assert quiet is True
+    @pytest.mark.asyncio
+    async def test_the_stuck_counter_resets_on_movement(self):
+        """Three identical polls then movement must NOT trip the guard — only
+        _POOL_STUCK_POLLS CONSECUTIVE identical ones do."""
+        seq = [BUSY, BUSY, BUSY,
+               {"upgrading": ["27"], "stale": 1, "spawning": 0, "draining": 0},
+               QUIET]
+        with patch.object(PS, "pool_churn_snapshot", AsyncMock(side_effect=seq)):
+            quiet, why = await PS.wait_for_pool_quiescence(900)
+        assert quiet is True, why
+
+    @pytest.mark.asyncio
+    async def test_the_wait_takes_no_heartbeat_callback(self):
+        """The caller owns beating, via _heartbeating's own session.
+
+        The first cut passed a callback that wrote last_progress_at through the
+        CALLER'S session. It beat for ~5.5 min, went silent, and the rollout was
+        orphaned at 3.1 min idle with no redeploy near it. _heartbeating exists
+        because an inline beat sharing the caller's pool is the bug — its
+        docstring says so."""
+        import inspect
+        params = inspect.signature(PS.wait_for_pool_quiescence).parameters
+        assert "heartbeat" not in params, (
+            "the wait must not beat; rollout_service wraps it in _heartbeating"
+        )
 
 
 class TestSnapshot:
@@ -208,9 +242,13 @@ class TestRolloutWiring:
         canary = src.index('_heartbeating(rollout.id, "canary-upgrade")')
         assert wait < canary
 
-    def test_the_wait_passes_a_heartbeat(self, src):
+    def test_the_wait_runs_INSIDE_heartbeating(self, src):
+        """Not an inline beat on the caller's session — that is what went
+        silent after 5.5 minutes and got the rollout orphaned."""
         i = src.index("wait_for_pool_quiescence(")
-        assert "heartbeat=" in src[i:i + 300]
+        window = src[max(0, i - 400):i + 200]
+        assert '_heartbeating(rollout.id, "pool-quiesce")' in window
+        assert "_beat_once" not in src, "the inline heartbeat must be gone"
 
     def test_a_non_quiescent_start_is_recorded_on_the_rollout(self, src):
         """If it ever proceeds anyway, the next person reading the rollout row

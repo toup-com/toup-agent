@@ -30,7 +30,7 @@ import logging
 import secrets
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 from sqlalchemy import select
@@ -437,6 +437,14 @@ async def notify_pool_image_refresh(image_tag: str) -> bool:
 
 
 _POOL_QUIESCE_POLL_S = 15.0
+# Bridge call inside a poll loop — the shared client's 30s default is a
+# lifetime here, and a hung snapshot stalls the whole wait.
+_POOL_SNAPSHOT_TIMEOUT_S = 10
+# Consecutive identical snapshots after which the pool is judged WEDGED rather
+# than churning. 4 x 15s = 60s: long enough that a slow batch is not mistaken
+# for a stall, short enough that a permanently-stuck slot cannot hold a rollout
+# for the whole timeout — which is what slot 26 did on 2026-08-01.
+_POOL_STUCK_POLLS = 4
 
 
 async def pool_churn_snapshot() -> Optional[dict]:
@@ -448,7 +456,10 @@ async def pool_churn_snapshot() -> Optional[dict]:
     """
     from app.services.docker_host_service import _bridge_client
     try:
-        async with _bridge_client() as client:
+        # Explicit short timeout: this runs in a poll loop, and the whole point
+        # of the loop is to stay responsive. The shared client's 30s default is
+        # a lifetime here.
+        async with _bridge_client(timeout_s=_POOL_SNAPSHOT_TIMEOUT_S) as client:
             resp = await client.get("/v1/pool/health")
             if resp.status_code != 200:
                 logger.warning("[pool_service] pool health %s", resp.status_code)
@@ -471,10 +482,7 @@ def pool_is_busy(snap: dict) -> bool:
     return bool(snap["upgrading"]) or snap["stale"] > 0 or snap["spawning"] > 0 or snap["draining"] > 0
 
 
-async def wait_for_pool_quiescence(
-    timeout_s: float,
-    heartbeat: Optional[Any] = None,
-) -> tuple[bool, str]:
+async def wait_for_pool_quiescence(timeout_s: float) -> tuple[bool, str]:
     """Block until the bridge has stopped recycling pool containers.
 
     WHY THIS EXISTS (measured on production 2026-08-01)
@@ -495,12 +503,23 @@ async def wait_for_pool_quiescence(
     pool had settled. Merges arrive in bursts (5 PRs in ~45 min that day), so
     every rollout after the first was landing in its predecessor's churn.
 
-    Returns (quiet, reason). Never raises. A timeout returns quiet=False so the
+    BUSY IS NOT THE SAME AS MOVING. `assigned_upgrading: ["26"]` with
+    `assigned_stale: 1` was reported unchanged at 18:40 and again at 19:23 —
+    slot 26 was WEDGED, not recycling. The first cut of this waited on that,
+    which is a condition that never clears; the gate then blocked every rollout
+    for its whole timeout. So the loop watches for CHANGE, and a snapshot that
+    has not moved for `_POOL_STUCK_POLLS` polls is treated as stuck rather than
+    busy — the rollout proceeds and says so.
+
+    Returns (quiet, reason). Never raises. Not-quiet returns quiet=False so the
     caller can record it and PROCEED — a late rollout beats a wedged one, and
     the canary gate still protects the fleet if it turns out to be a bad time.
 
-    `heartbeat`, if given, is awaited each poll so the reconciler's 3-minute
-    orphan timer doesn't kill a rollout that is legitimately waiting.
+    The CALLER owns heartbeating (rollout_service wraps this in
+    `_heartbeating`). An earlier version took a callback and beat through the
+    caller's session; it went silent after ~5.5 min and the rollout was orphaned
+    at 3.1 min idle. `_heartbeating` exists precisely because an inline beat
+    sharing the caller's pool is the bug.
     """
     if timeout_s <= 0:
         return True, "wait disabled"
@@ -513,16 +532,26 @@ async def wait_for_pool_quiescence(
         return True, "pool already quiescent"
 
     logger.info("[pool_service] waiting for pool quiescence: %s", first)
+    unchanged = 0
+    prev = first
     while time.time() < deadline:
         await asyncio.sleep(_POOL_QUIESCE_POLL_S)
-        if heartbeat is not None:
-            try:
-                await heartbeat()
-            except Exception:
-                pass
         snap = await pool_churn_snapshot()
         if snap is None:
             return True, "bridge went unreachable mid-wait — proceeding"
+
+        if snap == prev:
+            unchanged += 1
+            if unchanged >= _POOL_STUCK_POLLS:
+                return False, (
+                    f"pool state unchanged for "
+                    f"{int(_POOL_STUCK_POLLS * _POOL_QUIESCE_POLL_S)}s — treating "
+                    f"as wedged, not churning: {snap}"
+                )
+        else:
+            unchanged = 0
+            prev = snap
+
         if not pool_is_busy(snap):
             waited = int(timeout_s - (deadline - time.time()))
             logger.info("[pool_service] pool quiescent after %ss", waited)

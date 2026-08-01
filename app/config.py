@@ -1444,7 +1444,10 @@ class Settings(BaseSettings):
     # or 0 health checks in 259s. 15 min covers the observed churn; on timeout
     # the rollout PROCEEDS and says so, because a late rollout beats a wedged
     # one. Set 0 to disable the wait entirely.
-    rollout_pool_quiesce_timeout_s: int = 900
+    # 300s, not 900: the wait now exits early on a wedged pool (see
+    # wait_for_pool_quiescence), so this is only the backstop, and a rollout
+    # that has not started after five minutes is worse than one that races.
+    rollout_pool_quiesce_timeout_s: int = 300
     # Convergence sweep (2026-07-28 incident: rollout 01a945e2's driver was
     # killed by its own merge's Railway redeploy; the re-drive d79584ea hit
     # the bridge mid-restart — 502 — on tenant 2739b5c6, reported 'complete',
