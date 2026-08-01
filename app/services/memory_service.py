@@ -54,6 +54,63 @@ def value_tokens(content: str) -> set:
     } - {""}
 
 
+_NAME_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
+
+# Capitalised words that are never a subject identity. Kept deliberately
+# small (a large stoplist becomes a fifth vocabulary to drift — see
+# memory_taxonomy's four-vocabulary problem); everything here appears
+# sentence-initially or as a pronoun in real extracted memories.
+_NAME_STOPWORDS = frozenset({
+    "The", "A", "An", "My", "Our", "I", "He", "She", "They", "We", "You",
+    "It", "This", "That", "These", "Those", "There", "Here", "User", "Users",
+    "When", "Where", "What", "Who", "Why", "How", "His", "Her", "Their",
+    "Its", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+    "Saturday", "Sunday", "January", "February", "March", "April", "May",
+    "June", "July", "August", "September", "October", "November", "December",
+    "Also", "And", "But", "For", "From", "With", "Every", "Each", "Both",
+})
+
+
+def named_subjects(content: str) -> set:
+    """Capitalised words that plausibly name a distinct subject."""
+    return {m.group(0) for m in _NAME_RE.finditer(content or "")} - _NAME_STOPWORDS
+
+
+def mentions_different_subjects(existing_content: str, new_content: str) -> bool:
+    """True when two texts each name someone/something the other does not.
+
+    The ≥0.90 "auto-duplicate" shortcut assumes near-identical embeddings
+    mean the same fact restated. For a family of facts that share a
+    sentence shape but describe DIFFERENT people, that assumption silently
+    destroys data:
+
+        "My colleague Priya's desk door code is 1111"
+        "Marco from the design team uses door code 7a26 for his desk"
+
+    embed ≥0.90 alike, so the second was reinforced into the first and
+    Marco's code was never stored — measured on the memory-quality harness
+    (distractor_resistance 0/1, four colleagues seeded, the second one
+    unrecallable). `conflicts_on_value` does not catch it either: the two
+    sentences are phrased differently enough that token overlap lands
+    around 0.28, well under its 0.5 floor.
+
+    Requiring a unique name on BOTH sides is what keeps added-detail
+    merging intact: "I love pizza" vs "I love pepperoni pizza from
+    Dominos" has a unique name on one side only, so it still merges.
+
+    This does not decide the outcome — it only denies the silent shortcut,
+    handing the pair to the adjudicator, which may still answer duplicate,
+    merge, contradiction_update ("works at Google" → "joined Apple") or
+    new. Code, not prompt prose, because prose does not bind (see
+    services/memory_gate).
+    """
+    subjects_existing = named_subjects(existing_content)
+    subjects_new = named_subjects(new_content)
+    if not subjects_existing or not subjects_new:
+        return False
+    return bool(subjects_existing - subjects_new) and bool(subjects_new - subjects_existing)
+
+
 def conflicts_on_value(existing_content: str, new_content: str) -> bool:
     """True when two near-identical texts look like the SAME fact carrying a
     DIFFERENT value ("…passphrase is kestrel-dbf7" vs "…kestrel-13b4").
@@ -401,9 +458,12 @@ class MemoryService:
                 # old row would destroy an unrelated, unrecoverable fact.
                 # Kill switch: settings.memory_supersede_on_conflict.
                 _existing_text = similar_memory.canonical_content or similar_memory.content or ""
-                if (
-                    getattr(settings, "memory_supersede_on_conflict", True)
-                    and conflicts_on_value(_existing_text, memory_data.content)
+                # Same two guards as the dedup service's shortcut: a
+                # differing value, or two different named subjects sharing a
+                # sentence shape (colleague Priya's code vs Marco's).
+                if getattr(settings, "memory_supersede_on_conflict", True) and (
+                    conflicts_on_value(_existing_text, memory_data.content)
+                    or mentions_different_subjects(_existing_text, memory_data.content)
                 ):
                     logger.info(
                         "[MEMORY] value conflict with %s — storing correction as a "

@@ -20,6 +20,7 @@ from app.config import settings
 from app.services.memory_service import (
     MemoryService,
     conflicts_on_value,
+    mentions_different_subjects,
     value_tokens,
 )
 from app.services.embedding_service import get_embedding_service
@@ -303,9 +304,20 @@ class MemoryDedupService:
             # which a mere rewording fails (see _conflicts_on_value).
             # Kill switch: settings.memory_supersede_on_conflict (changes
             # write semantics for restated facts).
-            if (
-                getattr(settings, "memory_supersede_on_conflict", True)
-                and self._conflicts_on_value(existing_content, new_content)
+            #
+            # 2026-07-31: the same shortcut also swallowed facts about
+            # DIFFERENT PEOPLE that merely share a sentence shape —
+            # "colleague Priya's desk door code is …" vs "Marco … uses door
+            # code … for his desk" embed >= 0.90 alike, so Marco's code was
+            # reinforced into Priya's row and never stored. The value guard
+            # does not catch it (those two are phrased differently enough
+            # that token overlap is ~0.28, under its 0.5 floor), so a
+            # distinct-subject check runs alongside it. Neither guard
+            # decides the outcome — both merely deny the SILENT shortcut and
+            # let the adjudicator answer.
+            if getattr(settings, "memory_supersede_on_conflict", True) and (
+                self._conflicts_on_value(existing_content, new_content)
+                or mentions_different_subjects(existing_content, new_content)
             ):
                 return await self._llm_decide_action(
                     existing_content=existing_content,

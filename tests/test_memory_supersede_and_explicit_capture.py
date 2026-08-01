@@ -1175,3 +1175,106 @@ async def test_supersede_loser_does_not_leave_a_stray_duplicate(monkeypatch):
             assert [m.id for m in active] == [winner.id], "loser must leave nothing behind"
     finally:
         await engine.dispose()
+
+
+# ── Distinct-subject guard (2026-07-31, harness distractor_resistance) ──
+#
+# Measured on the canary: four colleagues' desk door codes seeded in one
+# session, the SECOND one then unrecallable (distractor_resistance 0/1
+# both before and after the D-mem-A round). Cause: those sentences embed
+# >=0.90 alike but are phrased differently enough that token overlap is
+# ~0.28 — under conflicts_on_value's 0.5 floor — so the auto-duplicate
+# shortcut reinforced each new colleague into the first one's row and threw
+# the new code away. Silent cross-person data loss, not just an eval miss.
+
+
+def test_different_colleagues_are_not_the_same_fact():
+    from app.services.memory_service import mentions_different_subjects
+
+    priya = "The user's colleague Priya has desk door code memqa-x-desk-1111"
+    marco = "Marco from the design team uses desk door code memqa-x-desk-7a26"
+    sofia = "The desk of colleague Sofia opens with code memqa-x-desk-3333"
+
+    assert mentions_different_subjects(priya, marco)
+    assert mentions_different_subjects(marco, sofia)
+    assert mentions_different_subjects(sofia, priya)
+
+
+def test_added_detail_still_merges():
+    """One-sided names must NOT trip the guard, or every enrichment
+    ('pizza' -> 'pepperoni pizza from Dominos') would burn an LLM call and
+    stop merging."""
+    from app.services.memory_service import mentions_different_subjects
+
+    assert not mentions_different_subjects("I love pizza", "I love pepperoni pizza from Dominos")
+    assert not mentions_different_subjects(
+        "The user plays basketball", "The user plays basketball on Saturdays"
+    )
+    assert not mentions_different_subjects(_OLD_FACT, _NEW_FACT)
+
+
+def test_sentence_initial_words_are_not_subjects():
+    """Without the stoplist, 'The'/'My'/'Monday' would make almost every
+    pair look like different subjects and route the whole fleet's dedup
+    through the LLM."""
+    from app.services.memory_service import named_subjects
+
+    found = named_subjects("The user works Monday. My desk is here. They agreed.")
+    assert found == set(), f"expected no subjects, got {found}"
+
+
+def test_same_entity_value_change_still_reaches_the_adjudicator():
+    """'works at Google' -> 'joined Apple' names a different company on each
+    side, so the guard fires — which is correct: it only denies the SILENT
+    shortcut. The adjudicator still gets to answer contradiction_update."""
+    from app.services.memory_service import mentions_different_subjects
+
+    assert mentions_different_subjects(
+        "The user works at Google", "The user just joined Apple"
+    )
+
+
+async def test_four_colleagues_all_survive_one_batch(monkeypatch):
+    """End-to-end on the batch path the extractor uses: four same-shape
+    facts about four people must leave FOUR active rows, with every code
+    still retrievable. Pre-fix this collapsed to one."""
+    import app.services.memory_dedup_service as mds
+    import app.services.memory_service as ms_mod
+    from sqlalchemy import select
+    from app.db.models import Memory, User
+
+    # The adjudicator, once consulted, correctly calls these distinct facts.
+    llm = _RecordingLLM(content='{"action": "new", "reason": "different colleagues"}')
+    emb = _FakeEmbeddings()  # similarity 1.0 for every pair — worst case
+    monkeypatch.setattr(mds, "get_llm_service", lambda: llm)
+    monkeypatch.setattr(mds, "get_embedding_service", lambda: emb)
+    monkeypatch.setattr(ms_mod, "get_embedding_service", lambda: emb)
+
+    facts = [
+        "The user's colleague Priya has desk door code memqa-x-desk-1111",
+        "Marco from the design team uses desk door code memqa-x-desk-7a26",
+        "The desk of colleague Sofia opens with code memqa-x-desk-3333",
+        "Jonas, who sits by the window, has memqa-x-desk-4444 as his desk code",
+    ]
+
+    user_id = str(uuid.uuid4())
+    engine, Session = await _memory_session()
+    try:
+        async with Session() as db:
+            db.add(User(id=user_id, email=f"desk-{user_id[:8]}@example.com", hashed_password="x"))
+            await db.commit()
+            dedup = mds.MemoryDedupService(db=db)
+
+            for f in facts:
+                await dedup.smart_create_memory(new_memory=_mem_create(f), user_id=user_id)
+
+            active = (await db.execute(
+                select(Memory).where(Memory.user_id == user_id, Memory.is_active == True)
+            )).scalars().all()
+            contents = " || ".join(m.content for m in active)
+
+            assert len(active) == 4, f"expected 4 colleagues, got {len(active)}: {contents}"
+            for code in ("desk-1111", "desk-7a26", "desk-3333", "desk-4444"):
+                assert code in contents, f"{code} was swallowed"
+    finally:
+        await engine.dispose()
