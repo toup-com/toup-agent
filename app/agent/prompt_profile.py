@@ -280,3 +280,60 @@ def disabled_tools_for(profile: PromptProfile) -> frozenset[str]:
     if profile == PromptProfile.AUTOPILOT:
         return AUTOPILOT_DISABLED_TOOLS
     return frozenset()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Voice: the deferral tools are removed, not discouraged
+#
+# Voice is a real-time interface. The user is holding a live audio
+# session open, so an answer that arrives "later, in Mission Control" is
+# not a slower answer — it is no answer, delivered to a surface they are
+# not looking at. Every tool below moves work OUT of the current turn.
+#
+# Measured on the founder's account, 2026-08-01T00:25Z. He asked, in
+# Farsi, for U of T professors working on LLMs. In 145 seconds the agent
+# produced THREE background jobs and zero spoken answers:
+#
+#   00:25:24  create_job → "Find UofT LLM professors"     (cancelled)
+#   00:25:57  spawn      → "UofT LLM/NLP professor …"     (failed)
+#   00:27:23  spawn      → "UofT LLM/NLP professor …"     (failed)
+#
+# Both subagent rows recorded total_tokens=0 and credit_spent=0.0 over
+# the 19 minutes they were alive: they never ran at all, then an agent
+# restart marked them infra_interrupted. Meanwhile the voice model said
+# «یه گزارش جمع‌وجور و به‌دردبخور به فارسی برات میاد» — "a compact, useful
+# report in Farsi is coming to you". Nothing ever came. He re-asked twice,
+# and each re-ask minted another job, because nothing dedupes a request
+# against work already in flight.
+#
+# Prompt guidance cannot fix this, for the reason SUBAGENT_DISABLED_TOOLS
+# already states: prompts are advisory, tool-list omission is hard. The
+# model followed the prompt correctly — the FULL profile's decision rules
+# literally say "research … → call `create_job` FIRST". So voice loses
+# the tools instead.
+#
+# `start_mission` is deliberately NOT here. It is the one deferral the
+# user asks for in words ("while I'm away", "keep working on X"), it is
+# the surface Mission Control was built for, and it reports back through
+# channels the user will actually see. Removing it would leave a real
+# request with nowhere to go. `create_job`/`update_job` draw a progress
+# card and perform no work; `spawn` hands the work to a child whose
+# result this turn never waits for. None of the three can put an answer
+# in the user's ear.
+VOICE_DISABLED_TOOLS: frozenset[str] = frozenset({
+    "create_job",
+    "update_job",
+    "spawn",
+})
+
+
+def disabled_tools_for_channel(channel: str | None) -> frozenset[str]:
+    """Extra tool-disable set implied by the SURFACE, independent of profile.
+
+    Merged on top of the profile set and the user's own disabled list, so a
+    voice sub-agent loses the union of both — which is already what both
+    sets independently want.
+    """
+    if (channel or "").strip().lower() == "voice":
+        return VOICE_DISABLED_TOOLS
+    return frozenset()

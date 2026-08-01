@@ -936,7 +936,9 @@ class AgentRunner:
             # triggers (those are user-intent surfaces, not
             # sub-agent surfaces). Read-only memory access via
             # memory_search remains available.
-            from app.agent.prompt_profile import disabled_tools_for
+            from app.agent.prompt_profile import (
+                disabled_tools_for, disabled_tools_for_channel,
+            )
             _profile_disabled = disabled_tools_for(prompt_profile)
             if _profile_disabled:
                 merged = (_RUN_DISABLED_TOOLS_CTX.get() or frozenset()) | frozenset(_profile_disabled)
@@ -946,6 +948,19 @@ class AgentRunner:
                     "[AGENT] sub-agent run — disabling %d additional tools "
                     "(memory-write + spawn + job/routine/trigger mutators)",
                     len(_profile_disabled),
+                )
+            # Surface-implied disables, on top of the profile set. Voice loses
+            # create_job/update_job/spawn — the tools that move work out of the
+            # live turn and into a card the user is not looking at. See
+            # prompt_profile.VOICE_DISABLED_TOOLS for the incident this closes.
+            _channel_disabled = disabled_tools_for_channel(channel)
+            if _channel_disabled:
+                merged = (_RUN_DISABLED_TOOLS_CTX.get() or frozenset()) | frozenset(_channel_disabled)
+                self.tools.user_disabled_tools = merged
+                _RUN_DISABLED_TOOLS_CTX.set(merged)
+                logger.info(
+                    "[AGENT] channel=%s — disabling deferral tools (%s)",
+                    channel, ", ".join(sorted(_channel_disabled)),
                 )
             logger.info(f"[PERF] load_agent_config: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
@@ -3072,6 +3087,12 @@ class AgentRunner:
         # block — it is the agent's only authoritative product map. Routes
         # are verified against frontend/src/App.tsx; capability names match
         # tool_definitions.py.
+        # Voice is a live audio session, so two of the rules below invert:
+        # the deferral tools are GONE from its tool list (see
+        # prompt_profile.VOICE_DISABLED_TOOLS), and a rule naming a tool the
+        # model cannot call is worse than no rule — it reliably produces
+        # "I can't do that from here" instead of the thing the model CAN do.
+        _voice_now = (channel or "").strip().lower() == "voice"
         section_parts["platform_knowledge"] = (
             "# Platform Knowledge — How Toup Works\n"
             "You run on **Toup** — a personal-agent platform. The user lives "
@@ -3180,8 +3201,10 @@ class AgentRunner:
             "these when the user wants something to **keep, share, or "
             "edit** — not for inline conversational answers.\n\n"
             "### Jobs & schedules\n"
-            "Multi-step work → `create_job` then `update_job` as you "
-            "progress. Live job card visible at `/jobs`. For reminders "
+            + ("" if _voice_now else
+               "Multi-step work → `create_job` then `update_job` as you "
+               "progress. Live job card visible at `/jobs`. ")
+            + "For reminders "
             "(text delivered at a scheduled time) → `routines__remind` "
             "with `when=once|daily|every`. For recurring agent tasks "
             "('every morning summarise my email') → `routines__create` "
@@ -3205,7 +3228,8 @@ class AgentRunner:
             "- 'what do you know about <X>' → call `memory_search`\n"
             "- 'show me my memories' / 'take me to my brain' → call `navigate_to` with path `/brain`\n"
             "- 'make me a <tool/app>' / 'I need a <thing>' → use the app_builder skill\n"
-            "- 'search the web' / 'find <X> for me' / 'book <X>' → call `browser`. If they should watch, also drop `[[navigate:/browser]]`\n"
+            + ("- 'search the web' / 'find <X> for me' / 'look up <X>' → call `web_search`, then `web_fetch` on the two or three results worth reading. `browser` is for pages you must OPERATE (sign in, fill a form, click through a flow) or 'book <X>' — it drives a real headless browser and costs tens of seconds per step, so it is the wrong tool for a question that a search answers. If they should watch a browser session, drop `[[navigate:/browser]]`\n")
+            +
             "- 'remind me at <Y>' / 'in N minutes remind me' / 'every morning at 7 nudge me' → call `routines__remind`\n"
             "- 'schedule <agent task X>' / 'every morning summarise my email' → call `routines__create` with kind=`agent_task` or `email_briefing`\n"
             "- 'make this a PDF/doc/spreadsheet/deck' → call `generate_pdf` / `generate_docx` / `generate_xlsx` / `generate_pptx`\n"
@@ -3214,8 +3238,12 @@ class AgentRunner:
             "- 'change your name' / 'change your personality' → call `navigate_to` with path `/agent/soul`\n"
             "- 'what tools do you have' → call `navigate_to` with path `/agent/tools`\n"
             "- 'yesterday's chat' / 'what did we talk about Monday' → call `recall_day`\n"
-            "- User asks you to DO something (research / build / fix / produce — anything beyond answering a question) that you will finish IN THIS TURN → call `create_job` FIRST, then `update_job` as you complete each step\n"
-            "- 'while I'm away' / 'keep working on X' / 'keep me updated' / work that must continue after this conversation → call `start_mission`; do NOT also create_job — the mission IS the tracked task and appears in Mission Control\n"
+            + ("- The user is SPEAKING to you. Do the work in this turn and say the answer out loud. A question that a search answers is `web_search` → read the best results → speak a short spoken-shaped summary, naming the two or three sources you used. You have no way to hand this off: the job and sub-agent tools are not in your tool list on this surface, by design. Never promise a report, a summary 'when it's ready', or anything arriving later — on voice, later never arrives.\n"
+               if _voice_now else
+               "- User asks you to DO something (research / build / fix / produce — anything beyond answering a question) that you will finish IN THIS TURN → call `create_job` FIRST, then `update_job` as you complete each step\n")
+            + "- 'while I'm away' / 'keep working on X' / 'keep me updated' / work that must continue after this conversation → call `start_mission`"
+            + ("" if _voice_now else "; do NOT also create_job — the mission IS the tracked task and appears in Mission Control")
+            + "\n"
             "- 'where's my account' / 'change password' / 'billing' → call `navigate_to` with path `/account`\n"
             "- 'show me the dashboard' / 'metrics' → call `navigate_to` with path `/dashboard`\n"
             "- 'build me an app' (then they want to see it) → app_builder, then offer `[[open_app:<slug>]]` chip\n\n"
@@ -3235,11 +3263,16 @@ class AgentRunner:
         # Flag-off keeps the legacy literal above byte-identical.
         from app.agent.prompt_diet import (
             prompt_diet_enabled as _prompt_diet_enabled,
-            PLATFORM_KNOWLEDGE_DIET as _PLATFORM_KNOWLEDGE_DIET,
+            platform_knowledge_diet as _platform_knowledge_diet,
             DOC_GENERATION_DIET as _DOC_GENERATION_DIET,
         )
         if _prompt_diet_enabled():
-            section_parts["platform_knowledge"] = _PLATFORM_KNOWLEDGE_DIET
+            # Channel-aware, or this line silently reverts the voice fix above:
+            # it REPLACES the whole literal, and the diet's own decision rules
+            # named `create_job` and routed search to `browser`. With the voice
+            # tools removed that combination is the worst case — the model is
+            # told to call something it does not have.
+            section_parts["platform_knowledge"] = _platform_knowledge_diet(_voice_now)
 
         # Who owns/founded Toup — a static company fact appended to the
         # always-on platform map so every agent can answer "who's behind
@@ -4064,7 +4097,28 @@ class AgentRunner:
             "web":       "User is in the Toup web app in a browser (toup.ai). Full markdown and formatting OK — long code blocks, tables, headings all fine.",
             "app":       "User is inside a Toup in-app workspace (one of their custom apps). Full markdown and formatting OK.",
             "mobile":    "User is in the Toup mobile app (React Native on iOS or Android). This is the native Toup app — NOT Telegram, NOT a web browser. Keep responses compact: short paragraphs, avoid large code blocks or tables. Small screen.",
-            "voice":     "User is on the Toup voice/realtime surface (spoken audio, not text). Conversational tone. No markdown. Sentences should read naturally when spoken aloud.",
+            "voice": (
+                "User is on the Toup voice/realtime surface (spoken audio, not text). Conversational tone. "
+                "No markdown. Sentences should read naturally when spoken aloud.\n\n"
+                "BEHAVIOR — this is the part that matters most on this surface. The user is holding a live "
+                "audio session open and waiting. An answer that arrives 'later' arrives nowhere: they are "
+                "listening, not watching a dashboard.\n"
+                "  1. ANSWER IN THIS TURN. For anything factual, current, or researchable, call `web_search` "
+                "immediately, read what comes back, and speak the answer. Do not narrate that you are about "
+                "to start; just do it and then talk.\n"
+                "  2. NEVER promise a deliverable. No 'I'll put together a report', no 'when it's ready I'll "
+                "tell you', no 'let me look into that and get back to you'. If you cannot finish it now, say "
+                "what you DO know now and offer `start_mission` in plain words.\n"
+                "  3. SPEAK THE FINDINGS, not a description of them. 'There are four: Gerald Penn in Computer "
+                "Science, who works on speech and computational linguistics; …' — not 'I found some professors "
+                "and can summarise them for you'. The list IS the answer.\n"
+                "  4. LENGTH: aim for 3-6 sentences. If the honest answer is a long list, give the top three "
+                "aloud and offer the rest — a spoken paragraph the user cannot skim is worse than a short one.\n"
+                "  5. CITE BRIEFLY. Name the site ('according to the department's own page'), never read a URL "
+                "aloud — the sources appear on the user's screen as cards while you speak.\n"
+                "  6. If the user repeats a request you are already working on, do NOT start it again — say "
+                "you are on it and keep going."
+            ),
             "telegram":  "User is on Telegram messenger (talking to the Toup bot there). Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
             "discord":   "User is on Discord (Toup bot). Full markdown and code blocks OK. Keep message length under ~2000 chars.",
             "slack":     "User is on Slack (Toup integration). Slack-flavored markdown (limited). Short messages preferred.",
@@ -4116,7 +4170,11 @@ class AgentRunner:
             f"- You can read and write files using `read_file` and `write_file` tools.",
             f"- When you create a report or document for the user, end your reply with a markdown link [Open <name>](toup://report?path=<workspace-relative-path>) so they can tap to open it (the write_file result includes the exact link).",
             f"- You can search the web using the `web_search` tool.",
-            f"- When the user asks you to DO something you will finish in this turn (research, produce, fix — anything beyond answering), create a trackable job with `create_job` and advance it with `update_job` per step. For work that must CONTINUE after this conversation ('while I'm away', 'keep me updated'), use `start_mission` instead — never both for the same ask.",
+            (
+                "- The user is speaking to you live. Finish the work in this turn and say the answer. Only `start_mission` defers, and only when they ask for work that outlives the call ('while I'm away', 'keep me updated')."
+                if _channel_safe == "voice" else
+                "- When the user asks you to DO something you will finish in this turn (research, produce, fix — anything beyond answering), create a trackable job with `create_job` and advance it with `update_job` per step. For work that must CONTINUE after this conversation ('while I'm away', 'keep me updated'), use `start_mission` instead — never both for the same ask."
+            ),
         ]
         if hasattr(self, "_current_lane") and self._current_lane != "main":
             runtime_lines.append(f"- Execution lane: {self._current_lane}")

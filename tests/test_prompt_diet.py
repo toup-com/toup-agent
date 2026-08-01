@@ -262,7 +262,13 @@ def test_runner_wiring_order_and_both_swap_sites():
     src = (
         Path(__file__).resolve().parents[1] / "app" / "agent" / "agent_runner.py"
     ).read_text()
-    pk_swap = src.find('section_parts["platform_knowledge"] = _PLATFORM_KNOWLEDGE_DIET')
+    # The swap became channel-aware — _platform_knowledge_diet(_voice_now)
+    # rather than the bare constant — because the diet's own decision rules
+    # named `create_job` and routed search to `browser`, which would have
+    # reverted the voice fix the moment PROMPT_DIET was turned on. The
+    # ORDERING invariant this test exists for is unchanged; only the symbol is.
+    # See tests/test_voice_answers_inline.py::TestPromptDietIsVoiceAware.
+    pk_swap = src.find('section_parts["platform_knowledge"] = _platform_knowledge_diet(')
     owner = src.find('section_parts["platform_knowledge"] += "\\n\\n" + OWNER_GLOBAL_FACT')
     doc_swap = src.find('section_parts["doc_generation"] = _DOC_GENERATION_DIET')
     assert pk_swap != -1 and doc_swap != -1

@@ -1647,6 +1647,14 @@ async def _finalize_onboarding(user_id: str) -> str:
         await _ensure_vps_user(user_id)
 
         # ── 1. Read memories from VPS ──
+        # Both reads used limit=10000 against the agent's ceiling of 200 and so
+        # 422'd every time — the same skew that was fixed in
+        # build_realtime_instructions (see _MEMORIES_MAX_LIMIT). Here the cost
+        # was worse than a thin prompt: this is the function that COMPILES
+        # saul.md and identity.md at the end of onboarding, so every voice
+        # onboarding finished by writing a soul and a profile built from zero
+        # memories. Re-verified against the live agent 2026-08-01:
+        # limit=200 → 200 OK, limit=201 → 422.
         vps = await _get_vps_info(user_id)
         agent_memories = []
         user_memories = []
@@ -1656,7 +1664,7 @@ async def _finalize_onboarding(user_id: str) -> str:
 
             agent_mems_data = await _vps_api(
                 agent_url, agent_api_key, "GET", "/api/memories",
-                params={"brain_type": "agent", "limit": 10000},
+                params={"brain_type": "agent", "limit": _MEMORIES_MAX_LIMIT},
             )
             if agent_mems_data:
                 agent_memories = agent_mems_data.get("memories", agent_mems_data) if isinstance(agent_mems_data, dict) else agent_mems_data
@@ -1665,7 +1673,7 @@ async def _finalize_onboarding(user_id: str) -> str:
 
             user_mems_data = await _vps_api(
                 agent_url, agent_api_key, "GET", "/api/memories",
-                params={"brain_type": "user", "limit": 10000},
+                params={"brain_type": "user", "limit": _MEMORIES_MAX_LIMIT},
             )
             if user_mems_data:
                 user_memories = user_mems_data.get("memories", user_mems_data) if isinstance(user_mems_data, dict) else user_mems_data
