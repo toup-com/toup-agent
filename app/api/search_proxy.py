@@ -245,14 +245,42 @@ _fleet = _FleetGuard()
 
 
 def _effective_rate() -> tuple[float, int]:
-    """Per-process share of the configured per-tenant rate.
+    """Per-process share of the configured per-tenant SUSTAINED rate.
 
-    See ``_TokenBucket``: buckets are per process, so the configured value has
-    to be divided by the replica count to mean anything fleet-wide.
+    Buckets are per process, so the sustained rate is divided by the replica
+    count to mean what it says fleet-wide.
+
+    BURST IS NOT DIVIDED. Rate is about sustained load, where dividing is the
+    right approximation. Burst is about how many searches ONE turn may have in
+    flight, and dividing it there makes a turn's outcome depend on load-balancer
+    luck rather than on the configured number.
+
+    Both production observations fit that reading:
+
+      2026-07-31  a 10-request burst inside 762ms was served IN FULL against a
+                  configured burst of 5 — the requests spread over two replicas,
+                  two buckets, and Brave's own counter fell 49 -> 40.
+      2026-08-01  a voice research turn issuing three concurrent searches had
+                  exactly one shed, degraded_reason='tenant_rate_limit', with a
+                  repeating 2-ok/1-throttled signature at 16:56:58 and again at
+                  18:36:45 — three requests landing on ONE replica whose burst
+                  had become max(1, 5 // 2) = 2.
+
+    So the divisor does not bound a turn; it decides whether a routine turn is
+    shed based on how the balancer happened to fan three simultaneous requests.
+    The shed search still answered through the slower in-container tier, so the
+    cost was pure latency on the path voice is most sensitive to, and it never
+    surfaced as an error.
+
+    Removing the divisor is safe on the number that actually matters: burst 5 on
+    each of 2 replicas is at most 10 instantaneous requests against Brave's
+    50 rps account ceiling — precisely the 2026-07-31 case, which was fine. And
+    ``_FleetGuard`` reads Brave's own fleet-wide counter, needs no even-load
+    assumption, and remains the primary bound. This was always the secondary.
     """
     replicas = max(1, int(getattr(settings, "platform_replicas", 1)))
     rate = float(getattr(settings, "brave_rate_per_sec", 2.0)) / replicas
-    burst = max(1, int(getattr(settings, "brave_burst", 5)) // replicas)
+    burst = max(1, int(getattr(settings, "brave_burst", 5)))
     return rate, burst
 
 

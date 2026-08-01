@@ -772,12 +772,22 @@ async def test_empty_query_is_rejected(gw, brave, tenant):
 # ── The replica divisor ──────────────────────────────────────────────
 #
 # Every test above pins platform_replicas=1 so its assertions are about the
-# bucket maths. This one is about the divisor itself, which exists because a
-# production burst of 10 inside 762ms was served in full against a configured
-# burst of 5 (two replicas, two buckets, Brave's own counter 49 -> 40).
+# bucket maths. These are about the divisor itself: it applies to the SUSTAINED
+# RATE and deliberately NOT to the burst.
+#
+# The two production observations that settle it:
+#   2026-07-31  a 10-request burst inside 762ms served IN FULL against a
+#               configured burst of 5 — spread over two replicas, Brave's own
+#               counter 49 -> 40.
+#   2026-08-01  a voice turn's three concurrent searches, all landing on ONE
+#               replica whose burst had become max(1, 5 // 2) = 2, shed exactly
+#               one with degraded_reason='tenant_rate_limit'.
+# Dividing the burst therefore decided a routine turn's outcome by balancer
+# luck. _FleetGuard, which reads Brave's own fleet-wide counter, is the primary
+# bound and needs no even-load assumption.
 
 
-def test_effective_rate_divides_by_replica_count(monkeypatch):
+def test_effective_rate_divides_the_RATE_by_replica_count(monkeypatch):
     monkeypatch.setattr(sp.settings, "brave_rate_per_sec", 2.0)
     monkeypatch.setattr(sp.settings, "brave_burst", 5)
 
@@ -785,22 +795,44 @@ def test_effective_rate_divides_by_replica_count(monkeypatch):
     assert sp._effective_rate() == (2.0, 5)
 
     monkeypatch.setattr(sp.settings, "platform_replicas", 2)
-    assert sp._effective_rate() == (1.0, 2)
+    assert sp._effective_rate() == (1.0, 5), "the RATE halves; the burst must not"
+
+
+def test_burst_survives_the_production_replica_default(monkeypatch):
+    """The regression this fixes, stated as its own case.
+
+    platform_replicas defaults to 2, so `5 // 2` left a burst of 2 while a voice
+    research turn issues three concurrent searches — one shed, every time those
+    three shared a replica. The configured burst must reach the bucket intact.
+    """
+    monkeypatch.setattr(sp.settings, "brave_burst", 5)
+    monkeypatch.setattr(sp.settings, "brave_rate_per_sec", 2.0)
+    monkeypatch.setattr(sp.settings, "platform_replicas", 2)
+
+    _rate, burst = sp._effective_rate()
+    assert burst >= 3, (
+        f"burst {burst} sheds one search of a routine 3-search voice turn"
+    )
+    assert burst == 5
 
 
 def test_effective_rate_never_returns_a_zero_bucket(monkeypatch):
-    """A burst that divides below 1 must still admit one call.
+    """No replica count may take fast search away by arithmetic.
 
-    Without the floor, raising the replica count past the configured burst
-    would silently take fast search away from every tenant rather than
-    slowing it — the degrade-never-deny contract broken by arithmetic.
+    This used to guard a floor under `burst // replicas`, which could reach 0
+    and break the degrade-never-deny contract. The burst is no longer divided
+    at all, so the guarantee is now unconditional — the case is kept because
+    the property is what matters, not the expression that satisfies it.
     """
     monkeypatch.setattr(sp.settings, "brave_burst", 3)
     monkeypatch.setattr(sp.settings, "brave_rate_per_sec", 2.0)
-    monkeypatch.setattr(sp.settings, "platform_replicas", 8)
-    rate, burst = sp._effective_rate()
-    assert burst == 1
-    assert rate > 0
+
+    for replicas in (1, 2, 8, 64):
+        monkeypatch.setattr(sp.settings, "platform_replicas", replicas)
+        rate, burst = sp._effective_rate()
+        assert burst >= 1, f"replicas={replicas} produced an unusable bucket"
+        assert burst == 3, "the configured burst must reach the bucket intact"
+        assert rate > 0, f"replicas={replicas} produced a non-positive rate"
 
     # And a nonsense value cannot produce a divide-by-zero or a negative rate.
     monkeypatch.setattr(sp.settings, "platform_replicas", 0)
