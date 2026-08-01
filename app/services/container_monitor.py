@@ -25,9 +25,58 @@ _last_alert: Dict[str, datetime] = {}
 ALERT_AFTER_FAILURES = 3  # Alert after 3 consecutive failures (15 min)
 ALERT_COOLDOWN = timedelta(hours=1)  # Don't spam — max 1 alert per container per hour
 
+# ── Tenant DB path ────────────────────────────────────────────────
+# 2026-08-01: pgbouncer died and every tenant lost its database. Chat 500'd
+# fleet-wide for six minutes and NOTHING alerted, because the containers were
+# up, Postgres was up, and /agent/health kept returning 200 with
+# `status: "healthy"`. The agent's own db_watchdog had already detected it and
+# published `db_ok: false` in that same payload — this monitor just never read
+# the field. That is the "/agent/health green != chat works" trap, and it is
+# the second time it has cost a fleet-wide outage.
+#
+# db_ok is deliberately NOT folded into `healthy` below. `healthy` drives the
+# auto-restart path, and restarting 55 containers because a SHARED component
+# (pgbouncer/Postgres) is down is both useless and harmful — it would turn one
+# outage into a restart storm. So this is a separate, aggregated signal that
+# alerts and never acts.
+_db_down_counts: Dict[str, int] = {}
+_last_db_alert: Optional[datetime] = None
+# One tenant reporting db_ok=false could be its own database; wait a cycle.
+# Two or more at once is a shared component — say so immediately, because the
+# operator's next move differs completely.
+DB_ALERT_AFTER_FAILURES = 2
+DB_ALERT_MIN_TENANTS_IMMEDIATE = 2
+DB_ALERT_COOLDOWN = timedelta(minutes=30)
 
-async def _check_container_health(container: ManagedContainer) -> bool:
-    """Check if a container's agent is healthy by hitting its health endpoint.
+
+def verdict_from_health_body(data: dict) -> "tuple[bool, Optional[bool]]":
+    """Read `(healthy, db_ok)` out of an /agent/health body.
+
+    Pure, so the decision that mattered on 2026-08-01 is testable without a
+    database or an HTTP stack. `db_ok` is a SIBLING of `status`, not nested
+    under it — a tenant whose database is unreachable still answers
+    `{"status": "healthy", "db_ok": false}`, which is exactly why reading
+    only `status` missed a fleet-wide outage.
+
+    A missing or non-boolean `db_ok` is None, meaning "the agent did not
+    say" — never "down". Older images and pool-generic boots omit it, and
+    treating absence as failure would page forever.
+    """
+    healthy = data.get("status") in ("healthy", "ok")
+    db_ok = data.get("db_ok")
+    return healthy, (db_ok if isinstance(db_ok, bool) else None)
+
+
+async def _probe_agent_health(
+    container: ManagedContainer,
+) -> "tuple[bool, Optional[bool]]":
+    """Probe a container's agent health endpoint.
+
+    Returns `(healthy, db_ok)`. `healthy` is the liveness verdict that drives
+    the alert + auto-restart path below. `db_ok` is the agent's own
+    db_watchdog verdict on whether its tenant database is reachable, and is
+    reported separately — see the note by `_db_down_counts`.
+    `db_ok` is None when the agent did not report the field at all.
 
     Phase 3: URL is the HTTPS subdomain per AgentConfig.agent_url, fronted
     by Caddy on 443. The platform doesn't need bridge mTLS for this check —
@@ -53,17 +102,16 @@ async def _check_container_health(container: ManagedContainer) -> bool:
         # when AgentConfig rows haven't been populated with HTTPS URLs yet.
         url = f"http://{settings.docker_host_ip}:{container.host_port}/agent/health"
     else:
-        return False
+        return False, None
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url)
             if resp.status_code == 200:
-                data = resp.json()
-                return data.get("status") in ("healthy", "ok")
+                return verdict_from_health_body(resp.json())
     except Exception:
         pass
-    return False
+    return False, None
 
 
 async def _send_telegram_alert(message: str):
@@ -114,9 +162,26 @@ async def check_all_containers():
         if not containers:
             return
 
+        db_down: list[ManagedContainer] = []
+
         for container in containers:
-            healthy = await _check_container_health(container)
+            healthy, db_ok = await _probe_agent_health(container)
             key = container.id
+
+            # Tenant DB path — tracked and alerted, never acted on. Only a
+            # container that is otherwise ANSWERING can report db_ok; a dead
+            # container returns (False, None) and belongs to the liveness
+            # path below, not here.
+            if db_ok is False:
+                _db_down_counts[key] = _db_down_counts.get(key, 0) + 1
+                db_down.append(container)
+                logger.warning(
+                    "[MONITOR] %s reports db_ok=false (%d consecutive) — "
+                    "agent is up but its database is unreachable",
+                    container.container_name, _db_down_counts[key],
+                )
+            elif db_ok is True:
+                _db_down_counts.pop(key, None)
 
             if healthy:
                 # Reset failure count and clear error
@@ -192,6 +257,63 @@ async def check_all_containers():
                     container.status = "error"
                     container.error_message = f"Unhealthy for {count * 5} minutes"
                     await db.commit()
+
+        await _alert_on_db_path(db_down)
+
+
+async def _alert_on_db_path(db_down: "list[ManagedContainer]") -> None:
+    """One aggregated alert for tenants whose database is unreachable.
+
+    Aggregated on purpose: the failure this exists for (pgbouncer down) hits
+    every tenant at once, and 55 separate messages would bury the one fact
+    that matters. The count IS the diagnosis — several tenants at once means
+    a shared component, and the alert says so, because "restart the
+    container" is the wrong move there and is what an operator would
+    otherwise reach for.
+    """
+    global _last_db_alert
+
+    if not db_down:
+        return
+
+    fleet_wide = len(db_down) >= DB_ALERT_MIN_TENANTS_IMMEDIATE
+    # A single tenant may just be its own database; give it one more cycle.
+    # Several at once is shared infrastructure — say it now.
+    if not fleet_wide:
+        only = db_down[0]
+        if _db_down_counts.get(only.id, 0) < DB_ALERT_AFTER_FAILURES:
+            return
+
+    now = datetime.utcnow()
+    if _last_db_alert and (now - _last_db_alert) < DB_ALERT_COOLDOWN:
+        return
+    _last_db_alert = now
+
+    names = ", ".join(f"<code>{c.container_name}</code>" for c in db_down[:3])
+    if len(db_down) > 3:
+        names += f" +{len(db_down) - 3} more"
+
+    if fleet_wide:
+        verdict = (
+            f"<b>{len(db_down)} tenants at once → shared component.</b>\n"
+            f"Check pgbouncer first (<code>systemctl is-active pgbouncer</code>, "
+            f"port 6432), then Postgres.\n"
+            f"<b>Restarting containers will NOT help</b> and risks a restart storm."
+        )
+    else:
+        verdict = (
+            "<b>Single tenant</b> — likely its own database, not shared "
+            "infrastructure. Check that tenant's DB before touching the fleet."
+        )
+
+    await _send_telegram_alert(
+        f"🗄️ <b>Tenant DB path unreachable</b>\n"
+        f"{names}\n"
+        f"Time: {now.strftime('%H:%M UTC')}\n\n"
+        f"{verdict}\n\n"
+        f"<i>Agents are UP and /agent/health returns 200 — they report "
+        f"db_ok=false. Chat is failing for these users.</i>"
+    )
 
 
 async def monitor_loop():
