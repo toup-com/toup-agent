@@ -18,6 +18,16 @@ from app.db.models import Base
 logger = logging.getLogger(__name__)
 
 
+class _SkipPlanning(Exception):
+    """Internal signal: boot-DDL planning is not armed for this tenant.
+
+    Raised and caught inside init_db() only, so the "not armed" path and the
+    "planning blew up" path stay visibly distinct — the first is normal and
+    silent, the second must warn.
+    """
+
+
+
 def _build_engine(database_url: str) -> AsyncEngine:
     """Construct an AsyncEngine, optionally with connection-leak tracing.
 
@@ -1083,10 +1093,14 @@ async def init_db():
     # Fail-open everywhere: a failed snapshot leaves _ddl_skipped empty
     # and every statement runs, which is exactly the previous behaviour.
     _statements_to_run = _alter_statements
-    if not _is_sqlite and settings.init_db_plan_ddl:
+    if not _is_sqlite:
         try:
             import time as _time
-            from app.db.ddl_plan import SNAPSHOT_SQL, plan, snapshot_from_rows
+            from app.db.ddl_plan import (
+                SNAPSHOT_SQL, plan, should_plan, snapshot_from_rows,
+            )
+            if not should_plan(settings.init_db_plan_ddl):
+                raise _SkipPlanning()
             _t_plan = _time.perf_counter()
             async with engine.connect() as conn:
                 _cols = (await conn.execute(text(SNAPSHOT_SQL["columns"]))).all()
@@ -1103,6 +1117,8 @@ async def init_db():
                 len(_to_run), len(_alter_statements), len(_skip),
                 (_time.perf_counter() - _t_plan) * 1000,
             )
+        except _SkipPlanning:
+            pass  # not armed for this tenant — full list, unchanged behaviour
         except Exception as _plan_err:
             _statements_to_run = _alter_statements
             _logger.warning(

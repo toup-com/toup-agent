@@ -198,3 +198,24 @@ SNAPSHOT_SQL = {
         "WHERE table_schema = current_schema()"
     ),
 }
+
+
+# ── arming this on one tenant ─────────────────────────────────────────
+# `INIT_DB_PLAN_DDL=true` works, but tenant environments are built by the
+# bridge and are append-only across a blue-green upgrade — so arming ONE tenant
+# by env is a deploy, not a switch, which defeats the point of a canary soak.
+# A workspace sentinel makes it `docker exec <tenant> touch <path>` plus a
+# restart, and the same pattern already carries the blue-green promote marker
+# (/app/workspace/.toup_bg_promoted) and the pool-leak instrument.
+SENTINEL = "/app/workspace/.init_db_plan_ddl"
+
+
+def should_plan(settings_flag: bool) -> bool:
+    """True when the boot-DDL pass should be planned against the catalog."""
+    if settings_flag:
+        return True
+    try:
+        import os
+        return os.path.exists(SENTINEL)
+    except Exception:
+        return False

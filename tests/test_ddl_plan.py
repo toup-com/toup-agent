@@ -282,3 +282,31 @@ def test_every_real_statement_survives_an_empty_snapshot():
     to_run, skipped = plan(stmts, EMPTY)
     assert to_run == stmts
     assert skipped == []
+
+
+def test_arming_by_workspace_sentinel():
+    """Tenant env is bridge-built and append-only across a blue-green upgrade,
+    so arming ONE tenant by env is a deploy rather than a switch — which
+    defeats a canary soak. The sentinel makes it a `docker exec touch` plus a
+    restart, the same pattern as the blue-green promote marker."""
+    import os
+    import tempfile
+
+    from app.db import ddl_plan
+
+    assert ddl_plan.should_plan(False) is False, "must be off by default"
+    assert ddl_plan.should_plan(True) is True, "the settings flag alone is enough"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sentinel = os.path.join(tmp, ".init_db_plan_ddl")
+        original = ddl_plan.SENTINEL
+        ddl_plan.SENTINEL = sentinel
+        try:
+            assert ddl_plan.should_plan(False) is False, "armed with no sentinel"
+            open(sentinel, "w").close()
+            assert ddl_plan.should_plan(False) is True, (
+                "sentinel present but planning stayed disarmed — it could "
+                "never be soaked on a single tenant"
+            )
+        finally:
+            ddl_plan.SENTINEL = original
