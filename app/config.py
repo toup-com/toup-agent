@@ -26,6 +26,22 @@ class Settings(BaseSettings):
     # into explicitly (SQL_ECHO=true) and never ride on a general dev flag.
     sql_echo: bool = False
 
+    # Plan init_db()'s boot-time ALTER list against the live catalog and issue
+    # only the statements whose effect is actually missing, instead of
+    # replaying all ~358 every start.
+    #
+    # This is not a micro-optimisation. Postgres takes ACCESS EXCLUSIVE BEFORE
+    # evaluating `IF NOT EXISTS`, so each "idempotent" no-op still queues for
+    # an exclusive lock on a table the blue container is actively serving
+    # during a blue-green swap (proven on postgres:16, 2026-08-03). It is why
+    # rollouts abort with `health_checks_passed: 0` and why the health budget
+    # was raised 30 -> 120 -> 240 without ever fixing it.
+    #
+    # Default OFF: this governs schema delivery to tenants, and a wrong skip
+    # is a silent missing column. Enable per-tenant (INIT_DB_PLAN_DDL=true) to
+    # soak on the canary before the fleet. See app/db/ddl_plan.py.
+    init_db_plan_ddl: bool = False
+
     # Deployment environment. Drives the sk_live_ / sk_test_ guard below.
     # Anything other than "production" treats the deployment as non-prod and
     # forbids live Stripe keys. Set via ENVIRONMENT env var.

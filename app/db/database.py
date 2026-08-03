@@ -1041,7 +1041,58 @@ async def init_db():
     # to land on production despite being in the loop.
     from sqlalchemy import text, inspect as _sa_inspect
     _is_sqlite = engine.dialect.name == "sqlite"
-    for stmt in _alter_statements:
+
+    # ── Plan the pass against the live catalog (2026-08-03) ───────────
+    # The list is idempotent, but idempotent is NOT free: Postgres takes
+    # ACCESS EXCLUSIVE *before* it evaluates `IF NOT EXISTS`, so a no-op
+    # ALTER still queues behind any open transaction on that table — and
+    # the blue container is serving this same database during a
+    # blue-green swap. Proven on postgres:16 (isolated container,
+    # 2026-08-03): with one plain `BEGIN; SELECT count(*) FROM t;` held
+    # open, a no-op `ADD COLUMN IF NOT EXISTS` hit `lock timeout` with
+    # pg_locks showing AccessExclusiveLock granted=false. That is how a
+    # green got through 41 of 358 statements in 251s on 2026-08-01 while
+    # three siblings on the same host each did all 358 in under a minute.
+    #
+    # So: ask the catalog ONCE (read-only, no table locks) and issue only
+    # the statements whose effect is actually missing. Deliberately NOT a
+    # stored schema-version marker — tenant DBs have no alembic_version,
+    # a marker can be written when a statement actually failed, and it
+    # cannot see out-of-band drift. Catalog-derived planning can only
+    # skip a statement whose effect is already present, and it re-plans a
+    # dropped column back in on the next boot.
+    #
+    # Fail-open everywhere: a failed snapshot leaves _ddl_skipped empty
+    # and every statement runs, which is exactly the previous behaviour.
+    _statements_to_run = _alter_statements
+    if not _is_sqlite and settings.init_db_plan_ddl:
+        try:
+            import time as _time
+            from app.db.ddl_plan import SNAPSHOT_SQL, plan, snapshot_from_rows
+            _t_plan = _time.perf_counter()
+            async with engine.connect() as conn:
+                _cols = (await conn.execute(text(SNAPSHOT_SQL["columns"]))).all()
+                _idxs = (await conn.execute(text(SNAPSHOT_SQL["indexes"]))).all()
+                _tbls = (await conn.execute(text(SNAPSHOT_SQL["tables"]))).all()
+            _snap = snapshot_from_rows(
+                [(r[0], r[1]) for r in _cols], [r[0] for r in _idxs], [r[0] for r in _tbls]
+            )
+            _to_run, _skip = plan(_alter_statements, _snap)
+            _statements_to_run = _to_run
+            _logger.info(
+                "[init_db] ddl_plan: %d of %d statements need to run "
+                "(%d already satisfied) — planned in %.0fms",
+                len(_to_run), len(_alter_statements), len(_skip),
+                (_time.perf_counter() - _t_plan) * 1000,
+            )
+        except Exception as _plan_err:
+            _statements_to_run = _alter_statements
+            _logger.warning(
+                "[init_db] ddl_plan unavailable, running the full list: %s",
+                str(_plan_err)[:200],
+            )
+
+    for stmt in _statements_to_run:
         try:
             if _is_sqlite:
                 # sqlite doesn't support `ADD COLUMN IF NOT EXISTS` — rewrite
