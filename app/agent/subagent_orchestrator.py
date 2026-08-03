@@ -14,7 +14,7 @@ What it does:
      in ``config_json``, ``source_kind='subagent'``,
      idempotency key from
      ``subagent_dispatcher.derive_idempotency_key``).
-  3. Fires the child via ``asyncio.create_task(_run_child(...))``
+  3. Fires the child via ``_spawn_bg(_run_child(...))``
      and returns the job_id to the parent — non-blocking.
   4. The child task acquires a ``LaneType.SUBAGENT`` slot on the
      process-wide ``LaneManager``, flips the job to ``running``,
@@ -65,6 +65,7 @@ from app.agent.subagent_dispatcher import (
     subagent_depth_of,
     transition_job_status,
 )
+from app.services.background_tasks import spawn as _spawn_bg
 
 
 logger = logging.getLogger(__name__)
@@ -232,7 +233,7 @@ async def spawn_subagent(
 
     if was_fresh:
         # 3. Fire the child. The task owns its own session lifecycle.
-        asyncio.create_task(_run_child(
+        _spawn_bg(_run_child(
             job_id=job.id,
             user_id=user_id,
             task=task,

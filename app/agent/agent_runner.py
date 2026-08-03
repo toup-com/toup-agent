@@ -62,6 +62,7 @@ from app.services.openai_agent_service import OpenAIAgentService, StreamEvent
 from app.services.anthropic_service import AnthropicService
 from app.services.model_router import classify_request, RoutingDecision
 from app.agent.hooks import get_hook_bus, HookEvent
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -628,7 +629,7 @@ class AgentRunner:
                     "leaving them to the reaper", len(ids),
                 )
                 return
-            asyncio.create_task(self._close_interrupted_jobs(tuple(ids), user_id))
+            _spawn_bg(self._close_interrupted_jobs(tuple(ids), user_id))
         except Exception:  # noqa: BLE001 — cleanup must never mask the real error
             logger.exception("[job-finalize] sweep failed")
 
@@ -1430,7 +1431,7 @@ class AgentRunner:
                             "[AGENT] drop-time memory promotion failed (non-fatal): %s", p_err
                         )
 
-                asyncio.create_task(_promote())
+                _spawn_bg(_promote())
             except Exception:
                 logger.debug("[AGENT] drop-time promotion scheduling failed", exc_info=True)
 

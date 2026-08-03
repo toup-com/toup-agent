@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.models import ManagedContainer, AgentConfig, Rollout
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -516,8 +517,7 @@ async def provision_container(
     )
 
     # Post-provision soul sync (background, non-blocking)
-    asyncio.create_task(
-        _sync_soul_after_start(user_id, data["agent_url"], data["agent_api_key"])
+    _spawn_bg(_sync_soul_after_start(user_id, data["agent_url"], data["agent_api_key"])
     )
     return container
 

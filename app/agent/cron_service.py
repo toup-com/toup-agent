@@ -23,6 +23,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 from app.config import settings
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -307,8 +308,7 @@ class CronService:
         if job_info["user_id"] != user_id:
             return {"error": "Not your job"}
 
-        asyncio.create_task(
-            self._execute_job(
+        _spawn_bg(self._execute_job(
                 job_id,
                 job_info["user_id"],
                 job_info["chat_id"],

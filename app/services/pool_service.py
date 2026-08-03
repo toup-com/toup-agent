@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.models import AgentConfig, ManagedContainer
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -696,7 +697,7 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
         c = await claim_for_user(db, user_id)
         if c is not None:
             try:
-                asyncio.create_task(_verify_and_heal_pool_claim(user_id))
+                _spawn_bg(_verify_and_heal_pool_claim(user_id))
             except Exception:
                 # create_task should never fail in an async context, but if it
                 # somehow does, the periodic reconciler still covers us.

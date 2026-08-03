@@ -42,6 +42,7 @@ from app.agent.skills.base import Skill, SkillContext, SkillMeta
 # the toup uid, else npm/expo lifecycle scripts run as root and can read
 # /proc/1/environ (docs/security/audit-2026.md).
 from app.services.exec_env import scrubbed_environ, sandbox_preexec
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -998,8 +999,7 @@ class AppBuilderSkill(Skill):
             })
 
         # Spawn background build
-        asyncio.create_task(
-            self._build_app(job_id, app_id, name, description, user_id, slug, app_dir, plan_context)
+        _spawn_bg(self._build_app(job_id, app_id, name, description, user_id, slug, app_dir, plan_context)
         )
 
         return (
@@ -1135,8 +1135,7 @@ class AppBuilderSkill(Skill):
         completed_steps = checkpoint.get("completed_steps", [])
 
         # Spawn background resume
-        asyncio.create_task(
-            self._resume_build_app(job_id, checkpoint, user_id)
+        _spawn_bg(self._resume_build_app(job_id, checkpoint, user_id)
         )
 
         return (
@@ -1194,8 +1193,7 @@ class AppBuilderSkill(Skill):
             await db.commit()
 
         # Spawn background modification
-        asyncio.create_task(
-            self._modify_app(job_id, app_id, app.name, app.description or "", changes, user_id, app.slug, app.app_dir)
+        _spawn_bg(self._modify_app(job_id, app_id, app.name, app.description or "", changes, user_id, app.slug, app.app_dir)
         )
 
         return (

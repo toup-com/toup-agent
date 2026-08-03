@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 
 from app.db.models import Memory
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,7 @@ class UserPortraitService:
             return  # Already in progress
 
         _rebuilding[user_id] = True
-        asyncio.create_task(self._background_rebuild(user_id))
+        _spawn_bg(self._background_rebuild(user_id))
 
     async def _background_rebuild(self, user_id: str):
         """Rebuild portrait in background with its own DB session. Updates cache when done."""

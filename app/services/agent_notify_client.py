@@ -37,6 +37,7 @@ from sqlalchemy import or_, select, update
 from app.config import settings
 from app.db.database import async_session_maker
 from app.db.models import AgentNotifyOutbox
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ async def notify(
     # the background loop is the guarantee, this is just latency.
     if OPPORTUNISTIC_FLUSH:
         try:
-            asyncio.get_running_loop().create_task(flush_notify_outbox())
+            _spawn_bg(flush_notify_outbox())
         except RuntimeError:
             pass  # no running loop (sync caller) — loop will catch it
     return row_id

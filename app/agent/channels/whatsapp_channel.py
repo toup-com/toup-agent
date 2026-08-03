@@ -27,6 +27,7 @@ from app.agent.channels.base import (
     ChannelType,
     InboundMessage,
 )
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +242,7 @@ class WhatsAppChannel(BaseChannel):
         # webhook handler can return 200 immediately. The in-process
         # guard means we hit the DB at most once per container lifetime.
         if any_user_message and not self._connected_marked:
-            asyncio.create_task(self._mark_connected_if_first())
+            _spawn_bg(self._mark_connected_if_first())
 
     async def _mark_connected_if_first(self) -> None:
         """One-shot UPDATE of agent_configs.whatsapp_connected_at.

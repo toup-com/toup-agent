@@ -46,6 +46,7 @@ from app.config import settings
 from app.db.database import async_session_maker
 from app.db.models import AgentConfig
 from app.db.models.platform import ManagedContainer
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +148,7 @@ async def schedule_prewarm(user_id: str) -> PrewarmStatus:
 
     # asyncio.create_task fires AFTER the session is closed and the
     # commit is durable. The task opens its own session.
-    asyncio.create_task(_run_prewarm(user_id))
+    _spawn_bg(_run_prewarm(user_id))
     # Telemetry marker: prewarm trigger time. Pair with the matching
     # [BOOT-READY] line (same user prefix) to compute boot duration,
     # and with [WAKE-CLICK] to compute the user-facing gap. Format

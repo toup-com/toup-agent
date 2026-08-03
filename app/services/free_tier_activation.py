@@ -38,6 +38,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AgentConfig
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ def _schedule_openai_project_provision(user_id: str) -> None:
     the platform master key until it lands)."""
     import asyncio
     try:
-        asyncio.create_task(_run_openai_project_provision(user_id))
+        _spawn_bg(_run_openai_project_provision(user_id))
     except RuntimeError:
         # No running event loop (e.g. a sync management context) — skip; the
         # backfill reconciler will provision the project on its next pass.

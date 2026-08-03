@@ -24,6 +24,7 @@ full boot to execute).
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -312,6 +313,26 @@ _CTX_SRC = (Path(__file__).resolve().parent.parent / "app" / "agent" / "context_
 _RUN_SRC = _SRC.split("async def run(")[1].split("async def _get_or_create_session")[0]
 
 
+def _callee_name(node: ast.AST) -> str | None:
+    """`f(...)` -> "f"; `a.b.f(...)` -> "f"; anything else -> None."""
+    if not isinstance(node, ast.Call):
+        return None
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        return f.attr
+    if isinstance(f, ast.Name):
+        return f.id
+    return None
+
+
+def _find_funcdef(src: str, name: str) -> ast.AST | None:
+    """The (possibly nested) def of `name` in `src`."""
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    return None
+
+
 class TestRunnerWiring:
     def test_overflow_branch_exists_before_generic_ladder(self):
         """A8-2: the overflow branch must classify BEFORE the auth/429
@@ -348,10 +369,47 @@ class TestRunnerWiring:
 
     def test_drop_promotion_is_fire_and_forget(self):
         """A8-6: the dropped span rides the existing background memory
-        extractor via a scheduled task — never inline on the turn."""
+        extractor via a scheduled task — never inline on the turn.
+
+        Pinned as a PROPERTY, not a spelling. This read
+        ``"asyncio.create_task(_promote())" in _RUN_SRC`` until #418, which
+        broke it by making the code strictly better: a bare ``create_task``
+        hands the loop a task it keeps only a WEAK reference to, so the task
+        can be collected mid-await and leak the DB session ``_promote``
+        opens. What A8-6 actually requires — scheduled, never awaited on the
+        turn — survives that rename. The literal did not, and a pin that
+        fails on its own fix is a pin that teaches people to edit the test.
+        """
         assert "def _promote_dropped_span(" in _RUN_SRC
-        assert "asyncio.create_task(_promote())" in _RUN_SRC
         assert "on_drop=_promote_dropped_span," in _RUN_SRC
+
+        fn = _find_funcdef(_SRC, "_promote_dropped_span")
+        assert fn is not None, "_promote_dropped_span is gone"
+
+        awaited = [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.Await) and _callee_name(n.value) == "_promote"
+        ]
+        assert not awaited, (
+            "the dropped-span promotion is awaited inline — A8-6 exists "
+            "because memory extraction must not sit on the turn's latency"
+        )
+
+        schedulers = [
+            _callee_name(n) for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and n.args
+            and _callee_name(n.args[0]) == "_promote"
+        ]
+        assert schedulers, (
+            "nothing schedules _promote() — the dropped span is silently "
+            "never promoted to durable memory"
+        )
+        # `spawn`/`_spawn_bg` keep a strong reference; a bare `create_task`
+        # is the #418 defect and is caught repo-wide by
+        # tests/test_background_task_refs.py.
+        assert all(s in ("spawn", "_spawn_bg", "create_task") for s in schedulers), (
+            f"_promote() is scheduled by something unexpected: {schedulers}"
+        )
 
     def test_compaction_sites_pass_conversation_for_persistence(self):
         """A8-5: both compaction call sites hand the Conversation id to

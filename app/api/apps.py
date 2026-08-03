@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import async_session_maker
 from app.db.models import App, BuildJob
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -762,7 +763,7 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
                     except Exception:  # noqa: BLE001
                         logger.debug("[DASHBOARD] waiting notify skipped")
 
-        asyncio.create_task(_run_dashboard_task())
+        _spawn_bg(_run_dashboard_task())
 
     return _job_to_response(job)
 

@@ -72,6 +72,7 @@ from app.services.oauth_state import (
     verify_state,
 )
 from app.services.provider_apps import get_provider_app
+from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
@@ -564,7 +565,7 @@ async def oauth_callback(
     # GCP misconfig) are logged + retried by the daily refresh.
     if payload.connector_id == "gmail":
         import asyncio as _asyncio
-        _asyncio.create_task(_arm_gmail_watch_post_connect(payload.user_id))
+        __spawn_bg(_arm_gmail_watch_post_connect(payload.user_id))
 
     # 7. Redirect to the frontend OAuth callback bridge. When the
     #    OAuth flow ran in a popup, the bridge posts back to the
