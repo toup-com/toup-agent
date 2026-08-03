@@ -306,7 +306,7 @@ async def _chat_stream(
     """
     import asyncio
     
-    async def generate_stream():
+    async def _stream_body(db):
         start_time = time.time()
         full_response = ""
         
@@ -515,6 +515,18 @@ async def _chat_stream(
             })
             yield f"data: {error_data}\n\n"
     
+    async def generate_stream():
+        """Own the session — see the note in app/api/chat.py.
+
+        This module is an unmounted duplicate of app/api/chat.py, so the same
+        defect here is latent rather than live. Fixed anyway: a dormant copy of
+        a known leak is a regression waiting for whoever mounts it.
+        """
+        from app.db.database import async_session_maker as _own_maker
+        async with _own_maker() as _own_db:
+            async for _evt in _stream_body(_own_db):
+                yield _evt
+
     return StreamingResponse(
         generate_stream(),
         media_type="text/event-stream",

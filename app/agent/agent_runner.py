@@ -1482,9 +1482,24 @@ class AgentRunner:
             try:
                 from app.db import AgentConfig as _AC
                 from sqlalchemy import select as _sel
-                _pref = (await db.execute(
-                    _sel(_AC.preferred_provider).where(_AC.user_id == user_id)
-                )).scalar_one_or_none()
+                # OWN session. `db` here is the Phase 1 session, whose
+                # `async with` block closed ~150 lines above — but Python does
+                # not unbind the name at the end of a `with`, so this read used
+                # to run on a CLOSED session. That is not an error: a closed
+                # AsyncSession is still usable, so it silently CHECKED OUT A
+                # NEW CONNECTION that nothing would ever return, and the
+                # `except Exception: pass` below hid it completely.
+                #
+                # That was the connection leak. Measured 2026-08-03 on the
+                # canary at ~0.5 leaked connections per turn — this branch runs
+                # once per turn whenever the model is auto-routed, which is the
+                # default. Found by the pool-checkout instrument (#421) after
+                # three fixes aimed by log-context inference missed it.
+                from app.db.database import async_session_maker as _pref_maker
+                async with _pref_maker() as _pref_db:
+                    _pref = (await _pref_db.execute(
+                        _sel(_AC.preferred_provider).where(_AC.user_id == user_id)
+                    )).scalar_one_or_none()
                 preferred = _pref
             except Exception:
                 pass

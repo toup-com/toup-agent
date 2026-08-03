@@ -313,7 +313,7 @@ async def _chat_stream(
     """
     import asyncio
     
-    async def generate_stream():
+    async def _stream_body(db):
         start_time = time.time()
         full_response = ""
         
@@ -526,7 +526,26 @@ async def _chat_stream(
                 "data": str(e)
             })
             yield f"data: {error_data}\n\n"
-    
+
+    async def generate_stream():
+        """Own the session for the whole stream.
+
+        The `db` from `Depends(get_db)` is ALREADY CLOSED by the time this
+        body is iterated: since FastAPI 0.106 the dependency AsyncExitStack is
+        exited before the response streams. A closed AsyncSession is still
+        usable, so every query below used to silently re-check-out a
+        connection that no `async with` would ever return — the same defect
+        this PR fixes in agent_runner, and the same hazard already documented
+        at llm_proxy.py:1131.
+
+        Wrapping rather than re-indenting 200 lines: `_stream_body` takes the
+        session as a parameter, so the body is unchanged.
+        """
+        from app.db.database import async_session_maker as _own_maker
+        async with _own_maker() as _own_db:
+            async for _evt in _stream_body(_own_db):
+                yield _evt
+
     return StreamingResponse(
         generate_stream(),
         media_type="text/event-stream",
