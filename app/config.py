@@ -42,6 +42,19 @@ class Settings(BaseSettings):
     # soak on the canary before the fleet. See app/db/ddl_plan.py.
     init_db_plan_ddl: bool = False
 
+    # Record the stack at every pool checkout and replay it if that connection
+    # is garbage-collected without ever being checked in.
+    #
+    # `SAWarning: ... non-checked-in connection` names no origin, and it is
+    # emitted by the GC — so the surrounding log lines are where the COLLECTION
+    # happened, not where the session leaked. Reading them has now aimed three
+    # fixes (#407, #408, #418) at real defects that each failed to drive the
+    # rate to zero. This makes the origin an observation instead of a guess.
+    #
+    # Formats a stack on every checkout, so it is a diagnostic to switch on for
+    # one tenant while reproducing — not something to leave running.
+    pool_leak_debug: bool = False
+
     # Deployment environment. Drives the sk_live_ / sk_test_ guard below.
     # Anything other than "production" treats the deployment as non-prod and
     # forbids live Stripe keys. Set via ENVIRONMENT env var.

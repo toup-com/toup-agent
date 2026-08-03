@@ -19,6 +19,24 @@ logger = logging.getLogger(__name__)
 
 
 def _build_engine(database_url: str) -> AsyncEngine:
+    """Construct an AsyncEngine, optionally with connection-leak tracing.
+
+    Wraps `_build_engine_inner` so the tracing also covers the engines built
+    by `rebind_database()` — the agent swaps generic→tenant on /admin/bind,
+    and a leak that only appeared on the post-bind engine would otherwise be
+    invisible to the instrument.
+    """
+    eng = _build_engine_inner(database_url)
+    try:
+        from app.db import pool_debug
+        if pool_debug.should_enable(settings.pool_leak_debug):
+            pool_debug.install(eng)
+    except Exception as _pd_err:  # never let a diagnostic break boot
+        logger.warning("[pool-leak] install failed: %s", _pd_err)
+    return eng
+
+
+def _build_engine_inner(database_url: str) -> AsyncEngine:
     """Construct an AsyncEngine for the given URL using the same
     knobs as the original module-level setup. Centralized so
     `rebind_database()` builds an identical engine to the one created
