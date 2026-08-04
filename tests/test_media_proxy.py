@@ -468,3 +468,51 @@ def test_the_outage_branch_returns_the_distinct_code():
     branch = src.split("if _is_proxy_outage(e):", 1)[1].split("if _should_try_next_client", 1)[0]
     assert "proxy_unavailable" in branch, "outage branch no longer returns its own code"
     assert "logger.error" in branch, "a platform-wide outage must log at ERROR, not WARNING"
+
+
+def test_extract_warm_does_not_download_media_bytes():
+    """`_ensure_extract_bg` must be a metadata handshake, never a build.
+
+    This is the entire safety argument for aiming it at the track that is
+    playing RIGHT NOW: a build pulls ~11.8MB of itag-18 through the one
+    residential proxy the live stream needs, an extraction pulls none. If this
+    ever routes through the remux path it silently becomes the bandwidth
+    self-competition bug it was written to avoid.
+    """
+    import ast
+    import inspect
+    from app.api import media_proxy
+
+    # Assert on the CODE, not the prose: the docstring names the build path in
+    # order to explain why it must not be used, and a plain substring scan of
+    # the source counts that as a violation.
+    tree = ast.parse(inspect.getsource(media_proxy._ensure_extract_bg).strip())
+    fn = tree.body[0]
+    if ast.get_docstring(fn):
+        fn.body = fn.body[1:]
+    called = {
+        n.func.id for n in ast.walk(ast.Module(body=fn.body, type_ignores=[]))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    assert "_extract_coalesced" in called, "extract warm must use the extract path"
+    assert not called & {"_remux_now", "_ensure_remux_bg", "_bounded_build"}, (
+        "extract warm must NOT trigger a build — that is the competing "
+        f"download this function exists to avoid (calls: {sorted(called)})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_extract_warm_swallows_failure_and_never_raises():
+    """A failed pre-warm must be invisible; the phone's own request surfaces
+    the real error on the normal path."""
+    from app.api import media_proxy
+
+    async def _boom(_vid):
+        raise RuntimeError("extraction exploded")
+
+    orig = media_proxy._extract_coalesced
+    media_proxy._extract_coalesced = _boom
+    try:
+        await media_proxy._ensure_extract_bg("abc123def45")  # must not raise
+    finally:
+        media_proxy._extract_coalesced = orig

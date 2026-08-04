@@ -870,3 +870,61 @@ def test_resolver_demotes_download_farm_rips_but_still_answers():
         ("junky1234567", "دانلود ار نبینمش لری", ""),
     ]
     assert mr.pick_best("ار نبینمش لری", mixed)[0] == "junky1234567"
+
+
+@pytest.mark.asyncio
+async def test_fast_path_pre_extracts_the_track_it_just_broadcast(monkeypatch):
+    """Extraction must start at BROADCAST time, not when the phone asks.
+
+    Extraction is the single largest item on the cold-start path — a median
+    3.4s, mean 7.1s and worst case 20.8s against the production proxy
+    (measured 2026-08-04) — and all of it lands in front of the first byte of
+    audio. Started when the frame goes out, it overlaps the agent's reply and
+    the card render, so `/audio_stream` finds it cached or coalesces onto it.
+
+    It must be an EXTRACT: a build would pull the whole track through the same
+    residential proxy the imminent stream needs.
+    """
+    import httpx
+    from app.api import ws_chat
+    from app.agent import media_resolve as _mr
+    from app.agent.radio import player as _player
+
+    class _Resp:
+        text = "<html>stubbed</html>"
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(_mr, "scrape_results", lambda html, limit=6: [("vid12345678", "A Real Title", "")])
+    monkeypatch.setattr(_mr, "pick_best", lambda q, c, variety=False: ("vid12345678", "A Real Title", 1.0))
+    monkeypatch.setattr(ws_chat, "_check_age_and_swap", lambda *a, **k: asyncio.sleep(0))
+
+    warmed: list = []
+    monkeypatch.setattr(
+        _player, "warm_audio_cache",
+        lambda ids, mode="build": warmed.append((list(ids), mode)),
+    )
+
+    queue: asyncio.Queue = asyncio.Queue()
+    result = await ws_chat._fast_media_check("Play me something", "user-1", queue)
+    assert result is not None
+
+    assert warmed, "the fast path must warm the track it broadcast"
+    ids, mode = warmed[0]
+    assert ids == ["vid12345678"], "it must warm the track it just broadcast"
+    assert mode == "extract", (
+        "must be an EXTRACT — a build competes with the stream the phone is "
+        "about to start for the same residential proxy"
+    )

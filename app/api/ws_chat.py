@@ -585,6 +585,23 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
         broadcast_queue.put_nowait(event)
         logger.info("[FAST-MEDIA] Broadcast media_play in fast-path: %s - %s", video_id, video_title)
 
+        # Start the yt-dlp extraction NOW, in parallel with everything the user
+        # is about to watch happen: the agent composing its reply, the card
+        # rendering, the phone deciding to ask for bytes. That gap is one to
+        # three seconds of otherwise dead time, and extraction is the single
+        # largest item on the cold-start critical path — a median 3.4s against
+        # the production proxy, a mean of 7.1s, and a worst case of 20.8s
+        # (measured 2026-08-04). By the time /audio_stream asks, the result is
+        # cached or the call is already in flight and coalesces onto it.
+        #
+        # EXTRACT, never build: a build would pull the whole track through the
+        # same proxy the imminent stream needs. See warm_audio_cache.
+        try:
+            from app.agent.radio.player import warm_audio_cache as _warm
+            _warm([video_id], mode="extract")
+        except Exception as _we:
+            logger.debug("[FAST-MEDIA] pre-extract warm skipped: %s", _we)
+
         # Fire-and-forget: check age restriction in background, swap embed if needed
         asyncio.create_task(_check_age_and_swap(video_id, user_id))
 

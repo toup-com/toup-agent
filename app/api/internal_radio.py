@@ -55,6 +55,13 @@ class YtReq(BaseModel):
 class WarmReq(BaseModel):
     user_id: str = Field(..., min_length=8, max_length=36)
     video_ids: List[str] = Field(..., max_length=3)
+    # "build"   — download + remux the whole track (UPCOMING tracks only; it
+    #             saturates the residential proxy, so aiming it at the track
+    #             currently playing would starve that track's own stream).
+    # "extract" — yt-dlp metadata handshake only, no media bytes. Safe for the
+    #             track playing RIGHT NOW, which is where the latency is.
+    # Defaults to "build" so an older agent image keeps its exact behaviour.
+    mode: str = Field(default="build", pattern="^(build|extract)$")
 
 
 async def _auth_agent(x_agent_key: Optional[str], user_id: str) -> None:
@@ -135,11 +142,15 @@ async def warm(req: WarmReq, x_agent_key: Optional[str] = Header(default=None)) 
     if not ids:
         return {"ok": True, "warmed": 0}
     try:
-        from app.api.media_proxy import _ensure_remux_bg
+        from app.api.media_proxy import _ensure_extract_bg, _ensure_remux_bg
     except Exception as e:  # media proxy unavailable in this process shape
         logger.warning("[internal/media] warm unavailable: %s", e)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "media proxy unavailable")
+    warmer = _ensure_extract_bg if req.mode == "extract" else _ensure_remux_bg
     for vid in ids:
-        asyncio.create_task(_ensure_remux_bg(vid))
-    logger.info("[internal/media] warm accepted ids=%s user=%s", ids, req.user_id[:8])
-    return {"ok": True, "warmed": len(ids)}
+        asyncio.create_task(warmer(vid))
+    logger.info(
+        "[internal/media] warm accepted mode=%s ids=%s user=%s",
+        req.mode, ids, req.user_id[:8],
+    )
+    return {"ok": True, "warmed": len(ids), "mode": req.mode}

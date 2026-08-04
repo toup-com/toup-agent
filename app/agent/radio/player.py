@@ -61,21 +61,35 @@ def infer_requested_mode(text: str) -> str | None:
     return None
 
 
-def warm_audio_cache(video_ids: list) -> None:
-    """Fire-and-forget: ask the PLATFORM to pre-build the audio remux for these
-    tracks (L1/L2 cache) the moment they are broadcast/queued, so the phone's
-    native play lands on a warm cache instead of a cold yt-dlp extraction.
+def warm_audio_cache(video_ids: list, mode: str = "build") -> None:
+    """Fire-and-forget: ask the PLATFORM to warm these tracks the moment they are
+    broadcast/queued, so the phone's native play lands warm instead of cold.
 
     This is the server half of audio-first: the agent knows the video_id
-    seconds before the phone can ask for bytes, and the platform's build is
-    deduped (`_remux_tasks`) + concurrency-capped (`_build_sem`), so warming
-    here is free when the phone's own request arrives first and decisive when
-    it doesn't. Never awaited, never raises — a failed warm degrades to
-    exactly today's cold path.
+    seconds before the phone can ask for bytes. Never awaited, never raises —
+    a failed warm degrades to exactly today's cold path.
+
+    TWO MODES, and the distinction is the whole point:
+
+    * `build` (default) — download + remux the entire ~11.8MB itag-18. Deduped
+      (`_remux_tasks`) and concurrency-capped (`_build_sem`), but it saturates
+      the single residential proxy, so it is only ever correct for UPCOMING
+      tracks. Aimed at the track playing right now it competes with that
+      track's own stream, which is the regression this argument exists to keep
+      from being re-introduced.
+
+    * `extract` — the yt-dlp metadata handshake only, no media bytes. Cheap
+      enough to aim at the track playing RIGHT NOW, and that is where the wait
+      actually is: measured against the production proxy on 2026-08-04,
+      extraction alone is a median 3.4s, a mean 7.1s and a worst case of 20.8s,
+      all of it in front of the first byte of audio. Run at broadcast time it
+      overlaps the agent's reply and the card render, so the phone's request
+      finds the extraction cached or already in flight.
     """
     ids = [v for v in (video_ids or []) if isinstance(v, str) and _VIDEO_ID_RE.match(v)][:3]
     if not ids:
         return
+    mode = mode if mode in ("build", "extract") else "build"
 
     async def _go() -> None:
         try:
@@ -85,9 +99,10 @@ def warm_audio_cache(video_ids: list) -> None:
         if getattr(settings, "run_mode", "") != "agent":
             # Platform/monolith: media_proxy is in-process — warm directly.
             try:
-                from app.api.media_proxy import _ensure_remux_bg
+                from app.api.media_proxy import _ensure_extract_bg, _ensure_remux_bg
+                warmer = _ensure_extract_bg if mode == "extract" else _ensure_remux_bg
                 for vid in ids:
-                    asyncio.create_task(_ensure_remux_bg(vid))
+                    asyncio.create_task(warmer(vid))
             except Exception:
                 pass
             return
@@ -109,14 +124,14 @@ def warm_audio_cache(video_ids: list) -> None:
                         resp = await hc.post(
                             url,
                             headers={"X-Agent-Key": key},
-                            json={"user_id": uid, "video_ids": ids},
+                            json={"user_id": uid, "video_ids": ids, "mode": mode},
                         )
                     except Exception:
                         continue
                     if resp.status_code == 200:
-                        logger.info("[radio/player] warm ok ids=%s", ids)
+                        logger.info("[radio/player] warm ok mode=%s ids=%s", mode, ids)
                         return
-                logger.info("[radio/player] warm unreachable ids=%s", ids)
+                logger.info("[radio/player] warm unreachable mode=%s ids=%s", mode, ids)
         except Exception as e:
             logger.debug("[radio/player] warm failed: %s", e)
 
@@ -185,14 +200,25 @@ async def broadcast_radio_track(
         # plays NEXT — audio-first means the phone asks for these bytes within
         # seconds on the 'app' channel.
         if channel == "app":
-            # UPCOMING ONLY — never the track being broadcast. A warm is a
-            # full itag-18 pull through the SAME single residential proxy the
-            # live progressive stream is about to use, so warming the now-
-            # playing id starves the very playback it was meant to accelerate
-            # (the media proxy already defers its own background build to
-            # AFTER the response body for exactly this reason). The live track
-            # gains nothing from it either: its extraction is already coalesced
-            # server-side.
+            # The now-playing track gets an EXTRACT-only warm; upcoming tracks
+            # get the full build.
+            #
+            # A BUILD is still upcoming-only, for the original reason: it pulls
+            # the whole itag-18 through the SAME single residential proxy the
+            # live progressive stream is about to use, so aiming it at the
+            # now-playing id starves the playback it was meant to accelerate
+            # (media_proxy defers its own background build to AFTER the
+            # response body for exactly this reason).
+            #
+            # An EXTRACT is a different animal — a metadata handshake, no media
+            # bytes — so it does not compete, and it is where the wait actually
+            # is. The claim this comment used to make, that the live track
+            # "gains nothing because its extraction is already coalesced", was
+            # wrong: coalescing dedupes CONCURRENT calls, it does not make the
+            # first one faster, and that first one is a median 3.4s / mean 7.1s
+            # / worst-case 20.8s against the production proxy (measured
+            # 2026-08-04) sitting directly in front of the first byte of audio.
+            warm_audio_cache([video_id], mode="extract")
             warm_audio_cache([u.get("video_id", "") for u in (upcoming or [])[:2]])
         logger.info(
             "[radio/player] broadcast radio_auto user=%s channel=%s num_ws_connections=%d sent=%d "
