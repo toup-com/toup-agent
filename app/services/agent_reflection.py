@@ -36,6 +36,8 @@ from app.memory_taxonomy import (
 )
 from app.schemas import MemoryCreate, MemoryLevel, MemoryType
 
+from app.services.memory_log import describe_memory
+
 logger = logging.getLogger(__name__)
 
 
@@ -155,7 +157,7 @@ async def extract_agent_reflections(
         if len(content) < 15 or content.count(" ") < 3:
             continue
         if _SELF_PRAISE.search(content):
-            logger.info("[agent_reflection] dropped self-praise: %s", content[:60])
+            logger.info("[agent_reflection] dropped self-praise: %s", describe_memory(content))
             continue
         try:
             importance = float(item.get("importance", 0.7))
@@ -211,15 +213,23 @@ async def store_agent_reflections(
             memory, action = await dedup.smart_create_memory(
                 new_memory=memory_data, user_id=user_id
             )
+            if memory is None:
+                # Refused by the write gate. Not an error, and not a store.
+                logger.info(
+                    "[agent_reflection] %s: %s", action,
+                    describe_memory(note["content"]),
+                )
+                continue
             stored += 1
             logger.info(
-                "[agent_reflection] %s [%s]: %s",
-                action, note["category"], note["content"][:70],
+                "[agent_reflection] %s",
+                describe_memory(note["content"], action=action,
+                                category=note["category"]),
             )
         except Exception as e:
             logger.warning(
-                "[agent_reflection] store failed for %r: %s: %s",
-                note["content"][:40], type(e).__name__, str(e)[:200],
+                "[agent_reflection] store failed for %s: %s: %s",
+                describe_memory(note["content"]), type(e).__name__, str(e)[:200],
             )
     return stored
 

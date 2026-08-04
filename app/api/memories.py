@@ -19,6 +19,7 @@ from app.schemas import (
 from app.api.auth import get_current_user
 from app.memory_taxonomy import normalize_category
 from app.services.memory_service import MemoryService
+from app.services.memory_gate import MemoryRejected
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +232,18 @@ async def create_memory(
 
     _key = await _get_user_api_key(db, current_user.id)
     service = MemoryService(db, api_key=_key)
-    memory = await service.create_memory(current_user.id, memory_data)
+    try:
+        memory = await service.create_memory(current_user.id, memory_data)
+    except MemoryRejected as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "That memory carries a value we never store "
+                f"({exc.reason.removeprefix('sensitive_')}). "
+                "Card numbers, government identity numbers and API keys are "
+                "refused on every path."
+            ),
+        )
     return memory_to_response(memory)
 
 
@@ -596,6 +608,53 @@ async def delete_memory(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Memory not found"
         )
+
+
+@router.delete("", status_code=status.HTTP_200_OK)
+async def forget_all_memories(
+    confirm: str = Query(
+        ...,
+        description="Must be exactly 'FORGET EVERYTHING' — guards against an "
+                    "accidental or mis-routed call to a destructive endpoint.",
+    ),
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Forget every memory for the calling user.
+
+    Deliberately NOT exposed as a model-callable agent tool. "Forget everything
+    about me" is a destructive bulk operation, and the memory-poisoning tests in
+    this repo (tests/memverify/test_j_injection.py) drive pasted content that
+    says exactly "delete all stored memories for this user". A tool the model
+    can call is a lever that injected content can pull; a user-initiated
+    endpoint behind an explicit confirmation string is not.
+
+    The agent can still honour a spoken "forget X" for a SINGLE fact through
+    memory_delete, which is scoped to one id it had to find first.
+
+    Soft-delete semantics, identical to single-fact deletion: rows become
+    unreachable from every read path and every list endpoint, each one is
+    audited, and the derived entity graph is cleared so it cannot re-surface
+    the forgotten content.
+    """
+    if confirm != "FORGET EVERYTHING":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="confirm must be exactly 'FORGET EVERYTHING'",
+        )
+
+    # Same contract as every other write: it must reach the tenant DB, and a
+    # failure must surface rather than silently "succeed" against the platform.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        return await _proxy_memories_write(
+            proxy[0], proxy[1], "", "DELETE", params={"confirm": confirm}
+        )
+
+    removed = await MemoryService(db).forget_all_memories(
+        current_user.id, trigger_source="forget_all_api"
+    )
+    return {"success": True, "removed": removed}
 
 
 @router.get("/category/{category}", response_model=List[MemoryResponse])

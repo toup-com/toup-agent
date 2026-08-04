@@ -19,6 +19,7 @@ from app.api.auth import get_current_user
 from app.api.memories import memory_to_response
 from app.config import settings
 from app.services.memory_service import MemoryService
+from app.services.memory_gate import MemoryRejected
 
 router = APIRouter(prefix="/agent", tags=["Agent API"])
 
@@ -36,12 +37,18 @@ async def agent_store_memories(
     service = MemoryService(db)
     created_memories = []
     
+    rejected = []
     for memory_data in request.memories:
-        memory = await service.create_memory(
-            current_user.id,
-            memory_data,
-            source_message_id=None  # Agent-created memories
-        )
+        try:
+            memory = await service.create_memory(
+                current_user.id,
+                memory_data,
+                source_message_id=None  # Agent-created memories
+            )
+        except MemoryRejected as exc:
+            # One refused memory must not fail the whole batch.
+            rejected.append(exc.reason)
+            continue
         created_memories.append(memory)
     
     return [memory_to_response(m) for m in created_memories]

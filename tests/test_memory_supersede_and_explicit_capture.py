@@ -246,7 +246,7 @@ async def test_batch_path_routes_the_same_conflict_through_adjudication(monkeypa
     dedup._supersede_with_new = AsyncMock(return_value=superseding)
 
     results = await dedup.smart_create_memories(
-        new_memories=[_mem_create(_NEW_FACT)], user_id="u1"
+        new_memories=[_mem_create(_NEW_FACT)], user_id="u1", explicit_save=True
     )
     assert [action for _, action in results] == ["contradiction_updated"]
     dedup._supersede_with_new.assert_awaited_once()
@@ -284,7 +284,7 @@ async def test_supersede_e2e_new_row_active_old_row_superseded(monkeypatch):
 
             # 1. store the original fact
             old_mem, action = await dedup.smart_create_memory(
-                new_memory=_mem_create(_OLD_FACT), user_id=user_id
+                new_memory=_mem_create(_OLD_FACT), user_id=user_id, explicit_save=True
             )
             assert action == "created"
             old_id = old_mem.id
@@ -292,7 +292,7 @@ async def test_supersede_e2e_new_row_active_old_row_superseded(monkeypatch):
             # 2. restate with a conflicting value — sim 1.0 (same fake
             #    vector), so pre-fix this was swallowed as "reinforced"
             new_mem, action = await dedup.smart_create_memory(
-                new_memory=_mem_create(_NEW_FACT), user_id=user_id
+                new_memory=_mem_create(_NEW_FACT), user_id=user_id, explicit_save=True
             )
             assert action == "contradiction_updated"
             assert new_mem.content == _NEW_FACT
@@ -311,7 +311,7 @@ async def test_supersede_e2e_new_row_active_old_row_superseded(monkeypatch):
             #    verbatim restatement of the NEW value reinforces the NEW
             #    row via the no-LLM shortcut
             again, action = await dedup.smart_create_memory(
-                new_memory=_mem_create(_NEW_FACT), user_id=user_id
+                new_memory=_mem_create(_NEW_FACT), user_id=user_id, explicit_save=True
             )
             assert action == "reinforced"
             assert again.id == new_mem.id
@@ -1005,10 +1005,10 @@ async def test_update_on_a_superseded_row_lands_on_the_active_head(monkeypatch):
             dedup = mds.MemoryDedupService(db=db)
 
             old_mem, _ = await dedup.smart_create_memory(
-                new_memory=_mem_create(_OLD_FACT), user_id=user_id
+                new_memory=_mem_create(_OLD_FACT), user_id=user_id, explicit_save=True
             )
             new_mem, action = await dedup.smart_create_memory(
-                new_memory=_mem_create(_NEW_FACT), user_id=user_id
+                new_memory=_mem_create(_NEW_FACT), user_id=user_id, explicit_save=True
             )
             assert action == "contradiction_updated"
 
@@ -1090,7 +1090,7 @@ async def test_supersede_is_atomic_when_the_deactivation_fails(monkeypatch):
             dedup = mds.MemoryDedupService(db=db)
 
             old_mem, _ = await dedup.smart_create_memory(
-                new_memory=_mem_create(_OLD_FACT), user_id=user_id
+                new_memory=_mem_create(_OLD_FACT), user_id=user_id, explicit_save=True
             )
 
             boom = RuntimeError("connection reset between the two commits")
@@ -1149,7 +1149,7 @@ async def test_supersede_loser_does_not_leave_a_stray_duplicate(monkeypatch):
             dedup = mds.MemoryDedupService(db=db)
 
             old_mem, _ = await dedup.smart_create_memory(
-                new_memory=_mem_create(_OLD_FACT), user_id=user_id
+                new_memory=_mem_create(_OLD_FACT), user_id=user_id, explicit_save=True
             )
             winner = await dedup._supersede_with_new(
                 old_memory_id=old_mem.id,

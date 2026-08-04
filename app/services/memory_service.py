@@ -12,9 +12,10 @@ import time
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete, func, and_, or_, text
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from app.config import settings
+from app.services.memory_gate import MemoryRejected, sensitive_content_reason
 from app.db.models import (
     Memory, Entity, EntityLink, EntityRelationship, BrainStats,
     MemoryEvent, MemoryEventType, memory_relationships,
@@ -33,6 +34,11 @@ from app.memory_taxonomy import (
 # Types that mean "we could not place this". An entity carrying one of these is
 # a candidate for upgrade the moment a concrete type shows up.
 _VAGUE_ENTITY_TYPES = frozenset({"unknown", "topic", "note", "conversation", ""})
+
+# How the user may be named as one end of a graph edge, before tenant-specific
+# display names are added. Mirrors memory_gate._SELF_REFERENTS; kept here as a
+# plain list because it goes into a SQL ANY(:selves) bind.
+_USER_SELF_NAMES = ["user", "the user", "me", "myself", "self", "owner"]
 from app.services.embedding_service import get_embedding_service
 
 # Module-level, deliberately. This file previously had only two FUNCTION-LOCAL
@@ -41,6 +47,8 @@ from app.services.embedding_service import get_embedding_service
 # hit that branch. That is not hypothetical: PR #375 shipped exactly this bug
 # in decay_service.py and every tap of the Keep button raised NameError in
 # production before the commit. One module-level binding removes the trap.
+from app.services.memory_log import describe_memory
+
 logger = logging.getLogger(__name__)
 
 
@@ -400,7 +408,40 @@ class MemoryService:
 
         Returns:
             Memory: The created or reinforced memory
+
+        Raises:
+            MemoryRejected: the content carries a never-store secret.
         """
+        # ── Storage backstop ─────────────────────────────────────────────
+        #
+        # `smart_create_memory` screens with the full gate, but EIGHT callers
+        # reach this function directly and bypass it entirely — including
+        # `mcp_server.create_memory`, which is model-controlled, and the REST
+        # endpoint. This is the last function before the row exists, so the
+        # policy that must hold everywhere is enforced here.
+        #
+        # Deliberately ONLY the never-store tier: payment cards, CVVs,
+        # government identity numbers, API keys and bearer tokens. Those are
+        # never legitimate in any memory, on any path, however the write was
+        # requested — so applying them here cannot contradict a decision made
+        # upstream.
+        #
+        # The rest of the gate is NOT applied here on purpose. Length and
+        # scaffolding would break document ingestion, which legitimately stores
+        # long RAG chunks; quoted-content and echo need the conversation turn,
+        # which this layer does not have; and the passphrase tier depends on
+        # whether the user explicitly asked, which only the caller knows. Those
+        # rules stay at the boundary that has the context to apply them.
+        _content = (memory_data.content or "")
+        _secret = sensitive_content_reason(_content, explicit_save=True)
+        if _secret:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[memory_gate] storage backstop refused (%s) for user=%s",
+                _secret, user_id,
+            )
+            raise MemoryRejected(_secret)
+
         # Generate embedding (unless the caller already computed it).
         # W1.5 mirror (write path): an embedding failure must never error the
         # memory write — agent images deliberately ship WITHOUT
@@ -785,7 +826,9 @@ class MemoryService:
         new_content: str,
         change_summary: str,
         source_type: str = "merge",
-        new_embedding: Optional[List[float]] = None
+        new_embedding: Optional[List[float]] = None,
+        *,
+        user_id: str,
     ) -> Memory:
         """
         Merge new information into an existing memory, updating history.
@@ -800,8 +843,17 @@ class MemoryService:
         Returns:
             The updated memory
         """
+        # `user_id` is a REQUIRED keyword argument, not an optional filter.
+        # This primitive took an id and nothing else, so it would happily
+        # rewrite any row in the table given its uuid — every caller today
+        # establishes ownership first, but that is a convention, and a
+        # convention is one careless caller away from a cross-tenant write.
+        # Making it required means a caller that forgets fails loudly at the
+        # call site instead of silently succeeding against someone else's row.
         result = await self.db.execute(
-            select(Memory).where(Memory.id == memory_id)
+            select(Memory).where(
+                and_(Memory.id == memory_id, Memory.user_id == user_id)
+            )
         )
         memory = result.scalar_one_or_none()
         if not memory:
@@ -863,7 +915,9 @@ class MemoryService:
     async def supersede_memory(
         self,
         old_memory_id: str,
-        new_memory_id: str
+        new_memory_id: str,
+        *,
+        user_id: str,
     ) -> Memory:
         """
         Mark a memory as superseded by another (after merging).
@@ -875,8 +929,13 @@ class MemoryService:
         Returns:
             The updated old memory
         """
+        # Required keyword, for the reason given on merge_memory. BOTH rows are
+        # scoped: superseding across tenants would need only one of them to be
+        # a stranger's, and the target is where merged_from is recorded.
         result = await self.db.execute(
-            select(Memory).where(Memory.id == old_memory_id)
+            select(Memory).where(
+                and_(Memory.id == old_memory_id, Memory.user_id == user_id)
+            )
         )
         memory = result.scalar_one_or_none()
         if not memory:
@@ -888,7 +947,9 @@ class MemoryService:
         
         # Update the target memory's merged_from
         target_result = await self.db.execute(
-            select(Memory).where(Memory.id == new_memory_id)
+            select(Memory).where(
+                and_(Memory.id == new_memory_id, Memory.user_id == user_id)
+            )
         )
         target_memory = target_result.scalar_one_or_none()
         if target_memory:
@@ -1281,6 +1342,172 @@ class MemoryService:
         await self._update_brain_stats(user_id)
         return True
     
+    async def get_core_facts(
+        self,
+        user_id: str,
+        limit: int = 5,
+        *,
+        min_importance: float = 0.7,
+    ) -> List[Dict[str, Any]]:
+        """The user's standing facts, retrieved WITHOUT reference to the query.
+
+        Why this exists
+        ---------------
+        Everything the model learns about the user used to arrive through
+        `hybrid_search`, which is similarity-gated. Measured on
+        text-embedding-3-small, that silently loses the facts that matter most:
+
+            "suggest somewhere to eat dinner tonight"
+                vs "The user is severely allergic to peanuts."      sim 0.072
+            "where do I work?"
+                vs "The user is the founder of Toup."               sim 0.125
+            "do I eat meat?"
+                vs "The user has been vegetarian for eight years."  sim 0.346
+
+        against a production floor of 0.35. The dinner question is the case
+        that matters: the agent recommends a restaurant knowing nothing about a
+        severe allergy. No threshold fixes it — "convert 400 kelvin to celsius"
+        scores 0.055 against the same row, so any floor low enough to catch the
+        allergy also drags in unrelated memories on every turn.
+
+        The second channel, the user portrait, could not cover it either:
+        PORTRAIT_CATEGORIES had no `health` entry at all, so an allergy reached
+        the model through NO path on that turn. (Fixed alongside this, in
+        user_portrait_service.)
+
+        A standing constraint is not a search result. It is retrieved by
+        standing, not by resemblance — which is exactly what the prompt section
+        it feeds ("Core facts about this user") already claims to be.
+
+        Contract, so this cannot become a token regression:
+          * bounded — `limit` rows, default 5, hard-capped by the caller
+          * JIT — one indexed SELECT per turn, no LLM, no cache to go stale
+          * OUTSIDE the cached system-prompt prefix, in the same query-time
+            memory block as everything else (STABLE_PREFIX_LAYOUT untouched)
+        """
+        rows = (
+            await self.db.execute(
+                select(Memory)
+                .where(
+                    and_(
+                        Memory.user_id == user_id,
+                        Memory.brain_type == "user",
+                        Memory.is_deleted == False,  # noqa: E712
+                        Memory.is_active == True,  # noqa: E712
+                        Memory.importance >= min_importance,
+                        Memory.memory_type.notin_(["event", "conversation", "task"]),
+                        or_(
+                            Memory.expires_at.is_(None),
+                            Memory.expires_at > datetime.utcnow(),
+                        ),
+                    )
+                )
+                .order_by(
+                    Memory.importance.desc(),
+                    Memory.strength.desc(),
+                    Memory.created_at.desc(),
+                )
+                .limit(limit)
+            )
+        ).scalars().all()
+
+        return [
+            {
+                "id": m.id,
+                "content": m.content,
+                "category": m.category,
+                "memory_type": m.memory_type,
+                "importance": m.importance,
+                "strength": m.strength,
+                "brain_type": m.brain_type,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "similarity_score": 1.0,  # standing, not scored
+                "retrieval_reason": "core_fact",
+            }
+            for m in rows
+        ]
+
+    async def forget_all_memories(
+        self,
+        user_id: str,
+        *,
+        trigger_source: str = "forget_all",
+    ) -> int:
+        """Forget everything about one user. Returns how many rows were removed.
+
+        "Forget everything about me" had no executable path anywhere in the
+        system: no service method, no agent tool, no endpoint. Account deletion
+        cascades by foreign key, but that deletes the account — a user who wants
+        their agent to forget them while keeping their account could not be
+        served at all.
+
+        Semantics match single-fact deletion so there is one deletion model, not
+        two: rows are SOFT-deleted (is_deleted=True), which makes them
+        unreachable from every retrieval path and every list endpoint, and each
+        one gets a DELETED audit event before it is touched. The derived graph
+        is cleared too — an entity map rebuilt from forgotten memories would put
+        the forgotten content straight back in front of the model.
+
+        Scoping is by user_id on every statement, so one user's wipe can never
+        reach another's rows. That is asserted, not assumed
+        (tests/memverify/test_e_updates_forget.py).
+        """
+        rows = (
+            await self.db.execute(
+                select(Memory).where(
+                    and_(
+                        Memory.user_id == user_id,
+                        Memory.is_deleted == False,  # noqa: E712
+                    )
+                )
+            )
+        ).scalars().all()
+
+        now = datetime.utcnow()
+        for memory in rows:
+            await self._log_memory_event(
+                memory_id=memory.id,
+                user_id=user_id,
+                event_type=MemoryEventType.DELETED,
+                event_data={
+                    "category": memory.category,
+                    "memory_type": memory.memory_type,
+                    "content_preview": memory.content[:100],
+                    "strength_at_deletion": memory.strength,
+                    "bulk": True,
+                },
+                trigger_source=trigger_source,
+            )
+            memory.is_deleted = True
+            memory.deleted_at = now
+            memory.is_active = False
+
+        # Derived structures. The graph is never gated on the write path, so if
+        # it survived a wipe the next entity/graph retrieval would re-surface
+        # exactly what the user asked to be forgotten.
+        entity_ids = (
+            await self.db.execute(
+                select(Entity.id).where(Entity.user_id == user_id)
+            )
+        ).scalars().all()
+        if entity_ids:
+            await self.db.execute(
+                delete(EntityLink).where(EntityLink.entity_id.in_(entity_ids))
+            )
+        await self.db.execute(
+            delete(EntityRelationship).where(EntityRelationship.user_id == user_id)
+        )
+        await self.db.execute(delete(Entity).where(Entity.user_id == user_id))
+
+        await self.db.commit()
+        await self._update_brain_stats(user_id)
+
+        logger.info(
+            "[MEMORY] forget_all: removed %d memories for user=%s (source=%s)",
+            len(rows), user_id[:8], trigger_source,
+        )
+        return len(rows)
+
     async def search_memories(
         self,
         user_id: str,
@@ -1814,6 +2041,70 @@ class MemoryService:
         self._alias_cache = aliases
         return aliases
 
+    async def _endpoint_in_user_world(
+        self, user_id: str, source_name: str, target_name: str
+    ) -> bool:
+        """True when either endpoint is already ONE HOP from the user.
+
+        This is the graph half of the extraction prompt's rule: an edge counts
+        when the user, *or someone/something in the user's life*, is one end.
+        A pure string gate can only see the user themselves, so it was
+        discarding facts about the people and projects the user had already
+        told the agent about.
+
+        MEASURED on the founder's live graph before shipping — 16 entities sit
+        within one hop of the user, and against that set this rescue:
+          - readmits ZERO of the 15 labelled world-knowledge rows. Better Call
+            Saul, Netflix, Drake, Rampage, Shops at Don Mills and Codex are all
+            entity-to-entity edges the user was never linked to.
+          - rescues ALL of Toup, Majid Tajik, Brother, Sarah Rostami and
+            Mohammad — every third-party subject the user actually has a
+            relationship with.
+
+        KNOWN LEAK, accepted deliberately: once a user-to-X edge exists, X is
+        in the user's world forever, so a later "X is available on Netflix"
+        would pass. That is the correct semantics of "something in the user's
+        life", and the tautology / scaffolding / agent-self rules still apply
+        to those edges. Revisit only with a fresh measurement, never by
+        intuition — this rule cost two calibration mistakes already.
+        """
+        names = [n.strip().lower() for n in (source_name, target_name) if n and n.strip()]
+        if not names:
+            return False
+        selves = _USER_SELF_NAMES + [
+            a.lower() for a in await self._user_aliases(user_id)
+        ]
+        try:
+            # ORM rather than raw SQL: the first draft used Postgres-only
+            # `= ANY(:names)`, which would have passed in production and failed
+            # on the SQLite test path — a prod-only construct is a test that
+            # cannot fail for the reason that matters.
+            src = aliased(Entity)
+            tgt = aliased(Entity)
+            q = (
+                select(EntityRelationship.id)
+                .join(src, src.id == EntityRelationship.source_entity_id)
+                .join(tgt, tgt.id == EntityRelationship.target_entity_id)
+                .where(
+                    and_(
+                        EntityRelationship.user_id == user_id,
+                        or_(
+                            and_(func.lower(src.name).in_(names),
+                                 func.lower(tgt.name).in_(selves)),
+                            and_(func.lower(tgt.name).in_(names),
+                                 func.lower(src.name).in_(selves)),
+                        ),
+                    )
+                )
+                .limit(1)
+            )
+            return (await self.db.execute(q)).first() is not None
+        except Exception as exc:
+            # Fail CLOSED here: the pure gate already said "no user endpoint",
+            # and a broken lookup must not silently readmit world knowledge.
+            logger.debug("[memory_gate] user-world lookup failed: %s", exc)
+            return False
+
     async def store_entity_relationship(
         self,
         user_id: str,
@@ -1902,10 +2193,23 @@ class MemoryService:
             user_aliases=await self._user_aliases(user_id),
             rendered=relationship_content,
         )
+        # "no_user_endpoint" is the one verdict that needs the GRAPH to decide.
+        # The extraction prompt's actual rule is "the USER, *or someone/
+        # something in the USER's life*, must be one end of the edge" — the
+        # pure gate can only implement the first half, so on its own it was
+        # rejecting "Majid Tajik works at Microsoft" (the user's tutor),
+        # "Brother lives in Tehran", and even "Toup uses React Native" — the
+        # user's OWN product, which the prompt explicitly lists as valid
+        # (Project → Technology).
+        if gate_reason == "no_user_endpoint" and await self._endpoint_in_user_world(
+            user_id, source_name, target_name
+        ):
+            gate_reason = None
+
         if gate_reason:
             logger.info(
                 "[memory_gate] relationship not mirrored (%s): %s",
-                gate_reason, relationship_content[:80],
+                gate_reason, describe_memory(relationship_content),
             )
             return
         existing = await self.find_similar_memories(
@@ -1933,6 +2237,52 @@ class MemoryService:
             mem.last_accessed_at = datetime.utcnow()
             mem.confidence = max(mem.confidence, confidence)
         else:
+            # Supersede the previous value of this same relationship.
+            #
+            # The mirror bypasses MemoryDedupService entirely — its only check
+            # is the 0.85 similarity probe above, which asks "have I seen this
+            # exact sentence?" and never "does this contradict something I
+            # already believe?". So when a user moved city, the brain ended up
+            # holding "USER lives in Toronto" AND "USER lives in Vancouver",
+            # both active, with nothing to tell the model which is current.
+            #
+            # The triple is stored structurally in metadata_json, so the stale
+            # row can be found exactly — same user, same source entity, same
+            # predicate, different target — with no LLM call and no guessing.
+            # Superseding (rather than deleting) matches the extracted-memory
+            # contradiction path: the old row keeps its id and its trail.
+            stale_rows = (
+                await self.db.execute(
+                    select(Memory).where(
+                        and_(
+                            Memory.user_id == user_id,
+                            Memory.source_type == "entity_extraction",
+                            Memory.is_active == True,  # noqa: E712
+                            Memory.is_deleted == False,  # noqa: E712
+                            Memory.metadata_json.isnot(None),
+                        )
+                    )
+                )
+            ).scalars().all()
+            for row in stale_rows:
+                try:
+                    meta = json.loads(row.metadata_json or "{}")
+                except (ValueError, TypeError):
+                    continue
+                if (
+                    meta.get("relationship_type") == relationship
+                    and (meta.get("source_entity") or "").strip().lower()
+                    == (source_name or "").strip().lower()
+                    and (meta.get("target_entity") or "").strip().lower()
+                    != (target_name or "").strip().lower()
+                ):
+                    row.is_active = False
+                    row.updated_at = datetime.utcnow()
+                    logger.info(
+                        "[MEMORY] relationship mirror superseded: %s",
+                        describe_memory(row.content),
+                    )
+
             embedding = self.embedding_service.embed(relationship_content, api_key=self.api_key)
             
             rel_memory = Memory(
@@ -2119,30 +2469,53 @@ class MemoryService:
             for cat, count in category_counts.items()
         }
         
-        # Upsert brain stats
-        result = await self.db.execute(
-            select(BrainStats).where(BrainStats.user_id == user_id)
-        )
-        stats = result.scalar_one_or_none()
-        
-        if stats:
-            stats.region_counts_json = json.dumps(category_counts)
-            stats.region_sizes_json = json.dumps(category_sizes)
-            stats.total_memories = total_memories
-            stats.total_entities = total_entities
-            stats.total_connections = total_connections
-            stats.updated_at = datetime.utcnow()
-        else:
-            stats = BrainStats(
-                user_id=user_id,
-                region_counts_json=json.dumps(category_counts),
-                region_sizes_json=json.dumps(category_sizes),
-                total_memories=total_memories,
-                total_entities=total_entities,
-                total_connections=total_connections,
+        # Upsert brain stats.
+        #
+        # This used to be SELECT-then-INSERT, which is a lost-update race with
+        # a UNIQUE index on brain_stats.user_id: two turns for the same user
+        # arriving together (web + mobile, or rapid-fire messages) both saw no
+        # row and both INSERTed. The second raised UniqueViolationError, and
+        # because this runs INSIDE create_memory's transaction it took the
+        # whole memory write down with it — the user stated a fact and it was
+        # silently dropped. Measured: 4 of 20 concurrent writes lost.
+        #
+        # A single INSERT ... ON CONFLICT DO UPDATE is atomic, so concurrent
+        # turns serialise on the row instead of colliding.
+        payload = {
+            "region_counts_json": json.dumps(category_counts),
+            "region_sizes_json": json.dumps(category_sizes),
+            "total_memories": total_memories,
+            "total_entities": total_entities,
+            "total_connections": total_connections,
+            "updated_at": datetime.utcnow(),
+        }
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as _pg_insert
+
+            stmt = _pg_insert(BrainStats).values(
+                id=str(uuid.uuid4()), user_id=user_id, **payload
             )
-            self.db.add(stats)
-        
+            await self.db.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[BrainStats.user_id], set_=payload
+                )
+            )
+        else:
+            # SQLite (tests//CI) has no matching unique-index upsert here;
+            # the race it guards against cannot happen on a single-writer
+            # in-memory database anyway.
+            existing = (
+                await self.db.execute(
+                    select(BrainStats).where(BrainStats.user_id == user_id)
+                )
+            ).scalar_one_or_none()
+            if existing:
+                for key, value in payload.items():
+                    setattr(existing, key, value)
+            else:
+                self.db.add(BrainStats(user_id=user_id, **payload))
+
         await self.db.commit()
     
     async def _log_memory_event(

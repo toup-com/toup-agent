@@ -63,6 +63,7 @@ from .support import SupportIssue, SupportIssueEvent, SupportAttachment
 
 # Agent-side notification outbox (agent-only — Autopilot arc PR4)
 from .agent_outbox import AgentNotifyOutbox
+from .memory_capture_outbox import MemoryCaptureOutbox
 
 # Autopilot approvals (agent-only — Autopilot arc PR7)
 from .autopilot import (
@@ -209,6 +210,7 @@ __all__ = [
     "SupportIssue", "SupportIssueEvent", "SupportAttachment",
     # Agent-side notification outbox (Autopilot arc PR4)
     "AgentNotifyOutbox",
+    "MemoryCaptureOutbox",
     # Autopilot approvals (Autopilot arc PR7)
     "AutopilotApproval",
     "APPROVAL_KIND_QUESTION", "APPROVAL_KIND_APPROVAL",

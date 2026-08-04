@@ -874,12 +874,30 @@ def humanize_relationship(
 def resolve_ttl_days(
     category: str,
     explicit_days: Optional[float] = None,
+    *,
+    respect_never_expire: bool = True,
 ) -> Optional[int]:
     """Decide how long a transient memory should live.
 
     Returns None when the memory must NOT expire — either because its category
     holds durable personal facts, or because nothing suggests a horizon.
     `explicit_days` (from the extractor) wins when the category permits expiry.
+
+    `respect_never_expire=False` answers a DIFFERENT question: what horizon did
+    the model actually ask for, before the category override. Those two
+    questions were conflated, and the conflation was a junk source.
+
+    "I'm feeling queasy today" is flagged transient with a 1-day horizon 8/8,
+    and HEALTH is a never-expire category, so the horizon was discarded and the
+    row stored permanently — a passing state kept forever. Meanwhile every
+    durable health fact ("severely allergic to peanuts", "type 1 diabetes since
+    I was twelve", "takes metformin twice a day") is flagged durable 8/8, so the
+    model's verdict separates the two perfectly. Only the pipeline could not
+    hear it.
+
+    The override is still exactly right for its own job: a health fact must
+    never be auto-expired by a TTL bug. It just must not also silence the
+    "this is a passing state, do not store it at all" signal.
     """
     canonical = normalize_category(category)
     try:
@@ -887,7 +905,7 @@ def resolve_ttl_days(
     except ValueError:
         return None
 
-    if cat in NEVER_EXPIRE_CATEGORIES:
+    if respect_never_expire and cat in NEVER_EXPIRE_CATEGORIES:
         return None
 
     if explicit_days is not None:

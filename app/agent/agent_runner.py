@@ -64,6 +64,8 @@ from app.services.model_router import classify_request, RoutingDecision
 from app.agent.hooks import get_hook_bus, HookEvent
 from app.services.background_tasks import spawn as _spawn_bg
 
+from app.services.memory_log import describe_memory
+
 logger = logging.getLogger(__name__)
 
 # Max retries on transient LLM errors
@@ -76,6 +78,13 @@ RETRY_DELAY = 2.0  # seconds
 # behavioural guidance, not recall, and it must not crowd out the user's own
 # memories or inflate the per-turn payload outside the cached prefix.
 AGENT_BRAIN_RETRIEVAL_LIMIT = 3
+
+# Standing facts injected on EVERY non-trivial turn regardless of the question
+# (allergies, dietary needs, who the user is, what they are building). Small on
+# purpose: this is the one part of the memory block that is not earned by
+# relevance, so it pays for itself only while it stays short. Five rows of
+# typical length is ~350 characters, well under 150 tokens.
+CORE_FACTS_LIMIT = 5
 
 # Idempotent, read-only tools that are safe to execute concurrently when the
 # model emits several in one assistant turn. Everything NOT in this set —
@@ -2431,6 +2440,15 @@ class AgentRunner:
                             # been enabled in production.
                             from app.services.memory_expiry import expire_stale_memories
                             expired = await expire_stale_memories(bg_db, user_id)
+                            # Replay any capture whose write failed on an
+                            # earlier turn. Same reasoning as the sweep above:
+                            # this rides the per-turn path because the
+                            # memory-maintenance scheduler is behind a flag that
+                            # has never been enabled in production.
+                            from app.services.memory_capture_outbox_service import (
+                                replay_pending,
+                            )
+                            await replay_pending(bg_db, user_id)
                             if tasks_found or archived or expired:
                                 await bg_db.commit()
                                 logger.info(
@@ -3642,18 +3660,46 @@ class AgentRunner:
                 except Exception as e:
                     logger.warning(f"Portrait generation failed ({(time.perf_counter()-_t0)*1000:.0f}ms): {e}")
 
-                if user_memories:
-                    # B. Core facts
-                    core_facts = [
-                        m for m in user_memories
-                        if m.get("strength", 0) >= 0.7
-                        and m.get("memory_type") not in ("event", "conversation")
-                    ]
-                    if core_facts:
-                        memory_sections.append("## Core facts about this user")
-                        for m in core_facts[:5]:
-                            memory_sections.append(f"- {m.get('content', '')}")
+                # B. Core facts — retrieved by STANDING, not by resemblance.
+                #
+                # This section used to be a filter over the query-conditioned
+                # results, which meant a standing constraint only reached the
+                # model when the turn's question happened to embed near it.
+                # "suggest somewhere to eat dinner tonight" scores 0.072
+                # against "The user is severely allergic to peanuts" — under
+                # the 0.35 floor — so the agent recommended restaurants with no
+                # knowledge of a severe allergy. See
+                # MemoryService.get_core_facts for the measurements.
+                #
+                # Bounded at CORE_FACTS_LIMIT rows and still inside the
+                # query-time block, so the cached prefix is untouched.
+                try:
+                    standing = await mem_svc.get_core_facts(
+                        user_id=user_id, limit=CORE_FACTS_LIMIT
+                    )
+                except Exception as e:
+                    logger.warning(f"Core-fact retrieval failed: {e}")
+                    standing = []
 
+                retrieved_core = [
+                    m for m in user_memories
+                    if m.get("strength", 0) >= 0.7
+                    and m.get("memory_type") not in ("event", "conversation")
+                ]
+                core_facts = list(standing)
+                _seen_core = {m.get("id") for m in core_facts}
+                for m in retrieved_core:
+                    if m.get("id") not in _seen_core:
+                        core_facts.append(m)
+                        _seen_core.add(m.get("id"))
+                core_facts = core_facts[:CORE_FACTS_LIMIT]
+
+                if core_facts:
+                    memory_sections.append("## Core facts about this user")
+                    for m in core_facts:
+                        memory_sections.append(f"- {m.get('content', '')}")
+
+                if user_memories:
                     # C. Relevant memories
                     core_ids = {m.get("id") for m in core_facts}
                     regular = [m for m in user_memories if m.get("id") not in core_ids]
@@ -3667,7 +3713,8 @@ class AgentRunner:
 
                     for m in user_memories:
                         score = m.get("similarity_score", 0)
-                        logger.info(f"[AGENT]   Memory: [{m.get('category','')}] ({score:.2f}) {m.get('content','')[:80]}")
+                        logger.info("[AGENT]   Memory: (%.2f) %s", score,
+                                    describe_memory(m.get('content', ''), category=m.get('category', '')))
 
                 # C2. Agent-brain notes — corrections and working preferences
                 # this user has expressed. Rendered as directives because that
@@ -4804,6 +4851,10 @@ class AgentRunner:
         ):
             logger.info("[AGENT] Memory extraction skipped — trivial turn")
             return 0
+        # Bound before the try so the failure handler can tell "extraction
+        # never returned" (nothing to save) from "extraction returned and the
+        # WRITE failed" (facts in hand, no row) without inspecting locals().
+        extracted = []
         try:
             from app.services.memory_extractor import get_memory_extractor
             from app.services.memory_dedup_service import MemoryDedupService
@@ -4908,7 +4959,12 @@ class AgentRunner:
                 user_id=user_id,
             )
             for mem, (stored, action) in zip(extracted, stored_results):
-                logger.info(f"Memory {action}: {stored.content[:50]}...")
+                if stored is None:
+                    # Refused by the write gate; no row, and no entity work to do.
+                    logger.info(f"Memory {action} — nothing written")
+                    continue
+                logger.info("Memory %s", describe_memory(stored.content, action=action,
+                                         category=stored.category, memory_id=stored.id))
                 count += 1
 
                 # Phase 4: Upsert entities with schema-enforced data + create EntityLinks
@@ -4989,6 +5045,22 @@ class AgentRunner:
             # A6-2: storage/dedup failures also lose the turn's facts —
             # report N even when the LLM call itself succeeded.
             self._last_extraction_ok = "N"
+            # ...and when the facts WERE extracted, park them instead of
+            # dropping them. This handler is the end of the line: capture runs
+            # fire-and-forget after the reply is streamed, so there is no
+            # request to fail and no user to retry it. Everything the user
+            # stated that turn died here.
+            #
+            # `extracted` is bound only once the LLM call has returned, so its
+            # absence distinguishes "extraction failed" (nothing to save —
+            # already covered by the A6-2 retry) from "the write failed" (facts
+            # in hand, no row).
+            try:
+                if extracted:
+                    from app.services.memory_capture_outbox_service import record_failure
+                    await record_failure(db, user_id, extracted, e)
+            except Exception as _outbox_err:  # noqa: BLE001
+                logger.error("[memory_outbox] park failed: %s", _outbox_err)
             return 0
     
     @staticmethod

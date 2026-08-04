@@ -13,7 +13,13 @@ from enum import Enum
 
 from app.config import settings
 from app.schemas import MemoryCategory, MemoryType
-from app.services.memory_gate import memory_gate_reason
+from app.services.memory_gate import (
+    SCHEDULABLE_REASONS,
+    is_scheduled_commitment,
+    memory_gate_reason,
+    scheduled_floor_ttl,
+    transient_horizon_reason,
+)
 from app.memory_taxonomy import (
     build_category_prompt_block,
     build_entity_type_prompt_block,
@@ -732,6 +738,14 @@ ASSISTANT RESPONSE:
    status is 30. Omit `valid_for_days` when transient is false.
    A durable preference revealed BY a transient request should be extracted as its
    own separate, non-transient memory ("prefers tea in the afternoon").
+   Also set `"scheduled": true` when the memory is a COMMITMENT THE USER HAS AT A
+   SPECIFIC TIME — an appointment, flight, meeting, interview, deadline,
+   reservation or booked call, whether or not a clock time is stated. Set it
+   false for how they feel, where they currently are, and what they happen to be
+   working on right now. "Dentist tomorrow at 3" is scheduled; "I'm exhausted
+   today" and "I'm waiting on the deploy" are not. This is what keeps a
+   short-lived appointment from being discarded as a passing mood, so decide it
+   on every transient memory.
 
 9. **Do NOT extract general world knowledge.** Facts about companies, shows, products
    or public figures that would be true for everybody are NOT memories about this user
@@ -753,6 +767,7 @@ Extract as many memories as the conversation warrants (up to {max_memories}). Do
       "confidence": 0.9,
       "transient": false,
       "valid_for_days": null,
+      "scheduled": false,
       "entities": [
         {{
           "name": "Alice",
@@ -782,6 +797,7 @@ If the conversation is just casual chat, commands, or questions with nothing wor
         # from "the model proposed six things and all six were junk" — the
         # two look identical from the outside and mean opposite things.
         _gated: List[str] = []
+        _kept_notes: List[str] = []
         self.last_gated_reasons = _gated
 
         try:
@@ -832,6 +848,12 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                     content,
                     user_message=user_message,
                     assistant_response=assistant_response,
+                    # D-mem-C: the caller already detected "please remember: ..."
+                    # phrasing. Without passing it through, the secret tier
+                    # silently dropped the very facts the user asked to save —
+                    # "remember my storage locker passphrase is kestrel-dbf7"
+                    # was refused by a rule meant for observed credentials.
+                    explicit_save=explicit_save_requested,
                 )
                 if gate_reason:
                     _gated.append(gate_reason)
@@ -875,6 +897,15 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                 # expire durable-fact categories even when the model says
                 # transient, so a misclassification cannot cost a real fact.
                 ttl_days = None
+                # What the model ASKED for, before the never-expire override.
+                # These are two different questions and conflating them was a
+                # junk source: "I'm feeling queasy today" is flagged transient
+                # with a 1-day horizon 8/8, but HEALTH never expires, so the
+                # horizon became None and the passing state was stored forever.
+                # Every durable health fact is flagged durable 8/8, so the
+                # model's verdict separates them perfectly — the pipeline just
+                # could not hear it.
+                requested_ttl = None
                 if bool(mem_data.get("transient")) and not describes_recurring_arrangement(content):
                     # A standing arrangement ("a Gmail briefing every day at
                     # 11:49") reads as a schedule and the model often flags it
@@ -884,6 +915,40 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                     ttl_days = resolve_ttl_days(
                         category, mem_data.get("valid_for_days")
                     )
+                    requested_ttl = resolve_ttl_days(
+                        category, mem_data.get("valid_for_days"),
+                        respect_never_expire=False,
+                    )
+
+                # Second half of the transience decision: a horizon of a day or
+                # less is conversational state, not memory, so it is not stored
+                # at all rather than stored-then-expired. An explicitly
+                # requested save is never dropped, whatever horizon the model
+                # attached to it (D-mem-C).
+                if not explicit_save_requested:
+                    # Gate on the REQUESTED horizon; expire on the resolved
+                    # one. The override exists so a TTL bug cannot delete a
+                    # health fact — not so a passing state becomes permanent.
+                    horizon_reason = transient_horizon_reason(
+                        requested_ttl, category,
+                        # ttl None + a requested horizon == a never-expire
+                        # category: keeping this is a permanent decision.
+                        permanent_if_kept=(ttl_days is None and requested_ttl is not None),
+                    )
+                    if horizon_reason in SCHEDULABLE_REASONS and is_scheduled_commitment(
+                        content, bool(mem_data.get("scheduled"))
+                    ):
+                        # A commitment at a time is not a passing state. Keep it,
+                        # and floor its TTL so the row outlives the appointment
+                        # rather than expiring the morning of it.
+                        # Never-expire categories keep ttl None; everything
+                        # else gets a floor so the row outlives the commitment.
+                        if ttl_days is not None:
+                            ttl_days = scheduled_floor_ttl(ttl_days)
+                        _kept_notes.append("scheduled_commitment")
+                    elif horizon_reason:
+                        _gated.append(horizon_reason)
+                        continue
 
                 # `summary` is deliberately NOT taken from the model. The
                 # mobile card renders `summary || content`, so an LLM
@@ -904,11 +969,12 @@ If the conversation is just casual chat, commands, or questions with nothing wor
                 ))
 
             self.last_extraction_outcome = "retried" if _retried else "ok"
-            if _gated:
+            if _gated or _kept_notes:
                 import logging
                 logging.getLogger(__name__).info(
-                    "[memory_gate] kept %d, rejected %d this turn: %s",
+                    "[memory_gate] kept %d, rejected %d this turn: %s%s",
                     len(memories), len(_gated), ",".join(sorted(set(_gated))),
+                    (" | kept-by: " + ",".join(sorted(set(_kept_notes)))) if _kept_notes else "",
                 )
             return memories
 

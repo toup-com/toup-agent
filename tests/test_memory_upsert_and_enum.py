@@ -45,7 +45,7 @@ async def memory_user():
 
 
 @pytest.mark.asyncio
-async def test_partial_unique_index_blocks_duplicate_ref(memory_user):
+async def test_partial_unique_index_blocks_duplicate_ref(memory_user, requires_agent_tables):
     """Floor invariant: two active memories with the same (user_id,
     ref_kind, ref_id) cannot coexist. This is what makes the Ticket 2
     upsert behavior correct — even if an MCP tool regression slips in,
@@ -80,7 +80,7 @@ async def test_partial_unique_index_blocks_duplicate_ref(memory_user):
 
 
 @pytest.mark.asyncio
-async def test_partial_unique_allows_different_ref_id(memory_user):
+async def test_partial_unique_allows_different_ref_id(memory_user, requires_agent_tables):
     """The partial unique index is scoped to (user, ref_kind, ref_id).
     Two routines with different ref_ids must each get their own row."""
     from app.db import async_session_maker
@@ -110,7 +110,7 @@ async def test_partial_unique_allows_different_ref_id(memory_user):
 
 
 @pytest.mark.asyncio
-async def test_partial_unique_allows_null_ref(memory_user):
+async def test_partial_unique_allows_null_ref(memory_user, requires_agent_tables):
     """Legacy memories (no ref_kind/ref_id) must coexist freely. The
     partial predicate `WHERE ref_id IS NOT NULL` excludes them."""
     from app.db import async_session_maker

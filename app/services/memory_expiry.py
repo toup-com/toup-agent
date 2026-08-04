@@ -32,6 +32,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Memory, MemoryEvent, MemoryEventType
 
+from app.services.memory_log import describe_memory
+
 logger = logging.getLogger(__name__)
 
 # Safety valve: never archive more than this many rows in a single turn. A
@@ -105,7 +107,7 @@ async def expire_stale_memories(
         )
         logger.info(
             "[memory_expiry] archived (expired %s): %s",
-            memory.expires_at, memory.content[:60],
+            memory.expires_at, describe_memory(memory.content),
         )
 
     await db.flush()

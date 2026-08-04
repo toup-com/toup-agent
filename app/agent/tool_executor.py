@@ -1495,8 +1495,19 @@ class ToolExecutor:
                 memory, action = await dedup.smart_create_memory(
                     new_memory=memory_data,
                     user_id=self._current_user_id,
+                    # This tool is only reached because something asked for the
+                    # fact to be remembered, so the user-chosen-secret tier
+                    # applies (a locker passphrase, a garage door code). Cards,
+                    # government ids and API keys are refused here regardless.
+                    explicit_save=True,
                 )
-            
+
+            if memory is None:
+                # The write gate refused it. Say so plainly rather than raising:
+                # the model reads this string, and "rejected:sensitive_secret"
+                # tells it not to retry with the same content.
+                return f"Memory not stored ({action}). Nothing was written."
+
             return f"Memory {action}: {memory.id} — {memory.content[:80]}"
 
         except Exception as exc:

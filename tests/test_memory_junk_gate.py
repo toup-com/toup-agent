@@ -347,3 +347,91 @@ def test_real_identity_still_enforces_the_user_endpoint_rule():
         "Better Call Saul", "play_on", "Netflix",
         user_aliases=["Nariman", "nariman@toup.ai"],
     ) == "no_user_endpoint"
+
+
+# ── The graph half: "someone/something in the USER's life" ────────────────
+
+@pytest.mark.asyncio
+async def test_user_world_rescue_keeps_facts_about_the_users_people_and_projects(
+    test_user_id,
+):
+    """The pure gate can only see the user; the graph sees their world.
+
+    Without this, #385 rejected "Majid Tajik works at Microsoft" (the user's
+    tutor), "Brother lives in Tehran", and "Toup uses React Native" — the
+    user's OWN product, which the extraction prompt explicitly lists as a valid
+    Project -> Technology edge.
+
+    Measured on the founder's live graph before shipping: 16 entities within
+    one hop, rescuing all of Toup/Majid Tajik/Brother/Sarah Rostami/Mohammad
+    while readmitting ZERO of the 15 labelled world-knowledge rows.
+    """
+    from sqlalchemy import inspect as _inspect
+
+    from app.db.database import async_session_maker, engine
+    from app.services.memory_service import MemoryService
+
+    # `entities` is an AGENT_ONLY table with a pgvector column. CI runs
+    # RUN_MODE=platform on SQLite (.github/workflows/test-backend.yml), where
+    # init_db() does not create it and the column could not compile anyway — so
+    # this test raised `no such table: entities` and would have turned CI red
+    # the moment this branch merged. Skipping honestly is better than a red
+    # build OR a green one that never ran the assertion: the same rescue is
+    # exercised end-to-end against real Postgres + pgvector by
+    # tests/memverify/test_g_isolation.py and test_b_precision_junk.py.
+    async with engine.connect() as conn:
+        has_entities = await conn.run_sync(
+            lambda sync_conn: _inspect(sync_conn).has_table("entities")
+        )
+    if not has_entities:
+        pytest.skip(
+            "requires the AGENT_ONLY `entities` table (RUN_MODE=agent on "
+            "Postgres+pgvector); covered by backend/tests/memverify"
+        )
+
+    async with async_session_maker() as db_session:
+        await _user_world_body(db_session, test_user_id)
+
+
+async def _user_world_body(db_session, test_user_id):
+    from app.services.memory_service import MemoryService
+
+    svc = MemoryService(db_session)
+
+    # The user tells the agent about their tutor and their product.
+    await svc._upsert_entity(test_user_id, "User", "person")
+    for name, etype in (("Majid Tajik", "person"), ("Toup", "project")):
+        await svc._upsert_entity(test_user_id, name, etype)
+    await db_session.flush()
+
+    from app.db.models import Entity, EntityRelationship
+    from sqlalchemy import select as _sel
+    import uuid as _uuid
+    from datetime import datetime as _dt
+
+    async def link(a, b):
+        ents = {
+            e.name: e for e in (await db_session.execute(
+                _sel(Entity).where(Entity.user_id == test_user_id)
+            )).scalars()
+        }
+        db_session.add(EntityRelationship(
+            id=str(_uuid.uuid4()), user_id=test_user_id,
+            source_entity_id=ents[a].id, target_entity_id=ents[b].id,
+            relationship_type="knows", relationship_label=f"{a} knows {b}",
+            confidence=0.9, mention_count=1,
+            first_seen_at=_dt.utcnow(), last_seen_at=_dt.utcnow(),
+        ))
+        await db_session.flush()
+
+    await link("User", "Majid Tajik")
+    await link("User", "Toup")
+
+    # In the user's world -> rescued.
+    assert await svc._endpoint_in_user_world(test_user_id, "Majid Tajik", "Microsoft")
+    assert await svc._endpoint_in_user_world(test_user_id, "Toup", "React Native")
+
+    # Never linked to the user -> still world knowledge, still rejected.
+    assert not await svc._endpoint_in_user_world(
+        test_user_id, "Better Call Saul", "Netflix")
+    assert not await svc._endpoint_in_user_world(test_user_id, "Drake", "0-100")

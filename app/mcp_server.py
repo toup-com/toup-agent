@@ -17,6 +17,7 @@ from fastmcp import FastMCP
 from app.config import settings
 from app.db.database import async_session_maker
 from app.services.memory_service import MemoryService
+from app.services.memory_gate import MemoryRejected
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +340,11 @@ async def memory_create(
                     }
 
         svc = MemoryService(db)
-        memory = await svc.create_memory(user_id, memory_data)
+        try:
+            memory = await svc.create_memory(user_id, memory_data)
+        except MemoryRejected as exc:
+            # Model-controlled path: say why, so it does not retry verbatim.
+            return {"action": "rejected", "reason": exc.reason}
         # Stamp ref linkage if provided. Service-level path doesn't know
         # about it; we apply it post-create so the partial unique index
         # catches future collisions.

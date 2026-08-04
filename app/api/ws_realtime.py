@@ -57,6 +57,8 @@ from app.config import settings
 from app.agent.tool_definitions import get_agent_tools, get_extended_tools
 from app.api.voice import detect_script_language
 
+from app.services.memory_log import describe_memory
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Realtime Voice"])
@@ -1365,7 +1367,7 @@ async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: 
                 })
                 if not result.startswith("ERROR"):
                     pushed += 1
-                    logger.info("[REALTIME] Memory stored on VPS: %s", mem.content[:50])
+                    logger.info("[REALTIME] Memory stored on VPS: %s", describe_memory(mem.content, category=mem.category))
                 else:
                     logger.warning("[REALTIME] VPS memory_store failed: %s", result[:200])
             except Exception as e:

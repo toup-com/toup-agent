@@ -24,9 +24,12 @@ from app.services.memory_service import (
     value_tokens,
 )
 from app.services.embedding_service import get_embedding_service
+from app.services.memory_gate import memory_gate_reason
 from app.services.llm_service import get_llm_service
 from app.schemas import MemoryCreate, MemoryResponse, BrainType
 from app.db.models import Memory
+
+from app.services.memory_log import describe_memory
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +75,10 @@ class MemoryDedupService:
     async def smart_create_memory(
         self,
         new_memory: MemoryCreate,
-        user_id: str
-    ) -> Tuple[Memory, str]:
+        user_id: str,
+        *,
+        explicit_save: bool = False,
+    ) -> Tuple[Optional[Memory], str]:
         """
         Intelligently create or merge a memory.
         
@@ -94,6 +99,26 @@ class MemoryDedupService:
             - "skipped": Exact duplicate, no action taken (returns existing)
             - "reinforced": Same info, just strengthened existing
         """
+        # Step 0: the write gate.
+        #
+        # The gate used to live in exactly one producer (the LLM extractor), so
+        # every OTHER way into memory was unscreened — the agent's own
+        # memory_store tool, the MCP create_memory tool, and the chat paths all
+        # arrive here having passed nothing. Those are the paths where the MODEL
+        # chooses the content, which is precisely where a screen is worth having:
+        # the same omission on the active-task path was storing secrets and
+        # prompt-injection payloads.
+        #
+        # Placed at the storage boundary rather than at each caller, so a new
+        # caller is gated by construction instead of by remembering to ask.
+        gate_reason = memory_gate_reason(new_memory.content, explicit_save=explicit_save)
+        if gate_reason:
+            logger.info(
+                "[memory_gate] refused at write (%s): %s",
+                gate_reason, describe_memory(new_memory.content),
+            )
+            return None, f"rejected:{gate_reason}"
+
         # Step 1: Generate embedding for new content (async — the sync embed
         # blocks the event loop on OpenAI HTTP; W1.4e).
         # W1.5 mirror (write path): an embedding failure must degrade to an
@@ -101,6 +126,10 @@ class MemoryDedupService:
         # deliberately ship WITHOUT sentence-transformers, so a provider that
         # resolves "local" raises ImportError there.
         new_embedding = await self._embed_or_none(new_memory.content)
+
+        # Taken AFTER embedding (a network call we do not want to hold a lock
+        # across) and BEFORE the read-then-write window that actually races.
+        await self._lock_user_writes(user_id)
 
         # Step 2+3: Search for similar memories and filter candidates
         # (no vector → nothing to compare against; go straight to create)
@@ -144,7 +173,7 @@ class MemoryDedupService:
         similarity = top_match.get('similarity_score', 0)
         existing_content = top_match.get('content', '')
 
-        logger.info(f"Found candidate with similarity {similarity:.3f}: {existing_content[:50]}...")
+        logger.info("Found candidate with similarity %.3f: %s", similarity, describe_memory(existing_content))
 
         decision = await self._decide_action(
             similarity=similarity,
@@ -152,7 +181,8 @@ class MemoryDedupService:
             new_content=new_memory.content,
         )
 
-        logger.info(f"Dedup decision: {decision['action']} - {decision.get('reason', '')[:50]}")
+        logger.info("Dedup decision: %s - %s", decision['action'],
+                    describe_memory(decision.get('reason', '')))
 
         return await self._apply_decision(
             decision=decision,
@@ -165,8 +195,10 @@ class MemoryDedupService:
     async def smart_create_memories(
         self,
         new_memories: List[MemoryCreate],
-        user_id: str
-    ) -> List[Tuple[Memory, str]]:
+        user_id: str,
+        *,
+        explicit_save: bool = False,
+    ) -> List[Tuple[Optional[Memory], str]]:
         """
         Batch variant of smart_create_memory for one turn's extraction (W1.4d).
 
@@ -181,8 +213,23 @@ class MemoryDedupService:
         pending: List[Dict[str, Any]] = []
 
         for i, new_memory in enumerate(new_memories):
+            # Same write gate as the singular path. Kept here as well as there
+            # because these two functions are reached by different callers and
+            # the last time a fix landed on only one of them (candidate sorting)
+            # it sat on the path nobody takes for as long as it existed.
+            gate_reason = memory_gate_reason(new_memory.content, explicit_save=explicit_save)
+            if gate_reason:
+                logger.info(
+                    "[memory_gate] refused at write (%s): %s",
+                    gate_reason, describe_memory(new_memory.content),
+                )
+                results[i] = (None, f"rejected:{gate_reason}")
+                continue
+
             # W1.5 mirror (write path) — see smart_create_memory
             new_embedding = await self._embed_or_none(new_memory.content)
+            # Same read-then-write race as the singular path.
+            await self._lock_user_writes(user_id)
             if new_embedding is None:
                 candidates = []
             else:
@@ -199,6 +246,18 @@ class MemoryDedupService:
                 results[i] = (memory, "created")
                 continue
 
+            # Rank by SIMILARITY, exactly as smart_create_memory does — see the
+            # long comment there. This line was MISSING here, and this is the
+            # path production actually uses: agent_runner.py:4731 calls the
+            # batch variant on every turn, while the singular one is only
+            # reached from the memory_store tool. So the documented fix was
+            # live on the path nobody takes and absent from the path everybody
+            # takes, and `candidates[0]` was the top BLENDED-score row
+            # (similarity is 40% of it, against strength/importance/salience/
+            # recency) rather than the nearest duplicate.
+            candidates = sorted(
+                candidates, key=lambda c: c.get('similarity_score', 0), reverse=True
+            )
             top_match = candidates[0]
             similarity = top_match.get('similarity_score', 0)
 
@@ -230,7 +289,8 @@ class MemoryDedupService:
                 for p in pending
             ])
             for p, decision in zip(pending, decisions):
-                logger.info(f"Dedup decision: {decision['action']} - {decision.get('reason', '')[:50]}")
+                logger.info("Dedup decision: %s - %s", decision['action'],
+                    describe_memory(decision.get('reason', '')))
                 results[p["index"]] = await self._apply_decision(
                     decision=decision,
                     top_match=p["top_match"],
@@ -240,6 +300,37 @@ class MemoryDedupService:
                 )
 
         return results  # type: ignore[return-value]
+
+    async def _lock_user_writes(self, user_id: str) -> None:
+        """Serialise this user's memory writes for the rest of the transaction.
+
+        Dedup is read-then-write: find candidates, decide, insert. Two turns for
+        the same user running concurrently — the web + mobile case, and rapid
+        successive messages — both read BEFORE either inserts, so both see no
+        duplicate and both create one. Measured: 4 concurrent writes of "The
+        user is a vegetarian" produced 2 rows.
+
+        A transaction-scoped Postgres advisory lock keyed on the user closes it.
+        The cost is bounded: only writes for the SAME user serialise, and
+        capture already runs off the user-visible reply path, so the wait is
+        invisible. Other tenants and other users are unaffected.
+
+        No-op on non-Postgres backends (CI runs SQLite, which has a single
+        writer and therefore cannot exhibit the race).
+        """
+        bind = self.db.bind
+        if bind is None or bind.dialect.name != "postgresql":
+            return
+        try:
+            from sqlalchemy import text as _text
+
+            await self.db.execute(
+                _text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                {"k": f"memwrite:{user_id}"},
+            )
+        except Exception as exc:  # pragma: no cover - lock is best-effort
+            logger.warning("[MEMORY] advisory lock unavailable (%s); "
+                           "concurrent writes may duplicate", exc)
 
     async def _embed_or_none(self, content: str) -> Optional[List[float]]:
         """Embed content, degrading to None when the embedding backend is
@@ -627,6 +718,7 @@ class MemoryDedupService:
 
         # Update the memory using memory_service method
         updated = await self.memory_service.merge_memory(
+            user_id=user_id,
             memory_id=existing_memory_id,
             new_content=merged_content,
             change_summary=change_summary,
@@ -1050,6 +1142,7 @@ Rules:
                             
                             # Mark duplicate as superseded
                             await self.memory_service.supersede_memory(
+                                user_id=user_id,
                                 old_memory_id=dup['id'],
                                 new_memory_id=memory.id
                             )

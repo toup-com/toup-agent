@@ -271,3 +271,38 @@ def signed_stripe_event() -> Callable[..., tuple[str, dict[str, str]]]:
         return payload, {"stripe-signature": sig_header, "Content-Type": "application/json"}
 
     return _factory
+
+
+# ── AGENT_ONLY tables ────────────────────────────────────────────────────
+#
+# `memories`, `entities` and friends are AGENT_ONLY: init_db() creates them
+# under RUN_MODE=agent, not under the RUN_MODE=platform this suite runs in
+# (.github/workflows/test-backend.yml), and `entities.embedding` is a pgvector
+# column that cannot compile on SQLite at all.
+#
+# Tests that need them were failing with "no such table", which is neither a
+# pass nor a useful failure. This fixture makes the gap explicit: such a test
+# SKIPS with a reason naming where the coverage actually lives
+# (backend/tests/memverify, which runs against real Postgres + pgvector).
+
+
+@pytest_asyncio.fixture
+async def requires_agent_tables():
+    """Skip unless the AGENT_ONLY memory tables exist in this database."""
+    from sqlalchemy import inspect as _inspect
+    from app.db.database import engine
+
+    async with engine.connect() as conn:
+        present = await conn.run_sync(
+            lambda sync_conn: {
+                name: _inspect(sync_conn).has_table(name)
+                for name in ("memories", "entities")
+            }
+        )
+    missing = [name for name, ok in present.items() if not ok]
+    if missing:
+        pytest.skip(
+            f"requires AGENT_ONLY table(s) {missing} — run with RUN_MODE=agent "
+            "against Postgres+pgvector; covered by backend/tests/memverify "
+            "(python backend/scripts/memory_verify.py)"
+        )

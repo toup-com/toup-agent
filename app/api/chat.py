@@ -37,6 +37,8 @@ from app.services.memory_dedup_service import MemoryDedupService
 from app.services.embedding_service import get_embedding_service
 from app.config import settings
 
+from app.services.memory_log import describe_memory
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -231,9 +233,15 @@ async def _chat_complete(
                     user_id=current_user.id
                 )
                 
-                # Log what happened
-                logger.info(f"Memory {action}: {stored_memory.content[:50]}...")
-                
+                # Log what happened. `stored_memory` is None when the write
+                # gate refused the content — dereferencing it here (before the
+                # existing None check below) is what made that refusal a crash.
+                if stored_memory is None:
+                    logger.info(f"Memory {action} — nothing written")
+                else:
+                    logger.info("Memory %s", describe_memory(stored_memory.content, action=action,
+                                         category=stored_memory.category, memory_id=stored_memory.id))
+
                 if stored_memory:
                     extracted_memories.append(MemoryResponse(
                         id=stored_memory.id,
@@ -482,7 +490,11 @@ async def _chat_stream(
                             user_id=current_user.id
                         )
                         
-                        logger.info(f"Memory {action}: {stored_memory.content[:50]}...")
+                        if stored_memory is None:
+                            logger.info(f"Memory {action} — nothing written")
+                            continue
+                        logger.info("Memory %s", describe_memory(stored_memory.content, action=action,
+                                         category=stored_memory.category, memory_id=stored_memory.id))
                         extracted_memory_ids.append({
                             "id": stored_memory.id,
                             "action": action,

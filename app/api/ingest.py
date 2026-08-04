@@ -17,6 +17,7 @@ from app.api.auth import get_current_user
 from app.api.memories import memory_to_response
 from app.services import get_memory_extractor, get_embedding_service
 from app.services.memory_service import MemoryService
+from app.services.memory_gate import MemoryRejected
 
 router = APIRouter(prefix="/ingest", tags=["Ingestion"])
 
@@ -108,11 +109,14 @@ async def ingest_message(
                 metadata=ext_memory.metadata,
             )
             
-            memory = await memory_service.create_memory(
-                current_user.id,
-                memory_data,
-                source_message_id=user_msg.id
-            )
+            try:
+                memory = await memory_service.create_memory(
+                    current_user.id,
+                    memory_data,
+                    source_message_id=user_msg.id
+                )
+            except MemoryRejected:
+                continue
             memories_created.append(memory)
             
             # Create/link entities

@@ -72,6 +72,9 @@ AGENT_ONLY_TABLES: set[str] = {
     "autopilot_approvals",
     # Memory system
     "memories",
+    # Durable outbox for facts extracted but not yet stored — capture is
+    # fire-and-forget, so without this a failed write loses the turn silently.
+    "memory_capture_outbox",
     "memory_relationships",
     "brain_stats",
     "memory_events",

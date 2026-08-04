@@ -41,6 +41,14 @@ PORTRAIT_CATEGORIES = {
     "skills": "Abilities, education, what they're learning",
     "people": "Important people in their life",
     "locations": "Where they live and work",
+    # `health` was missing entirely. Combined with similarity-gated retrieval
+    # (a dinner question scores 0.072 against "severely allergic to peanuts",
+    # under the 0.35 floor) that left an allergy reachable through NO path on
+    # the turns where it matters most. Standing constraints are now also
+    # injected directly by MemoryService.get_core_facts; this closes the second
+    # hole rather than relying on that one alone.
+    "health": "Health conditions, allergies, dietary needs, medications",
+    "habits": "Routines and standing arrangements",
 }
 
 # In-memory cache: {user_id: {"summary": str, "ts": float}}

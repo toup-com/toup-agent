@@ -25,6 +25,7 @@ from app.schemas import (
 from app.api.auth import get_current_user
 from app.services import get_embedding_service, get_document_service
 from app.services.memory_service import MemoryService
+from app.services.memory_gate import MemoryRejected
 
 router = APIRouter(prefix="/ingest", tags=["Document Ingestion"])
 
@@ -197,14 +198,26 @@ async def ingest_document(
                     "page_number": chunk.page_number,
                     "source_file": document.original_filename,
                     "file_type": file_type
-                }
+                },
+                # Was passed as a create_memory(..., source_type="document")
+                # KEYWORD, which that function has never accepted — so every
+                # document upload raised TypeError on its first chunk and
+                # document-to-memory ingestion did not work at all. MemoryCreate
+                # already carries the field, and create_memory already reads it
+                # from there (memory_service.py:576).
+                source_type="document",
             )
             
-            memory = await memory_service.create_memory(
-                current_user.id,
-                memory_data,
-                source_type="document"
-            )
+            try:
+                memory = await memory_service.create_memory(
+                    current_user.id,
+                    memory_data,
+                )
+            except MemoryRejected:
+                # A chunk carrying a card number or an API key is skipped; the
+                # rest of the document still ingests. Storing it would put the
+                # secret in a plaintext, embedded, permanently-retrievable row.
+                continue
             memories_created += 1
             
             # Create document chunk record
@@ -404,14 +417,23 @@ async def ingest_media(
                 "width": extraction.width,
                 "height": extraction.height,
                 "duration": extraction.duration
-            }
+            },
+            # Same defect as the document path above: passed as a keyword
+            # create_memory has never accepted, so media ingestion raised
+            # TypeError too.
+            source_type="media",
         )
         
-        memory = await memory_service.create_memory(
-            current_user.id,
-            memory_data,
-            source_type="media"
-        )
+        try:
+            memory = await memory_service.create_memory(
+                current_user.id,
+                memory_data,
+            )
+        except MemoryRejected:
+            media.processing_status = "rejected"
+            media.processed_at = datetime.utcnow()
+            await db.commit()
+            return {"media_id": media_id, "memories_created": 0, "status": "rejected"}
         media.memory_id = memory.id
         memories_created = 1
         
