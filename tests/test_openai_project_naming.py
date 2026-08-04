@@ -86,26 +86,83 @@ def test_billing_helper_accepts_user_name_kwarg():
     )
 
 
-def test_free_tier_activation_prefers_agent_name_over_user_name():
-    """activate_free_tier must prefer the AGENT name (e.g. 'Aria') over
-    the user's display name (e.g. 'NARIMAN') when labelling the OpenAI
-    project. The OpenAI project represents the agent's API consumption,
-    so the persona name is the more meaningful identifier when scanning
-    the operator's dashboard. Falls back to the user's display name when
-    the agent_name is missing (e.g. activation runs before Soul step).
+def test_free_tier_activation_prefers_agent_name_over_user_name(monkeypatch):
+    """The OpenAI project label must be the AGENT persona name, falling back
+    to the user's display name when there is no agent name yet (activation can
+    run before the Soul step).
+
+    This used to be three `inspect.getsource(activate_free_tier)` substring
+    checks, and it went red without anything breaking: the logic was moved
+    into `_run_openai_project_provision` (free_tier_activation.py:88-100),
+    where it still does exactly this. A test that greps for a line is really
+    testing where the line lives.
+
+    So call the thing and look at what it passes. This version would have
+    stayed green through that refactor, and goes red if the preference order
+    is ever reversed — which the grep could not tell you.
     """
-    from app.services import free_tier_activation
-    src = inspect.getsource(free_tier_activation.activate_free_tier)
-    # Both lookup branches must remain in source.
-    assert "cfg.agent_name" in src, (
-        "activate_free_tier must check cfg.agent_name first."
+    import asyncio as _asyncio
+
+    from app.services import free_tier_activation as fta
+
+    seen: dict = {}
+
+    class _FakeCfg:
+        def __init__(self, agent_name):
+            self.agent_name = agent_name
+            self.bundle_openai_project_id = None
+            self.bundle_openai_api_key = None
+
+    class _FakeUser:
+        name = "NARIMAN"
+
+    def _fake_session(cfg):
+        class _Res:
+            def scalar_one_or_none(self_inner):
+                return cfg
+
+        class _DB:
+            async def execute(self_inner, *a, **k):
+                return _Res()
+
+            async def get(self_inner, model, ident):
+                return _FakeUser()
+
+            async def commit(self_inner):
+                return None
+
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+        def _maker():
+            return _DB()
+
+        return _maker
+
+    import app.api.billing as billing
+
+    def _record(cfg, user_name=None):
+        seen["user_name"] = user_name
+
+    monkeypatch.setattr(billing, "_provision_openai_project_if_needed", _record)
+
+    # 1. agent_name present -> the persona name wins
+    import app.db.database as dbmod
+    monkeypatch.setattr(dbmod, "async_session_maker", _fake_session(_FakeCfg("Aria")))
+    _asyncio.run(fta._run_openai_project_provision("u-1"))
+    assert seen["user_name"] == "Aria", (
+        "the agent persona name must label the OpenAI project — it is what "
+        f"makes the operator's dashboard readable; got {seen['user_name']!r}"
     )
-    assert "from app.db.models import User" in src, (
-        "activate_free_tier must still fall back to User.name when "
-        "agent_name is missing."
+
+    # 2. no agent_name yet (activation before the Soul step) -> user's name
+    seen.clear()
+    monkeypatch.setattr(dbmod, "async_session_maker", _fake_session(_FakeCfg(None)))
+    _asyncio.run(fta._run_openai_project_provision("u-1"))
+    assert seen["user_name"] == "NARIMAN", (
+        f"must fall back to the user's display name; got {seen['user_name']!r}"
     )
-    assert "user_name=project_label" in src, (
-        "The resolved label must be forwarded to "
-        "_provision_openai_project_if_needed so the OpenAI dashboard "
-        "shows readable per-agent project names."
-    )
+

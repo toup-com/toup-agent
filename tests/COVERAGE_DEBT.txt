@@ -99,8 +99,6 @@ test_trigger_production_hardening.py  # MODE: triggers (agent) + connector_ident
 #
 # the behaviour deliberately changed and the assertion never followed. NOT a
 # production defect in any of these — each was checked against current source:
-test_openai_project_naming.py  # STALE: asserts inspect.getsource() text; the logic moved, intact
-test_prompt_profile.py  # STALE: pins {full, subagent}; AUTOPILOT was added on purpose
 test_routine_next_run_at_and_refresh_durability.py  # STALE: source-grep; runner.py:637 does call _sync_next_run
 test_routine_outcome_state_machine.py  # STALE: asserts RoutineRun; f06c260d made build_jobs the sole per-fire row
 test_routine_runner.py  # STALE: same cutover — the two failures are the only RoutineRun tests
@@ -109,7 +107,6 @@ test_routines_phase3_verification.py  # STALE: same jobs cutover, from the data 
 test_subagent_context_isolation.py  # STALE: regex-pins a literal `if prompt_profile ==` shape
 test_triggers_inbound.py  # STALE: SELECTs TriggerEvent, removed by the unified-jobs cutover
 test_whatsapp_baileys.py  # STALE: pins a constructor 056eaf25 deleted (neonize -> Baileys)
-test_whatsapp_qr_endpoints.py  # STALE: _mock_channel() lacks kick_pair, so MagicMock is awaited
 #
 # the test's own scaffolding is wrong; neither the assertion nor production is:
 test_migration_021_roundtrip.py  # INFRA: no collectible test at all (only __main__ main()) -> pytest exits 5

@@ -14,7 +14,7 @@ direct-execution harness used by the other whatsapp test files.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 from fastapi import FastAPI, HTTPException
 
@@ -40,16 +40,31 @@ def _fake_user():
 
 
 def _mock_channel(session_status: str = "not_linked", **status_overrides):
-    ch = MagicMock()
-    ch.health = MagicMock(return_value={"session_status": session_status})
-    ch.get_pairing_status = MagicMock(return_value={
+    """Autospec'd against the REAL channel, not a bare MagicMock.
+
+    A bare `MagicMock()` invents any attribute you ask for, so
+    `await channel.kick_pair()` returned a MagicMock and blew up with
+    `TypeError: object MagicMock can't be used in 'await' expression` — the
+    endpoint had grown a coroutine call the fixture never heard of. That is a
+    mock drifting from its subject, and it fails as a confusing TypeError
+    rather than "you forgot to stub kick_pair".
+
+    `create_autospec` takes the surface FROM `BaileysWhatsAppChannel`: every
+    method exists, coroutines come back as AsyncMock automatically, and calling
+    something the class does not define is an AttributeError at the call — so
+    the next method the endpoint adds cannot silently pass here.
+    """
+    from app.agent.channels.whatsapp_baileys import BaileysWhatsAppChannel
+
+    ch = create_autospec(BaileysWhatsAppChannel, instance=True)
+    ch.health.return_value = {"session_status": session_status}
+    ch.get_pairing_status.return_value = {
         "session_status": session_status,
         "connected": status_overrides.get("connected", False),
         "self_e164": status_overrides.get("self_e164"),
         "qr_data_url": status_overrides.get("qr_data_url"),
         "qr_emitted_at": status_overrides.get("qr_emitted_at"),
-    })
-    ch.force_logout = AsyncMock()
+    }
     return ch
 
 
@@ -127,14 +142,25 @@ class TestActiveChannel:
             assert res["ok"] is True
             ch.force_logout.assert_not_called()
 
-    async def test_start_force_logouts_when_logged_out(self):
-        """If the previous session terminated as logged_out, start()
-        clears it before re-pairing — otherwise neonize would refuse
-        to emit a fresh QR."""
+    async def test_start_repairs_from_any_prior_session_state(self):
+        """/start must kick a fresh pair no matter how the last session ended.
+
+        This used to assert `force_logout()` was awaited first, with the
+        reasoning "otherwise neonize would refuse to emit a fresh QR". Commit
+        056eaf25 replaced neonize with the Baileys sidecar, and the teardown
+        moved INTO `kick_pair()` — it POSTs /pair/start, which wipes auth and
+        starts a fresh QR flow (see its docstring). So the separate
+        force_logout step is gone, deliberately, and the endpoint is correct.
+
+        The property the old test cared about is still worth pinning: a
+        `logged_out` session must not be a dead end. Assert that, rather than
+        the intermediate call that no longer exists.
+        """
         import app.agent.channels.whatsapp_baileys as wb
-        ch = _mock_channel(session_status="logged_out")
-        with patch.object(wb, "_active_channel", ch):
-            handlers = _agent_router_handlers()
-            res = await handlers["/api/whatsapp/qr/start"](_user=_fake_user())
-            assert res["ok"] is True
-            ch.force_logout.assert_awaited_once()
+        for prior in ("logged_out", "not_linked", "linked", "linking"):
+            ch = _mock_channel(session_status=prior)
+            with patch.object(wb, "_active_channel", ch):
+                handlers = _agent_router_handlers()
+                res = await handlers["/api/whatsapp/qr/start"](_user=_fake_user())
+                assert res["ok"] is True, f"start failed from {prior!r}"
+                ch.kick_pair.assert_awaited_once()

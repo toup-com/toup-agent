@@ -34,13 +34,25 @@ def test_promptprofile_is_str_subclass():
     assert PromptProfile.SUBAGENT == "subagent"
 
 
-def test_promptprofile_has_only_full_and_subagent_v1():
-    """Amendment 1: MINIMAL is intentionally omitted from v1 to avoid
-    speculative API surface. Pin the membership so a 'helpful' PR
-    that adds MINIMAL up-front fails review here."""
+def test_promptprofile_membership_is_reviewed():
+    """Every profile must be one someone decided to add, not speculative surface.
+
+    Amendment 1 kept MINIMAL out of v1 deliberately, and this pin is what makes
+    a "helpful" PR adding it fail review. It did its job: AUTOPILOT tripped it.
+
+    AUTOPILOT is NOT speculative — it is load-bearing in production
+    (`agent_runner.py:940` branches on it to keep autopilot ticks headless
+    while still writing day history, and `prompt_profile.py:119` defines its
+    section set). So it is accepted into the pinned set, and the guard stays
+    exactly as strict for the next addition.
+    """
     from app.agent.prompt_profile import PromptProfile
 
-    assert {p.value for p in PromptProfile} == {"full", "subagent"}
+    assert {p.value for p in PromptProfile} == {"full", "subagent", "autopilot"}
+    assert "minimal" not in {p.value for p in PromptProfile}, (
+        "MINIMAL was omitted from v1 on purpose (Amendment 1) — adding it "
+        "needs the same argument AUTOPILOT had to make, in review"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
