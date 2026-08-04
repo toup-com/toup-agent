@@ -232,6 +232,35 @@ def _should_try_next_client(err: BaseException) -> bool:
     return False
 
 
+# The residential proxy failing is NOT a property of the video, and every
+# player client goes through the same proxy — so retrying clients is wasted
+# latency and the per-video log line is actively misleading. On 2026-08-03 the
+# IPRoyal account ran out of prepaid traffic and answered every CONNECT with
+# `402 Payment Required`. Audio died platform-wide for every track that was not
+# already cached, and the only trace was
+# `[media_proxy] client=android permanent error video_id=… — abort`, one line
+# per video, indistinguishable from a handful of unavailable songs. Nothing
+# alerted; it surfaced as a user complaint hours later.
+_PROXY_OUTAGE_MARKERS = (
+    "tunnel connection failed",
+    "unable to connect to proxy",
+    "402 payment required",
+    "407 proxy authentication required",
+    "proxyerror",
+)
+
+
+def _is_proxy_outage(err: BaseException) -> bool:
+    """Did extraction fail because the egress proxy itself is unusable?
+
+    True means: out of prepaid traffic, bad credentials, or the proxy is down.
+    Whole-platform, operator-actionable, and identical for every video — as
+    opposed to a bot-block or an unavailable video, which are per-request.
+    """
+    msg = str(err).lower()
+    return any(m in msg for m in _PROXY_OUTAGE_MARKERS)
+
+
 _RESOLVED_COOKIEFILE: str | None = None
 _COOKIES_RESOLVED = False
 
@@ -337,6 +366,19 @@ def _extract_audio(video_id: str) -> dict:
                 )
         except Exception as e:
             last_err = e
+            # Check the proxy BEFORE the per-client fall-through: a dead proxy
+            # also matches the bot-block heuristic sometimes, and retrying the
+            # other three clients through the same dead egress just multiplies
+            # the latency of a request that cannot succeed.
+            if _is_proxy_outage(e):
+                logger.error(
+                    "[media_proxy] PROXY OUTAGE — egress proxy is unusable, "
+                    "ALL uncached audio is failing platform-wide (not this "
+                    "video). Check YT_DLP_PROXY credit/credentials. "
+                    "video_id=%s client=%s err=%s",
+                    video_id, client, str(e)[:200],
+                )
+                return {"error": "proxy_unavailable", "detail": str(e)}
             if _should_try_next_client(e):
                 logger.warning(
                     "[media_proxy] client=%s fall-through video_id=%s err=%s",
@@ -1007,11 +1049,28 @@ async def get_audio_url(
 
     if "error" in result:
         return JSONResponse(status_code=502, content=result)
-    # Pre-warm the audio-only remux in the background so the native
-    # /audio_stream play (and the next ⏭) serves it from local disk → fast.
-    # Mobile pre-warms the current track + upcoming via this endpoint at
-    # media_play, so the remux is usually cached before playback/skip asks.
-    asyncio.create_task(_ensure_remux_bg(video_id))
+    # DELIBERATELY NO REMUX BUILD HERE. This used to fire
+    # `create_task(_ensure_remux_bg(video_id))`, and on the mobile play path
+    # that is a build of the very track the phone is about to stream: the app
+    # calls /audio_url on the `media_play` frame and starts /audio_stream a
+    # moment later (ChatScreen.prewarmAudioUrl). The build pulls the whole
+    # itag-18 through the residential proxy while the live stream pulls the
+    # SAME bytes through the SAME proxy — the two halve each other's share of
+    # a link that is the hard bottleneck (measured 0.45-0.76 MB/s on
+    # 2026-08-03, against a 1.2-2.7 MB/s healthy baseline). iOS needs ~2.5MB
+    # buffered before it makes a sound, so the duplicate turned a ~5s cold
+    # start into 10s+.
+    #
+    # The stream path already fixed this at its own trigger by warming in the
+    # response's `finally` ("no longer competing…", below); this was the same
+    # bug at the other trigger, firing BEFORE playback instead of during it.
+    #
+    # Nothing stops being cached. Every track that actually plays is warmed by
+    # that post-stream hook, and upcoming tracks are built by the phone's
+    # `/audio_stream?prefetch=1` requests, which build-and-wait by design
+    # (trackPlayer.prefetchAudioToDisk). A track that is prewarmed but never
+    # played simply is not built — which is the correct trade for a bottleneck
+    # this tight.
     return result
 
 
@@ -1173,21 +1232,39 @@ async def stream_audio(
             released = True
             sem.release()
 
+    # Per-stage timing. Time-to-first-audio is the number the user actually
+    # feels, and until now nothing recorded where it went: a 12.5s cold start
+    # (founder recording, 2026-08-03) and a 0.6s cached one logged the same
+    # single line, so a delivery regression was indistinguishable from a cold
+    # track and only a screen recording could tell them apart. Every exit path
+    # below emits `audio_stream TIMING` with the tier that served it and the
+    # milliseconds each stage cost. Cheap: one monotonic read per stage.
+    _t0 = time.monotonic()
+
+    def _ms(since: float) -> int:
+        return int((time.monotonic() - since) * 1000)
+
     # FAST PATH: serve the cached audio-only remux straight off local disk —
     # ~4x smaller than itag-18 and no googlevideo/proxy round-trip on playback.
     # A local-file serve holds no upstream connection, so release the stream
     # semaphore. (See _local_audio_response for the Range/206 detail that fixed
     # the PlaybackError-1-no-audio bug, root-caused on device 2026-06-08.)
     rpath = _remuxed_ready(video_id)
+    tier = "L1" if rpath else None
     from_pg_only = False
     if not rpath:
         # Shared L2 — pull a once-built remux to local disk and serve it (no proxy
         # fetch, no throttle, plays with the user's Mac OFF). Try R2 first (free
         # egress, uncapped, the durable store), then the Postgres blob fallback.
         rpath = await _r2_pull_to_local(video_id)
+        if rpath:
+            tier = "R2"
     if not rpath:
         rpath = await _pg_cache_pull_to_local(video_id)
         from_pg_only = rpath is not None
+        if rpath:
+            tier = "PG"
+    _cache_ms = _ms(_t0)
     if rpath:
         resp = _local_audio_response(rpath, request.headers.get("range"))
         if resp is not None:
@@ -1197,9 +1274,14 @@ async def stream_audio(
             # Postgres blob store can eventually be retired (no separate job needed).
             if from_pg_only and _r2_ready():
                 asyncio.create_task(_r2_store_from_local(video_id, rpath))
-            logger.info("[media_proxy] audio_stream remux HIT video_id=%s", video_id)
+            logger.info(
+                "[media_proxy] audio_stream TIMING video_id=%s tier=%s "
+                "cache_lookup_ms=%d total_ms=%d",
+                video_id, tier, _cache_ms, _ms(_t0),
+            )
             return resp
         # cached file vanished / 0 bytes (pruned mid-flight) → fall through.
+        tier = None
 
     # MISS. Two callers, two needs:
     #  • The mobile PREFETCH (?prefetch=1) downloads the NEXT track to the phone's
@@ -1234,6 +1316,7 @@ async def stream_audio(
     # play measurably slower to sound — the build wins nothing, because nothing
     # can read the remux until it is finished anyway. Deferred, the cache still
     # warms for the next play and the ⏭, which is all it was ever for.
+    _t_extract = time.monotonic()
     try:
         result = await asyncio.wait_for(
             _extract_coalesced(video_id),
@@ -1248,12 +1331,15 @@ async def stream_audio(
         logger.warning("[media_proxy] audio_stream extract failed video_id=%s: %s", video_id, e)
         return JSONResponse(status_code=502, content={"error": "extraction_failed", "detail": str(e)})
 
+    _extract_ms = _ms(_t_extract)
+
     if "error" in result:
         _release()
         return JSONResponse(status_code=502, content=result)
 
     upstream_url = result["url"]
     mime = result.get("mime_type") or "audio/mp4"
+    _t_upstream = time.monotonic()
 
     # Forward the client's Range header so AVFoundation can seek; googlevideo
     # honours it and replies 206 + Content-Range.
@@ -1298,11 +1384,38 @@ async def stream_audio(
         if h in upstream.headers:
             resp_headers[h.title()] = upstream.headers[h]
 
+    _upstream_ms = _ms(_t_upstream)
+
     async def _body():
+        sent = 0
+        t_first: float | None = None
         try:
             async for chunk in upstream.aiter_bytes(_STREAM_CHUNK_BYTES):
+                if t_first is None:
+                    t_first = time.monotonic()
+                    # The one number that maps to what the user hears. iOS needs
+                    # roughly 2.5MB of itag-18 buffered before it makes a sound,
+                    # so first-byte plus (2.5MB / throughput) IS the wait — which
+                    # is why throughput is logged at the end of the body too.
+                    logger.info(
+                        "[media_proxy] audio_stream TIMING video_id=%s tier=MISS "
+                        "cache_lookup_ms=%d extract_ms=%d upstream_ms=%d "
+                        "first_byte_ms=%d",
+                        video_id, _cache_ms, _extract_ms, _upstream_ms, _ms(_t0),
+                    )
+                sent += len(chunk)
                 yield chunk
         finally:
+            # Throughput over the bytes actually delivered. Below ~1MB/s the
+            # residential proxy is the bottleneck and no code change helps —
+            # this is the line that tells the two apart without a stopwatch.
+            if t_first is not None and sent > 0:
+                _dur = max(time.monotonic() - t_first, 1e-3)
+                logger.info(
+                    "[media_proxy] audio_stream DELIVERED video_id=%s bytes=%d "
+                    "stream_ms=%d throughput_mbps=%.2f total_ms=%d",
+                    video_id, sent, int(_dur * 1000), (sent / _dur) / 1e6, _ms(_t0),
+                )
             await upstream.aclose()
             await client.aclose()
             _release()

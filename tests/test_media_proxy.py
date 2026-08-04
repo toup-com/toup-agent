@@ -353,3 +353,118 @@ async def test_the_inflight_slot_is_released_after_completion():
 
     await asyncio.sleep(0)  # let the done-callback run
     assert "abc123def45" not in media_proxy._extract_inflight
+
+
+# ── /audio_url must not build the remux (proxy-bandwidth priority) ─────────
+# The phone calls /audio_url on the `media_play` frame and starts
+# /audio_stream a moment later for the SAME video. When /audio_url kicked off
+# a remux build, that build pulled the whole itag-18 through the residential
+# proxy while the live stream pulled the same bytes through the same proxy,
+# and the two halved each other's share of the hard bottleneck. Measured
+# 2026-08-03: 0.45-0.76 MB/s against a 1.2-2.7 MB/s healthy baseline, and iOS
+# needs ~2.5MB buffered before it makes a sound — the duplicate turned a ~5s
+# cold start into 10s+. Warming is the post-stream hook's job.
+
+
+async def test_audio_url_does_not_start_a_remux_build(client):
+    """/audio_url resolves the URL only. A build here races the play it precedes."""
+    built: list[str] = []
+
+    async def spy(vid: str) -> None:
+        built.append(vid)
+
+    with patch("app.api.media_proxy._extract_audio",
+               side_effect=lambda v: _wrap_with_helpers(_fake_info_ok())), \
+         patch("app.api.media_proxy._ensure_remux_bg", side_effect=spy):
+        r = await client.get("/api/media/abc123def45/audio_url")
+        # Let any task the handler scheduled actually run before asserting —
+        # without this the test passes even if create_task() was called.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert r.status_code == 200
+    assert r.json()["url"] == _FAKE_URL
+    assert built == [], f"/audio_url scheduled a remux build for {built}"
+
+
+async def test_stream_still_warms_the_cache_after_the_response(client):
+    """The warm did not disappear — it moved to where it no longer competes.
+
+    Guards the other half of the fix: if someone deletes the post-stream hook
+    too, nothing would ever populate the shared remux cache for played tracks
+    and every play would be a cold proxy pull forever.
+    """
+    from pathlib import Path
+
+    from app.api import media_proxy
+
+    src = Path(media_proxy.__file__).read_text()
+    stream_fn = src.split("async def stream_audio", 1)[1]
+    assert "_ensure_remux_bg" in stream_fn, (
+        "stream_audio no longer warms the remux cache; with /audio_url's build "
+        "removed, nothing would cache a played track"
+    )
+
+
+# ── A dead egress proxy must be diagnosable ───────────────────────────────
+
+
+def test_proxy_outage_is_distinguished_from_an_unavailable_video():
+    from app.api.media_proxy import _is_proxy_outage, _should_try_next_client
+
+    # The exact yt-dlp error production emitted on 2026-08-03, when the
+    # IPRoyal account ran out of prepaid traffic.
+    real = (
+        "ERROR: [youtube] fv_5VOUkHYA: Unable to download API page: "
+        "('Unable to connect to proxy', OSError('Tunnel connection failed: "
+        "402 Payment Required'))"
+    )
+    assert _is_proxy_outage(Exception(real))
+    # …and it must not be retried across clients: they share the one proxy.
+    assert not _should_try_next_client(Exception(real))
+
+    for other in (
+        "407 Proxy Authentication Required",
+        "ProxyError('Cannot connect to proxy')",
+    ):
+        assert _is_proxy_outage(Exception(other)), other
+
+    # Genuinely per-video / per-client failures stay out of this bucket, or a
+    # single private song would page whoever is on call.
+    for benign in (
+        "Video unavailable. This video is private",
+        "Sign in to confirm you're not a bot",
+        "Requested format is not available",
+        "This video is age-restricted",
+    ):
+        assert not _is_proxy_outage(Exception(benign)), benign
+
+
+async def test_proxy_outage_surfaces_its_own_error_code(client):
+    """A platform-wide outage must not be reported as 'extraction_failed'.
+
+    yt-dlp is not installed in the test env, so the extractor itself is
+    stubbed; the classifier that produces this dict is covered by
+    test_proxy_outage_is_distinguished_from_an_unavailable_video above. What
+    this pins is that the distinct code survives the handler and reaches the
+    client instead of being flattened into the generic failure.
+    """
+    outage = {"error": "proxy_unavailable", "detail": "Tunnel connection failed: 402"}
+
+    with patch("app.api.media_proxy._extract_audio", return_value=outage):
+        r = await client.get("/api/media/fv_5VOUkHYA/audio_url")
+
+    assert r.status_code == 502
+    assert r.json().get("error") == "proxy_unavailable", r.json()
+
+
+def test_the_outage_branch_returns_the_distinct_code():
+    """The classifier and the code are wired to each other, not just present."""
+    from pathlib import Path
+
+    from app.api import media_proxy
+
+    src = Path(media_proxy.__file__).read_text()
+    branch = src.split("if _is_proxy_outage(e):", 1)[1].split("if _should_try_next_client", 1)[0]
+    assert "proxy_unavailable" in branch, "outage branch no longer returns its own code"
+    assert "logger.error" in branch, "a platform-wide outage must log at ERROR, not WARNING"
