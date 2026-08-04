@@ -95,11 +95,50 @@ def test_compute_run_cost_applies_credit_multiplier(monkeypatch):
 
 @dataclass
 class FakeAgentResponse:
+    """Field names MUST match the real AgentResponse — see the guard below.
+
+    They did not. This mock declared `input_tokens` / `output_tokens` /
+    `model_used`, while `AgentResponse` declares `tokens_input` /
+    `tokens_output` / `model`. `_run_child` reads the real names via getattr
+    with a None default, so every read returned None, every cost computed to
+    0.0, and the budget could never be exceeded. The tests below passed by
+    measuring nothing.
+    """
     text: str
     session_id: str = "subagent:fake"
-    input_tokens: int = 100_000  # default: expensive run
-    output_tokens: int = 50_000
-    model_used: str = "claude-3-5-haiku-20241022"
+    tokens_input: int = 100_000  # default: expensive run
+    tokens_output: int = 50_000
+    model: str = "claude-3-5-haiku-20241022"
+
+
+def test_fake_response_field_names_match_the_real_one():
+    """A mock that names fields the reader does not read tests nothing.
+
+    `_run_child` pulls token counts off the response with
+    `getattr(response, "tokens_input", None)`. A mock with a different
+    spelling returns None for all of them, the cost is 0.0, and every budget
+    assertion below silently passes no matter what the code does. So pin the
+    three names the orchestrator actually reads against the real dataclass.
+    """
+    import dataclasses
+
+    from app.agent.agent_runner import AgentResponse
+
+    real = {f.name for f in dataclasses.fields(AgentResponse)}
+    fake = {f.name for f in dataclasses.fields(FakeAgentResponse)}
+    read_by_orchestrator = {"tokens_input", "tokens_output", "model"}
+
+    missing_from_real = read_by_orchestrator - real
+    assert not missing_from_real, (
+        "subagent_orchestrator._run_child reads these off AgentResponse and "
+        f"the dataclass no longer declares them: {sorted(missing_from_real)}"
+    )
+    missing_from_fake = read_by_orchestrator - fake
+    assert not missing_from_fake, (
+        "FakeAgentResponse does not declare the fields the orchestrator reads, "
+        "so every cost in this file computes to 0.0 and the budget assertions "
+        f"measure nothing: {sorted(missing_from_fake)}"
+    )
 
 
 class FakeAgentRunner:
@@ -214,8 +253,8 @@ async def test_run_under_budget_completes_normally(enable_spawning, patch_writer
 
     # Run costs $0.028; budget is $1.00 — comfortably under.
     runner = FakeAgentRunner(response=FakeAgentResponse(
-        text="ok", input_tokens=10_000, output_tokens=5_000,
-        model_used="claude-3-5-haiku-20241022",
+        text="ok", tokens_input=10_000, tokens_output=5_000,
+        model="claude-3-5-haiku-20241022",
     ))
     result = await spawn_subagent(
         user_id=uid, task="cheap task", label="L", model=None,
@@ -246,8 +285,8 @@ async def test_run_over_budget_terminates_with_budget_exhausted(
 
     runner = FakeAgentRunner(response=FakeAgentResponse(
         text="partial result before budget hit",
-        input_tokens=10_000, output_tokens=5_000,
-        model_used="claude-3-5-haiku-20241022",
+        tokens_input=10_000, tokens_output=5_000,
+        model="claude-3-5-haiku-20241022",
     ))
     result = await spawn_subagent(
         user_id=uid, task="costly task", label="L", model=None,
@@ -281,8 +320,8 @@ async def test_no_budget_set_skips_enforcement(enable_spawning, patch_writer):
         await _seed_user(db, uid)
 
     runner = FakeAgentRunner(response=FakeAgentResponse(
-        text="ok", input_tokens=1_000_000, output_tokens=500_000,
-        model_used="claude-3-5-haiku-20241022",
+        text="ok", tokens_input=1_000_000, tokens_output=500_000,
+        model="claude-3-5-haiku-20241022",
     ))
     result = await spawn_subagent(
         user_id=uid, task="big task", label="L", model=None,
@@ -311,8 +350,8 @@ async def test_unknown_model_does_not_trip_budget(enable_spawning, patch_writer)
         await _seed_user(db, uid)
 
     runner = FakeAgentRunner(response=FakeAgentResponse(
-        text="ok", input_tokens=1_000_000, output_tokens=1_000_000,
-        model_used="some-future-claude-not-in-pricing-table",
+        text="ok", tokens_input=1_000_000, tokens_output=1_000_000,
+        model="some-future-claude-not-in-pricing-table",
     ))
     result = await spawn_subagent(
         user_id=uid, task="t", label="L", model=None,

@@ -319,12 +319,35 @@ class _FakeExtractor:
 
 
 class _FakeDedupService:
+    """Stands in for MemoryDedupService, returning stored-memory stand-ins.
+
+    The stand-in must carry every field the caller reads off a stored memory,
+    not just the ones this file cares about. It originally returned only
+    `id` and `content`, and `_extract_memories` reads `.category` too — in its
+    `describe_memory(...)` LOG line. The AttributeError propagated out of the
+    store loop, the whole extraction was recorded as failed, and the test saw
+    0 memories with no hint that a log statement was the cause.
+
+    Mirroring the input's fields keeps that from recurring: whatever the
+    caller reads, it is here, because the real pipeline puts it there.
+    """
+
     def __init__(self, db, api_key=None):
         pass
 
     async def smart_create_memories(self, new_memories, user_id):
         return [
-            (SimpleNamespace(id=f"m{i}", content=nm.content), "created")
+            (
+                SimpleNamespace(
+                    id=f"m{i}",
+                    content=nm.content,
+                    summary=getattr(nm, "summary", None),
+                    category=getattr(nm, "category", None),
+                    memory_type=getattr(nm, "memory_type", None),
+                    importance=getattr(nm, "importance", None),
+                ),
+                "created",
+            )
             for i, nm in enumerate(new_memories)
         ]
 

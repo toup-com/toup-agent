@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.db.models.base import Base
 from app.db.models.conversation import Conversation, Message
 from app.db.models.day_chat import DayChat
 from app.db.models.user import User
@@ -50,56 +51,26 @@ load_day_context = _dcl_mod.load_day_context
 
 
 async def _make_engine():
+    """Build the tables from the ORM models, not from a copy of them.
+
+    This was a hand-written `CREATE TABLE users (...)` and it drifted: the User
+    model gained a column the copy never did, and every ORM insert here started
+    failing on a column the table had never heard of. A hand-written schema is
+    a second source of truth nothing keeps in sync, and it breaks somewhere
+    else entirely — whenever someone adds a column.
+
+    `create_all(tables=[...])` stays narrow: only the tables this file uses, so
+    no pgvector column is compiled on sqlite, and dependency order is handled.
+    """
     engine = create_async_engine(
         "sqlite+aiosqlite://", connect_args={"check_same_thread": False}
     )
     async with engine.begin() as conn:
-        for stmt in [
-            """CREATE TABLE IF NOT EXISTS users (
-                id VARCHAR(36) PRIMARY KEY, email VARCHAR(255) UNIQUE,
-                hashed_password VARCHAR(255),
-                name VARCHAR(255), password_changed_at TIMESTAMP,
-                role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
-                updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
-                email_verified_at TIMESTAMP, email_verification_token VARCHAR(64),
-                email_verification_sent_at TIMESTAMP, is_canary BOOLEAN DEFAULT 0
-            )""",
-            """CREATE TABLE IF NOT EXISTS day_chats (
-                id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) REFERENCES users(id),
-                local_date DATE NOT NULL, timezone VARCHAR(50) DEFAULT 'UTC',
-                started_at TIMESTAMP, last_message_at TIMESTAMP,
-                message_count INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
-                rolling_summary TEXT, summary_up_to_message_id VARCHAR(50),
-                summary_updated_at TIMESTAMP, summary_status VARCHAR(20) DEFAULT 'up_to_date',
-                summary_failure_count INTEGER DEFAULT 0,
-                summary_last_failure_at TIMESTAMP,
-                summary_last_failure_reason VARCHAR(64),
-                archival_summary TEXT,
-                archival_summary_generated_at TIMESTAMP,
-                archival_summary_status VARCHAR(20) DEFAULT 'not_needed',
-                UNIQUE(user_id, local_date)
-            )""",
-            """CREATE TABLE IF NOT EXISTS conversations (
-                id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) REFERENCES users(id),
-                title VARCHAR(500), day_chat_id VARCHAR(36) REFERENCES day_chats(id),
-                channel VARCHAR(50) DEFAULT 'web', is_active BOOLEAN DEFAULT 1,
-                started_at TIMESTAMP, ended_at TIMESTAMP, updated_at TIMESTAMP,
-                message_count INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
-                builder_mode VARCHAR(10), metadata_json TEXT
-            )""",
-            """CREATE TABLE IF NOT EXISTS messages (
-                id VARCHAR(50) PRIMARY KEY, conversation_id VARCHAR(36) REFERENCES conversations(id),
-                day_chat_id VARCHAR(36) REFERENCES day_chats(id), role VARCHAR(20),
-                content TEXT, created_at TIMESTAMP, tokens_prompt INTEGER,
-                tokens_completion INTEGER, model_used VARCHAR(50),
-                memories_retrieved_json TEXT, processing_time_ms INTEGER,
-                metadata_json TEXT, embedding_json TEXT, embedding BLOB,
-                channel VARCHAR(50), source VARCHAR(50),
-                reply_to_message_id VARCHAR(50), attachments TEXT
-            )""",
-        ]:
-            await conn.run_sync(lambda c, s=stmt: c.execute(text(s)))
+        await conn.run_sync(
+            Base.metadata.create_all,
+            tables=[User.__table__, DayChat.__table__,
+                    Conversation.__table__, Message.__table__],
+        )
     return engine
 
 

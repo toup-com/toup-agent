@@ -28,8 +28,33 @@ from typing import Any, Optional
 import pytest
 from sqlalchemy import select
 
+# Every user in this file lives here, and the dedupe rows the runner writes
+# are stamped with THIS zone's date — never the test runner's. Keep the two
+# uses tied to one constant so they cannot drift apart again.
+_TEST_TZ = "America/Toronto"
 
-async def _make_user(timezone: str = "America/Toronto") -> str:
+
+def _user_local_today() -> date:
+    """The date `_write_nudge` will stamp on the dedupe row.
+
+    NOT `date.today()`. The runner resolves the USER's IANA timezone and
+    uses `datetime.now(tz).date()` — "one notice per local day" means the
+    user's day, which is the whole point of storing a timezone. `date.today()`
+    is the *server's* day, and for a UTC-4 user the two disagree for four
+    hours out of every twenty-four.
+
+    That gap is exactly how this file failed CI at 02:21 UTC on 2026-08-04:
+    the runner wrote scope_date=2026-08-03 (22:21 in Toronto) and the test
+    queried for 2026-08-04, found nothing, and reported it as a violated
+    dedupe contract. Nothing was wrong with the runner. A test that is green
+    twenty hours a day is not a passing test — it is an unfired one.
+    """
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo(_TEST_TZ)).date()
+
+
+async def _make_user(timezone: str = _TEST_TZ) -> str:
     from app.db import async_session_maker
     from app.db.models import User
 
@@ -180,6 +205,8 @@ async def test_reauth_nudge_dedupes_within_same_local_day():
         user_id, delivery_channels=["website", "telegram"],
     )
 
+    day_at_start = _user_local_today()
+
     rr = RoutineRunner()
     async with async_session_maker() as db:
         routine = await db.get(Routine, routine_id)
@@ -223,21 +250,138 @@ async def test_reauth_nudge_dedupes_within_same_local_day():
         RoutineResult(status="skipped_reauth", error_class="reauth_required"),
     )
 
-    # Exactly one dedupe row exists for (routine_id, "reauth", today).
+    # If the user's midnight passed while those two nudges were being posted,
+    # the premise is gone: the second nudge belongs to a different local day
+    # and SHOULD get its own row. Skip rather than assert — a test that fails
+    # for one second a day teaches nothing, and silently tolerating two rows
+    # would blunt the check for the other 86,399.
+    if _user_local_today() != day_at_start:
+        pytest.skip(
+            f"run straddled midnight in {_TEST_TZ} "
+            f"({day_at_start} -> {_user_local_today()}); same-day premise void"
+        )
+
+    # Exactly one dedupe row exists for (routine_id, "reauth").
+    #
+    # Deliberately NOT filtered by date: filtering would let a second row
+    # written under a different scope_date pass unnoticed, which is the one
+    # way this dedupe can actually break in production. Two nudges landing
+    # either side of the user's midnight is a real duplicate, and a
+    # date-filtered query is blind to it. Count them all, then pin the date.
     async with async_session_maker() as db:
         result = await db.execute(
             select(RoutineNotificationDedupe).where(
                 RoutineNotificationDedupe.routine_id == routine_id,
                 RoutineNotificationDedupe.kind == "reauth",
-                RoutineNotificationDedupe.scope_date == date.today(),
             )
         )
         rows = list(result.scalars().all())
     assert len(rows) == 1, (
         f"Ticket 2.2 dedupe contract violated: found {len(rows)} rows for "
-        "(routine, kind=reauth, today). Expected exactly 1 — the second "
-        "nudge must be suppressed by the UNIQUE on (routine_id, kind, "
-        "scope_date)."
+        "(routine, kind=reauth). Expected exactly 1 — the second nudge must "
+        "be suppressed by the UNIQUE on (routine_id, kind, scope_date). "
+        f"scope_dates seen: {[r.scope_date for r in rows]}"
+    )
+    assert rows[0].scope_date == day_at_start, (
+        f"dedupe row is stamped {rows[0].scope_date}, but the user's local "
+        f"date is {day_at_start}. The 24h notice window is scoped to the "
+        "USER's day — a server-local scope_date silently shifts the window "
+        "for every user outside UTC."
+    )
+
+
+# ── 2b. The dedupe day is the USER's day, at every hour ────────────
+
+
+def _zone_whose_date_differs_from_the_server() -> tuple[str, date]:
+    """An IANA zone whose current date is NOT the server's, plus that date.
+
+    There is always one. Kiritimati is UTC+14 and Niue is UTC-11, so for any
+    UTC hour 0-9 Niue has already rolled back a day, and for 10-23 Kiritimati
+    has rolled forward. One of the two disagrees with the server at every
+    instant of every day.
+
+    That is what makes the test below a real guard rather than a lottery
+    ticket. The `America/Toronto` test above only exercises the difference
+    between the user's day and the server's for the four hours a day that
+    Toronto and UTC disagree — which is precisely why a server-local
+    scope_date survived in CI until a run happened to land at 02:21 UTC.
+    """
+    server_today = date.today()
+    for name in ("Pacific/Kiritimati", "Pacific/Niue"):
+        from zoneinfo import ZoneInfo
+
+        local = datetime.now(ZoneInfo(name)).date()
+        if local != server_today:
+            return name, local
+    raise AssertionError(  # unreachable — see the docstring
+        f"neither +14 nor -11 differs from the server date {server_today}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedupe_day_is_the_users_day_not_the_servers():
+    """The notice window is scoped to the user's local day.
+
+    A user in Kiritimati gets one reconnect nudge per KIRITIMATI day. If the
+    runner stamped the server's date instead, that user's 24h window would be
+    cut or doubled at an arbitrary hour — and every user outside UTC would be
+    affected differently, which is the kind of bug that never reproduces for
+    whoever is debugging it.
+
+    This pins the behaviour `_write_nudge` already has (it resolves the user's
+    IANA zone and calls `datetime.now(tz).date()`). Written after the
+    date-filtered assertion above failed CI at 02:21 UTC and looked, for a
+    few minutes, exactly like a broken dedupe.
+    """
+    from app.agent.routines.base_handler import RoutineResult
+    from app.agent.routines.runner import RoutineRunner
+    from app.db import async_session_maker
+    from app.db.models import Routine, RoutineRun, RoutineNotificationDedupe
+
+    tz_name, user_today = _zone_whose_date_differs_from_the_server()
+    assert user_today != date.today()  # the whole premise of the test
+
+    user_id = await _make_user(timezone=tz_name)
+    routine_id = await _make_routine(user_id, delivery_channels=["website"])
+
+    rr = RoutineRunner()
+    async with async_session_maker() as db:
+        routine = await db.get(Routine, routine_id)
+
+    run_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(
+            RoutineRun(
+                id=run_id, routine_id=routine_id, user_id=user_id,
+                scheduled_for_local_date=user_today, status="running",
+                fire_instant=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+    await rr._post_terminal(
+        routine, run_id,
+        RoutineResult(status="skipped_reauth", error_class="reauth_required"),
+    )
+
+    from zoneinfo import ZoneInfo
+
+    if datetime.now(ZoneInfo(tz_name)).date() != user_today:
+        pytest.skip(f"run straddled midnight in {tz_name}; premise void")
+
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(RoutineNotificationDedupe).where(
+                RoutineNotificationDedupe.routine_id == routine_id,
+            )
+        )
+        rows = list(result.scalars().all())
+
+    assert len(rows) == 1, f"expected one dedupe row, got {len(rows)}"
+    assert rows[0].scope_date == user_today, (
+        f"dedupe row for a {tz_name} user is stamped {rows[0].scope_date}; "
+        f"that user's local date is {user_today} (the server's is "
+        f"{date.today()}). The notice window must follow the user's day."
     )
 
 

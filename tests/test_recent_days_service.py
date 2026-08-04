@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
+from app.db.models.base import Base
 from app.db.models.user import User
 from app.db.models.day_chat import DayChat
 
@@ -61,37 +62,27 @@ def test_should_inject_recent_days_gate():
 # ── Helper — sqlite engine ──
 
 async def _make_engine():
+    """Build the two tables from the ORM models, not from a copy of them.
+
+    This used to be a hand-written `CREATE TABLE users (...)`, and it went red
+    the moment the User model gained a column the copy did not have
+    (`email_verified_at`): the ORM insert names a column the table has never
+    heard of. A hand-written schema is a second source of truth that nothing
+    keeps in sync, and it fails LATER — whenever someone adds a column,
+    somewhere else entirely.
+
+    `create_all(tables=[...])` is still narrow: only the tables this file
+    actually uses are created, so no pgvector column is ever compiled on
+    sqlite, and dependency order is handled for us.
+    """
     engine = create_async_engine(
         "sqlite+aiosqlite://", connect_args={"check_same_thread": False},
     )
     async with engine.begin() as conn:
-        for stmt in [
-            """CREATE TABLE IF NOT EXISTS users (
-                id VARCHAR(36) PRIMARY KEY, email VARCHAR(255) UNIQUE,
-                hashed_password VARCHAR(255), name VARCHAR(255),
-                password_changed_at TIMESTAMP,
-                role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
-                updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
-                is_canary BOOLEAN DEFAULT 0
-            )""",
-            """CREATE TABLE IF NOT EXISTS day_chats (
-                id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36),
-                local_date DATE NOT NULL, timezone VARCHAR(50) DEFAULT 'UTC',
-                started_at TIMESTAMP, last_message_at TIMESTAMP,
-                message_count INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
-                rolling_summary TEXT, summary_up_to_message_id VARCHAR(50),
-                summary_updated_at TIMESTAMP,
-                summary_status VARCHAR(20) DEFAULT 'up_to_date',
-                archival_summary TEXT,
-                archival_summary_generated_at TIMESTAMP,
-                archival_summary_status VARCHAR(20) NOT NULL DEFAULT 'not_needed',
-                summary_failure_count INTEGER NOT NULL DEFAULT 0,
-                summary_last_failure_at TIMESTAMP,
-                summary_last_failure_reason VARCHAR(50)
-            )""",
-        ]:
-            await conn.run_sync(lambda c, s=stmt: c.execute(text(s)))
+        await conn.run_sync(
+            Base.metadata.create_all,
+            tables=[User.__table__, DayChat.__table__],
+        )
     return engine
 
 
@@ -106,15 +97,23 @@ async def _seed_user(db, user_id):
 
 async def _insert_day(db, user_id, d, archival=None, archival_status="not_needed",
                      rolling=None):
+    # Insert through the MODEL, not raw SQL.
+    #
+    # Several DayChat columns are NOT NULL with a *Python-side* default
+    # (`timezone`, `started_at`, …) — there is no server default, so a raw
+    # INSERT that omits them is a NOT NULL violation. The old hand-written
+    # CREATE TABLE in this file wrote `DEFAULT 'UTC'` into its own DDL and hid
+    # that; the moment the schema came from the model, the raw INSERT started
+    # failing one column at a time. Chasing them one at a time is the wrong
+    # shape — the model already knows every default, so let it apply them.
     dc_id = str(uuid.uuid4())
-    await db.execute(text("""
-        INSERT INTO day_chats (id, user_id, local_date, summary_status,
-            archival_summary, archival_summary_status, rolling_summary)
-        VALUES (:id, :uid, :d, 'up_to_date', :a, :as_, :r)
-    """), {
-        "id": dc_id, "uid": user_id, "d": d,
-        "a": archival, "as_": archival_status, "r": rolling,
-    })
+    db.add(DayChat(
+        id=dc_id, user_id=user_id, local_date=d,
+        summary_status="up_to_date",
+        archival_summary=archival, archival_summary_status=archival_status,
+        rolling_summary=rolling,
+    ))
+    await db.flush()
     return dc_id
 
 

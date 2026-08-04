@@ -20,40 +20,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
+from app.db.models.base import Base
 from app.db.models.user import User
 from app.db.models.day_chat import DayChat, MigrationStatus
 
 
 async def _make_engine():
+    """Build the tables from the ORM models, not from a copy of them.
+
+    This was a hand-written `CREATE TABLE users (...)`, and it went red the
+    moment the User model gained a column the copy did not have
+    (`email_verified_at`) — the ORM insert names a column the table has never
+    heard of. A hand-written schema is a second source of truth that nothing
+    keeps in sync, and it fails somewhere else entirely, whenever someone adds
+    a column.
+
+    `create_all(tables=[...])` stays narrow: only the tables this file uses, so
+    no pgvector column is ever compiled on sqlite, and dependency order is
+    handled for us.
+    """
     engine = create_async_engine("sqlite+aiosqlite://", connect_args={"check_same_thread": False})
     async with engine.begin() as conn:
-        for stmt in [
-            """CREATE TABLE IF NOT EXISTS users (
-                id VARCHAR(36) PRIMARY KEY, email VARCHAR(255) UNIQUE,
-                hashed_password VARCHAR(255),
-                name VARCHAR(255), password_changed_at TIMESTAMP,
-                role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
-                updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50)
-            )""",
-            """CREATE TABLE IF NOT EXISTS day_chats (
-                id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) REFERENCES users(id),
-                local_date DATE NOT NULL, timezone VARCHAR(50) DEFAULT 'UTC',
-                started_at TIMESTAMP, last_message_at TIMESTAMP,
-                message_count INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
-                rolling_summary TEXT, summary_up_to_message_id VARCHAR(50),
-                summary_updated_at TIMESTAMP, summary_status VARCHAR(20) DEFAULT 'up_to_date',
-                archival_summary TEXT,
-                archival_summary_generated_at TIMESTAMP,
-                archival_summary_status VARCHAR(20) DEFAULT 'not_needed',
-                UNIQUE(user_id, local_date)
-            )""",
-            """CREATE TABLE IF NOT EXISTS migration_status (
-                migration_name VARCHAR(100) PRIMARY KEY, status VARCHAR(20) DEFAULT 'not_started',
-                started_at TIMESTAMP, completed_at TIMESTAMP, progress_json TEXT, error_message TEXT
-            )""",
-        ]:
-            await conn.run_sync(lambda c, s=stmt: c.execute(text(s)))
+        await conn.run_sync(
+            Base.metadata.create_all,
+            tables=[User.__table__, DayChat.__table__, MigrationStatus.__table__],
+        )
     return engine
 
 

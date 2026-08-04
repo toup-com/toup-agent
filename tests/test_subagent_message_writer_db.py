@@ -31,6 +31,11 @@ import pytest_asyncio
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.db.models.base import Base
+from app.db.models.conversation import Conversation, Message
+from app.db.models.day_chat import DayChat
+from app.db.models.user import User
+
 
 # Override conftest's autouse init_db — this test file owns its
 # engine + schema and doesn't want conftest's app-wide init clobbering
@@ -150,11 +155,22 @@ async def db_with_manual_schema(monkeypatch):
         connect_args={"check_same_thread": False, "uri": True},
     )
 
+    # Build the four tables from the ORM models rather than from the
+    # hand-written copies below. Those copies drifted — the User model gained
+    # columns they never did, so ORM inserts started naming columns the table
+    # had never heard of. A hand-written schema is a second source of truth
+    # that nothing keeps in sync.
+    #
+    # The original reason for hand-writing it (keep the pgvector column out of
+    # sqlite) still holds and is still satisfied: `create_all(tables=[...])`
+    # touches only these four tables, and app.db.database already degrades the
+    # vector column when the extension is absent.
     async with engine.begin() as conn:
-        for ddl in (
-            _USERS_DDL, _DAY_CHATS_DDL, _CONVERSATIONS_DDL, _MESSAGES_DDL,
-        ):
-            await conn.execute(sa.text(ddl))
+        await conn.run_sync(
+            Base.metadata.create_all,
+            tables=[User.__table__, DayChat.__table__,
+                    Conversation.__table__, Message.__table__],
+        )
 
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -175,38 +191,31 @@ async def db_with_manual_schema(monkeypatch):
 
 
 async def _seed_user(db: AsyncSession, user_id: str) -> str:
-    """Insert a user + today's day_chat. Returns the day_chat_id so
-    tests can pin it.
+    """Insert a user + today's day_chat through the MODELS. Returns the
+    day_chat_id so tests can pin it.
 
-    Pre-creating the day_chat sidesteps SQLite's lack of
-    ON CONFLICT DO NOTHING (the resolver's create path uses
-    pg_insert; on SQLite it falls through to a plain ORM add which
-    requires every column the model declares to be present in our
-    DDL). The fast-path SELECT in get_or_create_day_chat finds the
-    pre-created row without needing the create path at all."""
-    from datetime import date, timezone as _tz
+    These were raw INSERTs, which worked only because the hand-written DDL
+    above gave several columns a SERVER default. The real models declare them
+    NOT NULL with a *Python-side* default instead, so once the schema came
+    from the models each raw INSERT started failing on a different column
+    (`users.is_canary` first). Chasing them one at a time is the wrong shape —
+    the models already know every default.
 
-    await db.execute(sa.text(
-        "INSERT INTO users (id, email, hashed_password, name, role, "
-        " created_at, updated_at, is_active, timezone) "
-        "VALUES (:id, :email, 'x', 'Test', 'beta_user', :now, :now, 1, 'UTC')"
-    ), {
-        "id": user_id,
-        "email": f"{user_id[:8]}@test.local",
-        "now": datetime.utcnow(),
-    })
+    Pre-creating the day_chat still sidesteps SQLite's lack of the pg_insert
+    ON CONFLICT path the resolver uses: the fast-path SELECT in
+    get_or_create_day_chat finds this row and never reaches the create path.
+    """
+    from datetime import timezone as _tz
+
+    db.add(User(
+        id=user_id, email=f"{user_id[:8]}@test.local", hashed_password="x",
+        name="Test", role="beta_user", is_active=True, timezone="UTC",
+    ))
     day_chat_id = str(uuid.uuid4())
-    await db.execute(sa.text(
-        "INSERT INTO day_chats "
-        "(id, user_id, local_date, timezone, started_at, last_message_at, "
-        " message_count, total_tokens, summary_status, summary_failure_count) "
-        "VALUES (:id, :uid, :ld, 'UTC', :now, :now, 0, 0, 'up_to_date', 0)"
-    ), {
-        "id": day_chat_id,
-        "uid": user_id,
-        "ld": datetime.now(_tz.utc).date(),
-        "now": datetime.utcnow(),
-    })
+    db.add(DayChat(
+        id=day_chat_id, user_id=user_id,
+        local_date=datetime.now(_tz.utc).date(), timezone="UTC",
+    ))
     await db.commit()
     return day_chat_id
 

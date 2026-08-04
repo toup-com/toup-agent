@@ -19,12 +19,13 @@ without coordinating with the API validator / handlers).
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 
@@ -250,6 +251,26 @@ async def test_same_event_dedupe_id_allowed_for_different_triggers():
     assert len(rows) == 2
 
 
+def _is_sqlite() -> bool:
+    return os.environ.get("DATABASE_URL", "").startswith("sqlite")
+
+
+async def _ensure_sqlite_fks_on() -> None:
+    """SQLite has FK enforcement OFF by default — it is a per-connection
+    setting, and neither conftest nor `_build_engine` turns it on. So an
+    `ondelete="CASCADE"` the model genuinely declares is simply not enforced
+    by the test engine, and a cascade test fails against correct production
+    code. (Verified: PRAGMA foreign_keys reads 0; with it ON this file is
+    11/11 green.) Copied from tests/test_connector_schema.py, which hit this
+    first. No-op on Postgres.
+    """
+    if not _is_sqlite():
+        return
+    from app.db.database import engine
+    async with engine.begin() as conn:
+        await conn.execute(text("PRAGMA foreign_keys = ON"))
+
+
 # ── FK lifecycle ─────────────────────────────────────────────────────
 
 
@@ -261,6 +282,7 @@ async def test_deleting_trigger_cascades_to_events():
     from app.db import async_session_maker
     from app.db.models import Trigger, TriggerEvent
 
+    await _ensure_sqlite_fks_on()
     user_id = await _make_user()
     tid = await _make_trigger(user_id)
 

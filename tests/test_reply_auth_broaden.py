@@ -56,62 +56,33 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.db.models.base import Base
 from app.db.models.conversation import Conversation, Message
 from app.db.models.day_chat import DayChat
 from app.db.models.user import User
 
 
 async def _make_engine():
+    """Build the tables from the ORM models, not from a copy of them.
+
+    This was a hand-written `CREATE TABLE users (...)` and it drifted: the User
+    model gained a column the copy never did, and every ORM insert here started
+    failing on a column the table had never heard of. A hand-written schema is
+    a second source of truth nothing keeps in sync, and it breaks somewhere
+    else entirely — whenever someone adds a column.
+
+    `create_all(tables=[...])` stays narrow: only the tables this file uses, so
+    no pgvector column is compiled on sqlite, and dependency order is handled.
+    """
     engine = create_async_engine(
         "sqlite+aiosqlite://", connect_args={"check_same_thread": False}
     )
     async with engine.begin() as conn:
-        for stmt in [
-            """CREATE TABLE IF NOT EXISTS users (
-                id VARCHAR(36) PRIMARY KEY, email VARCHAR(255) UNIQUE,
-                hashed_password VARCHAR(255),
-                name VARCHAR(255), password_changed_at TIMESTAMP,
-                role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
-                updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
-                email_verified_at TIMESTAMP, email_verification_token VARCHAR(64),
-                email_verification_sent_at TIMESTAMP, is_canary BOOLEAN DEFAULT 0
-            )""",
-            """CREATE TABLE IF NOT EXISTS day_chats (
-                id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) REFERENCES users(id),
-                local_date DATE NOT NULL, timezone VARCHAR(50) DEFAULT 'UTC',
-                started_at TIMESTAMP, last_message_at TIMESTAMP,
-                message_count INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
-                rolling_summary TEXT, summary_up_to_message_id VARCHAR(50),
-                summary_updated_at TIMESTAMP, summary_status VARCHAR(20) DEFAULT 'up_to_date',
-                summary_failure_count INTEGER DEFAULT 0,
-                summary_last_failure_at TIMESTAMP,
-                summary_last_failure_reason VARCHAR(64),
-                archival_summary TEXT,
-                archival_summary_generated_at TIMESTAMP,
-                archival_summary_status VARCHAR(20) DEFAULT 'not_needed',
-                UNIQUE(user_id, local_date)
-            )""",
-            """CREATE TABLE IF NOT EXISTS conversations (
-                id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) REFERENCES users(id),
-                title VARCHAR(500), day_chat_id VARCHAR(36) REFERENCES day_chats(id),
-                channel VARCHAR(50) DEFAULT 'web', is_active BOOLEAN DEFAULT 1,
-                started_at TIMESTAMP, ended_at TIMESTAMP, updated_at TIMESTAMP,
-                message_count INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
-                builder_mode VARCHAR(10), metadata_json TEXT
-            )""",
-            """CREATE TABLE IF NOT EXISTS messages (
-                id VARCHAR(50) PRIMARY KEY, conversation_id VARCHAR(36) REFERENCES conversations(id),
-                day_chat_id VARCHAR(36) REFERENCES day_chats(id), role VARCHAR(20),
-                content TEXT, created_at TIMESTAMP, tokens_prompt INTEGER,
-                tokens_completion INTEGER, model_used VARCHAR(50),
-                memories_retrieved_json TEXT, processing_time_ms INTEGER,
-                metadata_json TEXT, embedding_json TEXT, embedding BLOB,
-                channel VARCHAR(50), source VARCHAR(50),
-                reply_to_message_id VARCHAR(50), attachments TEXT
-            )""",
-        ]:
-            await conn.run_sync(lambda c, s=stmt: c.execute(text(s)))
+        await conn.run_sync(
+            Base.metadata.create_all,
+            tables=[User.__table__, DayChat.__table__,
+                    Conversation.__table__, Message.__table__],
+        )
     return engine
 
 
@@ -219,112 +190,125 @@ async def test_service_conv_user_owned_day_chat_authorizes():
     POST-FIX day_chat ownership rescues the auth.
     """
     engine = await _make_engine()
-    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    USER_A, USER_B, dc_a, _dc_b = await _seed(sm)
+    try:
+        sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        USER_A, USER_B, dc_a, _dc_b = await _seed(sm)
 
-    # Service-stamped conversation but message bucketed into Alice's day_chat.
-    conv_service = await _make_conversation(sm, user_id=USER_B, dc_id=dc_a, channel="radio")
-    target_id = await _make_message(
-        sm, conv_id=conv_service, dc_id=dc_a, role="assistant",
-        content="Digital detox video is now playing for you!",
-        when=datetime(2026, 4, 28, 14, 16, 0),
-    )
-
-    async with sm() as db:
-        assert await _is_authorized(db, target_id, USER_A) is True, (
-            "Alice must be allowed to reply to a message in her own day_chat "
-            "even if the conversation is service-stamped"
+        # Service-stamped conversation but message bucketed into Alice's day_chat.
+        conv_service = await _make_conversation(sm, user_id=USER_B, dc_id=dc_a, channel="radio")
+        target_id = await _make_message(
+            sm, conv_id=conv_service, dc_id=dc_a, role="assistant",
+            content="Digital detox video is now playing for you!",
+            when=datetime(2026, 4, 28, 14, 16, 0),
         )
-    await engine.dispose()
+
+        async with sm() as db:
+            assert await _is_authorized(db, target_id, USER_A) is True, (
+                "Alice must be allowed to reply to a message in her own day_chat "
+                "even if the conversation is service-stamped"
+            )
 
 
+    finally:
+        await engine.dispose()
 async def test_same_user_conversation_still_authorizes():
     """Sanity: the original code path (Conversation.user_id == user_id)
     still works after the loosening."""
     engine = await _make_engine()
-    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    USER_A, _USER_B, dc_a, _dc_b = await _seed(sm)
+    try:
+        sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        USER_A, _USER_B, dc_a, _dc_b = await _seed(sm)
 
-    conv = await _make_conversation(sm, user_id=USER_A, dc_id=dc_a, channel="web")
-    target_id = await _make_message(
-        sm, conv_id=conv, dc_id=dc_a, role="assistant",
-        content="Standard same-user reply target",
-        when=datetime(2026, 4, 28, 10, 0, 0),
-    )
+        conv = await _make_conversation(sm, user_id=USER_A, dc_id=dc_a, channel="web")
+        target_id = await _make_message(
+            sm, conv_id=conv, dc_id=dc_a, role="assistant",
+            content="Standard same-user reply target",
+            when=datetime(2026, 4, 28, 10, 0, 0),
+        )
 
-    async with sm() as db:
-        assert await _is_authorized(db, target_id, USER_A) is True
-    await engine.dispose()
+        async with sm() as db:
+            assert await _is_authorized(db, target_id, USER_A) is True
 
 
+    finally:
+        await engine.dispose()
 async def test_other_user_message_is_rejected():
     """IDOR guard: a message that genuinely belongs to a different
     user (different conversation AND different day_chat) must STILL
     be rejected. The loosening must not open a cross-account leak.
     """
     engine = await _make_engine()
-    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    USER_A, USER_B, _dc_a, dc_b = await _seed(sm)
+    try:
+        sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        USER_A, USER_B, _dc_a, dc_b = await _seed(sm)
 
-    conv_b = await _make_conversation(sm, user_id=USER_B, dc_id=dc_b, channel="web")
-    target_id = await _make_message(
-        sm, conv_id=conv_b, dc_id=dc_b, role="user",
-        content="ServiceBot's private content",
-        when=datetime(2026, 4, 28, 11, 0, 0),
-    )
-
-    async with sm() as db:
-        assert await _is_authorized(db, target_id, USER_A) is False, (
-            "Alice must NOT be able to reply to ServiceBot's owned message"
+        conv_b = await _make_conversation(sm, user_id=USER_B, dc_id=dc_b, channel="web")
+        target_id = await _make_message(
+            sm, conv_id=conv_b, dc_id=dc_b, role="user",
+            content="ServiceBot's private content",
+            when=datetime(2026, 4, 28, 11, 0, 0),
         )
-    await engine.dispose()
+
+        async with sm() as db:
+            assert await _is_authorized(db, target_id, USER_A) is False, (
+                "Alice must NOT be able to reply to ServiceBot's owned message"
+            )
 
 
+    finally:
+        await engine.dispose()
 async def test_missing_target_returns_none():
     """Stale frontend id: no row exists. Auth must return False, not
     crash, and the calling code's WARNING log surfaces the case."""
     engine = await _make_engine()
-    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    USER_A, _USER_B, _dc_a, _dc_b = await _seed(sm)
+    try:
+        sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        USER_A, _USER_B, _dc_a, _dc_b = await _seed(sm)
 
-    async with sm() as db:
-        assert await _is_authorized(db, "non-existent-msg-id", USER_A) is False
-    await engine.dispose()
+        async with sm() as db:
+            assert await _is_authorized(db, "non-existent-msg-id", USER_A) is False
 
 
-async def test_null_conv_user_with_owned_day_chat_authorizes():
-    """Edge case: Conversation.user_id is literally NULL (legacy row
-    before the user_id stamp was tightened). Day_chat ownership must
-    still rescue auth."""
+    finally:
+        await engine.dispose()
+async def test_missing_conversation_row_still_authorizes_via_day_chat():
+    """The outer join must not lose auth when the Conversation row is absent.
+
+    This test used to insert a conversation with `user_id = NULL`, saying
+    "older rows in prod predate that constraint". That premise is false:
+    `conversations.user_id` is NOT NULL in the very first migration
+    (20260204_0001, line 39) and no `alter_column` has ever touched it, so a
+    NULL-user_id conversation has never existed. The old test only ran at all
+    because this file's hand-written CREATE TABLE omitted the constraint —
+    once the schema came from the model, the insert correctly failed with
+    `IntegrityError: NOT NULL constraint failed: conversations.user_id`.
+
+    So pin the property the production code actually claims. ws_chat.py says,
+    in its own words: "Outer-joins so a missing Conversation or DayChat row
+    (older data, race conditions) doesn't fail the whole query — we just check
+    the side that resolved." Reach the NULL the way production can: a message
+    whose `conversation_id` points at no row, with day_chat ownership left to
+    carry the authorization.
+    """
     engine = await _make_engine()
-    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    USER_A, _USER_B, dc_a, _dc_b = await _seed(sm)
+    try:
+        sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        USER_A, _USER_B, dc_a, _dc_b = await _seed(sm)
 
-    # Raw insert because the ORM declares user_id non-null; older rows
-    # in prod predate that constraint.
-    conv_null = str(uuid.uuid4())
-    async with sm() as db:
-        await db.execute(text(
-            "INSERT INTO conversations (id, user_id, channel, day_chat_id, "
-            "started_at, updated_at, is_active, message_count, total_tokens) "
-            "VALUES (:id, NULL, 'routine', :dc, :ts, :ts, 1, 0, 0)"
-        ), {
-            "id": conv_null, "dc": dc_a,
-            "ts": datetime(2026, 4, 28, 8, 0, 0),
-        })
-        await db.commit()
-
-    target_id = await _make_message(
-        sm, conv_id=conv_null, dc_id=dc_a, role="assistant",
-        content="Legacy routine output with null conv user_id",
-        when=datetime(2026, 4, 28, 12, 0, 0),
-    )
-
-    async with sm() as db:
-        assert await _is_authorized(db, target_id, USER_A) is True, (
-            "Legacy NULL-user_id conversation must still authorize via day_chat"
+        target_id = await _make_message(
+            sm, conv_id=str(uuid.uuid4()),   # orphan: no such conversation row
+            dc_id=dc_a, role="assistant",
+            content="Routine output whose conversation row is gone",
+            when=datetime(2026, 4, 28, 12, 0, 0),
         )
-    await engine.dispose()
+
+        async with sm() as db:
+            assert await _is_authorized(db, target_id, USER_A) is True, (
+                "a missing Conversation row must not lose auth — the outer "
+                "join exists so day_chat ownership can still carry it"
+            )
+    finally:
+        await engine.dispose()
 
 
 async def _main():
@@ -333,7 +317,7 @@ async def _main():
         ("same-user conv (regression)", test_same_user_conversation_still_authorizes),
         ("other user's message rejected (IDOR guard)", test_other_user_message_is_rejected),
         ("missing target returns False", test_missing_target_returns_none),
-        ("null conv user_id + user day_chat", test_null_conv_user_with_owned_day_chat_authorizes),
+        ("orphaned conversation_id + user day_chat", test_missing_conversation_row_still_authorizes_via_day_chat),
     ]
     failures = []
     for name, fn in tests:

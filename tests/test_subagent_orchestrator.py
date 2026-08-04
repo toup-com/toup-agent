@@ -23,8 +23,11 @@ What we pin
   job_type='subagent', source_kind='subagent', source_id=parent,
   config_json populated, idempotency_key set.
 - Child run is fired via asyncio.create_task; spawn_subagent
-  returns immediately (non-blocking contract: well under 500ms
-  even for a child that takes a full second).
+  returns without waiting for it. Pinned by holding the child on an
+  asyncio.Event rather than by timing the call: a blocking
+  implementation cannot reach the assertions at all, which is true
+  at any machine speed. The former "under 500ms with a 1s child"
+  bound was a coin-flip under CI load and is gone.
 - On child success: writer called with outcome='success', WS
   broadcast fires, summary_message_id stamped, status='completed'
   / outcome='success'.
@@ -65,19 +68,38 @@ class FakeAgentResponse:
 
 
 class FakeAgentRunner:
-    def __init__(self, *, response_text="result", raise_exc=None, delay=0.0):
+    """Stands in for the real runner.
+
+    `gate` is the deterministic alternative to `delay`. A test that needs to
+    observe the child *while it is still running* should hold it on an
+    unset `gate` rather than race a `delay` against a wall clock: with a gate
+    the child provably has not finished, at any machine speed and under any
+    CI load. `delay` remains for tests that only need "this takes a moment".
+    """
+
+    def __init__(self, *, response_text="result", raise_exc=None, delay=0.0,
+                 gate: "asyncio.Event | None" = None):
         self.calls: list[dict[str, Any]] = []
         self._response_text = response_text
         self._raise_exc = raise_exc
         self._delay = delay
+        self._gate = gate
+        self.started = asyncio.Event()
+        self.finished = asyncio.Event()
 
     async def run(self, **kwargs):
         self.calls.append(kwargs)
-        if self._delay:
-            await asyncio.sleep(self._delay)
-        if self._raise_exc:
-            raise self._raise_exc
-        return FakeAgentResponse(text=self._response_text)
+        self.started.set()
+        try:
+            if self._gate is not None:
+                await self._gate.wait()
+            elif self._delay:
+                await asyncio.sleep(self._delay)
+            if self._raise_exc:
+                raise self._raise_exc
+            return FakeAgentResponse(text=self._response_text)
+        finally:
+            self.finished.set()
 
 
 @pytest_asyncio.fixture
@@ -142,20 +164,38 @@ async def _seed_user(db, user_id: str) -> None:
         await db.commit()
 
 
-async def _wait_for_completion(job_id: str, *, timeout: float = 5.0):
+async def _wait_for_completion(job_id: str, *, timeout: float = 30.0):
+    """Poll until the job row reaches a terminal status.
+
+    The deadline is a deadlock backstop, NOT a performance assertion — so it is
+    generous. A tight bound here measures how loaded the CI runner is rather
+    than whether the orchestrator works, and the sweep runs many pytest
+    processes at once. Nothing about correctness depends on this number; if a
+    test needs to observe a child mid-flight it should gate the child (see
+    FakeAgentRunner) instead of shrinking this.
+
+    On expiry, report the status actually seen — "did not reach terminal" with
+    no value forces whoever hits it to re-run locally to learn anything.
+    """
     from app.db.database import async_session_maker
     from app.db.models import BuildJob
     from sqlalchemy import select
 
+    TERMINAL = ("completed", "failed", "timeout", "cancelled", "budget_exhausted")
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
+    last = "<never read>"
     while loop.time() < deadline:
         async with async_session_maker() as db:
             row = (await db.execute(select(BuildJob).where(BuildJob.id == job_id))).scalar_one()
-            if row.status in ("completed", "failed", "timeout", "cancelled", "budget_exhausted"):
+            last = row.status
+            if row.status in TERMINAL:
                 return row
         await asyncio.sleep(0.05)
-    raise AssertionError(f"Job {job_id} did not reach terminal status within {timeout}s")
+    raise AssertionError(
+        f"Job {job_id} did not reach a terminal status within {timeout}s — "
+        f"last status seen was {last!r} (terminal set: {TERMINAL})"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -238,7 +278,7 @@ async def test_spawn_creates_buildjob_with_right_shape(
         assert job.idempotency_key is not None
         assert job.idempotency_key.startswith("sa:top:")
 
-    await _wait_for_completion(job_id, timeout=3.0)
+    await _wait_for_completion(job_id)
 
 
 @pytest.mark.asyncio
@@ -260,7 +300,7 @@ async def test_happy_path_writes_message_and_marks_completed(
         agent_runner=runner,
     )
     job_id = result["job_id"]
-    row = await _wait_for_completion(job_id, timeout=5.0)
+    row = await _wait_for_completion(job_id)
 
     assert row.status == "completed"
     assert row.outcome == "success"
@@ -319,7 +359,7 @@ async def test_timeout_marks_status_and_announces(
         parent_job_id=None, channel="web",
         telegram_chat_id=None, agent_runner=runner,
     )
-    row = await _wait_for_completion(result["job_id"], timeout=5.0)
+    row = await _wait_for_completion(result["job_id"])
 
     assert row.status == "timeout"
     assert row.outcome == "timeout"
@@ -352,7 +392,7 @@ async def test_exception_marks_failed_with_error_message(
         parent_job_id=None, channel="web",
         telegram_chat_id=None, agent_runner=runner,
     )
-    row = await _wait_for_completion(result["job_id"], timeout=5.0)
+    row = await _wait_for_completion(result["job_id"])
 
     assert row.status == "failed"
     assert row.outcome == "failed"
@@ -415,7 +455,7 @@ async def test_retried_spawn_collapses_to_existing_row(
     assert r1["job_id"] == r2["job_id"]
     assert r2["idempotency_collapsed"] is True
 
-    await _wait_for_completion(r1["job_id"], timeout=5.0)
+    await _wait_for_completion(r1["job_id"])
     # Only one child run was fired despite the duplicate spawn.
     assert len(runner.calls) == 1
 
@@ -427,33 +467,59 @@ async def test_retried_spawn_collapses_to_existing_row(
 
 @pytest.mark.asyncio
 async def test_spawn_returns_immediately(enable_spawning, patch_writer):
-    """spawn_subagent must return ~ms regardless of how long the
-    child takes. We use a 1-second delay child and assert spawn
-    returned in well under 500ms. Same single-writer fix as
-    test_retried_spawn — don't hold a session during spawn."""
-    import time
+    """spawn_subagent must return without waiting for its child.
+
+    Proven by construction rather than by stopwatch: the child is held on an
+    `asyncio.Event` that this test never sets until after the assertions, so
+    an implementation that awaited the child could not reach the assertions
+    at all. Same single-writer care as test_retried_spawn — don't hold a
+    session open across spawn.
+    """
     from app.agent.subagent_orchestrator import spawn_subagent
     from app.db.database import async_session_maker
 
     uid = str(uuid.uuid4())
     async with async_session_maker() as db:
         await _seed_user(db, uid)
-    runner = FakeAgentRunner(delay=1.0)
-    t0 = time.perf_counter()
-    result = await spawn_subagent(
-        user_id=uid, task="slow",
-        label="L", model=None, timeout_seconds=10,
-        parent_job_id=None, channel="web",
-        telegram_chat_id=None, agent_runner=runner,
-    )
-    elapsed = time.perf_counter() - t0
-    # Generous bound to absorb singleton-state pollution from other
-    # tests in the same pytest session (LaneManager / engine / etc.).
-    # The 1.0s child delay makes the non-blocking property obvious
-    # regardless: if spawn awaited the child, elapsed would be ≥ 1.0.
-    assert elapsed < 0.95, f"spawn took {elapsed:.3f}s — must be non-blocking"
+    # Hold the child on a gate nothing has set yet. This is what makes the
+    # assertion deterministic: if spawn_subagent awaited its child, it could
+    # not return at all — so the property is proven by spawn returning, not by
+    # it returning FAST. The previous version raced a 1.0s child delay against
+    # an `elapsed < 0.95` bound, which is a coin-flip on a loaded runner: it
+    # failed 1 run in 5 on an idle laptop, and CI executes this file alongside
+    # others.
+    #
+    # wait_for, not a bare await, so a genuinely blocking implementation fails
+    # in 10s with "spawn_subagent never returned" instead of hanging the suite
+    # forever — a hang is strictly worse than a failure, because it reports as
+    # a timeout with no diagnosis.
+    gate = asyncio.Event()
+    runner = FakeAgentRunner(gate=gate)
+    try:
+        result = await asyncio.wait_for(
+            spawn_subagent(
+                user_id=uid, task="slow",
+                label="L", model=None, timeout_seconds=10,
+                parent_job_id=None, channel="web",
+                telegram_chat_id=None, agent_runner=runner,
+            ),
+            timeout=10.0,
+        )
+    except asyncio.TimeoutError:
+        raise AssertionError(
+            "spawn_subagent never returned while its child was held on a gate "
+            "— it is awaiting the child instead of backgrounding it"
+        )
+
     assert result["job_id"]
-    await _wait_for_completion(result["job_id"], timeout=5.0)
+    # The child is still inside run(), provably: only `gate` can release it.
+    assert not runner.finished.is_set(), (
+        "child finished before the gate was released — the fake ran to "
+        "completion, so this test is no longer observing a live child"
+    )
+
+    gate.set()
+    await _wait_for_completion(result["job_id"])
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -86,11 +86,34 @@ def test_b_engine_race(monkeypatch):
     monkeypatch.setattr(S, "_search_mojeek", eng(PER_OP, "mojeek"))
     monkeypatch.setattr(S.settings, "search_cache_enabled", False)
 
-    base = _time(lambda: asyncio.run(S._toup_search_sequential("q", 5)))   # waits on DDG
-    final = _time(lambda: asyncio.run(S._toup_search_race("q", 5)))        # Bing wins
+    seq_out = {}
+    race_out = {}
+    base = _time(lambda: seq_out.update(r=asyncio.run(S._toup_search_sequential("q", 5))))
+    final = _time(lambda: race_out.update(r=asyncio.run(S._toup_search_race("q", 5))))
 
     _record("B. search w/ dead+slow engine", base, final, "sequential→race")
-    assert final < base * 0.6, f"race should return the fastest engine: base={base:.2f} final={final:.2f}"
+
+    # Assert the CLAIM, not the clock.
+    #
+    # This used to be `final < base * 0.6`, and it went red in CI on
+    # 2026-08-03 with base=0.45 final=0.31 — nothing was broken, the runner was
+    # just busy (the sweep runs three pytest processes at once, and 0.16s of
+    # scheduling noise is enough to eat a 0.15s-vs-0.45s margin). A wall-clock
+    # ratio measured under parallel load is a coin toss, and a test that goes
+    # red when the machine is busy teaches people to ignore it.
+    #
+    # What "race should return the fastest engine" actually MEANS is that the
+    # winner is bing (0.15s) and not ddg (0.45s) — which is deterministic.
+    assert race_out["r"][1] == "bing", (
+        f"race must return the FASTEST engine's result, got {race_out['r'][1]!r}"
+    )
+    assert seq_out["r"][1] == "ddg", (
+        "the sequential baseline must still be the slow primary — otherwise "
+        f"this scenario is not measuring what it claims, got {seq_out['r'][1]!r}"
+    )
+    # Timing kept as a soft floor only: the race must not WAIT for the slow
+    # engine. Bounded well away from scheduling noise rather than at 0.6x.
+    assert final < base, f"race should not be slower: base={base:.2f} final={final:.2f}"
 
 
 # ── Scenario C: cache (repeat query) ────────────────────────────────────
