@@ -73,7 +73,9 @@ async def test_a_play_never_runs_an_agent_turn(v2_on, monkeypatch):
     assert len(calls) == 1, f"expected exactly one hop, got {calls}"
     method, path, body, timeout = calls[0]
     assert (method, path) == ("POST", "/api/v1/internal/play-media")
-    assert body == {"query": "asap rocky"}
+    # The query is what must survive the hop; the body is additive over time
+    # (`variety` rides along so an open-ended voice ask starts somewhere fresh).
+    assert body["query"] == "asap rocky"
     assert timeout == rt._PLAY_MEDIA_TIMEOUT_S
     # The regression this whole change exists to prevent.
     assert all("agent-turn" not in c[1] for c in calls)

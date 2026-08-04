@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Optional
+import re
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel, Field
@@ -34,6 +35,8 @@ from app.db.models import AgentConfig
 router = APIRouter(prefix="/internal/radio", tags=["internal (radio)"])
 logger = logging.getLogger(__name__)
 
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,16}$")
+
 
 class YtReq(BaseModel):
     user_id: str = Field(..., min_length=8, max_length=36)
@@ -42,6 +45,16 @@ class YtReq(BaseModel):
     query: Optional[str] = None
     filter: Optional[str] = None
     limit: Optional[int] = None
+    # get_watch_playlist only: request YT Music's own "Start Radio" variant
+    # (params=wAEB), which varies its picks per call — the lever that makes a
+    # repeated "play me Drake" build a FRESH station instead of the same 50
+    # tracks in the same order.
+    radio: Optional[bool] = None
+
+
+class WarmReq(BaseModel):
+    user_id: str = Field(..., min_length=8, max_length=36)
+    video_ids: List[str] = Field(..., max_length=3)
 
 
 async def _auth_agent(x_agent_key: Optional[str], user_id: str) -> None:
@@ -78,7 +91,9 @@ async def yt(req: YtReq, x_agent_key: Optional[str] = Header(default=None)) -> d
             if not req.video_id:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "video_id required")
             result: Any = await asyncio.to_thread(
-                lambda: ytm.get_watch_playlist(videoId=req.video_id, limit=req.limit or 50)
+                lambda: ytm.get_watch_playlist(
+                    videoId=req.video_id, limit=req.limit or 50, radio=bool(req.radio),
+                )
             )
         elif op == "search":
             if not req.query:
@@ -95,3 +110,36 @@ async def yt(req: YtReq, x_agent_key: Optional[str] = Header(default=None)) -> d
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"ytmusic failed: {type(e).__name__}")
 
     return {"result": result}
+
+
+# Separate router because the warm endpoint is media-scoped, not radio-scoped
+# (/api/internal/media/warm). Registered alongside internal_radio_router in
+# platform_main.
+media_warm_router = APIRouter(prefix="/internal/media", tags=["internal (media)"])
+
+
+@media_warm_router.post("/warm")
+async def warm(req: WarmReq, x_agent_key: Optional[str] = Header(default=None)) -> dict:
+    """Pre-build the audio remux (L1/L2 cache) for up to 3 tracks.
+
+    Called by tenant agents at media_play broadcast time (radio/player.py
+    `warm_audio_cache`) so the phone's native request — which lands within a
+    second or two on the audio-first app — hits a build already in flight or
+    done instead of a cold yt-dlp extraction. The build path is deduped
+    (`_remux_tasks`) and concurrency-capped (`_build_sem`), so this can never
+    stampede the residential proxy; a warm for an already-cached track is a
+    no-op.
+    """
+    await _auth_agent(x_agent_key, req.user_id)
+    ids = [v for v in req.video_ids if isinstance(v, str) and _VIDEO_ID_RE.match(v)][:3]
+    if not ids:
+        return {"ok": True, "warmed": 0}
+    try:
+        from app.api.media_proxy import _ensure_remux_bg
+    except Exception as e:  # media proxy unavailable in this process shape
+        logger.warning("[internal/media] warm unavailable: %s", e)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "media proxy unavailable")
+    for vid in ids:
+        asyncio.create_task(_ensure_remux_bg(vid))
+    logger.info("[internal/media] warm accepted ids=%s user=%s", ids, req.user_id[:8])
+    return {"ok": True, "warmed": len(ids)}

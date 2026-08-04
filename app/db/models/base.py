@@ -87,6 +87,10 @@ AGENT_ONLY_TABLES: set[str] = {
     "documents",
     "document_chunks",
     "media",
+    # Toup Media library — saved, replayable playlists (captured radio
+    # stations). Platform reads via the memories-style proxy; the platform DB
+    # keeps a mirror table only as the read-fallback target.
+    "media_playlists",
     # Apps & build jobs
     "apps",
     "build_jobs",

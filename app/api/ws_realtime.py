@@ -181,6 +181,9 @@ _VOICE_TOOL_DESCRIPTIONS = {
         "'something like X'. Do NOT use `think` for playback: this is far faster and it is "
         "the tool that actually starts the audio. Pass what they asked for in their own "
         "words. More music in the same style follows automatically after the track ends. "
+        "For an open-ended ask — an artist, genre, or vibe rather than one specific song "
+        "('play me some Drake', 'something chill') — also pass variety=true so a repeat "
+        "request starts somewhere fresh instead of replaying the same track. "
         "Say ONE short line while it starts — they are listening to a speaker, not reading "
         "a screen — and never read out a list of alternatives.\n"
         "ONE exception to acting immediately: you must actually have heard WHAT to play. "
@@ -1420,7 +1423,7 @@ _THINK_FALLBACK_SYSTEM = (
 
 
 # ── Deep Think — Claude Opus reasoning for complex voice tasks ────────
-async def _play_media_direct(user_id: str, query: str) -> str:
+async def _play_media_direct(user_id: str, query: str, variety: bool = False) -> str:
     """Start playback via the agent's tool-less /internal/play-media route.
 
     The whole point is that nothing here reasons. `think` exists for requests
@@ -1449,7 +1452,9 @@ async def _play_media_direct(user_id: str, query: str) -> str:
     try:
         data = await _vps_api(
             agent_url, agent_api_key, "POST", "/api/v1/internal/play-media",
-            json_body={"query": query},
+            # Voice is always audio (a call has no screen for video); `variety`
+            # rides through so an open-ended ask starts somewhere fresh.
+            json_body={"query": query, "variety": variety},
             timeout=_PLAY_MEDIA_TIMEOUT_S,
         )
     except Exception as e:  # noqa: BLE001
@@ -3044,7 +3049,8 @@ async def realtime_voice_ws(
                         # ── Play media: straight to the agent's resolver ──
                         elif func_name == "play_media":
                             result, _played = await _play_media_direct(
-                                user_id, str(arguments.get("query", "")))
+                                user_id, str(arguments.get("query", "")),
+                                variety=bool(arguments.get("variety")))
                             # Carried to this turn's assistant persist so the
                             # thread gets the same Toup media card a chat play
                             # produces. Cleared after the persist below.

@@ -918,6 +918,67 @@ class SoulConfigResponse(BaseModel):
         from_attributes = True
 
 
+class PlaylistTrack(BaseModel):
+    """One entry of a saved Toup Media playlist (music only today)."""
+    video_id: str
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    length: Optional[str] = None
+    video_type: Optional[str] = None
+
+
+class PlaylistCreate(BaseModel):
+    """Create a playlist — either from explicit tracks or by capturing the
+    live radio station on `from_channel` (exact tracks, exact order)."""
+    name: Optional[str] = Field(default=None, max_length=200)
+    media_type: str = Field(default="music", max_length=20)
+    from_channel: Optional[str] = Field(default=None, max_length=16)
+    tracks: Optional[List[PlaylistTrack]] = None
+
+
+class PlaylistUpdate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+
+
+class PlaylistSummaryResponse(BaseModel):
+    id: str
+    name: str
+    media_type: str
+    source: str
+    seed_intent: Optional[str] = None
+    track_count: int
+    artwork_url: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+
+class PlaylistResponse(PlaylistSummaryResponse):
+    tracks: List[PlaylistTrack]
+
+
+class PlaylistPlayRequest(BaseModel):
+    channel: str = Field(default="app", max_length=16)
+    # Start from this track instead of the top, so tapping a song in the detail
+    # view plays THAT song with the rest of the playlist behind it.
+    start_video_id: Optional[str] = Field(default=None, max_length=32)
+
+
+class PlaylistPlayResponse(BaseModel):
+    ok: bool
+    first: Optional[PlaylistTrack] = None
+    upcoming: List[PlaylistTrack] = []
+
+
+class LiveStationResponse(BaseModel):
+    """Snapshot of the live radio station on a channel — what "Save this
+    station" captures. active=False when nothing is playing."""
+    active: bool
+    seed_intent: Optional[str] = None
+    current: Optional[PlaylistTrack] = None
+    track_count: int = 0
+
+
 # Forward references
 MemoryWithRelations.model_rebuild()
 SessionWithMessages.model_rebuild()

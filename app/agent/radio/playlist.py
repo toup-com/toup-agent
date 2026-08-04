@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -52,6 +53,7 @@ def _yt_remote(
     query: str = "",
     filter: str = "",
     limit: int = 0,
+    radio: bool = False,
 ):
     """Run a ytmusicapi call on the PLATFORM (which has a working residential
     proxy) instead of locally, and return the raw result.
@@ -88,6 +90,8 @@ def _yt_remote(
         body["filter"] = filter
     if limit:
         body["limit"] = limit
+    if radio:
+        body["radio"] = True
     # The route lives under the API prefix (`/api/internal/radio/yt`), but a
     # tenant's PLATFORM_API_URL is not reliably set with the `/api` suffix —
     # caught live for this tenant on 2026-05-24, where the container's OS env
@@ -203,12 +207,37 @@ def _parse_track(raw: dict) -> Optional[StationTrack]:
     )
 
 
+def _light_shuffle(
+    station: List[StationTrack], keep_head: int = 2, window: int = 8,
+) -> List[StationTrack]:
+    """Vary playback order without wrecking the station's flow.
+
+    Keeps the first `keep_head` tracks in place (the closest matches to the
+    seed — the "this is the right vibe" confirmation), then shuffles the rest
+    inside consecutive windows so similar-ranked tracks trade places but a
+    track from the deep tail can never jump to slot 3. Belt-and-suspenders on
+    top of `radio=True`: even if YT Music returns a similar list twice, the
+    ORDER a repeat request plays in still differs.
+    """
+    if len(station) <= keep_head + 2:
+        return station
+    head = station[:keep_head]
+    rest = station[keep_head:]
+    out: List[StationTrack] = []
+    for i in range(0, len(rest), window):
+        chunk = rest[i:i + window]
+        random.shuffle(chunk)
+        out.extend(chunk)
+    return head + out
+
+
 async def build_station(
     seed_video_id: str,
     limit: int = 50,
     *,
     seed_title: str = "",
     seed_artist: str = "",
+    variety: bool = False,
 ) -> Tuple[Optional[StationTrack], List[StationTrack]]:
     """Return (seed_meta, station) for `seed_video_id` from YT Music Song Radio.
 
@@ -236,11 +265,14 @@ async def build_station(
         return None, []
 
     def _fetch() -> dict:
-        remote = _yt_remote("get_watch_playlist", video_id=seed, limit=limit)
+        # `radio=True` (variety) asks for YT Music's own "Start Radio" variant
+        # (params=wAEB), which changes its picks per call — a repeated request
+        # for the same seed gets a FRESH station instead of the same 50 tracks.
+        remote = _yt_remote("get_watch_playlist", video_id=seed, limit=limit, radio=variety)
         if remote is not None:
             return remote
         ytm = _ytmusic()
-        return ytm.get_watch_playlist(videoId=seed, limit=limit)
+        return ytm.get_watch_playlist(videoId=seed, limit=limit, radio=variety)
 
     try:
         # Bounded, like every other network call in this module
@@ -296,7 +328,7 @@ async def build_station(
         flush=True,
     )
     if station:
-        return seed_meta, station
+        return seed_meta, (_light_shuffle(station) if variety else station)
     # YT Music had no Song-radio for this seed (regional / non-catalog track →
     # 200 with empty tracks, or the fetch threw above). Recover with a search-
     # based station rather than rejecting the toggle. Reached ONLY on today's

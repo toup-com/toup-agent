@@ -536,53 +536,38 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
                 params={"search_query": query},
                 headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36"},
             )
-            id_matches = _re_mod.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
-            if id_matches:
-                video_id = id_matches[0]
-                # Take the title from the SAME result block as the id we chose.
-                # These two regexes used to run independently — first id on the
-                # page, first title on the page — which are not the same result
-                # whenever YouTube puts a shelf, an ad, or a "people also
-                # watched" entry between them. On 2026-07-31 that paired
-                # Kendrick Lamar's HUMBLE (correct video) with the title of a
-                # Rakim reaction video, and because the title is what feeds both
-                # the [SYSTEM] line below AND the radio seed, the user got the
-                # right song followed by a station built from a stranger.
-                # Anchoring on the id keeps the same video and makes the title
-                # honest.
-                # `(?:(?!"videoId":")[\s\S])` — consume anything EXCEPT the
-                # start of another result. Without that guard, a bounded `.*?`
-                # window still crosses into the next videoRenderer whenever our
-                # own block happens to carry no title, and we are right back to
-                # showing one video under another's name — the bug this is here
-                # to fix, just rarer and harder to spot.
-                title_m = _re_mod.search(
-                    _re_mod.escape(f'"videoId":"{video_id}"')
-                    + r'(?:(?!"videoId":")[\s\S]){0,3000}?'
-                    + r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"',
-                    resp.text,
+            from app.agent import media_resolve as _mr
+            _cands = _mr.scrape_results(resp.text, limit=6)
+            _pick = _mr.pick_best(query, _cands, variety=False)
+            if _pick:
+                # RELEVANCE-RANKED, not "first id on the page". The top result
+                # for a Persian song title is regularly a mix, a reaction or a
+                # different artist's cover; taking it blind is half of how the
+                # agent came to announce one song while another played.
+                video_id, video_title, _ = _pick
+            else:
+                # No result carried a title of its own. Do NOT fall back to the
+                # user's words — that is where the literal lowercase "ebi" card
+                # came from, and a fake title does not stop at the card: it is
+                # the [SYSTEM] line the model paraphrases, the persisted card,
+                # and the seed the whole station is built from. Hand the request
+                # to the agent's own resolver ladder (yt-dlp always returns real
+                # metadata) by declining the fast path.
+                logger.warning(
+                    "[FAST-MEDIA] no titled result for %r — deferring to play_media", query,
                 )
-                if title_m:
-                    raw_title = title_m.group(1)
-                    try:
-                        # Decode YouTube's JSON escapes (& for & is in a
-                        # large share of music titles).
-                        video_title = json.loads(f'"{raw_title}"')
-                    except Exception:
-                        video_title = raw_title
-                else:
-                    # No title in this id's block. Use what the user asked for
-                    # rather than some other result's title — a generic label is
-                    # merely unhelpful, a WRONG one actively misdirects the
-                    # agent's reply and the station seed.
-                    video_title = query
-                    logger.warning(
-                        "[FAST-MEDIA] no title block for %s — falling back to the query", video_id
-                    )
-
+                return None
         if not video_id:
             logger.warning("[FAST-MEDIA] No video found for: %s", query)
             return None
+
+        # Which surface did they ask for? This path handles most typed "play …"
+        # messages AND tells the agent not to call play_media, so if it doesn't
+        # answer the question nothing downstream can: the phone is audio-first,
+        # and "play the music video for HUMBLE" would come out as album art.
+        # See infer_requested_mode — the same call the tool makes.
+        from app.agent.radio.player import infer_requested_mode
+        requested_mode = infer_requested_mode(text) or "song"
 
         # Broadcast media_play immediately — frontend opens YouTube embed (zero delay)
         event = {
@@ -591,6 +576,7 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
             "video_id": video_id,
             "title": video_title,
             "url": f"https://www.youtube.com/watch?v={video_id}",
+            "mode": requested_mode,
             # Always send artwork — see the note in tool_executor's identical
             # broadcast. Derived from the id, so it costs nothing and can never
             # be blank.
@@ -605,13 +591,43 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
         # Radio session: record this as a user-driven seed. Channel is unknown
         # at this helper layer — caller records after resolving channel.
 
-        # Return modified text so agent knows media is already playing
+        # Return modified text so the agent knows media has been dispatched.
+        # The model cannot see the card, so this line is the ONLY thing standing
+        # between it and announcing whatever the user asked for. Bind it to the
+        # resolved title, and when the resolution does not answer the request,
+        # tell it to say so rather than claim success over a stranger's song.
+        #
+        # It says STARTING, not "already playing". All that has happened here is
+        # a media_play frame going out over the socket; on the audio-first phone
+        # path the device then has to resolve, fetch and buffer the track, which
+        # on a cold track is seconds — 12.5s of them in the founder recording of
+        # 2026-08-03. The old wording ("is ALREADY playing") was a claim the
+        # server cannot make and the model repeated it verbatim: it answered a
+        # fresh "Play me moein" with "Moein's already playing", over silence,
+        # nine seconds before the first sound. Worse, "already" reads as "this
+        # was on before you asked", so the reply denied the request it was
+        # fulfilling. Playback truth lives on the device (`nowPlaying`, written
+        # only when audio is genuinely audible); the agent must not assert it.
+        _mismatch = _mr.describe_mismatch(query, video_title)
         modified_text = (
-            f"{text}\n\n[SYSTEM: The video \"{video_title}\" (https://www.youtube.com/watch?v={video_id}) "
-            f"is already playing in the user's browser. Do NOT call play_media. "
-            f"Just respond conversationally about what's now playing.]"
+            f"{text}\n\n[SYSTEM: The track \"{video_title}\" "
+            f"(https://www.youtube.com/watch?v={video_id}) is being STARTED on the "
+            f"user's device right now — it is not audible yet. Do NOT call play_media. "
+            f"Respond conversationally as though putting it on, and when you name what "
+            f"is playing use this EXACT title — \"{video_title}\" — never the words the "
+            f"user typed. Never imply it was audible before this message, and never "
+            f"ask whether they can hear it yet."
+            + (f" {_mismatch}" if _mismatch else "")
+            + "]"
         )
-        media_meta = {"type": "youtube", "video_id": video_id, "title": video_title}
+        media_meta = {
+            "type": "youtube", "video_id": video_id, "title": video_title,
+            # Carried so the auto-enable that follows can build the station on
+            # the SAME surface the frame just told the client to use. Without
+            # it the station resolves its variants for 'song' while the phone
+            # is showing the video the user asked for.
+            "mode": requested_mode,
+        }
         return (modified_text, media_meta)
     except Exception as e:
         logger.warning("[FAST-MEDIA] Fast-path failed (agent will handle): %s", e)
@@ -640,6 +656,13 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
     # We still build the station + flip the toggle ON; the queue prefetches from
     # the first auto-advance onward.
     auto = bool(msg.get("_auto"))
+    # Optional initial display mode riding the toggle. Applied AFTER enable()'s
+    # reset — this is what collapses the old two-frame race where the client
+    # toggled and then sent radio_display_mode, and the station resolved its
+    # first upcoming window in between, for the wrong surface.
+    initial_mode = (msg.get("mode") or "").strip().lower()
+    if initial_mode not in ("song", "video"):
+        initial_mode = ""
 
     print(f"[radio] toggle entry user={user_id[:8]} channel={channel!r} enabled={enabled} auto={auto} msg={msg}", flush=True)
 
@@ -711,7 +734,21 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
     atv_seed = seed_video_id
     try:
         from app.agent.radio.playlist import StationTrack as _ST, find_topic_version as _ftv
-        _probe = _ST(video_id=seed_video_id, title=(seed_title or seed_intent), artist="")
+        from app.agent.media_resolve import split_artist_title as _split
+        # PASS THE ARTIST. find_topic_version holds the only artist check in the
+        # media stack and it is conditional on the caller supplying one — probe
+        # with "" and the guard is skipped entirely, so the first ATV hit for
+        # the seed's title wins no matter WHOSE it is, and the whole 50-track
+        # station is then built from that stranger. "Play me ebi" coming back as
+        # Music_Afghani and Parastoo Ahmadi (recording, 2026-08-03 14:11) is this
+        # line. Titles arrive as "Artist - Title" from both producers.
+        _seed_label = seed_title or seed_intent or ""
+        _seed_artist, _seed_song = _split(_seed_label)
+        _probe = _ST(
+            video_id=seed_video_id,
+            title=_seed_song or _seed_label,
+            artist=_seed_artist,
+        )
         _resolved = await _ftv(_probe)
         if _resolved and _resolved.video_id:
             atv_seed = _resolved.video_id
@@ -722,6 +759,51 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
             )
     except Exception as _se:
         print(f"[radio] seed_atv_resolve_failed seed={seed_video_id} err={_se}", flush=True)
+
+    # DUPLICATE TOGGLE FOR A STATION THAT ALREADY EXISTS.
+    #
+    # A typed "play me X" on the phone produces TWO toggles: this handler's own
+    # `_auto` one, fired server-side right after the fast-path broadcast, and
+    # the client's reseed, which it sends for every play it sees. Building twice
+    # is not merely wasteful — the second build re-announces the seed that is
+    # already playing, carrying YT Music's artwork where the first carried the
+    # video thumbnail (the picture visibly flipping mid-song in the 2026-08-03
+    # recording), and `variety` guarantees the two stations hold DIFFERENT
+    # tracks, so whichever window the phone prefetched now belongs to a station
+    # the backend has thrown away.
+    #
+    # Within a short window, treat the second toggle as what it is — the same
+    # request arriving twice — and re-ship the existing station's state instead.
+    # Outside that window the same seed genuinely means "build me a fresh
+    # station", which is the whole point of variety, so it rebuilds.
+    _existing = mgr.get(user_id, channel)
+    if (
+        _existing is not None
+        and _existing.enabled
+        and _existing.seed_track is not None
+        and _existing.seed_track.video_id == seed_video_id
+        and _existing.playlist
+        and (time.time() - (_existing.station_built_ts or 0)) < _DUP_TOGGLE_WINDOW_SEC
+    ):
+        print(
+            f"[radio] toggle DEDUPED user={user_id[:8]} seed={seed_video_id} "
+            f"age={time.time() - _existing.station_built_ts:.1f}s — re-shipping the live station",
+            flush=True,
+        )
+        if initial_mode:
+            mgr.set_display_mode(
+                _existing, initial_mode, user_initiated=True, source="toggle_mode",
+            )
+        await _resolve_upcoming_variants(_existing)
+        _win = _upcoming_tracks(_existing)
+        if _win:
+            await broadcast_to_user(user_id, {
+                "type": "radio_upcoming",
+                "channel": channel,
+                "upcoming": _win,
+            })
+        await broadcast_to_user(user_id, _existing.to_broadcast_dict())
+        return
 
     # Build the YT Music station BEFORE we mark the session enabled — if YT
     # Music rejects the seed (non-music, region-locked, etc.) we don't want
@@ -734,6 +816,11 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         # Seed the search-based fallback (regional / non-catalog tracks have no
         # YT Music Song-radio) — the title alone is usually "Artist - Title".
         seed_title=(seed_title or seed_intent or ""),
+        # Fresh station per request: YT Music "Start Radio" variant + a light
+        # order shuffle, so a repeated "play me X" never replays the same
+        # songs in the same order. Saved playlists (media_playlists) are the
+        # way to replay an exact list.
+        variety=True,
     )
     if not station:
         print(
@@ -762,6 +849,17 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
         station=station,
         source="toggle_on",
     )
+    if initial_mode:
+        mgr.set_display_mode(sess, initial_mode, user_initiated=True, source="toggle_mode")
+    # Record this station in the user's library the moment it exists, so Toup
+    # Media holds everything they have actually listened to rather than only
+    # the stations someone remembered to save. Fire-and-forget and failure-proof
+    # — a library entry must never be on the playback path.
+    try:
+        from app.api.media_playlists import autosave_station as _autosave
+        asyncio.create_task(_autosave(user_id, channel))
+    except Exception as _ae:
+        logger.warning("[toup-media] autosave hook failed: %s", _ae)
     top = station[0] if station else None
     print(
         f"[radio] toggle OK user={user_id[:8]} channel={channel} "
@@ -813,6 +911,24 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
             f"[radio] iframe_force_sync from=unknown to={seed_video_id} reason=toggle_on",
             flush=True,
         )
+    else:
+        # _auto: the seed is already playing from the fast-path broadcast, so
+        # no media_play re-send — but the phone still needs the prebuffer
+        # window NOW. It used to get none until the first natural advance,
+        # which made the first lock-screen ⏭ after a fresh play a guaranteed
+        # cold round-trip (the 1-2s silent skip, 2026-08-03 recording). The
+        # dedicated radio_upcoming frame carries the window without touching
+        # the in-flight track.
+        await _resolve_upcoming_variants(sess)
+        upcoming = _upcoming_tracks(sess)
+        if upcoming:
+            await broadcast_to_user(user_id, {
+                "type": "radio_upcoming",
+                "channel": channel,
+                "upcoming": upcoming,
+            })
+        from app.agent.radio.player import warm_audio_cache
+        warm_audio_cache([t.get("video_id", "") for t in upcoming[:2]])
 
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
@@ -919,6 +1035,7 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
             _seed_meta, new_tracks = await build_station(
                 extend_seed, limit=50,
                 seed_title=_ext_title, seed_artist=_ext_artist,
+                variety=True,
             )
             if new_tracks:
                 mgr.extend_playlist(sess, new_tracks)
@@ -1043,6 +1160,14 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
         flush=True,
     )
     await _broadcast_track_for_mode(user_id, channel, sess, next_track, trigger, record=False)
+    # Keep the library entry in step with what was actually played — the tape
+    # grows as the station runs, and a playlist the user opens tomorrow should
+    # show the songs they heard, not only the ones queued at the start.
+    try:
+        from app.api.media_playlists import autosave_station as _autosave
+        asyncio.create_task(_autosave(user_id, channel))
+    except Exception:
+        pass
     return True
 
 
@@ -1188,6 +1313,9 @@ async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str,
 # A track that became current less than this long ago has not ended — nothing a
 # user asks for is 15 seconds long. Absolute floor, applied when we have no
 # duration for the track.
+# How long after a station is built a second toggle for the SAME seed counts
+# as a duplicate of the same user request rather than a fresh ask.
+_DUP_TOGGLE_WINDOW_SEC = 25.0
 _MIN_TRACK_PLAY_SEC = 30.0
 # …and when we DO know the duration, require a real fraction of it. A 4-minute
 # song does not end at 45s. Kept well below 1.0 so a fade-out, a short outro or
@@ -1375,7 +1503,23 @@ async def _handle_radio_skip_next(user_id: str, msg: dict) -> None:
         f"history={sess.history_cursor}/{len(sess.played_history) - 1}",
         flush=True,
     )
-    await _advance_and_broadcast_next(user_id, channel, sess, trigger="skip_next")
+    # ONE advance at a time per (user, channel) — the same lock media_ended
+    # holds. Skips are dispatched as independent create_task's from two lanes
+    # (main loop + mid-turn stop-watcher), and _advance_and_broadcast_next
+    # awaits network mid-flight (refill build, variant search): two unlocked
+    # skip tasks interleave around those awaits and pop twice / broadcast out
+    # of order. The skip stays UNGATED (no pinning, no dedup — an explicit
+    # skip is authoritative); the lock only serializes.
+    async with _media_ended_lock(user_id, channel):
+        # Re-check under the lock. The wait is not instant — the holder may be
+        # a media_ended advance in the middle of a station refill (a build can
+        # take tens of seconds), and a user who gives up and switches radio OFF
+        # in the meantime is handled inline, unlocked. Popping and broadcasting
+        # after that restarts music the user just stopped.
+        if not sess.enabled:
+            print(f"[radio] skip_next abandoned — radio turned off while queued user={user_id[:8]}", flush=True)
+            return
+        await _advance_and_broadcast_next(user_id, channel, sess, trigger="skip_next")
 
 
 async def _handle_radio_skip_prev(user_id: str, msg: dict) -> None:
@@ -1444,7 +1588,34 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
     reload_needed = False
     alt: Optional[StationTrack] = None
 
-    if sess.enabled and current_track is not None:
+    if channel == "app" and sess.enabled and mode == "song":
+        # SONG direction only. The app plays song mode NATIVELY: an ATV swap
+        # re-broadcasts the same song under a different video_id, which the
+        # phone can only honor as a cold reload + mid-file seek — audible dead
+        # air stacked on whatever flip (manual pill or the background
+        # auto-flip) just happened, for audio that is the same song either
+        # way. Skip it; FUTURE advances pick the right variant via the
+        # upcoming pre-resolver, and the re-resolved window ships now so the
+        # phone's prefetch queue matches what the pops will play.
+        #
+        # The VIDEO direction deliberately falls through to the normal swap
+        # below: an explicit Video tap on a Topic/ATV track wants the actual
+        # music video, the surface changing is the whole point, and the
+        # iframe's loadVideoById + mode-flip position carry absorb the reload.
+        await _resolve_upcoming_variants(sess)
+        upcoming = _upcoming_tracks(sess)
+        if upcoming:
+            await broadcast_to_user(user_id, {
+                "type": "radio_upcoming",
+                "channel": channel,
+                "upcoming": upcoming,
+            })
+        print(
+            f"[radio] mode_toggle app-channel song: no mid-track swap; "
+            f"reshipped upcoming n={len(upcoming)}",
+            flush=True,
+        )
+    elif sess.enabled and current_track is not None:
         if mode == "song" and current_track.video_type == "MUSIC_VIDEO_TYPE_OMV":
             print(
                 f"[radio] mode_toggle clicked → song reload_needed=candidate "
@@ -2715,8 +2886,18 @@ async def ws_chat(
                             )
                             # Sync the toggle UI (toggle stays OFF for a fresh seed,
                             # unless the user re-enables it explicitly).
+                            #
+                            # EXCEPT on mobile, where an auto-enable is already on
+                            # its way (a few lines below) and this frame would be a
+                            # lie with a visible cost: record_user_seed turns the
+                            # old station OFF for a new intent, so shipping that
+                            # state drops the phone's card back to a bare "YOUTUBE"
+                            # card with no prev/next for the ~3-6s the station takes
+                            # to build, and again for every later play. The client
+                            # renders the station optimistically; the _auto toggle's
+                            # radio_state is the one that tells the truth.
                             _sess = _mgr.get(user_id, channel)
-                            if _sess:
+                            if _sess and channel != "mobile":
                                 await broadcast_to_user(user_id, _sess.to_broadcast_dict())
                     except Exception as _re:
                         logger.warning("[radio] seed-record failed: %s", _re)
@@ -2731,12 +2912,26 @@ async def ws_chat(
                 if _fast_result and channel == "mobile":
                     _ameta = _fast_result[1] or {}
                     if _ameta.get("video_id"):
+                        # Audio-first: the phone starts this track NATIVELY
+                        # within a second or two — warm the platform's remux
+                        # cache for it immediately (deduped + capped server-
+                        # side; never awaited).
+                        # Deliberately NOT warming this id: the phone is about
+                        # to stream these exact bytes and both requests share
+                        # one residential proxy — warming here competes with the
+                        # play it is supposed to speed up. The station's window
+                        # is warmed instead, once it exists.
+                        pass
                         asyncio.create_task(_handle_radio_toggle(user_id, {
                             "channel": "app",
                             "enabled": True,
                             "video_id": _ameta.get("video_id", ""),
                             "title": _ameta.get("title", "") or "Now Playing",
                             "seed_intent": text.strip(),
+                            # Same surface the media_play frame announced, so
+                            # the station's variant resolution matches what the
+                            # phone actually put on screen.
+                            "mode": _ameta.get("mode") or "song",
                             "_auto": True,
                         }))
 

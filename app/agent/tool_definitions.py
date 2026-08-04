@@ -910,8 +910,13 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             "name": "play_media",
             "description": (
                 "Play a song or video for the user. Searches YouTube and streams it "
-                "directly in the user's browser — no navigation needed. "
+                "directly in the user's player — no navigation needed. "
                 "Pass the song/artist name or movie title as the query. "
+                "Music plays as AUDIO by default; pass mode='video' ONLY when the "
+                "user explicitly asks to watch (\"video\", \"music video\", \"watch\"). "
+                "For an open-ended request (an artist, genre, or vibe rather than one "
+                "specific song — \"play me some Drake\", \"something chill\") pass "
+                "variety=true so the station starts somewhere fresh each time. "
                 "For Netflix content, pass channel='netflix' and the agent will use "
                 "the user's connected Netflix account via the browser agent."
             ),
@@ -926,6 +931,15 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                         "type": "string",
                         "enum": ["youtube", "netflix"],
                         "description": "Streaming channel to use. Default: youtube.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["audio", "video"],
+                        "description": "How it plays. Omit for music — audio is the default and it keeps playing when the screen locks. Pass 'video' when the user asked to WATCH, asked for a music video, or asked for something that isn't music (documentary, trailer, film, episode, interview, talk). Pass 'audio' only when they explicitly asked for audio only.",
+                    },
+                    "variety": {
+                        "type": "boolean",
+                        "description": "true when the request is open-ended (artist/genre/vibe, not one specific song): picks a varied starting track instead of the top search hit, so repeat requests don't replay the same song.",
                     },
                 },
                 "required": ["query"],

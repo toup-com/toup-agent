@@ -5248,6 +5248,27 @@ class ToolExecutor:
 
         query = (inp.get("query") or "").strip()
         channel = (inp.get("channel") or "youtube").strip().lower()
+        # Playback surface. Audio-first: 'audio' unless the user explicitly
+        # asked to WATCH — the model passes mode='video' only then. The frame
+        # carries the resolved value so the phone renders the right surface.
+        mode = (inp.get("mode") or "").strip().lower()
+        if mode not in ("audio", "video"):
+            mode = ""
+        # The model is not the only judge of that. It omits `mode` for anything
+        # it doesn't read as an explicit "watch", which is right for songs and
+        # wrong for content that has no audio-only version: "play a good
+        # documentary" would come out of the phone's speaker as a black card.
+        # Same inference the ws_chat fast path runs, so both entry points agree.
+        if not mode:
+            from app.agent.radio.player import infer_requested_mode
+            _inferred = infer_requested_mode(query)
+            if _inferred:
+                mode = _inferred
+                logger.info("[play_media] inferred mode=video from query %r", query)
+        # Open-ended request (artist / genre / vibe): pick a varied starting
+        # track instead of the pinned top hit, so "play me some Drake" starts
+        # somewhere fresh every time.
+        variety = bool(inp.get("variety"))
 
         if not query:
             return "ERROR: Provide a song/video name. Example: play_media(query='Adele Hello')"
@@ -5258,6 +5279,70 @@ class ToolExecutor:
         # ── YouTube search (same 3-tier strategy as browser agent) ──
         video_id = None
         video_title = "YouTube Video"
+        # Artist as resolved by the search, when it gave us one. Threaded on so
+        # the station's variant probe can use the ONLY artist guard in the media
+        # stack instead of being handed "" and accepting the first hit for any
+        # artist (that is how "play me ebi" built a station of other singers).
+        resolved_artist = ""
+
+        # 0a. Variety pick — BEFORE the resolve cache, which would otherwise pin
+        # an open-ended query to one video for 6 hours. Search YT Music's song
+        # catalog (proxied via the platform, same egress as the station builder)
+        # and choose randomly among the top distinct hits. Any failure falls
+        # through to the deterministic ladder below — variety can only ever be
+        # a better first track, never a broken one.
+        if variety:
+            try:
+                from app.agent.radio.playlist import _yt_remote, _ytmusic
+
+                def _search_songs():
+                    remote = _yt_remote("search", query=query, filter="songs", limit=12)
+                    if remote is not None:
+                        return remote
+                    return _ytmusic().search(query, filter="songs", limit=12) or []
+
+                _hits = await asyncio.wait_for(asyncio.to_thread(_search_songs), timeout=10.0)
+                from app.agent import media_resolve as _mr
+                _pool: list = []
+                _seen_titles: set = set()
+                for _h in _hits or []:
+                    _vid = ((_h or {}).get("videoId") or "").strip()
+                    _t = ((_h or {}).get("title") or "").strip()
+                    if not _vid or not _t:
+                        continue
+                    _k = _t.casefold()
+                    if _k in _seen_titles:
+                        continue
+                    _seen_titles.add(_k)
+                    _arts = (_h or {}).get("artists") or []
+                    _artist = ""
+                    if isinstance(_arts, list) and _arts and isinstance(_arts[0], dict):
+                        _artist = (_arts[0].get("name") or "").strip()
+                    _pool.append((_vid, _t, _artist))
+                    if len(_pool) >= 8:
+                        break
+                # RANDOM ONLY WHEN THE ASK IS OPEN-ENDED. `variety` is set by the
+                # model from phrasing, and it gets it wrong often enough that
+                # obeying it blindly played a uniformly random one of eight songs
+                # for a request that NAMED a track — "Playing Daman Zardoo now"
+                # over ONEDAM - Del Tanha (screenshot, 2026-08-03 17:05).
+                # pick_best falls back to pure relevance whenever the query
+                # identifies something.
+                _pick = _mr.pick_best(query, _pool, variety=True)
+                if _pick:
+                    _vid, _t, _artist = _pick
+                    video_id = _vid
+                    video_title = f"{_artist} - {_t}" if _artist else _t
+                    resolved_artist = _artist
+                    logger.info(
+                        "[play_media] pick %r -> %s %r (%d candidates, specific=%s)",
+                        query, video_id, video_title, len(_pool),
+                        _mr.looks_specific(query),
+                    )
+            except Exception as _ve:
+                logger.warning(
+                    "[play_media] variety search failed (%s) — falling back to top hit", _ve,
+                )
 
         # 0. Resolution cache.
         #
@@ -5276,7 +5361,9 @@ class ToolExecutor:
         _key = query.casefold()
         _cache_hit = False
         _hit = _MEDIA_RESOLVE_CACHE.get(_key)
-        if _hit and _now - _hit[2] < _MEDIA_RESOLVE_TTL_S:
+        # A variety pick above already chose a (deliberately varied) id — the
+        # cache must neither override it nor pin the query for next time.
+        if not video_id and _hit and _now - _hit[2] < _MEDIA_RESOLVE_TTL_S:
             video_id, video_title = _hit[0], _hit[1]
             _cache_hit = True
             logger.info("[play_media] resolve cache HIT %s -> %s", query, video_id)
@@ -5297,12 +5384,19 @@ class ToolExecutor:
                         params={"search_query": query},
                         headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0.0.0 Safari/537.36"},
                     )
-                id_matches = _re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
-                if id_matches:
-                    video_id = id_matches[0]
-                    title_m = _re.search(r'"title":\{"runs":\[\{"text":"([^"]+)"\}', resp.text)
-                    if title_m:
-                        video_title = title_m.group(1)
+                # ANCHORED, and relevance-ranked. This used to take the first id
+                # on the page and, independently, the first title on the page —
+                # two different results whenever a shelf, an ad or a Shorts row
+                # sat between them. ws_chat fixed that on 2026-07-31 and the fix
+                # was never backported here; now both callers share one scraper.
+                from app.agent import media_resolve as _mr
+                _cands = _mr.scrape_results(resp.text, limit=6)
+                _pick = _mr.pick_best(query, _cands, variety=False)
+                if _pick:
+                    video_id, _label, _ = _pick
+                    _a, _t = _mr.split_artist_title(_label)
+                    video_title = _label
+                    resolved_artist = _a
             except Exception as e:
                 logger.warning("[play_media] httpx YouTube search failed: %s", e)
 
@@ -5345,7 +5439,9 @@ class ToolExecutor:
         # meaningless name onto the song for six hours — and the title is not
         # cosmetic here: it is what seeds the radio station and what the
         # station-extend fallback searches on.
-        if not _cache_hit and video_title and video_title != "YouTube Video":
+        # NOT for a variety pick: caching it would pin the "varied" choice for
+        # six hours, which is the opposite of what variety means.
+        if not _cache_hit and not variety and video_title and video_title != "YouTube Video":
             # Insertion-ordered eviction: oldest first, which for a per-tenant
             # agent is a fine approximation of LRU. Re-insert on refresh so an
             # updated entry moves to the back.
@@ -5422,9 +5518,23 @@ class ToolExecutor:
                     # (maxresdefault 404s on many), so it can't regress to a
                     # broken image.
                     "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                    # Audio-first: the phone starts every music play as native
+                    # audio unless the user explicitly asked to WATCH — the
+                    # resolved surface rides the frame so the client never has
+                    # to guess. Web ignores the field.
+                    "mode": "video" if mode == "video" else "song",
                 })
-                logger.info("[play_media] Broadcast media_play: %s - %s", video_id, video_title)
+                logger.info("[play_media] Broadcast media_play: %s - %s (mode=%s)", video_id, video_title, mode or "audio")
                 asyncio.create_task(_check_age_and_swap(video_id, user_id))
+                # NO WARM FOR THE TRACK WE JUST BROADCAST. A warm downloads the
+                # whole ~12MB itag-18 through the SAME single residential proxy
+                # the phone is about to stream these exact bytes over, so it
+                # competes with the play it was meant to accelerate — and it
+                # cannot even help it: the phone's non-prefetch request never
+                # joins that in-flight build, and media_proxy already schedules
+                # the remux AFTER the response drains for precisely this reason.
+                # The station's UPCOMING window is warmed instead, by the _auto
+                # toggle and by broadcast_radio_track.
             except Exception as e:
                 logger.warning("[play_media] Broadcast failed: %s", e)
                 return f"Found '{video_title}' but could not send to player. URL: {yt_url}"
@@ -5449,12 +5559,54 @@ class ToolExecutor:
                         source="tool_play",
                     )
                     _sess = _mgr.get(user_id, self._current_channel)
-                    if _sess:
+                    # An 'audio' pin is only meaningful where audio is a
+                    # surface the client can render as the primary one — the
+                    # phone. On web, display_mode 'song' swaps the content-area
+                    # video for an audio overlay, and the model passing
+                    # mode='audio' because the schema calls it the default
+                    # would silently flip a browser session off video and latch
+                    # it there (user_initiated sets the override). An explicit
+                    # 'video' is safe everywhere.
+                    _pin_mode = bool(mode) and (
+                        mode == "video" or self._current_channel in ("app", "mobile")
+                    )
+                    if _sess and _pin_mode:
+                        # The user named a surface ("video" / audio) — pin the
+                        # session to it, after record_user_seed's reset, so the
+                        # station's variant resolution matches what plays.
+                        _mgr.set_display_mode(
+                            _sess, "video" if mode == "video" else "song",
+                            user_initiated=True, source="tool_play_mode",
+                        )
+                    # Same rule as the ws_chat fast path: on the phone the client
+                    # re-seeds the station itself for a fresh play, so a
+                    # radio_state carrying record_user_seed's intermediate
+                    # "disabled" would only strip the card's radio controls for a
+                    # few seconds and then be corrected. Web/desktop still get it.
+                    if _sess and self._current_channel not in ("app", "mobile"):
                         await _bcast(user_id, _sess.to_broadcast_dict())
             except Exception as _re:
                 logger.warning("[play_media] radio seed-record failed: %s", _re)
 
-        return f"Now playing \"{video_title}\"\n{yt_url}"
+        # WHAT THE MODEL IS ALLOWED TO SAY. The confirmation the user reads is
+        # written from THIS string, so it has to carry the resolved track and
+        # nothing else — an agent that composes its sentence from the request
+        # announces the song that was asked for even when a different one is
+        # playing. And when the resolver could not find what was named, say so
+        # here: the model cannot see the card, so silence reads as success.
+        from app.agent.media_resolve import describe_mismatch
+        _warn = describe_mismatch(query, video_title, resolved_artist)
+        if _warn:
+            logger.warning(
+                "[play_media] resolved %r for query %r — MISMATCH reported to the model",
+                video_title, query,
+            )
+            return f"Started \"{video_title}\"\n{yt_url}\n\n{_warn}"
+        return (
+            f"Now playing \"{video_title}\"\n{yt_url}\n\n"
+            f"[Tell the user this EXACT title — \"{video_title}\" — and no other. "
+            f"It is what is audible on their device.]"
+        )
 
     async def _play_netflix(self, query: str) -> str:
         """Find Netflix content and auto-open it in user's browser."""

@@ -920,6 +920,14 @@ async def init_db():
         # references cached_tokens. llm_proxy_events is PLATFORM_ONLY →
         # no-op on agent DBs (table absent → swallowed).
         "ALTER TABLE llm_proxy_events ADD COLUMN IF NOT EXISTS cached_tokens INTEGER",
+        # ── Toup Media library (2026-08-03) ──
+        # media_playlists is created by create_all on a fresh agent, but an
+        # agent that booted on an earlier build of this table already has it —
+        # and create_all never adds columns to an existing table. Same lesson
+        # as every ALTER above: the agent's boot path runs init_db(), not
+        # alembic, so a new column has to self-heal here or every query
+        # referencing it 500s on exactly the tenants that upgraded.
+        "ALTER TABLE media_playlists ADD COLUMN IF NOT EXISTS seed_video_id VARCHAR(32)",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

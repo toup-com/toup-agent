@@ -1642,6 +1642,11 @@ app.add_middleware(LobbyAndDrainMiddleware)
 app.include_router(agent_router, prefix=settings.api_prefix)
 app.include_router(stats_router, prefix=settings.api_prefix)
 app.include_router(memories_router, prefix=settings.api_prefix)
+# Toup Media — saved playlists. AGENT_ONLY store lives HERE; the platform
+# proxies user requests in with X-Agent-Key (memories pattern), and the play
+# endpoint broadcasts over this process's chat WS queues.
+from app.api.media_playlists import router as media_playlists_router
+app.include_router(media_playlists_router, prefix=settings.api_prefix)
 app.include_router(sessions_router, prefix=settings.api_prefix)
 app.include_router(day_chats_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)

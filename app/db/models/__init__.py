@@ -30,6 +30,7 @@ from .day_chat import DayChat, ContextBudgetLog, MigrationStatus
 
 # Memory system
 from .memory import Memory, memory_relationships, BrainStats, MemoryEvent, RetrievalEvent
+from .media_playlist import MediaPlaylist
 
 # Entity & Knowledge Graph
 from .entity import Entity, EntityLink, EntityRelationship
@@ -173,6 +174,7 @@ __all__ = [
     "User", "UserSession", "Identity",
     "Conversation", "Message", "ProcessedMessage",
     "Memory", "memory_relationships", "BrainStats", "MemoryEvent", "RetrievalEvent",
+    "MediaPlaylist",
     "Entity", "EntityLink", "EntityRelationship",
     "Document", "DocumentChunk", "Media",
     "App", "BuildJob", "BuildUsage", "ReconciliationLog",

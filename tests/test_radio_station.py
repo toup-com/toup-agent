@@ -175,7 +175,7 @@ async def test_extend_threads_title_and_artist(monkeypatch):
 
     calls: list[dict] = []
 
-    async def _capture(seed, limit=50, *, seed_title="", seed_artist=""):
+    async def _capture(seed, limit=50, *, seed_title="", seed_artist="", variety=False):
         calls.append({"seed": seed, "title": seed_title, "artist": seed_artist})
         return None, []
 
@@ -206,7 +206,7 @@ async def test_extend_drops_placeholder_title(monkeypatch):
 
     calls: list[dict] = []
 
-    async def _capture(seed, limit=50, *, seed_title="", seed_artist=""):
+    async def _capture(seed, limit=50, *, seed_title="", seed_artist="", variety=False):
         calls.append({"title": seed_title, "artist": seed_artist})
         return None, []
 

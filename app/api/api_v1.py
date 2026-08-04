@@ -260,6 +260,9 @@ async def api_chat(
 class PlayMediaRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=300)
     channel: str = Field(default="youtube", max_length=32)
+    # Open-ended ask (artist/genre/vibe): pick a varied starting track instead
+    # of the pinned top hit. See _tool_play_media's variety branch.
+    variety: bool = Field(default=False)
 
 
 @router.post("/internal/play-media", include_in_schema=False)
@@ -309,7 +312,9 @@ async def internal_play_media(req: PlayMediaRequest, request: Request):
     # nothing to restore. Use the setters; `_current_*` are read-only properties.
     tools.set_user_id(user_id)
     tools.set_channel("app")
-    result = await tools._tool_play_media({"query": req.query, "channel": req.channel})
+    result = await tools._tool_play_media({
+        "query": req.query, "channel": req.channel, "variety": req.variety,
+    })
 
     text = str(result or "")
     if text.upper().startswith("ERROR") or text.startswith("Could not find"):

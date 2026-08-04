@@ -25,6 +25,19 @@ logger = logging.getLogger(__name__)
 
 RADIO_ALLOWED_CHANNELS = frozenset({"web", "telegram", "discord", "slack", "app"})
 
+
+def default_display_mode(channel: str) -> str:
+    """The surface a fresh station starts on, per channel.
+
+    'app' is AUDIO-FIRST (2026-08-03): a phone request plays the native
+    extracted-audio path — no WebView means no background-handoff gap, and the
+    Now Playing card is up from the first second. Video on the phone is an
+    explicit ask (play_media mode:'video', or the card's Video pill).
+    Web keeps 'video' — its player IS the content-area iframe.
+    """
+    return "song" if channel == "app" else "video"
+
+
 MAX_CONSECUTIVE_FAILURES = 3
 MAX_PLAYED_HISTORY = 200           # defensive dedupe window
 PLAYLIST_REFILL_THRESHOLD = 3      # rebuild from current track when this many tracks remain
@@ -56,11 +69,13 @@ class RadioSession:
     # Defensive dedupe only — YT Music rarely repeats within one queue, but
     # extension can append tracks already played earlier in the session.
     played_track_ids: set = field(default_factory=set)
-    # "video" (default) or "song". Decides whether the frontend renders the
-    # full YouTube iframe (Video) or the audio-centric overlay (Song).
-    # Default is Video because Toup plays in the content area — visual-first
-    # is the common expected behavior. Users who want Song mode toggle into
-    # it and the override persists for the rest of the session.
+    # "video" or "song". Decides whether the frontend renders the full YouTube
+    # iframe (Video) or the audio-centric surface (Song). The dataclass default
+    # is Video (web's content-area model); every real construction path
+    # (get_or_create / enable / record_user_seed) immediately re-derives it via
+    # `default_display_mode(channel)` — 'song' on the app channel (audio-first,
+    # 2026-08-03). Users who want the other surface toggle into it and the
+    # override persists for the rest of the session.
     display_mode: str = "video"
     # True once the user has explicitly clicked the Song/Video pill at least
     # once in this session. Mid-track auto-advance swaps (Song+OMV → ATV /
@@ -98,6 +113,23 @@ class RadioSession:
     # another track.
     last_ended_video_id: str = ""
     last_ended_ts: float = 0.0
+    # ── Library auto-save (2026-08-03) ───────────────────────────────
+    # Row id of the media_playlists entry that mirrors THIS station, so the
+    # library keeps a record of everything the user has actually listened to
+    # without them having to save anything by hand. Set on the first save,
+    # reused for every subsequent update, and cleared by enable()/
+    # record_user_seed because a new station is a new library entry.
+    autosave_playlist_id: str = ""
+    # When the current station was BUILT. Distinguishes the client's duplicate
+    # toggle for a station the backend just auto-created (seconds) from a
+    # genuine later request for a fresh station on the same seed.
+    station_built_ts: float = 0.0
+    # Stop mirroring this station into the library. Set when the row it was
+    # writing is gone or has been curated by hand (the user's edits win over a
+    # passive recording), and when the station IS a saved playlist being
+    # replayed (already in the library — re-recording it would fill the list
+    # with near-duplicates of itself).
+    autosave_suppressed: bool = False
 
     @staticmethod
     def parse_length_sec(length: str) -> float:
@@ -163,6 +195,7 @@ class RadioSessionManager:
         sess = self._sessions.get(key)
         if sess is None:
             sess = RadioSession(user_id=user_id, channel=channel)
+            sess.display_mode = default_display_mode(channel)
             self._sessions[key] = sess
         return sess
 
@@ -208,10 +241,13 @@ class RadioSessionManager:
         )
         sess.played_history = [seed_station_track]
         sess.history_cursor = 0
-        sess.display_mode = "video"
+        sess.display_mode = default_display_mode(channel)
         sess.display_mode_user_override = False
         sess.current_station_track = seed_station_track
         sess.last_activity_ts = time.time()
+        sess.autosave_playlist_id = ""   # new station → its own library entry
+        sess.station_built_ts = time.time()
+        sess.autosave_suppressed = False
         logger.info(
             "[radio] seed_bind source=%s user=%s channel=%s videoId=%s "
             "intent=%r old_seed=%s station=%d",
@@ -265,7 +301,7 @@ class RadioSessionManager:
         sess.played_track_ids = {seed_track.video_id}
         sess.played_history = []
         sess.history_cursor = -1
-        sess.display_mode = "video"
+        sess.display_mode = default_display_mode(channel)
         sess.display_mode_user_override = False
         sess.current_station_track = None
         sess.last_activity_ts = time.time()
