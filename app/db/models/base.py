@@ -96,6 +96,12 @@ AGENT_ONLY_TABLES: set[str] = {
     "build_jobs",
     "build_usage",
     "reconciliation_logs",
+    # The per-job event log. `app/api/jobs_events.py` lives under app/api/ but
+    # is mounted ONLY by agent_main.py:1679 — platform_main never imports it —
+    # and every writer is agent-side (job_reaper, job_logger, tool_executor,
+    # app_builder/skill). Grepped for `JobEvent` across platform_main and every
+    # api module platform_main mounts, plus app/services: zero hits.
+    "job_events",
     # Agent runtime
     "cron_jobs",
     "telegram_user_mappings",
@@ -135,6 +141,26 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "llm_bundle_allocations",
     "llm_usage_records",
     "llm_proxy_events",
+    # Credits, plans and IAP. The platform is the sole accountant: the agent
+    # computes cost with PURE functions (`tokens_to_credits_raw`, `FLAT_FEES`,
+    # `image_generation_cost_cents`, `underlying_cost_to_credits` — each checked
+    # for `select(`/`await`/session use and clean) and then REPORTS the charge
+    # over HTTP via credit_reporter. Grepped `CreditLedger|CreditBalance|
+    # CreditReservation|SubscriptionPlan|AppleSubscription` across agent_main,
+    # all of app/agent/, and all 30 api modules agent_main mounts: zero hits.
+    #
+    # These were uncategorized until 2026-08-04, and uncategorized means created
+    # in BOTH databases — so every tenant carries empty copies. That is not
+    # harmless bookkeeping: app_builder/skill.py:848 records a gate that called
+    # `credit_service.check_balance()` against the agent's own DB, hit
+    # "subscription_plans 'free' row missing", had it swallowed by an except,
+    # and silently no-op'd. An empty table is a worse failure surface than an
+    # absent one, because it answers queries instead of refusing them.
+    "credit_ledger",
+    "credit_balances",
+    "credit_reservations",
+    "subscription_plans",
+    "apple_subscriptions",
     # Search gateway telemetry. Platform-only by construction: the whole point
     # of the gateway is that the tenant container no longer sees the upstream
     # call, so it has nothing to write here.
@@ -214,4 +240,10 @@ SHARED_TABLES: set[str] = {
     # platform-owns-the-config isolation still holds. This is the permanent fix
     # for that incident; the live fleet was already hot-patched with the table.
     "agent_configs",
+    # Browser-extension device registrations. `app/api/extension.py` touches
+    # ExtensionDevice 28 times and is mounted by BOTH platform_main.py:843 and
+    # agent_main.py:1734, so the table is genuinely bi-resident — the extension
+    # pairs against whichever surface answers it. Categorizing this one to a
+    # single side is precisely the mistake that took `agent_configs` down.
+    "extension_devices",
 }

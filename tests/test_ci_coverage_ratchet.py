@@ -226,6 +226,11 @@ def test_debt_is_not_growing_silently():
     because `media_playlists` is AGENT_ONLY. That entry ROUTES it to the right
     lane rather than excusing it.
 
+    2026-08-04 (partitioning): 70. `test_table_partitioning` is PAID OFF, not
+    excused — the 7 uncategorized tables it flagged are now categorized, so the
+    test passes and its debt line is gone. That is the direction this number is
+    supposed to move.
+
     2026-08-04 (follow-up): 71. Three more source-text assertions replaced with
     behavioural ones — each mutation-checked, i.e. shown to go red when the
     behaviour it claims to protect is actually broken. 71 and not 70: this
@@ -236,7 +241,7 @@ def test_debt_is_not_growing_silently():
     Lower this when you fix one. Raising it means shipping a test nobody runs,
     and should have to be argued for out loud in review.
     """
-    CEILING = 71
+    CEILING = 70
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

@@ -113,7 +113,3 @@ test_migration_021_roundtrip.py  # INFRA: no collectible test at all (only __mai
 test_search_fetch_cache.py  # INFRA: stub predates the SSRF guard, so it needs real DNS for example.com
 test_sqlite_test_infra.py  # INFRA: asserts the EFFECTIVE DATABASE_URL, which CI sets explicitly
 test_token_budget.py  # INFRA: stub lacks _meter_web_tool + pins a tail the INJ-2 fence changed (the real bug it found shipped in #431)
-#
-# a real invariant with a dormant trigger — worth fixing as hygiene, and an
-# adversarial pass confirmed it is NOT a live production defect:
-test_table_partitioning.py  # 7 tables on Base.metadata were never categorized in models/base.py
