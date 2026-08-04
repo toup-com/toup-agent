@@ -245,10 +245,21 @@ def test_debt_is_not_growing_silently():
     and taking the originally-planned 70 would silently re-forbid the media
     routing entry that #423 deliberately added.
 
+    2026-08-04 (Baileys): 66. `test_whatsapp_baileys` is PAID OFF, not excused.
+    Commit 056eaf25 replaced neonize with the Baileys Node sidecar and deleted
+    the constructor-time disk probe the file pinned, so its session_status test
+    asserted on a mechanism that no longer exists, and its ACL tests asserted
+    set membership on `whatsapp_baileys_session` — a module with zero production
+    importers — instead of the real gate. It is now 32 behavioural tests driving
+    `start()`, the SSE state machine, the ACL/dedupe inbound path and the
+    pairing controls through recorded HTTP calls and a spawn spy, all 25
+    mutations confirmed red. The entry is deleted rather than re-laned: the
+    file runs clean under RUN_MODE=platform, so the sweep picks it up.
+
     Lower this when you fix one. Raising it means shipping a test nobody runs,
     and should have to be argued for out loud in review.
     """
-    CEILING = 67
+    CEILING = 66
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

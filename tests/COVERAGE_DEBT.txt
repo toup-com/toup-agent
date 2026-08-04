@@ -106,7 +106,6 @@ test_routine_three_production_bugs.py  # STALE: two source-text greps over code 
 test_routines_phase3_verification.py  # STALE: same jobs cutover, from the data side
 test_subagent_context_isolation.py  # STALE: regex-pins a literal `if prompt_profile ==` shape
 test_triggers_inbound.py  # STALE: SELECTs TriggerEvent, removed by the unified-jobs cutover
-test_whatsapp_baileys.py  # STALE: pins a constructor 056eaf25 deleted (neonize -> Baileys)
 #
 # the test's own scaffolding is wrong; neither the assertion nor production is:
 test_token_budget.py  # INFRA: stub lacks _meter_web_tool + pins a tail the INJ-2 fence changed (the real bug it found shipped in #431)
