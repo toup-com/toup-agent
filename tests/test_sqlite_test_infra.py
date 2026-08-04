@@ -144,3 +144,83 @@ def test_conftest_defaults_database_url_to_the_shared_cache_form():
         "shared-cache form. Without cache=shared, a second "
         "create_async_engine in app code silently gets its own in-memory DB."
     )
+
+
+async def test_a_second_engine_sees_the_same_database():
+    """The property the shared-cache URL exists for, asserted on BEHAVIOUR.
+
+    The test above checks what conftest DEFAULTS to. This one checks what the
+    suite is actually running against — which is not the same question, and the
+    gap between them was live until 2026-08-04: the workflow set
+    `DATABASE_URL=sqlite+aiosqlite:///:memory:` at job level, so conftest's
+    `setdefault` never fired in the one environment that matters, and the
+    defence existed only on developer laptops.
+
+    With the plain `:memory:` form every engine gets its OWN private database.
+    A second `create_async_engine` anywhere in an app path then sees an empty
+    schema and fails with "no such table" — an error that points at the model
+    rather than at the URL, which is what makes it expensive to diagnose.
+
+    MUTATION: set the workflow's DATABASE_URL back to
+    `sqlite+aiosqlite:///:memory:` and this goes red with exactly that
+    "no such table" error. Measured both ways before this test was written.
+    """
+    if engine.dialect.name != "sqlite":
+        pytest.skip("sqlite-specific: on Postgres every engine reaches the same server")
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    url = engine.url.render_as_string(hide_password=False)
+    second = create_async_engine(url, poolclass=StaticPool)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("CREATE TABLE _two_engine_probe (id INTEGER PRIMARY KEY)"))
+        try:
+            async with second.begin() as conn:
+                found = (await conn.execute(
+                    text("SELECT COUNT(*) FROM _two_engine_probe")
+                )).scalar_one()
+        except Exception as exc:  # pragma: no cover — this IS the regression
+            raise AssertionError(
+                "A second engine on the SAME DATABASE_URL cannot see a table "
+                f"the first one just created ({type(exc).__name__}: {exc}). "
+                f"The URL in use is {url!r}. It needs the "
+                "`file::memory:?cache=shared&uri=true` form — with plain "
+                "`:memory:` each engine gets its own private database."
+            ) from exc
+        assert found == 0
+    finally:
+        await second.dispose()
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS _two_engine_probe"))
+
+
+def test_ci_and_conftest_agree_on_the_database_url():
+    """CI's explicit value must not drift from conftest's default.
+
+    Two places name this URL: conftest (with the reasoning) and the workflow
+    (which overrides it). They disagreed for as long as the sweep has existed.
+    Config values ARE the behaviour here, so comparing them is a real check —
+    unlike grepping Python source for an implementation detail.
+
+    A bare value is still required in the workflow rather than deleted: with no
+    DATABASE_URL set at all, `app/config.py` falls back to a FILE-backed
+    `sqlite+aiosqlite:///./toup.db`, so any step that imports app.config outside
+    pytest would quietly start writing a real database file.
+    """
+    import re
+    from pathlib import Path
+
+    wf = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "test-backend.yml"
+    values = re.findall(r'^\s*DATABASE_URL:\s*"?([^"\n]+)"?\s*$', wf.read_text(), re.M)
+    sqlite_values = [v.strip().rstrip('"') for v in values if v.startswith("sqlite")]
+    assert sqlite_values, "no sqlite DATABASE_URL found in the workflow"
+    for v in sqlite_values:
+        assert "cache=shared" in v, (
+            f"the workflow sets DATABASE_URL={v!r}, which gives every engine "
+            "its own private in-memory database and silently disables the "
+            "defence conftest documents. Use the "
+            "`sqlite+aiosqlite:///file::memory:?cache=shared&uri=true` form."
+        )

@@ -51,6 +51,7 @@ from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.dashboard import router as dashboard_router
 from app.api.workspace_files import router as workspace_files_router
 from app.api.soul import router as soul_router
+from app.api.identity import router as identity_router
 from app.api.llm_setup import router as llm_setup_router
 from app.api.apps import router as apps_router, set_app_manager, set_app_gateway, set_app_builder_skill, set_agent_runner
 # Generated-file attachments (doc-delivery feature). Serves the actual files
@@ -1690,6 +1691,12 @@ try:
 except ImportError as e:
     print(f"⚠️ Netflix stream not mounted: {e}")
 app.include_router(soul_router, prefix=settings.api_prefix)
+# The `identities` table is AGENT_ONLY (base.py) and `PUT /api/soul` compiles
+# into it right here on the agent — but until now nothing on the agent SERVED
+# it, so `GET /api/identity` answered 404 on every tenant while the platform's
+# realtime bootstrap called exactly that URL. Mounted beside soul because they
+# are two views of the same agent-side data.
+app.include_router(identity_router, prefix=settings.api_prefix)
 app.include_router(llm_setup_router, prefix=settings.api_prefix)
 # Generated-file attachments — data + files live here on the agent.
 app.include_router(files_router, prefix=settings.api_prefix)
