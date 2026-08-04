@@ -8,11 +8,23 @@ pre-021 schema for the two affected tables. Confirms:
   - Downgrade cleanly removes the columns.
   - Indexes come and go with the columns.
 
-Run: python tests/test_migration_021_roundtrip.py
+Until 2026-08-04 this file held all of that inside a `main()` with no `test_`
+function, so pytest collected NOTHING and exited 5 — "no tests ran" is not a
+pass, but on a per-file runner it looks like one. It also wrote to a FIXED
+path, `/tmp/mig021_test.db`, which two concurrent runs would clobber; the sweep
+runs several pytest processes at once, so that was a live collision. Both are
+fixed: real tests, and `tmp_path`.
+
+Split in two on purpose. As one blob, an upgrade failure and a downgrade
+failure were indistinguishable in the summary line.
+
+Run: pytest tests/test_migration_021_roundtrip.py   (or execute this file directly)
 """
 
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -105,46 +117,63 @@ def _seed_pre_021_schema(engine):
         ))
 
 
-def main():
-    import os
-    db_path = "/tmp/mig021_test.db"
-    if os.path.exists(db_path):
-        os.remove(db_path)
+_EXECED = False
 
-    engine = create_engine(f"sqlite:///{db_path}")
 
-    # 1. Build the pre-021 schema.
-    _seed_pre_021_schema(engine)
+def _load_migration():
+    """Exec the migration module once per process.
 
-    # 2. Apply upgrade() by rewriting alembic.op to a local shim that uses
-    #    our SQLAlchemy connection.
-    _spec.loader.exec_module(_m)
+    Deliberately lazy — the module does `from alembic import op` at import,
+    and the original file avoided doing that at collection time to sidestep a
+    broken revision in the chain. Keep that property.
+    """
+    global _EXECED
+    if not _EXECED:
+        _spec.loader.exec_module(_m)
+        _EXECED = True
+    return _m
+
+
+def _apply(engine, direction: str):
+    """Run upgrade()/downgrade() with alembic.op swapped for the sqlite shim."""
+    m = _load_migration()
+    original_op = m.op
     with engine.begin() as conn:
-        shim = _mock_alembic_op(conn)
-        _original_op = _m.op
-        _m.op = shim
+        m.op = _mock_alembic_op(conn)
         try:
-            _m.upgrade()
+            getattr(m, direction)()
         finally:
-            _m.op = _original_op
+            m.op = original_op
 
-    # 3. Verify the columns exist and data is preserved.
-    insp = inspect(engine)
+
+@pytest.fixture
+def upgraded(tmp_path):
+    """Pre-021 schema, seeded, with upgrade() applied. Own DB file per test."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'mig021.db'}")
+    _seed_pre_021_schema(engine)
+    _apply(engine, "upgrade")
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+def test_upgrade_adds_columns_and_preserves_existing_rows(upgraded):
+    insp = inspect(upgraded)
     lpe_cols = {c["name"] for c in insp.get_columns("llm_proxy_events")}
     assert "operation_type" in lpe_cols, f"operation_type missing: {lpe_cols}"
 
     dc_cols = {c["name"] for c in insp.get_columns("day_chats")}
-    assert "archival_summary" in dc_cols, dc_cols
-    assert "archival_summary_generated_at" in dc_cols, dc_cols
-    assert "archival_summary_status" in dc_cols, dc_cols
+    for col in ("archival_summary", "archival_summary_generated_at",
+                "archival_summary_status"):
+        assert col in dc_cols, f"{col} missing: {dc_cols}"
 
-    with engine.begin() as conn:
-        # Data preserved.
+    with upgraded.begin() as conn:
         row = conn.execute(text(
             "SELECT id, operation_type FROM llm_proxy_events WHERE id = 'pre1'"
         )).first()
         assert row[0] == "pre1"
-        assert row[1] is None, f"Existing row should have NULL operation_type, got {row[1]!r}"
+        assert row[1] is None, f"pre-existing row should have NULL operation_type, got {row[1]!r}"
 
         row = conn.execute(text(
             "SELECT id, rolling_summary, archival_summary, archival_summary_status "
@@ -152,53 +181,37 @@ def main():
         )).first()
         assert row[0] == "dc1"
         assert row[1] == "existing summary"
-        assert row[2] is None, "archival_summary should be NULL for pre-existing row"
+        assert row[2] is None, "archival_summary should be NULL for a pre-existing row"
         assert row[3] == "not_needed", (
             f"archival_summary_status should default to 'not_needed', got {row[3]!r}"
         )
 
-    # Indexes created?
     lpe_idx = {i["name"] for i in insp.get_indexes("llm_proxy_events")}
     assert "ix_llm_proxy_operation_type" in lpe_idx, lpe_idx
 
-    print("✓ upgrade() — columns added, data preserved, index created")
 
-    # 4. Now run downgrade() and verify columns/indexes disappear.
-    with engine.begin() as conn:
-        shim = _mock_alembic_op(conn)
-        _m.op = shim
-        try:
-            _m.downgrade()
-        finally:
-            _m.op = _original_op
+def test_downgrade_removes_columns_and_keeps_rows(upgraded):
+    _apply(upgraded, "downgrade")
 
-    insp = inspect(engine)
-    lpe_cols_after = {c["name"] for c in insp.get_columns("llm_proxy_events")}
-    assert "operation_type" not in lpe_cols_after, (
-        f"downgrade did not drop operation_type: {lpe_cols_after}"
-    )
-    dc_cols_after = {c["name"] for c in insp.get_columns("day_chats")}
-    assert "archival_summary" not in dc_cols_after
-    assert "archival_summary_generated_at" not in dc_cols_after
-    assert "archival_summary_status" not in dc_cols_after
+    insp = inspect(upgraded)
+    lpe_cols = {c["name"] for c in insp.get_columns("llm_proxy_events")}
+    assert "operation_type" not in lpe_cols, f"downgrade left operation_type: {lpe_cols}"
 
-    # Indexes gone.
-    lpe_idx_after = {i["name"] for i in insp.get_indexes("llm_proxy_events")}
-    assert "ix_llm_proxy_operation_type" not in lpe_idx_after, lpe_idx_after
+    dc_cols = {c["name"] for c in insp.get_columns("day_chats")}
+    for col in ("archival_summary", "archival_summary_generated_at",
+                "archival_summary_status"):
+        assert col not in dc_cols, f"downgrade left {col}: {dc_cols}"
 
-    # Seed data still present — downgrade must not drop rows.
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT id FROM llm_proxy_events WHERE id='pre1'")).first()
-        assert row is not None
-        row = conn.execute(text("SELECT id FROM day_chats WHERE id='dc1'")).first()
-        assert row is not None
+    lpe_idx = {i["name"] for i in insp.get_indexes("llm_proxy_events")}
+    assert "ix_llm_proxy_operation_type" not in lpe_idx, lpe_idx
 
-    print("✓ downgrade() — columns dropped, indexes dropped, data preserved")
-    print("\nMigration 021 round-trip: PASS")
-
-    engine.dispose()
-    os.remove(db_path)
+    # A downgrade drops COLUMNS, never rows.
+    with upgraded.begin() as conn:
+        assert conn.execute(text(
+            "SELECT id FROM llm_proxy_events WHERE id='pre1'")).first() is not None
+        assert conn.execute(text(
+            "SELECT id FROM day_chats WHERE id='dc1'")).first() is not None
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(pytest.main([__file__, "-q"]))

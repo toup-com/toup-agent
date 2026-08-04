@@ -130,11 +130,44 @@ _ARTICLE = (
 
 
 def _patch_fetch(monkeypatch, counter, *, final_url=None):
+    """Stub the HTTP client AND the name resolution the SSRF guard performs.
+
+    `_assert_public_url` calls `socket.getaddrinfo` on the initial URL and on
+    every redirect hop, and raises if the host will not resolve. Patching only
+    `httpx.AsyncClient` therefore was not enough: the guard rejected
+    `example.com` before the stubbed client was ever reached, the fetch
+    returned "", and the counter stayed at 0 — so three cache tests failed for
+    a reason that has nothing to do with caching.
+
+    A unit test of an in-process cache must not perform DNS. Resolve to a
+    fixed PUBLIC address so the guard's real logic still runs: a private or
+    loopback answer must still be rejected, which is what
+    test_ssrf_guard_rejects_internal_addresses at the bottom of this file
+    pins.
+    """
+    import socket as _socket
+
+    def _fake_getaddrinfo(host, port, *a, **k):
+        return [(_socket.AF_INET, _socket.SOCK_STREAM, _socket.IPPROTO_TCP, "",
+                 ("93.184.216.34", port or 80))]
+
+    monkeypatch.setattr(R.socket, "getaddrinfo", _fake_getaddrinfo)
+
     class _Resp:
-        def __init__(self, url):
+        def __init__(self, url, *, redirect_to=None):
             self.text = _ARTICLE
             self.headers = {"content-type": "text/html"}
-            self.url = final_url or url
+            if redirect_to:
+                self.headers["location"] = redirect_to
+            self.url = url
+            # `_guarded_get` follows redirects BY HAND (the client is built
+            # with follow_redirects=False so the SSRF guard can run on every
+            # hop). It reads `.is_redirect`, which this stub never had — the
+            # AttributeError was swallowed by toup_read_page's handler and
+            # came back as an empty string, so the cache tests failed with
+            # "assert 'article body' in ''" and no hint of the real cause.
+            self.is_redirect = bool(redirect_to)
+
         def raise_for_status(self):
             pass
 
@@ -147,6 +180,8 @@ def _patch_fetch(monkeypatch, counter, *, final_url=None):
             return False
         async def get(self, url, headers=None):
             counter["n"] += 1
+            if final_url and url != final_url:
+                return _Resp(url, redirect_to=final_url)
             return _Resp(url)
 
     monkeypatch.setattr(R.httpx, "AsyncClient", _Client)
@@ -166,10 +201,20 @@ def test_fetch_cache_dedups_final_redirect_url(monkeypatch):
     counter = {"n": 0}
     _patch_fetch(monkeypatch, counter, final_url="http://example.com/final")
     monkeypatch.setattr(R.settings, "fetch_cache_enabled", True)
+
     asyncio.run(R.toup_read_page("http://example.com/start", 10000))
-    # the final post-redirect url is also cached -> a direct fetch hits
+    after_first = counter["n"]
+    assert after_first >= 1, "the first fetch must actually hit the network"
+
+    # The final post-redirect url is cached too, so fetching it DIRECTLY costs
+    # nothing more. Asserted as a delta rather than an absolute count: the
+    # redirect chain is walked one hop at a time now, so pinning a total would
+    # be pinning the number of hops, which is not what this test is about.
     asyncio.run(R.toup_read_page("http://example.com/final", 10000))
-    assert counter["n"] == 1
+    assert counter["n"] == after_first, (
+        f"direct fetch of the final url should have been served from cache, "
+        f"but requests went {after_first} -> {counter['n']}"
+    )
 
 
 def test_fetch_cache_flag_off(monkeypatch):
@@ -236,3 +281,107 @@ def test_bind_clears_caches_for_tenant_isolation():
     assert "clear_caches()" in bind_src
     # ordered after the identity apply
     assert bind_src.index("apply_to_settings") < bind_src.index("clear_caches()")
+
+
+# ── SSRF guard — behaviour, not spelling ────────────────────────────────
+#
+# Until 2026-08-04 the only "coverage" of this guard was
+# `assert "_assert_public_url" in rd` in test_security_builder_attribution
+# — a source-text assertion that the guard is MENTIONED. It would pass
+# against a body of `def _assert_public_url(url): return`. This is a control
+# that stops injected content from pointing the agent at cloud metadata, the
+# docker-bridge pgbouncer, the bridge admin API, or another tenant's
+# container, so it deserves tests that would fail if it stopped working.
+
+def _resolving_to(monkeypatch, ip: str):
+    """Force name resolution to `ip` so the guard's real logic is exercised."""
+    import socket as _socket
+
+    def _gai(host, port, *a, **k):
+        fam = _socket.AF_INET6 if ":" in ip else _socket.AF_INET
+        return [(fam, _socket.SOCK_STREAM, _socket.IPPROTO_TCP, "", (ip, port or 80))]
+
+    monkeypatch.setattr(R.socket, "getaddrinfo", _gai)
+
+
+@pytest.mark.parametrize("ip,label", [
+    ("127.0.0.1", "loopback"),
+    ("10.0.0.5", "private/8"),
+    ("172.16.4.4", "private/12"),
+    ("192.168.1.1", "private/16"),
+    ("169.254.169.254", "cloud metadata (link-local)"),
+    ("100.64.1.1", "CGNAT / Tailscale"),
+    ("0.0.0.0", "unspecified"),
+    ("224.0.0.1", "multicast"),
+    ("::1", "IPv6 loopback"),
+])
+def test_ssrf_guard_rejects_internal_addresses(monkeypatch, ip, label):
+    _resolving_to(monkeypatch, ip)
+    with pytest.raises(ValueError) as e:
+        R._assert_public_url("http://totally-innocent.example/x")
+    assert "internal address" in str(e.value), (
+        f"{label} ({ip}) must be refused; got {e.value!r}"
+    )
+
+
+def test_ssrf_guard_allows_a_public_address(monkeypatch):
+    _resolving_to(monkeypatch, "93.184.216.34")
+    R._assert_public_url("https://example.com/x")  # must not raise
+
+
+@pytest.mark.parametrize("scheme", ["file", "gopher", "ftp", "data"])
+def test_ssrf_guard_rejects_non_http_schemes(monkeypatch, scheme):
+    _resolving_to(monkeypatch, "93.184.216.34")
+    with pytest.raises(ValueError) as e:
+        R._assert_public_url(f"{scheme}://example.com/x")
+    assert "unsupported URL scheme" in str(e.value)
+
+
+def test_ssrf_guard_rejects_a_host_that_will_not_resolve(monkeypatch):
+    import socket as _socket
+
+    def _boom(*a, **k):
+        raise _socket.gaierror("nope")
+
+    monkeypatch.setattr(R.socket, "getaddrinfo", _boom)
+    with pytest.raises(ValueError) as e:
+        R._assert_public_url("http://nx.example/x")
+    assert "cannot resolve host" in str(e.value)
+
+
+def test_ssrf_guard_runs_on_every_redirect_hop(monkeypatch):
+    """The attack this exists to stop: a PUBLIC url that redirects inward.
+
+    Guarding only the initial URL would let `http://evil.example/` 302 to
+    `http://169.254.169.254/latest/meta-data/` and hand the agent cloud
+    credentials. `_guarded_get` re-runs the guard on each hop, so the second
+    hop must raise even though the first was fine.
+    """
+    import socket as _socket
+    hops = []
+
+    def _gai(host, port, *a, **k):
+        hops.append(host)
+        ip = "169.254.169.254" if host == "169.254.169.254" else "93.184.216.34"
+        return [(_socket.AF_INET, _socket.SOCK_STREAM, _socket.IPPROTO_TCP, "", (ip, port or 80))]
+
+    monkeypatch.setattr(R.socket, "getaddrinfo", _gai)
+
+    class _Redirect:
+        is_redirect = True
+        headers = {"location": "http://169.254.169.254/latest/meta-data/"}
+
+    class _Client:
+        async def get(self, url, headers=None):
+            return _Redirect()
+
+    with pytest.raises(ValueError) as e:
+        asyncio.run(_guarded_get_probe(_Client(), "http://evil.example/start"))
+    assert "internal address" in str(e.value), (
+        f"a redirect to the metadata address must be refused; got {e.value!r}"
+    )
+    assert "169.254.169.254" in hops, "the guard never ran on the redirect target"
+
+
+async def _guarded_get_probe(client, url):
+    return await R._guarded_get(client, url, {}, max_redirects=3)

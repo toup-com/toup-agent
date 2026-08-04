@@ -102,19 +102,45 @@ async def test_init_db_alter_statements_add_columns_on_sqlite():
     )
 
 
-def test_default_database_url_is_shared_cache_sqlite():
-    """The conftest defaults DATABASE_URL to the shared-cache form.
+def test_conftest_defaults_database_url_to_the_shared_cache_form():
+    """conftest must DEFAULT to shared-cache sqlite when nothing is set.
 
-    If a contributor sets DATABASE_URL in their environment, the os
-    .environ.setdefault is a no-op — that's fine. But on CI / fresh
-    checkouts the default should be the shared-cache form so any new
-    code that builds a second sqlite engine still sees the same DB.
+    This used to read `os.environ["DATABASE_URL"]` in-process and assert on
+    it, which measured the AMBIENT ENVIRONMENT rather than our code. CI sets
+    `DATABASE_URL=sqlite+aiosqlite:///:memory:` explicitly, so the conftest's
+    `setdefault` is a no-op there and the assertion failed — while the thing
+    it means to protect (the default) was perfectly fine.
+
+    The fix is the same shape as the hermetic-settings lesson from #411:
+    exercise the defaulting logic with a CLEAN environment, in a subprocess,
+    so an ambient value can neither satisfy nor break it.
+
+    Why shared-cache matters: with plain `sqlite:///:memory:`, a second
+    `create_async_engine` anywhere in the app path gets its OWN empty
+    in-memory DB, and the resulting schema-drift bug is painful to find.
     """
     import os
-    url = os.environ["DATABASE_URL"]
-    if url.startswith("sqlite"):
-        assert "cache=shared" in url, (
-            f"Expected shared-cache sqlite URL, got {url!r}. "
-            f"Without cache=shared, a second create_async_engine in app code "
-            f"would silently get its own in-memory DB."
-        )
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    probe = (
+        "import os, importlib.util as u, pathlib;"
+        f"s=u.spec_from_file_location('cft', r'{Path(__file__).resolve().parent / 'conftest.py'}');"
+        "m=u.module_from_spec(s);s.loader.exec_module(m);"
+        "print(os.environ['DATABASE_URL'])"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert out.returncode == 0, f"probe failed: {out.stderr[-800:]}"
+    url = out.stdout.strip().splitlines()[-1]
+
+    assert url.startswith("sqlite"), f"default should be sqlite, got {url!r}"
+    assert "cache=shared" in url, (
+        f"conftest defaulted DATABASE_URL to {url!r}, which is NOT the "
+        "shared-cache form. Without cache=shared, a second "
+        "create_async_engine in app code silently gets its own in-memory DB."
+    )

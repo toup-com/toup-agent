@@ -109,7 +109,4 @@ test_triggers_inbound.py  # STALE: SELECTs TriggerEvent, removed by the unified-
 test_whatsapp_baileys.py  # STALE: pins a constructor 056eaf25 deleted (neonize -> Baileys)
 #
 # the test's own scaffolding is wrong; neither the assertion nor production is:
-test_migration_021_roundtrip.py  # INFRA: no collectible test at all (only __main__ main()) -> pytest exits 5
-test_search_fetch_cache.py  # INFRA: stub predates the SSRF guard, so it needs real DNS for example.com
-test_sqlite_test_infra.py  # INFRA: asserts the EFFECTIVE DATABASE_URL, which CI sets explicitly
 test_token_budget.py  # INFRA: stub lacks _meter_web_tool + pins a tail the INJ-2 fence changed (the real bug it found shipped in #431)

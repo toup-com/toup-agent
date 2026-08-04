@@ -226,6 +226,13 @@ def test_debt_is_not_growing_silently():
     because `media_playlists` is AGENT_ONLY. That entry ROUTES it to the right
     lane rather than excusing it.
 
+    2026-08-04 (INFRA): 67. Three more PAID OFF, not excused —
+    test_migration_021_roundtrip (had no collectible test at all, so pytest
+    exited 5 and "no tests ran" looked like a pass), test_sqlite_test_infra
+    (asserted the ambient DATABASE_URL rather than the default it means to
+    protect), and test_search_fetch_cache (its stub had fallen behind both the
+    SSRF guard's DNS lookup and the hand-rolled redirect loop).
+
     2026-08-04 (partitioning): 70. `test_table_partitioning` is PAID OFF, not
     excused — the 7 uncategorized tables it flagged are now categorized, so the
     test passes and its debt line is gone. That is the direction this number is
@@ -241,7 +248,7 @@ def test_debt_is_not_growing_silently():
     Lower this when you fix one. Raising it means shipping a test nobody runs,
     and should have to be argued for out loud in review.
     """
-    CEILING = 70
+    CEILING = 67
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "
