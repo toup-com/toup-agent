@@ -164,38 +164,81 @@ async def _seed_user(db, user_id: str) -> None:
         await db.commit()
 
 
-async def _wait_for_completion(job_id: str, *, timeout: float = 30.0):
-    """Poll until the job row reaches a terminal status.
+async def _drain_background_tasks(*, timeout: float = 60.0) -> None:
+    """Wait for the orchestrator's fire-and-forget work to actually finish.
 
-    The deadline is a deadlock backstop, NOT a performance assertion — so it is
-    generous. A tight bound here measures how loaded the CI runner is rather
-    than whether the orchestrator works, and the sweep runs many pytest
-    processes at once. Nothing about correctness depends on this number; if a
-    test needs to observe a child mid-flight it should gate the child (see
-    FakeAgentRunner) instead of shrinking this.
+    ``spawn_subagent`` launches the child through
+    ``app.services.background_tasks.spawn``, which keeps a STRONG reference to
+    every in-flight task in a module-level set — that exists so a task cannot
+    be garbage-collected mid-await (#427). It also happens to be the one thing
+    a test needs and a database poll can never provide: the real completion
+    signal.
 
-    On expiry, report the status actually seen — "did not reach terminal" with
-    no value forces whoever hits it to re-run locally to learn anything.
+    Awaiting the task is not a nicety. A poll asks "has it finished YET?", and
+    every deadline you pick is a bet on how loaded the machine is; lose the bet
+    and you get a red build that says nothing about the code. This asks "tell
+    me when it has finished", so a genuinely hung task fails with a diagnosis
+    naming the tasks instead of racing.
+
+    Loops rather than a single ``asyncio.wait`` because a background task may
+    itself spawn one (the announce path does).
+    """
+    from app.services import background_tasks as _bg
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        # Scoped to THIS test's loop on purpose. The task set is a module
+        # global that outlives a single test, while pytest-asyncio hands every
+        # test a fresh event loop — so a task stranded by an earlier test would
+        # still be in the set, and awaiting it from here raises "attached to a
+        # different loop". Filtering is what keeps this helper from turning one
+        # test's leak into every later test's error.
+        pending = [
+            t for t in list(_bg._background_tasks)
+            if not t.done() and t.get_loop() is loop
+        ]
+        if not pending:
+            return
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError(
+                f"{len(pending)} background task(s) still in flight after "
+                f"{timeout}s: {[t.get_name() for t in pending]}"
+            )
+        await asyncio.wait(pending, timeout=remaining)
+
+
+async def _wait_for_completion(job_id: str, *, timeout: float = 60.0):
+    """Wait for the spawned child to finish, then read its row ONCE.
+
+    This used to poll the row for a terminal status with a 30s deadline, and it
+    broke CI on 2026-08-04: `last status seen was 'running'`. That message (added
+    with the deadline) is what made the diagnosis possible, and what it says is
+    that the row had simply not been written yet — the poll was racing the
+    background task rather than observing it.
+
+    Polling was the wrong instrument regardless of the number. ``_finalize``
+    writes the announce first and flips the status LAST, so "status is terminal"
+    is the last event in a multi-step sequence; a poll that samples it is
+    sampling the end of a race it cannot see the start of. Draining the task
+    removes the race outright instead of widening the window and hoping.
     """
     from app.db.database import async_session_maker
     from app.db.models import BuildJob
     from sqlalchemy import select
 
     TERMINAL = ("completed", "failed", "timeout", "cancelled", "budget_exhausted")
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    last = "<never read>"
-    while loop.time() < deadline:
-        async with async_session_maker() as db:
-            row = (await db.execute(select(BuildJob).where(BuildJob.id == job_id))).scalar_one()
-            last = row.status
-            if row.status in TERMINAL:
-                return row
-        await asyncio.sleep(0.05)
-    raise AssertionError(
-        f"Job {job_id} did not reach a terminal status within {timeout}s — "
-        f"last status seen was {last!r} (terminal set: {TERMINAL})"
+    await _drain_background_tasks(timeout=timeout)
+    async with async_session_maker() as db:
+        row = (await db.execute(select(BuildJob).where(BuildJob.id == job_id))).scalar_one()
+    assert row.status in TERMINAL, (
+        f"Job {job_id} has status {row.status!r} after every background task "
+        f"finished — this is NOT a timing problem: the child completed and the "
+        f"row was still never moved to a terminal status "
+        f"(terminal set: {TERMINAL})"
     )
+    return row
 
 
 # ──────────────────────────────────────────────────────────────────────
