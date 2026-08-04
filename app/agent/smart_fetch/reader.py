@@ -185,6 +185,37 @@ def _extract_metadata(soup: BeautifulSoup) -> dict:
     return meta
 
 
+def page_cache_key(url: str, max_chars: int) -> tuple:
+    """Canonical cache key for a fetched page.
+
+    Exported for the same reason ``search.cache_key`` is: a caller that fronts
+    this cache with its own earlier tier (``ToolExecutor._tool_web_fetch``)
+    must hash the url exactly the way ``toup_read_page`` does below, or the two
+    tiers cache-miss each other forever and the probe is pure overhead.
+    """
+    return (url.strip(), max_chars)
+
+
+def page_cache_get(url: str, max_chars: int) -> Optional[str]:
+    """Read-through for callers ahead of this module in the fetch chain.
+
+    ``ToolExecutor._tool_web_fetch`` consults this BEFORE metering, so a page
+    served from cache is never billed — the same rule web_search already
+    follows via ``search.cache_get``. Returns None when caching is disabled
+    (``settings.fetch_cache_enabled``) or on a miss.
+
+    This function is the one that went missing. The call site landed in
+    tool_executor.py on 2026-07-31 and this half never did, so every
+    ``web_fetch`` raised AttributeError, was swallowed by ``execute()``'s
+    catch-all, and came back to the model as `ERROR: AttributeError: ...`.
+    The agent could not read a web page on any tenant for four days, and
+    nothing failed loudly enough for anyone to notice.
+    """
+    if not settings.fetch_cache_enabled:
+        return None
+    return _PAGE_CACHE.get(page_cache_key(url, max_chars))
+
+
 async def toup_read_page(url: str, max_chars: int = 15000) -> str:
     """
     Fetch and extract clean text from a URL without a browser.
@@ -200,7 +231,7 @@ async def toup_read_page(url: str, max_chars: int = 15000) -> str:
     """
     cache_key = None
     if settings.fetch_cache_enabled:
-        cache_key = (url.strip(), max_chars)
+        cache_key = page_cache_key(url, max_chars)
         cached = _PAGE_CACHE.get(cache_key)
         if cached is not None:
             logger.info("[PERF] web_fetch cache=hit url=%s", url[:80])
