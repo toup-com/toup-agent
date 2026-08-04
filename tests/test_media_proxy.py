@@ -516,3 +516,41 @@ async def test_extract_warm_swallows_failure_and_never_raises():
         await media_proxy._ensure_extract_bg("abc123def45")  # must not raise
     finally:
         media_proxy._extract_coalesced = orig
+
+
+def test_no_ad_hoc_ddl_on_the_audio_hot_path():
+    """media_proxy must never CREATE a table at request time.
+
+    `audio_remux_cache` was created ad-hoc with CREATE TABLE IF NOT EXISTS on
+    the audio path, which is why it was invisible to every guard in the repo:
+    no SQLAlchemy model, no alembic migration, absent from the AGENT_ONLY /
+    PLATFORM_ONLY / SHARED table lists, so no migration review ever sized it.
+    It grew to 1187 MB of a 1233 MB database — 96% — and restricted the
+    project. Self-creating DDL also means a DROP is not a fix: the next
+    request recreates the table and it regrows.
+    """
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "app" / "api" / "media_proxy.py"
+    text = src.read_text().upper()
+    assert "CREATE TABLE" not in text, (
+        "media_proxy must not create tables at request time — add a model and "
+        "a migration instead, so the table is visible to the schema guards"
+    )
+
+
+def test_postgres_blob_cache_is_retired():
+    """The shared audio cache is R2 only.
+
+    Postgres held ~3MB audio blobs as BYTEA to give replicas a shared cache
+    before R2 existed. R2 does that job without putting media in a relational
+    database. Verified before removal (2026-08-04): all 300 PG rows were also
+    in R2, so retiring the tier lost no cache entries.
+    """
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "app" / "api" / "media_proxy.py"
+    text = src.read_text()
+    assert "audio_remux_cache" not in text, "the Postgres blob cache must stay retired"
+    assert "_r2_pull_to_local" in text, "R2 is the shared read tier"
+    assert "_r2_store_from_local" in text, "R2 is the shared write tier"
