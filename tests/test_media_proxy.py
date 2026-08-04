@@ -10,6 +10,7 @@ what's under test, not the extractor plumbing.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from types import SimpleNamespace
 from typing import AsyncIterator
@@ -554,3 +555,281 @@ def test_postgres_blob_cache_is_retired():
     assert "audio_remux_cache" not in text, "the Postgres blob cache must stay retired"
     assert "_r2_pull_to_local" in text, "R2 is the shared read tier"
     assert "_r2_store_from_local" in text, "R2 is the shared write tier"
+
+
+# ── Shared (cross-replica) extraction cache ──────────────────────────────
+# `_EXTRACT_CACHE` is per-PROCESS and platform-api runs at numReplicas=2, so
+# the broadcast-time pre-extract warmed one replica while the phone's play
+# request landed on either — half of all first plays threw the warm away and
+# paid the full ~5-7s extraction with the user waiting.
+
+
+def _client_error(code: str) -> Exception:
+    """An exception shaped like botocore's ClientError (it carries `.response`)."""
+    err = Exception(f"simulated {code}")
+    err.response = {"Error": {"Code": code}}
+    return err
+
+
+class _FakeBody:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _FakeR2:
+    """Records every call so tests assert on behaviour, not on source text."""
+
+    def __init__(self, store: dict | None = None, raises: Exception | None = None) -> None:
+        self.store = store or {}
+        self.raises = raises
+        self.gets: list[str] = []
+        self.puts: list[tuple[str, bytes]] = []
+        self.deletes: list[str] = []
+
+    def get_object(self, Bucket, Key):  # noqa: N803 — boto3's kwarg names
+        self.gets.append(Key)
+        if self.raises is not None:
+            raise self.raises
+        if Key not in self.store:
+            raise _client_error("NoSuchKey")
+        return {"Body": _FakeBody(self.store[Key])}
+
+    def put_object(self, Bucket, Key, Body, **kw):  # noqa: N803
+        self.puts.append((Key, Body))
+        self.store[Key] = Body
+
+    def delete_object(self, Bucket, Key):  # noqa: N803
+        self.deletes.append(Key)
+        self.store.pop(Key, None)
+
+
+@pytest.fixture
+def shared_r2(monkeypatch):
+    """A fake shared tier wired into media_proxy, with both caches reset."""
+    from app.api import media_proxy
+
+    fake = _FakeR2()
+    media_proxy._EXTRACT_CACHE.clear()
+    media_proxy._extract_inflight.clear()
+    monkeypatch.setattr(media_proxy, "_get_r2_meta_client", lambda: fake)
+    monkeypatch.setattr(media_proxy.settings, "r2_bucket", "test-bucket", raising=False)
+    yield fake
+    media_proxy._EXTRACT_CACHE.clear()
+
+
+def _shared_payload(video_id: str, stored_at: float, *, expires_at: float | None = None) -> bytes:
+    import json as _json
+    return _json.dumps({
+        "v": 1,
+        "stored_at": stored_at,
+        "result": {
+            "url": f"https://rr2.googlevideo.com/{video_id}",
+            "expires_at": expires_at if expires_at is not None else stored_at + 21600,
+            "mime_type": "audio/mp4",
+        },
+    }).encode()
+
+
+def test_a_failed_extraction_is_never_cached_in_either_tier():
+    """The poison rule: only a result with a real URL may be published.
+
+    A cached error would be served to every replica for an hour, turning one
+    transient yt-dlp failure into a fleet-wide outage for that track.
+    """
+    from app.api import media_proxy
+
+    now = time.time()
+    assert media_proxy._extract_cache_deadline({"error": "no_stream"}, now) == 0.0
+    assert media_proxy._extract_cache_deadline({"url": ""}, now) == 0.0
+    assert media_proxy._extract_cache_deadline({}, now) == 0.0
+    assert media_proxy._extract_cache_deadline({"url": "https://x"}, now) > now
+
+
+def test_the_staleness_cap_is_anchored_to_when_the_extraction_was_taken():
+    """The shared tier must age from the extraction, not from the read.
+
+    Recomputing the 1h cap against `now` on every hit renews it on each read,
+    so a single extraction would live forever and keep serving a URL whose
+    signing IP rotated 30 minutes ago.
+    """
+    from app.api import media_proxy
+
+    taken = time.time() - 3500          # 58 min old — inside the 1h cap
+    result = {"url": "https://x", "expires_at": time.time() + 21600}
+    assert media_proxy._extract_cache_deadline(result, taken) > time.time()
+
+    taken = time.time() - 3700          # 61 min old — past it
+    assert media_proxy._extract_cache_deadline(result, taken) <= time.time()
+
+
+def test_the_deadline_stops_short_of_the_signed_urls_own_expiry():
+    from app.api import media_proxy
+
+    now = time.time()
+    result = {"url": "https://x", "expires_at": now + 600}
+    # 5-minute safety margin: serving a URL that expires mid-download is a
+    # dead player, not a slow one.
+    assert media_proxy._extract_cache_deadline(result, now) == pytest.approx(now + 300, abs=1)
+
+
+def test_another_replicas_extraction_skips_yt_dlp_entirely(shared_r2):
+    """The headline behaviour: replica B reuses replica A's work."""
+    from app.api import media_proxy
+
+    vid = "sharedvid01"
+    shared_r2.store[f"extract/{vid}.json"] = _shared_payload(vid, time.time() - 30)
+
+    with patch.object(media_proxy, "_extract_audio") as ext:
+        result = media_proxy._cached_extract(vid)
+
+    ext.assert_not_called()
+    assert result["url"].endswith(vid)
+    assert shared_r2.gets == [f"extract/{vid}.json"]
+
+
+def test_a_shared_hit_is_promoted_so_the_next_read_is_local(shared_r2):
+    from app.api import media_proxy
+
+    vid = "sharedvid02"
+    shared_r2.store[f"extract/{vid}.json"] = _shared_payload(vid, time.time() - 30)
+
+    with patch.object(media_proxy, "_extract_audio") as ext:
+        media_proxy._cached_extract(vid)
+        media_proxy._cached_extract(vid)
+
+    ext.assert_not_called()
+    # One R2 round trip, not two — the promotion happened.
+    assert len(shared_r2.gets) == 1
+
+
+def test_a_cold_extraction_is_published_for_the_other_replica(shared_r2):
+    from app.api import media_proxy
+    import json as _json
+
+    vid = "coldvid0001"
+    fresh = {"url": f"https://rr2.googlevideo.com/{vid}", "expires_at": time.time() + 21600}
+
+    with patch.object(media_proxy, "_extract_audio", return_value=fresh):
+        media_proxy._cached_extract(vid)
+
+    assert [k for k, _ in shared_r2.puts] == [f"extract/{vid}.json"]
+    payload = _json.loads(shared_r2.puts[0][1])
+    assert payload["result"]["url"] == fresh["url"]
+    assert payload["stored_at"] > 0, "without stored_at the reader cannot age the entry"
+
+
+def test_a_failed_extraction_is_not_published(shared_r2):
+    from app.api import media_proxy
+
+    with patch.object(media_proxy, "_extract_audio", return_value={"error": "no_stream"}):
+        media_proxy._cached_extract("badvid00001")
+
+    assert shared_r2.puts == [], "an error must never reach the shared tier"
+
+
+def test_a_stale_shared_entry_is_ignored_and_re_extracted(shared_r2):
+    from app.api import media_proxy
+
+    vid = "stalevid001"
+    shared_r2.store[f"extract/{vid}.json"] = _shared_payload(vid, time.time() - 7200)
+    fresh = {"url": "https://fresh", "expires_at": time.time() + 21600}
+
+    with patch.object(media_proxy, "_extract_audio", return_value=fresh) as ext:
+        result = media_proxy._cached_extract(vid)
+
+    ext.assert_called_once()
+    assert result["url"] == "https://fresh"
+
+
+def test_a_miss_is_silent_but_a_credentials_failure_is_logged(monkeypatch, caplog):
+    """A cache that never hits must not look the same as one that is cold.
+
+    NoSuchKey is the normal case for any track nobody played this hour and
+    would drown the logs; AccessDenied means the tier is dead and nobody would
+    ever find out. Both arrive as botocore `ClientError`, so the code has to
+    read the error CODE, not the exception class.
+    """
+    from app.api import media_proxy
+
+    monkeypatch.setattr(media_proxy.settings, "r2_bucket", "test-bucket", raising=False)
+
+    miss = _FakeR2(raises=_client_error("NoSuchKey"))
+    monkeypatch.setattr(media_proxy, "_get_r2_meta_client", lambda: miss)
+    with caplog.at_level(logging.WARNING, logger="app.api.media_proxy"):
+        assert media_proxy._shared_extract_load("v1", time.time()) is None
+    assert caplog.records == []
+
+    denied = _FakeR2(raises=_client_error("AccessDenied"))
+    monkeypatch.setattr(media_proxy, "_get_r2_meta_client", lambda: denied)
+    with caplog.at_level(logging.WARNING, logger="app.api.media_proxy"):
+        assert media_proxy._shared_extract_load("v1", time.time()) is None
+    assert any("shared extract read failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_purging_a_poisoned_url_clears_both_tiers(shared_r2):
+    """Clearing only RAM leaves the bad URL in R2 for the fleet to read back."""
+    from app.api import media_proxy
+
+    vid = "poisonvid01"
+    media_proxy._EXTRACT_CACHE[vid] = ({"url": "https://stale"}, time.time() + 600)
+    shared_r2.store[f"extract/{vid}.json"] = _shared_payload(vid, time.time())
+
+    await media_proxy._purge_extraction(vid)
+
+    assert vid not in media_proxy._EXTRACT_CACHE
+    assert shared_r2.deletes == [f"extract/{vid}.json"]
+
+
+def test_the_shared_tier_client_bounds_its_timeouts(monkeypatch):
+    """botocore defaults to 60s connect AND 60s read.
+
+    `_r2_pull_to_local` bounds that with `asyncio.wait_for`, which is not
+    available here — `_cached_extract` is synchronous, inside an executor — so
+    an unreachable R2 would add up to a minute to a play the user is waiting on.
+    """
+    from app.api import media_proxy
+
+    monkeypatch.setattr(media_proxy, "_r2_ready", lambda: True)
+    for attr, val in (
+        ("r2_account_id", "acct"), ("r2_bucket", "b"),
+        ("r2_access_key_id", "k"), ("r2_secret_access_key", "s"),
+    ):
+        monkeypatch.setattr(media_proxy.settings, attr, val, raising=False)
+    monkeypatch.setattr(media_proxy, "_r2_meta_client", None)
+    monkeypatch.setattr(media_proxy, "_r2_meta_disabled", False)
+
+    client = media_proxy._get_r2_meta_client()
+    assert client is not None
+    cfg = client.meta.config
+    assert 0 < cfg.connect_timeout <= 10, f"connect_timeout={cfg.connect_timeout}"
+    assert 0 < cfg.read_timeout <= 10, f"read_timeout={cfg.read_timeout}"
+
+
+def test_the_stream_403_path_purges_before_it_retries():
+    """Order matters: re-extracting before the purge just re-reads the poison.
+
+    `_extract_coalesced` reads `_EXTRACT_CACHE` first, so a retry issued while
+    the bad entry is still cached returns the same dead URL and the retry is
+    theatre. Asserted on the AST because the two calls sit in one branch.
+    """
+    import ast
+    import inspect
+    from app.api import media_proxy
+
+    tree = ast.parse(inspect.getsource(media_proxy.stream_audio).strip())
+    order: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name in ("_purge_extraction", "_extract_coalesced"):
+                order.append((node.lineno, name))
+    names = [n for _, n in sorted(order)]
+    assert "_purge_extraction" in names, "the 403 branch must purge the poisoned entry"
+    purge_at = names.index("_purge_extraction")
+    assert "_extract_coalesced" in names[purge_at + 1:], (
+        "the re-extraction must come AFTER the purge, or it re-reads the cache"
+    )

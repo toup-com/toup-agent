@@ -19,6 +19,7 @@ Two routes:
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -431,31 +432,209 @@ def _extract_audio(video_id: str) -> dict:
 # real request, and seeks — each previously triggered a fresh ~2-3s yt-dlp
 # call. With the cache they reuse one extraction, and the mobile pre-warm
 # (media_play → /audio_url) fills it BEFORE the user locks, so the byte-pump
-# skips extraction entirely. Safe now that extraction + byte-pump share one
-# stable egress IP (the Tailscale exit node): the signed googlevideo URL stays
-# valid for the same IP on reuse — the rotating-Railway-IP 403 that forced the
-# earlier cache revert (commit 4039597a) can't happen through the proxy.
+# skips extraction entirely. Safe because extraction and the byte-pump share
+# one stable egress IP (the sticky `YT_DLP_PROXY` session), so the signed
+# googlevideo URL stays valid on reuse — the rotating-Railway-IP 403 that
+# forced the earlier cache revert (commit 4039597a) can't happen through it.
 _EXTRACT_CACHE: dict[str, tuple[dict, float]] = {}
 _EXTRACT_CACHE_TTL_CAP = 3600.0  # never serve an extraction older than 1h
 
 
+def _extract_cache_deadline(result: dict, base: float) -> float:
+    """When an extraction taken at `base` stops being servable. 0.0 = never cache.
+
+    Both tiers call this, and the shared tier passes the time the extraction was
+    TAKEN, not the time it was read — recomputing from `now` on every read would
+    renew the 1h staleness cap on each hit and let one extraction live forever.
+    """
+    if "error" in result or not result.get("url"):
+        return 0.0
+    deadline = base + _EXTRACT_CACHE_TTL_CAP
+    exp = result.get("expires_at") or 0
+    if exp:
+        # Stop serving 5 min before the signed URL itself expires.
+        deadline = min(deadline, float(exp) - 300.0)
+    return deadline
+
+
+# ── Shared (cross-replica) extraction cache ───────────────────────────────
+# `_EXTRACT_CACHE` above is per-PROCESS, and `railway.json` runs platform-api
+# at numReplicas=2. That made the broadcast-time pre-extract a coin flip: the
+# agent warms `/api/internal/media/warm` on whichever replica the router picks,
+# then the phone's `/audio_stream` lands on either one, so half of all first
+# plays threw the warm away and paid the full ~5-7s yt-dlp extraction with the
+# user waiting. The remux tier never had this problem because R2 is shared;
+# extraction did, because its result lived only in RAM.
+#
+# The stored value is the signed googlevideo URL, which IS bound to the IP that
+# extracted it (`ip=` in the URL; a range probe from an unrelated address 403s —
+# measured 2026-08-04). Sharing it between replicas is nonetheless safe, and for
+# one specific reason: `YT_DLP_PROXY` pins a STICKY IPRoyal session, so every
+# replica reads the same credential and egresses from the same exit address.
+# Verified the same day: three consecutive requests through the proxy all left
+# from 209.173.194.71, the exact address the signed URLs name.
+#
+# That session has a 30-minute lifetime while `_EXTRACT_CACHE_TTL_CAP` is an
+# hour, so a cached URL CAN outlive the IP that signed it and start 403-ing —
+# a pre-existing hazard of the in-process cache that this tier inherits rather
+# than introduces. `stream_audio` now treats that 403 as poison: it purges both
+# tiers and re-extracts, instead of 502-ing and letting the client's auto-skip
+# move the user off the song they asked for.
+#
+# A dedicated boto3 client because the audio one takes botocore's DEFAULT 60s
+# connect/read timeouts. `_r2_pull_to_local` bounds those with
+# `asyncio.wait_for`, which is unavailable here — `_cached_extract` is sync,
+# inside an executor — so an R2 hiccup would add up to a minute to a hot-path
+# play. Tight timeouts and no retries: this tier is an optimisation, and
+# giving up on it costs one extraction, not a failure.
+_R2_META_TIMEOUT = float(os.environ.get("AUDIO_R2_META_TIMEOUT", "2.5"))
+_r2_meta_client = None
+_r2_meta_disabled = False
+
+
+def _get_r2_meta_client():
+    global _r2_meta_client, _r2_meta_disabled
+    if _r2_meta_disabled or not _r2_ready():
+        return None
+    if _r2_meta_client is not None:
+        return _r2_meta_client
+    try:
+        import boto3
+        from botocore.config import Config
+        _r2_meta_client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{settings.r2_account_id}.r2.cloudflarestorage.com",
+            aws_access_key_id=settings.r2_access_key_id,
+            aws_secret_access_key=settings.r2_secret_access_key,
+            region_name="auto",
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=_R2_META_TIMEOUT,
+                read_timeout=_R2_META_TIMEOUT,
+                retries={"max_attempts": 1, "mode": "standard"},
+            ),
+        )
+        return _r2_meta_client
+    except Exception as e:
+        logger.warning("[media_proxy] R2 meta client init failed — shared extract cache off: %s", e)
+        _r2_meta_disabled = True
+        return None
+
+
+def _r2_extract_key(video_id: str) -> str:
+    # Own prefix: `_r2_key` puts the audio at the bucket root as `<id>.m4a`.
+    return f"extract/{video_id}.json"
+
+
+def _shared_extract_load(video_id: str, now: float) -> tuple[dict, float] | None:
+    """Read another replica's extraction. None on miss, staleness or any error.
+
+    Blocking — same executor contract as `_cached_extract`, its only caller.
+    """
+    client = _get_r2_meta_client()
+    if client is None:
+        return None
+    t0 = time.monotonic()
+    try:
+        obj = client.get_object(Bucket=settings.r2_bucket, Key=_r2_extract_key(video_id))
+        payload = json.loads(obj["Body"].read())
+    except Exception as e:
+        # A miss is the normal case for any track nobody has played this hour,
+        # so it must not be a warning. Everything else — bad credentials, a
+        # missing bucket, a timeout, a corrupt object — is logged, because a
+        # cache that silently never hits is indistinguishable from one that is
+        # merely cold. Match on the S3 error CODE, not the exception class:
+        # AccessDenied and NoSuchKey are both `ClientError`.
+        code = ""
+        if isinstance(getattr(e, "response", None), dict):
+            code = str(e.response.get("Error", {}).get("Code") or "")
+        if code in ("NoSuchKey", "404"):
+            return None
+        logger.warning("[media_proxy] shared extract read failed video_id=%s: %s", video_id, e)
+        return None
+
+    result = payload.get("result")
+    stored_at = payload.get("stored_at")
+    if not isinstance(result, dict) or not isinstance(stored_at, (int, float)):
+        return None
+    deadline = _extract_cache_deadline(result, float(stored_at))
+    if deadline <= now:
+        return None
+    logger.info(
+        "[media_proxy] extract cache HIT tier=shared video_id=%s age_s=%.0f r2_ms=%.0f",
+        video_id, now - float(stored_at), (time.monotonic() - t0) * 1000,
+    )
+    return result, deadline
+
+
+def _shared_extract_store(video_id: str, result: dict, stored_at: float) -> None:
+    """Publish a successful extraction for the other replicas. Best-effort.
+
+    Inline rather than on a background thread: it runs after a ~5-7s extraction
+    that the caller is already waiting on, so a bounded sub-second PUT is noise,
+    and a thread would only add an interpreter-shutdown failure mode.
+    """
+    client = _get_r2_meta_client()
+    if client is None:
+        return
+    try:
+        client.put_object(
+            Bucket=settings.r2_bucket,
+            Key=_r2_extract_key(video_id),
+            Body=json.dumps({"v": 1, "stored_at": stored_at, "result": result}).encode(),
+            ContentType="application/json",
+            CacheControl="no-store",
+        )
+    except Exception as e:
+        logger.warning("[media_proxy] shared extract store failed video_id=%s: %s", video_id, e)
+
+
+async def _purge_extraction(video_id: str) -> None:
+    """Drop a poisoned extraction from BOTH tiers.
+
+    Clearing only the local tier would leave the bad URL in R2 for every other
+    replica to read — and for this one to read back on its next miss.
+    """
+    _EXTRACT_CACHE.pop(video_id, None)
+
+    def _drop() -> None:
+        client = _get_r2_meta_client()
+        if client is None:
+            return
+        client.delete_object(Bucket=settings.r2_bucket, Key=_r2_extract_key(video_id))
+
+    try:
+        await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _drop),
+            timeout=_R2_META_TIMEOUT * 2,
+        )
+    except Exception as e:
+        # Not fatal — the object carries its own deadline and the local tier is
+        # already clear — but a purge that keeps failing means the shared tier
+        # is serving a bad URL to the fleet until it expires. Say so.
+        logger.warning("[media_proxy] shared extract purge failed video_id=%s: %s", video_id, e)
+
+
 def _cached_extract(video_id: str) -> dict:
-    """`_extract_audio` with a short-lived per-video cache. Blocking; run in an
+    """`_extract_audio` with a two-tier per-video cache. Blocking; run in an
     executor like the underlying call. Only successful results are cached."""
     now = time.time()
     hit = _EXTRACT_CACHE.get(video_id)
     if hit and hit[1] > now:
-        logger.info("[media_proxy] extract cache HIT video_id=%s", video_id)
+        logger.info("[media_proxy] extract cache HIT tier=L1 video_id=%s", video_id)
         return hit[0]
+
+    shared = _shared_extract_load(video_id, now)
+    if shared is not None:
+        result, deadline = shared
+        _EXTRACT_CACHE[video_id] = (result, deadline)
+        return result
+
     result = _extract_audio(video_id)
-    if "error" not in result and result.get("url"):
-        cache_until = now + _EXTRACT_CACHE_TTL_CAP
-        exp = result.get("expires_at") or 0
-        if exp:
-            # Stop serving 5 min before the signed URL itself expires.
-            cache_until = min(cache_until, float(exp) - 300.0)
-        if cache_until > now:
-            _EXTRACT_CACHE[video_id] = (result, cache_until)
+    deadline = _extract_cache_deadline(result, now)
+    if deadline > now:
+        _EXTRACT_CACHE[video_id] = (result, deadline)
+        _shared_extract_store(video_id, result, now)
     return result
 
 
@@ -1282,13 +1461,46 @@ async def stream_audio(
         logger.warning("[media_proxy] audio_stream upstream-connect failed video_id=%s: %s", video_id, e)
         return JSONResponse(status_code=502, content={"error": "upstream_fetch_failed", "detail": str(e)})
 
+    if upstream.status_code in (403, 410):
+        # The signed URL was refused for our own egress. The cause that
+        # actually fires: the URL is bound to the proxy's exit IP, that IP is a
+        # sticky session with a 30-minute lifetime, and the extraction caches
+        # hold results for an hour — so a URL can outlive the address that
+        # signed it. 502-ing here would let the client's auto-skip walk the
+        # user off the song they asked for, over a stale cache entry. Purge
+        # both tiers and extract once more instead.
+        status = upstream.status_code
+        await upstream.aclose()
+        logger.warning(
+            "[media_proxy] audio_stream upstream status=%s — purging cached extraction video_id=%s",
+            status, video_id,
+        )
+        await _purge_extraction(video_id)
+        try:
+            result = await asyncio.wait_for(
+                _extract_coalesced(video_id), timeout=_AUDIO_EXTRACT_TIMEOUT_SECS
+            )
+            if "error" in result or not result.get("url"):
+                raise RuntimeError(result.get("error") or "no stream url")
+            mime = result.get("mime_type") or mime
+            upstream_req = client.build_request(
+                "GET", result["url"], headers=upstream_headers
+            )
+            upstream = await client.send(upstream_req, stream=True)
+        except Exception as e:
+            await client.aclose()
+            _release()
+            logger.warning(
+                "[media_proxy] audio_stream re-extract after %s failed video_id=%s: %s",
+                status, video_id, e,
+            )
+            return JSONResponse(status_code=502, content={"error": "upstream_status", "status": status})
+
     if upstream.status_code >= 400:
         status = upstream.status_code
         await upstream.aclose()
         await client.aclose()
         _release()
-        # 403 here would mean the signed URL rejected OUR IP too (rare —
-        # usually a stale extraction); surface as a 502 to the client.
         logger.warning("[media_proxy] audio_stream upstream status=%s video_id=%s", status, video_id)
         return JSONResponse(status_code=502, content={"error": "upstream_status", "status": status})
 
