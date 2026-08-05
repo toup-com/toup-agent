@@ -219,3 +219,111 @@ class TestTheRegistrationThatDecidesAllOfThis:
             f"{self.TABLE} is missing from AGENT_ONLY_TABLES — it would be "
             "created on the shared platform database as well as on tenants"
         )
+
+
+# ── The case that actually happens on a tenant ───────────────────────────
+#
+# Everything above bootstraps a FRESH database. No live tenant is fresh: it has
+# ~41 tables already and gains one. Those are different code paths through
+# `create_all`, and only the second one ever runs in production.
+#
+# It is also the path where a mistake is silent. A new table that fails to
+# appear on an existing database raises nothing — `create_all` simply emits no
+# CREATE for it — and the outbox's callers are exception-guarded, so the first
+# symptom would be facts quietly not being replayed.
+
+
+@needs_pg
+async def test_an_existing_tenant_schema_gains_the_new_table():
+    """Build the schema as it was BEFORE this table existed, then run the real
+    bootstrap and assert it arrives — adding exactly one table and dropping
+    nothing.
+
+    The old world is simulated by creating every table EXCEPT the outbox,
+    rather than by mutating `Base.metadata`: this runs in the same process as
+    every other test, and a global metadata mutation that leaked would be a
+    far worse bug than the one being tested.
+    """
+    from app.db.models.base import Base, PLATFORM_ONLY_TABLES
+
+    scratch = f"upgradepath_{uuid.uuid4().hex[:8]}"
+    admin = _admin_engine()
+    try:
+        async with admin.connect() as conn:
+            await conn.execute(text(f'CREATE DATABASE "{scratch}"'))
+    finally:
+        await admin.dispose()
+
+    base = DB_URL.split("?")[0].rsplit("/", 1)[0]
+    engine = create_async_engine(f"{base}/{scratch}")
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+
+        # ── the world as it was: every agent table except this one
+        old_world = [
+            t for t in Base.metadata.sorted_tables
+            if t.name not in PLATFORM_ONLY_TABLES
+            and t.name != "memory_capture_outbox"
+        ]
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all, tables=old_world)
+
+        async def tables():
+            async with engine.connect() as conn:
+                return set((await conn.execute(text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='public'"))).scalars().all())
+
+        before = await tables()
+        assert "memory_capture_outbox" not in before, (
+            "the simulation is meaningless if the table is already present"
+        )
+        assert "memories" in before, "the old world should still look like a tenant"
+
+        # ── the upgrade: the real production bootstrap
+        import app.db.database as database
+        from app.config import settings
+
+        prev = (database.engine, database.async_session_maker, settings.run_mode)
+        database.engine = engine
+        database.async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+        settings.run_mode = "agent"
+        try:
+            await database.init_db()
+        finally:
+            (database.engine, database.async_session_maker, settings.run_mode) = prev
+
+        after = await tables()
+        added = after - before
+
+        # NOT "exactly one table appeared". `init_db` also creates a handful of
+        # tables from raw DDL rather than from `Base.metadata` (e.g.
+        # `redeemed_iap_transactions`, database.py:911), so they cannot be in a
+        # metadata-built old world and legitimately show up here. Asserting
+        # equality made this test fail on correct code the first time it ran.
+        assert "memory_capture_outbox" in added, (
+            f"the upgrade did not create the outbox; it added {sorted(added)}"
+        )
+        assert not (before - after), (
+            f"the upgrade DROPPED pre-existing tables: {sorted(before - after)}"
+        )
+
+        async with engine.connect() as conn:
+            cols = set((await conn.execute(text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='memory_capture_outbox'"))).scalars().all())
+            idx = set((await conn.execute(text(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE tablename='memory_capture_outbox'"))).scalars().all())
+        assert not (OUTBOX_COLUMNS - cols), f"missing columns {sorted(OUTBOX_COLUMNS - cols)}"
+        assert any("due" in i for i in idx), f"the due index is absent: {sorted(idx)}"
+    finally:
+        await engine.dispose()
+        admin = _admin_engine()
+        try:
+            async with admin.connect() as conn:
+                await conn.execute(text(f'DROP DATABASE IF EXISTS "{scratch}"'))
+        finally:
+            await admin.dispose()
