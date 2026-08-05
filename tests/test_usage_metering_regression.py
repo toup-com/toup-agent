@@ -552,6 +552,80 @@ async def test_credit_health_monitor_is_quiet_on_a_healthy_system():
     assert sent == []
 
 
+async def test_duplicate_grant_alarm_is_windowed_not_all_time():
+    """A repaired account keeps its historical duplicate rows forever. An
+    all-time count would fire on every run from then on, and an alarm that
+    never clears is one people learn to ignore. Reproduced live: after the
+    repair script ran, the alarm still read 2 users on a system whose loop was
+    already dead.
+    """
+    from app.db import async_session_maker
+    from app.db.models import BUCKET_MESSAGE, CreditLedger, LEDGER_PLAN_GRANT
+    from app.services import credit_health_monitor as CHM
+
+    uid = await _mk_user("windowed@example.com")
+    await _grant_via_balance(uid)
+
+    # A duplicate grant from LAST WEEK — real history, already remediated.
+    async with async_session_maker() as db:
+        db.add(CreditLedger(
+            id=str(uuid.uuid4()), user_id=uid, event_type=LEDGER_PLAN_GRANT,
+            bucket=BUCKET_MESSAGE, amount=Decimal("100"),
+            balance_after=Decimal("100"),
+            created_at=datetime.utcnow() - timedelta(days=7),
+            metadata_json={"reason": "initial_grant"},
+        ))
+        await db.commit()
+
+    async def _noop(*a, **k):
+        return True
+    CHM.send_infra_alert = _noop
+
+    result = await CHM.check_credit_health()
+    assert result["readings"]["users_with_duplicate_grants"] == 0
+    assert "duplicate_grants" not in result["alerts"]
+
+
+async def test_charge_ratio_ignores_corrections_and_grants():
+    """`plan_change` carries admin corrections and the duplicate-grant
+    clawback. Counting any negative amount as revenue made a REFUND look like
+    income — the live reading jumped 12.1 -> 73.7 credits the moment the repair
+    script ran, which would have masked exactly the undercharging this alarm
+    exists to catch."""
+    from app.db import async_session_maker
+    from app.db.models import (
+        BUCKET_MESSAGE, CreditLedger, LEDGER_CHAT_MESSAGE, LEDGER_PLAN_CHANGE,
+    )
+    from app.services import credit_health_monitor as CHM
+
+    uid = await _mk_user("ratio@example.com")
+    await _grant_via_balance(uid)
+
+    async with async_session_maker() as db:
+        db.add(CreditLedger(
+            id=str(uuid.uuid4()), user_id=uid, event_type=LEDGER_CHAT_MESSAGE,
+            bucket=BUCKET_MESSAGE, amount=Decimal("-5"),
+            balance_after=Decimal("95"), underlying_cost_cents=Decimal("5"),
+        ))
+        # A clawback. Negative, but NOT revenue.
+        db.add(CreditLedger(
+            id=str(uuid.uuid4()), user_id=uid, event_type=LEDGER_PLAN_CHANGE,
+            bucket=BUCKET_MESSAGE, amount=Decimal("-40"),
+            balance_after=Decimal("55"),
+            metadata_json={"reason": "duplicate_grant_reconciliation"},
+        ))
+        await db.commit()
+
+    async def _noop(*a, **k):
+        return True
+    CHM.send_infra_alert = _noop
+
+    result = await CHM.check_credit_health()
+    assert result["readings"]["credits_charged"] == 5.0, (
+        "the 40-credit clawback must not be counted as revenue"
+    )
+
+
 def test_web_fetch_cache_probe_symbol_exists():
     """web_fetch called `reader.page_cache_get`, which did not exist — every
     page fetch raised AttributeError and returned an error string."""

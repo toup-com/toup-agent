@@ -42,12 +42,17 @@ from sqlalchemy import func, or_, select
 from app.config import settings
 from app.db.database import async_session_maker
 from app.db.models import (
-    BUCKET_MESSAGE, CreditLedger, LEDGER_CHAT_MESSAGE, LEDGER_PLAN_GRANT,
-    LLMProxyEvent,
+    BUCKET_MESSAGE, CreditLedger, LEDGER_CHAT_MESSAGE, LEDGER_IMAGE_GEN,
+    LEDGER_PLAN_GRANT, LEDGER_TOOL_CALL, LLMProxyEvent,
 )
 from app.services.alerting import send_infra_alert
 
 logger = logging.getLogger(__name__)
+
+# Ledger event types that represent a user CONSUMING something. Grants,
+# renewals, daily resets and plan changes all move the balance without being
+# usage, so the revenue-vs-cost ratio must ignore them.
+_USAGE_EVENT_TYPES = (LEDGER_CHAT_MESSAGE, LEDGER_TOOL_CALL, LEDGER_IMAGE_GEN)
 
 
 def _cfg(name: str, default):
@@ -104,11 +109,17 @@ async def check_credit_health() -> dict:
             )
 
         # ── 2. Duplicate one-time grants ──────────────────────────────
+        # Windowed, NOT all-time. A repaired account keeps its historical
+        # duplicate rows forever, so an all-time count fires on every run from
+        # now until the end of time — and an alarm that never clears is one
+        # people learn to ignore. More than one one-time grant INSIDE the
+        # window is a live loop; a legitimate signup contributes exactly one.
         _dupe_users = (
             select(CreditLedger.user_id)
             .where(
                 CreditLedger.event_type == LEDGER_PLAN_GRANT,
                 CreditLedger.bucket == BUCKET_MESSAGE,
+                CreditLedger.created_at >= since,
             )
             .group_by(CreditLedger.user_id)
             .having(func.count() > 1)
@@ -137,6 +148,12 @@ async def check_credit_health() -> dict:
             ).where(
                 CreditLedger.created_at >= since,
                 CreditLedger.amount < 0,
+                # USAGE only. A negative amount is not necessarily revenue —
+                # `plan_change` carries admin corrections and the
+                # duplicate-grant reconciliation, and counting those made a
+                # clawback look like income: the live reading jumped from 12.1
+                # to 73.7 credits the moment the repair script ran.
+                CreditLedger.event_type.in_(_USAGE_EVENT_TYPES),
                 # NOT IN drops NULLs in SQL and most rows have no such key, so
                 # the IS NULL arm is load-bearing, not defensive.
                 or_(_is_admin.is_(None), ~_is_admin),
