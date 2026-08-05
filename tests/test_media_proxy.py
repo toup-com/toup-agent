@@ -995,3 +995,212 @@ async def test_the_gate_is_released_when_a_client_disconnects_early():
     assert "_ungate()" in body[fin:fin + 400], (
         "the gate must be released in the body's finally, not only on the happy path"
     )
+
+
+# ── Egress session pool ───────────────────────────────────────────────────
+#
+# `YT_DLP_PROXY` names ONE IPRoyal sticky session, so every extraction, every
+# byte-pump and every remux build for every user on both replicas left through
+# ONE residential peer's home uplink — a single point of bandwidth for the whole
+# product, redrawn by lottery every 30 minutes.
+#
+# Measured 2026-08-05 (2.5MB from Cloudflare through each session, so the number
+# is the proxy's uplink rather than googlevideo's):
+#   production's pinned session   0.63 MB/s over 5 samples
+#   20 fresh draws                median 2.04, p25 0.75, p75 3.90, max 8.41
+# 16 of 20 beat the peer production was stuck on. For iOS's ~2.5MB pre-roll that
+# is 3.9s against 1.2s.
+
+
+_POOL_PROXY = "http://user:pw_country-us_session-toupaudio_lifetime-30m@geo.iproyal.com:12321"
+
+
+@pytest.fixture
+def pooled(monkeypatch):
+    from app.api import media_proxy as mp
+    monkeypatch.setattr(mp.settings, "yt_dlp_proxy", _POOL_PROXY, raising=False)
+    monkeypatch.setattr(mp, "_PROXY_SESSION_POOL", 8)
+    return mp
+
+
+def test_different_videos_draw_different_peers(pooled):
+    slots = {pooled._proxy_slot_for(v) for v in
+             ("kJQP7kiw5Fk", "dQw4w9WgXcQ", "9bZkp7q19f0", "JGwWNGJdvx8",
+              "OPf0YbXqDm0", "3JZ_D3ELwOQ", "fJ9rUzIMcZQ", "CevxZvSJLk8")}
+    assert len(slots) > 1, "every video mapped to one peer — the pool does nothing"
+
+
+def test_the_same_video_always_draws_the_same_peer(pooled):
+    """googlevideo binds the signed URL to the extracting IP, so extraction, the
+    byte-pump and the remux download must agree."""
+    a = [pooled._proxy_slot_for("kJQP7kiw5Fk") for _ in range(20)]
+    assert len(set(a)) == 1
+
+
+def test_both_replicas_agree_without_talking_to_each_other(pooled):
+    """The slot is a pure function of the video id, so the R2-shared extraction
+    stays usable on whichever replica reads it."""
+    import hashlib
+    vid = "kJQP7kiw5Fk"
+    expected = int(hashlib.sha256(vid.encode()).hexdigest()[:8], 16) % 8
+    assert pooled._proxy_slot_for(vid) == expected
+
+
+def test_the_session_token_is_what_varies_and_nothing_else(pooled):
+    url = pooled._proxy_with_slot(3)
+    assert "session-toupaudio3" in url
+    assert url.startswith("http://user:")
+    assert url.endswith("@geo.iproyal.com:12321")
+    assert "country-us" in url and "lifetime-30m" in url
+
+
+def test_slot_zero_is_byte_identical_to_today(pooled):
+    """AUDIO_PROXY_SESSION_POOL=1 is the rollback, so slot 0 must not touch the
+    configured URL at all."""
+    assert pooled._proxy_with_slot(0) == _POOL_PROXY
+
+
+def test_a_pool_of_one_disables_the_whole_thing(monkeypatch, pooled):
+    monkeypatch.setattr(pooled, "_PROXY_SESSION_POOL", 1)
+    for v in ("kJQP7kiw5Fk", "dQw4w9WgXcQ", "9bZkp7q19f0"):
+        assert pooled._proxy_slot_for(v) == 0
+        assert pooled._proxy_with_slot(pooled._proxy_slot_for(v)) == _POOL_PROXY
+
+
+def test_a_password_containing_an_at_sign_survives(monkeypatch, pooled):
+    """Splitting on the FIRST '@' would truncate the credentials and send every
+    request to a host that does not exist."""
+    weird = "http://user:p@ss_session-toupaudio@geo.iproyal.com:12321"
+    monkeypatch.setattr(pooled.settings, "yt_dlp_proxy", weird, raising=False)
+    out = pooled._proxy_with_slot(4)
+    assert out.endswith("@geo.iproyal.com:12321")
+    assert "p@ss" in out and "session-toupaudio4" in out
+
+
+def test_a_proxy_with_no_session_token_is_left_exactly_alone(monkeypatch, pooled):
+    """A provider that does not do sticky sessions must still be USED, not
+    dropped — returning None here would send music straight out of Railway and
+    into YouTube's datacenter-IP bot challenge."""
+    plain = "http://user:pw@some.proxy:8080"
+    monkeypatch.setattr(pooled.settings, "yt_dlp_proxy", plain, raising=False)
+    assert pooled._proxy_with_slot(5) == plain
+
+
+def test_no_proxy_configured_stays_no_proxy(monkeypatch, pooled):
+    monkeypatch.setattr(pooled.settings, "yt_dlp_proxy", "", raising=False)
+    assert pooled._proxy_with_slot(0) is None
+    assert pooled._proxy_with_slot(3) is None
+
+
+def test_the_pump_reads_the_slot_the_extraction_RECORDED(pooled):
+    """Not recomputed. Recomputing looks equivalent and is not: it would make
+    every cached URL depend on the pool size being identical when it is read and
+    when it was written, so changing the pool size would remap every warm entry
+    onto the wrong egress and 403 the lot at once."""
+    assert pooled._proxy_for_result({"proxy_slot": 6}) == pooled._proxy_with_slot(6)
+    assert pooled._proxy_for_result({"proxy_slot": 6}) != pooled._proxy_with_slot(2)
+
+
+def test_an_extraction_cached_before_the_pool_shipped_still_works(pooled):
+    """No `proxy_slot` means it was taken through the unmodified URL, which is
+    exactly slot 0."""
+    assert pooled._proxy_for_result({"url": "https://x"}) == _POOL_PROXY
+
+
+def test_a_corrupt_slot_falls_back_instead_of_raising(pooled):
+    """A bad cache entry must not 500 the play."""
+    assert pooled._proxy_for_result({"proxy_slot": "garbage"}) == _POOL_PROXY
+    assert pooled._proxy_for_result({"proxy_slot": None}) == _POOL_PROXY
+
+
+def test_extraction_records_the_slot_it_used():
+    """The whole scheme rests on the slot travelling with the result."""
+    import ast
+    import inspect
+    from app.api import media_proxy as mp
+
+    src = inspect.getsource(mp._extract_audio)
+    assert '"proxy_slot": slot' in src, "the extraction result must carry its slot"
+    assert "opts[\"proxy\"] = proxy" in src, "extraction must use the pooled proxy"
+
+
+def test_the_403_retry_rebuilds_the_client_for_the_new_egress():
+    """The first client is pinned to the OLD entry's slot. Reusing it after a
+    re-extraction is a guaranteed second 403 during rollout, when every cached
+    entry reads as slot 0 while its retry lands on the video's real slot."""
+    import inspect
+    from app.api import media_proxy as mp
+
+    src = inspect.getsource(mp.stream_audio)
+    branch = src[src.index("if upstream.status_code in (403, 410):"):]
+    branch = branch[:branch.index("if upstream.status_code >= 400:")]
+    assert "httpx.AsyncClient(" in branch, "the 403 retry must rebuild the client"
+    assert "_proxy_for_result(result)" in branch
+
+
+def test_every_per_video_egress_uses_the_pool_and_none_uses_the_raw_setting():
+    """Extraction signs the URL; the pump and the remux download must leave from
+    the same address. One of the three reading the raw setting is a 403."""
+    import inspect
+    from app.api import media_proxy as mp
+
+    for fn in (mp._extract_audio, mp._do_remux, mp.stream_audio):
+        src = inspect.getsource(fn)
+        assert "settings.yt_dlp_proxy" not in src, (
+            f"{fn.__name__} still reaches for the un-pooled proxy directly"
+        )
+
+
+async def test_the_pump_egresses_where_the_EXTRACTION_said_not_where_the_hash_says(
+    monkeypatch, client, pooled
+):
+    """The behavioural half of the recorded-slot contract.
+
+    Recomputing the slot in the pump looks equivalent to reading it and is not:
+    it ties every cached URL to the pool size being identical when it is read
+    and when it was written. Bumping AUDIO_PROXY_SESSION_POOL would then remap
+    every warm entry onto the wrong egress and 403 the lot at once.
+
+    So hand the pump a cached extraction whose recorded slot DISAGREES with the
+    hash, and require it to follow the recording.
+    """
+    vid = "kJQP7kiw5Fk"
+    hashed = pooled._proxy_slot_for(vid)
+    recorded = (hashed + 3) % 8
+    assert recorded != hashed, "precondition: the two must differ"
+
+    async def _fake_extract(v):
+        return {
+            "url": _FAKE_URL,
+            "proxy_slot": recorded,
+            "expires_at": 9999999999,
+            "duration": 234,
+            "mime_type": "audio/mp4",
+            "ext": "m4a",
+        }
+
+    seen: dict = {}
+    real_client_cls = pooled.httpx.AsyncClient
+
+    class _SpyClient(real_client_cls):
+        def __init__(self, *a, **kw):
+            seen["proxy"] = kw.get("proxy")
+            raise RuntimeError("stop here — the proxy choice is all this asserts")
+
+    monkeypatch.setattr(pooled, "_extract_coalesced", _fake_extract)
+    monkeypatch.setattr(pooled, "_remuxed_ready", lambda v: None)
+
+    async def _no_r2(v):
+        return None
+    monkeypatch.setattr(pooled, "_r2_pull_to_local", _no_r2)
+    monkeypatch.setattr(pooled.httpx, "AsyncClient", _SpyClient)
+
+    try:
+        await client.get(f"/api/media/{vid}/audio_stream")
+    except Exception:
+        pass  # the spy aborts the request on purpose
+
+    assert seen.get("proxy") == pooled._proxy_with_slot(recorded), (
+        "the pump recomputed the slot instead of using the one the extraction recorded"
+    )
+    assert seen["proxy"] != pooled._proxy_with_slot(hashed)

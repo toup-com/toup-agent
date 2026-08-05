@@ -19,6 +19,7 @@ Two routes:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -305,6 +306,81 @@ def _resolve_cookiefile() -> str | None:
     return _RESOLVED_COOKIEFILE
 
 
+# ── Egress session pool ───────────────────────────────────────────────────
+# `YT_DLP_PROXY` names ONE IPRoyal sticky session (`session-toupaudio`,
+# `lifetime-30m`), so every extraction, every byte-pump and every remux build
+# for every user on both replicas leaves through ONE residential peer's home
+# uplink. That is a single point of bandwidth for the entire product, and the
+# draw is a lottery re-run every 30 minutes.
+#
+# Measured 2026-08-05, downloading 2.5MB through each session (Cloudflare, so
+# the number is the proxy's uplink and not googlevideo's):
+#
+#   production's pinned session   0.63 MB/s   (5 samples: 0.52 0.62 0.63 0.67 0.65)
+#   20 fresh draws                median 2.04, p25 0.75, p75 3.90, max 8.41 MB/s
+#
+# 16 of 20 draws beat the peer production was stuck on. For iOS's ~2.5MB
+# pre-roll that is 3.9s against 1.2s — most of the founder's cold-start report,
+# with no code path at fault.
+#
+# So spread the draw. A slot is chosen per VIDEO, not per request, because
+# googlevideo binds the signed URL to the extracting IP: extraction, the
+# byte-pump and the remux download must all leave from the same address.
+#
+# The chosen slot is CARRIED IN THE EXTRACTION RESULT rather than recomputed
+# from the video id. Recomputing looks equivalent and is not — it would make
+# every cached URL (L1 for an hour, R2 across replicas) depend on the pool size
+# being the same when it is read as when it was written, so changing
+# AUDIO_PROXY_SESSION_POOL would silently remap every warm entry onto the wrong
+# egress and 403 the lot at once.
+#
+# Slot 0 is the unmodified URL, so AUDIO_PROXY_SESSION_POOL=1 is byte-identical
+# to today's behaviour and is the rollback.
+_PROXY_SESSION_POOL = max(1, int(os.environ.get("AUDIO_PROXY_SESSION_POOL", "8")))
+_PROXY_SESSION_RE = re.compile(r"(session-)([A-Za-z0-9]+)")
+
+
+def _proxy_slot_for(video_id: str) -> int:
+    if _PROXY_SESSION_POOL <= 1 or not video_id:
+        return 0
+    return int(hashlib.sha256(video_id.encode()).hexdigest()[:8], 16) % _PROXY_SESSION_POOL
+
+
+def _proxy_with_slot(slot: int) -> str | None:
+    """The configured proxy URL with its sticky-session token varied by `slot`.
+
+    Returns the URL untouched for slot 0, for a provider whose URL carries no
+    session token, and for anything it cannot parse — a proxy we fail to
+    understand must still be used exactly as configured, never dropped.
+    """
+    base = (settings.yt_dlp_proxy or "").strip()
+    if not base:
+        return None
+    if not slot:
+        return base
+    # Split on the LAST '@' so a password containing '@' stays intact, and edit
+    # the credentials as text: `urlsplit` does not percent-decode userinfo, so a
+    # decode/re-encode round trip would corrupt an already-encoded password.
+    head, sep, host = base.rpartition("@")
+    if not sep or not _PROXY_SESSION_RE.search(head):
+        return base
+    return _PROXY_SESSION_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{slot}", head, count=1
+    ) + sep + host
+
+
+def _proxy_for_result(result: dict) -> str | None:
+    """The egress the given extraction was taken through. See `_proxy_slot_for`.
+
+    A cached extraction from before this shipped has no slot; treating that as
+    slot 0 is exactly right, because it WAS taken through the unmodified URL.
+    """
+    try:
+        return _proxy_with_slot(int(result.get("proxy_slot") or 0))
+    except (TypeError, ValueError):
+        return _proxy_with_slot(0)
+
+
 def _extract_audio(video_id: str) -> dict:
     """Blocking extract; callers must run in a thread / executor.
 
@@ -327,6 +403,11 @@ def _extract_audio(video_id: str) -> dict:
     cookiefile = _resolve_cookiefile()
     pot_base = (settings.bgutil_pot_base_url or "").strip()
     last_err: BaseException | None = None
+    # One slot for the whole extraction, and it travels with the result: the
+    # byte-pump and the remux download must leave from the address that signed
+    # the URL. See the pool note above.
+    slot = _proxy_slot_for(video_id)
+    proxy = _proxy_with_slot(slot)
 
     for client in _PLAYER_CLIENTS:
         extractor_args: dict = {"youtube": {"player_client": [client]}}
@@ -356,8 +437,8 @@ def _extract_audio(video_id: str) -> dict:
             opts["cookiefile"] = cookiefile
         # Route extraction through a residential proxy when configured — this
         # is the reliable defense against YouTube's datacenter-IP bot challenge.
-        if settings.yt_dlp_proxy:
-            opts["proxy"] = settings.yt_dlp_proxy
+        if proxy:
+            opts["proxy"] = proxy
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -404,11 +485,12 @@ def _extract_audio(video_id: str) -> dict:
         url = info["url"]
         ext = info.get("ext") or "m4a"
         logger.info(
-            "[media_proxy] audio_url ok video_id=%s client=%s ext=%s bitrate=%s",
-            video_id, client, ext, info.get("abr"),
+            "[media_proxy] audio_url ok video_id=%s client=%s ext=%s bitrate=%s slot=%d",
+            video_id, client, ext, info.get("abr"), slot,
         )
         return {
             "url": url,
+            "proxy_slot": slot,
             "expires_at": _parse_expires(url),
             "duration": int(info.get("duration") or 0),
             "mime_type": _mime_from_ext(ext),
@@ -1044,7 +1126,7 @@ def _do_remux(video_id: str) -> str | None:
     # ffmpeg's finicky https-proxy handling.
     try:
         with httpx.Client(
-            proxy=settings.yt_dlp_proxy or None, timeout=60.0, follow_redirects=True
+            proxy=_proxy_for_result(result), timeout=60.0, follow_redirects=True
         ) as dl:
             with dl.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as r:
                 if r.status_code >= 400:
@@ -1526,14 +1608,16 @@ async def stream_audio(
     if range_header:
         upstream_headers["Range"] = range_header
 
-    # googlevideo signs the stream URL to the IP that EXTRACTED it. If
-    # extraction went through the residential proxy, the byte-pump must use the
-    # same proxy or googlevideo 403s the mismatched IP. When no proxy is set,
-    # extraction + fetch are both Railway-direct, which also matches.
+    # googlevideo signs the stream URL to the IP that EXTRACTED it, so the
+    # byte-pump must leave from that same address or googlevideo 403s the
+    # mismatch. `_proxy_for_result` reads the pool slot the extraction recorded
+    # rather than recomputing it, so a cached URL keeps working across replicas
+    # and across a change to the pool size. When no proxy is set, extraction and
+    # fetch are both Railway-direct, which also matches.
     client = httpx.AsyncClient(
         timeout=_STREAM_TIMEOUT,
         follow_redirects=True,
-        proxy=settings.yt_dlp_proxy or None,
+        proxy=_proxy_for_result(result),
     )
     try:
         upstream_req = client.build_request("GET", upstream_url, headers=upstream_headers)
@@ -1566,6 +1650,17 @@ async def stream_audio(
             if "error" in result or not result.get("url"):
                 raise RuntimeError(result.get("error") or "no stream url")
             mime = result.get("mime_type") or mime
+            # Rebuild the client against the RE-EXTRACTED result's egress. The
+            # first one is pinned to the old entry's slot, and reusing it is a
+            # guaranteed second 403 during the pool rollout: every extraction
+            # cached before this shipped reads as slot 0, while the retry that
+            # replaces it lands on the video's real slot.
+            await client.aclose()
+            client = httpx.AsyncClient(
+                timeout=_STREAM_TIMEOUT,
+                follow_redirects=True,
+                proxy=_proxy_for_result(result),
+            )
             upstream_req = client.build_request(
                 "GET", result["url"], headers=upstream_headers
             )
