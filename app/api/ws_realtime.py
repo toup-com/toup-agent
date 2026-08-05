@@ -724,6 +724,30 @@ async def _get_user_openai_key(user_id: str) -> Optional[str]:
     from app.db.database import async_session_maker
     from app.db import AgentConfig
 
+    key, _is_byok = await _get_user_openai_key_ex(user_id)
+    return key
+
+
+async def _get_user_openai_key_ex(user_id: str) -> tuple[Optional[str], bool]:
+    """``(key, is_byok)`` — the key AND whether the USER owns it.
+
+    These are two different questions and conflating them killed voice
+    metering outright. The gate was ``using_platform_key = not openai_key``,
+    but this resolver already falls back to platform-owned keys, so it is
+    never None on a session that survives — and when it IS None the handler
+    closes the socket before the relay loop. ``_maybe_meter_response`` was
+    therefore unreachable: zero realtime rows in llm_proxy_events, ever, and
+    no voice event type in credit_ledger.
+
+    Only a LEGACY per-user ``openai_api_key`` is genuinely BYOK (that user
+    pays OpenAI directly, so billing them credits too would double-bill —
+    the rationale the old comment gave, correctly, for the wrong variable).
+    ``bundle_openai_api_key`` is provisioned BY the platform, and both
+    settings fallbacks are platform-owned: the platform pays for all three.
+    """
+    from app.db.database import async_session_maker
+    from app.db import AgentConfig
+
     async with async_session_maker() as db:
         result = await db.execute(
             select(AgentConfig.openai_api_key, AgentConfig.bundle_openai_api_key)
@@ -732,7 +756,11 @@ async def _get_user_openai_key(user_id: str) -> Optional[str]:
         row = result.first()
     user_key = (row[0] if row else None) or None
     bundle_key = (row[1] if row else None) or None
-    return user_key or bundle_key or settings.platform_openai_api_key or settings.openai_api_key or None
+    key = (
+        user_key or bundle_key
+        or settings.platform_openai_api_key or settings.openai_api_key or None
+    )
+    return key, bool(user_key)
 
 
 async def _get_agent_name(user_id: str) -> Optional[str]:
@@ -2183,6 +2211,16 @@ async def _meter_voice_turn(user_id: str, model: str, usage: dict, response_id: 
                 input_tokens=input_tokens, output_tokens=output_tokens,
                 underlying_cost_cents=Decimal(str(cost_cents)),
                 metadata={"endpoint": "realtime_voice", "channel": "voice"},
+                # This gate has never fired in production, so voice has always
+                # been free. Turning it on and billing in the same deploy would
+                # start charging for something users have never paid for, with
+                # no idea what a real session costs. meter_only writes the row
+                # with amount=0 and moves no balance — flip
+                # `voice_metering_charge` once the series exists.
+                meter_only=not getattr(settings, "voice_metering_charge", False),
+                # The audio tokens are already spent at OpenAI by the time
+                # response.done arrives; the daily cap must not zero them.
+                already_incurred=True,
             )
             await db.commit()
         logger.info(
@@ -2291,13 +2329,18 @@ async def realtime_voice_ws(
     # Bounded: a stuck platform-DB pool acquisition here used to propagate as
     # a bare 1011 close with zero frames sent — the silent-forever class.
     try:
-        openai_key = await asyncio.wait_for(_get_user_openai_key(user_id), timeout=8.0)
+        openai_key, is_byok = await asyncio.wait_for(
+            _get_user_openai_key_ex(user_id), timeout=8.0,
+        )
     except Exception:
         logger.exception("[REALTIME] OpenAI key lookup failed")
-        openai_key = None
-    # Platform-key sessions are the ones we meter (v1 and v2): BYOK users pay
-    # OpenAI directly, charging them credits too would be a double-bill.
-    using_platform_key = not openai_key
+        openai_key, is_byok = None, False
+    # Platform-key sessions are the ones we meter: a BYOK user pays OpenAI
+    # directly, so charging credits too would double-bill. This USED to read
+    # `not openai_key`, which is False for every session that survives (the
+    # resolver falls back to platform keys) and True only where the socket is
+    # closed below — so nothing was ever metered. See _get_user_openai_key_ex.
+    using_platform_key = not is_byok
     openai_key = openai_key or settings.openai_api_key
     if not openai_key:
         await websocket.send_json({
@@ -2444,11 +2487,34 @@ async def realtime_voice_ws(
     _health_t = asyncio.create_task(_health_step())
     _lang_t = asyncio.create_task(_lang_step())
     _bg_tasks = [_session_t, _instructions_t, _tools_t, _health_t, _lang_t]
+    # Metering tasks are NOT in _bg_tasks. They used to be, and the session-end
+    # `finally` cancels everything in that list — asyncio.CancelledError is a
+    # BaseException, so _meter_voice_turn's `except Exception` could not catch
+    # it and the final turn's cost vanished with no log at all. Every hang-up
+    # (i.e. every call) silently dropped its last charge. These are drained,
+    # never cancelled: the cost is already incurred at OpenAI.
+    _meter_tasks: list[asyncio.Task] = []
 
     def _cancel_bg() -> None:
         # Tap-and-close must not leave tasks poking a cold agent for 25s.
         for _t in _bg_tasks:
             _t.cancel()
+
+    async def _drain_meter_tasks() -> None:
+        if not _meter_tasks:
+            return
+        try:
+            # Bounded so a wedged DB cannot hold the socket open; each task
+            # already logs its own failure, and gather never raises here.
+            await asyncio.wait_for(
+                asyncio.gather(*_meter_tasks, return_exceptions=True), timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[REALTIME] voice metering did not finish within 10s user=%s "
+                "(%d task(s)) — cost may be unrecorded",
+                user_id[:8], len(_meter_tasks),
+            )
 
     db_session_id: Optional[str] = None
 
@@ -2901,7 +2967,7 @@ async def realtime_voice_ws(
 
                     _meter_t = _maybe_meter_response(user_id, response, using_platform_key)
                     if _meter_t is not None:
-                        _bg_tasks.append(_meter_t)
+                        _meter_tasks.append(_meter_t)
                     # Extract final text from output items
                     full_text = response_text_accum
                     for item in response.get("output", []):
@@ -3223,6 +3289,9 @@ async def realtime_voice_ws(
     finally:
         logger.info("[REALTIME] Session ended for user %s", user_id[:8])
         _cancel_bg()
+        # Before the sockets go: these charges are for audio OpenAI has already
+        # billed us for. Cancelling them (the old behaviour) lost the cost.
+        await _drain_meter_tasks()
         try:
             await openai_ws.close()
         except Exception:

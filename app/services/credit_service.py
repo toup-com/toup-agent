@@ -323,6 +323,7 @@ def _split_message_charge(
     used_today: Decimal,
     daily_cap: Optional[Decimal],
     amount: Decimal,
+    ignore_daily_cap: bool = False,
 ) -> tuple[Decimal, Decimal, bool, Optional[str]]:
     """Decide how a MESSAGE-bucket charge splits across the two wallets.
 
@@ -332,15 +333,25 @@ def _split_message_charge(
 
     Returns ``(from_plan, from_purchased, feasible, reason)``.
 
-    INVARIANT — when ``purchased_remaining == 0`` this reduces EXACTLY to
-    the pre-IAP behaviour: ``from_plan = min(amount, plan_remaining,
-    cap_room)``, ``from_purchased = 0``, feasible iff ``amount <=
-    plan_remaining`` AND ``amount <= cap_room``, with insufficient-vs-cap
-    reason precedence matching the old try_charge gate (insufficient
-    checked first, then daily-cap).
+    ``ignore_daily_cap`` treats the cap as absent for THIS split. It exists
+    for costs the platform has ALREADY paid a provider: a single heavy
+    gpt-5.5 call quotes 26-28 credits against a free daily cap of 15, so the
+    cap could never be satisfied, the charge was denied, zeroed — and the
+    answer streamed anyway. Measured in production 2026-08-03: 274 calls,
+    $17.17 of provider spend, 59% of all real-user LLM cost, given away with
+    `{"denied": true, "reason": "daily_cap_exceeded"}` in the ledger. The cap
+    must gate ADMISSION of new work (see ``check_balance``), never zero a cost
+    already incurred; the plan wallet remains the hard ceiling either way.
+
+    INVARIANT — with ``ignore_daily_cap=False`` and ``purchased_remaining ==
+    0`` this reduces EXACTLY to the pre-IAP behaviour: ``from_plan =
+    min(amount, plan_remaining, cap_room)``, ``from_purchased = 0``, feasible
+    iff ``amount <= plan_remaining`` AND ``amount <= cap_room``, with
+    insufficient-vs-cap reason precedence matching the old try_charge gate
+    (insufficient checked first, then daily-cap).
     """
     cap_room = (
-        None if daily_cap is None
+        None if (daily_cap is None or ignore_daily_cap)
         else max(Decimal("0"), daily_cap - used_today)
     )
     if cap_room is None:
@@ -579,6 +590,7 @@ def _bucket_remaining(balance: CreditBalance, bucket: str) -> Decimal:
 
 def _apply_delta(
     balance: CreditBalance, bucket: str, delta: Decimal,
+    ignore_daily_cap: bool = False,
 ) -> Optional[tuple[Decimal, Decimal]]:
     """Mutate a wallet by ``delta``. Returns the (from_plan, from_purchased)
     split for MESSAGE-bucket charges (delta < 0); None otherwise.
@@ -588,6 +600,12 @@ def _apply_delta(
     the purchased wallet per :func:`_split_message_charge`; only the plan
     portion advances the daily-used counter so purchased spend bypasses the
     cap. Feasibility is enforced by callers BEFORE this runs.
+
+    ``ignore_daily_cap`` MUST match whatever the caller's feasibility gate
+    used. This function re-derives the split independently, so a gate that
+    ignored the cap while this did not would clamp ``from_plan`` to the (zero)
+    cap headroom and push the whole amount onto ``from_purchased`` — driving
+    the purchased wallet negative for a user who never bought anything.
     """
     if bucket == BUCKET_MESSAGE:
         if delta >= 0:
@@ -603,6 +621,7 @@ def _apply_delta(
             (Decimal(balance.message_credits_daily_cap)
              if balance.message_credits_daily_cap is not None else None),
             amount,
+            ignore_daily_cap=ignore_daily_cap,
         )
         balance.message_credits_remaining = _q(
             Decimal(balance.message_credits_remaining) - from_plan, _BALANCE_QUANTUM,
@@ -793,12 +812,43 @@ class CreditService:
         await db.flush()
 
     async def _already_granted(self, db: AsyncSession, user_id: str) -> bool:
-        """True iff THIS user already owns a grant tombstone (i.e. its
-        one-time grant already fired). Makes grant_initial_free_credits
-        idempotent and a no-op when the grant happened at signup."""
+        """True iff THIS user's one-time grant already fired.
+
+        Two independent proofs, because the tombstone alone is not one.
+        `grant_eligibility` is keyed by CANONICAL EMAIL HASH, so a user whose
+        hash was claimed by an earlier account of the same person can never
+        own a row — `_claim_grant_tombstone` hits the IntegrityError branch and
+        (with `free_grant_dedupe_enabled` off) returns "granted" WITHOUT
+        writing anything. Such a user stayed a `reconcile_deferred_grants`
+        candidate forever and was re-granted on every hourly sweep, and
+        `_apply_initial_grant` ASSIGNS the monthly allotment rather than adding
+        it — so each sweep silently reset the wallet to full and wiped the
+        period's spend while leaving `message_credits_used_today` climbing.
+        Observed in production 2026-08-03: two accounts, 48 and 117 repeat
+        grants, `integration_credits_remaining` pinned at exactly 500.
+
+        The ledger is the honest per-user record: `_apply_initial_grant` is the
+        only runtime writer of a `plan_grant` row (the sole other source is
+        alembic 054, whose grandfathered rows also mean "already granted"), it
+        keys the row to THIS user_id, and nothing rewrites history. Ask it
+        first; keep the tombstone check so a user who legitimately owns one is
+        still short-circuited. Deliberately NOT filtered on
+        metadata->>'reason' — `metadata_json` is JSON-with-a-JSONB-variant, so
+        `.astext` would break the SQLite test DB, and event_type alone is
+        already unambiguous.
+        """
+        uid = str(user_id)
+        row = await db.execute(
+            select(CreditLedger.id).where(
+                CreditLedger.user_id == uid,
+                CreditLedger.event_type == LEDGER_PLAN_GRANT,
+            ).limit(1)
+        )
+        if row.first() is not None:
+            return True
         row = await db.execute(
             select(GrantEligibility.canonical_email_hash).where(
-                GrantEligibility.first_user_id == str(user_id)
+                GrantEligibility.first_user_id == uid
             )
         )
         return row.first() is not None
@@ -844,12 +894,28 @@ class CreditService:
           * signed up while ``require_verified_email_for_grant`` was ON, then
             the flag was turned OFF (nothing re-triggers their grant).
 
-        Candidates = balances with NO owned tombstone (i.e. never granted).
-        Each is re-run through ``grant_initial_free_credits``, which grants
-        only if eligible and still suppresses aliases / unverified-and-gated
-        users. Idempotent and safe to run on a schedule. Per-candidate commit
-        isolates failures. Returns the number actually granted.
+        Candidates = balances that have never been granted. "Never granted"
+        means NO `plan_grant` ledger row for this user AND no owned tombstone —
+        the tombstone alone is not sufficient, because it is keyed by canonical
+        email hash and a user colliding with an earlier account of the same
+        person can never own one (see ``_already_granted``). Selecting on the
+        tombstone alone made such users permanent candidates: the sweep runs
+        hourly, `_apply_initial_grant` ASSIGNS the monthly allotment, and the
+        wallet was silently reset to full every hour, forever.
+
+        Each candidate is re-run through ``grant_initial_free_credits``, which
+        grants only if eligible and still suppresses aliases /
+        unverified-and-gated users. Idempotent and safe to run on a schedule.
+        Per-candidate commit isolates failures. Returns the number granted.
         """
+        already_granted = (
+            select(CreditLedger.id)
+            .where(
+                CreditLedger.user_id == CreditBalance.user_id,
+                CreditLedger.event_type == LEDGER_PLAN_GRANT,
+            )
+            .exists()
+        )
         rows = await db.execute(
             select(CreditBalance.user_id)
             .outerjoin(
@@ -857,6 +923,7 @@ class CreditService:
                 GrantEligibility.first_user_id == CreditBalance.user_id,
             )
             .where(GrantEligibility.canonical_email_hash.is_(None))
+            .where(~already_granted)
             .limit(limit)
         )
         candidate_ids = [r[0] for r in rows.all()]
@@ -885,12 +952,39 @@ class CreditService:
         self, db: AsyncSession, user_id: str, bucket: str,
         required: Decimal | float | int,
     ) -> ChargeResult:
-        """Read-only "would this charge succeed?" peek. No ledger row written."""
+        """Read-only "would this charge succeed?" peek. No ledger row written.
+
+        This is the ONLY pre-flight in the system — every 402 gate calls it —
+        and it was blind to the daily cap: it compared ``required`` against the
+        bucket total and nothing else, so a free user sitting at the cap with a
+        full monthly wallet always passed. That is what let an over-cap turn
+        reach a provider before anything could refuse it. With
+        ``credit_cap_admission_control`` on it asks the same
+        ``_split_message_charge`` the charge itself will use, so the gate and
+        the application agree by construction.
+        """
         balance = await self.get_or_create_balance(db, user_id)
         required_q = _q(required, _AMOUNT_QUANTUM)
         enforcement = getattr(settings, "credit_enforcement_enabled", False)
         remaining = _bucket_remaining(balance, bucket)
         if not enforcement:
+            return ChargeResult(success=True, balance_after=remaining)
+        if (
+            bucket == BUCKET_MESSAGE
+            and getattr(settings, "credit_cap_admission_control", False)
+        ):
+            _fp, _fpur, feasible, split_reason = _split_message_charge(
+                Decimal(balance.message_credits_remaining),
+                Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0),
+                Decimal(balance.message_credits_used_today),
+                (Decimal(balance.message_credits_daily_cap)
+                 if balance.message_credits_daily_cap is not None else None),
+                required_q,
+            )
+            if not feasible:
+                return ChargeResult(
+                    success=False, balance_after=remaining, reason=split_reason,
+                )
             return ChargeResult(success=True, balance_after=remaining)
         if required_q > remaining:
             return ChargeResult(
@@ -903,6 +997,20 @@ class CreditService:
     async def get_balance_view(self, db: AsyncSession, user_id: str) -> BalanceView:
         balance = await self.get_or_create_balance(db, user_id)
         plan = await db.get(SubscriptionPlan, balance.plan_id)
+
+        # `message_credits_used_today` is rolled ONLY by `_reset_daily_if_needed`,
+        # whose two call sites are both WRITES (try_charge, reserve) — and there
+        # is no daily cron. So the raw column is "as of the last charge that
+        # landed", which after a quiet night is yesterday's total. /status is a
+        # GET and must not write, so roll it for the RESPONSE only and leave the
+        # row alone; the next charge persists the reset through the normal path.
+        used_today = Decimal(balance.message_credits_used_today)
+        anchor = getattr(balance, "day_anchor_local_date", None)
+        if anchor:
+            user = await db.get(User, user_id)
+            today_iso = _local_day_iso(getattr(user, "timezone", None) if user else None)
+            if today_iso > anchor:
+                used_today = Decimal("0")
 
         # Map the stored plan_source to the mobile contract:
         #   apple            → 'iap'
@@ -936,7 +1044,7 @@ class CreditService:
             # /status reports what the user can actually spend.
             message_credits_remaining=_bucket_remaining(balance, BUCKET_MESSAGE),
             message_credits_monthly=Decimal(plan.message_credits_monthly) if plan else Decimal("0"),
-            message_credits_used_today=Decimal(balance.message_credits_used_today),
+            message_credits_used_today=used_today,
             message_credits_daily_cap=(
                 Decimal(balance.message_credits_daily_cap)
                 if balance.message_credits_daily_cap is not None else None
@@ -962,8 +1070,19 @@ class CreditService:
         underlying_cost_cents: Optional[Decimal | float | int] = None,
         metadata: Optional[dict] = None,
         meter_only: bool = False,
+        already_incurred: bool = False,
     ) -> ChargeResult:
         """Instant deduction. Atomic, idempotent.
+
+        Set ``already_incurred=True`` when the cost being charged has ALREADY
+        been paid to a provider and the user already has the result — an LLM
+        response that streamed, an image that was generated. Denying such a
+        charge does not un-spend the money; it only hides it. With
+        ``credit_cap_admission_control`` on, an incurred charge is exempt from
+        the DAILY CAP (never from the balance check) so it lands instead of
+        being zeroed, and the resulting over-cap ``used_today`` is what makes
+        the next pre-flight refuse. See config.py's flag comment for the
+        production numbers this closes.
 
         When ``settings.credit_enforcement_enabled=False`` always succeeds
         but still writes the ledger row (shadow mode).
@@ -1031,6 +1150,10 @@ class CreditService:
                 (Decimal(balance.message_credits_daily_cap)
                  if balance.message_credits_daily_cap is not None else None),
                 amount_q,
+                ignore_daily_cap=(
+                    already_incurred
+                    and getattr(settings, "credit_cap_admission_control", False)
+                ),
             )
             if not _feasible:
                 deny_reason = _split_reason
@@ -1086,7 +1209,13 @@ class CreditService:
             and not meter_only
         )
         if will_deduct:
-            _apply_delta(balance, bucket, -amount_q)
+            _apply_delta(
+                balance, bucket, -amount_q,
+                ignore_daily_cap=(
+                    already_incurred
+                    and getattr(settings, "credit_cap_admission_control", False)
+                ),
+            )
             actual_amount = -amount_q
         else:
             actual_amount = Decimal("0")

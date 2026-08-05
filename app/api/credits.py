@@ -23,6 +23,7 @@ from app.api.admin.deps import require_admin
 from app.api.auth import get_current_user
 from app.db import get_db
 from app.db.models import (
+    LEDGER_TOOL_CALL,
     AgentConfig, CreditLedger, PlatformSetting, SubscriptionPlan, User,
 )
 from app.services.credit_service import FLAT_FEES, credit_service
@@ -71,8 +72,21 @@ async def sync_subscription_plan_stripe_ids(db_session_maker) -> dict[str, str]:
 class BucketStatus(BaseModel):
     remaining: float
     monthly: float
+    # Null means "this bucket has NO daily dimension", not "we failed to
+    # compute it". Only the MESSAGE bucket has per-day counters
+    # (credit_balances.message_credits_used_today / _daily_cap); there is no
+    # integration equivalent in the schema, so integration reports null here
+    # deliberately. `has_daily_limit` lets a client tell the two apart instead
+    # of inferring from a null it cannot interpret.
     used_today: Optional[float] = None
     daily_cap: Optional[float] = None
+    has_daily_limit: bool = False
+    # Credits consumed this PERIOD = monthly - remaining, computed server-side.
+    # The endpoint used to return no "used" figure at all, so every client
+    # re-derived it — and the two mobile screens derived it differently (one
+    # subtracted the purchased wallet first, one did not) and then rounded it
+    # differently. One number, one place.
+    used_this_period: float = 0.0
 
 
 class CreditStatusResponse(BaseModel):
@@ -156,10 +170,24 @@ async def get_credit_status(
             used_today=float(view.message_credits_used_today),
             daily_cap=(float(view.message_credits_daily_cap)
                        if view.message_credits_daily_cap is not None else None),
+            has_daily_limit=view.message_credits_daily_cap is not None,
+            # `remaining` is plan + purchased, so subtracting it from the plan's
+            # monthly allotment would under-report usage for anyone holding IAP
+            # credits. Bought credits are not part of the period allowance.
+            used_this_period=max(0.0, float(
+                view.message_credits_monthly
+                - (view.message_credits_remaining - view.purchased_credits_remaining)
+            )),
         ),
         integration=BucketStatus(
             remaining=float(view.integration_credits_remaining),
             monthly=float(view.integration_credits_monthly),
+            # No per-day integration counter exists in the schema — null here
+            # is the schema's answer, not a missing computation.
+            has_daily_limit=False,
+            used_this_period=max(0.0, float(
+                view.integration_credits_monthly - view.integration_credits_remaining
+            )),
         ),
         period_start=view.period_start,
         period_end=view.period_end,
@@ -468,7 +496,25 @@ async def agent_charge(
     # of 42). Those are direct outbound calls from the agent to Brave; the LLM
     # proxy never sees them, so they were never charged inline in the first
     # place and there is nothing to double-count.
-    if (cfg.llm_mode or "").strip().lower() == "bundle" and not body.meter_only:
+    #
+    # But meter_only alone was the WRONG key. It is True today only because
+    # `web_tool_metering_charge` is False; flipping that flag — the documented
+    # way to start billing web tools — makes the agent send meter_only=False,
+    # re-engages this guard, and the usage series DISAPPEARS for the whole
+    # fleet instead of starting to bill. The flag advertised as "start
+    # charging" would in fact have blinded the system.
+    #
+    # So key on the real question: did the LLM proxy already bill this event
+    # inline? Only events that traverse the proxy can double-charge.
+    #   tool_call        — agent → Brave directly, proxy never sees it. EXEMPT.
+    #   image_generation — the proxy charges it at llm_proxy.py:1675/1804/
+    #                      1899/1992/2087. NOT exempt; suppression is correct.
+    # An allowlist, not a denylist: an unrecognised future event_type falls to
+    # the suppressed side, which risks an under-charge rather than billing a
+    # user twice.
+    _PROXY_NEVER_BILLS = {LEDGER_TOOL_CALL}
+    _bundle_exempt = body.meter_only or (body.event_type in _PROXY_NEVER_BILLS)
+    if (cfg.llm_mode or "").strip().lower() == "bundle" and not _bundle_exempt:
         view = await credit_service.get_balance_view(db, body.user_id)
         await db.commit()
         remaining = float(view.message_credits_remaining)

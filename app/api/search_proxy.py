@@ -44,14 +44,14 @@ import asyncio
 import hashlib
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -74,6 +74,20 @@ TIER_BRAVE = "brave_api"
 ST_OK = "ok"
 ST_THROTTLED = "throttled"   # we shed it; the agent falls to a lower tier
 ST_ERROR = "error"           # upstream failed; the agent falls to a lower tier
+
+# Per-user daily Brave ceiling.
+RSN_USER_DAILY_CAP = "user_daily_cap"
+
+# degraded_reason values that mean the request never reached Brave and so
+# consumed none of its quota. This module PRODUCES every one of them, so it
+# owns the vocabulary; search_quota_monitor imports it rather than keeping a
+# second copy (they had drifted apart the moment a new reason was added).
+# A capped attempt must appear here or the ceiling becomes self-reinforcing:
+# capped rows would count as usage and hold the user over the cap forever.
+NEVER_REACHED_BRAVE = (
+    "tenant_rate_limit", "fleet_headroom", "cooldown_after_429",
+    RSN_USER_DAILY_CAP,
+)
 
 
 # ── Token auth ───────────────────────────────────────────────────────
@@ -331,6 +345,36 @@ def _query_hash(query: str) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
+async def _user_brave_calls_24h(db: AsyncSession, user_id: str) -> Optional[int]:
+    """How many Brave calls this user has actually consumed in the last 24h.
+
+    Mirrors ``search_quota_monitor._brave_calls_since`` — the NOT IN arm drops
+    NULLs in SQL and a served call has ``degraded_reason IS NULL``, so the
+    IS NULL arm is load-bearing, not defensive.
+
+    Returns None if the count could not be taken; callers must fail OPEN. A
+    broken counter must never take search down — but it is logged, because a
+    silently-open ceiling is indistinguishable from no ceiling at all.
+    """
+    since = datetime.utcnow() - timedelta(hours=24)
+    try:
+        result = await db.execute(
+            select(func.count()).where(
+                SearchEvent.user_id == user_id,
+                SearchEvent.created_at >= since,
+                SearchEvent.tier == TIER_BRAVE,
+                or_(
+                    SearchEvent.degraded_reason.is_(None),
+                    SearchEvent.degraded_reason.notin_(NEVER_REACHED_BRAVE),
+                ),
+            )
+        )
+        return int(result.scalar() or 0)
+    except Exception:
+        logger.exception("[search-gw] daily-cap count FAILED user=%s (failing open)", user_id)
+        return None
+
+
 async def _record(
     db: AsyncSession,
     *,
@@ -464,6 +508,32 @@ async def search_web(
         await db.commit()
         logger.warning("[search-gw] degraded user=%s reason=%s", user_id, reason)
         return degraded(reason or "throttled")
+
+    # Per-user daily VOLUME ceiling. Every other guard above bounds RATE and
+    # sheds to a lower tier, so a runaway loop was reshaped, never bounded —
+    # and metering cannot bound it either while web_tool_metering_charge is
+    # False (meter_only rows charge 0.00 and `_charge` below never denies).
+    # This is the only thing that caps what one user can cost us at Brave.
+    # Deliberately a DEGRADE, not a 4xx: the agent still answers from its free
+    # lower tiers, which is the correct trade when the cost being protected is
+    # Brave quota specifically. A hard error here would break the turn for a
+    # limit the user cannot see.
+    cap = int(getattr(settings, "search_daily_cap_per_user", 0) or 0)
+    if getattr(settings, "search_daily_cap_enabled", False) and cap > 0:
+        used = await _user_brave_calls_24h(db, user_id)
+        if used is not None and used >= cap:
+            await _record(
+                db, user_id=user_id, tier=TIER_BRAVE, engine="brave",
+                status=ST_THROTTLED, degraded_reason=RSN_USER_DAILY_CAP,
+                latency_ms=0, result_count=0, channel=body.channel,
+                query_sha256=qhash, brave_remaining=_fleet.remaining,
+            )
+            await db.commit()
+            logger.warning(
+                "[search-gw] user daily Brave cap reached user=%s used=%d cap=%d",
+                user_id, used, cap,
+            )
+            return degraded(RSN_USER_DAILY_CAP)
 
     started = time.monotonic()
     params = {"q": body.query, "count": body.count, "extra_snippets": "true"}

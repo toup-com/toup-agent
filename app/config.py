@@ -331,6 +331,16 @@ class Settings(BaseSettings):
     # the same deploy that first measures them.
     web_tool_metering_enabled: bool = True
     web_tool_metering_charge: bool = False
+    # Same split for the OTHER flat-fee tools. FLAT_FEES has priced
+    # browser_action, browser_screenshot and doc_gen_* since the credits arc
+    # shipped, but `_flat_fee_for_tool`'s only caller is connector_dispatcher,
+    # which never sees those names — so seven priced entries were unreachable
+    # and browser/document work produced no usage record at all. Metered from
+    # ToolExecutor.execute (the single dispatch point) via `_FLAT_FEE_TOOLS`.
+    # Charge defaults OFF for the same reason web tools do: these have never
+    # been billed, and measuring must come before taking credits.
+    flat_tool_metering_enabled: bool = True
+    flat_tool_metering_charge: bool = False
     # Brave's 50 req/s is an ACCOUNT ceiling shared by every key and therefore
     # by every tenant on the platform's shared key, so one runaway agent loop
     # can starve the whole fleet. These bound ONE tenant's share, enforced in
@@ -357,6 +367,55 @@ class Settings(BaseSettings):
     # of 5 let 10 requests through in 762ms across 2 replicas.
     # KEEP IN SYNC with railway.json.
     platform_replicas: int = 2
+
+    # Per-USER daily search ceiling — the only VOLUME limit in the system.
+    # Everything else here bounds RATE and, on breach, degrades to a free
+    # lower tier (scrape / headless Chromium) rather than refusing, so a
+    # runaway loop was converted into unbounded scraping, never into less
+    # work. `search_web` says so outright: "There is deliberately NO deny
+    # path." Metering is meter-only (web_tool_metering_charge=False), so the
+    # credit ledger cannot stop it either: measured 2026-08-03, 99 tool_call
+    # rows quoting 99.00 credits and charging 0.00.
+    # One deep-research turn spent 22 Brave calls, so this is a per-user
+    # ABUSE ceiling, not a product limit — it should sit well above a normal
+    # day and well below what would burn brave_monthly_budget (2000/mo across
+    # the whole account) on one user. Counted from `search_events` rows that
+    # reached Brave, over the user's rolling 24h.
+    # 0 disables the ceiling entirely.
+    search_daily_cap_enabled: bool = False
+    search_daily_cap_per_user: int = 200
+
+    # Realtime voice billing. The metering gate was dead
+    # (`using_platform_key = not openai_key`, always False on a surviving
+    # session), so live voice has NEVER been charged: zero realtime rows in
+    # llm_proxy_events, ever. The gate is fixed, but it lands in meter-only —
+    # rows with amount=0 carrying the real cost — because switching a
+    # never-billed feature straight to billing, with no idea what a session
+    # actually costs, is how you surprise every voice user at once. Read the
+    # series off `credit_ledger` where endpoint='realtime_voice', then flip.
+    # NOTE: realtime INPUT transcription is billed separately by OpenAI and
+    # does not appear in `response.usage`, so the recorded cost UNDERSTATES
+    # reality. Price with that in mind.
+    voice_metering_charge: bool = False
+
+    # Credit-health monitor (app/services/credit_health_monitor.py). Asserts
+    # hourly the invariants that make the meter mean anything. Every symptom of
+    # the 2026-08-03 incident — 274 denied-but-served calls, two accounts with
+    # 48 and 117 duplicate grants, $17.17 given away — was queryable the whole
+    # time; nothing looked. Thresholds are deliberately tight: steady state for
+    # the first two alarms is exactly zero.
+    credit_health_monitor_enabled: bool = True
+    credit_health_check_interval_s: int = 3600
+    credit_health_window_h: int = 24
+    # Provider spend attached to denied-and-served rows before it pages as
+    # critical rather than a warning.
+    credit_health_unbilled_usd_critical: float = 5.0
+    # Credits charged ÷ provider cents. 1.0 is break-even by design (1 credit
+    # = 1¢ of underlying cost); below this the meter is undercounting.
+    credit_health_ratio_critical: float = 0.5
+    # Sample floors — below these a ratio or a zero is noise, not signal.
+    credit_health_min_cost_cents: float = 200.0
+    credit_health_min_events: int = 50
 
     # Search-quota monitor (app/services/search_quota_monitor.py). Brave's
     # monthly rate-limit bucket reports limit 0 / remaining 0 on this plan, so
@@ -640,6 +699,26 @@ class Settings(BaseSettings):
 
     # ── Credit-based billing (docs/credits/design.md) ────
     credit_enforcement_enabled: bool = False
+    # The daily cap must gate ADMISSION of new work, never zero the cost of
+    # work already paid for. Today it does the opposite: `_split_message_charge`
+    # denies any charge larger than the remaining cap headroom, `try_charge`
+    # writes an amount=0 "denied" ledger row, and `llm_proxy._log_event` never
+    # branches on `result.success` — so the answer streams for free. A single
+    # heavy gpt-5.5 call quotes 26-28 credits against a free cap of 15, so the
+    # cap is UNSATISFIABLE for exactly the calls that cost the most. Production
+    # 2026-08-03: 274 calls, $17.17 of provider spend, 59% of all real-user LLM
+    # cost, served free with reason="daily_cap_exceeded".
+    #
+    # ON flips both halves of one policy:
+    #   * `check_balance` consults the daily cap, so the PRE-FLIGHT can refuse
+    #     a turn before any provider spend (it is cap-blind today, and is asked
+    #     for 0.1 credits, so it always answers yes).
+    #   * `try_charge(already_incurred=True)` lets an incurred cost land against
+    #     the plan wallet even past the cap. `used_today` then climbs past the
+    #     cap and the next pre-flight refuses — the plan wallet stays the hard
+    #     ceiling. Nothing is ever served unbilled.
+    # OFF (default) is byte-for-byte today's behavior.
+    credit_cap_admission_control: bool = False
     # Sybil resistance: when True, the one-time free-credit grant is deduped
     # per CANONICAL email identity (Gmail dot/+alias variants AND
     # delete→re-signup collapse to a single grant) via the grant_eligibility

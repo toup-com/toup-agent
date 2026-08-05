@@ -76,7 +76,16 @@ MIN_INTERVAL_UNCONFIGURED = 21600
 # Degrade reasons recorded for calls the gateway shed BEFORE any HTTP request
 # left the process. They cost a user latency but cost Brave nothing, so they
 # must not count against the monthly budget.
-_NEVER_REACHED_BRAVE = ("tenant_rate_limit", "fleet_headroom", "cooldown_after_429")
+def _never_reached_brave() -> tuple[str, ...]:
+    """The degraded_reason values that consumed no Brave quota.
+
+    Imported from search_proxy — which produces every one of them — so a new
+    shed reason cannot be added on one side and silently counted as real usage
+    on the other. Deferred to call time because search_quota_monitor is
+    imported during app startup and app.api.search_proxy is not yet loaded.
+    """
+    from app.api.search_proxy import NEVER_REACHED_BRAVE
+    return NEVER_REACHED_BRAVE
 
 
 def _cfg(name: str, default):
@@ -144,7 +153,7 @@ async def _brave_calls_since(db: AsyncSession, since: datetime) -> int:
             SearchEvent.created_at >= since,
             or_(
                 SearchEvent.degraded_reason.is_(None),
-                SearchEvent.degraded_reason.notin_(_NEVER_REACHED_BRAVE),
+                SearchEvent.degraded_reason.notin_(_never_reached_brave()),
             ),
         )
     )

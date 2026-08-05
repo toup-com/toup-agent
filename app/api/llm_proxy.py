@@ -342,12 +342,26 @@ async def _log_event(
                 provider=provider, input_tokens=input_tokens, output_tokens=output_tokens,
                 underlying_cost_cents=cost_cents,
                 metadata={"endpoint": endpoint, "operation_type": operation_type or "user"},
+                # We are downstream of the provider call: the tokens are spent
+                # and the user already has the answer. Denying here cannot
+                # un-spend them, it only hides the cost — which is exactly what
+                # produced 274 free calls / $17.17 of provider spend carrying
+                # reason="daily_cap_exceeded". The charge lands; the resulting
+                # over-cap used_today is what makes the NEXT pre-flight (:1017)
+                # return 402 and stop the loop.
+                already_incurred=True,
             )
+            if not result.success:
+                logger.warning(
+                    "[credits] charge DENIED but response already served "
+                    "user=%s model=%s reason=%s credits=%s cost_cents=%s",
+                    user_id[:8], model, result.reason, credits, cost_cents,
+                )
             logger.info(
                 "[credits] deducted user=%s model=%s tokens=%d/%d credits=%s "
-                "balance_after=%s idempotent=%s",
+                "balance_after=%s idempotent=%s success=%s",
                 user_id[:8], model, input_tokens, output_tokens, credits,
-                result.balance_after, result.idempotent_hit,
+                result.balance_after, result.idempotent_hit, result.success,
             )
         except Exception:
             # Full stack trace so we can debug silent deduction failures.

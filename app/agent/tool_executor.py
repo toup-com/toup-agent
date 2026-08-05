@@ -815,6 +815,33 @@ class ToolExecutor:
             else:
                 return f"ERROR: Unknown tool '{tool_name}'"
 
+            # Priced-but-never-charged tools. FLAT_FEES has carried prices for
+            # browser actions and document generation since the credits arc
+            # shipped, but `_flat_fee_for_tool`'s only caller is
+            # connector_dispatcher, which never sees these names — so the
+            # entries were unreachable and a user's browser/doc work produced
+            # no usage record at all. Metered HERE, at the single dispatch
+            # point, rather than in seven handlers that would drift apart.
+            # web_search / web_fetch are deliberately absent: they meter
+            # themselves (`_meter_web_tool`) with tier/engine detail this
+            # generic hook cannot know, and connector tool names never appear
+            # in the map, so neither can be double-counted.
+            #
+            # Fail-open at the CALL SITE, not just inside the helper: this sits
+            # on the success path of every tool, and the enclosing `except`
+            # turns anything raised here into "ERROR: ..." — i.e. a metering
+            # fault would present as a broken tool. Same invariant
+            # `_meter_web_tool` states ("a metering outage must not turn into a
+            # failed search"); it just has to hold one frame earlier, because
+            # the attribute lookup itself happens out here.
+            try:
+                await self._meter_flat_tool(tool_name, result)
+            except Exception:
+                logger.debug(
+                    "[metering] flat-fee metering failed for %s (non-fatal)",
+                    tool_name, exc_info=True,
+                )
+
             # Apply per-tool output limit. Web search/fetch truncate ONCE to a
             # token-aware budget (Ticket 6) — replacing the legacy byte cap so
             # content isn't double-truncated; all other tools keep the byte cap.
@@ -1626,6 +1653,73 @@ class ToolExecutor:
                 "[metering] %s metering failed (non-fatal)", tool, exc_info=True,
             )
 
+    # Tool name → FLAT_FEES key, for tools whose price was already decided but
+    # which had no charge call site anywhere. Deliberately conservative: only
+    # names whose fee entry unambiguously refers to THEM. `browser`,
+    # `navigate_to`, `exec`, `create_job`/`update_job` and the `extension_*`
+    # family are NOT here because no price has ever been set for them —
+    # inventing one is a pricing decision, not a bug fix. They are listed in
+    # docs/credits/coverage.md as an open decision.
+    _FLAT_FEE_TOOLS: Dict[str, str] = {
+        "browser_action": "browser_action",
+        "browser_screenshot": "browser_screenshot",
+        "generate_pdf": "doc_gen_pdf",
+        "generate_html_to_pdf": "doc_gen_pdf",
+        "generate_docx": "doc_gen_docx",
+        "generate_xlsx": "doc_gen_xlsx",
+        "generate_pptx": "doc_gen_pptx",
+    }
+
+    async def _meter_flat_tool(self, tool_name: str, result: str) -> None:
+        """Record one flat-fee tool call from the generic dispatch point.
+
+        Meter-only unless `flat_tool_metering_charge` is on: these tools have
+        never been billed, so measuring and charging in the same deploy would
+        start taking credits for work that has always been free.
+
+        Fail-open, like `_meter_web_tool` — a metering outage must not turn
+        into a failed tool call.
+        """
+        fee_key = self._FLAT_FEE_TOOLS.get(tool_name)
+        if fee_key is None or not settings.flat_tool_metering_enabled:
+            return
+        user_id = self._current_user_id or ""
+        if not user_id:
+            return
+        # A failed tool did no billable work. The check is a prefix match on
+        # the contract `execute()` documents ("On error the string starts with
+        # ERROR:"), not a substring scan — tool output is untrusted and a
+        # fetched page containing the word ERROR must not become free.
+        if isinstance(result, str) and result.startswith("ERROR:"):
+            return
+        try:
+            import uuid as _uuid
+            from app.db.models import LEDGER_TOOL_CALL
+            from app.services.credit_reporter import report_flat_charge
+            from app.services.credit_service import FLAT_FEES
+
+            fee = FLAT_FEES.get(fee_key)
+            if not fee:
+                return
+            await report_flat_charge(
+                user_id=user_id,
+                event_type=LEDGER_TOOL_CALL,
+                credits=float(fee["credits"]),
+                bucket=("integration" if fee["bucket"] == "integration" else "message"),
+                idempotency_key=f"{tool_name}:{_uuid.uuid4()}",
+                metadata={
+                    "tool": tool_name,
+                    "fee_key": fee_key,
+                    "channel": self._current_channel or "unknown",
+                },
+                meter_only=not settings.flat_tool_metering_charge,
+                log_label=tool_name,
+            )
+        except Exception:
+            logger.debug(
+                "[metering] %s metering failed (non-fatal)", tool_name, exc_info=True,
+            )
+
     # ------------------------------------------------------------------
     # 7. web_search  (uses platform's stealth browser API)
     # ------------------------------------------------------------------
@@ -1734,12 +1828,17 @@ class ToolExecutor:
         # Secondary: multi-engine httpx scrape (free, no key) — fast when it works,
         # but search engines IP-block datacenters, so this often returns empty.
         try:
-            result, engine, _hit = await _sf_search.toup_search_meta(query, count)
+            result, engine, cache_hit = await _sf_search.toup_search_meta(query, count)
             if result and "No search results" not in result:
-                await self._meter_web_tool(
-                    "web_search", tier="httpx_race", engine=engine or "unknown",
-                    started=started, query=query,
-                )
+                # We bill OUTBOUND calls, not memory reads. toup_search_meta has
+                # its own inner cache, so discarding cache_hit here metered a
+                # cached answer as a fresh search (engine="cache") and broke the
+                # invariant the rest of this file is written to.
+                if not cache_hit:
+                    await self._meter_web_tool(
+                        "web_search", tier="httpx_race", engine=engine or "unknown",
+                        started=started, query=query,
+                    )
                 return result
             _search_degraded(skipped="httpx_race", reason="empty_or_blocked", query=query)
         except Exception as exc:
