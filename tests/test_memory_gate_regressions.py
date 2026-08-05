@@ -632,3 +632,98 @@ class TestInferredInterest:
             user_message="Remember that I am interested in stock options?",
             explicit_save=True,
         ) is None
+
+
+class TestUnsupportedClaimOnAQuestionTurn:
+    """The agent's own advice, stored as facts about the user.
+
+    Found on the production canary tenant on 2026-08-05, by the probe that was
+    verifying a DIFFERENT fix. The user asked exactly one question — "There's a
+    big storm forecast tonight — anything I should do?" — and the agent gave
+    ordinary storm-prep advice. Two rows were written as durable user facts:
+
+        "The user charges their phones and keeps a flashlight handy during storms."
+        "The user brings in balcony items during storms."
+
+    The user has never said either. This is the mission's "the agent's own
+    suggestions" junk class, and `assistant_echo_reason` could not catch it:
+    containment against the reply was 0.43 and 0.20 against a 0.60 floor,
+    because the extractor PARAPHRASES rather than quotes, and echo is a
+    containment test.
+
+    The signal it missed was containment against the USER's words: 0.00, on a
+    purely interrogative turn.
+    """
+
+    STORM_Q = "There is a big storm forecast tonight — anything I should do?"
+    STORM_A = (
+        "For Thistle, set up her basement crate now: bedding, a chew, water. "
+        "Close curtains, run a fan or calm music. Also worth doing: charge your "
+        "phones and power banks, keep a flashlight handy in case the power goes "
+        "out, and bring in anything loose from the balcony."
+    )
+
+    @pytest.mark.parametrize("junk", [
+        "The user charges their phones and keeps a flashlight handy during storms.",
+        "The user brings in balcony items during storms.",
+    ])
+    def test_advice_the_user_never_gave_is_refused(self, junk):
+        from app.services.memory_gate import memory_gate_reason
+        assert memory_gate_reason(
+            junk, user_message=self.STORM_Q, assistant_response=self.STORM_A,
+        ) == "unsupported_on_question_turn"
+
+    @pytest.mark.parametrize("content,user,assistant", [
+        # Question-only, but the fact is drawn from the user's OWN words. This
+        # is why the rule keys on "nothing from the user" and not merely on
+        # "the turn was a question".
+        ("The user has a flight to Berlin.",
+         "Do you know if my flight to Berlin is on time?",
+         "Let me check your Berlin flight."),
+        # A first-person assertion means is_question_only declines outright.
+        ("The user is severely allergic to peanuts.",
+         "I'm allergic to peanuts — what should I order?",
+         "Avoid the satay then."),
+        ("The user lives in Toronto.",
+         "I live in Toronto now, what is the weather?",
+         "Toronto is cold today."),
+        ("The user prefers dark roast coffee.",
+         "I only drink dark roast. Any recommendations?",
+         "Try an Ethiopian dark roast."),
+        ("The user works at Acme as a designer.",
+         "I work at Acme as a designer — how do I write a promo doc?",
+         "Start with impact."),
+        # The turn that STATED the fact, from the same production probe.
+        ("The user adopted a greyhound named Thistle who is terrified of thunderstorms.",
+         "I got a rescue greyhound and called her Thistle. She is terrified of thunderstorms.",
+         "Thistle — got it."),
+    ])
+    def test_real_facts_still_pass(self, content, user, assistant):
+        from app.services.memory_gate import memory_gate_reason
+        assert memory_gate_reason(
+            content, user_message=user, assistant_response=assistant,
+        ) is None, content
+
+    def test_it_abstains_when_the_memory_matches_neither_side(self):
+        from app.services.memory_gate import memory_gate_reason
+        """The BUG-26 lesson, kept.
+
+        A memory written in English from a Persian question overlaps neither
+        the user's words nor the assistant's. Rejecting there would delete real
+        facts on the founder's own path, so the rule requires positive evidence
+        that the claim came from the ASSISTANT before refusing it.
+        """
+        assert memory_gate_reason(
+            "The user is planning a trip to Kish Island in March.",
+            user_message="سفر به کیش چطوره؟",
+            assistant_response="Kish is warm in March and visa-free for most visitors.",
+        ) != "unsupported_on_question_turn"
+
+    def test_an_explicit_save_still_wins(self):
+        from app.services.memory_gate import memory_gate_reason
+        assert memory_gate_reason(
+            "The user brings in balcony items during storms.",
+            user_message=self.STORM_Q,
+            assistant_response=self.STORM_A,
+            explicit_save=True,
+        ) != "unsupported_on_question_turn"

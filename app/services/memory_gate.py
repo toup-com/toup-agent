@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Iterable, Optional, Sequence, Set
+from typing import Dict, Iterable, Optional, Sequence, Set
 
 
 class MemoryRejected(ValueError):
@@ -988,6 +988,117 @@ def inferred_interest_reason(
     return None
 
 
+#: On a question-only turn, this much support from the user's own words is
+#: "essentially none" — the claim did not come from them.
+UNSUPPORTED_USER_MAX = 0.10
+#: ...and it must demonstrably come from the assistant instead. Below this it
+#: overlaps neither side, which is the cross-lingual case the echo rule
+#: deliberately abstains on. Staying quiet there is the whole reason BUG-26
+#: was a false negative rather than a false positive.
+UNSUPPORTED_ASSISTANT_MIN = 0.15
+
+
+def _dominant_script(text: Optional[str]) -> Optional[str]:
+    """'latin', 'arabic', 'cyrillic', 'han'… for the bulk of the letters, or None.
+
+    Only the alphabetic characters count, so digits, punctuation and emoji
+    cannot swing the verdict.
+    """
+    counts: Dict[str, int] = {}
+    for ch in text or "":
+        if not ch.isalpha():
+            continue
+        code = ord(ch)
+        if code < 0x0250:
+            script = "latin"
+        elif 0x0370 <= code <= 0x03FF:
+            script = "greek"
+        elif 0x0400 <= code <= 0x04FF:
+            script = "cyrillic"
+        elif 0x0590 <= code <= 0x05FF:
+            script = "hebrew"
+        elif 0x0600 <= code <= 0x06FF or 0x0750 <= code <= 0x077F or 0xFB50 <= code <= 0xFDFF:
+            script = "arabic"          # Arabic, Persian, Urdu
+        elif 0x0900 <= code <= 0x097F:
+            script = "devanagari"
+        elif 0x3040 <= code <= 0x30FF:
+            script = "kana"
+        elif 0x4E00 <= code <= 0x9FFF:
+            script = "han"
+        elif 0xAC00 <= code <= 0xD7AF:
+            script = "hangul"
+        else:
+            script = "other"
+        counts[script] = counts.get(script, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+def unsupported_claim_reason(
+    content: str,
+    user_message: Optional[str],
+    assistant_response: Optional[str],
+) -> Optional[str]:
+    """Reject a claim about the user, on a turn where the user only ASKED.
+
+    `assistant_echo_reason` is a containment test, so it catches the assistant's
+    answer being *quoted* back. It does not catch it being *paraphrased*, and
+    paraphrase is what the extractor actually produces.
+
+    Measured in production on 2026-08-05. The user asked one question —
+    *"There's a big storm forecast tonight — anything I should do?"* — and the
+    agent gave ordinary storm advice. Two rows were stored as durable facts
+    about the user:
+
+        "The user charges their phones and keeps a flashlight handy during storms."
+        "The user brings in balcony items during storms."
+
+    The user has never said either of those things. Containment against the
+    assistant's reply was 0.43 and 0.20, both under `ECHO_ASSISTANT_MIN` of
+    0.60, so the echo rule stayed silent — correctly, by its own terms.
+
+    The signal it missed is the one this rule uses: containment against the
+    **user's** words was **0.00**, on a turn that was purely interrogative.
+
+    Keying on "nothing from the user" rather than on "question-only" alone is
+    what keeps this narrow. *"Do you know if my flight to Berlin is on time?"*
+    is also question-only, but a memory about a Berlin flight draws real tokens
+    from the question, so it survives. Only a claim the user never gestured at
+    is refused. `is_question_only` already declines to fire when the user
+    asserted anything in the first person, so a turn like *"I'm allergic to
+    peanuts — what should I order?"* never reaches here at all.
+    """
+    if not user_message or not assistant_response:
+        return None
+
+    _quoted, own_voice = _split_quoted(user_message)
+    text = own_voice if own_voice.strip() else user_message
+    if not is_question_only(text):
+        return None
+
+    # A memory written in a different script from the user's message CANNOT
+    # lexically overlap it, so "the user's words support none of this" is not a
+    # measurement — it is an artefact of the alphabet. The founder speaks
+    # Persian to a brain that stores English; without this the rule would
+    # refuse essentially every fact from every Persian turn.
+    #
+    # This is the same trap BUG-26 was: `assistant_echo_reason` abstains in the
+    # cross-lingual case on purpose, and any rule that leans on `from_user`
+    # inherits that obligation.
+    if _dominant_script(content) != _dominant_script(text):
+        return None
+
+    tokens = _content_tokens(content)
+    if len(tokens) < _ECHO_MIN_TOKENS:
+        return None
+    if _overlap(tokens, _content_tokens(text)) > UNSUPPORTED_USER_MAX:
+        return None
+    if _overlap(tokens, _content_tokens(assistant_response)) < UNSUPPORTED_ASSISTANT_MIN:
+        return None
+    return "unsupported_on_question_turn"
+
+
 def memory_gate_reason(
     content: str,
     *,
@@ -1023,7 +1134,25 @@ def memory_gate_reason(
         if reason:
             return reason
 
-    return assistant_echo_reason(text, user_message, assistant_response)
+    reason = assistant_echo_reason(text, user_message, assistant_response)
+    if reason:
+        return reason
+
+    # LAST, because it is the widest net: echo asks "was this quoted from the
+    # answer", this asks "did the user say anything like it at all". Anything
+    # echo can name, echo should name — the reason string is a diagnostic that
+    # tests and log lines key on, so the most specific rule that fires has to
+    # be the one that reports. Ordering this first silently relabelled the
+    # Persian 409A case from `assistant_echo` to `unsupported_on_question_turn`
+    # and broke test_memory_junk_gate, which was right to complain.
+    #
+    # Yields to an explicit save ask, as the provenance rules above do.
+    if not explicit_save:
+        reason = unsupported_claim_reason(text, user_message, assistant_response)
+        if reason:
+            return reason
+
+    return None
 
 
 __all__ = [
@@ -1031,6 +1160,9 @@ __all__ = [
     "ECHO_ASSISTANT_MIN",
     "ECHO_MARGIN_MIN",
     "QUOTED_CONTAINMENT_MIN",
+    "UNSUPPORTED_USER_MAX",
+    "UNSUPPORTED_ASSISTANT_MIN",
+    "unsupported_claim_reason",
     "MemoryRejected",
     "SCHEDULABLE_REASONS",
     "SCHEDULED_MIN_TTL_DAYS",
