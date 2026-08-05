@@ -18,7 +18,9 @@ reintroduce a prefix-buster:
     byte-identical); legacy keeps the old behavior byte-for-byte.
   * ``build_turn_context_message`` — single ephemeral user message with
     the injection-fencing envelope; empty parts → no message.
-  * ``settings.stable_prefix_layout`` defaults OFF (flag-gated rollout).
+  * ``settings.stable_prefix_layout`` defaults ON since 2026-08-05 —
+    off-by-default turned a missing env var into a silent, permanent
+    regression for any tenant provisioned before the flag existed.
 """
 
 from __future__ import annotations
@@ -648,9 +650,27 @@ class TestChannelConverge:
 
     def test_runner_converge_wiring(self):
         # wire array is the full set; policy moves to allowed_tools +
-        # executor disabled-set; gated names subtract the banned set
-        assert "_stable_tools = list(all_tools)" in _SRC
+        # executor disabled-set; gated names subtract the banned set.
+        #
+        # This used to pin the literal line `_stable_tools = list(all_tools)`.
+        # That line was the BUG: `all_tools` is `self.tool_defs`, which has
+        # already had the per-SURFACE disable set filtered out of it, so a
+        # voice turn converged an array that had already lost
+        # VOICE_DISABLED_TOOLS (measured 2026-08-05: 49 defs/8,233 tok vs
+        # web's 52/9,116 — a separate cache lineage). Pinning the exact line
+        # made the correct fix read as a regression, so assert the mechanism
+        # instead of one spelling of it. The behavioural contract — voice and
+        # web emitting byte-identical arrays — lives in
+        # tests/test_channel_converge_voice_array.py, which executes it.
+        assert "_stable_tools = list(self.tool_defs_ignoring(" in _SRC, (
+            "the converge branch must build from the array with the surface "
+            "disable set exempted, or voice never converges"
+        )
         assert "_channel_banned = channel_banned_names(" in _SRC
+        assert "| frozenset(_surface_disabled)" in _SRC, (
+            "surface-disabled names must still be banned via allowed_tools + "
+            "the executor — exposing a definition is not permitting a call"
+        )
         assert "self.tools.user_disabled_tools = (" in _SRC
         assert ") - _channel_banned" in _SRC
         # ContextVar union keeps the W2.2 race fix intact

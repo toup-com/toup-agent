@@ -475,6 +475,36 @@ class AgentRunner:
             ]
         return defs
 
+    def tool_defs_ignoring(self, exempt: "frozenset[str] | set[str]") -> list:
+        """`tool_defs` as if `exempt` were not in the disabled set.
+
+        W2.3a needs this. `tool_defs` filters the disabled set out of the
+        WIRE ARRAY, and a voice turn's disabled set carries
+        VOICE_DISABLED_TOOLS (set in run() long before the array is read).
+        So `list(all_tools)` under channel_converge was converging an array
+        that had ALREADY diverged: measured 2026-08-05, voice shipped 49
+        defs / 8,233 tok against web's 52 / 9,116 — an 883-token difference
+        at the very head of the prefix, which is a separate provider cache
+        lineage and therefore a full re-bill of the whole system+history
+        tail on any voice<->web hop.
+
+        Callers must keep enforcing `exempt` some other way. The converge
+        path does: the names go into the allowed_tools restriction (the
+        model cannot pick them) and into the executor's disabled set (a
+        call that slips through is refused at execute time). Exposing a
+        definition is not the same as permitting a call.
+        """
+        if not exempt:
+            return self.tool_defs
+        _ctx = _RUN_DISABLED_TOOLS_CTX.get()
+        _current = _ctx if _ctx is not None else self._disabled_tool_names
+        _kept = frozenset(_current or ()) - frozenset(exempt)
+        _token = _RUN_DISABLED_TOOLS_CTX.set(_kept)
+        try:
+            return self.tool_defs
+        finally:
+            _RUN_DISABLED_TOOLS_CTX.reset(_token)
+
     # ------------------------------------------------------------------
     # Vibecoding DB registration
     # ------------------------------------------------------------------
@@ -1629,11 +1659,24 @@ class AgentRunner:
                 # used to encode moves to (1) the allowed_tools restriction
                 # below and (2) the executor's disabled set — a banned call
                 # that slips past allowed_tools is refused at execute time.
-                _stable_tools = list(all_tools)
-                _channel_banned = channel_banned_names(
-                    all_tools, channel,
-                    strip_vault_tool_for_channel=strip_vault_tool_for_channel,
+                # `all_tools` is `self.tool_defs`, which has already had the
+                # SURFACE disable set filtered out of it — for a voice turn
+                # that is VOICE_DISABLED_TOOLS, applied ~600 lines above.
+                # Converging that array converges something already diverged:
+                # measured 2026-08-05, voice sent 49 defs / 8,233 tok vs web's
+                # 52 / 9,116, so voice stayed its own cache lineage and every
+                # voice<->web hop re-billed the whole prefix. Take the array as
+                # if the surface set were absent, then ban those names the same
+                # way the strips are banned.
+                from app.agent.prompt_profile import (
+                    disabled_tools_for_channel as _disabled_for_channel,
                 )
+                _surface_disabled = _disabled_for_channel(channel)
+                _stable_tools = list(self.tool_defs_ignoring(_surface_disabled))
+                _channel_banned = channel_banned_names(
+                    _stable_tools, channel,
+                    strip_vault_tool_for_channel=strip_vault_tool_for_channel,
+                ) | frozenset(_surface_disabled)
                 if _channel_banned:
                     self.tools.user_disabled_tools = (
                         set(self.tools.user_disabled_tools) | set(_channel_banned)
