@@ -132,6 +132,23 @@ def test_noisy_third_party_loggers_are_pinned_to_warning():
         assert logging.getLogger(name).level >= logging.WARNING, f"{name} left chatty at INFO"
 
 
+def test_the_mcp_library_is_quiet_too_not_just_its_access_lines():
+    """The first pass silenced `/api/mcp/mcp` ACCESS lines and left the mcp
+    LIBRARY at INFO, which was worse than the flood it replaced: measured on the
+    deploy that enabled INFO, `mcp.server.streamable_http` (449) plus
+    `mcp.server.lowlevel.server` (147) were 596 of 1000 consecutive lines.
+
+    Asserted on the child logger, because that is what actually emits — pinning
+    only the exact string "mcp" would pass while `mcp.server.x` stayed loud if
+    anything ever set a level on the child.
+    """
+    for name in ("mcp", "mcp.server.streamable_http", "mcp.server.lowlevel.server",
+                 "fastmcp", "apscheduler"):
+        assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING, (
+            f"{name} left chatty at INFO — it will bury the application again"
+        )
+
+
 def test_log_level_is_env_overridable(monkeypatch):
     """An operator must be able to turn it down without a code change."""
     monkeypatch.setenv("LOG_LEVEL", "WARNING")
