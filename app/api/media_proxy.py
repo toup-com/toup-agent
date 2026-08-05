@@ -729,12 +729,95 @@ def _get_build_sem() -> "asyncio.Semaphore":
     return _build_sem
 
 
+# ── Live-first gate: a build must never race the sound someone is waiting for ─
+#
+# `_REMUX_BUILD_CONCURRENCY` caps how MANY builds run. It says nothing about
+# WHEN, and two builds are two thirds of the proxy's uplink whether or not a
+# user is sitting in silence waiting for a first play. On 2026-08-05 that is
+# exactly what was happening: `ws_chat` warms `upcoming[:2]` in
+# `warm_audio_cache`'s DEFAULT `build` mode on the `_auto` toggle, which fires
+# seconds into the very play whose first 2.5MB is still arriving.
+#
+# Measured the same day against the production proxy session: 0.63 MB/s of
+# uplink, consistent across five samples. Alone, iOS's ~2.5MB pre-roll takes
+# ~4.0s. Split three ways with two builds it takes ~12s — which is the founder
+# report this gate exists to answer.
+#
+# This is the THIRD appearance of one bug. `get_audio_url` carries
+# "DELIBERATELY NO REMUX BUILD HERE" and `stream_audio` defers its own warm to
+# the response body's `finally` "now that this response is no longer competing";
+# both fixed it at a call site, and a new call site reintroduced it. Fixing it
+# at the BUILDER means a fourth trigger cannot.
+#
+# The gate is held only while someone is WAITING TO HEAR SOMETHING, not for a
+# whole track. A progressive itag-18 response keeps pumping long after playback
+# starts, so gating on "a stream is open" would block builds for ~30s per track
+# and starve the prefetch that makes skip instant. It releases as soon as the
+# client has enough bytes to be making sound.
+_LIVE_GATE_BYTES = int(os.environ.get("AUDIO_LIVE_GATE_BYTES", "3000000"))
+# A client that stalls without disconnecting must not starve the cache forever.
+# Timing out and building anyway is just today's behaviour, which is merely slow.
+_BUILD_YIELD_TIMEOUT = float(os.environ.get("AUDIO_BUILD_YIELD_TIMEOUT", "45"))
+_live_starting = 0
+_live_idle: "asyncio.Event | None" = None
+
+
+def _get_live_idle() -> "asyncio.Event":
+    global _live_idle
+    if _live_idle is None:
+        _live_idle = asyncio.Event()
+        _live_idle.set()
+    return _live_idle
+
+
+def _live_start_begin() -> None:
+    global _live_starting
+    _live_starting += 1
+    _get_live_idle().clear()
+
+
+def _live_start_done() -> None:
+    """Idempotent per stream — the caller guards with its own flag.
+
+    Clamped at zero because an unbalanced decrement would set the event while a
+    real cold start was still in progress, silently disabling the gate.
+    """
+    global _live_starting
+    _live_starting = max(0, _live_starting - 1)
+    if _live_starting == 0:
+        _get_live_idle().set()
+
+
+async def _await_live_idle(video_id: str) -> None:
+    ev = _get_live_idle()
+    if ev.is_set():
+        return
+    t0 = time.monotonic()
+    try:
+        await asyncio.wait_for(ev.wait(), timeout=_BUILD_YIELD_TIMEOUT)
+        logger.info(
+            "[media_proxy] build yielded %.1fs to a live cold start video_id=%s",
+            time.monotonic() - t0, video_id,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[media_proxy] build gate timed out after %.0fs — building anyway video_id=%s",
+            _BUILD_YIELD_TIMEOUT, video_id,
+        )
+
+
 async def _bounded_build(video_id: str) -> str | None:
     """Run _do_remux under the global build-concurrency cap so concurrent prefetch
     builds can't saturate the residential proxy uplink and starve live playback.
-    On success, persist the result into the SHARED Postgres cache so other
-    replicas (and future restarts) serve it without re-fetching through the proxy."""
+    On success, persist the result into the SHARED R2 cache so other replicas
+    (and future restarts) serve it without re-fetching through the proxy."""
+    await _await_live_idle(video_id)
     async with _get_build_sem():
+        # Re-check: this build may have queued behind the concurrency cap for
+        # long enough that a new cold start began while it waited. Checking only
+        # before the semaphore would let a build acquire a slot during a quiet
+        # moment and then pull 11.8MB straight through somebody's first play.
+        await _await_live_idle(video_id)
         path = await asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
     if path:
         # R2 is the durable, uncapped, Mac-independent store — and now the ONLY
@@ -1517,6 +1600,20 @@ async def stream_audio(
     async def _body():
         sent = 0
         t_first: float | None = None
+        # Only a LIVE play holds the build gate. A `?prefetch=1` pull is the
+        # phone filling its own disk for a future ⏭ — nobody is waiting on it,
+        # and letting it block builds would deadlock the two halves of warming
+        # against each other.
+        gating = not prefetch
+        if gating:
+            _live_start_begin()
+
+        def _ungate() -> None:
+            nonlocal gating
+            if gating:
+                gating = False
+                _live_start_done()
+
         try:
             async for chunk in upstream.aiter_bytes(_STREAM_CHUNK_BYTES):
                 if t_first is None:
@@ -1532,8 +1629,18 @@ async def stream_audio(
                         video_id, _cache_ms, _extract_ms, _upstream_ms, _ms(_t0),
                     )
                 sent += len(chunk)
+                # Release the gate the moment the client has enough to be making
+                # sound. Holding it until the response completes would block
+                # builds for the whole ~30s progressive pull and starve the
+                # prefetch that makes ⏭ instant — the gate is for the silence
+                # before playback, not for playback.
+                if sent >= _LIVE_GATE_BYTES:
+                    _ungate()
                 yield chunk
         finally:
+            # Covers the short-file case (never reached the byte threshold), an
+            # upstream error, and a client disconnect. Idempotent via `gating`.
+            _ungate()
             # Throughput over the bytes actually delivered. Below ~1MB/s the
             # residential proxy is the bottleneck and no code change helps —
             # this is the line that tells the two apart without a stopwatch.

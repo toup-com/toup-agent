@@ -945,7 +945,13 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
                 "upcoming": upcoming,
             })
         from app.agent.radio.player import warm_audio_cache
-        warm_audio_cache([t.get("video_id", "") for t in upcoming[:2]])
+        # Explicit `build`, because the invisible default is what caused the
+        # 2026-08-05 cold-start report: this fires on the `_auto` toggle,
+        # seconds into a play whose first 2.5MB is still arriving, and a build
+        # pulls ~11.8MB through the same proxy. `_bounded_build` now yields to
+        # a live cold start, so this is safe again — but state the mode, so the
+        # next reader sees which one they are in.
+        warm_audio_cache([t.get("video_id", "") for t in upcoming[:2]], mode="build")
 
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 

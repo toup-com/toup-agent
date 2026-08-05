@@ -219,7 +219,12 @@ async def broadcast_radio_track(
             # / worst-case 20.8s against the production proxy (measured
             # 2026-08-04) sitting directly in front of the first byte of audio.
             warm_audio_cache([video_id], mode="extract")
-            warm_audio_cache([u.get("video_id", "") for u in (upcoming or [])[:2]])
+            # Explicit, for the same reason as the ws_chat call site: the
+            # dangerous mode is the DEFAULT one, so an omitted argument reads
+            # as "cheap" and is not.
+            warm_audio_cache(
+                [u.get("video_id", "") for u in (upcoming or [])[:2]], mode="build"
+            )
         logger.info(
             "[radio/player] broadcast radio_auto user=%s channel=%s num_ws_connections=%d sent=%d "
             "video=%s title=%r artist=%r video_type=%r reason=%s",

@@ -833,3 +833,165 @@ def test_the_stream_403_path_purges_before_it_retries():
     assert "_extract_coalesced" in names[purge_at + 1:], (
         "the re-extraction must come AFTER the purge, or it re-reads the cache"
     )
+
+
+# ── Live-first build gate ─────────────────────────────────────────────────
+#
+# The founder reported a music cold start of ~10s on 2026-08-05 where it had
+# been ~2s. `warm_audio_cache`'s docstring already names this exact failure —
+# a `build` "saturates the single residential proxy, so it is only ever correct
+# for UPCOMING tracks. Aimed at the track playing right now it competes with
+# that track's own stream, which is the regression this argument exists to keep
+# from being re-introduced." `ws_chat.py` then called it with no `mode=`, whose
+# default is `build`, on the `_auto` toggle — seconds into the play whose first
+# 2.5MB was still arriving.
+#
+# Measured against the production proxy that day: 0.63 MB/s, consistent over
+# five samples. iOS needs ~2.5MB before it makes a sound: ~4.0s alone, ~12s
+# split three ways with two builds.
+#
+# The concurrency cap was never the fix. It bounds how MANY builds run, not
+# whether they run while somebody is sitting in silence.
+
+
+@pytest.fixture(autouse=True)
+def _reset_live_gate():
+    """The gate is module state; a leaked count would silently disable it for
+    every later test in the file."""
+    from app.api import media_proxy as mp
+    mp._live_starting = 0
+    mp._live_idle = None
+    yield
+    mp._live_starting = 0
+    mp._live_idle = None
+
+
+async def test_a_build_waits_while_a_cold_start_is_still_silent():
+    from app.api import media_proxy as mp
+
+    mp._live_start_begin()
+    waiter = asyncio.create_task(mp._await_live_idle("vid"))
+    await asyncio.sleep(0)
+    assert not waiter.done(), "the build did not yield to the live cold start"
+
+    mp._live_start_done()
+    await asyncio.wait_for(waiter, timeout=1.0)
+
+
+async def test_a_build_does_not_wait_when_nothing_is_starting():
+    from app.api import media_proxy as mp
+
+    await asyncio.wait_for(mp._await_live_idle("vid"), timeout=0.5)
+
+
+async def test_two_concurrent_cold_starts_both_have_to_finish():
+    """A refcount, not a flag. With a boolean the second play's `done` would
+    open the gate while the first was still silent."""
+    from app.api import media_proxy as mp
+
+    mp._live_start_begin()
+    mp._live_start_begin()
+    waiter = asyncio.create_task(mp._await_live_idle("vid"))
+
+    mp._live_start_done()
+    await asyncio.sleep(0)
+    assert not waiter.done(), "the gate opened while one cold start was still silent"
+
+    mp._live_start_done()
+    await asyncio.wait_for(waiter, timeout=1.0)
+
+
+async def test_the_gate_gives_up_rather_than_starving_the_cache(monkeypatch):
+    """A client that stalls without disconnecting must not block builds forever.
+    Building anyway is merely today's behaviour."""
+    from app.api import media_proxy as mp
+
+    monkeypatch.setattr(mp, "_BUILD_YIELD_TIMEOUT", 0.05)
+    mp._live_start_begin()  # never released
+    await asyncio.wait_for(mp._await_live_idle("vid"), timeout=1.0)
+
+
+async def test_an_unbalanced_release_cannot_drive_the_count_negative():
+    """A negative count would never return to zero, so the event would never be
+    set again and the gate would block every build until restart."""
+    from app.api import media_proxy as mp
+
+    mp._live_start_done()
+    mp._live_start_done()
+    assert mp._live_starting == 0
+
+    mp._live_start_begin()
+    waiter = asyncio.create_task(mp._await_live_idle("vid"))
+    await asyncio.sleep(0)
+    assert not waiter.done(), "the gate stopped working after an unbalanced release"
+    mp._live_start_done()
+    await asyncio.wait_for(waiter, timeout=1.0)
+
+
+def test_the_gate_is_taken_before_AND_inside_the_concurrency_cap():
+    """Checking only before the semaphore lets a build acquire a slot during a
+    quiet moment and then pull 11.8MB straight through somebody's first play.
+    Order matters, so assert the order."""
+    import ast
+    import inspect
+    from app.api import media_proxy as mp
+
+    tree = ast.parse(inspect.getsource(mp._bounded_build))
+    fn = tree.body[0]
+
+    # calls, in source order, tagged with whether they are inside the `async with`
+    seq = []
+
+    def walk(nodes, inside):
+        for n in nodes:
+            if isinstance(n, ast.AsyncWith):
+                walk(n.body, True)
+                continue
+            for sub in ast.walk(n):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                    seq.append((sub.func.id, inside))
+
+    walk(fn.body, False)
+    waits = [inside for name, inside in seq if name == "_await_live_idle"]
+    assert waits.count(False) >= 1, "no gate check before the concurrency cap"
+    assert waits.count(True) >= 1, "no gate re-check after acquiring a build slot"
+
+
+def test_a_prefetch_stream_does_not_hold_the_gate():
+    """`?prefetch=1` is the phone filling its own disk for a future skip. Nobody
+    is waiting on it, and holding the gate would deadlock the two halves of
+    warming against each other."""
+    import ast
+    import inspect
+    from app.api import media_proxy as mp
+
+    src = inspect.getsource(mp.stream_audio)
+    assert "gating = not prefetch" in src, (
+        "the build gate must be held by LIVE plays only, never by a prefetch"
+    )
+
+
+def test_the_gate_releases_on_sound_not_on_completion():
+    """A progressive itag-18 response keeps pumping for ~30s after playback
+    starts. Holding until completion would block builds for the whole track and
+    starve the prefetch that makes the next skip instant."""
+    import inspect
+    from app.api import media_proxy as mp
+
+    src = inspect.getsource(mp.stream_audio)
+    assert "_LIVE_GATE_BYTES" in src, "the gate must release on bytes delivered"
+    assert mp._LIVE_GATE_BYTES > 0
+
+
+async def test_the_gate_is_released_when_a_client_disconnects_early():
+    """The release lives in `finally`, so an abandoned stream cannot wedge every
+    build until the process restarts."""
+    import inspect
+    from app.api import media_proxy as mp
+
+    src = inspect.getsource(mp.stream_audio)
+    body = src[src.index("async def _body"):]
+    fin = body.index("finally:")
+    assert "_ungate()" in body[fin:fin + 400], (
+        "the gate must be released in the body's finally, not only on the happy path"
+    )
