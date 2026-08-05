@@ -564,8 +564,7 @@ async def oauth_callback(
     # block on an external Google API call. Failures (token, scope,
     # GCP misconfig) are logged + retried by the daily refresh.
     if payload.connector_id == "gmail":
-        import asyncio as _asyncio
-        __spawn_bg(_arm_gmail_watch_post_connect(payload.user_id))
+        _spawn_bg(_arm_gmail_watch_post_connect(payload.user_id))
 
     # 7. Redirect to the frontend OAuth callback bridge. When the
     #    OAuth flow ran in a popup, the bridge posts back to the
