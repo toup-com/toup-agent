@@ -87,13 +87,17 @@ async def _proxy_memory_list_from_tenant(
     db,
     user_id: str,
     params: Optional[dict] = None,
+    path: str = "",
 ):
-    """Read a memory list from the tenant agent that actually holds the rows.
+    """Read memories from the tenant agent that actually holds the rows.
 
     Read counterpart to `_proxy_memory_write_to_tenant`. Returns None when
     there is no tenant agent or the tenant is unreachable — for a READ that is
     an acceptable fall-back to the platform session, which is the deliberate
     asymmetry documented on `_proxy_memories`. Never raises.
+
+    ``path`` selects the tenant sub-resource: "" lists, "search" runs the
+    semantic search. Both are reads, so both share the fall-back rule.
     """
     from app.api.memories import _get_agent_proxy_info, _proxy_memories
 
@@ -105,9 +109,9 @@ async def _proxy_memory_list_from_tenant(
         return None
 
     try:
-        return await _proxy_memories(proxy[0], proxy[1], "", params=params or {})
+        return await _proxy_memories(proxy[0], proxy[1], path, params=params or {})
     except Exception as e:
-        logger.warning("[mcp] memory list proxy failed: %s", e)
+        logger.warning("[mcp] memory %s proxy failed: %s", path or "list", e)
         return None
 
 
@@ -174,6 +178,53 @@ async def memory_search(
     )
 
     async with async_session_maker() as db:
+        # Ask the tenant first — `memories` is AGENT_ONLY, so searching the
+        # platform session queries the wrong database. It does not error: it
+        # matches against whatever monolith-era rows are still sitting in the
+        # platform table. Measured 2026-08-05 on the canary: 2 stale rows from
+        # 2026-07-28 on the platform (one carrying a category that is not even
+        # in the taxonomy) versus 19 real memories in the tenant. So an MCP
+        # client could memory_create into the tenant and then fail to find it,
+        # because the write and the read were hitting different databases.
+        # The REST route (`GET /api/memories/search`) has always proxied; only
+        # this tool did not. Same fall-back rule as memory_list: a read MAY
+        # fall back, a write may not.
+        proxied = await _proxy_memory_list_from_tenant(
+            db, user_id,
+            path="search",
+            params={
+                k: v for k, v in {
+                    "query": query,
+                    "limit": min(limit, 50),
+                    "brain_type": brain_type,
+                    "categories": ",".join(categories) if categories else None,
+                    "min_importance": min_importance,
+                    "min_similarity": min_similarity,
+                }.items() if v is not None
+            },
+        )
+        if isinstance(proxied, dict) and isinstance(proxied.get("results"), list):
+            rows = proxied["results"]
+            return {
+                "results": [
+                    {
+                        "id": str(m.get("id")),
+                        "content": m.get("content"),
+                        "summary": m.get("summary"),
+                        "category": m.get("category"),
+                        "importance": float(m.get("importance") or 0.0),
+                        # The tenant serialises MemoryWithScore, whose score
+                        # field is `similarity_score`; this tool's contract
+                        # calls it `score`.
+                        "score": float(m.get("similarity_score") or 0.0),
+                        "explanation": m.get("explanation"),
+                    }
+                    for m in rows
+                ],
+                "total": proxied.get("total_count", len(rows)),
+                "search_time_ms": proxied.get("search_time_ms", 0.0),
+            }
+
         svc = MemoryService(db)
         results, total, search_time = await svc.search_memories(user_id, request)
         return {

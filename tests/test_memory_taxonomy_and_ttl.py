@@ -928,8 +928,14 @@ def test_remaining_mcp_tools_on_agent_only_tables_are_known():
                 and "_to_tenant" not in body:
             unproxied.add(n.name)
 
+    # memory_search left this set on 2026-08-05. The old entry read "has a
+    # builtin in tool_executor; never hits MCP" — true of the AGENT, which does
+    # have `_tool_memory_search`, but not of the EXTERNAL MCP clients this
+    # server exists for. Those are exactly who memory_create/list were proxied
+    # for, and they could create into the tenant and then search the platform's
+    # stale monolith table and find nothing. See
+    # tests/test_mcp_memory_search_tenant.py.
     assert unproxied == {
-        "memory_search",          # has a builtin in tool_executor; never hits MCP
         "session_create", "session_list",
         "entity_search", "graph_traverse", "entity_relationship_create",
         "identity_get", "identity_update",
