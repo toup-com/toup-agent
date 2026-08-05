@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import os
 import uuid
 from types import SimpleNamespace
@@ -303,7 +304,26 @@ async def test_remind_probe_failure_falls_back_to_website(monkeypatch):
 # ── Prompt surfaces: the asking contract is inverted ─────────────────
 
 
-def test_tool_descriptions_never_ask():
+_NEVER_ASK = re.compile(r"(do\s+not|don'?t|never)\s+ask", re.I)
+
+
+@pytest.mark.parametrize("diet", [False, True])
+def test_tool_descriptions_never_ask(monkeypatch, diet):
+    """The routines tools must tell the model not to ask about delivery.
+
+    Parametrised over `prompt_diet` because the diet rewrites these very
+    descriptions, and this contract has to hold in BOTH renderings — the
+    whole point of the diet is that it may compress the wording but must not
+    drop a behavioural rule.
+
+    Matched by directive rather than exact spelling: the full description
+    says "Do NOT ask", the dieted one says "never ask where to send it".
+    Pinning one spelling made this fail the moment the diet became the
+    default, for a phrasing difference and not a behaviour change.
+    """
+    from app.config import settings
+    monkeypatch.setattr(settings, "prompt_diet", diet, raising=False)
+
     skill = _load_skill()
     tools = {t["name"]: t for t in skill.get_tools()}
     blob = json.dumps(tools)
@@ -311,15 +331,17 @@ def test_tool_descriptions_never_ask():
     assert "ALWAYS ask" not in blob
     assert "Ask the user before picking" not in blob
 
-    create_desc = tools["routines__create"]["description"]
-    remind_desc = tools["routines__remind"]["description"]
-    assert "Do NOT ask" in create_desc
-    assert "do NOT ask" in remind_desc
-
     for tool in ("routines__create", "routines__remind"):
+        desc = tools[tool]["description"]
+        assert _NEVER_ASK.search(desc), (
+            f"{tool} (prompt_diet={diet}) lost its never-ask directive: {desc}"
+        )
         param = tools[tool]["input_schema"]["properties"]["delivery_channels"]
         assert "OMIT" in param["description"]
-        assert "do NOT ask" in param["description"]
+        assert _NEVER_ASK.search(param["description"]), (
+            f"{tool}.delivery_channels (prompt_diet={diet}) lost the directive: "
+            f"{param['description']}"
+        )
     # The stale website-only default is gone from the remind param.
     remind_param = tools["routines__remind"]["input_schema"]["properties"]["delivery_channels"]
     assert 'Defaults to `["website"]`' not in remind_param["description"]

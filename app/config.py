@@ -490,14 +490,26 @@ class Settings(BaseSettings):
     #     render into ONE per-turn <turn_context> message appended after
     #     history, behind the cacheable prefix
     #   - OpenAI calls also send safety_identifier + prompt_cache_retention
-    # Default OFF: model-visible prompt layout change — flip after canary
-    # validation (STABLE_PREFIX_LAYOUT=true).
+    # Default ON since 2026-08-05. It shipped dark, soaked on 59 of 61 fleet
+    # containers, and the default was flipped because OFF-by-default turned a
+    # missing env var into a silent, permanent regression:
+    #
+    #   Assigned tenants take env from /data/agents/<prefix>/.env, written at
+    #   provision time. Pool containers pick up new fleet flags from the bridge
+    #   env (pool_addon._feature_flag_env_args); assigned tenants never do. Two
+    #   tenants — the canary and the founder's own account — therefore ran
+    #   WITHOUT this flag from the day it was introduced. Nothing failed; they
+    #   just quietly paid full price for every prefix.
+    #
+    # Measured on the canary, same container/model/wire, flag off then on:
+    # 9.9% -> 92.2-93.9% of input tokens served from cache. Disable with
+    # STABLE_PREFIX_LAYOUT=false.
     # Known residual (accepted): the coarse time-of-day word in about_you
     # still flips ~4x/day (morning/afternoon/evening/late-night), so expect
     # scheduled cache-hit dips near 05/12/17/22 local. OpenAI-only benefit:
     # Claude models keep the legacy intent-filtered tools array (Anthropic
     # tool_choice cannot express an allowlist).
-    stable_prefix_layout: bool = False
+    stable_prefix_layout: bool = True
 
     # Per-tenant CANARY for the stable prefix layout. Agent feature flags are
     # otherwise baked fleet-wide by the bridge's docker-run env — there is no
@@ -543,10 +555,13 @@ class Settings(BaseSettings):
     #     (Pages map + NEVER list + owner fact + fencing all kept)
     #   - doc_generation shrinks 654 → ~200 tok (tool-choice rules + the
     #     convert-vs-regenerate rule kept)
-    # Default OFF: model-visible prompt change — flip via PROMPT_DIET=true
-    # after canary validation. Flag-off output is byte-identical to today
-    # (regression-pinned in tests/test_prompt_diet.py).
-    prompt_diet: bool = False
+    # Default ON since 2026-08-05 — same reasoning as stable_prefix_layout
+    # above: it was already set on 60 of 61 fleet containers, and the one
+    # container missing it (the founder's own tenant) was silently paying
+    # ~5,750 extra prefix tokens on every single turn. Flag-off output stays
+    # byte-identical to the pre-diet prompt (regression-pinned in
+    # tests/test_prompt_diet.py); disable with PROMPT_DIET=false.
+    prompt_diet: bool = True
 
     # Channel convergence (token-efficiency W2.3a). Today every channel gets
     # its own wire tools array (vault strip, vibecoding/app strips) — and

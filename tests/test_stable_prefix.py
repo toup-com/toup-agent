@@ -195,10 +195,26 @@ class TestTurnContextMessage:
 
 
 class TestFlagDefault:
-    def test_stable_prefix_layout_defaults_off(self):
-        # Behavior change with regression risk — must ship dark
-        # (audit guardrail; flip via STABLE_PREFIX_LAYOUT=true).
-        assert Settings.model_fields["stable_prefix_layout"].default is False
+    def test_stable_prefix_layout_defaults_on(self):
+        """Flipped 2026-08-05 after soaking on 59 of 61 fleet containers.
+
+        It shipped dark, which was right. What was NOT right is that OFF was
+        the default for so long that a missing env var became a silent,
+        permanent regression: assigned tenants take env from a per-tenant
+        .env written at provision time and never receive later fleet flags,
+        so the canary and the founder's own account ran without it for weeks
+        at 9.9% cached where the flag delivers 92-94%. A default that only
+        works when every deploy path remembers to set it is not a safe
+        default.
+        """
+        assert Settings.model_fields["stable_prefix_layout"].default is True
+
+    def test_stable_prefix_layout_can_still_be_turned_off(self):
+        """The kill switch has to survive the default flip, or there is no way
+        back without a code change."""
+        assert Settings(
+            _env_file=None, stable_prefix_layout=False
+        ).stable_prefix_layout is False
 
 
 # ---------------------------------------------------------------------------

@@ -148,8 +148,9 @@ _DIET_PROPERTY_DESCRIPTIONS = {
             "executed at fire time (fresh context, no memory of this chat)."
         ),
         "delivery_channels": (
-            "OMIT for the default (chat + every connected channel). Set only "
-            "on explicit user restriction; `website` always included."
+            "OMIT for the default (chat + every connected channel) and do "
+            "NOT ask the user where to send it. Set only on explicit user "
+            "restriction; `website` always included."
         ),
     },
     "routines__remind": {
@@ -168,8 +169,9 @@ _DIET_PROPERTY_DESCRIPTIONS = {
         ),
         "name": "Optional short name for Mission Control (defaults from reminder_text).",
         "delivery_channels": (
-            "OMIT for the default (chat + every connected channel). Set only "
-            "on explicit user restriction; `website` always included."
+            "OMIT for the default (chat + every connected channel) and do "
+            "NOT ask the user where to send it. Set only on explicit user "
+            "restriction; `website` always included."
         ),
         "timezone": (
             "IANA tz (e.g. \"America/Toronto\") — pass only after a "

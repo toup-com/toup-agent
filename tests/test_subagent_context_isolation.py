@@ -306,12 +306,49 @@ async def test_subagent_run_isolated_end_to_end(monkeypatch, tmp_path):
     # (a) No day-context: the flag itself was never consulted for SUBAGENT
     assert flag_checks["n"] == 0, "SUBAGENT must not even check the day-chat flag"
 
-    # (a) Empty history: exactly the current user message went to the LLM
+    # (a) Empty history: no PARENT conversation reached the child.
+    #
+    # This asserted `len(sent) == 1` until 2026-08-05, which used message
+    # COUNT as a proxy for isolation. That proxy only held while
+    # stable_prefix_layout defaulted OFF: with the layout on — which is what
+    # 59 of 61 fleet containers were already running — a <turn_context>
+    # message is appended ahead of the task, so the count is 2 and the test
+    # failed for a reason that has nothing to do with isolation. It was
+    # therefore a test that only passed in a configuration production does
+    # not use.
+    #
+    # Isolation is about CONTENT, so assert content: the child sees its own
+    # task and nothing of the parent's history, memories or day. The
+    # turn_context a SUBAGENT gets is clock-only (verified below), which is
+    # exactly what it should be.
     assert len(fake.calls) == 1
     sent = fake.calls[0]["messages"]
-    assert len(sent) == 1, f"child must start with empty history, got {len(sent)} messages"
-    assert sent[0]["role"] == "user"
-    assert "compare pricing of X and Y" in str(sent[0]["content"])
+    assert all(m["role"] == "user" for m in sent), (
+        f"child was handed non-user turns: {[m['role'] for m in sent]}"
+    )
+    task_msgs = [m for m in sent if "compare pricing of X and Y" in str(m["content"])]
+    assert len(task_msgs) == 1, "the child's own task must be present exactly once"
+
+    others = [m for m in sent if m not in task_msgs]
+    assert len(others) <= 1, (
+        f"child received {len(others)} messages beyond its task — expected at "
+        f"most one <turn_context>: {[str(m['content'])[:80] for m in others]}"
+    )
+    for m in others:
+        raw = str(m["content"])
+        assert raw.lstrip().startswith("<turn_context>"), (
+            f"unexpected message prepended to a SUBAGENT run: {raw[:200]}"
+        )
+        # Inspect the BODY only. The block's fixed preamble names every kind
+        # of state it CAN carry ("recalled memories, open threads, day
+        # summary"), so scanning the whole string matches those words in the
+        # boilerplate and reports a leak on an empty block.
+        body = raw.split(")\n\n", 1)[1].split("</turn_context>")[0]
+        lines = [ln for ln in body.splitlines() if ln.strip()]
+        assert lines and all(ln.startswith("Current time:") for ln in lines), (
+            "a SUBAGENT's turn_context must be clock-only — anything else is "
+            f"parent state reaching an isolated child: {lines}"
+        )
 
     # (b) Cache key scoped to the child's own sentinel — user:subagent:job
     assert fake.calls[0]["prompt_cache_key"] == f"{user_id}:subagent:{job_id}"

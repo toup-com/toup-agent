@@ -67,10 +67,20 @@ def diet_off(monkeypatch):
 # ── flag plumbing ──────────────────────────────────────────────────────
 
 
-def test_flag_defaults_off():
-    """Model-visible prompt change — must ship dark and flip only after
-    the canary A/B against the eval baseline."""
-    assert Settings.model_fields["prompt_diet"].default is False
+def test_flag_defaults_on():
+    """Flipped 2026-08-05, after it was already set on 60 of 61 containers.
+
+    The one container without it was the founder's own tenant, silently
+    paying ~5,750 extra prefix tokens per turn because the per-tenant .env
+    that carries agent flags is written once at provision time and never
+    picks up flags introduced later.
+    """
+    assert Settings.model_fields["prompt_diet"].default is True
+
+
+def test_flag_can_still_be_turned_off():
+    """The kill switch must survive the default flip."""
+    assert Settings(_env_file=None, prompt_diet=False).prompt_diet is False
 
 
 def test_helper_reads_settings(monkeypatch):
