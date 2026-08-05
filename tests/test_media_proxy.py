@@ -10,6 +10,7 @@ what's under test, not the extractor plumbing.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from types import SimpleNamespace
@@ -1204,3 +1205,172 @@ async def test_the_pump_egresses_where_the_EXTRACTION_said_not_where_the_hash_sa
         "the pump recomputed the slot instead of using the one the extraction recorded"
     )
     assert seen["proxy"] != pooled._proxy_with_slot(hashed)
+
+
+# ── Extraction-cache failure paths ────────────────────────────────────────
+#
+# Three defects that each cost the user real silence, all on paths that only
+# run when something has already gone slightly wrong — which is exactly why
+# none of them showed up in normal use.
+
+
+async def test_the_shared_publish_does_not_block_the_play(monkeypatch):
+    """`_cached_extract` runs inside the executor whose future the phone is
+    blocked on. A PUT there is silence the user hears, and the R2 meta client's
+    2.5s connect + 2.5s read ceiling makes the tail 5s of it."""
+    from app.api import media_proxy as mp
+
+    started = asyncio.Event()
+    release = __import__("threading").Event()
+
+    def _slow_store(video_id, result, stored_at):
+        started.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(mp, "_shared_extract_store", _slow_store)
+    monkeypatch.setattr(mp, "_extract_audio", lambda v: {"url": "https://x", "expires_at": 0})
+    monkeypatch.setattr(mp, "_shared_extract_load", lambda v, n: None)
+    mp._EXTRACT_CACHE.pop("vid", None)
+
+    t0 = time.monotonic()
+    result = await asyncio.get_event_loop().run_in_executor(None, mp._cached_extract, "vid")
+    elapsed = time.monotonic() - t0
+    release.set()
+
+    assert result["url"] == "https://x"
+    assert elapsed < 1.0, f"the play waited {elapsed:.1f}s on a best-effort cache write"
+
+
+async def test_a_publish_that_cannot_start_a_thread_still_publishes(monkeypatch):
+    """Degrading to the old inline behaviour is slower and still correct.
+    Silently dropping the write would leave the shared tier permanently cold."""
+    from app.api import media_proxy as mp
+
+    calls = []
+    monkeypatch.setattr(mp, "_shared_extract_store", lambda v, r, s: calls.append(v))
+
+    import threading as _t
+    def _boom(*a, **kw):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(_t, "Thread", _boom)
+
+    mp._publish_shared_extract("vid", {"url": "https://x"}, 0.0)
+    assert calls == ["vid"], "the publish was dropped instead of falling back to inline"
+
+
+async def test_a_purge_does_not_destroy_another_replica_s_fresher_entry(monkeypatch, shared_r2):
+    """Replica A pumping an hour-old L1 entry that has just started 403-ing can
+    race replica B publishing a fresh extraction for the same video. An
+    unconditional delete has A destroy B's good entry and the next play pays a
+    full ~10s yt-dlp run for nothing."""
+    from app.api import media_proxy as mp
+
+    shared_r2.store[mp._r2_extract_key("vid")] = json.dumps(
+        {"v": 1, "stored_at": time.time(), "result": {"url": "https://FRESH"}}
+    ).encode()
+
+    await mp._purge_extraction("vid", poisoned_url="https://STALE")
+
+    assert mp._r2_extract_key("vid") in shared_r2.store, (
+        "purging a URL we were not holding destroyed the other replica's fresh entry"
+    )
+
+
+async def test_a_purge_DOES_remove_the_entry_it_was_actually_holding(monkeypatch, shared_r2):
+    from app.api import media_proxy as mp
+
+    shared_r2.store[mp._r2_extract_key("vid")] = json.dumps(
+        {"v": 1, "stored_at": time.time(), "result": {"url": "https://STALE"}}
+    ).encode()
+
+    await mp._purge_extraction("vid", poisoned_url="https://STALE")
+
+    assert mp._r2_extract_key("vid") not in shared_r2.store, (
+        "the poisoned entry survived, so every replica keeps reading the bad URL"
+    )
+
+
+async def test_a_purge_with_no_url_is_unconditional(monkeypatch, shared_r2):
+    """A caller that cannot say what it was holding gets the old behaviour —
+    the safe direction, since a bad URL left in place poisons the whole fleet."""
+    from app.api import media_proxy as mp
+
+    shared_r2.store[mp._r2_extract_key("vid")] = json.dumps(
+        {"v": 1, "stored_at": time.time(), "result": {"url": "https://ANYTHING"}}
+    ).encode()
+
+    await mp._purge_extraction("vid")
+
+    assert mp._r2_extract_key("vid") not in shared_r2.store
+
+
+def test_the_403_branch_tells_the_purge_which_url_failed():
+    """Without the url the conditional purge silently degrades to unconditional,
+    which is the bug it was added to fix."""
+    import inspect
+    from app.api import media_proxy as mp
+
+    src = inspect.getsource(mp.stream_audio)
+    assert "_purge_extraction(video_id, poisoned_url=upstream_url)" in src
+
+
+def test_the_upstream_connect_is_bounded_well_below_the_read_timeout():
+    """`_STREAM_TIMEOUT.connect` governs the TCP connection to the PROXY. The
+    CONNECT tunnel and the headers behind it fall under `read`, which must stay
+    long for a slow progressive body — so headers need their own, shorter,
+    ceiling. Production logged three '504 Gateway Timeout' upstream-connect
+    failures where the phone could wait a minute for a 502."""
+    import inspect
+    from app.api import media_proxy as mp
+
+    assert mp._UPSTREAM_HEADERS_TIMEOUT < mp._STREAM_TIMEOUT.read, (
+        "a header ceiling at or above the read timeout bounds nothing"
+    )
+    src = inspect.getsource(mp.stream_audio)
+    assert "_UPSTREAM_HEADERS_TIMEOUT" in src
+    assert "upstream_connect_timeout" in src, "a timeout must be distinguishable from a refusal"
+
+
+async def test_a_hanging_upstream_connect_returns_quickly_instead_of_stalling(
+    monkeypatch, client
+):
+    """The behavioural half. Production logged three '504 Gateway Timeout'
+    upstream-connect failures — IPRoyal's gateway answering CONNECT — and with
+    only `_STREAM_TIMEOUT` in play the phone can sit through read=60 before a
+    502 arrives, by which time its auto-skip has moved the user off the song
+    they asked for."""
+    from app.api import media_proxy as mp
+
+    async def _fake_extract(v):
+        return {"url": _FAKE_URL, "expires_at": 9999999999, "duration": 1,
+                "mime_type": "audio/mp4", "ext": "m4a"}
+
+    monkeypatch.setattr(mp, "_extract_coalesced", _fake_extract)
+    monkeypatch.setattr(mp, "_remuxed_ready", lambda v: None)
+
+    async def _no_r2(v):
+        return None
+    monkeypatch.setattr(mp, "_r2_pull_to_local", _no_r2)
+    monkeypatch.setattr(mp, "_UPSTREAM_HEADERS_TIMEOUT", 0.2)
+
+    class _HangingClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def build_request(self, *a, **kw):
+            return object()
+
+        async def send(self, *a, **kw):
+            await asyncio.sleep(30)  # a proxy that accepts and never answers
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(mp.httpx, "AsyncClient", _HangingClient)
+
+    t0 = time.monotonic()
+    resp = await client.get("/api/media/kJQP7kiw5Fk/audio_stream")
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 5, f"the phone waited {elapsed:.1f}s on a dead proxy"
+    assert resp.status_code == 504, f"expected a distinguishable timeout, got {resp.status_code}"

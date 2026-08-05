@@ -652,9 +652,13 @@ def _shared_extract_load(video_id: str, now: float) -> tuple[dict, float] | None
 def _shared_extract_store(video_id: str, result: dict, stored_at: float) -> None:
     """Publish a successful extraction for the other replicas. Best-effort.
 
-    Inline rather than on a background thread: it runs after a ~5-7s extraction
-    that the caller is already waiting on, so a bounded sub-second PUT is noise,
-    and a thread would only add an interpreter-shutdown failure mode.
+    Called OFF the awaited path — see `_publish_shared_extract`. It used to run
+    inline at the end of `_cached_extract`, on the reasoning that a sub-second
+    PUT is noise beside a ~5-7s extraction. That is true of the median and not
+    of the shape: `_cached_extract` runs inside the executor whose future the
+    phone is blocked on, so every millisecond here is a millisecond of silence,
+    and the R2 client's 2.5s connect + 2.5s read ceiling is 5s of it when R2 is
+    slow. Nothing waits on the publish, so nothing should block for it.
     """
     client = _get_r2_meta_client()
     if client is None:
@@ -671,11 +675,21 @@ def _shared_extract_store(video_id: str, result: dict, stored_at: float) -> None
         logger.warning("[media_proxy] shared extract store failed video_id=%s: %s", video_id, e)
 
 
-async def _purge_extraction(video_id: str) -> None:
+async def _purge_extraction(video_id: str, poisoned_url: str | None = None) -> None:
     """Drop a poisoned extraction from BOTH tiers.
 
     Clearing only the local tier would leave the bad URL in R2 for every other
     replica to read — and for this one to read back on its next miss.
+
+    `poisoned_url` makes the shared delete CONDITIONAL, and that matters with
+    two replicas. Replica A can be pumping an hour-old L1 entry that has just
+    started 403-ing at the same moment replica B publishes a fresh extraction
+    for the same video. An unconditional delete has A destroy B's good entry,
+    and the next play on either replica pays a full ~10s yt-dlp run for nothing.
+    Deleting only when the stored URL is the one that actually failed makes the
+    purge idempotent and safe to race. Omitted (or unreadable) → unconditional,
+    which is the old behaviour and the safe direction for a caller that cannot
+    say what it was holding.
     """
     _EXTRACT_CACHE.pop(video_id, None)
 
@@ -683,6 +697,20 @@ async def _purge_extraction(video_id: str) -> None:
         client = _get_r2_meta_client()
         if client is None:
             return
+        if poisoned_url:
+            try:
+                obj = client.get_object(
+                    Bucket=settings.r2_bucket, Key=_r2_extract_key(video_id)
+                )
+                stored = (json.loads(obj["Body"].read()) or {}).get("result") or {}
+            except Exception:
+                stored = None
+            if isinstance(stored, dict) and stored.get("url") != poisoned_url:
+                logger.info(
+                    "[media_proxy] shared extract already replaced — not purging video_id=%s",
+                    video_id,
+                )
+                return
         client.delete_object(Bucket=settings.r2_bucket, Key=_r2_extract_key(video_id))
 
     try:
@@ -695,6 +723,29 @@ async def _purge_extraction(video_id: str) -> None:
         # already clear — but a purge that keeps failing means the shared tier
         # is serving a bad URL to the fleet until it expires. Say so.
         logger.warning("[media_proxy] shared extract purge failed video_id=%s: %s", video_id, e)
+
+
+def _publish_shared_extract(video_id: str, result: dict, stored_at: float) -> None:
+    """Hand the shared-tier PUT to a plain daemon thread and return immediately.
+
+    A thread rather than `asyncio.create_task`, because the only caller runs in
+    an executor worker with no running event loop of its own. Daemon, because a
+    best-effort cache write must never hold up interpreter shutdown; the object
+    it would have written is one an extraction re-creates.
+    """
+    try:
+        import threading
+        threading.Thread(
+            target=_shared_extract_store,
+            args=(video_id, result, stored_at),
+            name=f"extract-publish-{video_id}",
+            daemon=True,
+        ).start()
+    except Exception as e:
+        # A thread we cannot start is not a reason to fail a play that already
+        # has its URL. Fall back to publishing inline: slower, still correct.
+        logger.warning("[media_proxy] shared extract publish thread failed: %s", e)
+        _shared_extract_store(video_id, result, stored_at)
 
 
 def _cached_extract(video_id: str) -> dict:
@@ -716,7 +767,10 @@ def _cached_extract(video_id: str) -> dict:
     deadline = _extract_cache_deadline(result, now)
     if deadline > now:
         _EXTRACT_CACHE[video_id] = (result, deadline)
-        _shared_extract_store(video_id, result, now)
+        # Publish to the shared tier WITHOUT holding the caller. See
+        # `_publish_shared_extract` — this function's future is what the phone
+        # is waiting on, so a PUT here is silence the user hears.
+        _publish_shared_extract(video_id, result, now)
     return result
 
 
@@ -1361,6 +1415,9 @@ async def get_audio_url(
 
 _STREAM_CHUNK_BYTES = 64 * 1024
 _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+# Ceiling on getting RESPONSE HEADERS back, separate from `read` above, which
+# has to stay long enough to cover a slow progressive body. See the call site.
+_UPSTREAM_HEADERS_TIMEOUT = float(os.environ.get("AUDIO_UPSTREAM_HEADERS_TIMEOUT", "20"))
 
 
 def _parse_byte_range(range_header: str | None, file_size: int):
@@ -1621,7 +1678,25 @@ async def stream_audio(
     )
     try:
         upstream_req = client.build_request("GET", upstream_url, headers=upstream_headers)
-        upstream = await client.send(upstream_req, stream=True)
+        # Bounded explicitly. `_STREAM_TIMEOUT`'s connect=10 governs the TCP
+        # connection to the PROXY; the CONNECT tunnel handshake and the response
+        # headers behind it fall under read=60. Production logged three
+        # "504 Gateway Timeout" upstream-connect failures on 2026-08-04/05 —
+        # IPRoyal's own gateway answering CONNECT — and the phone can sit for a
+        # minute before that becomes a 502, by which time its auto-skip has
+        # moved the user off the song they asked for. Headers arrive in ~1s on a
+        # healthy path (measured), so 20s is generous and still bounded.
+        upstream = await asyncio.wait_for(
+            client.send(upstream_req, stream=True), timeout=_UPSTREAM_HEADERS_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        await client.aclose()
+        _release()
+        logger.warning(
+            "[media_proxy] audio_stream upstream-connect timed out after %.0fs video_id=%s",
+            _UPSTREAM_HEADERS_TIMEOUT, video_id,
+        )
+        return JSONResponse(status_code=504, content={"error": "upstream_connect_timeout"})
     except Exception as e:
         await client.aclose()
         _release()
@@ -1642,7 +1717,7 @@ async def stream_audio(
             "[media_proxy] audio_stream upstream status=%s — purging cached extraction video_id=%s",
             status, video_id,
         )
-        await _purge_extraction(video_id)
+        await _purge_extraction(video_id, poisoned_url=upstream_url)
         try:
             result = await asyncio.wait_for(
                 _extract_coalesced(video_id), timeout=_AUDIO_EXTRACT_TIMEOUT_SECS
