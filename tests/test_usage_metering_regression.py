@@ -95,6 +95,22 @@ async def _grant_via_balance(uid: str) -> None:
         await db.commit()
 
 
+async def _call_agent_deduct(uid: str, body):
+    """Drive `/credits/agent-deduct` as the agent does: X-Agent-Key auth against
+    an AgentConfig row, and llm_mode='manual' (bundle short-circuits before the
+    charge, by design — see the double-charge guard in the endpoint)."""
+    from app.db import async_session_maker
+    from app.db.models import AgentConfig
+    from app.api.credits import agent_deduct
+
+    key = f"agent-key-{uid[:8]}"
+    async with async_session_maker() as db:
+        db.add(AgentConfig(user_id=uid, llm_mode="manual", agent_api_key=key))
+        await db.commit()
+    async with async_session_maker() as db:
+        return await agent_deduct(body, x_agent_key=key, db=db)
+
+
 async def _plan_grant_rows(uid: str) -> int:
     from app.db import async_session_maker
     from app.db.models import CreditLedger, LEDGER_PLAN_GRANT
@@ -357,6 +373,186 @@ async def test_flag_off_preserves_the_old_cap_denial(credit_flags):
         await db.commit()
     assert result.success is False
     assert result.reason == "daily_cap_exceeded"
+
+
+async def test_admission_gate_rolls_a_stale_day_instead_of_locking_the_user_out(
+    credit_flags,
+):
+    """The deadlock the admission gate would otherwise ship with.
+
+    `used_today` is rolled only by `_reset_daily_if_needed`, called from
+    `try_charge` and `reserve` — both DOWNSTREAM of this gate, and there is no
+    daily cron. So a free user who ended yesterday at the cap would be refused
+    on their first request today, and that refusal is precisely what stops the
+    counter from ever rolling: locked out permanently, while /status shows "0
+    used today" because it rolls the same value for display.
+    """
+    from app.db import async_session_maker, CreditBalance
+    from app.db.models import BUCKET_MESSAGE
+    from app.services.credit_service import credit_service
+
+    credit_flags(credit_enforcement_enabled=True, credit_cap_admission_control=True)
+
+    uid = await _mk_user("cap-stale-day@example.com")
+    await _grant_via_balance(uid)
+    async with async_session_maker() as db:
+        b = await db.get(CreditBalance, uid)
+        b.message_credits_daily_cap = Decimal("15")
+        b.message_credits_used_today = Decimal("28")     # yesterday's total…
+        b.day_anchor_local_date = (                       # …and it IS yesterday
+            datetime.utcnow().date() - timedelta(days=1)
+        ).isoformat()
+        await db.commit()
+
+    async with async_session_maker() as db:
+        peek = await credit_service.check_balance(db, uid, BUCKET_MESSAGE, Decimal("0.1"))
+    assert peek.success is True, (
+        "a new local day must re-open the cap at the gate; otherwise the first "
+        "request of every day is refused forever"
+    )
+
+    # Still a read: the roll is persisted by the next charge, not by the peek.
+    b = await _balance(uid)
+    assert Decimal(b.message_credits_used_today) == Decimal("28")
+
+
+async def test_admission_gate_still_refuses_within_the_same_day(credit_flags):
+    """The other half — rolling a STALE day must not soften a live one."""
+    from app.db import async_session_maker, CreditBalance
+    from app.db.models import BUCKET_MESSAGE
+    from app.services.credit_service import credit_service
+
+    credit_flags(credit_enforcement_enabled=True, credit_cap_admission_control=True)
+
+    uid = await _mk_user("cap-same-day@example.com")
+    await _grant_via_balance(uid)
+    async with async_session_maker() as db:
+        b = await db.get(CreditBalance, uid)
+        b.message_credits_daily_cap = Decimal("15")
+        b.message_credits_used_today = Decimal("28")
+        b.day_anchor_local_date = datetime.utcnow().date().isoformat()
+        await db.commit()
+
+    async with async_session_maker() as db:
+        peek = await credit_service.check_balance(db, uid, BUCKET_MESSAGE, Decimal("0.1"))
+    assert peek.success is False
+    assert peek.reason == "daily_cap_exceeded"
+
+
+def test_every_message_bucket_settlement_is_marked_already_incurred():
+    """`llm_proxy` was only ONE of the deduct paths.
+
+    Every MESSAGE-bucket `try_charge` in the codebase runs AFTER the provider
+    has been paid — there is no call site that charges before the work. So each
+    one must say so, or the daily cap zeroes a bill we already owe and the user
+    gets the turn free. That is the 2026-08-03 defect; this asserts it cannot
+    come back through a second door.
+
+    Deliberately NOT asserted for INTEGRATION-bucket charges (search_proxy,
+    connector_dispatcher): that bucket has no daily cap, so the flag is inert
+    there and demanding it would be cargo cult.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "app"
+    offenders = []
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(), str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not (isinstance(fn, ast.Attribute) and fn.attr == "try_charge"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords if k.arg}
+            bucket = next(
+                (a for a in node.args if isinstance(a, ast.Name)
+                 and a.id in ("BUCKET_MESSAGE", "_BUCKET_MESSAGE")),
+                None,
+            )
+            if bucket is None:
+                continue                       # integration, or bucket is dynamic
+            incurred = kw.get("already_incurred")
+            if not (isinstance(incurred, ast.Constant) and incurred.value is True):
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        "MESSAGE-bucket try_charge without already_incurred=True: "
+        + ", ".join(offenders)
+    )
+
+
+async def test_manual_mode_charges_the_incurred_turn_and_still_blocks_the_next(
+    credit_flags,
+):
+    """`/agent-deduct` had to do two things the old code could not do at once.
+
+    Manual mode has no proxy and never calls `check_balance`; the agent's only
+    gate is `raise_if_exhausted`, which blocks the next call iff the last
+    deduct returned success=False. So denying was the ONLY way to stop the
+    loop — and denying is what zeroed a bill we had already paid. The charge
+    must land and the response must still say "stop".
+    """
+    from app.db import async_session_maker, CreditBalance
+    from app.services.credit_service import credit_service
+
+    credit_flags(credit_enforcement_enabled=True, credit_cap_admission_control=True)
+
+    uid = await _mk_user("manual-cap@example.com")
+    await _grant_via_balance(uid)
+    async with async_session_maker() as db:
+        b = await db.get(CreditBalance, uid)
+        b.message_credits_daily_cap = Decimal("15")
+        b.message_credits_used_today = Decimal("14")
+        b.day_anchor_local_date = datetime.utcnow().date().isoformat()
+        await db.commit()
+
+    from app.api.credits import AgentDeductRequest
+    resp = await _call_agent_deduct(uid, AgentDeductRequest(
+        user_id=uid, model="gpt-5.5", provider="openai",
+        input_tokens=19000, output_tokens=150,
+        idempotency_key="manual-cap-1",
+    ))
+
+    # The money landed…
+    assert resp.amount_charged > 0, "an incurred cost must never be zeroed"
+    b = await _balance(uid)
+    assert Decimal(b.message_credits_used_today) > Decimal("15"), (
+        "the charge must advance the day counter past the cap"
+    )
+    # …and the agent is told to stop, which is what ends the loop.
+    assert resp.success is False
+    assert resp.reason == "daily_cap_exceeded"
+
+
+async def test_gate_and_status_read_the_same_day_counter(credit_flags):
+    """They are one helper precisely so they cannot drift: a screen that says
+    "0 of 15 used" while the gate refuses every message is unreportable as a
+    bug, because the user has no way to see the number the gate is judging."""
+    from app.db import async_session_maker, CreditBalance
+    from app.db.models import BUCKET_MESSAGE
+    from app.services.credit_service import credit_service
+
+    credit_flags(credit_enforcement_enabled=True, credit_cap_admission_control=True)
+
+    uid = await _mk_user("cap-agree@example.com")
+    await _grant_via_balance(uid)
+    async with async_session_maker() as db:
+        b = await db.get(CreditBalance, uid)
+        b.message_credits_daily_cap = Decimal("15")
+        b.message_credits_used_today = Decimal("28")
+        b.day_anchor_local_date = (
+            datetime.utcnow().date() - timedelta(days=1)
+        ).isoformat()
+        await db.commit()
+
+    async with async_session_maker() as db:
+        view = await credit_service.get_balance_view(db, uid)
+        peek = await credit_service.check_balance(db, uid, BUCKET_MESSAGE, Decimal("0.1"))
+
+    # Screen says the day is fresh; the gate must agree the day is fresh.
+    assert Decimal(view.message_credits_used_today) == Decimal("0")
+    assert peek.success is True
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -624,6 +820,53 @@ async def test_charge_ratio_ignores_corrections_and_grants():
     assert result["readings"]["credits_charged"] == 5.0, (
         "the 40-credit clawback must not be counted as revenue"
     )
+
+
+async def test_charge_ratio_excludes_the_one_cent_cost_floor():
+    """`_calc_cost_cents` ends in `max(1, int(cost_usd * 100))`.
+
+    So a 15-token embedding whose true cost is ~$0.0000003 is recorded as a
+    full cent — five orders of magnitude high — and this alarm divides by that
+    column. Measured over 30 days of production: 3507 floored rows contributing
+    a fictitious $35.07 against 1059 real rows worth $70.37, dragging the ratio
+    to 0.428, under the 0.5 critical bar. The alarm would have paged forever on
+    a correctly-priced system. On real rows alone the ratio is 1.087.
+    """
+    from app.db import async_session_maker
+    from app.db.models import BUCKET_MESSAGE, CreditLedger, LEDGER_CHAT_MESSAGE
+    from app.services import credit_health_monitor as CHM
+
+    uid = await _mk_user("floor@example.com")
+    await _grant_via_balance(uid)
+
+    async with async_session_maker() as db:
+        # One honestly-priced call: 10 credits against 10 cents. Ratio 1.0.
+        db.add(CreditLedger(
+            id=str(uuid.uuid4()), user_id=uid, event_type=LEDGER_CHAT_MESSAGE,
+            bucket=BUCKET_MESSAGE, amount=Decimal("-10"),
+            balance_after=Decimal("90"), underlying_cost_cents=Decimal("10"),
+        ))
+        # 300 embeddings, each truly worth a rounding error, each recorded at
+        # the 1-cent floor. Charged ~0 because that is what they actually cost.
+        for _ in range(300):
+            db.add(CreditLedger(
+                id=str(uuid.uuid4()), user_id=uid, event_type=LEDGER_CHAT_MESSAGE,
+                bucket=BUCKET_MESSAGE, amount=Decimal("-0.001"),
+                balance_after=Decimal("90"), underlying_cost_cents=Decimal("1"),
+            ))
+        await db.commit()
+
+    async def _noop(*a, **k):
+        return True
+    CHM.send_infra_alert = _noop
+
+    result = await CHM.check_credit_health()
+    # Counting the floor: 10.3 credits / 310 cents = 0.033 → critical.
+    # Excluding it: 10 / 10 = 1.0 → silent, which is the truth.
+    assert "undercharging" not in result["alerts"], (
+        "the 1-cent floor must not be read as provider cost"
+    )
+    assert result["readings"]["provider_cost_usd"] == 0.10
 
 
 def test_web_fetch_cache_probe_symbol_exists():

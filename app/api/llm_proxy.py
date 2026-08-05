@@ -1677,6 +1677,7 @@ async def proxy_openai_images(
             model=model, provider="openai",
             underlying_cost_cents=total_cents,
             metadata={"endpoint": "images", "size": size, "quality": quality, "n": n},
+            already_incurred=True,   # image exists; the cap gates admission, not settlement
         )
     except Exception:
         logger.exception(
@@ -1806,6 +1807,7 @@ async def proxy_openai_image_edits(
             model=model, provider="openai",
             underlying_cost_cents=total_cents,
             metadata={"endpoint": "images", "op": "edit", "size": size, "quality": quality, "n": n},
+            already_incurred=True,   # image exists; the cap gates admission, not settlement
         )
     except Exception:
         logger.exception(
@@ -1902,6 +1904,7 @@ async def proxy_kie_image(
             underlying_cost_cents=cents_d,
             metadata={"endpoint": "kie_image", "mode": mode,
                       "kie_credits": result.credits_consumed},
+            already_incurred=True,   # image exists; the cap gates admission, not settlement
         )
     except Exception:
         logger.exception("[credits] kie image try_charge failed user=%s", config.user_id[:8])
@@ -2090,6 +2093,7 @@ async def proxy_kie_image_poll(
                 underlying_cost_cents=cents_d,
                 metadata={"endpoint": "kie_image_poll", "kie_credits": kie_credits,
                           "task_id": task_id},
+                already_incurred=True,   # image exists; the cap gates admission, not settlement
             )
     except Exception:
         logger.exception("[credits] kie image charge/settle failed user=%s", config.user_id[:8])

@@ -23,7 +23,9 @@ The invariants
    spend — and is a free-credit farm.
 3. **Revenue covers cost.** Credits charged should track the underlying
    provider cents they represent (1 credit ≈ 1¢ by design). A ratio far below
-   1 means the meter is undercounting, not that pricing is generous.
+   1 means the meter is undercounting, not that pricing is generous. Measured
+   on rows whose cost is NOT the 1-cent floor — see the query for why that
+   exclusion is the difference between 0.428 (false alarm) and 1.087 (true).
 4. **The meter is moving.** LLM proxy events with no corresponding charge rows
    means the charge path is broken again, whatever the reason.
 
@@ -157,6 +159,19 @@ async def check_credit_health() -> dict:
                 # NOT IN drops NULLs in SQL and most rows have no such key, so
                 # the IS NULL arm is load-bearing, not defensive.
                 or_(_is_admin.is_(None), ~_is_admin),
+                # Exclude the 1-cent FLOOR. `_calc_cost_cents` ends in
+                # `max(1, int(cost_usd * 100))`, so a 15-token embedding whose
+                # true cost is ~$0.0000003 is recorded as a full cent — five
+                # orders of magnitude high. Measured over 30 days of production:
+                # 3507 floored rows contributing a fictitious $35.07 against
+                # 1059 real rows worth $70.37, which dragged this ratio to 0.428
+                # — under the 0.5 critical bar. The alarm would have paged
+                # forever on a correctly-priced system the moment volume cleared
+                # the min-cost floor. On real rows alone the ratio is 1.087,
+                # i.e. break-even, which is what the pricing is designed for.
+                # This is a denominator the column cannot support, not a
+                # threshold that needs loosening.
+                CreditLedger.underlying_cost_cents > 1,
             )
         )).first()
         credits_charged = float(row[0] or 0)

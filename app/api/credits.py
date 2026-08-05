@@ -401,20 +401,45 @@ async def agent_deduct(
         output_tokens=body.output_tokens,
         underlying_cost_cents=body.underlying_cost_cents,
         metadata=_deduct_meta,
+        # This endpoint is a REPORT, not a request: the agent already talked to
+        # the provider on its own key and we are recording what that cost. The
+        # daily cap must gate ADMISSION (check_balance), never zero a bill we
+        # have already paid — that is the 2026-08-03 defect, and llm_proxy is
+        # only ONE of the two deduct paths. Manual mode has no proxy in front
+        # of it, so without this the same over-cap turn is served free here.
+        already_incurred=True,
     )
     # Read the balance view AFTER try_charge committed so plan +
     # period_end reflect any lazy monthly-renewal that just landed.
     view = await credit_service.get_balance_view(db, body.user_id)
+
+    # `success` is an ADMISSION verdict, not a receipt.
+    #
+    # The agent's only gate on this path is `credit_reporter.raise_if_exhausted`,
+    # which blocks the NEXT call iff the last deduct came back success=False —
+    # manual mode has no proxy in front of it and never calls check_balance. So
+    # the two things this response has to do are in tension under the old code:
+    # deny (to stop the loop) and charge (because the provider was already
+    # paid). It denied, which stopped the loop and gave the turn away free.
+    #
+    # Now the charge always lands (already_incurred above) and admission is
+    # asked separately, exactly as the proxy asks it. The agent keeps blocking
+    # after the cap, and we keep the money. `amount_charged` reports what really
+    # happened; it is deliberately no longer tied to `success`.
+    from decimal import Decimal as _Dec
+    admission = await credit_service.check_balance(
+        db, body.user_id, _BUCKET_MESSAGE, _Dec("0.1"),
+    )
     await db.commit()
 
     from app.config import settings as _settings
     return AgentDeductResponse(
-        success=result.success,
+        success=result.success and admission.success,
         bucket=_BUCKET_MESSAGE,
         amount_charged=float(credits) if result.success else 0.0,
         balance_after=float(result.balance_after),
         enforcement_enabled=bool(getattr(_settings, "credit_enforcement_enabled", False)),
-        reason=result.reason,
+        reason=result.reason or admission.reason,
         idempotent_hit=result.idempotent_hit,
         plan_id=view.plan_id,
         plan_display_name=view.plan_display_name,

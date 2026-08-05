@@ -948,6 +948,35 @@ class CreditService:
         )
         return granted
 
+    async def _effective_used_today(
+        self, db: AsyncSession, balance: CreditBalance, user_id: str,
+    ) -> Decimal:
+        """``used_today`` as of NOW, computed without writing.
+
+        The stored column is rolled ONLY by :meth:`_reset_daily_if_needed`,
+        whose two call sites are both WRITES (``try_charge``, ``reserve``), and
+        there is no daily cron. So the raw column is "as of the last charge that
+        landed", which after a quiet night is *yesterday's* total. Any READER
+        that gates on it has to roll it itself or it judges today by yesterday.
+
+        For :meth:`get_balance_view` that was cosmetic. For :meth:`check_balance`
+        it is a deadlock: the admission gate refuses BEFORE ``try_charge`` runs,
+        so a free user who ended a day at the cap is refused on the first
+        request of the next day — and the refusal is exactly what stops the
+        counter from ever rolling. Permanently locked out, with ``/status``
+        cheerfully reporting "0 used today" because it rolls the same value for
+        display. One helper for both, so the gate and the screen cannot disagree.
+        """
+        used_today = Decimal(balance.message_credits_used_today)
+        anchor = getattr(balance, "day_anchor_local_date", None)
+        if not anchor:
+            return used_today
+        user = await db.get(User, user_id)
+        today_iso = _local_day_iso(getattr(user, "timezone", None) if user else None)
+        # Forward only — see _reset_daily_if_needed: an anchor AHEAD of today is
+        # legitimate (timezone learned after signup) and must not zero the day.
+        return Decimal("0") if today_iso > anchor else used_today
+
     async def check_balance(
         self, db: AsyncSession, user_id: str, bucket: str,
         required: Decimal | float | int,
@@ -976,7 +1005,7 @@ class CreditService:
             _fp, _fpur, feasible, split_reason = _split_message_charge(
                 Decimal(balance.message_credits_remaining),
                 Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0),
-                Decimal(balance.message_credits_used_today),
+                await self._effective_used_today(db, balance, user_id),
                 (Decimal(balance.message_credits_daily_cap)
                  if balance.message_credits_daily_cap is not None else None),
                 required_q,
@@ -998,19 +1027,11 @@ class CreditService:
         balance = await self.get_or_create_balance(db, user_id)
         plan = await db.get(SubscriptionPlan, balance.plan_id)
 
-        # `message_credits_used_today` is rolled ONLY by `_reset_daily_if_needed`,
-        # whose two call sites are both WRITES (try_charge, reserve) — and there
-        # is no daily cron. So the raw column is "as of the last charge that
-        # landed", which after a quiet night is yesterday's total. /status is a
-        # GET and must not write, so roll it for the RESPONSE only and leave the
-        # row alone; the next charge persists the reset through the normal path.
-        used_today = Decimal(balance.message_credits_used_today)
-        anchor = getattr(balance, "day_anchor_local_date", None)
-        if anchor:
-            user = await db.get(User, user_id)
-            today_iso = _local_day_iso(getattr(user, "timezone", None) if user else None)
-            if today_iso > anchor:
-                used_today = Decimal("0")
+        # /status is a GET and must not write, so roll the day for the RESPONSE
+        # only and leave the row alone; the next charge persists the reset
+        # through the normal path. Shared with check_balance so the number the
+        # user is shown and the number the gate judges are the same number.
+        used_today = await self._effective_used_today(db, balance, user_id)
 
         # Map the stored plan_source to the mobile contract:
         #   apple            → 'iap'
