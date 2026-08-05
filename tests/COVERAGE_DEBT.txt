@@ -42,6 +42,7 @@ test_routine_one_per_kind.py  # agent-mode
 test_routine_reconnect_notice.py  # agent-mode
 test_routines_skill.py  # agent-mode
 test_signup_hardening.py  # agent-mode
+test_subagent_context_isolation.py  # agent-mode: _build_system_prompt SELECTs `identities` (AGENT_ONLY); 8/8 green under agent, 3 of 4 platform failures were this lane and not staleness
 test_subagent_dispatcher.py  # agent-mode
 test_toup_media_and_audio_first.py  # agent-mode: media_playlists is AGENT_ONLY (26/26 green under agent, 7 red under platform)
 test_subagent_orchestrator.py  # agent-mode
@@ -104,7 +105,6 @@ test_routine_outcome_state_machine.py  # STALE: asserts RoutineRun; f06c260d mad
 test_routine_runner.py  # STALE: same cutover — the two failures are the only RoutineRun tests
 test_routine_three_production_bugs.py  # STALE: two source-text greps over code that legitimately changed
 test_routines_phase3_verification.py  # STALE: same jobs cutover, from the data side
-test_subagent_context_isolation.py  # STALE: regex-pins a literal `if prompt_profile ==` shape
 test_triggers_inbound.py  # STALE: SELECTs TriggerEvent, removed by the unified-jobs cutover
 #
 # the test's own scaffolding is wrong; neither the assertion nor production is:

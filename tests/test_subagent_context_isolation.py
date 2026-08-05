@@ -21,115 +21,30 @@ tokens/spawn). Four fixes pinned:
       sentinel (announce-back persists via write_subagent_message,
       which resolves its own conversation — untouched).
 
-Mix of source-grep pins (convention: test_agent_runner_subagent_params
-/ test_stable_prefix) and DB-backed behavior tests with a fake LLM.
+2026-08-04 — this file used to be half source-text greps over
+agent_runner.py, and that half was worthless twice over.
+
+It was worthless as coverage: ``assert re.search(r"...", _SRC)`` passes
+against a function body of ``return``. It never executes a line of the
+code it claims to protect.
+
+And it was worthless in practice: #367 (CHANNEL_CONVERGE W2.3a) inserted
+an ``elif _channel_converge:`` branch between the SUBAGENT branch and the
+day/session ``else``. Every guarded BEHAVIOUR was unchanged — SUBAGENT is
+still first, so it still wins — but the regex demanded the two branches be
+textually adjacent, so it went red and got parked in COVERAGE_DEBT.txt.
+A test that fails on a refactor it should not care about, and passes on a
+deletion it should catch, has its polarity backwards on both ends.
+
+Every pin here is now behavioural: drive the real ``run()`` with a fake
+LLM and assert on the kwargs it received, the spy counters, and the rows
+in the database.
 """
 from __future__ import annotations
 
-import re
 import uuid as _uuid
-from pathlib import Path
 
 import pytest
-
-
-BACKEND_DIR = Path(__file__).resolve().parent.parent
-_SRC = (BACKEND_DIR / "app" / "agent" / "agent_runner.py").read_text()
-
-
-# ──────────────────────────────────────────────────────────────────────
-# (a) History gate — source pins
-# ──────────────────────────────────────────────────────────────────────
-
-
-def test_day_context_load_is_gated_on_explicit_subagent_check():
-    """The day-context feature-flag check itself sits under the profile
-    gate — a SUBAGENT run never even asks should_use_day_chat_context."""
-    assert re.search(
-        r"if prompt_profile != PromptProfile\.SUBAGENT:\s*\n\s*try:\s*\n"
-        r"\s*from app\.agent\.day_chat_resolver import should_use_day_chat_context",
-        _SRC,
-    ), "day-context load must be gated on prompt_profile != SUBAGENT"
-
-
-def test_day_context_gate_is_not_allows_post_builder_blocks():
-    """AUTOPILOT also has allows_post_builder_blocks == False but
-    deliberately keeps day context — the gate must be the explicit
-    enum comparison, never the post-builder predicate."""
-    gate_idx = _SRC.index("if prompt_profile != PromptProfile.SUBAGENT:")
-    flag_idx = _SRC.index("_use_day_ctx = await should_use_day_chat_context()")
-    assert gate_idx < flag_idx, "gate must precede the flag check"
-    # No allows_post_builder_blocks CALL between the _use_day_ctx init
-    # and the load (a comment may name it — only a call is a violation)
-    region = _SRC[_SRC.index("_use_day_ctx = False"):flag_idx]
-    assert "allows_post_builder_blocks(" not in region
-
-
-def test_autopilot_still_allows_day_context():
-    """Regression guard for the gate's polarity: AUTOPILOT (and FULL)
-    must pass the gate — only SUBAGENT is excluded."""
-    from app.agent.prompt_profile import PromptProfile
-
-    for profile in (PromptProfile.FULL, PromptProfile.AUTOPILOT):
-        assert profile != PromptProfile.SUBAGENT  # the gate lets these through
-
-
-# ──────────────────────────────────────────────────────────────────────
-# (b) Cache key — source pins
-# ──────────────────────────────────────────────────────────────────────
-
-
-def test_cache_scope_is_session_sentinel_for_subagent():
-    assert re.search(
-        r"if prompt_profile == PromptProfile\.SUBAGENT:\s*\n"
-        r"\s*_cache_scope = session_id\s*\n"
-        r"\s*else:\s*\n"
-        r"\s*_cache_scope = _day_chat_id or session_id",
-        _SRC,
-    ), "SUBAGENT cache scope must be the child's own session sentinel"
-    # Key shape unchanged: user_id-prefixed
-    assert '_cache_key = f"{user_id}:{_cache_scope}"' in _SRC
-
-
-# ──────────────────────────────────────────────────────────────────────
-# (c) Skip discarded work — source pins
-# ──────────────────────────────────────────────────────────────────────
-
-
-def test_memory_retrieval_short_circuits_on_profile():
-    """Same predicate as the pop site: 'user_brain' not in the
-    profile's section list → the hybrid_search fan-out never runs."""
-    assert '"user_brain" not in _profile_sections' in _SRC
-    assert "reason=profile_no_user_brain" in _SRC
-    # The short-circuit precedes the retrieval body
-    assert _SRC.index('"user_brain" not in _profile_sections') < _SRC.index(
-        "memories = await mem_svc.hybrid_search("
-    )
-
-
-def test_active_tasks_short_circuits_on_profile():
-    assert '"active_tasks" not in _profile_sections' in _SRC
-    assert _SRC.index('"active_tasks" not in _profile_sections') < _SRC.index(
-        "active_tasks = await get_active_tasks(db, user_id)"
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# (d) No orphan Conversation row — source pins
-# ──────────────────────────────────────────────────────────────────────
-
-
-def test_subagent_run_skips_get_or_create_session():
-    """SUBAGENT keeps the caller's 'subagent:{job_id}' id as an
-    in-memory sentinel instead of inserting a Conversation row."""
-    assert re.search(
-        r"if prompt_profile == PromptProfile\.SUBAGENT:\s*\n(?:\s*#[^\n]*\n)*"
-        r'\s*session_id = session_id or f"subagent:\{uuid\.uuid4\(\)\.hex\[:20\]\}"',
-        _SRC,
-    ), "SUBAGENT branch must keep/synthesize a sentinel session_id"
-    # The ContextVar stamp survives on both branches (a child tool call
-    # must not inherit the parent's conversation id).
-    assert "self.tools.set_session_id(session_id)" in _SRC
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -138,6 +53,9 @@ def test_subagent_run_skips_get_or_create_session():
 
 
 def test_spawn_description_says_child_starts_blank():
+    """Not a source grep: this reads the live tool definition that is
+    actually shipped to the model, so it goes red if the description is
+    changed — which is the thing that would mislead the model."""
     from app.agent.tool_definitions import get_agent_tools, get_extended_tools
 
     spawn = next(
@@ -270,8 +188,7 @@ async def test_full_profile_still_calls_retrieval_and_active_tasks(monkeypatch, 
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Behavior: end-to-end SUBAGENT run() with a fake LLM — empty history,
-# sentinel cache key, no Conversation row, no day-context flag check
+# Behavior: end-to-end run() with a fake LLM
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -296,6 +213,55 @@ class _FakeLLM:
         )
 
 
+def _quiet_prompt_build(monkeypatch):
+    """Silence the retrieval fan-out for the non-SUBAGENT profiles.
+
+    FULL and AUTOPILOT really do call hybrid_search, and the sqlite test
+    database has no pgvector — so without this the run dies on the
+    embedding column rather than on the thing under test.
+    """
+    import app.services.active_task_service as at_svc
+    from app.services.memory_service import MemoryService
+    from app.services.user_portrait_service import UserPortraitService
+
+    async def _no_hybrid(self, **kwargs):
+        return []
+
+    async def _no_active(db, user_id):
+        return []
+
+    async def _no_portrait(self, user_id):
+        return None
+
+    monkeypatch.setattr(MemoryService, "hybrid_search", _no_hybrid)
+    monkeypatch.setattr(at_svc, "get_active_tasks", _no_active)
+    monkeypatch.setattr(UserPortraitService, "get_or_build_portrait", _no_portrait)
+
+
+async def _run_with_fake(monkeypatch, tmp_path, *, profile, session_id, user_id):
+    """Drive one real run() against a fake LLM and hand back the recorder."""
+    from app.agent.agent_runner import AgentRunner
+    from app.agent.tool_executor import ToolExecutor
+
+    fake = _FakeLLM()
+    runner = AgentRunner(
+        llm_service=fake,  # type: ignore[arg-type]
+        tool_executor=ToolExecutor(workspace=str(tmp_path)),
+    )
+    response = await runner.run(
+        user_message="compare pricing of X and Y",
+        user_id=user_id,
+        session_id=session_id,
+        channel="subagent" if session_id.startswith("subagent:") else "web",
+        prompt_profile=profile,
+        save_user_message=False,
+        save_assistant_message=False,
+        disable_post_processing=True,
+        model_override="gpt-5.5-mini",
+    )
+    return fake, response
+
+
 @pytest.mark.asyncio
 async def test_subagent_run_isolated_end_to_end(monkeypatch, tmp_path):
     import app.agent.day_chat_resolver as dc_resolver
@@ -313,20 +279,6 @@ async def test_subagent_run_isolated_end_to_end(monkeypatch, tmp_path):
         return False
 
     monkeypatch.setattr(dc_resolver, "should_use_day_chat_context", _spy_flag)
-
-    # conversations/messages are AGENT_ONLY — the conftest platform-mode
-    # init_db doesn't create them, but run() reads history from messages
-    # and this test asserts the conversations row count.
-    from app.db import database as db_database
-    from app.db.models import Message
-    from app.db.models.base import Base
-
-    async with db_database.engine.begin() as conn:
-        await conn.run_sync(lambda sc: Base.metadata.create_all(
-            sc,
-            tables=[Conversation.__table__, Message.__table__],
-            checkfirst=True,
-        ))
 
     user_id = await _make_user()
     job_id = str(_uuid.uuid4())
@@ -373,3 +325,148 @@ async def test_subagent_run_isolated_end_to_end(monkeypatch, tmp_path):
             )
         )).scalar_one()
     assert n_convs == 0, "SUBAGENT run must not create a Conversation row"
+
+
+@pytest.mark.asyncio
+async def test_autopilot_still_checks_the_day_context_flag(monkeypatch, tmp_path):
+    """(a) POLARITY — the gate must be the enum comparison, not the
+    post-builder predicate.
+
+    ``allows_post_builder_blocks`` is False for AUTOPILOT *as well as*
+    SUBAGENT, so gating the day-context load on it would silently strip
+    autopilot's day history too. Only SUBAGENT is excluded.
+
+    This replaces two source greps (one asserting the textual order of the
+    gate and the flag check, one asserting the string
+    "allows_post_builder_blocks(" was absent from a slice of the file) and
+    a third that asserted ``PromptProfile.FULL != PromptProfile.SUBAGENT``
+    — a tautology about the enum that executed none of our code.
+
+    MUTATION: change the gate in run() from
+    ``if prompt_profile != PromptProfile.SUBAGENT:`` to
+    ``if allows_post_builder_blocks(prompt_profile):`` — AUTOPILOT stops
+    consulting the flag and this goes red, while the SUBAGENT assertion in
+    the test above stays green. That asymmetry is the whole point.
+    """
+    import app.agent.day_chat_resolver as dc_resolver
+    from app.agent.prompt_profile import PromptProfile
+
+    _quiet_prompt_build(monkeypatch)
+
+    flag_checks = {"n": 0}
+
+    async def _spy_flag(*a, **kw):
+        flag_checks["n"] += 1
+        return False
+
+    monkeypatch.setattr(dc_resolver, "should_use_day_chat_context", _spy_flag)
+
+    user_id = await _make_user()
+    await _run_with_fake(
+        monkeypatch, tmp_path,
+        profile=PromptProfile.AUTOPILOT,
+        session_id=str(_uuid.uuid4()),
+        user_id=user_id,
+    )
+
+    assert flag_checks["n"] >= 1, (
+        "AUTOPILOT must still consult the day-chat flag — it deliberately "
+        "KEEPS day context. If this is zero the gate has been widened from "
+        "the SUBAGENT enum check to allows_post_builder_blocks."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# (b) Cache scope — behavioural, across the CHANNEL_CONVERGE branch
+# ──────────────────────────────────────────────────────────────────────
+#
+# The scope chain in run() is three-way:
+#
+#     if prompt_profile == PromptProfile.SUBAGENT:  _cache_scope = session_id
+#     elif _channel_converge:                       _cache_scope = "all"
+#     else:                                         _cache_scope = _day_chat_id or session_id
+#
+# and ``_channel_converge`` is ``stable_prefix_enabled(user_id) and
+# settings.channel_converge``, both off by default. The end-to-end test
+# above only ever exercises the flag-OFF path, so before these three the
+# ORDER of the first two branches was pinned by nothing but a regex — and
+# reordering them is precisely the mistake that would route a child's
+# prefix into the parent's shared shard, which is the leak W1.2(b) exists
+# to prevent.
+
+
+def _enable_channel_converge(monkeypatch, *, on: bool):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "stable_prefix_layout", True, raising=False)
+    monkeypatch.setattr(settings, "channel_converge", on, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_subagent_scope_wins_over_channel_converge(monkeypatch, tmp_path):
+    """SUBAGENT must keep its own sentinel even when CHANNEL_CONVERGE is on.
+
+    MUTATION: swap the first two branches so ``elif _channel_converge`` is
+    tested first — this goes red (key becomes ``{user}:all``) while
+    test_subagent_run_isolated_end_to_end stays green, because that one
+    runs with the flag off.
+    """
+    from app.agent.prompt_profile import PromptProfile
+
+    _enable_channel_converge(monkeypatch, on=True)
+
+    user_id = await _make_user()
+    job_id = str(_uuid.uuid4())
+    fake, _ = await _run_with_fake(
+        monkeypatch, tmp_path,
+        profile=PromptProfile.SUBAGENT,
+        session_id=f"subagent:{job_id}",
+        user_id=user_id,
+    )
+
+    assert fake.calls[0]["prompt_cache_key"] == f"{user_id}:subagent:{job_id}"
+
+
+@pytest.mark.asyncio
+async def test_full_scope_is_the_stable_shard_when_channel_converge_is_on(monkeypatch, tmp_path):
+    """Control for the branch above: FULL *does* take the "all" shard.
+
+    MUTATION: delete the ``elif _channel_converge:`` branch — the key falls
+    back to ``{user}:{session}`` and this goes red.
+    """
+    from app.agent.prompt_profile import PromptProfile
+
+    _quiet_prompt_build(monkeypatch)
+    _enable_channel_converge(monkeypatch, on=True)
+
+    user_id = await _make_user()
+    fake, _ = await _run_with_fake(
+        monkeypatch, tmp_path,
+        profile=PromptProfile.FULL,
+        session_id=str(_uuid.uuid4()),
+        user_id=user_id,
+    )
+
+    assert fake.calls[0]["prompt_cache_key"] == f"{user_id}:all"
+
+
+@pytest.mark.asyncio
+async def test_full_scope_is_the_session_when_channel_converge_is_off(monkeypatch, tmp_path):
+    """Default path: no day chat resolved, so the scope is the session.
+
+    MUTATION: replace the ``else`` scope with a constant — this goes red.
+    """
+    from app.agent.prompt_profile import PromptProfile
+
+    _quiet_prompt_build(monkeypatch)
+    _enable_channel_converge(monkeypatch, on=False)
+
+    user_id = await _make_user()
+    fake, response = await _run_with_fake(
+        monkeypatch, tmp_path,
+        profile=PromptProfile.FULL,
+        session_id=str(_uuid.uuid4()),
+        user_id=user_id,
+    )
+
+    assert fake.calls[0]["prompt_cache_key"] == f"{user_id}:{response.session_id}"
