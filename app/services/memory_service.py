@@ -1395,7 +1395,30 @@ class MemoryService:
                         Memory.is_deleted == False,  # noqa: E712
                         Memory.is_active == True,  # noqa: E712
                         Memory.importance >= min_importance,
-                        Memory.memory_type.notin_(["event", "conversation", "task"]),
+                        # "file" excluded for the same reason as the rest: a
+                        # RAG chunk is not a standing fact about the user.
+                        #
+                        # Document ingestion writes one memory PER CHUNK with
+                        # memory_type=FILE, content up to `chunk_size` (default
+                        # 1000 chars) prefixed "[From: <title>]", and an
+                        # `importance` the CALLER supplies — a plain Form field
+                        # the frontend forwards from `options.importance`. It
+                        # defaults to 0.5, safely under the 0.7 floor, so this
+                        # only bites when someone marks an upload important.
+                        # Then five chunks of a rented PDF are presented to the
+                        # model as "Core facts about this user", on every turn,
+                        # ahead of the query-conditioned results.
+                        #
+                        # That is wrong twice over: they are not facts about
+                        # the user, and this channel is contract-bound to stay
+                        # small (measured at 21 tokens; five 1000-char chunks
+                        # is ~1250, injected every turn). Documents are already
+                        # reachable through hybrid_search, which is where a RAG
+                        # chunk belongs — retrieved when the query calls for
+                        # it, not asserted permanently.
+                        Memory.memory_type.notin_(
+                            ["event", "conversation", "task", "file"]
+                        ),
                         or_(
                             Memory.expires_at.is_(None),
                             Memory.expires_at > datetime.utcnow(),

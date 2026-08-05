@@ -8,8 +8,10 @@ This service handles:
 4. Generating change summaries using LLM
 """
 
+import asyncio
 import json
 import logging
+import time
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime
 
@@ -43,6 +45,14 @@ MIN_THRESHOLD = 0.25        # Below this, definitely not related
 # middle band is worth an LLM call.
 AUTO_DUPLICATE_THRESHOLD = 0.90  # >= : reinforce existing without asking the LLM
 AUTO_NEW_THRESHOLD = 0.50        # best candidate below this: create without asking
+
+# How long a same-user write will queue for the dedup advisory lock before
+# giving up and proceeding unlocked. Must stay comfortably under the engine's
+# 30s `command_timeout` / `statement_timeout`: past that the DATABASE kills the
+# waiter, asyncpg invalidates the connection, and the write is lost rather than
+# merely duplicated. See `_lock_user_writes` for the full account.
+_LOCK_WAIT_BUDGET_S = 8.0
+_LOCK_POLL_INTERVAL_S = 0.05
 
 
 class SupersedeRaceError(RuntimeError):
@@ -317,6 +327,43 @@ class MemoryDedupService:
 
         No-op on non-Postgres backends (CI runs SQLite, which has a single
         writer and therefore cannot exhibit the race).
+
+        The wait is BOUNDED, and that is the whole point
+        ------------------------------------------------
+        This used to be a bare `pg_advisory_xact_lock`, which blocks for as
+        long as it takes. It is held across `_find_candidates` (a vector
+        search) and `_decide_action` (an LLM call, in the ambiguous
+        similarity band), so a queue of same-user writes advances at LLM
+        latency — and the engine sets `command_timeout: 30` on the client and
+        `statement_timeout: 30000` on the server. Past thirty seconds the
+        WAITER ITSELF is killed, asyncpg invalidates the connection, and the
+        caller gets
+
+            PendingRollbackError: Can't reconnect until invalid transaction
+            is rolled back
+
+        on a session that had done nothing wrong. **The fact is then lost** —
+        this path is `memory_store`/the tool path, which the capture outbox
+        does not cover.
+
+        That is report §5.8, recorded on 2026-08-03 as a concurrency failure
+        seen once and neither reproduced nor explained. It reproduced on
+        2026-08-05: 2 of 20 rapid-fire writes lost, both raising exactly that
+        error, in a test that ran for 30.55 seconds against a 30-second
+        timeout. Connection exhaustion was correctly ruled out at the time
+        (peak 18 of max_connections=100) — the pool was never the problem, the
+        lock queue was.
+
+        So the wait now degrades instead of dying: poll `pg_try_advisory_xact_lock`
+        (which returns immediately and therefore can never be the statement
+        that times out) for a budget well under the 30s ceiling, and if the
+        lock cannot be had in that time, go ahead WITHOUT it.
+
+        That trade is deliberate. Proceeding unlocked risks a duplicate row,
+        which dedup detects on the next write and merges, and which the
+        adjudication path exists to resolve. Blocking to the timeout loses the
+        user's fact outright, with no retry and no trace beyond a warning. A
+        recoverable duplicate beats an unrecoverable loss.
         """
         bind = self.db.bind
         if bind is None or bind.dialect.name != "postgresql":
@@ -324,10 +371,27 @@ class MemoryDedupService:
         try:
             from sqlalchemy import text as _text
 
-            await self.db.execute(
-                _text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-                {"k": f"memwrite:{user_id}"},
-            )
+            key = f"memwrite:{user_id}"
+            deadline = time.monotonic() + _LOCK_WAIT_BUDGET_S
+            while True:
+                got = (
+                    await self.db.execute(
+                        _text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"),
+                        {"k": key},
+                    )
+                ).scalar()
+                if got:
+                    return
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "[MEMORY] advisory lock for user=%s not acquired in %.1fs; "
+                        "proceeding UNLOCKED — a duplicate is possible and will be "
+                        "merged, whereas waiting to the %ss statement timeout would "
+                        "lose the fact",
+                        str(user_id)[:8], _LOCK_WAIT_BUDGET_S, 30,
+                    )
+                    return
+                await asyncio.sleep(_LOCK_POLL_INTERVAL_S)
         except Exception as exc:  # pragma: no cover - lock is best-effort
             logger.warning("[MEMORY] advisory lock unavailable (%s); "
                            "concurrent writes may duplicate", exc)

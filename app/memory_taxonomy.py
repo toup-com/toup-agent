@@ -831,6 +831,64 @@ _NEVER_INFLECT = frozenset({
     "has", "have", "had", "does", "do", "did", "cannot", "wont",
 })
 
+# The "-s" repair below is only ever correct on a BARE VERB STEM, and the
+# `_NEVER_INFLECT` comment above records what happens when some other word
+# class reaches it. Modals were the first such class. They were not the last.
+#
+# Measured on the live fleet (2026-08-05): of the 71 distinct predicates in
+# production, 33 reach this fallback and the inflection branch modified
+# exactly FOUR — `allergic_to` -> "allergics", `artist_of` -> "artists",
+# `lent` -> "lents", `people_might_come_to` -> "peoples". An adjective, an
+# agent noun, an irregular past tense, and a plural noun heading a clause. It
+# improved none of the other 29: those are already third-person ("buys",
+# "offers", "writes"), already past ("adopted", "performed"), or guarded.
+#
+# Rather than give up the repair (real bare stems do read as imperatives after
+# a subject — "User frobnicate Widget"), each observed class gets the specific
+# signal that identifies it.
+
+# Adjective and agent-noun endings, high-precision only. "-al"/"-ent"/"-er"
+# are deliberately absent: they would also swallow "went", "signal", "consider".
+_NOT_A_VERB_SUFFIXES = ("ic", "ous", "ful", "ive", "able", "ible", "ist", "ian", "ary")
+
+# Irregular past tenses that `_THIRD_PERSON` cannot see, because they do not
+# end in -s/-ed/-ing. "lent" is the one production actually emitted.
+_IRREGULAR_PAST = frozenset({
+    "lent", "sent", "spent", "built", "kept", "left", "met", "felt", "held",
+    "told", "sold", "found", "bought", "brought", "taught", "caught",
+    "thought", "made", "paid", "said", "laid", "put", "cut", "set", "let",
+    "got", "went", "came", "gave", "took", "wrote", "drove", "knew", "grew",
+    "flew", "saw", "ate", "ran", "won", "lost", "led", "fed", "hid", "slid",
+})
+
+# An adjective or noun followed by a bare preposition is not a verb phrase; it
+# needs a copula. "allergic_to" wants "is allergic to", never "allergics to".
+_PREDICATE_PREPOSITIONS = frozenset({
+    "to", "of", "in", "on", "at", "for", "with", "from", "about", "by",
+    "as", "into", "near", "under", "over", "against", "toward",
+})
+
+
+def _head_is_not_a_verb(head: str, tail: List[str]) -> bool:
+    """Can we positively identify this head as something other than a stem?"""
+    if head in _IRREGULAR_PAST:
+        return True
+    if head.endswith(_NOT_A_VERB_SUFFIXES):
+        return True
+    # "people_might_come_to": a head followed by a modal is the SUBJECT of the
+    # clause, never the verb being conjugated.
+    if tail and tail[0] in _NEVER_INFLECT:
+        return True
+    return False
+
+
+def _inflect_third_person(head: str) -> str:
+    if head.endswith(("s", "x", "z", "ch", "sh")):
+        return head + "es"
+    if head.endswith("y") and len(head) > 1 and head[-2] not in "aeiou":
+        return head[:-1] + "ies"
+    return head + "s"
+
 
 def humanize_relationship(
     source_name: str,
@@ -856,18 +914,23 @@ def humanize_relationship(
     if template:
         return template.format(s=source, t=target).strip()
 
-    # Unknown predicate. Repair the verb so the result is at least a sentence:
-    # a bare stem gets "-s", anything already inflected is left alone.
+    # Unknown predicate. Leave it alone unless we can say what word class the
+    # head belongs to — a confidently wrong sentence reads worse than a plain
+    # one, and it is the version the user sees on the Memory screen.
     words = key.split("_")
     head = words[0]
-    if head and head.lower() not in _NEVER_INFLECT and not _THIRD_PERSON.search(head):
-        if head.endswith(("s", "x", "z", "ch", "sh")):
-            head += "es"
-        elif head.endswith("y") and len(head) > 1 and head[-2] not in "aeiou":
-            head = head[:-1] + "ies"
-        else:
-            head += "s"
-    phrase = " ".join([head] + words[1:])
+    tail = words[1:]
+    finite = head.lower() in _NEVER_INFLECT or bool(_THIRD_PERSON.search(head))
+    not_a_verb = _head_is_not_a_verb(head, tail)
+
+    if not_a_verb and len(tail) == 1 and tail[0] in _PREDICATE_PREPOSITIONS:
+        # "allergic to", "artist of" — copula, not conjugation.
+        return f"{source} is {head} {tail[0]} {target}".strip()
+
+    if head and not finite and not not_a_verb:
+        head = _inflect_third_person(head)
+
+    phrase = " ".join([head] + tail)
     return f"{source} {phrase} {target}".strip()
 
 

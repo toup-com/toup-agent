@@ -28,6 +28,76 @@ async def test_web_and_mobile_writing_simultaneously_both_land(db, user_a):
     assert "adelaide" in contents, contents
 
 
+async def test_a_contended_write_lock_degrades_instead_of_killing_the_session(db, user_a):
+    """§5.8, explained and closed.
+
+    `_lock_user_writes` used to be a bare `pg_advisory_xact_lock`, which waits
+    as long as it takes. The lock is held across a vector search and — in the
+    ambiguous similarity band — an LLM call, so a queue of same-user writes
+    advances at model latency. The engine sets `command_timeout: 30` and
+    `statement_timeout: 30000`, so past thirty seconds Postgres kills the
+    WAITER, asyncpg invalidates the connection, and every later statement on
+    that session raises
+
+        PendingRollbackError: Can't reconnect until invalid transaction is
+        rolled back
+
+    The write is then lost. This path is the memory_store/tool path, which the
+    capture outbox does not cover.
+
+    That was recorded on 2026-08-03 as a failure seen once and neither
+    reproduced nor explained. It reproduced on 2026-08-05: 2 of 20 rapid-fire
+    writes lost, both raising exactly that error, in a test that ran 30.55s
+    against a 30s ceiling.
+
+    This test makes it deterministic rather than waiting for the race. Another
+    transaction holds the lock outright; the waiter must give up inside its
+    budget and hand back a session that still WORKS. On the old code it blocks
+    to the statement timeout and comes back poisoned.
+    """
+    import time
+
+    from sqlalchemy import text
+
+    from app.db.database import async_session_maker
+    from app.services.memory_dedup_service import (
+        MemoryDedupService, _LOCK_WAIT_BUDGET_S,
+    )
+
+    if db.bind is None or db.bind.dialect.name != "postgresql":
+        pytest.skip("advisory locks are a Postgres behaviour")
+
+    holder = async_session_maker()
+    await holder.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+        {"k": f"memwrite:{user_a}"},
+    )
+    try:
+        waiter = async_session_maker()
+        try:
+            started = time.monotonic()
+            await MemoryDedupService(waiter)._lock_user_writes(user_a)
+            elapsed = time.monotonic() - started
+
+            assert elapsed < _LOCK_WAIT_BUDGET_S + 5, (
+                f"waited {elapsed:.1f}s for a lock it could never get; the "
+                "database kills the waiter at 30s and takes the connection "
+                "with it"
+            )
+            # The point of the whole exercise: the session is still usable, so
+            # the write proceeds (unlocked, risking a mergeable duplicate)
+            # rather than dying and losing the user's fact.
+            assert (await waiter.execute(text("SELECT 1"))).scalar() == 1, (
+                "the session came back poisoned — this is the PendingRollbackError"
+            )
+        finally:
+            await waiter.rollback()
+            await waiter.close()
+    finally:
+        await holder.rollback()
+        await holder.close()
+
+
 async def test_rapid_fire_writes_lose_nothing(db, user_a):
     from app.db.database import async_session_maker
 

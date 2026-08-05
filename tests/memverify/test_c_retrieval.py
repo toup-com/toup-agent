@@ -136,6 +136,60 @@ async def test_always_on_core_block_is_bounded(db, user_a):
     assert "peanut" in joined, f"top-importance constraint not in core block: {core}"
 
 
+async def test_an_uploaded_document_never_becomes_a_core_fact(db, user_a):
+    """A RAG chunk is not a standing fact about the user.
+
+    `POST /api/ingest/document` writes one memory PER CHUNK with
+    memory_type=FILE, content up to `chunk_size` (default 1000) chars, and an
+    `importance` the CALLER supplies — a Form field the frontend forwards from
+    `options.importance`. It defaults to 0.5, under the 0.7 core-facts floor,
+    so nothing is wrong until someone marks an upload important.
+
+    Then the core-facts filter — which excludes event/conversation/task — had
+    nothing to say about `file`, and five chunks of a PDF were injected on
+    EVERY turn as "Core facts about this user", ahead of the query-conditioned
+    results. Wrong twice: they are not facts about the user, and this channel
+    is contract-bound to stay small. Measured at 21 tokens; five 1000-char
+    chunks is roughly 1250, on every turn.
+
+    Documents stay reachable through hybrid_search, which is where a RAG chunk
+    belongs — served when the query calls for it, not asserted permanently.
+    """
+    from app.agent.agent_runner import CORE_FACTS_LIMIT
+    from app.services.memory_service import MemoryService
+    from .pipeline import recall
+
+    chunk = (
+        "[From: Tenancy Agreement 2026]\n\nThe lessee shall maintain the "
+        "premises in good repair and shall not sublet without written consent "
+        "of the lessor, such consent not to be unreasonably withheld."
+    )
+    await store_direct(
+        db, user_a, chunk,
+        category="other", memory_type="file", importance=0.95,
+    )
+    await store_direct(
+        db, user_a, "The user is severely allergic to peanuts.", importance=0.9,
+    )
+
+    core = await MemoryService(db).get_core_facts(user_a, limit=CORE_FACTS_LIMIT)
+    joined = " ".join(m["content"].lower() for m in core)
+
+    assert "lessee" not in joined, (
+        "a document chunk reached the always-on core block, where it is "
+        f"presented as a standing fact about the user: {core}"
+    )
+    # The real standing fact still makes it — this must not become a filter
+    # that quietly empties the channel.
+    assert "peanut" in joined, f"core facts lost the real constraint: {core}"
+
+    # ...and the document is still findable the way documents should be.
+    hits = await recall(db, user_a, "what does my lease say about subletting?")
+    assert any("lessee" in m["content"].lower() for m in hits), (
+        "the document must remain retrievable through hybrid_search"
+    )
+
+
 async def test_retrieval_identical_for_both_client_surfaces(db, user_a):
     """Web and mobile are thin clients over one store (MEMORY_SYSTEM_MAP §6).
     Both reach retrieval through the same service call, so 'identical' is

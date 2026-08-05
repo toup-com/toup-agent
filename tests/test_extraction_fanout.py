@@ -332,6 +332,11 @@ class _FakeDedupService:
     caller reads, it is here, because the real pipeline puts it there.
     """
 
+    #: action every stored memory is reported with. Class-level so a test can
+    #: swap it without rebuilding the fake — the relationship mirror keys off
+    #: this and nothing else.
+    action = "created"
+
     def __init__(self, db, api_key=None):
         pass
 
@@ -346,7 +351,7 @@ class _FakeDedupService:
                     memory_type=getattr(nm, "memory_type", None),
                     importance=getattr(nm, "importance", None),
                 ),
-                "created",
+                type(self).action,
             )
             for i, nm in enumerate(new_memories)
         ]
@@ -403,6 +408,40 @@ async def test_relationships_run_when_memories_extracted(monkeypatch):
     )
     assert count == 1
     assert extractor.relationship_calls == 1
+
+
+@pytest.mark.parametrize("action", ["merged", "reinforced", "skipped"])
+async def test_relationships_skipped_when_nothing_new_was_recorded(monkeypatch, action):
+    """A recall turn must not mint graph rows restating what memory just said.
+
+    Measured in production (canary tenant, 2026-08-05). The user stated a fact
+    in one session; in a DIFFERENT session they asked a question the agent
+    answered from memory. Extraction behaved correctly and merged that turn
+    into the existing row — creating nothing — and the relationship mirror,
+    which sees none of that, wrote a brand-new memory restating the answer.
+
+    Every recall turn was therefore a junk generator, and the junk is itself
+    retrievable, so it compounds. The gate is "did this turn record a NEW
+    fact", not "did it store anything": merged, reinforced and skipped all
+    mean the graph already knows.
+    """
+    monkeypatch.setattr(_FakeDedupService, "action", action)
+    extractor = _FakeExtractor(memories=[_extracted("the user only buys salmon cat food")])
+    _patch_extraction_pipeline(monkeypatch, extractor)
+    runner = _make_runner()
+
+    count = await runner._extract_memories(
+        db=MagicMock(), user_id="u1",
+        user_message="I'm at the pet store, what should I pick up?",
+        assistant_response="Salmon-based food, no chicken — for Vesper.",
+    )
+
+    assert count == 1, "the memory itself is still stored/merged as before"
+    assert extractor.extract_calls == 1
+    assert extractor.relationship_calls == 0, (
+        f"action={action!r} recorded no new fact, so there is no new edge to "
+        "mirror — firing the mirror here is what wrote 'USER buys salmon food'"
+    )
 
 
 async def test_trivial_turn_skips_extraction_entirely(monkeypatch):

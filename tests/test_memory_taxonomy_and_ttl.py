@@ -7,6 +7,7 @@ tenant (toup-agent-871bac24, 119 active rows) on 2026-07-29.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timedelta
 
@@ -594,6 +595,49 @@ def test_relationship_rendering_never_leaks_a_raw_predicate():
     # Already-inflected verbs are left alone rather than double-suffixed.
     assert humanize_relationship("User", "watches", "Netflix") == \
         "User watches Netflix"
+
+
+def test_only_verbs_are_conjugated():
+    """The "-s" repair assumes the head is a verb. Often it is not.
+
+    These four are real predicates read off the live fleet on 2026-08-05, and
+    they are exactly the ones the old rule modified — an adjective, an agent
+    noun, an irregular past tense, and a plural noun heading a clause. Of the
+    71 distinct predicates in production it touched only these four, and it
+    damaged all four; the other 29 fallback cases were already finite.
+
+    `allergic_to` is the one a user actually saw: a turn stating a cat's food
+    allergy produced the memory "Vesper allergics to chicken", which is both
+    what the Memory screen rendered and what was embedded for search.
+
+    Same disease as the modal case `_NEVER_INFLECT` documents ("Rampage mights
+    cause problems in Canada"), so the guard is per word class rather than per
+    word — otherwise the next class discovers itself in production too.
+    """
+    from app.memory_taxonomy import humanize_relationship as H
+
+    # Adjective + preposition needs a copula, not a conjugation.
+    assert H("Vesper", "allergic_to", "chicken") == "Vesper is allergic to chicken"
+    # Agent noun, same shape.
+    assert H("Baltazar", "artist_of", "Bunker") == "Baltazar is artist of Bunker"
+    # Irregular past: no -s, and no "is" either — it is already a finite verb.
+    assert H("Ali", "lent", "the car") == "Ali lent the car"
+    # A head followed by a modal is the SUBJECT, so it is never the verb.
+    assert H("Guests", "people_might_come_to", "the launch") == \
+        "Guests people might come to the launch"
+
+    # ...while genuine stems still conjugate — see the test above, which this
+    # must not regress.
+    assert H("User", "frobnicate", "Widget") == "User frobnicates Widget"
+    assert H("User", "work_at", "Acme") == "User works at Acme"
+
+    for rendered in (
+        H("Vesper", "allergic_to", "chicken"),
+        H("Baltazar", "artist_of", "Bunker"),
+        H("Ali", "lent", "the car"),
+        H("Guests", "people_might_come_to", "the launch"),
+    ):
+        assert not re.search(r"\b(?:allergics|artists|lents|peoples)\b", rendered), rendered
 
 
 def test_forgotten_relationships_stay_forgotten_across_the_phrasing_change():

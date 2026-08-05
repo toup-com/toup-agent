@@ -4980,6 +4980,7 @@ class AgentRunner:
                 new_memories=memory_datas,
                 user_id=user_id,
             )
+            created_count = 0
             for mem, (stored, action) in zip(extracted, stored_results):
                 if stored is None:
                     # Refused by the write gate; no row, and no entity work to do.
@@ -4988,6 +4989,8 @@ class AgentRunner:
                 logger.info("Memory %s", describe_memory(stored.content, action=action,
                                          category=stored.category, memory_id=stored.id))
                 count += 1
+                if action == "created":
+                    created_count += 1
 
                 # Phase 4: Upsert entities with schema-enforced data + create EntityLinks
                 if mem.entities:
@@ -5028,7 +5031,40 @@ class AgentRunner:
             # W1.4b: zero extracted memories means nothing worth linking was
             # stated — skip the relationship LLM call instead of firing it
             # unconditionally on the same low-information turn.
-            if extracted:
+            #
+            # Stronger condition (2026-08-05): a NEW row, not merely a stored
+            # one. The graph is a mirror of the facts; if the turn recorded no
+            # new fact there is no new fact to mirror, and firing anyway is a
+            # measured junk source.
+            #
+            # Observed in production on the canary tenant. Turn A stated "I
+            # adopted a Bengal cat named Vesper; she's allergic to chicken, so
+            # I can only buy the salmon food" — captured correctly. Turn B, in
+            # a different session, asked "what food should I be picking up?"
+            # and the agent answered from memory. Extraction did the right
+            # thing and MERGED that turn into the existing row, creating
+            # nothing — and the relationship mirror, which reads none of that,
+            # independently wrote a brand-new row: "USER buys salmon food".
+            #
+            # So every recall turn minted a fresh graph row restating what the
+            # model had just been told by its own memory. That is the profile
+            # of the near-duplicate clusters on the founder's tenant, and it
+            # compounds: each new row is itself retrievable next turn.
+            #
+            # The mirror cannot screen this itself. `assistant_echo_reason`
+            # needs `_ECHO_MIN_TOKENS` content words and relationship prose is
+            # three or four, so it abstains on essentially every edge; and
+            # `store_entity_relationship` is never passed the turn's messages,
+            # so it has nothing to compare against. `created_count` is the one
+            # signal already in hand that answers "did this turn actually tell
+            # us anything new?", and unlike any text test it cannot misfire on
+            # language — the cross-lingual false negative that BUG-26 turned on.
+            #
+            # Trade-off, stated plainly: an edge that is genuinely new on a
+            # turn whose facts all merged is now missed. It returns the next
+            # time the user states it as new information, and the underlying
+            # fact is stored either way — whereas the junk row was permanent.
+            if extracted and created_count:
                 try:
                     relationships = await extractor.extract_relationships_with_llm(
                         user_message=user_message,
