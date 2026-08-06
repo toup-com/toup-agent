@@ -678,6 +678,29 @@ async def test_health_reports_unconfigured_when_the_key_is_missing(gw, monkeypat
     assert body["configured"] is False
 
 
+async def test_health_reports_whether_the_user_cap_actually_enforces(gw, monkeypatch):
+    """A ceiling that lives only in an env var is one nobody can confirm is on,
+    and this gateway's failure mode is looking healthy while enforcing nothing
+    — it shipped with a comment reading "there is deliberately NO deny path"
+    and stayed that way for months because no surface contradicted it."""
+    monkeypatch.setattr(sp.settings, "search_daily_cap_enabled", True, raising=False)
+    monkeypatch.setattr(sp.settings, "search_daily_cap_per_user", 200, raising=False)
+    body = (await gw.get("/api/search/health")).json()
+    assert body["user_daily_cap_enforcing"] is True
+    assert body["user_daily_cap"] == 200
+
+    # The flag is not the answer — a cap of 0 refuses nobody.
+    monkeypatch.setattr(sp.settings, "search_daily_cap_per_user", 0, raising=False)
+    body = (await gw.get("/api/search/health")).json()
+    assert body["user_daily_cap_enforcing"] is False
+    assert body["user_daily_cap"] is None
+
+    monkeypatch.setattr(sp.settings, "search_daily_cap_enabled", False, raising=False)
+    monkeypatch.setattr(sp.settings, "search_daily_cap_per_user", 200, raising=False)
+    body = (await gw.get("/api/search/health")).json()
+    assert body["user_daily_cap_enforcing"] is False
+
+
 async def test_health_surfaces_the_breaker(gw):
     sp._fleet.trip(30.0)
     body = (await gw.get("/api/search/health")).json()

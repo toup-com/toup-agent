@@ -644,12 +644,26 @@ async def search_health() -> dict:
 
     No tenant data, so no tenant auth — but also no secret: only whether a key
     is present, never any part of it.
+
+    Reports the per-user daily cap because there was otherwise NO way to tell
+    from outside whether it is armed. A ceiling that only exists in an env var
+    is one nobody can confirm is on, and this subsystem's whole failure mode
+    is looking healthy while enforcing nothing — the gateway shipped with a
+    comment reading "there is deliberately NO deny path" and stayed that way
+    for months because no surface contradicted it.
     """
     allowed, reason = _fleet.allowed()
+    _cap = int(getattr(settings, "search_daily_cap_per_user", 0) or 0)
+    _cap_on = bool(getattr(settings, "search_daily_cap_enabled", False)) and _cap > 0
     return {
         "configured": bool((getattr(settings, "brave_api_key", "") or "").strip()),
         "fleet_allowed": allowed,
         "fleet_block_reason": reason,
         "brave_remaining": _fleet.remaining,
         "tenants_seen": len(_buckets),
+        # `enforcing` is the answer to "will a user actually be refused", which
+        # is NOT the same as the flag: a cap of 0 with the flag on enforces
+        # nothing. Report the conjunction, not the switch.
+        "user_daily_cap_enforcing": _cap_on,
+        "user_daily_cap": _cap if _cap_on else None,
     }
