@@ -287,6 +287,14 @@ class ScenarioResult:
     stored: List[str]
     missed: List[str]
     junk: List[str]
+    #: (category, brain_type) for every ACTIVE row the scenario left behind.
+    #:
+    #: Captured here rather than re-queried later because the labeled corpus is
+    #: executed once per session and the autouse `_reset_database` fixture
+    #: TRUNCATEs the memory tables before every test — by the time an assertion
+    #: body runs, the rows are gone. Carrying the labels out as plain data is
+    #: the same trick `stored`/`missed`/`junk` already use.
+    labels: List[tuple] = field(default_factory=list)
 
     @property
     def recall(self) -> float:
@@ -306,7 +314,18 @@ class ScenarioResult:
 
 async def run_scenario(db, user_id: str, sc: Scenario) -> ScenarioResult:
     await drive_conversation(db, user_id, sc.turns)
-    contents = await active_contents(db, user_id)
+    rows = await active_memories(db, user_id)
+    contents = [m.content for m in rows]
+    # `category` and `brain_type` are plain String columns on the model, but
+    # coerce anyway so a future switch to a SQLAlchemy Enum type does not turn
+    # every label into "MemoryCategory.OTHER" and silently break the metric.
+    labels = [
+        (
+            str(getattr(m.category, "value", m.category) or ""),
+            str(getattr(m.brain_type, "value", m.brain_type) or ""),
+        )
+        for m in rows
+    ]
 
     stored, missed, junk = [], [], []
     for m in sc.must_store:
@@ -315,4 +334,4 @@ async def run_scenario(db, user_id: str, sc: Scenario) -> ScenarioResult:
         hit = m.found_in(contents)
         if hit:
             junk.append(f"{m.id} :: {hit[:160]}")
-    return ScenarioResult(sc.id, stored, missed, junk)
+    return ScenarioResult(sc.id, stored, missed, junk, labels)

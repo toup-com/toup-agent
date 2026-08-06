@@ -1,0 +1,47 @@
+{
+  "_README": [
+    "Committed baseline for the agent memory verification suite.",
+    "",
+    "Gated by tests/memverify/test_o_baseline.py via tests/memverify/metrics.py.",
+    "Each entry is {\"min\": n} or {\"max\": n}. A bound of null means the number",
+    "has NEVER been measured; that is reported as a FAILURE, not tolerated, and",
+    "the failure message prints the JSON to paste back here. A number nobody has",
+    "looked at must not read as a pass — that is the defect this whole change",
+    "exists to fix.",
+    "",
+    "`source` records where a bound came from, so a modelled figure can never be",
+    "mistaken for a measured one:",
+    "  contract  - restates an assertion the suite already makes elsewhere.",
+    "  invariant - follows from the production code, not from a measurement.",
+    "  measured  - observed on a real run; `recorded_at` names that run.",
+    "  unrecorded- bound is null; the next real run must record it.",
+    "",
+    "As of 2026-08-06 NO run has ever happened: the CI step was gated on an",
+    "OPENAI_API_KEY secret that this repository has never had, so it took its",
+    "`exit 0` branch on every build since it landed. There are therefore no",
+    "measured numbers to record yet, and unlabeled_rate_pct is deliberately",
+    "left null rather than guessed."
+  ],
+  "metrics": {
+    "recall_pct": {
+      "min": 100.0,
+      "source": "contract",
+      "note": "test_a_capture_recall.py::test_recall_aggregate already asserts recall == 1.0. Restated here so all three headline numbers are gated in one place."
+    },
+    "precision_pct": {
+      "min": 100.0,
+      "source": "contract",
+      "note": "test_b_precision_junk.py::test_junk_aggregate already asserts zero junk across ALL_LABELED. 100% precision is the same statement as a junk count of 0."
+    },
+    "non_canonical_rate_pct": {
+      "max": 0.0,
+      "source": "invariant",
+      "note": "Every production write path normalises the category before it reaches the column - memory_service.py:536, memory_extractor.py:872 and :1131, agent_reflection.py:168. A row whose stored value is not canonical for its brain means a path bypassed normalize_category, which is a structural defect independent of extraction quality."
+    },
+    "unlabeled_rate_pct": {
+      "max": null,
+      "source": "unrecorded",
+      "note": "No run has ever produced this number and it cannot be derived from the code: it depends on how often the real extractor picks the catch-all bucket. Guessing a ceiling here would be a modelled figure wearing a measured figure's clothes. The first run that completes will fail with the measured value and the exact line to paste; record it, commit it, and this becomes a real ratchet."
+    }
+  }
+}
