@@ -8,7 +8,11 @@ cache-hit rate caused by three prefix-busters: per-message/mid-run tools
 churn, a minute clock at system section 6/22, and per-query memory
 retrieval at section 8.
 
-Everything here is behind ``settings.stable_prefix_layout`` (default OFF).
+Everything here is behind ``settings.stable_prefix_layout``, which has
+defaulted **ON** since #467 — off-by-default meant a tenant that never
+received the env var silently lost the whole optimisation, permanently and
+across every future rollout, which is exactly what happened to the canary
+and the founder's own account (0 % cached where the fix measures 92–94 %).
 When the flag is on:
 
 - the wire tools array is fixed for the whole run (channel strips only);
