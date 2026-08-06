@@ -5,6 +5,21 @@ Upload and process documents and media files for the Toup memory system.
 Supports:
 - Documents: PDF, Markdown, Text, Code, DOCX, JSON, YAML, CSV
 - Media: Images, Videos, Audio
+
+TOPOLOGY (see app/api/tenant_proxy.py)
+    Every table this router touches — `documents`, `document_chunks`, `media`,
+    `memories` — is AGENT_ONLY, so the store is the tenant container's Postgres
+    and NOT the platform's. Registered on BOTH apps: on the platform every
+    handler proxies to the user's agent with X-Agent-Key; on the agent
+    `serving_locally()` is true and the handlers execute against the real
+    store, which is also the database `hybrid_search` reads.
+
+    Nothing here falls back to a platform-local query. Before this router was
+    proxied it was mounted only by platform_main.py, where `select(Document)`
+    raised `UndefinedTableError: relation "documents" does not exist` — every
+    upload and every listing was a 500, and on an older platform DB that still
+    carries the monolith leftovers it was worse: the rows landed somewhere the
+    agent never reads.
 """
 
 import json
@@ -13,6 +28,7 @@ import time
 from datetime import datetime
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -23,11 +39,23 @@ from app.schemas import (
     MediaUploadRequest, MediaResponse, IngestMediaResponse,
 )
 from app.api.auth import get_current_user
+from app.api.tenant_proxy import (
+    UPLOAD_PROXY_TIMEOUT_S,
+    agent_proxy_info,
+    proxy_to_agent,
+)
 from app.services import get_embedding_service, get_document_service
 from app.services.memory_service import MemoryService
 from app.services.memory_gate import MemoryRejected
 
 router = APIRouter(prefix="/ingest", tags=["Document Ingestion"])
+
+
+def _form_str(value) -> str:
+    """Render a form value the way the agent's Form(...) parser expects."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 # Maximum file sizes
@@ -81,7 +109,46 @@ async def ingest_document(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File too large. Maximum size is {MAX_DOCUMENT_SIZE // (1024*1024)} MB"
         )
-    
+
+    # Route to the tenant BEFORE any local work. Everything below writes
+    # `documents`, `document_chunks` and `memories` — all AGENT_ONLY — plus a
+    # file on local disk, none of which the agent can see from the platform.
+    # The cheap size guard above runs first so a 60 MB reject doesn't cost a
+    # 60 MB upload to the tenant.
+    proxy = await agent_proxy_info(current_user.id, db)
+    if proxy:
+        form = {
+            "brain_type": brain_type,
+            "category": category,
+            "importance": _form_str(importance),
+            "chunk_size": _form_str(chunk_size),
+            "chunk_overlap": _form_str(chunk_overlap),
+            "extract_entities": _form_str(extract_entities),
+            "generate_summary": _form_str(generate_summary),
+        }
+        if title is not None:
+            form["title"] = title
+        if description is not None:
+            form["description"] = description
+        if tags is not None:
+            form["tags"] = tags
+        data = await proxy_to_agent(
+            proxy[0], proxy[1], "ingest/document", "POST",
+            data=form,
+            files={"file": (
+                file.filename,
+                content,
+                file.content_type or "application/octet-stream",
+            )},
+            timeout=UPLOAD_PROXY_TIMEOUT_S,
+        )
+        if data is None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Your agent ingested the document but returned no details.",
+            )
+        return JSONResponse(content=data)
+
     document_service = get_document_service()
     embedding_service = get_embedding_service()
     memory_service = MemoryService(db)
@@ -295,15 +362,50 @@ async def ingest_media(
     - Videos/Audio: Transcription (when available)
     """
     start_time = time.time()
-    
+
     content = await file.read()
-    
+
+    # Same contract as /ingest/document: `media` and `memories` are AGENT_ONLY,
+    # so the tenant does the work or nobody does. Size validation happens on the
+    # agent here because the limit depends on the detected media type.
+    proxy = await agent_proxy_info(current_user.id, db)
+    if proxy:
+        form = {
+            "brain_type": brain_type,
+            "category": category,
+            "importance": _form_str(importance),
+            "generate_description": _form_str(generate_description),
+            "transcribe_audio": _form_str(transcribe_audio),
+        }
+        if title is not None:
+            form["title"] = title
+        if description is not None:
+            form["description"] = description
+        if tags is not None:
+            form["tags"] = tags
+        data = await proxy_to_agent(
+            proxy[0], proxy[1], "ingest/media", "POST",
+            data=form,
+            files={"file": (
+                file.filename,
+                content,
+                file.content_type or "application/octet-stream",
+            )},
+            timeout=UPLOAD_PROXY_TIMEOUT_S,
+        )
+        if data is None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Your agent ingested the media but returned no details.",
+            )
+        return JSONResponse(content=data)
+
     document_service = get_document_service()
     memory_service = MemoryService(db)
-    
+
     # Detect file type
     file_type, mime_type = document_service.detect_file_type(file.filename, content)
-    
+
     # Validate media type
     if file_type not in ['image', 'video', 'audio']:
         raise HTTPException(
@@ -478,6 +580,21 @@ async def list_documents(
     db: AsyncSession = Depends(get_db)
 ):
     """List uploaded documents"""
+    # A fixed write path with reads still pointing at the platform DB is half a
+    # fix: the upload would land on the tenant and this listing would 500 on the
+    # missing relation. No local fallback — see tenant_proxy's contract.
+    proxy = await agent_proxy_info(current_user.id, db)
+    if proxy:
+        params: dict = {"limit": limit, "offset": offset}
+        if brain_type:
+            params["brain_type"] = brain_type
+        if category:
+            params["category"] = category
+        if file_type:
+            params["file_type"] = file_type
+        data = await proxy_to_agent(proxy[0], proxy[1], "ingest/documents", "GET", params=params)
+        return JSONResponse(content=data if data is not None else [])
+
     query = select(Document).where(
         Document.user_id == current_user.id,
         Document.is_deleted == False
@@ -528,6 +645,18 @@ async def list_media(
     db: AsyncSession = Depends(get_db)
 ):
     """List uploaded media files"""
+    proxy = await agent_proxy_info(current_user.id, db)
+    if proxy:
+        params: dict = {"limit": limit, "offset": offset}
+        if brain_type:
+            params["brain_type"] = brain_type
+        if category:
+            params["category"] = category
+        if media_type:
+            params["media_type"] = media_type
+        data = await proxy_to_agent(proxy[0], proxy[1], "ingest/media", "GET", params=params)
+        return JSONResponse(content=data if data is not None else [])
+
     query = select(Media).where(
         Media.user_id == current_user.id,
         Media.is_deleted == False
@@ -577,6 +706,17 @@ async def delete_document(
     db: AsyncSession = Depends(get_db)
 ):
     """Soft delete a document and its associated memories"""
+    # A delete that "succeeds" against a database the agent never reads is how a
+    # user comes to believe they removed a document that is still retrievable.
+    proxy = await agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await proxy_to_agent(
+            proxy[0], proxy[1], f"ingest/documents/{document_id}", "DELETE"
+        )
+        return JSONResponse(
+            content=data or {"status": "deleted", "document_id": document_id}
+        )
+
     result = await db.execute(
         select(Document).where(
             Document.id == document_id,
@@ -617,6 +757,13 @@ async def delete_media(
     db: AsyncSession = Depends(get_db)
 ):
     """Soft delete a media file and its associated memory"""
+    proxy = await agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await proxy_to_agent(
+            proxy[0], proxy[1], f"ingest/media/{media_id}", "DELETE"
+        )
+        return JSONResponse(content=data or {"status": "deleted", "media_id": media_id})
+
     result = await db.execute(
         select(Media).where(
             Media.id == media_id,

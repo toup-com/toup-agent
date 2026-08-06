@@ -1,10 +1,25 @@
-"""Ingestion pipeline endpoints - process conversations and extract memories"""
+"""Ingestion pipeline endpoints - process conversations and extract memories
+
+TOPOLOGY (see app/api/tenant_proxy.py)
+    Identical defect and identical fix to `app/api/documents.py`, which is
+    mounted one line below this router in platform_main.py. `conversations`,
+    `messages`, `memories`, `entities` and `entity_links` are ALL AGENT_ONLY:
+    platform-mode `init_db` never creates them and no alembic revision does
+    either, so before this router was proxied `POST /api/ingest/message` raised
+    `UndefinedTableError: relation "conversations" does not exist` on the only
+    app that mounted it.
+
+    Registered on BOTH apps now. On the platform each handler forwards to the
+    user's agent with X-Agent-Key; on the agent `serving_locally()` is true and
+    the handlers run against the tenant store the agent actually reads.
+"""
 
 import json
 import uuid
 from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -15,6 +30,7 @@ from app.schemas import (
 )
 from app.api.auth import get_current_user
 from app.api.memories import memory_to_response
+from app.api.tenant_proxy import agent_proxy_info, proxy_to_agent
 from app.services import get_memory_extractor, get_embedding_service
 from app.services.memory_service import MemoryService
 from app.services.memory_gate import MemoryRejected
@@ -32,6 +48,22 @@ async def ingest_message(
     Ingest a single conversation turn (user message + assistant response).
     Extracts memories, entities, and creates embeddings.
     """
+    # Route to the tenant BEFORE touching this session — every table below is
+    # AGENT_ONLY. No local fallback: a turn "ingested" into the platform DB is
+    # invisible to the agent's hybrid_search forever.
+    proxy = await agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await proxy_to_agent(
+            proxy[0], proxy[1], "ingest/message", "POST",
+            json_body=request.model_dump(mode="json", exclude_none=True),
+        )
+        if data is None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Your agent ingested the message but returned no details.",
+            )
+        return JSONResponse(content=data)
+
     memory_service = MemoryService(db)
     extractor = get_memory_extractor()
     embedding_service = get_embedding_service()
@@ -167,6 +199,19 @@ async def ingest_conversation(
     Ingest a full conversation with multiple messages.
     Processes all messages and extracts memories.
     """
+    proxy = await agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await proxy_to_agent(
+            proxy[0], proxy[1], "ingest/conversation", "POST",
+            json_body=request.model_dump(mode="json", exclude_none=True),
+        )
+        if data is None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Your agent ingested the conversation but returned no details.",
+            )
+        return JSONResponse(content=data)
+
     memory_service = MemoryService(db)
     extractor = get_memory_extractor()
     embedding_service = get_embedding_service()

@@ -1648,6 +1648,18 @@ app.include_router(memories_router, prefix=settings.api_prefix)
 # endpoint broadcasts over this process's chat WS queues.
 from app.api.media_playlists import router as media_playlists_router
 app.include_router(media_playlists_router, prefix=settings.api_prefix)
+# Document / media / conversation ingestion. `documents`, `document_chunks`,
+# `media`, `conversations`, `messages`, `entities` and `memories` are ALL
+# AGENT_ONLY, so this is where the store is — yet both routers used to be
+# mounted ONLY by platform_main.py, where those relations do not exist and
+# every upload was a 500. Same shape as memories/playlists: the platform
+# proxies in with X-Agent-Key, these handlers execute locally.
+# ingest_router first, matching platform_main.py's order — both use the
+# /ingest prefix and the paths are disjoint.
+from app.api.ingest import router as ingest_router
+from app.api.documents import router as documents_router
+app.include_router(ingest_router, prefix=settings.api_prefix)
+app.include_router(documents_router, prefix=settings.api_prefix)
 app.include_router(sessions_router, prefix=settings.api_prefix)
 app.include_router(day_chats_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
