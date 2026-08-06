@@ -4,6 +4,8 @@ Tests for the Hybrid Retrieval Engine — RRF fusion, entity extraction, strateg
 These tests validate the core logic WITHOUT needing a database connection.
 """
 
+import uuid
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
@@ -356,9 +358,20 @@ class TestTraverseEntityGraph:
 
     @pytest.mark.asyncio
     async def test_traverse_returns_nodes(self):
-        """traverse_entity_graph should return graph nodes with depth info."""
+        """traverse_entity_graph should return graph nodes with depth info.
+
+        Seed ids MUST be real UUIDs. `traverse_entity_graph` interpolates them
+        into a recursive CTE, so it coerces every id through `uuid.UUID()` and
+        drops anything that fails — the injection guard. This test used to pass
+        `"e1"` / `"e2"`, which predates that guard: the guard dropped both, the
+        function short-circuited to `[]`, and the case failed `assert 0 == 2`.
+        The guard was right and the test was stale.
+        """
         from app.services.memory_service import MemoryService
-        from unittest.mock import AsyncMock, MagicMock, PropertyMock
+        from unittest.mock import AsyncMock, MagicMock
+
+        alice_id = str(uuid.uuid4())
+        google_id = str(uuid.uuid4())
 
         db = AsyncMock()
         service = MemoryService.__new__(MemoryService)
@@ -368,15 +381,15 @@ class TestTraverseEntityGraph:
         # Mock the CTE query result
         mock_rows = [
             MagicMock(
-                entity_id="e1", entity_name="Alice", entity_type="person",
+                entity_id=alice_id, entity_name="Alice", entity_type="person",
                 depth=0, relationship_type=None, relationship_label=None,
                 from_entity_id=None, from_entity_name=None,
             ),
             MagicMock(
-                entity_id="e2", entity_name="Google", entity_type="organization",
+                entity_id=google_id, entity_name="Google", entity_type="organization",
                 depth=1, relationship_type="works_at",
                 relationship_label="Alice works at Google",
-                from_entity_id="e1", from_entity_name="Alice",
+                from_entity_id=alice_id, from_entity_name="Alice",
             ),
         ]
         mock_result = MagicMock()
@@ -385,7 +398,7 @@ class TestTraverseEntityGraph:
 
         result = await service.traverse_entity_graph(
             user_id="user-1",
-            seed_entity_ids=["e1"],
+            seed_entity_ids=[alice_id],
             max_depth=2,
         )
 
@@ -395,6 +408,71 @@ class TestTraverseEntityGraph:
         assert result[1]["entity_name"] == "Google"
         assert result[1]["depth"] == 1
         assert result[1]["relationship_type"] == "works_at"
+
+    @pytest.mark.asyncio
+    async def test_traverse_drops_non_uuid_seed_ids_without_touching_sql(self):
+        """The guard that made the case above stale deserves its own coverage.
+
+        Seed ids are interpolated into the CTE text rather than bound, so a
+        non-UUID id is the injection vector. The guard must drop it BEFORE any
+        SQL is built — proven by asserting `db.execute` was never awaited, not
+        merely that the result was empty. An empty result alone would also be
+        produced by a query that ran and matched nothing.
+        """
+        from app.services.memory_service import MemoryService
+        from unittest.mock import AsyncMock, MagicMock
+
+        db = AsyncMock()
+        service = MemoryService.__new__(MemoryService)
+        service.db = db
+        service.embedding_service = MagicMock()
+
+        result = await service.traverse_entity_graph(
+            user_id="user-1",
+            seed_entity_ids=["e1", "' OR 1=1 --", "1; DROP TABLE entities"],
+            max_depth=2,
+        )
+
+        assert result == []
+        db.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_traverse_keeps_valid_seeds_when_some_are_malformed(self):
+        """Anti-vacuity control for the guard.
+
+        If the guard were rejecting the whole call whenever ANY id is bad — or
+        if it were rejecting everything outright — the test above would pass
+        for the wrong reason. One good id among bad ones must still traverse.
+        """
+        from app.services.memory_service import MemoryService
+        from unittest.mock import AsyncMock, MagicMock
+
+        good_id = str(uuid.uuid4())
+
+        db = AsyncMock()
+        service = MemoryService.__new__(MemoryService)
+        service.db = db
+        service.embedding_service = MagicMock()
+
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = [
+            MagicMock(
+                entity_id=good_id, entity_name="Alice", entity_type="person",
+                depth=0, relationship_type=None, relationship_label=None,
+                from_entity_id=None, from_entity_name=None,
+            ),
+        ]
+        db.execute.return_value = mock_result
+
+        result = await service.traverse_entity_graph(
+            user_id="user-1",
+            seed_entity_ids=["not-a-uuid", good_id],
+            max_depth=2,
+        )
+
+        assert len(result) == 1
+        assert result[0]["entity_name"] == "Alice"
+        db.execute.assert_awaited()
 
 
 # ----------------------------------------------------------------

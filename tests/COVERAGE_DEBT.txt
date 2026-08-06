@@ -73,10 +73,8 @@ test_email_briefing_handler.py  # fails for a reason not yet triaged
 test_friendly_error_provider_mapping.py  # asserts something the code no longer does
 test_gap_features.py  # fails for a reason not yet triaged
 test_grandfather_byo_llm_mode.py  # asserts something the code no longer does
-test_hybrid_retrieval.py  # asserts something the code no longer does
 test_layer6.py  # fails for a reason not yet triaged
 test_mcp_auth.py  # fails for a reason not yet triaged
-test_memory_upsert_and_enum.py  # fails for a reason not yet triaged
 test_models_endpoint.py  # asserts something the code no longer does
 test_notify_coverage.py  # needs a real database; sqlite has no such table/column
 test_oauth_flow.py  # needs a real database; sqlite has no such table/column

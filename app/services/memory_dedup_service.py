@@ -46,6 +46,22 @@ MIN_THRESHOLD = 0.25        # Below this, definitely not related
 AUTO_DUPLICATE_THRESHOLD = 0.90  # >= : reinforce existing without asking the LLM
 AUTO_NEW_THRESHOLD = 0.50        # best candidate below this: create without asking
 
+# Hard ceiling on how many candidates one write adjudicates against, and the
+# `limit` handed to the candidate search that produces them. Adjudication is
+# batched into ONE LLM call regardless of how many pairs it covers, so this
+# bounds PROMPT SIZE, not call count — but it has to stay explicit: without it,
+# raising the search limit would silently widen every write's adjudication
+# prompt.
+MAX_ADJUDICATED_CANDIDATES = 5
+
+# Precedence when candidates disagree — higher wins. See _select_decision.
+_ACTION_PRECEDENCE = {
+    "new": 0,
+    "duplicate": 1,
+    "merge": 2,
+    "contradiction_update": 3,
+}
+
 # How long a same-user write will queue for the dedup advisory lock before
 # giving up and proceeding unlocked. Must stay comfortably under the engine's
 # 30s `command_timeout` / `statement_timeout`: past that the DATABASE kills the
@@ -159,8 +175,8 @@ class MemoryDedupService:
             logger.info(f"Created new memory: {memory.id}")
             return memory, "created"
 
-        # Step 4: Decide what to do with the best candidate (thresholds
-        # shortcut the LLM for the obvious cases; W1.4d)
+        # Step 4: Adjudicate against EVERY candidate above the threshold
+        # (thresholds shortcut the LLM for the obvious cases; W1.4d).
         # Rank by SIMILARITY, not by the caller's blended relevance score.
         # find_similar_memories sorts by `final_score`, in which similarity is
         # only 40% of the weight against strength (0.25), importance (0.2),
@@ -176,21 +192,43 @@ class MemoryDedupService:
         # (access_count 20/23/12): the more a junk memory is retrieved, the
         # more reliably it hijacks the comparison and shields the true
         # duplicate from ever being seen.
+        #
+        # Ranking is necessary but NOT sufficient: the ranked list was then
+        # truncated to `candidates[0]` and everything else discarded, so the
+        # adjudicator only ever saw the single nearest row. Dedup and
+        # contradiction detection are the SAME adjudication — _decide_action
+        # returns duplicate|merge|contradiction_update|new for one pair — so a
+        # stale memory that contradicts the incoming fact but ranks 2nd was
+        # never compared against it at all, and the new fact was simply stored
+        # alongside it. Both then retrieve, forever, and the agent has two
+        # answers to the same question. Now every candidate above
+        # CANDIDATE_THRESHOLD is adjudicated and the verdicts are resolved by
+        # precedence (see _select_decision).
         candidates = sorted(
             candidates, key=lambda c: c.get('similarity_score', 0), reverse=True
+        )[:MAX_ADJUDICATED_CANDIDATES]
+
+        # Deterministic verdicts first; only the ambiguous band reaches the LLM,
+        # and all of it goes in ONE call (_llm_decide_actions_batch), so
+        # widening the comparison from 1 candidate to N does not multiply calls.
+        decisions, pending_positions = await self._plan_adjudication(
+            candidates, new_memory.content
         )
-        top_match = candidates[0]
-        similarity = top_match.get('similarity_score', 0)
-        existing_content = top_match.get('content', '')
+        if pending_positions:
+            llm_decisions = await self._llm_decide_actions_batch([
+                (candidates[pos].get('content', ''), new_memory.content)
+                for pos in pending_positions
+            ])
+            for pos, llm_decision in zip(pending_positions, llm_decisions):
+                decisions[pos] = llm_decision
 
-        logger.info("Found candidate with similarity %.3f: %s", similarity, describe_memory(existing_content))
+        decision, top_match = self._select_decision(candidates, decisions)
 
-        decision = await self._decide_action(
-            similarity=similarity,
-            existing_content=existing_content,
-            new_content=new_memory.content,
+        logger.info(
+            "Adjudicated %d candidate(s); winner similarity %.3f: %s",
+            len(candidates), top_match.get('similarity_score', 0),
+            describe_memory(top_match.get('content', '')),
         )
-
         logger.info("Dedup decision: %s - %s", decision['action'],
                     describe_memory(decision.get('reason', '')))
 
@@ -267,17 +305,19 @@ class MemoryDedupService:
             # recency) rather than the nearest duplicate.
             candidates = sorted(
                 candidates, key=lambda c: c.get('similarity_score', 0), reverse=True
-            )
-            top_match = candidates[0]
-            similarity = top_match.get('similarity_score', 0)
+            )[:MAX_ADJUDICATED_CANDIDATES]
 
-            if similarity >= AUTO_DUPLICATE_THRESHOLD or similarity < AUTO_NEW_THRESHOLD:
-                # Auto-resolvable — apply now so later batch members see it
-                decision = await self._decide_action(
-                    similarity=similarity,
-                    existing_content=top_match.get('content', ''),
-                    new_content=new_memory.content,
-                )
+            # …and adjudicate against ALL of them, not just candidates[0] — see
+            # the long comment in smart_create_memory. Same reasoning, and this
+            # is the path production actually takes.
+            decisions, pending_positions = await self._plan_adjudication(
+                candidates, new_memory.content
+            )
+
+            if not pending_positions:
+                # Every candidate resolved without an LLM — apply now so later
+                # batch members can dedup against the result.
+                decision, top_match = self._select_decision(candidates, decisions)
                 results[i] = await self._apply_decision(
                     decision=decision,
                     top_match=top_match,
@@ -288,22 +328,37 @@ class MemoryDedupService:
             else:
                 pending.append({
                     "index": i,
-                    "top_match": top_match,
+                    "candidates": candidates,
+                    "decisions": decisions,
+                    "pending_positions": pending_positions,
                     "new_memory": new_memory,
                     "embedding": new_embedding,
                 })
 
         if pending:
-            decisions = await self._llm_decide_actions_batch([
-                (p["top_match"].get('content', ''), p["new_memory"].content)
+            # Still exactly ONE adjudication call per turn: every unresolved
+            # (candidate, new memory) pair from every pending memory rides in
+            # the same request.
+            pairs = [
+                (p["candidates"][pos].get('content', ''), p["new_memory"].content)
                 for p in pending
-            ])
-            for p, decision in zip(pending, decisions):
+                for pos in p["pending_positions"]
+            ]
+            llm_decisions = await self._llm_decide_actions_batch(pairs)
+
+            cursor = 0
+            for p in pending:
+                for pos in p["pending_positions"]:
+                    p["decisions"][pos] = llm_decisions[cursor]
+                    cursor += 1
+                decision, top_match = self._select_decision(
+                    p["candidates"], p["decisions"]
+                )
                 logger.info("Dedup decision: %s - %s", decision['action'],
                     describe_memory(decision.get('reason', '')))
                 results[p["index"]] = await self._apply_decision(
                     decision=decision,
-                    top_match=p["top_match"],
+                    top_match=top_match,
                     new_memory=p["new_memory"],
                     user_id=user_id,
                     new_embedding=p["embedding"],
@@ -427,7 +482,7 @@ class MemoryDedupService:
         similar_memories = await self.memory_service.search_memories_by_embedding(
             user_id=user_id,
             embedding=new_embedding,
-            limit=5,
+            limit=MAX_ADJUDICATED_CANDIDATES,
             min_similarity=MIN_THRESHOLD,
             brain_types=[brain_type_value] if brain_type_value else None,
             categories=None  # Search across ALL categories to find related memories
@@ -436,13 +491,99 @@ class MemoryDedupService:
             return []
         return [m for m in similar_memories if m.get('similarity_score', 0) >= CANDIDATE_THRESHOLD]
 
+    async def _plan_adjudication(
+        self,
+        candidates: List[Dict[str, Any]],
+        new_content: str,
+    ) -> Tuple[List[Optional[Dict[str, str]]], List[int]]:
+        """Resolve every candidate that the thresholds can settle on their own.
+
+        Returns (decisions, pending_positions) where `decisions` is aligned to
+        `candidates` and holds None at each position the LLM still has to
+        answer. Splitting the deterministic half out is what lets BOTH entry
+        points collect all of a write's (and, in the batch path, all of a
+        turn's) unresolved pairs into a single `_llm_decide_actions_batch`
+        request instead of one call per candidate.
+        """
+        decisions: List[Optional[Dict[str, str]]] = []
+        pending_positions: List[int] = []
+        for pos, candidate in enumerate(candidates):
+            decision = await self._decide_action(
+                similarity=candidate.get('similarity_score', 0),
+                existing_content=candidate.get('content', ''),
+                new_content=new_content,
+                allow_llm=False,
+            )
+            decisions.append(decision)
+            if decision is None:
+                pending_positions.append(pos)
+        return decisions, pending_positions
+
+    @staticmethod
+    def _select_decision(
+        candidates: List[Dict[str, Any]],
+        decisions: List[Optional[Dict[str, str]]],
+    ) -> Tuple[Dict[str, str], Dict[str, Any]]:
+        """Resolve N per-candidate verdicts into the ONE action to apply.
+
+        Precedence: contradiction_update > merge > duplicate > new, ties broken
+        by similarity (the caller passes candidates already sorted descending,
+        and `max` keeps the first maximum, so a tie resolves to the nearer row).
+
+        Why contradiction wins over duplicate — the interesting disagreement.
+        Both verdicts can be returned for the same incoming fact only when two
+        STORED rows already disagree with each other, which is rare. In that
+        state the two outcomes are:
+          * duplicate wins  -> reinforce the near-identical row, drop the
+            incoming fact, and leave the contradicted row ACTIVE. The agent
+            keeps two conflicting answers to the same question and retrieves
+            whichever ranks higher that day. Nothing later fixes it: the next
+            restatement adjudicates into the same tie.
+          * contradiction wins -> the stale row is retired (is_active=False,
+            superseded_by set, content preserved and reversible) and the
+            incoming fact is stored.
+        The cost of choosing contradiction is a redundant near-duplicate pair
+        (the reinforced-instead row plus the new one) — a tidiness problem that
+        `find_and_merge_duplicates` exists to sweep, and that the next write on
+        the topic re-adjudicates. The cost of choosing duplicate is a wrong
+        fact that stays retrievable forever. Correctness outranks tidiness, so
+        contradiction_update wins.
+        merge > duplicate for the same reason in miniature: merge keeps the
+        added detail, duplicate discards it. duplicate > new because a verdict
+        of "we already hold this" is exactly what dedup exists to act on.
+        `contradiction_update` remains kill-switchable via
+        settings.memory_supersede_on_conflict, which still denies the >=0.90
+        escalation that produces most of them.
+        """
+        best = max(
+            range(len(candidates)),
+            key=lambda pos: (
+                _ACTION_PRECEDENCE.get((decisions[pos] or {}).get('action', 'new'), 0),
+                candidates[pos].get('similarity_score', 0),
+            ),
+        )
+        decision = decisions[best] or {
+            "action": "new", "reason": "no verdict returned for this candidate",
+        }
+        return decision, candidates[best]
+
     async def _decide_action(
         self,
         similarity: float,
         existing_content: str,
-        new_content: str
-    ) -> Dict[str, str]:
-        """Threshold shortcut around the LLM adjudication (W1.4d)."""
+        new_content: str,
+        *,
+        allow_llm: bool = True,
+    ) -> Optional[Dict[str, str]]:
+        """Threshold shortcut around the LLM adjudication (W1.4d).
+
+        With allow_llm=False the LLM is never consulted and None is returned
+        for pairs that would have needed it, so the caller can batch every such
+        pair into one request. That is the only difference: the thresholds, the
+        value-conflict guard and the different-subject guard are identical on
+        both settings, which is what keeps the batched path and the single-pair
+        path from drifting apart.
+        """
         if similarity >= AUTO_DUPLICATE_THRESHOLD:
             # D-mem-A (2026-07-29): near-identical vectors are NOT always the
             # same fact. "…passphrase is kestrel-dbf7" restated as
@@ -474,6 +615,8 @@ class MemoryDedupService:
                 self._conflicts_on_value(existing_content, new_content)
                 or mentions_different_subjects(existing_content, new_content)
             ):
+                if not allow_llm:
+                    return None
                 return await self._llm_decide_action(
                     existing_content=existing_content,
                     new_content=new_content,
@@ -487,6 +630,8 @@ class MemoryDedupService:
                 "action": "new",
                 "reason": f"auto: similarity {similarity:.2f} < {AUTO_NEW_THRESHOLD}",
             }
+        if not allow_llm:
+            return None
         return await self._llm_decide_action(
             existing_content=existing_content,
             new_content=new_content
