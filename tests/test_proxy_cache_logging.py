@@ -60,8 +60,18 @@ def test_cache_fields_non_string_key_treated_as_absent():
 
 
 class _FakeRequest:
-    def __init__(self, body: dict):
+    """Stands in for a Starlette Request.
+
+    `headers` is part of that shape — a real Request always has it, and the
+    proxy reads the channel-attribution header from it (alembic 082). The stub
+    omitted it, so it modelled a request that cannot exist; a test double that
+    is missing an attribute production always has will fail for a reason that
+    has nothing to do with what it is testing.
+    """
+
+    def __init__(self, body: dict, headers: dict | None = None):
         self._body = body
+        self.headers = headers or {}
 
     async def json(self) -> dict:
         return self._body

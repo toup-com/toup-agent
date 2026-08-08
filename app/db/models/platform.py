@@ -190,12 +190,30 @@ class LLMProxyEvent(Base):
     # cache_read_input_tokens. Telemetry only — never enters cost_cents or
     # credit math. NULL = recorded before 075 or usage wasn't inspectable.
     cached_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Surface the turn came from — "web", "voice", "telegram", … (alembic 082).
+    #
+    # Prompt caching is prefix-exact and the wire TOOLS ARRAY heads the prefix,
+    # so a channel that strips a tool starts a separate provider cache lineage
+    # and re-bills the whole request. That is a per-channel cost question, and
+    # until this column existed it was unanswerable: the value was resolved on
+    # the agent (agent_runner passes `channel` through the whole turn) and then
+    # dropped at the agent→proxy boundary, and it is NOT recoverable from
+    # anything else on the row — operation_type is NULL for every user-facing
+    # chat call by design, and the [CACHE] log line carries only an 8-char
+    # hash of the cache key.
+    #
+    # NULL means "not reported": every non-agent caller (embeddings, images,
+    # internal_llm system ops) and any agent old enough to predate the header.
+    channel: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
         Index("ix_llm_proxy_user_created", "user_id", "created_at"),
         Index("ix_llm_proxy_user_provider_created", "user_id", "provider", "created_at"),
         Index("ix_llm_proxy_operation_type", "operation_type"),
+        # The query this column exists for: cache hit rate per channel over a
+        # window. Leads with created_at because every such query is time-boxed.
+        Index("ix_llm_proxy_created_channel", "created_at", "channel"),
     )
 
 

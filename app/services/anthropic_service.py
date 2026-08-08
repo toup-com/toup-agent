@@ -433,6 +433,7 @@ class AnthropicService:
         safety_identifier: Optional[str] = None,  # noqa: ARG002 — PR-1 signature parity; OpenAI-only param
         idempotency_key: Optional[str] = None,  # noqa: ARG002 — PR-1 signature parity; Anthropic metering is unchanged
         stable_prefix_active: bool = False,  # noqa: ARG002 — PR-1 signature parity; OpenAI-only (retention/safety_identifier)
+        channel: Optional[str] = None,  # noqa: ARG002 — signature parity; the channel header is an OpenAI-proxy concern (alembic 082)
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a message. Yields StreamEvent objects for text chunks,

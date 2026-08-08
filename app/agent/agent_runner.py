@@ -1926,6 +1926,7 @@ class AgentRunner:
                         safety_identifier=user_id or None,
                         idempotency_key=_idem_key,
                         stable_prefix_active=_stable_prefix,
+                        channel=channel,
                     ):
                         if cancel_check and cancel_check():
                             logger.info("[AGENT] Cancelled during streaming")
@@ -2150,6 +2151,7 @@ class AgentRunner:
                                     safety_identifier=user_id or None,
                                     idempotency_key=_fb_idem_key,
                                     stable_prefix_active=_stable_prefix,
+                                    channel=channel,
                                 ):
                                     if cancel_check and cancel_check():
                                         raise asyncio.CancelledError("Cancelled")

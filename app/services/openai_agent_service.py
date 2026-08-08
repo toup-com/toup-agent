@@ -265,6 +265,7 @@ class OpenAIAgentService:
         safety_identifier: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         stable_prefix_active: bool = False,
+        channel: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a chat completion. Yields StreamEvent objects matching the
@@ -309,6 +310,7 @@ class OpenAIAgentService:
                 safety_identifier=safety_identifier,
                 idempotency_key=idempotency_key,
                 stable_prefix_active=stable_prefix_active,
+                channel=channel,
             ):
                 yield _ev
             return
@@ -332,6 +334,16 @@ class OpenAIAgentService:
         # that already holds the session's prefix in its local cache.
         if prompt_cache_key:
             kwargs["prompt_cache_key"] = prompt_cache_key
+
+        # Channel attribution for cache telemetry (alembic 082). Sent as a
+        # header, NOT a body field: the body is forwarded verbatim to OpenAI
+        # and an unknown key there is a 400 on the whole turn. The platform
+        # proxy reads it (llm_proxy._sanitize_channel) and records it on the
+        # llm_proxy_events row; OpenAI ignores an unrecognised header. Absent
+        # when the caller reports no channel, which keeps every non-agent
+        # caller and the BYOK direct-to-OpenAI path unchanged.
+        if channel:
+            kwargs["extra_headers"] = {"X-Toup-Channel": str(channel)[:20]}
         # Token-efficiency PR-1 (flag-gated: new request params are a
         # request-shape change; keep them off the legacy path).
         # prompt_cache_retention="24h" keeps the day prefix warm across
@@ -742,6 +754,7 @@ class OpenAIAgentService:
         safety_identifier: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         stable_prefix_active: bool = False,
+        channel: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a completion over the Responses API (/v1/responses), yielding
@@ -784,6 +797,17 @@ class OpenAIAgentService:
             kwargs["prompt_cache_retention"] = "24h"
             if safety_identifier:
                 kwargs["safety_identifier"] = safety_identifier
+
+
+        # Channel attribution for cache telemetry (alembic 082). Sent as a
+        # header, NOT a body field: the body is forwarded verbatim to OpenAI
+        # and an unknown key there is a 400 on the whole turn. The platform
+        # proxy reads it (llm_proxy._sanitize_channel) and records it on the
+        # llm_proxy_events row; OpenAI ignores an unrecognised header. Absent
+        # when the caller reports no channel, which keeps every non-agent
+        # caller and the BYOK direct-to-OpenAI path unchanged.
+        if channel:
+            kwargs["extra_headers"] = {"X-Toup-Channel": str(channel)[:20]}
 
         if tools:
             kwargs["tools"] = _anthropic_tools_to_responses(tools)

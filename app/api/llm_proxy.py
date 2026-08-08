@@ -280,6 +280,45 @@ def _calc_cost_cents(
 # ── Usage event logging ──────────────────────────────────────────────
 
 
+#: Header the agent uses to report which surface a turn came from.
+CHANNEL_HEADER = "x-toup-channel"
+
+
+#: Hard ceiling matching llm_proxy_events.channel VARCHAR(20). A value longer
+#: than the column would raise on INSERT — inside the metering write that runs
+#: after a successful LLM call — so it is truncated here, never rejected.
+_CHANNEL_MAX = 20
+
+
+def _sanitize_channel(raw: Optional[str]) -> Optional[str]:
+    """Normalise a reported channel to something safe to store, or None.
+
+    This deliberately does NOT validate against `channel_util.KNOWN_CHANNELS`,
+    for two reasons.
+
+    1. An allowlist here would SILENTLY DROP a newly-added channel. The
+       telemetry would then show a surface's traffic vanishing rather than a
+       new label appearing, which is the worse failure and exactly the
+       "vocabulary that drifts out of sync" problem this codebase has been
+       bitten by before (see app/memory_taxonomy.py's four-vocabulary note).
+    2. `llm_proxy.py` runs in the PLATFORM image and has no `app.agent`
+       dependency today. Importing one to reach a constant would put agent
+       code on the platform's import path — the drift that
+       requirements.platform.txt exists to prevent.
+
+    So the contract is narrow and local: lowercase, strip, keep only the
+    characters a channel name can contain, truncate to the column width, and
+    return None for anything empty. It cannot raise, and it cannot produce a
+    value the column will reject — which matters because this runs inside the
+    metering write AFTER the user's LLM call already succeeded. A logging
+    failure there would turn a served request into a 500.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = "".join(ch for ch in raw.strip().lower() if ch.isalnum() or ch in "_-")
+    return cleaned[:_CHANNEL_MAX] or None
+
+
 async def _log_event(
     db: AsyncSession,
     user_id: str,
@@ -295,8 +334,13 @@ async def _log_event(
     operation_type: Optional[str] = None,
     cached_tokens: Optional[int] = None,
     cache_write_tokens: Optional[int] = None,
+    channel: Optional[str] = None,
 ):
     """Log an LLM usage event.
+
+    `channel` (alembic 082): the surface the turn came from, sanitized by
+    `_sanitize_channel` — see there for why this is not validated against
+    KNOWN_CHANNELS. NULL for every caller that does not report one.
 
     `cached_tokens` (F-7 / A9-1): prompt-cache read hits reported by the
     provider (OpenAI usage.prompt_tokens_details.cached_tokens, Anthropic
@@ -347,6 +391,7 @@ async def _log_event(
         status=status,
         operation_type=operation_type,
         cached_tokens=cached_tokens,
+        channel=_sanitize_channel(channel),
     )
     db.add(event)
 
@@ -1042,6 +1087,12 @@ async def proxy_chat(
     Streams SSE responses without buffering.
     """
     config = await _auth_agent(request, db)
+    # Captured once, then passed explicitly to every _log_event below —
+    # including the ones inside the streaming generator. A local (closed over
+    # by the generator) rather than a ContextVar, because _log_event runs
+    # inside async generators whose context is whoever drives __anext__, and
+    # telemetry that silently records NULL would be worse than none.
+    req_channel = _sanitize_channel(request.headers.get(CHANNEL_HEADER))
     body = await request.json()
     requested_model = body.get("model", "claude-sonnet-4-6")
     model = _resolve_model_alias(requested_model)
@@ -1171,6 +1222,7 @@ async def proxy_chat(
             await _log_event(
                 db, config.user_id, backend.name, model, "chat",
                 0, 0, 0, int((time.time() - start_ts) * 1000), is_fallback, "error",
+                channel=req_channel,
             )
             logger.warning(
                 "[LLM-PROXY] %s upstream %d for user=%s model=%s body=%r",
@@ -1240,6 +1292,7 @@ async def proxy_chat(
                             inp, out, cost, latency, is_fallback,
                             cached_tokens=cached,
                             cache_write_tokens=cache_write,
+                            channel=req_channel,
                         )
 
                 try:
@@ -1266,6 +1319,7 @@ async def proxy_chat(
             await _log_event(
                 db, config.user_id, backend.name, model, "chat",
                 0, 0, 0, latency, is_fallback, "error",
+                channel=req_channel,
             )
             raise HTTPException(502, f"Provider error: {e}")
         # Surface clean upstream errors (model-not-found, rate-limit, etc.)
@@ -1274,6 +1328,7 @@ async def proxy_chat(
             await _log_event(
                 db, config.user_id, backend.name, model, "chat",
                 0, 0, 0, int((time.time() - start_ts) * 1000), is_fallback, "error",
+                channel=req_channel,
             )
             try:
                 detail = body_bytes.decode("utf-8", errors="replace")
@@ -1318,6 +1373,7 @@ async def proxy_chat(
             inp, out, cost, latency, is_fallback,
             cached_tokens=cached,
             cache_write_tokens=cache_write,
+            channel=req_channel,
         )
 
         # Use JSONResponse so we can attach the resolved-model header.
@@ -1389,6 +1445,7 @@ async def proxy_responses(
     toward the openai monthly budget automatically.
     """
     config = await _auth_agent(request, db)
+    req_channel = _sanitize_channel(request.headers.get(CHANNEL_HEADER))
     body = await request.json()
     requested_model = body.get("model")
     # No claude-* default here — this endpoint is OpenAI-only, and letting
@@ -1492,6 +1549,7 @@ async def proxy_responses(
             await _log_event(
                 db, config.user_id, "openai", model, "responses",
                 0, 0, 0, int((time.time() - start_ts) * 1000), False, "error",
+                channel=req_channel,
             )
             logger.warning(
                 "[LLM-PROXY] %s upstream %d for user=%s model=%s body=%r",
@@ -1547,6 +1605,7 @@ async def proxy_responses(
                             inp, out, cost, latency, False,
                             cached_tokens=cached,
                             cache_write_tokens=cache_write,
+                            channel=req_channel,
                         )
 
                 try:
@@ -1573,6 +1632,7 @@ async def proxy_responses(
             await _log_event(
                 db, config.user_id, "openai", model, "responses",
                 0, 0, 0, latency, False, "error",
+                channel=req_channel,
             )
             raise HTTPException(502, f"Provider error: {e}")
         if resp.status_code >= 400:
@@ -1580,6 +1640,7 @@ async def proxy_responses(
             await _log_event(
                 db, config.user_id, "openai", model, "responses",
                 0, 0, 0, int((time.time() - start_ts) * 1000), False, "error",
+                channel=req_channel,
             )
             try:
                 detail = body_bytes.decode("utf-8", errors="replace")
@@ -1618,6 +1679,7 @@ async def proxy_responses(
             inp, out, cost, latency, False,
             cached_tokens=cached,
             cache_write_tokens=cache_write,
+            channel=req_channel,
         )
 
         from fastapi.responses import JSONResponse
