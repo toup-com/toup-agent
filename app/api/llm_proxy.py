@@ -982,6 +982,42 @@ def _dedup_tool_names(tools: list) -> tuple[list, list]:
     return deduped, dups
 
 
+# OpenAI rejects any request whose `tools` array exceeds this, with
+# `array_above_max_length` — a 400 on the WHOLE turn, so the user sees
+# "There was an issue with the request. Please try rephrasing your
+# message." no matter what they typed. Anthropic has no equivalent hard
+# cap, so this is applied on the OpenAI path only; capping elsewhere
+# would drop tools for no reason.
+_OPENAI_MAX_TOOLS = 128
+
+
+def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS) -> tuple[list, list]:
+    """Trim an over-long tools array from the TAIL. Returns (kept, dropped_names).
+
+    This is a cliff, not a slope: at `limit` everything works and at
+    `limit + 1` every single turn fails, for every prompt, with an error
+    that blames the user's phrasing. One tenant crossed it on 2026-08-08
+    by connecting a 5-tool connector (124 → 129) and lost chat entirely.
+
+    Tail-first because the agent assembles core tools before skills
+    before MCP/connectors (the same ordering `_dedup_tool_names` relies
+    on for first-wins). So the agent keeps memory, files and messaging —
+    the tools it is broken without — and degrades at the margin instead.
+    That is the least-bad truncation, not a good one: the real fix is for
+    the agent not to offer 129 tools, and the WARN below is what makes
+    that visible rather than silent.
+    """
+    if len(tools) <= limit:
+        return tools, []
+    kept = tools[:limit]
+    dropped = [
+        t.get("name") or (t.get("function") or {}).get("name") or "<unnamed>"
+        for t in tools[limit:]
+        if isinstance(t, dict)
+    ]
+    return kept, dropped
+
+
 # ── Endpoints ────────────────────────────────────────────────────────
 
 
@@ -1042,6 +1078,22 @@ async def proxy_chat(
     resolved_model_header = {} if settings.security_leak_filter else {"x-toup-resolved-model": model}
 
     backend, api_key = _route_chat(model, config)
+
+    # Cap the tools array on the OpenAI path — see `_cap_tools`. Must sit
+    # AFTER routing, because the limit belongs to the provider and not to
+    # the requested model id: an alias can resolve across backends, and
+    # trimming an Anthropic turn would drop tools it would have accepted.
+    if backend.name == "openai":
+        _tools = body.get("tools")
+        if isinstance(_tools, list) and len(_tools) > _OPENAI_MAX_TOOLS:
+            _kept, _dropped = _cap_tools(_tools)
+            body["tools"] = _kept
+            logger.warning(
+                "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s: "
+                "%d > %d, dropped %d from the tail: %s",
+                config.user_id[:8], model, len(_tools), _OPENAI_MAX_TOOLS,
+                len(_dropped), _dropped,
+            )
 
     # Credit pre-flight: zero-balance gate. Only enforces when
     # credit_enforcement_enabled=True; in shadow mode this is a no-op.
@@ -1371,6 +1423,21 @@ async def proxy_responses(
         # Unreachable given the prefix gate above; kept as defense in depth
         # so a routing change can never send a Responses body elsewhere.
         raise HTTPException(400, "/responses is OpenAI-only")
+
+    # Same cap as proxy_chat. This endpoint is OpenAI-only by construction,
+    # so no backend test is needed — but it is the same 400 and the same
+    # unreadable "try rephrasing" for the user, and it would have been easy
+    # to fix one path and leave this one live.
+    _tools = body.get("tools")
+    if isinstance(_tools, list) and len(_tools) > _OPENAI_MAX_TOOLS:
+        _kept, _dropped = _cap_tools(_tools)
+        body["tools"] = _kept
+        logger.warning(
+            "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s: "
+            "%d > %d, dropped %d from the tail: %s",
+            config.user_id[:8], model, len(_tools), _OPENAI_MAX_TOOLS,
+            len(_dropped), _dropped,
+        )
 
     # Credit pre-flight: zero-balance gate (same contract as proxy_chat).
     try:
