@@ -297,6 +297,65 @@ def test_cleanup_pattern_is_marker_scoped():
     assert mq.MARKER_PREFIX in mq.CLEANUP_PATTERN
 
 
+# ── hermeticity: the two ways residue survived a "clean" sweep ──────────
+
+def test_cleanup_sweeps_the_capture_outbox():
+    """A memqa payload parked in memory_capture_outbox is replayed LATER.
+
+    When extraction succeeds but the write fails, the already-extracted
+    facts are stashed in `payload_json` and a sweeper retries them. That
+    row cannot be found by the memories-id path — it exists precisely
+    because no memories row was created — so it survived every sweep and
+    materialized as residue in a FUTURE run.
+    """
+    tables = [t for _l, t, _s in mq.OUTBOX_CLEANUP_STATEMENTS]
+    assert "memory_capture_outbox" in tables
+    for _l, _t, sql in mq.OUTBOX_CLEANUP_STATEMENTS:
+        # There is no id list to cast — the match is on the payload text.
+        assert "payload_json::text ILIKE $1" in sql, (
+            "outbox rows carry no memory id; they must be matched on payload"
+        )
+    assert "payload_json::text ILIKE $1" in mq.OUTBOX_COUNT_SQL
+    assert "count(*)" in mq.OUTBOX_COUNT_SQL.lower()
+
+
+def test_cleanup_accepts_a_settle_before_the_id_snapshot():
+    """settle-then-purge, not purge-then-hope.
+
+    cleanup_marker_rows takes ONE SELECT of the ids to delete. Extraction
+    is fire-and-forget, so a purge fired the instant the HTTP client closes
+    snapshots a set that does not yet contain the last STORE turns' rows.
+    The signature must let the caller wait first; the default stays 0 so
+    pre-clean and --cleanup-only do not pay for it.
+    """
+    import inspect
+
+    sig = inspect.signature(mq.cleanup_marker_rows)
+    assert "settle_seconds" in sig.parameters
+    assert sig.parameters["settle_seconds"].default == 0.0
+    src = inspect.getsource(mq.cleanup_marker_rows)
+    # The wait must precede the sweep, not follow it.
+    assert src.index("time.sleep(settle)") < src.index("_cleanup_async"), (
+        "settling AFTER the purge measures nothing and cleans nothing"
+    )
+
+
+def test_post_clean_settles_but_pre_clean_does_not():
+    """The run wires the settle where it matters, and only there."""
+    import inspect
+
+    src = inspect.getsource(mq.run_suite)
+    assert src.count("settle_seconds=args.settle_seconds") == 1, (
+        "exactly one cleanup call site — the POST-clean — takes the settle"
+    )
+    pre = src.index("pre = cleanup_marker_rows(")
+    post = src.index("post = cleanup_marker_rows(")
+    settle_at = src.index("settle_seconds=args.settle_seconds")
+    assert pre < post < settle_at, (
+        "the settle belongs to the post-clean; pre-clean has nothing in flight"
+    )
+
+
 # ── review-round pins (2026-07-29): hedged hallucinations + order-aware ──
 
 def test_negative_recall_fails_hedged_hallucination():

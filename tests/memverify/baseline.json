@@ -16,32 +16,59 @@
     "  measured  - observed on a real run; `recorded_at` names that run.",
     "  unrecorded- bound is null; the next real run must record it.",
     "",
-    "As of 2026-08-06 NO run has ever happened: the CI step was gated on an",
-    "OPENAI_API_KEY secret that this repository has never had, so it took its",
-    "`exit 0` branch on every build since it landed. There are therefore no",
-    "measured numbers to record yet, and unlabeled_rate_pct is deliberately",
-    "left null rather than guessed."
+    "2026-08-07: THE SUITE HAS NOW RUN. The OPENAI_API_KEY secret this file's",
+    "previous note described as missing was added, and the suite executed end to",
+    "end for the first time since it landed: 165 passed, 1 failed, 1 skipped.",
+    "The single failure was this file doing its job — unlabeled_rate_pct had no",
+    "bound, so it reported the measured value and refused to pass.",
+    "",
+    "unlabeled_rate_pct is now recorded, but NOT at the first value observed.",
+    "The extractor is an LLM, so the number moves between runs, and a ratchet",
+    "pinned to one sample is worse than no ratchet: it flaps, someone widens it",
+    "under time pressure, and the gate stops meaning anything. Seven consecutive",
+    "clean-state runs on 2026-08-07 measured:",
+    "",
+    "    3.75%  (3 of 80)      5.06%  (4 of 79)      3.85%  (3 of 78)",
+    "    6.67%  (5 of 75)      3.90%  (3 of 77)      5.26%  (4 of 76)",
+    "    4.00%  (3 of 75)",
+    "",
+    "So both terms move: 3-5 catch-all rows over a denominator of 75-80, mean",
+    "3.57 rows (sd 0.79). A bound at the first sample (3.75) would have failed",
+    "six of those seven runs. The ceiling is set at 8.0%, which tolerates up to",
+    "6 catch-all rows at the smallest observed denominator — roughly three",
+    "standard deviations above the mean — and still fails a genuine regression,",
+    "where extraction degrading to 7+ catch-all rows means the real extractor has",
+    "started reaching for the bucket that carries no usable label. Tighten it",
+    "when there are enough runs to justify a tighter number; do not widen it",
+    "without recording why here.",
+    "",
+    "non_canonical_rate_pct measured 0.0 on all seven runs, confirming the",
+    "invariant its bound was already derived from."
   ],
   "metrics": {
     "recall_pct": {
       "min": 100.0,
       "source": "contract",
-      "note": "test_a_capture_recall.py::test_recall_aggregate already asserts recall == 1.0. Restated here so all three headline numbers are gated in one place."
+      "recorded_at": "20260807T220512",
+      "note": "test_a_capture_recall.py::test_recall_aggregate already asserts recall == 1.0. Restated here so all three headline numbers are gated in one place. First real run measured 100.0 (32 of 32 facts), confirming the contract rather than replacing it."
     },
     "precision_pct": {
       "min": 100.0,
       "source": "contract",
-      "note": "test_b_precision_junk.py::test_junk_aggregate already asserts zero junk across ALL_LABELED. 100% precision is the same statement as a junk count of 0."
+      "recorded_at": "20260807T220512",
+      "note": "test_b_precision_junk.py::test_junk_aggregate already asserts zero junk across ALL_LABELED. 100% precision is the same statement as a junk count of 0. First real run measured 100.0 (0 of 44 junk markers stored)."
     },
     "non_canonical_rate_pct": {
       "max": 0.0,
       "source": "invariant",
-      "note": "Every production write path normalises the category before it reaches the column - memory_service.py:536, memory_extractor.py:872 and :1131, agent_reflection.py:168. A row whose stored value is not canonical for its brain means a path bypassed normalize_category, which is a structural defect independent of extraction quality."
+      "recorded_at": "20260807T220512",
+      "note": "Every production write path normalises the category before it reaches the column - memory_service.py:536, memory_extractor.py:872 and :1131, agent_reflection.py:168. A row whose stored value is not canonical for its brain means a path bypassed normalize_category, which is a structural defect independent of extraction quality. Measured 0.0 on all seven 2026-08-07 runs."
     },
     "unlabeled_rate_pct": {
-      "max": null,
-      "source": "unrecorded",
-      "note": "No run has ever produced this number and it cannot be derived from the code: it depends on how often the real extractor picks the catch-all bucket. Guessing a ceiling here would be a modelled figure wearing a measured figure's clothes. The first run that completes will fail with the measured value and the exact line to paste; record it, commit it, and this becomes a real ratchet."
+      "max": 8.0,
+      "source": "measured",
+      "recorded_at": "20260807T220512",
+      "note": "Seven consecutive clean-state runs 2026-08-07 measured 3.75, 3.85, 3.90, 4.00, 5.06, 5.26 and 6.67 percent (3-5 catch-all rows over 75-80 stored rows; mean 3.57 rows, sd 0.79). Bound set at 8.0 rather than at the observed maximum: this is an LLM-driven number and a ceiling inside its own jitter would flap. 8.0 tolerates 6 catch-all rows at the smallest observed denominator and still catches a doubling. See _README before changing it."
     }
   }
 }

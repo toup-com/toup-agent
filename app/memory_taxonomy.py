@@ -358,6 +358,69 @@ def normalize_category(
     return MemoryCategory.OTHER.value
 
 
+def canonical_category_for_filter(
+    value: Optional[str],
+    brain_type: Optional[str] = None,
+) -> Optional[str]:
+    """Canonicalise a category used as a FILTER. Never widens, never narrows.
+
+    `normalize_category` is a WRITE-path function: it must always return
+    something storable, so an unrecognised input falls back to `other` (user) or
+    `domain_knowledge` (agent). That is right on a write — an odd category must
+    never cost us the memory itself.
+
+    On a READ filter the same fallback is a silent lie, and a dangerous one,
+    because these filters AND:
+
+        normalize_category("domain_knowledge")  -> "other"
+        normalize_category("process")           -> "other"
+
+    Both are real categories, in the agent and work vocabularies. Filtering on
+    either through the write-path function would have searched for `other` and
+    returned rows the caller never asked for — or, far more often, nothing at
+    all. That is the same booby trap documented on `hybrid_search`, just
+    installed from the other end.
+
+    So this maps ONLY what is genuinely an alias, in whichever brain vocabulary
+    the value actually belongs to, and otherwise returns the value UNCHANGED so
+    the query keeps meaning what the caller said.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip().lower().replace(" ", "_").replace("-", "_")
+    if not raw:
+        return value
+
+    # Prefer the caller's brain when they told us which one.
+    if brain_type == BrainType.AGENT.value:
+        order = (AgentCategory, MemoryCategory, WorkCategory)
+        alias_maps = (AGENT_CATEGORY_ALIASES, MEMORY_CATEGORY_ALIASES)
+    elif brain_type == BrainType.WORK.value:
+        order = (WorkCategory, MemoryCategory, AgentCategory)
+        alias_maps = (MEMORY_CATEGORY_ALIASES, AGENT_CATEGORY_ALIASES)
+    else:
+        order = (MemoryCategory, AgentCategory, WorkCategory)
+        alias_maps = (MEMORY_CATEGORY_ALIASES, AGENT_CATEGORY_ALIASES)
+
+    # Already canonical in some vocabulary → leave it exactly as it is.
+    for enum_cls in order:
+        try:
+            return enum_cls(raw).value
+        except ValueError:
+            continue
+
+    # A known retired alias → map it, so "places" still finds "locations".
+    for amap in alias_maps:
+        mapped = amap.get(raw)
+        if mapped is not None:
+            return mapped.value
+
+    # Unknown. Return it untouched: an empty result is then the honest answer
+    # to a filter for something that does not exist, not a side effect of a
+    # fallback the caller never asked for.
+    return raw
+
+
 def normalize_memory_type(value: Optional[str]) -> str:
     """Coerce any memory_type string to a canonical value; unknown → fact."""
     raw = (value or "").strip().lower().replace(" ", "_").replace("-", "_")
@@ -995,6 +1058,7 @@ __all__ = [
     "WorkCategory",
     "MemoryType",
     "MemoryLevel",
+    "canonical_category_for_filter",
     "MEMORY_CATEGORY_ALIASES",
     "AGENT_CATEGORY_ALIASES",
     "MEMORY_TYPE_ALIASES",

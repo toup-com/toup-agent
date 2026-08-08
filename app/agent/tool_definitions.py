@@ -1737,13 +1737,18 @@ def get_extended_tools():
 def get_doc_generation_tools() -> List[Dict[str, Any]]:
     """Document-generation tools (PDF/DOCX/XLSX/PPTX/MD/HTML→PDF).
 
-    Gated by settings.feature_doc_generation. Each tool writes a file to
-    the per-user storage backend and returns a summary string; the
-    actual attachment metadata is emitted to the client over the WS
-    `attachment` event after the tool completes.
+    Gated by settings.feature_doc_generation AND the per-tenant
+    `doc_generation` entitlement (app/agent/tool_entitlements.py). Each tool
+    writes a file to the per-user storage backend and returns a summary
+    string; the actual attachment metadata is emitted to the client over the
+    WS `attachment` event after the tool completes.
 
     The LLM should pick these over inline markdown when the user asks
     for an export, report, invoice, spreadsheet, slide deck, etc.
+
+    `navigate_to` USED to be the last element of this list and is now in
+    `get_navigation_tools()` — it is navigation, not document generation,
+    and gating it here took page transfers down with the export tools.
     """
     _content_block = {
         "type": "array",
@@ -1889,6 +1894,25 @@ def get_doc_generation_tools() -> List[Dict[str, Any]]:
                 "required": ["html", "filename"],
             },
         },
+    ]
+
+
+def get_navigation_tools() -> List[Dict[str, Any]]:
+    """Page navigation. UNCONDITIONAL — never gated.
+
+    `navigate_to` used to be the last element of `get_doc_generation_tools()`,
+    for no better reason than that is where it was appended. It has nothing to
+    do with document generation, so `feature_doc_generation=false` (or, now,
+    a tenant without the doc_generation entitlement) silently took "take me to
+    my brain" down with it: 400 of the 1,560 tokens routinely attributed to
+    the doc-generation block were navigation.
+
+    Callers must keep appending this immediately after the doc-generation
+    block so the assembled array is byte-identical to the pre-split one when
+    both are present — the tools array heads the provider cache prefix and a
+    reordering is a new cache lineage.
+    """
+    return [
         # Navigate the user's browser to a different platform page. The handler
         # broadcasts a {"type":"navigate", "path":...} frame to the user's chat
         # WebSocket; the frontend listens for it and routes via React Router

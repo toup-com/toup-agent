@@ -113,12 +113,14 @@ class SkillLoader:
 
     async def register_dynamic(self, skill: Skill) -> bool:
         """Register a skill instance at runtime (no filesystem needed).
-        If a skill with the same name already exists, unload it first."""
+        If a skill with the same name already exists, unload it first.
+
+        Returns False when the skill belongs to a tool family this tenant is
+        not entitled to (see `_register`)."""
         name = skill.meta.name
         if name in self._skills:
             await self.unload_skill(name)
-        await self._register(skill)
-        return True
+        return await self._register(skill)
 
     async def unload_skill(self, name: str) -> bool:
         """Unload a single skill by name."""
@@ -185,8 +187,7 @@ class SkillLoader:
 
                 try:
                     skill = self._load_skill_from_file(skill_file, entry)
-                    if skill:
-                        await self._register(skill)
+                    if skill and await self._register(skill):
                         loaded += 1
                 except Exception as e:
                     logger.error(f"[SKILLS] Failed to load skill from {skill_dir}: {e}")
@@ -251,13 +252,40 @@ class SkillLoader:
 
         return instance
 
-    async def _register(self, skill: Skill) -> None:
-        """Validate and register a skill + index its tools."""
+    async def _register(self, skill: Skill) -> bool:
+        """Validate and register a skill + index its tools.
+
+        Returns True when the skill ended up registered.
+
+        This is the single funnel for BOTH `load_all()` (filesystem
+        discovery) and `register_dynamic()` (agent_main's late-bound
+        AppBuilderSkill), which is why the per-tenant entitlement check sits
+        here: withholding a skill at registration removes its tool
+        definitions, its system-prompt section, its commands, its hooks AND
+        its execution path together. A skill that is half-gated — tools
+        hidden but still callable, or callable but absent from the
+        capabilities listing — is worse than either extreme.
+
+        The entitlement is resolved once per process, so the set of loaded
+        skills is fixed for the life of the container. That matters because
+        skill tools are appended to the wire tools array, which heads the
+        provider cache prefix: a skill that came and went mid-life would
+        fork the cache lineage ([PERF] tools_array_changed).
+        """
         name = skill.meta.name
 
         if name in self._skills:
             logger.warning(f"[SKILLS] Duplicate skill name '{name}' — skipping")
-            return
+            return False
+
+        from app.agent.tool_entitlements import skill_enabled
+
+        if not skill_enabled(name):
+            logger.info(
+                "[SKILLS] Skipping '%s' — its tool family is not entitled for "
+                "this tenant (AGENT_TOOL_FAMILIES)", name,
+            )
+            return False
 
         tools = skill.get_tools()
         prefix = f"{name}__"
@@ -283,3 +311,4 @@ class SkillLoader:
             f"[SKILLS] Registered '{name}' v{skill.meta.version} "
             f"({len(tools)} tools: {[t['name'] for t in tools]})"
         )
+        return True

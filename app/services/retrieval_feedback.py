@@ -60,6 +60,10 @@ class RetrievalFeedback:
     Tracks retrieval quality signals and feeds them back to improve extraction.
     """
 
+    # Cap on how many cited memories are reinforced per turn. Matches the old
+    # retrieval-time top-5 so the write volume can only go down, never up.
+    REINFORCE_CITED_LIMIT = 5
+
     def __init__(self, db: AsyncSession):
         self.db = db
 
@@ -88,6 +92,7 @@ class RetrievalFeedback:
 
         retrieved_ids = [m.get("id", "") for m in retrieved_memories]
         used_ids = []
+        used_memories: List[Dict[str, Any]] = []
         irrelevant_ids = []
 
         # Lightweight content matching: check if memory content appears
@@ -106,6 +111,7 @@ class RetrievalFeedback:
 
             if match_ratio >= 0.3:  # At least 30% of significant words match
                 used_ids.append(mem.get("id", ""))
+                used_memories.append(mem)
             else:
                 irrelevant_ids.append(mem.get("id", ""))
 
@@ -145,6 +151,33 @@ class RetrievalFeedback:
         # Don't commit here — let the caller handle the transaction
         await self.db.flush()
 
+        # Reinforce ONLY what the response actually cited.
+        #
+        # This used to live at the end of MemoryService.hybrid_search, where it
+        # reinforced the top 5 results of every search unconditionally. That
+        # made retrieval a write: a memory that surfaced for the wrong query got
+        # stronger, and strength is an input to the same ranker, so the mistake
+        # became self-reinforcing. Nothing pushed the other way, because decay
+        # does not run against tenant memories.
+        #
+        # Here we are downstream of the finished assistant response, so we know
+        # which memories it used. Note what that buys us for free: on a MISS
+        # turn — one where memories came back and the model used none of them —
+        # `used_memories` is empty BY CONSTRUCTION, because quality_signal
+        # above assigns "miss" on exactly the condition `not used_ids`. "Do not
+        # reinforce on a miss" is therefore causal, not a rule bolted on
+        # afterwards; there is no way to be classified a miss and still be
+        # reinforced. Same for "empty" (nothing retrieved at all).
+        #
+        # The 1-hour per-memory cooldown inside DecayService.reinforce_memory
+        # still applies and is deliberately not bypassed.
+        #
+        # commit=False: this method's contract is that the caller owns the
+        # transaction (see the flush above). The sole caller,
+        # AgentRunner._background_post_processing, commits its own background
+        # session right after — off the request path.
+        await self._reinforce_used(user_id, used_memories)
+
         logger.info(
             f"[FEEDBACK] Logged retrieval event {event_id}: "
             f"retrieved={len(retrieved_ids)}, used={len(used_ids)}, "
@@ -152,6 +185,55 @@ class RetrievalFeedback:
             f"correction={is_correction}"
         )
         return event_id
+
+    async def _reinforce_used(
+        self,
+        user_id: str,
+        used_memories: List[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        Reinforce the memories the assistant response actually cited.
+
+        Returns the ids that were passed to DecayService (not the ids that
+        actually moved — the 1-hour cooldown may no-op some of them).
+        Never raises: reinforcement is a quality signal, not turn-critical.
+        """
+        if not used_memories:
+            return []
+
+        try:
+            from app.config import settings
+            if not bool(getattr(settings, "memory_reinforce_on_cite", True)):
+                return []
+        except Exception:
+            pass
+
+        reinforced: List[str] = []
+        try:
+            from app.services.decay_service import DecayService
+            decay_svc = DecayService(self.db)
+            for mem in used_memories[: self.REINFORCE_CITED_LIMIT]:
+                mem_id = mem.get("id") or ""
+                if not mem_id:
+                    continue
+                await decay_svc.reinforce_memory(
+                    memory_id=mem_id,
+                    user_id=user_id,
+                    access_context="cited",
+                    similarity_score=mem.get("similarity_score", 0.5),
+                    commit=False,
+                )
+                reinforced.append(mem_id)
+        except Exception as e:
+            logger.warning(f"[FEEDBACK] Cite reinforcement failed (non-fatal): {e}")
+            return reinforced
+
+        if reinforced:
+            logger.info(
+                f"[FEEDBACK] Reinforced {len(reinforced)} cited memories "
+                f"for user {user_id}"
+            )
+        return reinforced
 
     # ------------------------------------------------------------------
     # 2. Analyze extraction quality

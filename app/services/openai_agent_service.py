@@ -283,12 +283,20 @@ class OpenAIAgentService:
         from app.services.credit_reporter import raise_if_exhausted
         raise_if_exhausted()
 
-        # G1 blocker (docs/audits/2026-07-g1-model-gate.md): gpt-5.6-*
+        # G1 (docs/audits/2026-08-g1-cost-and-latency.md): gpt-5.6-*
         # rejects /v1/chat/completions when function tools are present —
         # the Responses API is the tools+reasoning wire for that family.
-        # Flag-gated second wire path; default "chat" leaves everything
-        # below this branch byte-identical to today.
-        if getattr(settings, "openai_wire_api", "chat") == "responses":
+        #
+        # Derived from the resolved model, not read straight from settings:
+        # the wire is a hard property of the model family, and treating it
+        # as an independent setting let a container be configured with a
+        # 5.6 model on the chat wire, which 400s every single turn while
+        # looking perfectly healthy. `wire_api_for` still honours
+        # settings.openai_wire_api for every other family, so the gpt-4o
+        # fallback keeps the chat wire it has always used.
+        from app.services.model_resolver import wire_api_for
+
+        if wire_api_for(model) == "responses":
             async for _ev in self._create_responses_stream(
                 messages=messages,
                 system=system,

@@ -797,6 +797,13 @@ class ChatMessageResponse(BaseModel):
     processing_time_ms: Optional[int] = None
     # Media metadata (YouTube/Netflix cards)
     media: Optional[dict] = None
+    # A staged `elevation: true` connector call awaiting the user's
+    # confirmation ({action_id, tool_name, summary, payload, ...}).
+    # Sent so the card re-renders on reload — an approval prompt that
+    # vanishes on refresh is worse than none, because the user assumes
+    # it went through. Live status comes from
+    # GET /api/connectors/pending-actions; this is the anchor.
+    pending_action: Optional[dict] = None
     # Generated-file attachments (doc-delivery feature). List of
     # {id, filename, mime_type, size_bytes, created_at}. storage_path
     # is stripped server-side — it's an internal key.

@@ -43,10 +43,18 @@ logger = logging.getLogger(__name__)
 # `agent_model` comment in config.py for the 2026-05-29 incident.
 # `_CANONICAL_ANTHROPIC_MODEL` stays Claude — it's the explicit-Claude
 # fallback, only reached when a user/operator deliberately picks Anthropic.
-_CANONICAL_AGENT_MODEL = "gpt-5.5"
+#
+# 2026-08-07: moved gpt-5.5 → gpt-5.6-terra. G1 passed on measured OpenAI
+# organization billing (docs/audits/2026-08-g1-cost-and-latency.md §8):
+# terra is 50-55% cheaper per token on every token class, p50 -17.5%,
+# p95 -54.1%, and marginally more reliable (2.1% vs 2.6% error rate).
+# `_CANONICAL_FALLBACK_MODEL` deliberately stays gpt-4o: it is the
+# cross-provider fallback and keeps its long-proven chat wire (see
+# `wire_api_for` below).
+_CANONICAL_AGENT_MODEL = "gpt-5.6-terra"
 _CANONICAL_FALLBACK_MODEL = "gpt-4o"
 _CANONICAL_ANTHROPIC_MODEL = "claude-opus-4-7"
-_CANONICAL_OPENAI_MODEL = "gpt-5.5"
+_CANONICAL_OPENAI_MODEL = "gpt-5.6-terra"
 
 
 # ── G1 chat-model guard (no-cached-rate tier) ─────────────────────────
@@ -76,6 +84,50 @@ def has_cached_input_rate(model: str | None) -> bool:
     if is_openai_model(m) and m.endswith("-pro"):
         return False
     return True
+
+
+# ── Wire selection (derived, NOT an independent operator choice) ───────
+# gpt-5.6-* returns 400 on /v1/chat/completions whenever function tools
+# are present ("use /v1/responses or set reasoning_effort to 'none'" —
+# canary abort 2026-07-28). Every agent turn sends function tools, so for
+# that family the wire is not a preference: it is the only wire that works.
+#
+# `settings.openai_wire_api` used to be the sole selector, which meant the
+# model and the wire were two independent settings that had to be flipped
+# together. Setting one without the other hard-400s every turn on that
+# container, and nothing about a half-flipped container looks unhealthy —
+# it just fails every request. This codebase has lost fleets to exactly
+# that shape before (the four bind gates, the append-only bridge env).
+#
+# So the wire is DERIVED from the model. A container can no longer land in
+# the broken half-flipped state, whether the model arrives from the code
+# default, a Railway env var, per-container bridge env, or a per-tenant
+# agent_config column. The setting still governs every other family, so an
+# operator can still move gpt-4o/gpt-5.5 onto the Responses wire
+# deliberately.
+_RESPONSES_ONLY_PREFIXES = ("gpt-5.6",)
+
+
+def requires_responses_wire(model: str | None) -> bool:
+    """True for OpenAI families that reject /v1/chat/completions outright
+    when function tools are present. Not a preference — a hard provider
+    constraint."""
+    if not model:
+        return False
+    return model.lower().strip().startswith(_RESPONSES_ONLY_PREFIXES)
+
+
+def wire_api_for(model: str | None) -> str:
+    """Which OpenAI wire to use for `model`: 'chat' | 'responses'.
+
+    Families that mandate the Responses API get it regardless of settings.
+    Everything else honours `settings.openai_wire_api` (default 'chat'),
+    so the gpt-4o fallback path keeps the wire it has always used.
+    """
+    if requires_responses_wire(model):
+        return "responses"
+    configured = (_settings_attr("openai_wire_api") or "chat")
+    return str(configured).strip().lower() or "chat"
 
 
 # ── Default-resolution functions ──────────────────────────────────────

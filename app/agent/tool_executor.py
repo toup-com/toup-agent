@@ -28,6 +28,7 @@ from typing import Dict, Any, Optional, List, Set
 import httpx
 
 from app.config import settings
+from app.agent.tool_entitlements import refusal_for_tool as _tool_entitlement_refusal
 from app.services.exec_env import scrubbed_environ, sandbox_preexec
 from app.services.workspace_perms import share_path, shared_makedirs
 
@@ -772,6 +773,18 @@ class ToolExecutor:
             return f"ERROR: Tool '{tool_name}' is blocked by administrator policy."
         if tool_name in self.user_disabled_tools:
             return f"ERROR: Tool '{tool_name}' has been disabled by the user."
+        # Per-tenant tool-family entitlement backstop. Withholding the tool
+        # DEFINITION (agent_runner.__init__ / SkillLoader._register) stops the
+        # model from picking it; this stops a call that arrives some other way
+        # — a replayed tool_use block from a cached transcript, an MCP alias,
+        # a hallucinated name — from reaching a handler, and returns wording
+        # the model can relay instead of inventing the capability. Returns
+        # None (falls through) for every tool on an entitled tenant, which is
+        # every tenant today.
+        _entitlement_refusal = _tool_entitlement_refusal(tool_name)
+        if _entitlement_refusal:
+            logger.info("[TOOL-POLICY] Not entitled: %s", tool_name)
+            return _entitlement_refusal
         if tool_name in settings.tool_elevated_list:
             logger.warning(f"[TOOL-POLICY] Elevated tool invoked: {tool_name}")
 
@@ -926,7 +939,78 @@ class ToolExecutor:
         finally:
             reset_pending_channel(token)
 
+        # An `elevation: true` tool did NOT run — the platform staged it
+        # and wants the user to approve a card. Stash it exactly the way
+        # `_last_media` works (ad-hoc attribute, drained by
+        # `AgentRunner._save_messages`) so the draft lands in the
+        # assistant message's metadata_json and the card survives a page
+        # reload. Without this the model's text is the only trace, and
+        # the user has nothing to tap.
+        envelope = self._mcp_envelope(call_result)
+        if envelope is not None and envelope.get("kind") == "confirmation_required":
+            action_id = envelope.get("action_id")
+            if action_id:
+                card = {
+                    "action_id": action_id,
+                    "connector_id": tool_name.split("__", 1)[0],
+                    "tool_name": tool_name,
+                    "summary": envelope.get("summary") or "",
+                    "payload": envelope.get("payload") or {},
+                    "expires_at": envelope.get("expires_at"),
+                    "status": "pending",
+                }
+                self._last_pending_action = card
+                # Live render, so the card is on screen the moment the
+                # turn's text lands rather than after a refresh. The
+                # metadata_json write above is the DURABLE path — this
+                # is best-effort and must never fail the tool call.
+                user_id = self._current_user_id
+                if user_id:
+                    try:
+                        from app.api.ws_chat import broadcast_to_user
+                        await broadcast_to_user(user_id, {
+                            "type": "pending_action",
+                            **card,
+                        })
+                    except Exception as e:
+                        logger.warning(
+                            "[MCP] pending_action broadcast failed for %s: %s "
+                            "(card still persisted on the message)",
+                            action_id, e,
+                        )
+            else:
+                # Shape drift between platform and agent images. Loud,
+                # because the alternative is the model telling the user
+                # a card exists when nothing is there to tap.
+                logger.error(
+                    "[MCP] confirmation_required envelope without action_id "
+                    "for tool=%s — card cannot be rendered", tool_name,
+                )
+
         return self._canonicalize_mcp_result(tool_name, call_result)
+
+    @staticmethod
+    def _mcp_envelope(call_result: Any) -> Optional[Dict[str, Any]]:
+        """Pull the `{kind, ...}` dict out of a FastMCP CallToolResult.
+
+        Split out of `_canonicalize_mcp_result` so the dispatch path can
+        inspect the envelope (to catch `confirmation_required`) without
+        parsing the result twice or duplicating the unwrap quirks.
+        """
+        structured = getattr(call_result, "structured_content", None) or getattr(
+            call_result, "structuredContent", None
+        )
+        if not isinstance(structured, dict):
+            return None
+        envelope = structured
+        # FastMCP wraps return-dict in {"result": <dict>} on some
+        # versions — unwrap if that shape comes back.
+        if (
+            set(envelope.keys()) == {"result"}
+            and isinstance(envelope["result"], dict)
+        ):
+            envelope = envelope["result"]
+        return envelope
 
     @staticmethod
     def _canonicalize_mcp_result(tool_name: str, call_result: Any) -> str:
@@ -945,19 +1029,7 @@ class ToolExecutor:
             string (the LLM sees a blank result, which is at least
             well-shaped).
         """
-        envelope: Optional[Dict[str, Any]] = None
-        structured = getattr(call_result, "structured_content", None) or getattr(
-            call_result, "structuredContent", None
-        )
-        if isinstance(structured, dict):
-            envelope = structured
-            # FastMCP wraps return-dict in {"result": <dict>} on some
-            # versions — unwrap if that shape comes back.
-            if (
-                set(envelope.keys()) == {"result"}
-                and isinstance(envelope["result"], dict)
-            ):
-                envelope = envelope["result"]
+        envelope = ToolExecutor._mcp_envelope(call_result)
 
         if envelope is not None and "kind" in envelope:
             kind = envelope.get("kind")

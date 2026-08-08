@@ -164,6 +164,43 @@ class StationTrack:
     # carries the SAME video_id the pop will play (no ATV/OMV swap divergence).
     # "" means "resolve me"; a value == the current mode means "already correct".
     variant_resolved_mode: str = ""
+    # How many times a variant lookup has been ATTEMPTED and come back empty for
+    # this track. Only failures count: "no swap needed" settles the track
+    # immediately and never touches this. A failed lookup used to stamp
+    # `variant_resolved_mode` anyway, which reads as "already correct" to the
+    # pop-time swap gate — so one 6s timeout or one throttled YT Music search
+    # pinned that track to its Topic/ATV id for the rest of the session, and
+    # Video mode played album art for it every time it came round.
+    variant_attempts: int = 0
+    # The other-format variant of this same song (ATV <-> OMV), remembered the
+    # first time a lookup found it.
+    #
+    # Without it, a Song<->Video flip is a NETWORK search per track in BOTH
+    # directions — and the forward swap DISCARDS the track it came from
+    # (`playlist[idx] = alt` in ws_chat._resolve_upcoming_variants), so flipping
+    # back re-searched YT Music for a track we had held in hand seconds earlier.
+    # Under the resolve budget only a slot or two settled in time,
+    # `_upcoming_tracks` truncates at the first UNSETTLED slot, and the phone's
+    # prebuffer window therefore collapsed to a single track. A window of one is
+    # a prebuffer of nothing, so every advance after a flip paid the full cold
+    # start: measured at 5.44s +/- 0.03 on a founder device (2026-08-07), against
+    # <1s for a track the phone had already downloaded.
+    #
+    # repr=False is load-bearing: the two tracks reference EACH OTHER, and a
+    # dataclass's generated __repr__ would recurse until the stack blew — on a
+    # debug print, in prod, nowhere near this line.
+    counterpart: Optional["StationTrack"] = field(default=None, repr=False)
+
+    def is_right_variant_for(self, mode: str) -> bool:
+        """Is this track already the variant `mode` wants?
+
+        Mirrors the `needed` test in the pre-resolver, inverted. An unknown /
+        UGC video_type answers True in both modes: there is no counterpart
+        lookup for it, so it is as right as it will ever be.
+        """
+        if mode == "song":
+            return self.video_type != "MUSIC_VIDEO_TYPE_OMV"
+        return self.video_type != "MUSIC_VIDEO_TYPE_ATV"
 
     def display_title(self) -> str:
         # "Artist — Title" for logs / debug. Frontend uses title directly.

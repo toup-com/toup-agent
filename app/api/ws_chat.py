@@ -818,6 +818,7 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
                 "type": "radio_upcoming",
                 "channel": channel,
                 "upcoming": _win,
+                "resolved_mode": _existing.display_mode,
             })
         await broadcast_to_user(user_id, _existing.to_broadcast_dict())
         return
@@ -943,6 +944,7 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
                 "type": "radio_upcoming",
                 "channel": channel,
                 "upcoming": upcoming,
+                "resolved_mode": sess.display_mode,
             })
         from app.agent.radio.player import warm_audio_cache
         # Explicit `build`, because the invisible default is what caused the
@@ -1210,10 +1212,32 @@ def _upcoming_tracks(sess, n: int = 5) -> list:
     for the mobile pre-load queue. Mobile prefetches + queues these to local
     disk so even rapid back-to-back skips hop to an already-downloaded file
     (instant) instead of round-tripping. n=5 covers a burst of ~4 fast skips;
-    it's just IDs+titles from the in-memory playlist, so it's ~free to send."""
+    it's just IDs+titles from the in-memory playlist, so it's ~free to send.
+
+    Truncated at the first slot the POP would still swap. The phone skips into
+    this window OPTIMISTICALLY — it advances the card to `upcoming[0]` without
+    waiting for us — so a slot the pre-resolver has not settled is not a hint,
+    it is a wrong card: `_advance_and_broadcast_next` re-resolves it inline and
+    plays a DIFFERENT id. `_resolve_upcoming_variants` runs under a 2s budget
+    over 8 slots, so under load it routinely leaves some unsettled, and the
+    window promised them anyway.
+
+    Measured 2026-08-06: the phone skipped to `mi-JD4jGVUQ` (KAROL G - Topic,
+    which YouTube plays as bare album art) while the pop played `QCZZwZQ4qNs`
+    (the official video) — same song, ~1s apart. Three of nine skips in that
+    run did it. That is the "stale song card that heals after a second".
+
+    Only the override case swaps at pop time, so only it truncates. With no
+    override the queue plays exactly what it holds and the window is already
+    true; in song mode an ATV needs no swap, so nothing truncates there either.
+    """
     out = []
     try:
+        strict = bool(getattr(sess, "display_mode_user_override", False))
+        mode = sess.display_mode
         for t in sess.playlist[sess.playlist_cursor:sess.playlist_cursor + n]:
+            if strict and t.variant_resolved_mode != mode:
+                break
             out.append({
                 "video_id": t.video_id,
                 "title": t.display_title(),
@@ -1230,9 +1254,20 @@ def _upcoming_tracks(sess, n: int = 5) -> list:
 # stalls a media_play broadcast.
 _VARIANT_RESOLVE_WINDOW = 8
 _VARIANT_RESOLVE_BUDGET = 2.0  # seconds
+# How many times a variant lookup may come back empty for one track before we
+# accept that no counterpart exists. Small on purpose: the failures this is
+# here for are transient (timeout / throttle), and a track that genuinely has
+# no music video should stop costing searches quickly.
+_VARIANT_RESOLVE_MAX_ATTEMPTS = 3
+# An explicit Song/Video tap is off the audio path (the current track keeps
+# playing), and the window it produces decides whether the phone can skip
+# instantly for the rest of the station. Worth more than the 2s the advance
+# path can afford.
+_VARIANT_RESOLVE_FLIP_BUDGET = 9.0  # seconds
 
 
-async def _resolve_upcoming_variants(sess, n: int = _VARIANT_RESOLVE_WINDOW) -> None:
+async def _resolve_upcoming_variants(sess, n: int = _VARIANT_RESOLVE_WINDOW,
+                                     budget: float = _VARIANT_RESOLVE_BUDGET) -> None:
     """Pre-resolve the Song/Video variant of the next `n` station tracks IN PLACE,
     so the `upcoming` window shipped to mobile carries the SAME video_ids the pop
     will actually play.
@@ -1284,7 +1319,17 @@ async def _resolve_upcoming_variants(sess, n: int = _VARIANT_RESOLVE_WINDOW) -> 
         if tr.variant_resolved_mode == mode:
             return
         alt = None
-        if mode == "song" and tr.video_type == "MUSIC_VIDEO_TYPE_OMV":
+        # A flip BACK is free. The forward swap replaced this slot and kept the
+        # track it replaced (`counterpart`), so the variant this mode wants is
+        # already in memory — no YT Music search, no budget spent, no slot left
+        # unsettled for `_upcoming_tracks` to truncate the window at. This is
+        # what keeps the phone's prebuffer window at full depth across a
+        # Song<->Video flip, and with it the difference between a track that
+        # starts instantly and one that pays the ~5.4s cold build.
+        cp = tr.counterpart
+        if cp is not None and cp.is_right_variant_for(mode):
+            alt = cp
+        elif mode == "song" and tr.video_type == "MUSIC_VIDEO_TYPE_OMV":
             alt = await find_topic_version(tr)
         elif mode == "video" and tr.video_type == "MUSIC_VIDEO_TYPE_ATV":
             alt = await find_music_video(tr)
@@ -1293,6 +1338,13 @@ async def _resolve_upcoming_variants(sess, n: int = _VARIANT_RESOLVE_WINDOW) -> 
             return
         if alt is not None and alt.video_id != vid:
             alt.variant_resolved_mode = mode
+            # One direction is enough, and the asymmetry is not an oversight:
+            # the track ENTERING the playlist gets a link to the one LEAVING it,
+            # so the very next flip finds its counterpart on the track it is
+            # looking at, and that flip re-links in the other direction in turn.
+            # A back-link here would be unreachable code — a mutation test that
+            # deletes it cannot make anything fail.
+            alt.counterpart = tr
             sess.playlist[idx] = alt
             print(
                 f"[radio] upcoming_variant_resolved mode={mode} from={vid} to={alt.video_id} "
@@ -1300,14 +1352,53 @@ async def _resolve_upcoming_variants(sess, n: int = _VARIANT_RESOLVE_WINDOW) -> 
                 flush=True,
             )
         else:
-            # No swap needed/available — accept the current variant and mark it so
-            # we don't search it again every frame (keeps upcoming==pop consistent).
-            sess.playlist[idx].variant_resolved_mode = mode
+            # "No swap NEEDED" and "no swap AVAILABLE" are not the same fact, and
+            # collapsing them is what made Video mode play album art.
+            #
+            # `variant_resolved_mode == mode` means "already the right variant",
+            # and the pop-time swap gate at _advance_and_broadcast_next reads it
+            # as exactly that. Stamping it after a FAILED lookup therefore does
+            # not merely skip a re-search — it permanently tells every later
+            # stage this ATV id is the music video. One 6s find_music_video
+            # timeout, one anti-bot-throttled YT Music search, or one artist-name
+            # mismatch condemned that track to album art for the whole session,
+            # with no retry anywhere.
+            #
+            # So: settle the track only when nothing was to be found in the first
+            # place, and give a genuine failure a bounded number of retries on
+            # later frames before accepting that no counterpart exists.
+            tr2 = sess.playlist[idx]
+            needed = (
+                (mode == "song" and tr2.video_type == "MUSIC_VIDEO_TYPE_OMV")
+                or (mode == "video" and tr2.video_type == "MUSIC_VIDEO_TYPE_ATV")
+            )
+            if not needed:
+                # Already the right variant for this mode, or a UGC/unknown type
+                # we have no counterpart lookup for. Settled, truthfully.
+                tr2.variant_resolved_mode = mode
+            else:
+                tr2.variant_attempts += 1
+                if tr2.variant_attempts >= _VARIANT_RESOLVE_MAX_ATTEMPTS:
+                    # Tried enough times across enough frames to call it: this
+                    # song has no usable counterpart. Settle it so we stop paying
+                    # for the search, and let the client present it honestly.
+                    tr2.variant_resolved_mode = mode
+                    print(
+                        f"[radio] variant_unavailable mode={mode} video_id={vid} "
+                        f"attempts={tr2.variant_attempts} title={tr2.title!r}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[radio] variant_lookup_failed mode={mode} video_id={vid} "
+                        f"attempt={tr2.variant_attempts} — will retry",
+                        flush=True,
+                    )
 
     try:
         await asyncio.wait_for(
             asyncio.gather(*[_resolve_one(v) for v in targets], return_exceptions=True),
-            timeout=_VARIANT_RESOLVE_BUDGET,
+            timeout=budget,
         )
     except asyncio.TimeoutError:
         pass  # ship what's resolved; the rest resolve on a later frame
@@ -1625,13 +1716,21 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
         # below: an explicit Video tap on a Topic/ATV track wants the actual
         # music video, the surface changing is the whole point, and the
         # iframe's loadVideoById + mode-flip position carry absorb the reload.
-        await _resolve_upcoming_variants(sess)
+        #
+        # Same budget as the Video direction: a Song tap is off the audio path
+        # too (this branch deliberately does NO mid-track swap on the app), and
+        # the window it produces decides whether every later advance starts
+        # instantly or cold-builds. The 2s advance-path budget was left here
+        # when the Video direction got its own, and under it this window
+        # truncated to a single track.
+        await _resolve_upcoming_variants(sess, budget=_VARIANT_RESOLVE_FLIP_BUDGET)
         upcoming = _upcoming_tracks(sess)
         if upcoming:
             await broadcast_to_user(user_id, {
                 "type": "radio_upcoming",
                 "channel": channel,
                 "upcoming": upcoming,
+                "resolved_mode": sess.display_mode,
             })
         print(
             f"[radio] mode_toggle app-channel song: no mid-track swap; "
@@ -1695,6 +1794,41 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
             print(
                 f"[radio] {fail_log} fallback={current_track.video_id} "
                 f"(staying on current track, {mode} UI still applies)",
+                flush=True,
+            )
+
+        # The window is resolved PER MODE, and only the song direction above
+        # re-ships it. So a Video tap swapped the CURRENT track to its music
+        # video and left the phone holding the SONG-side (ATV) window for the
+        # rest of the station — and the phone's optimistic skip reads that
+        # window directly. Every ⏭ after a Video tap therefore jumped the card
+        # to an ATV id the station would never play, which YouTube renders as
+        # album art with no chrome: a song-looking card under a lit Video pill,
+        # corrected only when the pop's own resolved media_play landed. That is
+        # the "stale song card on Next, but only after toggling" report; it
+        # needed a toggle precisely because a toggle is the only thing that
+        # leaves the two sides disagreeing about the window.
+        if channel == "app" and sess.enabled and mode == "video":
+            # Bigger budget than the default 2s. This runs on an explicit user
+            # tap, not on the audio path — the current track keeps playing
+            # throughout — and `_upcoming_tracks` now refuses to advertise a
+            # slot the pop would still swap. So a 2s budget that resolves
+            # NOTHING does not ship a wrong window any more, it ships no window
+            # at all, which silently costs the phone its instant skip and its
+            # prefetch for the rest of the station. Measured 2026-08-07 against
+            # a tenant on this image: a Video tap produced zero radio_upcoming.
+            # Spend the time here instead; the reply is a frame, not audio.
+            await _resolve_upcoming_variants(sess, budget=_VARIANT_RESOLVE_FLIP_BUDGET)
+            _win = _upcoming_tracks(sess)
+            if _win:
+                await broadcast_to_user(user_id, {
+                    "type": "radio_upcoming",
+                    "channel": channel,
+                    "upcoming": _win,
+                    "resolved_mode": sess.display_mode,
+                })
+            print(
+                f"[radio] mode_toggle app-channel video: reshipped upcoming n={len(_win)}",
                 flush=True,
             )
 

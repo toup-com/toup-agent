@@ -740,9 +740,18 @@ async def lifespan(app: FastAPI):
                     app_manager=app_manager,
                     ws_broadcast=broadcast_to_user,
                 )
-                await skill_loader.register_dynamic(builder_skill)
-                set_app_builder_skill(builder_skill)
-                print("🏗️ App Builder skill registered")
+                # register_dynamic returns False when the `app_builder` tool
+                # family is withheld from this tenant
+                # (app/agent/tool_entitlements.py). Don't hand the skill to
+                # the /api/apps surface in that case, and don't print a
+                # success line for a skill that isn't there — a wrong boot
+                # log is how an unentitled tenant gets debugged as a bug.
+                if await skill_loader.register_dynamic(builder_skill):
+                    set_app_builder_skill(builder_skill)
+                    print("🏗️ App Builder skill registered")
+                else:
+                    builder_skill = None
+                    print("🏗️ App Builder skill withheld (not entitled)")
             except Exception as e:
                 logger.error(f"[INIT] AppBuilderSkill registration failed: {e}", exc_info=True)
         else:

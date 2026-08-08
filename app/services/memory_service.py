@@ -1,6 +1,5 @@
 """Memory service - CRUD operations and search for memories"""
 
-import asyncio
 import json
 import logging
 import re
@@ -25,6 +24,7 @@ from app.schemas import (
     MemorySearchRequest, MemoryCategory, MemoryType, MemoryLevel, BrainType
 )
 from app.memory_taxonomy import (
+    canonical_category_for_filter,
     category_for_relationship,
     humanize_relationship,
     normalize_category,
@@ -1025,7 +1025,15 @@ class MemoryService:
         ]
         
         if category:
-            conditions.append(Memory.category == category)
+            # Canonicalise at the point of use. The taxonomy carries retired
+            # aliases ("places" -> "locations"), and this filter ANDs, so an
+            # un-canonicalised value returns ZERO rows rather than degrading.
+            # Deliberately the FILTER-side function, not normalize_category:
+            # the write-path one falls back to `other`, which on a filter would
+            # search for a category the caller never asked for.
+            conditions.append(
+                Memory.category == canonical_category_for_filter(category, brain_type)
+            )
         if brain_type:
             conditions.append(Memory.brain_type == brain_type)
         if is_active and not include_superseded:
@@ -1109,7 +1117,15 @@ class MemoryService:
         if brain_type:
             conditions.append(Memory.brain_type == brain_type)
         if category:
-            conditions.append(Memory.category == category)
+            # Canonicalise at the point of use. The taxonomy carries retired
+            # aliases ("places" -> "locations"), and this filter ANDs, so an
+            # un-canonicalised value returns ZERO rows rather than degrading.
+            # Deliberately the FILTER-side function, not normalize_category:
+            # the write-path one falls back to `other`, which on a filter would
+            # search for a category the caller never asked for.
+            conditions.append(
+                Memory.category == canonical_category_for_filter(category, brain_type)
+            )
         if memory_type:
             conditions.append(Memory.memory_type == memory_type)
         if min_importance is not None:
@@ -1212,6 +1228,32 @@ class MemoryService:
 
         # Update content and regenerate embedding if content changed
         if "content" in update_dict:
+            # ── Storage backstop, mirroring create_memory ────────────────
+            #
+            # create_memory screens every new row against the never-store tier
+            # because eight callers reach it directly. update_memory reaches
+            # the SAME column with the SAME reachability — REST
+            # PUT /api/memories/{id}, the MCP memory_update tool (which is
+            # model-controlled), and the merge endpoint — and had no screen at
+            # all. A card number refused at create was accepted by editing the
+            # row afterwards.
+            #
+            # Placed ABOVE the embedding call on purpose: a never-store value
+            # must not be shipped to the embedding provider on its way to being
+            # rejected.
+            #
+            # Never-store tier only, for the same reasons create_memory
+            # documents: the length, echo and passphrase rules need the
+            # conversation turn, which this layer does not have.
+            _new_content = update_dict["content"] or ""
+            _secret = sensitive_content_reason(_new_content, explicit_save=True)
+            if _secret:
+                logger.warning(
+                    "[memory_gate] update backstop refused (%s) for user=%s memory=%s",
+                    _secret, str(user_id)[:8], str(memory_id)[:8],
+                )
+                raise MemoryRejected(_secret)
+
             old_values["content"] = memory.content[:100]  # Truncate for audit
             # W1.5 mirror (write path) + W1.4e: the old sync
             # `embedding_service.embed(...)` blocked the event loop and raised
@@ -1419,6 +1461,17 @@ class MemoryService:
                         Memory.memory_type.notin_(
                             ["event", "conversation", "task", "file"]
                         ),
+                        # active_task rows belong to the working set, not the
+                        # standing portrait. They are written at importance=0.9
+                        # (above this channel's 0.7 floor) with
+                        # memory_type="semantic" — which is not a MemoryType at
+                        # all, it is a MemoryLevel — so the notin_ list above
+                        # never caught them and every live reminder was asserted
+                        # as a permanent fact about the user, on every turn.
+                        # active_task_service now writes MemoryType.TASK, but
+                        # rows already on the fleet still carry "semantic", so
+                        # this excludes by category and covers both.
+                        Memory.category != "active_task",
                         or_(
                             Memory.expires_at.is_(None),
                             Memory.expires_at > datetime.utcnow(),
@@ -1565,7 +1618,21 @@ class MemoryService:
             query = query.where(Memory.brain_type == brain_type_value)
         
         if request.categories:
-            categories = [c.value for c in request.categories]
+            # MemorySearchRequest.categories is `Optional[List[str]]` (schemas.py),
+            # so these are plain strings and `c.value` raised AttributeError on
+            # EVERY category-filtered search — the brain_type branch six lines
+            # above already guards this and this one did not. Normalising as
+            # well keeps a retired alias from silently matching nothing: the
+            # filter ANDs, so one stale value returns zero rows rather than
+            # degrading.
+            _brain = getattr(request, "brain_type", None)
+            _brain = getattr(_brain, "value", _brain)
+            categories = [
+                canonical_category_for_filter(
+                    c.value if hasattr(c, "value") else c, _brain
+                )
+                for c in request.categories
+            ]
             query = query.where(Memory.category.in_(categories))
         
         if request.memory_types:
@@ -1600,6 +1667,7 @@ class MemoryService:
         use_weighted = getattr(request, 'use_weighted_scoring', True)
         scored_memories = []
         total_count = 0
+        pgvector_failed = False
 
         if use_pgvector:
             try:
@@ -1650,11 +1718,25 @@ class MemoryService:
                 
                 scored_memories.sort(key=lambda x: x[1], reverse=True)
                 scored_memories = scored_memories[:request.limit]
-            except Exception:
-                scored_memories = []  # Fall through to Python-side search
+            except Exception as e:
+                # The comment below used to say "fall through to Python-side
+                # search", and the guard on that fallback is `not use_pgvector`
+                # — so on Postgres, which is every tenant, THE FALLBACK WAS
+                # UNREACHABLE. A pgvector failure returned an empty list with a
+                # 200 and no log line: indistinguishable, to the caller and to
+                # the user, from "you have no memories matching that".
+                #
+                # Log it, and let the Python-side path actually run.
+                logger.error(
+                    f"[MEMORY] search_memories pgvector path failed, degrading to "
+                    f"Python-side similarity: {type(e).__name__}: {e}"
+                )
+                scored_memories = []
+                pgvector_failed = True
 
-        # Fallback: Python-side cosine similarity (SQLite or pgvector failure)
-        if not scored_memories and not use_pgvector:
+        # Fallback: Python-side cosine similarity (SQLite, or a pgvector failure
+        # above — the degrade has to be reachable on both).
+        if not scored_memories and (not use_pgvector or pgvector_failed):
             result = await self.db.execute(query)
             memories = result.scalars().all()
             total_count = len(memories)
@@ -1732,8 +1814,12 @@ class MemoryService:
         offset: int = 0
     ) -> List[Memory]:
         """Get memories by category (only active, non-deleted)"""
-        # Handle both enum and string categories
-        cat_value = category.value if hasattr(category, 'value') else str(category)
+        # Handle both enum and string categories, and normalise — this endpoint
+        # is the one a client uses to browse a category by name, so a retired
+        # alias returning an empty list reads as "you have nothing here".
+        cat_value = canonical_category_for_filter(
+            category.value if hasattr(category, 'value') else str(category)
+        )
         result = await self.db.execute(
             select(Memory)
             .where(
@@ -1954,6 +2040,7 @@ class MemoryService:
         limit: int = 5,
         min_similarity: float = 0.7,
         brain_type: Optional[str] = None,
+        embedding: Optional[List[float]] = None,
     ) -> List[Tuple[Memory, float]]:
         """Find memories similar to given content. Uses pgvector when available.
 
@@ -1963,8 +2050,19 @@ class MemoryService:
         silently reinforce a semantically similar USER-brain row instead of
         being stored — which is one reason the agent brain never accumulated
         anything. Callers that genuinely want a cross-brain search pass None.
+
+        `embedding` is the vector for exactly this `content`, when the caller
+        already holds it. It exists for callers that must embed the same string
+        anyway for the row they are about to write: passing it here makes this
+        method PURE SQL, so the caller pays for one embedding instead of two and
+        — the part that matters — the network round-trip can be hoisted out of
+        the caller's transaction instead of running while it holds row locks.
+        Left None, the vector is computed here, off the event loop.
         """
-        embedding = self.embedding_service.embed(content, api_key=self.api_key)
+        if embedding is None:
+            embedding = await self.embedding_service.embed_async(
+                content, api_key=self.api_key
+            )
 
         brain_filter = [Memory.brain_type == brain_type] if brain_type else []
 
@@ -2058,10 +2156,19 @@ class MemoryService:
                         aliases.append(first)
                 if email:
                     aliases.append(email.split("@")[0])
+            # Only a SUCCESSFUL lookup is worth caching. Caching the empty list
+            # from a failure pinned the gate into its stricter mode for the rest
+            # of the service instance's life, and no later call could recover
+            # it — the retry never happened because the cache said "asked
+            # already". A failure should cost one lookup, not the turn.
+            self._alias_cache = aliases
         except Exception as exc:
-            logger.debug("[memory_gate] alias lookup failed (non-fatal): %s", exc)
+            logger.warning(
+                "[memory_gate] alias lookup failed for user=%s; relationship "
+                "gating falls back to generic self-referents this turn: %s",
+                str(user_id)[:8], exc,
+            )
 
-        self._alias_cache = aliases
         return aliases
 
     async def _endpoint_in_user_world(
@@ -2145,7 +2252,136 @@ class MemoryService:
         Uses the dedicated entity_relationships table for efficient graph traversal.
         Also creates/updates a Memory record for backward compatibility and
         vector search (so the relationship is discoverable via semantic search too).
+
+        Ordering is load-bearing and is split into three phases:
+
+          1. PURE — render the sentence, screen it for never-store secrets,
+             and run the half of the mirror gate that needs no database. Not
+             one statement is issued on `self.db`.
+          2. EMBED — one embedding call, still with the session untouched.
+          3. SESSION — every read and write, using the vector from phase 2.
+
+        Phase 2 sits where it does on purpose: this function used to embed the
+        identical string TWICE (once inside `find_similar_memories`, once
+        directly before the INSERT), synchronously, and both times after
+        `_upsert_entity` had already FLUSHED an `entities` INSERT. That held
+        row locks and a pooled connection across two network round-trips while
+        blocking the event loop — the same shape as #407/#408, where awaiting a
+        network call with an open transaction pinned a pgbouncer connection and
+        turned every chat turn into a PendingRollbackError 500.
         """
+        # ── Phase 1: pure. Nothing here touches `self.db`. ────────────────
+        #
+        # `content` is what the user READS on the Memory screen (the card shows
+        # content, and summary is None for these rows) and what gets embedded.
+        # It used to be `predicate.replace("_", " ")` spliced between the two
+        # entity names, which is grammatical only by accident — `performed_by`
+        # reads fine, `play_on` produced "Better Call Saul play on Netflix".
+        # The triple itself is untouched: it stays structured in metadata_json
+        # below and in the entity_relationships edge.
+        relationship_content = humanize_relationship(
+            source_name, relationship, target_name
+        )
+        legacy_content = f"{source_name} {relationship.replace('_', ' ')} {target_name}"
+
+        # ── Never-store backstop ─────────────────────────────────────────
+        #
+        # This was the ONE Memory INSERT in the codebase with no content
+        # screen at all. Every other write path runs `memory_gate_reason` or
+        # the `create_memory` storage backstop; this one was guarded only by
+        # `relationship_gate_reason`, which judges the SHAPE of a triple
+        # (tautology, scaffolding, world knowledge) and has no opinion about
+        # its VALUES. `("USER", "has_api_key", "sk-…")` is a perfectly
+        # well-shaped, user-endpointed edge, so it sailed through — and
+        # `entity_relationship_create` is a model-callable MCP tool, so the
+        # payload is not even hypothetical.
+        #
+        # Only the NEVER_STORE tier applies (`explicit_save=True` selects it):
+        # API keys, bearer tokens, government identity numbers, card numbers
+        # and CVVs. Those are never legitimate in any memory on any path,
+        # however the write was requested, so enforcing them here cannot
+        # contradict a decision made upstream — exactly the argument
+        # `create_memory` makes for the identical check. The softer tiers
+        # (passphrases, length, scaffolding) are deliberately NOT applied:
+        # they need context this layer does not have.
+        #
+        # Detection lives in memory_gate and is not duplicated here.
+        #
+        # Unlike the mirror gate below, this refusal aborts the WHOLE write,
+        # graph edge included. A secret must not be reachable through the
+        # entity graph either: the names are stored verbatim in `entities.name`
+        # and rendered back into `entity_relationships.relationship_label`.
+        for _candidate in (
+            relationship_content,
+            f"{source_name} {relationship} {target_name}",
+        ):
+            _secret = sensitive_content_reason(_candidate, explicit_save=True)
+            if _secret:
+                logger.warning(
+                    "[memory_gate] entity relationship refused (%s) for user=%s",
+                    _secret, user_id,
+                )
+                return
+
+        from app.services.memory_gate import relationship_gate_reason
+
+        # ── Alias-independent half of the mirror gate ────────────────────
+        #
+        # Called with no aliases, `relationship_gate_reason` runs only the
+        # rules that need no identity — scaffolding, tautology/degenerate,
+        # agent-talking-about-itself, negated predicate — because the
+        # user-endpoint rule below them FAILS OPEN when identity is unknown
+        # (`_identity_is_known`). So a verdict returned here is one the
+        # alias-aware call in phase 3 would return too, whatever this tenant's
+        # display name turns out to be. It can only ever under-reject.
+        #
+        # Its only job is to spare the embedding for a payload already known
+        # to be junk. Rows rejected *later*, by the alias-aware
+        # `no_user_endpoint` rule, do pay for one embedding they never use —
+        # the price of getting the network call out of the transaction, and
+        # still a large net saving because every mirrored row now embeds once
+        # instead of twice.
+        early_gate_reason = relationship_gate_reason(
+            source_name,
+            relationship,
+            target_name,
+            user_aliases=None,
+            rendered=relationship_content,
+        )
+
+        # ── Phase 2: ONE embedding, session still untouched ──────────────
+        #
+        # No statement has been executed on `self.db` at this point, so there
+        # is no open transaction of this function's making, no flushed INSERT,
+        # and no row lock held while we wait on the provider.
+        #
+        # `embed_async` alone would NOT have been the fix: it is only a thread
+        # wrapper (`run_in_executor`), so it unblocks the event loop while
+        # leaving the round-trip exactly where it was. Position is the fix;
+        # `embed_async` is what keeps the loop free during it.
+        embedding: Optional[List[float]] = None
+        if not early_gate_reason:
+            # An embedding failure must never error the relationship write —
+            # same W1.5 mirror rule `create_memory` follows. Agent images ship
+            # without sentence-transformers, so a "local" provider raises
+            # ImportError, and the OpenAI path can fail transiently. Store the
+            # mirror unembedded instead; keyword and graph retrieval still find
+            # it. Before this reordering the raise happened after the graph
+            # edge was staged, so it also took the edge down with it.
+            try:
+                embedding = await self.embedding_service.embed_async(
+                    relationship_content, api_key=self.api_key
+                )
+            except Exception as e:
+                from app.services.embedding_service import record_embed_degrade
+                record_embed_degrade(e)
+                logger.warning(
+                    "[MEMORY] relationship embedding failed, mirroring without vector: %s",
+                    e,
+                )
+                embedding = None
+
+        # ── Phase 3: everything that touches the session ─────────────────
         # Upsert source and target entities
         source_entity = await self._upsert_entity(user_id, source_name, source_type)
         target_entity = await self._upsert_entity(user_id, target_name, target_type)
@@ -2186,19 +2422,7 @@ class MemoryService:
         
         # Also maintain backward-compatible relationship memory for vector search
         #
-        # `content` is what the user READS on the Memory screen (the card shows
-        # content, and summary is None for these rows) and what gets embedded.
-        # It used to be `predicate.replace("_", " ")` spliced between the two
-        # entity names, which is grammatical only by accident — `performed_by`
-        # reads fine, `play_on` produced "Better Call Saul play on Netflix".
-        # The triple itself is untouched: it stays structured in metadata_json
-        # below and in the entity_relationships edge.
-        relationship_content = humanize_relationship(
-            source_name, relationship, target_name
-        )
-        legacy_content = f"{source_name} {relationship.replace('_', ' ')} {target_name}"
-
-        # ── Write-time gate on the Memory MIRROR only ────────────────────
+        # ── Write-time gate on the Memory MIRROR only ─────────────────────
         # The graph edge above is already committed and is NOT gated: every
         # traversal, entity map and graph query keeps full fidelity. What is
         # gated is whether this edge also becomes a row the user reads on the
@@ -2207,9 +2431,10 @@ class MemoryService:
         # 59 of the 73 junk memories on the founder's tenant came through
         # here, because this path had no quality check of any kind — it
         # rendered whatever triple the LLM emitted and INSERTed it.
-        from app.services.memory_gate import relationship_gate_reason
-
-        gate_reason = relationship_gate_reason(
+        #
+        # The alias-independent rules already ran in phase 1; the alias lookup
+        # is a DB read, so its half of the verdict waits until here.
+        gate_reason = early_gate_reason or relationship_gate_reason(
             source_name,
             relationship,
             target_name,
@@ -2235,13 +2460,23 @@ class MemoryService:
                 gate_reason, describe_memory(relationship_content),
             )
             return
-        existing = await self.find_similar_memories(
-            user_id=user_id,
-            content=relationship_content,
-            limit=1,
-            min_similarity=0.85,
-            brain_type="user",
-        )
+
+        # Reuses the phase-2 vector, so this is pure SQL: no provider call is
+        # made from inside the transaction the entity upserts just opened.
+        # When the embedding degraded to None the similarity probe is skipped
+        # rather than allowed to embed for itself — the same trade `create_memory`
+        # makes ("dedup needs the vector"). The exact-content forget guard below
+        # is unaffected, so a forgotten relationship still stays forgotten.
+        existing: List[Tuple[Memory, float]] = []
+        if embedding is not None:
+            existing = await self.find_similar_memories(
+                user_id=user_id,
+                content=relationship_content,
+                limit=1,
+                min_similarity=0.85,
+                brain_type="user",
+                embedding=embedding,
+            )
 
         # A relationship the user has explicitly forgotten must stay forgotten.
         # find_similar_memories excludes soft-deleted rows, so without this
@@ -2306,8 +2541,8 @@ class MemoryService:
                         describe_memory(row.content),
                     )
 
-            embedding = self.embedding_service.embed(relationship_content, api_key=self.api_key)
-            
+            # (the vector was computed once, in phase 2, before this
+            # transaction existed — see the docstring)
             rel_memory = Memory(
                 id=str(uuid.uuid4()),
                 user_id=user_id,
@@ -2325,7 +2560,7 @@ class MemoryService:
                 category=category_for_relationship(source_type, target_type),
                 memory_type="fact",
                 memory_level="episodic",
-                embedding_json=json.dumps(embedding),
+                embedding_json=json.dumps(embedding) if embedding is not None else None,
                 embedding=embedding,
                 importance=0.6,
                 confidence=confidence,
@@ -2739,6 +2974,15 @@ class MemoryService:
             Memory.user_id == user_id,
             Memory.is_deleted == False,
             Memory.is_active == True,
+            # Honour the lifetime the write side granted. get_core_facts has
+            # always filtered on this; hybrid_search did not, so an expired
+            # transient memory stayed retrievable — and the maintenance sweep
+            # that would archive it sits behind a flag not enabled in
+            # production. A TTL that only one read path enforces is not a TTL.
+            or_(
+                Memory.expires_at.is_(None),
+                Memory.expires_at > datetime.utcnow(),
+            ),
         ]
         # F5: real min_strength floor. The decay model is meaningless if
         # forgotten memories can still be retrieved. Active_task memories
@@ -2749,25 +2993,56 @@ class MemoryService:
         if brain_types:
             conditions.append(Memory.brain_type.in_(brain_types))
         if categories:
-            conditions.append(Memory.category.in_(categories))
+            # Filter-side canonicalisation, and brain-aware: `domain_knowledge`
+            # and `process` are real categories in the agent and work
+            # vocabularies, and the write-path normalizer maps both to `other`.
+            _brain = brain_types[0] if brain_types and len(brain_types) == 1 else None
+            conditions.append(
+                Memory.category.in_(
+                    [canonical_category_for_filter(c, _brain) for c in categories]
+                )
+            )
         if created_after:
             conditions.append(Memory.created_at >= created_after)
         if created_before:
             conditions.append(Memory.created_at <= created_before)
         
-        # Phase 7: Auto-detect temporal intent from query
+        # Phase 7: auto-detect temporal intent from the query.
+        #
+        # A time word in the question STEERS retrieval; it must never RESTRICT
+        # it. `created_at` is when the row was written — it is not what the
+        # memory is about. The two were conflated here: an auto-detected window
+        # was appended to `conditions`, which every strategy inherits, so
+        # "what am I doing today?" answered from memories written today and
+        # "my birthday is in June" answered from rows written in June 2026.
+        #
+        # Measured on a live tenant, 2026-08-07, production settings, warm
+        # sessions, temporal strategy left ON in both arms so the only variable
+        # was the window:
+        #     what am I doing today?        1 of 10 memories reachable
+        #     what happened yesterday?      0 of 10
+        #     what did we decide in March?  0 of 10
+        #     -> 59 of 60 retrievable memories hidden (98.3%)
+        #
+        # The signal is still used, in the place where it is meaningful: it
+        # arms the `temporal` strategy below, which RANKS by recency inside the
+        # window and competes in RRF like any other leg. A memory the user
+        # actually wants can now win on semantic or lexical evidence even
+        # though it was written months before they asked about "this week".
+        #
+        # An EXPLICIT created_after/created_before from the caller is still a
+        # hard filter — that is an API contract ("search memories I recorded in
+        # this range"), not an inference from prose.
         temporal = extract_temporal_filters(query)
-        temporal_after = created_after  # Preserve explicit params
-        temporal_before = created_before
+        temporal_after = created_after or temporal.get("created_after")
+        temporal_before = created_before or temporal.get("created_before")
         if temporal["has_temporal"]:
-            logger.info(f"[HYBRID] Temporal detected: {temporal['temporal_keywords']} → after={temporal.get('created_after')}, before={temporal.get('created_before')}")
-            if temporal["created_after"] and not created_after:
-                conditions.append(Memory.created_at >= temporal["created_after"])
-                temporal_after = temporal["created_after"]
-            if temporal["created_before"] and not created_before:
-                conditions.append(Memory.created_at <= temporal["created_before"])
-                temporal_before = temporal["created_before"]
-        
+            logger.info(
+                f"[HYBRID] Temporal detected: {temporal['temporal_keywords']} → "
+                f"ranking window after={temporal.get('created_after')} "
+                f"before={temporal.get('created_before')} (ranking only, not a filter)"
+            )
+
         # Generate query embedding once (shared by vector strategy)
         # Use async version to avoid blocking the event loop during chat
         # W1.5: an embedding failure must not kill the whole search —
@@ -2800,33 +3075,80 @@ class MemoryService:
             )
         if "graph" in strategies:
             tasks["graph"] = self._graph_search(
-                user_id, query, fetch_limit
+                user_id, query, fetch_limit, conditions
             )
         if "temporal" in strategies or temporal.get("has_temporal"):
             tasks["temporal"] = self._temporal_search(
-                user_id, query, fetch_limit, temporal_after, temporal_before
+                user_id, query, fetch_limit, temporal_after, temporal_before,
+                conditions,
             )
         
-        # Execute all strategies concurrently
+        # Run the strategies ONE AT A TIME. This used to be an
+        # asyncio.gather over `tasks.values()`, and that was wrong in a way
+        # that cost most of the user's recall:
+        #
+        #   Every strategy executes on the SAME self.db. An AsyncSession is
+        #   not safe for concurrent use, so the gathered coroutines raced to
+        #   provision the session's connection and every leg but the first
+        #   died with "This session is provisioning a new connection;
+        #   concurrent operations are not permitted". Three of the four
+        #   strategies swallow their own exception into `return []`, so the
+        #   search did not fail — it just came back short, silently.
+        #
+        #   The race only bites on a session whose first statement IS the
+        #   search. Auto-recall reuses the turn's warm session and was fine;
+        #   `memory_search` (tool_executor._tool_memory_search) opens a fresh
+        #   session per call and was degraded on EVERY invocation.
+        #
+        #   Measured on a live tenant, 2026-08-07, production settings
+        #   (limit=10, min_similarity=0.35), 12 realistic queries:
+        #       cold session 11 memories, warm session 33 -> 66.7% lost.
+        #       "what is my name?" returned 0 cold and 5 warm.
+        #   Un-instrumented control: gather 3 statements on a cold session,
+        #   2 of 3 raised, 5 runs of 5. Sequential: 3 of 3 succeeded.
+        #
+        # Sequential costs nothing, because the concurrency was never real:
+        # one AsyncSession holds ONE connection and Postgres runs one
+        # statement at a time on it. Same tenant, 20 x 10ms statements:
+        # gather 330ms, sequential 359ms — within noise of each other, and
+        # both ~= the 200ms the server-side sleeps alone demand.
+        #
+        # If these ever need to be genuinely parallel, each leg needs its own
+        # AsyncSession — which on the agent (NullPool) means a new physical
+        # connection through pgbouncer per leg per search. Don't, unless the
+        # latency budget actually demands it; it currently does not (retrieval
+        # p95 is ~26ms against a 150ms budget).
         task_names = list(tasks.keys())
-        task_coros = list(tasks.values())
-        
-        try:
-            results = await asyncio.gather(*task_coros, return_exceptions=True)
-        except Exception as e:
-            logger.warning(f"Hybrid search gather failed: {e}")
-            results = []
-        
+        results = []
+        for _name in task_names:
+            try:
+                results.append(await tasks[_name])
+            except Exception as e:  # noqa: BLE001 - one leg must not kill the search
+                results.append(e)
+
         # Collect valid ranked lists
         ranked_lists = []
+        degraded = []
         for name, result in zip(task_names, results):
             if isinstance(result, Exception):
-                logger.warning(f"Strategy '{name}' failed: {result}")
+                # error, not warning: a strategy that dies is indistinguishable
+                # from "nothing matched" in the response, so the log is the only
+                # place this is ever visible.
+                logger.error(
+                    f"[HYBRID] Strategy '{name}' failed: {type(result).__name__}: {result}"
+                )
+                degraded.append(name)
                 continue
             if result:
                 ranked_lists.append(result)
                 logger.info(f"[HYBRID] Strategy '{name}' returned {len(result)} results")
-        
+        if degraded:
+            logger.error(
+                f"[HYBRID] DEGRADED search for user={str(user_id)[:8]}: "
+                f"{len(degraded)}/{len(task_names)} strategies failed ({','.join(degraded)}) "
+                f"— results are incomplete"
+            )
+
         if not ranked_lists:
             return []
         
@@ -2871,8 +3193,15 @@ class MemoryService:
                 sim_result = await self.db.execute(sim_query)
                 for row in sim_result.all():
                     similarity_map[row.id] = row.sim
-            except Exception:
-                pass  # Fall through — similarity will be 0
+            except Exception as e:
+                # Not fatal — the rows are already chosen — but every similarity
+                # silently becomes 0, which flattens the weighted scoring that
+                # orders them. Ranking degrading with no log is how "recall got
+                # worse and nobody knows when" happens.
+                logger.warning(
+                    f"[HYBRID] similarity probe failed, all similarities will read "
+                    f"0 and weighted ranking is degraded: {type(e).__name__}: {e}"
+                )
         
         # Apply Brain's weighted scoring on top of RRF
         rrf_scores = dict(fused)
@@ -2940,21 +3269,66 @@ class MemoryService:
                 scored_memories = reranked
         except Exception as e:
             logger.warning(f"[HYBRID] Re-ranker failed, using score-based ranking: {e}")
-            scored_memories = scored_memories[:limit]
 
-        # Auto-reinforce top retrieved memories (spaced repetition)
+        # `limit` is a contract, not a hint. Every leg above deliberately
+        # over-fetches to give the re-ranker something to choose from
+        # (`fetch_limit = limit * 4` per strategy, RRF then keeps `limit * 3`),
+        # and the trim back down used to live ONLY inside the re-rank branch
+        # and its except handler. So when `enable_reranker` is False — it is
+        # in RELOADABLE_FIELDS (app/agent/config_reload.py), a tenant can flip
+        # it at runtime with no deploy — neither ran, and hybrid_search handed
+        # the caller up to 3x the rows it asked for. agent_runner injects that
+        # straight into the turn prompt: more tokens every turn, worse
+        # precision. One truncation point, applied on every path.
+        scored_memories = scored_memories[:limit]
+
+        # Retrieval-time auto-reinforcement — OFF by default since 2026-08-06.
+        #
+        # This used to run unconditionally on every hybrid_search call, and it
+        # is wrong twice over:
+        #
+        #   1. It reinforces on the RANKER'S OPINION, not on evidence. A row
+        #      that surfaces for the wrong query gets permanently stronger and
+        #      is therefore more likely to surface again — strength feeds back
+        #      into `final_score` at the top of this very function. Decay never
+        #      runs against tenant memories (settings.agent_memory_maintenance_
+        #      enabled is False and platform_main's decay job runs against the
+        #      platform DB, where `memories` does not live), so there is no
+        #      counter-force: strength is a one-way ratchet to MAX_STRENGTH.
+        #
+        #   2. DecayService.reinforce_memory COMMITS the session it is given
+        #      (decay_service.py, end of reinforce_memory). `self.db` here is
+        #      the CALLER'S session — on the chat path that is the turn-scoped
+        #      session opened in AgentRunner._run_inner, and hybrid_search is
+        #      called from the middle of _build_system_prompt. So prompt
+        #      assembly fired up to 5 commits, ×2 for the agent-brain leg,
+        #      on a session whose transaction boundaries belong to the caller.
+        #
+        # Reinforcement now lives in RetrievalFeedback.log_retrieval_feedback:
+        # off the request path, on its own background session, and only for the
+        # memories the finished response actually cited. See config.py
+        # (memory_reinforce_on_retrieval / memory_reinforce_on_cite).
         try:
-            from app.services.decay_service import DecayService
-            decay_svc = DecayService(self.db)
-            for mem in scored_memories[:5]:
-                await decay_svc.reinforce_memory(
-                    memory_id=mem["id"],
-                    user_id=user_id,
-                    access_context="retrieval",
-                    similarity_score=mem.get("similarity_score", 0.5),
-                )
-        except Exception as e:
-            logger.warning(f"[HYBRID] Auto-reinforcement failed (non-fatal): {e}")
+            from app.config import settings as _reinforce_settings
+            _reinforce_on_retrieval = bool(
+                getattr(_reinforce_settings, "memory_reinforce_on_retrieval", False)
+            )
+        except Exception:
+            _reinforce_on_retrieval = False
+
+        if _reinforce_on_retrieval:
+            try:
+                from app.services.decay_service import DecayService
+                decay_svc = DecayService(self.db)
+                for mem in scored_memories[:5]:
+                    await decay_svc.reinforce_memory(
+                        memory_id=mem["id"],
+                        user_id=user_id,
+                        access_context="retrieval",
+                        similarity_score=mem.get("similarity_score", 0.5),
+                    )
+            except Exception as e:
+                logger.warning(f"[HYBRID] Auto-reinforcement failed (non-fatal): {e}")
 
         return scored_memories
 
@@ -2998,7 +3372,11 @@ class MemoryService:
             # Apply the floor as an explicit filter so callers can tune it.
             floor = max(min_similarity, 0.0)
             return [(row.id, row.similarity) for row in result.all() if row.similarity > floor]
-        except Exception:
+        except Exception as e:
+            # Never swallow this silently: an empty list here is indistinguishable
+            # from "the user has no matching memories". A bare `return []` hid a
+            # session race for weeks (see the note in hybrid_search).
+            logger.error(f"[HYBRID] _vector_search failed: {type(e).__name__}: {e}")
             return []
 
     async def _keyword_search(
@@ -3041,8 +3419,14 @@ class MemoryService:
             rows = result.all()
             if rows:
                 return [(row.id, float(row.rank)) for row in rows]
-        except Exception:
-            pass  # Fall through to ILIKE
+        except Exception as e:
+            # Fall through to ILIKE — but say so. This is the expected path on
+            # a DB without the tsvector column; it is NOT expected to be how a
+            # session race gets hidden.
+            logger.warning(
+                f"[HYBRID] _keyword_search tsvector path failed, falling back to "
+                f"ILIKE: {type(e).__name__}: {e}"
+            )
         
         # Fallback: simple ILIKE search
         try:
@@ -3070,7 +3454,8 @@ class MemoryService:
             result = await self.db.execute(stmt)
             # Give ILIKE results a uniform rank (no ts_rank available)
             return [(row.id, 0.5) for row in result.all()]
-        except Exception:
+        except Exception as e:
+            logger.error(f"[HYBRID] _keyword_search ILIKE fallback failed: {type(e).__name__}: {e}")
             return []
 
     async def _graph_search(
@@ -3078,6 +3463,7 @@ class MemoryService:
         user_id: str,
         query: str,
         limit: int,
+        conditions: Optional[list] = None,
     ) -> List[Tuple[str, float]]:
         """
         Entity-graph search using recursive CTE for multi-hop traversal.
@@ -3149,15 +3535,31 @@ class MemoryService:
             # Decay score by depth: direct=1.0, 1-hop=0.5, 2-hop=0.25
             memory_scores[memory_id] += 1.0 / (1 + depth)
         
-        # Filter to active, non-deleted memories owned by this user
+        # Filter to memories this query is actually allowed to see.
+        #
+        # `conditions` is hybrid_search's full predicate list — ownership and
+        # liveness, PLUS brain_types, categories, min_strength and any date
+        # bounds. This leg used to hardcode only the first three, so a query
+        # scoped to `brain_types=["agent"]` could still be handed a USER-brain
+        # row by the graph. That row is then rendered under "How this user
+        # wants you to work (learned from their corrections — follow these)"
+        # — a plain fact about the user, presented to the model as a
+        # behavioural directive it should obey.
+        #
+        # Same argument for `categories`: query_classifier ANDs a category
+        # filter onto the query precisely so an unrelated class cannot answer
+        # it, and a leg that ignores the filter defeats that silently.
         if memory_scores:
+            _scope = list(conditions) if conditions else [
+                Memory.user_id == user_id,
+                Memory.is_deleted == False,
+                Memory.is_active == True,
+            ]
             result = await self.db.execute(
                 select(Memory.id).where(
                     and_(
                         Memory.id.in_(list(memory_scores.keys())),
-                        Memory.user_id == user_id,
-                        Memory.is_deleted == False,
-                        Memory.is_active == True,
+                        *_scope,
                     )
                 )
             )
@@ -3176,6 +3578,7 @@ class MemoryService:
         limit: int,
         created_after: Optional[datetime] = None,
         created_before: Optional[datetime] = None,
+        conditions: Optional[list] = None,
     ) -> List[Tuple[str, float]]:
         """
         Temporal retrieval strategy — prioritizes recency within a time window.
@@ -3191,12 +3594,18 @@ class MemoryService:
         Returns [(memory_id, temporal_score)] sorted by score desc.
         """
         try:
-            conditions = [
+            # Start from hybrid_search's full predicate list when it was
+            # given — ownership and liveness PLUS brain_types, categories and
+            # min_strength. Hardcoding only the first three let this leg
+            # answer a `brain_types=["agent"]` query with a USER-brain row,
+            # which the caller then renders as a behavioural directive. See
+            # the matching note in _graph_search.
+            conditions = list(conditions) if conditions else [
                 Memory.user_id == user_id,
                 Memory.is_deleted == False,
                 Memory.is_active == True,
             ]
-            
+
             if created_after:
                 conditions.append(Memory.created_at >= created_after)
             if created_before:
@@ -3240,8 +3649,9 @@ class MemoryService:
             
             scored.sort(key=lambda x: x[1], reverse=True)
             return scored[:limit]
-        
-        except Exception:
+
+        except Exception as e:
+            logger.error(f"[HYBRID] _temporal_search failed: {type(e).__name__}: {e}")
             return []
 
     async def traverse_entity_graph(
@@ -3621,7 +4031,15 @@ class MemoryService:
         if brain_types:
             conditions.append(Memory.brain_type.in_(brain_types))
         if categories:
-            conditions.append(Memory.category.in_(categories))
+            # Filter-side canonicalisation, and brain-aware: `domain_knowledge`
+            # and `process` are real categories in the agent and work
+            # vocabularies, and the write-path normalizer maps both to `other`.
+            _brain = brain_types[0] if brain_types and len(brain_types) == 1 else None
+            conditions.append(
+                Memory.category.in_(
+                    [canonical_category_for_filter(c, _brain) for c in categories]
+                )
+            )
         if created_after:
             conditions.append(Memory.created_at >= created_after)
         if created_before:
@@ -3687,8 +4105,16 @@ class MemoryService:
                 
                 scored_memories.sort(key=lambda x: x["final_score"], reverse=True)
                 return scored_memories[:limit]
-            except Exception:
-                scored_memories = []  # Fall through to Python-side search
+            except Exception as e:
+                # This one's fallback IS reachable (no `not use_pgvector` guard),
+                # so the degrade works — it just happened in total silence. This
+                # feeds the dedup candidate set, so a silent degrade here shows
+                # up as duplicate rows, not as an error.
+                logger.error(
+                    f"[MEMORY] search_memories_by_embedding pgvector path failed, "
+                    f"degrading to Python-side similarity: {type(e).__name__}: {e}"
+                )
+                scored_memories = []
         
         # Fallback: Python-side cosine similarity
         # Remove the pgvector-specific condition if it was added
@@ -3700,7 +4126,15 @@ class MemoryService:
         if brain_types:
             conditions.append(Memory.brain_type.in_(brain_types))
         if categories:
-            conditions.append(Memory.category.in_(categories))
+            # Filter-side canonicalisation, and brain-aware: `domain_knowledge`
+            # and `process` are real categories in the agent and work
+            # vocabularies, and the write-path normalizer maps both to `other`.
+            _brain = brain_types[0] if brain_types and len(brain_types) == 1 else None
+            conditions.append(
+                Memory.category.in_(
+                    [canonical_category_for_filter(c, _brain) for c in categories]
+                )
+            )
         if created_after:
             conditions.append(Memory.created_at >= created_after)
         if created_before:

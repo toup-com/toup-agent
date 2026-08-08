@@ -285,7 +285,14 @@ async def test_merge_threads_embedding_into_merge_memory(monkeypatch):
     existing = MagicMock(canonical_content="the user works at Google", content="the user works at Google")
     dedup._get_memory_by_id = AsyncMock(return_value=existing)
     dedup._llm_merge_contents = AsyncMock(return_value=("the user works at Google as an engineer", "added role"))
-    updated = MagicMock(importance=0.9)
+    # expires_at is set explicitly for the same reason _FakeDedupService below
+    # mirrors its input's fields: the stand-in must carry every attribute the
+    # caller reads. _merge_memories now reconciles the expiry lease (a transient
+    # memory restated as durable must not keep its horizon), and a bare
+    # MagicMock returns a truthy mock for `.expires_at`, which sends it down the
+    # promote branch and into `await self.db.commit()` on a mock session.
+    # A real merge target has expires_at None or a datetime.
+    updated = MagicMock(importance=0.9, expires_at=None)
     dedup.memory_service.merge_memory = AsyncMock(return_value=updated)
 
     result = await dedup._merge_memories(

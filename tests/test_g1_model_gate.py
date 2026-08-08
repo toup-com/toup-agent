@@ -46,11 +46,28 @@ async def _reset_database():
 # ── 1. Pricing dicts: the three 5.6 tiers everywhere ─────────────────
 
 # (input, cached_input, cache_write, output) in USD per 1M tokens.
+#
+# terra's cache_write was 3.125 — a MODELLED 1.25x input surcharge, taken from
+# the pricing page during G1 prep. Measured against OpenAI's organization
+# billing on 2026-08-07 it is 2.50, terra's plain list input rate: the billed
+# `cache writes` line divided by the tokens it covers gives $2.548/M, while the
+# separate `terra, input` line is $0.0045, i.e. nil. OpenAI files terra's
+# ordinary uncached input under that label rather than surcharging it.
+# See docs/audits/2026-08-g1-cost-and-latency.md §8.2.
+#
+# sol and luna keep the modelled 1.25x: neither has carried production
+# traffic, so there is nothing to measure, and "correcting" them by analogy
+# with terra would be inventing a number.
 _EXPECTED_PER_1M = {
-    "gpt-5.6-terra": (2.50, 0.25, 3.125, 15.00),
+    "gpt-5.6-terra": (2.50, 0.25, 2.50, 15.00),
     "gpt-5.6-sol": (5.00, 0.50, 6.25, 30.00),
     "gpt-5.6-luna": (1.00, 0.10, 1.25, 6.00),
 }
+
+# Which of the above are MEASURED against real billing vs modelled from the
+# published price list. Kept explicit so a future edit cannot quietly promote
+# a modelled figure to a measured one.
+_MEASURED_CACHE_WRITE = {"gpt-5.6-terra"}
 
 
 class TestPricingDicts(unittest.TestCase):
@@ -64,19 +81,42 @@ class TestPricingDicts(unittest.TestCase):
             self.assertAlmostEqual(entry["cache_write"], write / 1000)
             self.assertAlmostEqual(entry["output"], out / 1000)
 
-    def test_cache_write_is_exactly_1_25x_input(self):
-        """The 5.6 regime bills cache writes at 1.25x input — pin the ratio
-        so a price edit can't silently break the economics note."""
+    def test_unmeasured_tiers_keep_the_modelled_1_25x_cache_write(self):
+        """sol and luna have never carried production traffic, so 1.25x is
+        the published-price model and there is nothing to check it against.
+        Pin the ratio so a price edit can't silently break the economics note.
+        """
         from app.config import settings
-        for model in _EXPECTED_PER_1M:
+        for model in set(_EXPECTED_PER_1M) - _MEASURED_CACHE_WRITE:
             entry = settings.pricing_per_1k[model]
             self.assertAlmostEqual(entry["cache_write"], entry["input"] * 1.25)
 
-    def test_live_models_have_no_cache_columns(self):
-        """Legacy/live models must NOT grow the cache columns in this PR —
-        their presence is what activates the new billing math."""
+    def test_terra_cache_write_is_measured_at_the_plain_input_rate(self):
+        """terra is the one tier with real billing behind it, and the 1.25x
+        surcharge did not survive contact with it (see _EXPECTED_PER_1M).
+        This is the anti-vacuity partner of the test above: without it, the
+        1.25x rule would look like it still held across the family."""
         from app.config import settings
-        for model in ("gpt-5.5", "gpt-4o", "gpt-4o-mini", "gpt-5.4",
+        entry = settings.pricing_per_1k["gpt-5.6-terra"]
+        self.assertAlmostEqual(entry["cache_write"], entry["input"])
+        self.assertNotAlmostEqual(entry["cache_write"], entry["input"] * 1.25)
+
+    def test_models_with_no_measured_cached_rate_have_no_cached_column(self):
+        """A cached_input column must never be present without a measurement
+        behind it — inventing a discount replaces a known-wrong number with an
+        unknown-wrong one.
+
+        This used to include gpt-5.5 and gpt-4o-mini under the G1-prep rule
+        "live models must NOT grow the cache columns in this PR". That rule
+        outlived its PR: measured against OpenAI's organization billing on
+        2026-08-07, both DO receive a cached-input discount ($0.5493/M at
+        0.098x uncached, and $0.0750/M at 0.500x), and 56.8% / 43.3% of their
+        input comes back cached. Withholding the column was overcharging them
+        in our own ledger. They moved to
+        test_pricing_table_matches_billing.py, which pins the measured ratios.
+        """
+        from app.config import settings
+        for model in ("gpt-4o", "gpt-5.4", "gpt-5", "gpt-4.1",
                       "claude-opus-4-6", "claude-sonnet-4-6"):
             entry = settings.pricing_per_1k[model]
             self.assertNotIn("cached_input", entry, model)
@@ -126,17 +166,31 @@ class TestProxyCostMath(unittest.TestCase):
             _calc_cost_cents("gpt-5.6-terra", 100_000, 1_000, cached_tokens=80_000), 8
         )
 
-    def test_terra_cache_write_bills_at_1_25x(self):
+    def test_terra_cache_write_bills_at_the_plain_input_rate(self):
         from app.api.llm_proxy import _calc_cost_cents
-        # 100k in of which 80k written to cache: 20k*$2.5/M + 80k*$3.125/M
-        # + 1k*$15/M = $0.05 + $0.25 + $0.015 = 31.5c → 31 (a write turn
-        # costs MORE than an uncached turn — the 1.25x economics).
+        # 100k in of which 80k written to cache: 20k*$2.5/M + 80k*$2.5/M
+        # + 1k*$15/M = $0.05 + $0.20 + $0.015 = 26.5c → 26.
+        #
+        # This asserted 31 (the 1.25x model) until the rate was measured. A
+        # write turn costs the SAME as an uncached turn, which is why terra's
+        # billing looked so alarming from the outside — 97% of its spend sat
+        # under a "cache writes" line that is really just its input line.
         self.assertEqual(
             _calc_cost_cents(
                 "gpt-5.6-terra", 100_000, 1_000, cache_write_tokens=80_000
             ),
-            31,
+            26,
         )
+
+    def test_a_terra_write_turn_costs_the_same_as_an_uncached_one(self):
+        """States the economics directly rather than through a magic number,
+        so the claim survives a list-price change."""
+        from app.api.llm_proxy import _calc_cost_cents
+        uncached = _calc_cost_cents("gpt-5.6-terra", 100_000, 1_000)
+        written = _calc_cost_cents(
+            "gpt-5.6-terra", 100_000, 1_000, cache_write_tokens=80_000
+        )
+        self.assertEqual(written, uncached)
 
     def test_terra_read_and_write_disjoint_and_clamped(self):
         from app.api.llm_proxy import _calc_cost_cents
@@ -152,17 +206,27 @@ class TestProxyCostMath(unittest.TestCase):
             1,
         )
 
-    def test_gpt55_billing_byte_identical_with_cache_kwargs(self):
-        """The live default model's billing must not move in this PR."""
+    def test_gpt55_cached_reads_are_discounted(self):
+        """Was `test_gpt55_billing_byte_identical_with_cache_kwargs`, pinning
+        "the live default model's billing must not move in this PR". That was
+        correct scoping for G1 prep and became a defect once the window
+        closed: OpenAI bills gpt-5.5 a cached-input line ($2.98 over 14 days,
+        $0.5493/M measured = 0.098x uncached) and we were charging those
+        tokens at the full rate.
+
+        cache_write stays inert — gpt-5.5 has no measured cache-write rate and
+        must not acquire one by analogy."""
         from app.api.llm_proxy import _calc_cost_cents
         base = _calc_cost_cents("gpt-5.5", 27_200, 500)
-        self.assertEqual(
-            _calc_cost_cents(
-                "gpt-5.5", 27_200, 500,
-                cached_tokens=22_144, cache_write_tokens=5_000,
-            ),
-            base,
+        cached = _calc_cost_cents(
+            "gpt-5.5", 27_200, 500,
+            cached_tokens=22_144, cache_write_tokens=5_000,
         )
+        self.assertLess(cached, base)
+        # 22,144 of 27,200 input tokens move from $5/M to $0.50/M:
+        # 5,056*$5/M + 22,144*$0.50/M + 500*$30/M
+        # = $0.02528 + $0.011072 + $0.015 = 5.1372c → int() → 5.
+        self.assertEqual(cached, 5)
 
 
 class TestCreditMath(unittest.TestCase):
@@ -173,21 +237,39 @@ class TestCreditMath(unittest.TestCase):
         self.assertEqual(cold, Decimal("26.5"))
         self.assertEqual(warm, Decimal("8.5"))
 
-    def test_terra_credits_bill_cache_writes(self):
+    def test_terra_credits_bill_cache_writes_at_the_input_rate(self):
         from app.services.credit_service import tokens_to_credits
         write_turn = tokens_to_credits(
             "gpt-5.6-terra", 100_000, 1_000, cache_write_tokens=80_000
         )
-        self.assertEqual(write_turn, Decimal("31.5"))
+        # Was 31.5 under the modelled 1.25x surcharge; measured, a write turn
+        # prices identically to an uncached one.
+        self.assertEqual(write_turn, Decimal("26.5"))
+        self.assertEqual(
+            write_turn, tokens_to_credits("gpt-5.6-terra", 100_000, 1_000)
+        )
 
-    def test_gpt55_credits_identical_with_cache_kwargs(self):
+    def test_gpt55_credits_discount_cached_reads(self):
+        """Credits track the proxy's cost math, so the gpt-5.5 cached-input
+        correction has to land in both or the two ledgers disagree."""
         from app.services.credit_service import tokens_to_credits, tokens_to_credits_raw
         for fn in (tokens_to_credits, tokens_to_credits_raw):
             base = fn("gpt-5.5", 27_200, 500)
+            cached = fn("gpt-5.5", 27_200, 500,
+                        cached_tokens=22_144, cache_write_tokens=5_000)
+            self.assertLess(cached, base, fn.__name__)
+
+    def test_a_model_with_no_measured_cached_rate_still_ignores_the_kwargs(self):
+        """Anti-vacuity control: the credit path must not have grown a blanket
+        cache discount. gpt-4o has no measured cached rate and no column."""
+        from app.services.credit_service import tokens_to_credits, tokens_to_credits_raw
+        for fn in (tokens_to_credits, tokens_to_credits_raw):
+            base = fn("gpt-4o", 27_200, 500)
             self.assertEqual(
-                fn("gpt-5.5", 27_200, 500,
+                fn("gpt-4o", 27_200, 500,
                    cached_tokens=22_144, cache_write_tokens=5_000),
                 base,
+                fn.__name__,
             )
 
     def test_unknown_model_fallback_unchanged(self):
@@ -302,8 +384,11 @@ class TestProModelGuard(unittest.TestCase):
             self.assertTrue(mr.has_cached_input_rate(model), model)
 
     def test_settings_override_to_pro_falls_back_to_canonical(self):
+        # Assert against the constant, not a literal: what this test cares
+        # about is "falls through to the canonical default", and pinning the
+        # literal makes every model bump look like a gate regression.
         with _settings_with(agent_model="gpt-5.5-pro"):
-            self.assertEqual(mr.default_model(), "gpt-5.5")
+            self.assertEqual(mr.default_model(), mr._CANONICAL_AGENT_MODEL)
 
     def test_per_tenant_pro_falls_back_to_settings_layer(self):
         cfg = SimpleNamespace(agent_model="gpt-5.5-pro")
@@ -313,7 +398,7 @@ class TestProModelGuard(unittest.TestCase):
     def test_both_layers_pro_falls_back_to_canonical(self):
         cfg = SimpleNamespace(agent_model="o1-pro")
         with _settings_with(agent_model="gpt-5.5-pro"):
-            self.assertEqual(mr.default_model(cfg), "gpt-5.5")
+            self.assertEqual(mr.default_model(cfg), mr._CANONICAL_AGENT_MODEL)
 
     def test_guard_logs_an_error(self):
         with _settings_with(agent_model="gpt-5.5-pro"):
@@ -331,7 +416,7 @@ class TestProModelGuard(unittest.TestCase):
         with _settings_with(agent_model="gpt-5.4"):
             self.assertEqual(mr.default_model(), "gpt-5.4")
         with _settings_with():
-            self.assertEqual(mr.default_model(), "gpt-5.5")
+            self.assertEqual(mr.default_model(), mr._CANONICAL_AGENT_MODEL)
 
 
 # ── 5. Capability plumbing for the 5.6 family ────────────────────────

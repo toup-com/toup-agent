@@ -40,7 +40,13 @@ from app.agent.context_manager import (
     estimate_messages_tokens,
     is_context_overflow_error,
 )
-from app.agent.tool_definitions import get_agent_tools, get_extended_tools, get_doc_generation_tools
+from app.agent.tool_definitions import (
+    get_agent_tools,
+    get_extended_tools,
+    get_doc_generation_tools,
+    get_navigation_tools,
+)
+from app.agent.tool_entitlements import family_enabled as _tool_family_enabled
 from app.agent.tool_executor import ToolExecutor
 from app.agent.skills.loader import SkillLoader
 from app.agent.query_intent import (
@@ -357,6 +363,22 @@ def _scrub_tool_descriptions(tool_defs: list) -> list:
     return out
 
 
+# Shown INSTEAD of the ~500-token Document Generation guide when the fleet
+# feature flag is on but this tenant lacks the `doc_generation` entitlement.
+# A withheld capability the model is not told about is the worst outcome:
+# with no tools and no note it invents an export, or claims a transient
+# failure. Tenant-stable like the gate itself — an entitled tenant never
+# sees this string, so the default system prompt is unchanged.
+_DOC_GENERATION_UNAVAILABLE = (
+    "# Document Generation\n"
+    "File export (PDF, Word, Excel, PowerPoint) is NOT enabled on this "
+    "account. If the user asks for a document, say so plainly in one "
+    "sentence and offer the answer inline in chat instead. Do not claim you "
+    "produced a file, do not describe it as temporarily broken, and do not "
+    "try to build one with `exec` or `write_file`."
+)
+
+
 class AgentRunner:
     """
     Runs the agentic loop:  user message → (LLM ↔ tools)* → final response.
@@ -373,11 +395,27 @@ class AgentRunner:
         self.tools = tool_executor
         self.skill_loader = skill_loader
         # Core tools (static) — skill tools are added dynamically via property.
-        # Document-generation tools (generate_pdf/docx/xlsx/pptx/md/html_to_pdf)
-        # are only registered when the feature flag is on.
+        # Document-generation tools (generate_pdf/docx/xlsx/pptx/md/
+        # html_to_pdf/convert_document) need BOTH the fleet feature flag and
+        # this tenant's `doc_generation` entitlement. The entitlement is
+        # resolved once per process (tool_entitlements.entitled_families) and
+        # read HERE, at boot, so the wire array cannot change mid-life —
+        # tools serialize ahead of system+history, so a turn-conditional
+        # array would fork the provider cache lineage on every flip
+        # ([PERF] tools_array_changed). Default "*" keeps every family, so
+        # this line is byte-identical to before the gate landed.
         self._core_tool_defs = get_agent_tools() + get_extended_tools()
-        if getattr(settings, "feature_doc_generation", False):
+        if getattr(settings, "feature_doc_generation", False) and (
+            _tool_family_enabled("doc_generation")
+        ):
             self._core_tool_defs += get_doc_generation_tools()
+        # `navigate_to` is NOT document generation. It shipped as the last
+        # element of get_doc_generation_tools() by accident, so turning that
+        # group off used to remove "take me to my brain" — a core navigation
+        # behaviour — along with the exporters. It is appended here,
+        # unconditionally and in the position it already occupied, which is
+        # why the default array stays byte-identical.
+        self._core_tool_defs += get_navigation_tools()
         # White-label backstop: the tool schema is sent to the model on every
         # turn, and some tool DESCRIPTIONS name the underlying provider/model/
         # stack ("Claude Vision", "gpt-4o-mini-tts", "Chromium"). Scrub those
@@ -1188,7 +1226,7 @@ class AgentRunner:
                 if not should_inject_today_so_far(_day_context):
                     # W2.1b: the loader returned the day's COMPLETE verbatim
                     # history (the under-budget path — effectively always at
-                    # gpt-5.5's 630k budget), so the rolling summary would be
+                    # gpt-5.6-terra's 600k budget), so the rolling summary would be
                     # a pure duplicate: ≤1,000 uncached tokens re-billed
                     # every turn. The summary still injects on the
                     # over-budget path, where it replaces elided messages.
@@ -1474,12 +1512,35 @@ class AgentRunner:
             except Exception:
                 logger.debug("[AGENT] drop-time promotion scheduling failed", exc_info=True)
 
+        # Gated by disable_post_processing, exactly like the two sibling
+        # background write paths further down (`if not
+        # disable_post_processing:` around _background_post_processing, and
+        # the same guard on the day-chat summarizer). This one was NOT
+        # gated: a caller that explicitly asked for no post-processing —
+        # sub-agent runs, routine turns, `save=False` voice/probe turns —
+        # still got durable memory writes out of drop-time promotion, which
+        # is precisely the contract `save=False` advertises it will not do.
+        #
+        # Withholding the callback (rather than short-circuiting inside it)
+        # is what makes the gate complete: context_manager.py only enters
+        # the promotion block `if on_drop is not None`, and that block also
+        # ADVANCES the persisted `compaction_promoted_through` cursor. A
+        # closure that returned early would still let the cursor march past
+        # a span nobody promoted, so the next turn that IS allowed to
+        # promote would skip it as "already done".
+        _on_drop = None if disable_post_processing else _promote_dropped_span
+        if disable_post_processing:
+            logger.debug(
+                "[AGENT] drop-time memory promotion SKIPPED "
+                "(disable_post_processing=True)"
+            )
+
         # Context window management — initial check
         if needs_compaction(system_prompt, messages, settings.agent_model):
             logger.info(f"[AGENT] Context compaction triggered ({len(messages)} messages)")
             messages = await compact_messages(
                 messages, settings.agent_model,
-                conversation_id=session_id, on_drop=_promote_dropped_span,
+                conversation_id=session_id, on_drop=_on_drop,
             )
             logger.info(f"[AGENT] After compaction: {len(messages)} messages, ~{estimate_messages_tokens(messages)} tokens")
 
@@ -1575,8 +1636,8 @@ class AgentRunner:
         # A8-3: _context_window above was sized from settings.agent_model
         # BEFORE routing, but the model actually called can differ
         # (session/model override, router provider preference) and may
-        # have a far smaller window — history budgeted for gpt-5.5's
-        # 1.05M sent to a 200k Claude model is a guaranteed overflow.
+        # have a far smaller window — history budgeted for gpt-5.6-terra's
+        # 1.00M sent to a 200k Claude model is a guaranteed overflow.
         # Re-key the mid-loop compaction math to the ACTIVE model.
         _context_window = get_context_window(active_model)
 
@@ -1977,7 +2038,7 @@ class AgentRunner:
                             messages = await compact_messages(
                                 messages, active_model,
                                 conversation_id=session_id,
-                                on_drop=_promote_dropped_span,
+                                on_drop=_on_drop,
                             )
                             _after_tokens = estimate_messages_tokens(messages)
                             # Review pr3-#3: compact_messages no-ops when the
@@ -2327,7 +2388,7 @@ class AgentRunner:
                 logger.info(f"[AGENT] Mid-loop compaction #{_compaction_count} at {_usage_ratio:.0%} ({_total_ctx:,} tokens)")
                 messages = await compact_messages(
                     messages, active_model,
-                    conversation_id=session_id, on_drop=_promote_dropped_span,
+                    conversation_id=session_id, on_drop=_on_drop,
                 )
                 _after = estimate_messages_tokens(messages)
                 logger.info(f"[AGENT] After compaction: {len(messages)} messages, ~{_after:,} tokens")
@@ -3980,7 +4041,23 @@ class AgentRunner:
                         "seconds before retrying, or tell the user to "
                         "try again in N seconds.\n"
                         "- `[scope_missing] ...` — tell the user to "
-                        "reconnect and approve the missing permission."
+                        "reconnect and approve the missing permission.\n"
+                        "- `[confirmation_required] ...` — **NOTHING "
+                        "HAPPENED YET.** The mail was not sent, the post "
+                        "was not published, the event was not created. "
+                        "The platform staged your draft and put a card in "
+                        "the chat for the user to review, edit, and "
+                        "approve. You MUST NOT say \"sent\", \"done\", "
+                        "\"posted\" or anything that implies the action "
+                        "completed — that is the single worst mistake you "
+                        "can make here, because the user will walk away "
+                        "believing an email went out that did not. Say "
+                        "ONE short line pointing at the card, e.g. "
+                        "\"Here's the draft — check it over and hit Send.\" "
+                        "Then STOP. Do NOT call the tool again: a retry "
+                        "returns the same card and wastes the turn. Do "
+                        "NOT restate the full email body in your reply; "
+                        "the card already shows it."
                         + hints_block
                     )
         elif self.skill_loader and not intent.include_skill_prompts:
@@ -4020,7 +4097,17 @@ class AgentRunner:
         # ── 5a. Document Generation (only if feature flag is on) ──
         # Tokens aren't loaded when the flag is off — gated here, same pattern
         # as the tool schemas being gated in AgentRunner.__init__.
-        if getattr(settings, "feature_doc_generation", False):
+        _doc_flag = bool(getattr(settings, "feature_doc_generation", False))
+        _doc_entitled = _tool_family_enabled("doc_generation")
+        if _doc_flag and not _doc_entitled:
+            # Flag on fleet-wide but this TENANT is not entitled. The tools
+            # are absent from the array, so without a word here the model
+            # improvises: it either claims it just made a PDF or blames a
+            # transient failure. ~45 tok of plain refusal instead of the
+            # ~500-tok how-to. Never emitted for an entitled tenant, so the
+            # default prompt is unchanged.
+            section_parts["doc_generation"] = _DOC_GENERATION_UNAVAILABLE
+        elif _doc_flag:
             section_parts["doc_generation"] = (
                 "# Document Generation\n"
                 "You can produce formatted documents (PDF, Word, Excel, PowerPoint, Markdown) "
@@ -4822,6 +4909,16 @@ class AgentRunner:
         if media_meta:
             self.tools._last_media = None  # Clear after capture
 
+        # Capture a staged elevation:true call (gmail send, linkedin post,
+        # calendar write). The platform did NOT run it — it wants the user
+        # to approve a card first. Persisting it here is what makes the
+        # card survive a reload; an approval prompt that vanishes on
+        # refresh is worse than none, because the user assumes it went
+        # through. Same capture-and-clear contract as _last_media.
+        pending_action_meta = getattr(self.tools, '_last_pending_action', None)
+        if pending_action_meta:
+            self.tools._last_pending_action = None
+
         # Capture generated-file attachments (generate_* tools). IDs were already
         # emitted to the client during tool execution under asst_message_id; now
         # we persist the list against the same message ID so GET /api/files/... resolves.
@@ -4840,6 +4937,8 @@ class AgentRunner:
             _meta["media"] = media_meta
         if tool_event_records:
             _meta["tool_events"] = tool_event_records
+        if pending_action_meta:
+            _meta["pending_action"] = pending_action_meta
         _asst_kwargs = dict(
             conversation_id=session_id,
             day_chat_id=_day_chat_id,

@@ -320,6 +320,48 @@ def _tool_activity(func_name: str, arguments: dict) -> tuple:
     return title, detail
 
 
+def _local_today_str(tz_name: Optional[str]) -> str:
+    """The user's LOCAL calendar date as ``YYYY-MM-DD``.
+
+    The same day boundary DayChat buckets on (day_chat_resolver) and the
+    same fallback rule as `_same_local_day` above: unknown or invalid tz
+    degrades to UTC rather than raising. Reads this module's `datetime`
+    so the frozen-clock test helper applies here too.
+    """
+    now = datetime.now(timezone.utc)
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            return now.astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return now.strftime("%Y-%m-%d")
+
+
+def _day_history_header(total: int, day_date: Optional[str], local_today: Optional[str]) -> str:
+    """Header line for the day-history section of the voice instructions.
+
+    `local_today` is None when `voice_day_context_date_guard` is off, or
+    when the user's local date could not be resolved — in both cases the
+    historical wording is returned byte-for-byte, so the flag-off path
+    and the unresolvable-tz path are unchanged.
+
+    With the guard on and `day_date` genuinely not today, the block is
+    still included (nothing is dropped from the model's context) but it
+    is labelled with the date it came from, because the Realtime model
+    otherwise narrates a previous day as "earlier today".
+    """
+    _today = f"# Today's Full Conversation History ({total} messages across all channels)"
+    if not local_today or not day_date or day_date == local_today:
+        return _today
+    return (
+        f"# Conversation from {day_date} — the last day you and the user "
+        f"spoke ({total} messages across all channels). This is NOT today: "
+        f"today is {local_today} and nothing has been said today yet. Do "
+        f"not describe any of it as having happened today."
+    )
+
+
 # ── Build system instructions from Identity + Memory ──────────────────
 async def build_realtime_instructions(user_id: str, onboarding: bool = False) -> str:
     """Build system instructions for the Realtime API session.
@@ -445,9 +487,30 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         # Strategy: load all messages, keep user messages short (facts/requests),
         # keep recent assistant messages full for continuity.
         try:
+            # The user's LOCAL calendar date — the same boundary the text
+            # runner buckets on. None keeps every line below on its exact
+            # historical behaviour (guard off, or tz unresolvable).
+            #
+            # An UNKNOWN tz must leave the guard OFF, not fall back to UTC:
+            # a Toronto user at 21:00 local is already on the next UTC date,
+            # so a UTC "today" would tell the model that TODAY's own
+            # conversation happened on a previous day — the exact error
+            # this guard exists to prevent, inverted. Only a tz we actually
+            # read justifies contradicting the day chat's own date.
+            _tz_name = (
+                await _get_user_tz_name(user_id)
+                if settings.voice_day_context_date_guard else None
+            )
+            _local_today = _local_today_str(_tz_name) if _tz_name else None
+
             # Use the day-chats list endpoint to find today's actual date key
             # (handles timezone correctly — the agent resolves local_date)
             day_msgs = None
+            # Which local_date the messages below actually came from. The
+            # list endpoint is ordered local_date DESC (day_chats.py:205),
+            # so `dc_list[0]` is the NEWEST day chat — today's only if the
+            # user has already spoken today.
+            _day_msgs_date = None
             try:
                 dc_list = dc_list_prefetch
                 if dc_list and isinstance(dc_list, list) and dc_list:
@@ -458,17 +521,21 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
                             f"/api/day-chats/{today_date}/messages",
                             params={"limit": 500},
                         )
+                        _day_msgs_date = today_date
             except Exception:
                 pass
 
-            # Fallback: try UTC date directly
+            # Fallback: try the date directly. Guard on → the user's LOCAL
+            # date (what DayChat keys on); off → the server's UTC date,
+            # which is a different day for most of the fleet's evening.
             if not day_msgs:
-                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                today_str = _local_today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 day_msgs = await _vps_api(
                     agent_url, agent_api_key, "GET",
                     f"/api/day-chats/{today_str}/messages",
                     params={"limit": 500},
                 )
+                _day_msgs_date = today_str
 
             if day_msgs and isinstance(day_msgs, list):
                 day_msgs.sort(key=lambda m: m.get("created_at", ""))
@@ -476,7 +543,14 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
 
                 # Load ALL messages — no truncation, no windowing.
                 # The agent must remember everything from the entire day.
-                lines = [f"# Today's Full Conversation History ({total} messages across all channels)"]
+                if _local_today and _day_msgs_date and _day_msgs_date != _local_today:
+                    logger.warning(
+                        "[REALTIME] voice day-context is NOT today — loaded day_chat "
+                        "local_date=%s but the user's local date is %s (user %s). "
+                        "Labelling the block with its real date.",
+                        _day_msgs_date, _local_today, user_id[:8],
+                    )
+                lines = [_day_history_header(total, _day_msgs_date, _local_today)]
                 for m in day_msgs:
                     role = m.get("role", "")
                     content = (m.get("content", "") or "").strip()

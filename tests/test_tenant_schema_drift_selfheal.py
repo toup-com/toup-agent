@@ -78,7 +78,17 @@ async def test_drifted_memories_table_gains_missing_columns():
 
     async with engine.begin() as conn:
         # Drop dependents first so memories can be dropped.
-        for dep in ("memory_events", "memory_relationships", "entity_links"):
+        #
+        # `document_chunks` and `media` were added to this list on 2026-08-06:
+        # both carry a FK to memories (document_chunks_memory_id_fkey,
+        # media_memory_id_fkey), so once a run creates the full table set the
+        # DROP below fails with
+        #   DependentObjectsStillExistError: cannot drop table memories
+        #   because other objects depend on it
+        # and the whole self-heal assertion never gets to run. init_db()
+        # recreates them, which is the same contract the other three rely on.
+        for dep in ("memory_events", "memory_relationships", "entity_links",
+                    "document_chunks", "media"):
             await conn.execute(text(f"DROP TABLE IF EXISTS {dep}"))
         await conn.execute(text("DROP TABLE IF EXISTS memories"))
         await conn.execute(text(LEGACY_MEMORIES_DDL))
@@ -94,6 +104,10 @@ async def test_drifted_memories_table_gains_missing_columns():
         "brain_type", "summary", "embedding_json", "search_vector",
         "confidence", "strength", "memory_level", "emotional_salience",
         "last_reinforced_at", "consolidation_count", "decay_rate",
+        # The decay clock (alembic 080). Tenant DBs have no alembic_version,
+        # so init_db is the only thing that can put it there — and without it
+        # every decay pass re-charges the whole elapsed interval.
+        "last_decayed_at",
         "updated_at", "last_accessed_at", "access_count",
         "source_message_id", "source_type", "ref_kind", "ref_id",
         "metadata_json", "tags_json", "canonical_content", "history_json",

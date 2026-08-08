@@ -304,8 +304,14 @@ async def test_candidates_outside_the_ambiguous_band_never_reach_the_llm(monkeyp
 
 async def test_a_second_ambiguous_candidate_costs_one_call_not_two(monkeypatch):
     """The only class of write whose call count rises: rank 1 auto-resolves
-    (0 calls before) but rank 2 is ambiguous. It costs ONE call, not one per
-    candidate — and it is the case the fix exists for."""
+    (0 calls before) but rank 2 is ambiguous. Adjudication costs ONE call, not
+    one per candidate — and it is the case the fix exists for.
+
+    The verdict here is contradiction_update, which retires a row, so it also
+    pays the one fixed confirmation call. The invariant under test is
+    unchanged and is the one that matters for cost: adjudication does not
+    scale with the number of candidates.
+    """
     dedup, llm = _make_dedup(monkeypatch, {STALE: "contradiction_update"})
     _search(
         dedup,
@@ -315,9 +321,15 @@ async def test_a_second_ambiguous_candidate_costs_one_call_not_two(monkeypatch):
 
     _, action = await dedup.smart_create_memory(new_memory=_mem(INCOMING), user_id="u1")
 
-    assert len(llm.calls) == 1
-    assert llm.pair_count == 1  # only the ambiguous candidate was sent
+    assert len(llm.calls) == 2  # 1 adjudication + 1 confirmation
     assert action == "contradiction_updated"
+
+    # The auto-resolved rank-1 paraphrase reached NO prompt — that is what
+    # "the thresholds shortcut the LLM" has to mean, and it is asserted
+    # against every call rather than against a running pair total, which the
+    # confirmation call would otherwise inflate without anyone noticing.
+    assert not any(PARAPHRASE in c["prompt"] for c in llm.calls)
+    assert all(STALE in c["prompt"] for c in llm.calls)
 
 
 async def test_batch_path_keeps_one_call_for_every_memory_and_candidate(monkeypatch):

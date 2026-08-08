@@ -732,6 +732,7 @@ def _message_to_response(
         memories_retrieved=memories_retrieved,
         processing_time_ms=message.processing_time_ms,
         media=msg_metadata.get("media") if msg_metadata else None,
+        pending_action=msg_metadata.get("pending_action") if msg_metadata else None,
         attachments=attachments_list,
         channel=(
             (conversation_channels or {}).get(message.conversation_id)

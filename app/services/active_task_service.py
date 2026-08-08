@@ -22,6 +22,7 @@ from typing import List, Dict, Optional
 from sqlalchemy import select, and_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.memory_taxonomy import MemoryType
 from app.services.memory_log import describe_memory
 
 logger = logging.getLogger(__name__)
@@ -227,7 +228,11 @@ async def store_active_task(
         brain_type="user",
         content=content,
         category="active_task",
-        memory_type="semantic",
+        # "semantic" is a MemoryLevel, not a MemoryType — an off-vocabulary
+        # value in this column. It also meant get_core_facts' exclusion list
+        # (event/conversation/task/file) never matched, so every live reminder
+        # was injected into "Core facts about this user" at importance 0.9.
+        memory_type=MemoryType.TASK.value,
         importance=0.9,  # High — always injected
         confidence=1.0,
         strength=1.0,

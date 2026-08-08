@@ -251,7 +251,8 @@ async def test_batch_path_routes_the_same_conflict_through_adjudication(monkeypa
     assert [action for _, action in results] == ["contradiction_updated"]
     dedup._supersede_with_new.assert_awaited_once()
     assert dedup._supersede_with_new.call_args.kwargs["old_memory_id"] == "m1"
-    assert len(llm.calls) == 1
+    # adjudication + the confirmation the supersede had to pass
+    assert len(llm.calls) == 2
 
 
 # ── D-mem-A (2): end-to-end supersede on a real (sqlite) DB ──────────
@@ -297,7 +298,13 @@ async def test_supersede_e2e_new_row_active_old_row_superseded(monkeypatch):
             assert action == "contradiction_updated"
             assert new_mem.content == _NEW_FACT
             assert new_mem.id != old_id
-            assert len(llm.calls) == 1
+            # TWO calls: the adjudication, then the confirmation that a
+            # contradiction_update must pass before it may retire a row
+            # (_confirm_destructive_verdict). This scripted LLM answers
+            # contradiction_update both times, so the supersede proceeds —
+            # which is the point of asserting it here: the gate refuses only
+            # on DISAGREEMENT, it does not disable superseding.
+            assert len(llm.calls) == 2
 
             old_row = (await db.execute(
                 select(Memory).where(Memory.id == old_id)
@@ -315,7 +322,11 @@ async def test_supersede_e2e_new_row_active_old_row_superseded(monkeypatch):
             )
             assert action == "reinforced"
             assert again.id == new_mem.id
-            assert len(llm.calls) == 1  # no further adjudication
+            # Still 2 — this restatement resolved on the >=0.90 threshold
+            # shortcut, and a `source: threshold` verdict is NOT re-asked.
+            # Guards the confirmation from spreading onto the cheap path it
+            # was explicitly kept off (_DETERMINISTIC_SOURCES).
+            assert len(llm.calls) == 2  # no further adjudication
 
             # 4. D-mem-B companion (same-DB half): the id the reinforce path
             #    returned must be updatable — the shared update_memory lookup
@@ -774,8 +785,9 @@ def test_cleanup_delegates_to_the_quality_suite_sweep(monkeypatch):
     ::text[] casts) lives there and is pinned by test_memory_quality_scoring."""
     recorded = {}
 
-    def _fake_sweep(db_url, pattern):
+    def _fake_sweep(db_url, pattern, settle_seconds=0.0):
         recorded["args"] = (db_url, pattern)
+        recorded["settle_seconds"] = settle_seconds
         return {"pattern": pattern, "matched": 3, "statements": {}}
 
     fake_mod = SimpleNamespace(cleanup_marker_rows=_fake_sweep)
@@ -784,6 +796,17 @@ def test_cleanup_delegates_to_the_quality_suite_sweep(monkeypatch):
     result = bs.cleanup_memory_rows("postgresql://x/y")
     assert recorded["args"] == ("postgresql://x/y", "%kestrel-%")
     assert result["matched"] == 3
+
+    # The settle window must reach the sweep, not be swallowed by the
+    # delegating wrapper. Without it the purge takes its id snapshot before
+    # this run's own fire-and-forget extractions land, and the rows it exists
+    # to remove are written just after it looks (#489).
+    assert recorded["settle_seconds"] == 0.0, "default must stay non-blocking"
+    bs.cleanup_memory_rows("postgresql://x/y", settle_seconds=2.5)
+    assert recorded["settle_seconds"] == 2.5, (
+        "settle_seconds was dropped between cleanup_memory_rows and "
+        "cleanup_marker_rows — the sweep would outrun the extractor again"
+    )
 
 
 def test_suite_wires_the_sweep_and_the_keep_memories_escape_hatch():
@@ -794,7 +817,15 @@ def test_suite_wires_the_sweep_and_the_keep_memories_escape_hatch():
     cleanup hiccup must not page anyone), and --keep-memories skips it."""
     src = _SUITE_PATH.read_text()
     assert 'results["memory_cleanup"]' in src
-    assert "cleanup_memory_rows(os.environ.get" in src
+    # Matched loosely on purpose: the call went multi-line in #489 when
+    # settle_seconds was threaded through it, and a single-line pin broke on a
+    # reformat rather than on a behaviour change.
+    assert "cleanup_memory_rows(" in src
+    assert 'os.environ.get("DATABASE_URL"' in src
+    # …and the settle window is actually passed, which is the behaviour #489
+    # added. A call that reverted to the non-settling form would still satisfy
+    # the two lines above.
+    assert "settle_seconds=" in src
     # sweep failure → recorded under memory_cleanup, never a raise
     assert 'results["memory_cleanup"] = {"error"' in src
     # escape hatch declared and consulted

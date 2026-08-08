@@ -188,13 +188,21 @@ def test_agent_deduct_stores_cached_in_metadata_not_amount():
     assert "credits = _tokens_to_credits(body.model, body.input_tokens, body.output_tokens)" in src
 
 
-def test_calc_cost_cents_legacy_models_ignore_cached_tokens():
-    """A9-2 (cost overstatement on cache hits) stays out of scope for the
-    LIVE fleet: G1 prep added optional cached/cache-write kwargs to
-    _calc_cost_cents, but they may only act on models whose pricing entry
-    carries the cached_input/cache_write columns (gpt-5.6 family — dark).
-    For every current model the math must stay byte-identical, cached or
-    not."""
+def test_calc_cost_cents_ignores_cached_tokens_only_without_the_columns():
+    """The cache kwargs act ONLY on models whose pricing entry carries the
+    cached_input / cache_write columns. For everything else the math stays
+    byte-identical, cached or not.
+
+    2026-08-07: this used to assert inertness for `gpt-5.5` and `gpt-4o-mini`
+    too, under the G1-prep scoping "A9-2 stays out of scope for the LIVE
+    fleet". Measuring OpenAI's organization billing showed that scoping had
+    become a real overcharge — both models DO receive a cached-input discount
+    ($0.5493/M and $0.0750/M measured), and 56.8% / 43.3% of their input comes
+    back cached. They now carry the column, so they belong on the other side
+    of this test; see test_pricing_table_matches_billing.py.
+
+    What remains here is the invariant that was always the point: a model with
+    no cached rate must not have one invented for it."""
     sig = inspect.signature(lp._calc_cost_cents)
     assert list(sig.parameters) == [
         "model", "input_tokens", "output_tokens",
@@ -202,12 +210,23 @@ def test_calc_cost_cents_legacy_models_ignore_cached_tokens():
     ]
     assert sig.parameters["cached_tokens"].default == 0
     assert sig.parameters["cache_write_tokens"].default == 0
-    for model in ("gpt-5.5", "gpt-4o", "gpt-4o-mini", "claude-opus-4-6",
+    for model in ("gpt-4o", "gpt-5.4", "claude-opus-4-6",
                   "totally-unknown-model"):
         base = lp._calc_cost_cents(model, 27_200, 500)
         assert lp._calc_cost_cents(
             model, 27_200, 500, cached_tokens=22_144, cache_write_tokens=5_000
         ) == base, f"{model}: cache kwargs must be inert without cache pricing columns"
+
+
+def test_calc_cost_cents_does_apply_the_columns_where_they_exist():
+    """Anti-vacuity control for the test above. Without it, that test also
+    passes in a world where the cache kwargs were inert for EVERY model —
+    which is precisely the broken state it was written to describe."""
+    for model in ("gpt-5.5", "gpt-4o-mini", "gpt-5.6-terra"):
+        base = lp._calc_cost_cents(model, 1_000_000, 0)
+        discounted = lp._calc_cost_cents(model, 1_000_000, 0,
+                                         cached_tokens=1_000_000)
+        assert discounted < base, f"{model}: cached reads are not discounted"
 
 
 # ── 4. Admin rollup endpoint ─────────────────────────────────────────

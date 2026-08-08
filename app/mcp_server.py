@@ -378,7 +378,10 @@ async def memory_create(
                 update_data.importance = importance
                 if tags is not None:
                     update_data.tags = tags
-                updated = await svc.update_memory(existing.id, user_id, update_data)
+                try:
+                    updated = await svc.update_memory(existing.id, user_id, update_data)
+                except MemoryRejected as exc:
+                    return {"action": "rejected", "reason": exc.reason}
                 if updated is not None:
                     return {
                         "id": str(updated.id),
@@ -457,7 +460,11 @@ async def memory_update(
             return {**proxied, "updated": True}
 
         svc = MemoryService(db)
-        memory = await svc.update_memory(memory_id, user_id, update_data)
+        try:
+            memory = await svc.update_memory(memory_id, user_id, update_data)
+        except MemoryRejected as exc:
+            # Model-controlled path: say why, so it does not retry verbatim.
+            return {"action": "rejected", "reason": exc.reason}
         if not memory:
             return {"error": "Memory not found", "id": memory_id}
         return {
@@ -721,6 +728,17 @@ async def entity_relationship_create(
     """
     user_id = _get_user_id()
     async with async_session_maker() as db:
+        # NOTE (2026-08-07 audit): this writes the edge into the PLATFORM
+        # database, and a user with a tenant agent has their knowledge graph in
+        # the TENANT database — so the agent never reads this row back.
+        #
+        # Left as-is deliberately. `entity_search` and `graph_traverse` are also
+        # platform-side, so an external MCP client gets a self-consistent silo:
+        # what it writes, it can read. Making this tool refuse would break that
+        # working flow, and routing it to the tenant needs agent-side entity
+        # REST routes that do not exist yet. That gap is tracked by
+        # test_remaining_mcp_tools_on_agent_only_tables_are_known, which fails
+        # if the unproxied set grows OR shrinks, so it cannot be forgotten.
         svc = MemoryService(db)
         await svc.store_entity_relationship(
             user_id,

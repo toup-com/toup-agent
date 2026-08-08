@@ -406,3 +406,119 @@ class ProviderAppCredential(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow,
     )
+
+
+# ─── Pending-action status lifecycle ──────────────────────────────────
+#
+# `approved` is deliberately NOT the success state. It means "the user
+# said yes and we committed to running the tool" — the outcome is not
+# yet known. If the process dies between the claim and the provider
+# call, the row is left `approved` and we cannot say whether the mail
+# went out; what matters is that it can never be claimed a SECOND time
+# and send twice. `executed` / `failed` record the outcome once known.
+#
+# Every transition out of `pending` is a single atomic UPDATE guarded on
+# `status = 'pending'` (see `connector_pending_actions.py`). That is the
+# whole double-tap defence: two concurrent approvals race on one row and
+# exactly one wins.
+PENDING_ACTION_STATUSES = (
+    "pending", "approved", "executed", "failed", "rejected", "expired",
+)
+
+# Terminal states — a row in any of these is never actionable again.
+PENDING_ACTION_TERMINAL = frozenset({
+    "approved", "executed", "failed", "rejected", "expired",
+})
+
+
+class ConnectorPendingAction(Base):
+    """One staged, user-confirmable call to an `elevation: true` tool.
+
+    The dispatcher writes a row here INSTEAD of invoking the provider
+    when a tool declares `elevation: true` in its manifest. The draft
+    sits in `payload_json` until the user approves it from the chat
+    card, at which point `POST /api/connectors/pending-actions/{id}/
+    approve` re-enters the dispatcher with the gate lifted exactly once.
+
+    Why the platform DB and not the agent's:
+      - The tokens that execute the call live here, so approval can run
+        the tool WITHOUT a round-trip back to the tenant container. An
+        agent that has since been recycled must not be able to strand a
+        draft the user already approved.
+      - Both clients (web and mobile) talk only to the platform, so one
+        table serves both surfaces with no proxy.
+
+    `payload_json` holds ONLY the tool arguments. `connector_id` and
+    `tool_name` are columns precisely so the approve endpoint can never
+    be talked into running a different tool than the one the user was
+    shown — the request body supplies edited arguments and nothing else.
+
+    Rows are retained after they go terminal: this is the audit trail
+    for "what did the agent try to send, and did I approve it?".
+    """
+
+    __tablename__ = "connector_pending_actions"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()),
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    connector_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # JSON-encoded tool arguments — the draft the user reviews and may
+    # edit. Text not JSONB, matching ConnectorEvent.metadata_json above
+    # (SQLite tests seed it without driver gymnastics).
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", index=True,
+    )
+
+    # The channel that staged the draft. Recorded so the audit can
+    # answer "which surface asked?" and so a future per-channel policy
+    # has the data it needs.
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, default="web")
+
+    # Thread the card belongs to. The clients list pending actions by
+    # conversation on reload — a card that vanishes on refresh is worse
+    # than no card at all.
+    conversation_id: Mapped[Optional[str]] = mapped_column(
+        String(36), nullable=True, index=True,
+    )
+    # Assistant message carrying the card in its metadata_json. Nullable
+    # because the message row is written at END of turn, after staging.
+    message_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    agent_request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow,
+    )
+    # Hard TTL. A card the user ignored for a day must not fire when
+    # they finally scroll past and tap it.
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # 'web' | 'app' — where the decision came from.
+    decided_via: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    # Post-execution outcome, JSON-encoded and redacted per the tool's
+    # manifest `output_redaction`. Lets the card render "Sent" with a
+    # message id without a second round-trip.
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'executed', 'failed', "
+            "'rejected', 'expired')",
+            name="ck_connector_pending_actions_status",
+        ),
+        Index(
+            "ix_connector_pending_actions_user_status",
+            "user_id", "status",
+        ),
+    )

@@ -18,13 +18,24 @@ THE DEFECT THESE TESTS LOCK
     the tenant agent never reads.
 
 WHAT "WHICH DATABASE" MEANS HERE
-    These tests run in the conftest's default monolith profile, so `init_db`
-    creates EVERY table — `documents`, `document_chunks` and `memories` all
-    exist in the session the handler is holding. That is deliberate: it makes
-    "zero local rows" a real measurement rather than a table that happens to be
-    missing. When a tenant is configured and the request still leaves zero rows
-    behind while an X-Agent-Key request goes out to the agent's URL, the write
-    demonstrably went to the tenant and not to the local session.
+    Every table the handler touches must EXIST locally, so that "zero local
+    rows" is a real measurement rather than a table that happens to be
+    missing. When a tenant is configured and the request still leaves zero
+    rows behind while an X-Agent-Key request goes out to the agent's URL, the
+    write demonstrably went to the tenant and not to the local session.
+
+    This docstring used to say those tables were present because the suite
+    ran in the conftest's default monolith profile, where `init_db` creates
+    everything. That was true locally and FALSE in CI: the backend sweep runs
+    every file under **RUN_MODE=platform**
+    (`.github/workflows/test-backend.yml`), which excludes AGENT_ONLY tables
+    by design. So all 11 DB-backed tests here failed with `no such table:
+    documents` on main — an assumption about the environment, written down
+    confidently, that the environment did not honour.
+
+    The `_tenant_side_tables` fixture below now creates them explicitly from
+    `AGENT_ONLY_TABLES` instead of inheriting them from a profile, so the file
+    no longer depends on which RUN_MODE it happens to be invoked under.
 """
 
 from __future__ import annotations
@@ -140,6 +151,76 @@ async def _count(model) -> int:
         return int((await s.execute(
             select(func.count()).select_from(model.__table__)
         )).scalar_one())
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _tenant_side_tables():
+    """Create the tenant-side tables this file asserts emptiness on.
+
+    `documents`, `document_chunks`, `media`, `conversations` and `memories`
+    are AGENT_ONLY: `init_db()` creates them under RUN_MODE=agent, and the CI
+    sweep runs this suite under **RUN_MODE=platform**
+    (`.github/workflows/test-backend.yml`). Absent, every assertion here died
+    with `no such table: documents` — 11 red on main, which is neither a pass
+    nor a useful failure.
+
+    Created rather than SKIPPED (the `requires_agent_tables` route in
+    conftest) on purpose. The entire claim of this file is that ingestion
+    writes **nothing** to the platform DB, and you cannot assert a table is
+    empty if the table does not exist — skipping would retire the assertion
+    along with the error. It would also mean these tests run nowhere at all:
+    the sqlite sweep would skip them and `pytest-postgres` runs only four
+    hand-listed files.
+
+    Driven off `AGENT_ONLY_TABLES` — the same set `init_db()` itself uses
+    (`database.py:266`) — rather than a hand-written list, which would drift
+    the first time the ingestion path touched one more table. It already
+    would have: fixing `documents`/`media`/`conversations` merely moved the
+    error to `memory_events`.
+
+    Safe on SQLite: the model layer skips pgvector columns when the extension
+    is absent (`database.py:286`). Any table that still refuses to compile is
+    left out rather than failing the run — `test_the_tenant_side_tables_really
+    _exist` below asserts the ones THIS file needs, so an over-broad skip
+    cannot pass silently.
+    """
+    from app.db.database import engine
+    from app.db.models.base import AGENT_ONLY_TABLES, Base
+
+    targets = [t for name, t in Base.metadata.tables.items()
+               if name in AGENT_ONLY_TABLES]
+    for table in targets:
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(
+                    lambda sync_conn, t=table: t.create(sync_conn, checkfirst=True))
+        except Exception:
+            # Dialect cannot express this table (e.g. a pgvector index). Not
+            # fatal: the guard test below fails loudly if one this file
+            # actually needs went missing.
+            continue
+    yield
+
+
+@pytest.mark.asyncio
+async def test_the_tenant_side_tables_really_exist():
+    """Anti-vacuity guard for the fixture above.
+
+    Every "writes nothing locally" assertion in this file is a count against
+    one of these tables. If the fixture stopped creating them the counts would
+    raise, and a future refactor that turned those raises into skips or
+    tolerated errors would leave the file passing while asserting nothing.
+    """
+    from sqlalchemy import inspect as _inspect
+    from app.db.database import engine
+
+    async with engine.connect() as conn:
+        present = await conn.run_sync(
+            lambda s: {n: _inspect(s).has_table(n) for n in
+                       ("documents", "document_chunks", "media",
+                        "conversations", "memories", "memory_events")})
+    missing = sorted(n for n, ok in present.items() if not ok)
+    assert not missing, f"fixture failed to create: {missing}"
 
 
 @pytest_asyncio.fixture

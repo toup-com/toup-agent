@@ -21,6 +21,7 @@ from typing import ClassVar, Optional
 
 from app.connectors._google_base import (
     _GoogleConnectorError,
+    google_liveness,
     google_refresh,
     google_request,
     google_revoke,
@@ -39,6 +40,13 @@ from app.db.database import async_session_maker
 from app.services import connector_vault as _vault
 
 DOCS_API = "https://docs.googleapis.com/v1"
+
+# A syntactically valid document id that will never resolve. Used only
+# by `health_probe`; GETting it costs one small request and answers
+# 404 on a healthy path. Keep it well-formed — a malformed id could be
+# rejected at request validation, before Google checks the token, which
+# would make the probe blind to an expired credential.
+_PROBE_DOC_ID = "toup-health-probe-does-not-exist"
 
 # Match a Google Docs URL and capture the document id. Tolerates the
 # `/edit`, `/preview`, and `?usp=...` suffixes Google emits.
@@ -244,15 +252,29 @@ class DocsProvider(BaseConnectorProvider):
         return await google_refresh(refresh_token)
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:
-        """Docs has no cheap "ping" endpoint (no /me, no /about). The
-        cheapest signal is a `documents.create` smoke — but that would
-        litter Drive. Instead we just verify the token can be resolved
-        and trust the dispatcher's refresh-on-expiring to keep tokens
-        fresh; the next real tool call surfaces any deeper rot."""
+        """Docs has no /me and no /about, so we probe by GETting a
+        document id that cannot exist. Google authenticates before it
+        resolves the entity, so a 404 is proof of a healthy path: API
+        enabled, token accepted, scope sufficient. See `google_liveness`.
+
+        This used to only check that a token could be decrypted, on the
+        reasoning that "the next real tool call surfaces any deeper
+        rot". It does not — nothing feeds a failed tool call back into
+        the identity's status. On 2026-08-07 this connector reported
+        `active` for two days while every call returned 403
+        SERVICE_DISABLED, because the Docs API had never been enabled
+        on the Cloud project. The card read "Connected" throughout.
+        A probe that cannot fail is not a probe.
+        """
         try:
-            await _resolve_token(ctx.user_id)
-            return HealthResult(ok=True)
+            access_token = ctx.access_token or await _resolve_token(ctx.user_id)
         except _GoogleConnectorError as e:
             return HealthResult(ok=False, detail=repr(e.result))
         except Exception as e:
             return HealthResult(ok=False, detail=f"{type(e).__name__}: {e}")
+
+        ok, detail = await google_liveness(
+            f"{DOCS_API}/documents/{_PROBE_DOC_ID}",
+            access_token=access_token,
+        )
+        return HealthResult(ok=ok, detail=detail)

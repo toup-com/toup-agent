@@ -212,6 +212,10 @@ async def _check_budget(config: AgentConfig, provider: str, db: AsyncSession) ->
 # never receives a zero even if pricing is misconfigured to 0 cents.
 _MIN_IMAGE_CREDITS = Decimal("0.1")
 
+# Models already reported as missing a `cached_input` rate, so the warning in
+# _calc_cost_cents fires once per model per process instead of once per call.
+_MISSING_CACHED_RATE_WARNED: set[str] = set()
+
 
 def _calc_cost_cents(
     model: str,
@@ -236,6 +240,28 @@ def _calc_cost_cents(
         pricing = {"input": 0.003, "output": 0.015}
     cached_rate = pricing.get("cached_input")
     write_rate = pricing.get("cache_write")
+    # Detection-only guard. A model whose pricing entry has no `cached_input`
+    # column silently bills every cached token at the FULL input rate — there
+    # is no error, no warning, just a wrong number that every downstream cost
+    # figure inherits. That is exactly how gpt-5.5 and gpt-4o-mini went
+    # mispriced for months while the provider was discounting 57% and 43% of
+    # their input respectively (found 2026-08-07 only by reading OpenAI's own
+    # billing, see docs/audits/2026-08-g1-cost-and-latency.md).
+    #
+    # So: if the provider reports cached tokens for a model we have no cached
+    # rate for, say so. Once per model per process — this is a hot path, and a
+    # per-call log would bury it. Deliberately does NOT change the arithmetic:
+    # guessing a discount we have not measured would replace a known-wrong
+    # number with an unknown-wrong one.
+    if cached_rate is None and int(cached_tokens or 0) > 0:
+        if model not in _MISSING_CACHED_RATE_WARNED:
+            _MISSING_CACHED_RATE_WARNED.add(model)
+            logger.warning(
+                "[pricing] %s reports cached_tokens but has no cached_input "
+                "rate — cached reads are being billed at the full input rate. "
+                "Measure it against organization billing and add the column.",
+                model,
+            )
     # Cached-read and cache-write tokens are disjoint subsets of
     # prompt_tokens; clamp defensively so bogus provider usage can never
     # produce a negative base.

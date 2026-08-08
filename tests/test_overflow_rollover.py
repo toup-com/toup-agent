@@ -381,7 +381,14 @@ class TestRunnerWiring:
         fails on its own fix is a pin that teaches people to edit the test.
         """
         assert "def _promote_dropped_span(" in _RUN_SRC
-        assert "on_drop=_promote_dropped_span," in _RUN_SRC
+        # Since the disable_post_processing fix the callback reaches
+        # compact_messages through the `_on_drop` gate variable rather than
+        # by name; tests/test_dropped_span_promotion_gate.py owns the gate
+        # itself. A8-6 only requires that the wiring EXISTS at all.
+        assert "else _promote_dropped_span" in _RUN_SRC, (
+            "the promotion callback is bound to nothing"
+        )
+        assert "on_drop=_on_drop," in _RUN_SRC
 
         fn = _find_funcdef(_SRC, "_promote_dropped_span")
         assert fn is not None, "_promote_dropped_span is gone"

@@ -12,6 +12,7 @@ from typing import ClassVar
 
 from app.connectors._google_base import (
     _GoogleConnectorError,
+    google_liveness,
     google_refresh,
     google_request,
     google_revoke,
@@ -186,17 +187,31 @@ class CalendarProvider(BaseConnectorProvider):
         return await google_refresh(refresh_token)
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:
+        """Probe the SAME surface the tools use — `events.list` on the
+        primary calendar.
+
+        This used to call `users/me/calendarList`, which requires
+        `calendar.readonly`. That scope is `scopes_optional` in the
+        manifest and `oauth.py` only ever requests `oauth.scopes`, so
+        NO user has ever held it. Every probe returned 403
+        insufficientPermissions, three sweeps flipped the identity, and
+        Calendar read "Provider down" for every user on the platform
+        while all four of its tools worked perfectly. Verified against
+        a live grant on 2026-08-07.
+
+        The rule this cost us: a health probe must exercise a scope the
+        connector actually asks for. Probing a wider surface than the
+        grant turns a working connector into a permanently dead one.
+        """
         try:
             access_token = ctx.access_token or await _resolve_token(ctx.user_id)
-            await google_request(
-                "GET",
-                f"{CAL_API_BASE}/users/me/calendarList",
-                access_token=access_token,
-                params={"maxResults": 1},
-                scope_hint="calendar.events",
-            )
-            return HealthResult(ok=True)
         except _GoogleConnectorError as e:
             return HealthResult(ok=False, detail=repr(e.result))
         except Exception as e:
             return HealthResult(ok=False, detail=f"{type(e).__name__}: {e}")
+
+        ok, detail = await google_liveness(
+            f"{CAL_API_BASE}/calendars/primary/events?maxResults=1",
+            access_token=access_token,
+        )
+        return HealthResult(ok=ok, detail=detail)

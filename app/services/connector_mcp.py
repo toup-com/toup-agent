@@ -43,6 +43,7 @@ import logging
 from typing import Any, Optional
 
 from app.connectors.base import (
+    ConnectorConfirmationRequired,
     ConnectorOk,
     ConnectorProviderDown,
     ConnectorRateLimited,
@@ -127,6 +128,35 @@ def _serialize_result(result: ConnectorResult) -> dict:
                 f"[scope_missing] This tool needs the "
                 f"'{result.required_scope}' scope. User must reconnect "
                 f"and grant it."
+            ),
+        }
+
+    if isinstance(result, ConnectorConfirmationRequired):
+        # Wording matters more here than anywhere else in this file.
+        # The model has just "sent an email" from its own point of view,
+        # and the single worst outcome of this whole feature is that it
+        # replies "Sent!" while the draft is still sitting in a card.
+        # So: lead with NOT SENT, forbid the retry (a retry just dedupes
+        # to the same card and wastes a turn), and say what to tell the
+        # user.
+        return {
+            "kind": "confirmation_required",
+            "action_id": result.action_id,
+            "summary": result.summary,
+            "payload": result.payload,
+            "expires_at": (
+                result.expires_at.isoformat() + "Z"
+                if result.expires_at else None
+            ),
+            "message": (
+                f"[confirmation_required] NOT DONE YET — nothing has been "
+                f"sent, posted, or written. This action needs the user's "
+                f"approval first: {result.summary}. A card showing the "
+                f"draft is now in the chat for them to review, edit, and "
+                f"confirm. Do NOT call this tool again — a retry produces "
+                f"the same card. Do NOT tell the user it is done. Tell "
+                f"them the draft is ready below and you are waiting for "
+                f"them to approve it."
             ),
         }
 

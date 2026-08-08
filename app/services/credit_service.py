@@ -50,6 +50,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import credit_shadow
 from app.config import settings
 from app.db.models import (
     BUCKET_INTEGRATION, BUCKET_MESSAGE,
@@ -373,6 +374,48 @@ def _split_message_charge(
         else:
             reason = REASON_DAILY_CAP_EXCEEDED
     return from_plan, from_purchased, feasible, reason
+
+
+def _admission_verdict(
+    balance: CreditBalance, bucket: str, required_q: Decimal,
+    used_today: Decimal, *, cap_admission_control: bool,
+) -> ChargeResult:
+    """The admission gate's answer, ASSUMING enforcement is on.
+
+    Split verbatim out of :meth:`CreditService.check_balance` (everything below
+    its ``if not enforcement`` short-circuit) so that SHADOW MODE can ask the
+    same question without that short-circuit in front of it. There is exactly
+    one copy of the decision, so a shadow number cannot describe a gate that
+    differs from the one that would ship.
+
+    ``used_today`` is supplied by the caller because the two callers source it
+    differently: ``check_balance`` must roll a stale day itself (nothing
+    upstream of a read-only peek does), while ``try_charge`` has already been
+    through ``_reset_daily_if_needed``. It is ignored unless
+    ``cap_admission_control`` and ``bucket == BUCKET_MESSAGE``.
+    """
+    remaining = _bucket_remaining(balance, bucket)
+    if bucket == BUCKET_MESSAGE and cap_admission_control:
+        _fp, _fpur, feasible, split_reason = _split_message_charge(
+            Decimal(balance.message_credits_remaining),
+            Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0),
+            used_today,
+            (Decimal(balance.message_credits_daily_cap)
+             if balance.message_credits_daily_cap is not None else None),
+            required_q,
+        )
+        if not feasible:
+            return ChargeResult(
+                success=False, balance_after=remaining, reason=split_reason,
+            )
+        return ChargeResult(success=True, balance_after=remaining)
+    if required_q > remaining:
+        return ChargeResult(
+            success=False, balance_after=remaining,
+            reason=(REASON_INSUFFICIENT_MESSAGE if bucket == BUCKET_MESSAGE
+                    else REASON_INSUFFICIENT_INTEGRATION),
+        )
+    return ChargeResult(success=True, balance_after=remaining)
 
 
 def _is_unlimited_user(user) -> bool:
@@ -991,37 +1034,92 @@ class CreditService:
         ``credit_cap_admission_control`` on it asks the same
         ``_split_message_charge`` the charge itself will use, so the gate and
         the application agree by construction.
+
+        The verdict below the enforcement short-circuit lives in
+        :func:`_admission_verdict` so SHADOW MODE can ask the identical
+        question with the short-circuit removed. See
+        :meth:`_shadow_observe_message_charge`.
         """
         balance = await self.get_or_create_balance(db, user_id)
         required_q = _q(required, _AMOUNT_QUANTUM)
         enforcement = getattr(settings, "credit_enforcement_enabled", False)
-        remaining = _bucket_remaining(balance, bucket)
         if not enforcement:
-            return ChargeResult(success=True, balance_after=remaining)
-        if (
+            return ChargeResult(
+                success=True, balance_after=_bucket_remaining(balance, bucket),
+            )
+        cap_admission = (
             bucket == BUCKET_MESSAGE
             and getattr(settings, "credit_cap_admission_control", False)
-        ):
-            _fp, _fpur, feasible, split_reason = _split_message_charge(
-                Decimal(balance.message_credits_remaining),
-                Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0),
-                await self._effective_used_today(db, balance, user_id),
-                (Decimal(balance.message_credits_daily_cap)
+        )
+        # Only the cap branch reads the day counter, and reading it costs a
+        # `db.get(User, ...)`. Kept lazy so the non-cap path issues exactly the
+        # queries it always did.
+        used_today = (
+            await self._effective_used_today(db, balance, user_id)
+            if cap_admission else Decimal("0")
+        )
+        return _admission_verdict(
+            balance, bucket, required_q, used_today,
+            cap_admission_control=cap_admission,
+        )
+
+    async def _shadow_observe_message_charge(
+        self, db: AsyncSession, balance: CreditBalance, user_id: str,
+        amount_q: Decimal, *, event_type: str, is_unlimited: bool,
+    ) -> None:
+        """Log what a fully-enabled gate WOULD have decided. Denies nothing.
+
+        Called from :meth:`try_charge` — the one choke point every MESSAGE
+        spend passes through (chat via ``llm_proxy._log_event``, voice via
+        ``ws_realtime``, manual mode via ``/credits/agent-deduct``, image gen)
+        and the only place the turn's REAL cost is known; the live pre-flight
+        is asked for a nominal 0.1. State here is post-day-roll
+        (``_reset_daily_if_needed`` ran) and pre-``_apply_delta``, i.e. exactly
+        what that turn's pre-flight saw for a serial conversation.
+
+        The verdict is computed with ``cap_admission_control=True``
+        unconditionally: the question is what the FIXED gate would refuse, not
+        what the current (off) configuration refuses. The live flag values ride
+        along in the line so a reader can tell a counterfactual from a
+        description of live behaviour.
+
+        Returns None. There is no caller for the verdict, and that is the
+        safety property — see tests/test_credit_shadow_mode.py.
+        """
+        if not getattr(settings, "credit_shadow_admission_logging", False):
+            return          # inert: not one extra query, not one extra line
+        used_today = await self._effective_used_today(db, balance, user_id)
+        verdict = _admission_verdict(
+            balance, BUCKET_MESSAGE, credit_shadow.PREFLIGHT_QUOTE_CREDITS,
+            used_today, cap_admission_control=True,
+        )
+        user = await db.get(User, user_id)
+        credit_shadow.emit(credit_shadow.ShadowAdmission(
+            user_id=user_id,
+            decision=(credit_shadow.DECISION_ALLOW if verdict.success
+                      else credit_shadow.DECISION_DENY),
+            reason=verdict.reason,
+            amount=amount_q,
+            quote=credit_shadow.PREFLIGHT_QUOTE_CREDITS,
+            used_today=used_today,
+            cap=(Decimal(balance.message_credits_daily_cap)
                  if balance.message_credits_daily_cap is not None else None),
-                required_q,
-            )
-            if not feasible:
-                return ChargeResult(
-                    success=False, balance_after=remaining, reason=split_reason,
-                )
-            return ChargeResult(success=True, balance_after=remaining)
-        if required_q > remaining:
-            return ChargeResult(
-                success=False, balance_after=remaining,
-                reason=(REASON_INSUFFICIENT_MESSAGE if bucket == BUCKET_MESSAGE
-                        else REASON_INSUFFICIENT_INTEGRATION),
-            )
-        return ChargeResult(success=True, balance_after=remaining)
+            plan_remaining=Decimal(balance.message_credits_remaining),
+            purchased_remaining=Decimal(
+                getattr(balance, "purchased_credits_remaining", 0) or 0
+            ),
+            # The cap rolls on the USER's local day, so the rollup must group
+            # on the user's day too or a night-owl's spend lands in two buckets.
+            day=_local_day_iso(getattr(user, "timezone", None) if user else None),
+            event_type=event_type,
+            unlimited=is_unlimited,
+            enforcement_enabled=bool(
+                getattr(settings, "credit_enforcement_enabled", False)
+            ),
+            cap_admission_control=bool(
+                getattr(settings, "credit_cap_admission_control", False)
+            ),
+        ))
 
     async def get_balance_view(self, db: AsyncSession, user_id: str) -> BalanceView:
         balance = await self.get_or_create_balance(db, user_id)
@@ -1183,6 +1281,26 @@ class CreditService:
                 deny_reason = REASON_INSUFFICIENT_INTEGRATION
         else:
             raise ValueError(f"unknown bucket {bucket!r}")
+
+        # ── SHADOW MODE ─────────────────────────────────────────────────
+        # Measurement only. Records what a fully-enabled admission gate WOULD
+        # have decided for this turn and discards the answer — no branch below
+        # reads it, no balance moves, nothing is refused. Placed here because
+        # `balance` is post-day-roll and pre-`_apply_delta`, and past the
+        # idempotency short-circuit so a replay is not counted twice.
+        #
+        # Wrapped: a measurement that can break a charge is worse than no
+        # measurement. `_shadow_observe_message_charge` returns immediately
+        # when the flag is off, so the default cost of this block is one
+        # attribute read.
+        if bucket == BUCKET_MESSAGE:
+            try:
+                await self._shadow_observe_message_charge(
+                    db, balance, user_id, amount_q,
+                    event_type=event_type, is_unlimited=is_unlimited,
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("[CREDIT-SHADOW] probe failed", exc_info=True)
 
         enforcement = getattr(settings, "credit_enforcement_enabled", False)
 

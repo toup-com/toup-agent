@@ -123,6 +123,34 @@ class Settings(BaseSettings):
     memory_retrieval_limit: int = 10
     memory_retrieval_min_similarity: float = 0.35
 
+    # Retrieval-time auto-reinforcement (2026-08-06). OFF by default, and it
+    # is a kill switch in the "put it back" direction, not a feature gate.
+    #
+    # MemoryService.hybrid_search used to reinforce its own top 5 results on
+    # EVERY call, unconditionally. Two problems, both live:
+    #   1. Retrieval is not evidence of relevance — it is the ranker's opinion.
+    #      Reinforcing on retrieval makes a mis-retrieval permanently stronger
+    #      and therefore more likely to be retrieved again. With decay never
+    #      running against tenant memories (agent_memory_maintenance_enabled is
+    #      False, and platform_main's decay job runs against the platform DB
+    #      where `memories` does not live), strength is a ONE-WAY RATCHET.
+    #   2. DecayService.reinforce_memory COMMITS the session it is handed, so
+    #      the loop fired up to 5 commits on the caller's turn-scoped session
+    #      in the middle of system-prompt assembly — ×2, because a turn calls
+    #      hybrid_search on both the user leg and the agent-brain leg.
+    #
+    # Reinforcement now happens in RetrievalFeedback.log_retrieval_feedback,
+    # off the request path, for the memories the response actually cited.
+    # Flip this True only to restore the old behaviour for a controlled
+    # comparison; it stacks on top of the cite path, it does not replace it.
+    memory_reinforce_on_retrieval: bool = False
+
+    # Cite-time reinforcement — the replacement path. ON by default because it
+    # is the corrected form of a behaviour that already shipped (retrieval-time
+    # reinforcement); turning both this and the flag above off means memories
+    # are never reinforced by conversation at all. Ops kill switch only.
+    memory_reinforce_on_cite: bool = True
+
     # Chat & Session Settings
     memory_recall_limit: int = 15  # How many memories to recall per message
     auto_extract_memories: bool = True  # Auto-extract memories from conversations
@@ -241,7 +269,17 @@ class Settings(BaseSettings):
     # OpenAI default has no shared-account dependency. Anthropic models remain
     # fully available as an explicit per-user `agent_config.agent_model`
     # choice once the platform Claude account is funded.
-    agent_model: str = "gpt-5.5"  # Primary agent model (OpenAI — per-tenant key)
+    # 2026-08-07: gpt-5.5 → gpt-5.6-terra. Gate G1 passed on OpenAI's own
+    # organization billing, normalised for prompt-cache hit rate — terra is
+    # 50-55% cheaper per token on EVERY token class (uncached input -53.8%,
+    # cached input -62.5%, output -62.1%), p50 -17.5%, p95 -54.1%, and its
+    # error rate is marginally lower (2.1% vs 2.6% over 755 and 697 calls).
+    # Full working, including the retracted earlier "-14.2%, G1 = NO" cut
+    # that failed to control for cache hit rate:
+    # docs/audits/2026-08-g1-cost-and-latency.md §8.
+    # The Responses wire follows automatically — model_resolver.wire_api_for()
+    # derives it, so this cannot be flipped into the broken half-state.
+    agent_model: str = "gpt-5.6-terra"  # Primary agent model (OpenAI — per-tenant key)
     agent_fallback_model: str = "gpt-4o"  # Distinct OpenAI fallback if primary fails
     # analyze_image tool (vision Q&A on a URL/workspace image). Routed through
     # the bundle LLM proxy in bundle mode so it is metered + governed like every
@@ -587,9 +625,15 @@ class Settings(BaseSettings):
     # StreamEvent contract, [PERF] line, metering, and retry behavior; the
     # platform proxy serves /openai/v1/responses with chat-parity accounting.
     # Values: 'chat' | 'responses'.
-    # Default 'chat': flag-off request build is BYTE-IDENTICAL to today
-    # (regression-pinned in tests/test_openai_responses_wire.py) — flip via
-    # OPENAI_WIRE_API=responses per-tenant (canary 533354ce bound .env first).
+    #
+    # 2026-08-07: this is NO LONGER the sole selector. The wire for a
+    # gpt-5.6-* model is derived from the model itself
+    # (model_resolver.wire_api_for) because it is a hard provider
+    # constraint, not a preference — and because two settings that must be
+    # flipped together are a fleet outage waiting for someone to flip one.
+    # This setting now governs every OTHER family, so it stays 'chat': the
+    # gpt-4o cross-provider fallback keeps the wire it has always used, and
+    # that path is not exercised often enough to move it on inference.
     openai_wire_api: str = "chat"
 
     # Document Generation + Web Attachments (Phase 1+2 of doc-delivery feature)
@@ -597,6 +641,27 @@ class Settings(BaseSettings):
     # Frontend has its own localStorage gate (TOUP_DOC_ATTACHMENTS) for the two-pane UI.
     # Default ON as of the doc-delivery rollout — disable via FEATURE_DOC_GENERATION=false.
     feature_doc_generation: bool = True
+
+    # Per-tenant entitlement for OPTIONAL tool families. Every container
+    # ships doc_generation (1,160 tok), the app_builder skill (1,036 tok +
+    # a 547-tok prompt section) and the toup dev skill (684 tok) to every
+    # tenant on every turn — 3,427 tok of wire prefix most tenants never
+    # use. Measured on the OpenAI chat wire, o200k_base, 2026-08-06.
+    #
+    # The gate lives in app/agent/tool_entitlements.py and is resolved ONCE
+    # per process, because the tools array heads the provider cache prefix:
+    # anything turn-conditional here forks the cache lineage and costs more
+    # than it saves (see [PERF] tools_array_changed).
+    #
+    # "*" (default, and the value used when unset or blank) = every family
+    # = today's behaviour, byte-identical. "none"/"-" = no optional family.
+    # Otherwise a comma-separated subset, e.g. "doc_generation".
+    #
+    # NOT yet wired per tenant: the bridge's env writer (`_build_env` in
+    # /opt/toup-bridge/main.py) is out of this repo, and pool_addon's
+    # _FEATURE_FLAG_ENVS is a FLEET-wide forwarder, so it is deliberately
+    # not listed there. This ships BUILT, not ENABLED.
+    agent_tool_families: str = "*"
 
     # PR 8 of the unified-jobs arc: when True, every Auto Builder
     # job completion (success or failure) writes one Message into
@@ -640,6 +705,26 @@ class Settings(BaseSettings):
     # token ⇒ 24k chars ≈ 6k tokens, leaving headroom under OpenAI's
     # 16,384-token instructions+tools cap, which the tool schemas share.
     voice_realtime_instructions_budget_chars: int = 24000
+    # Voice day-context DATE guard (ITEM 14). `build_realtime_instructions`
+    # builds the Realtime model's own context on platform-api — a different
+    # assembly path from the text runner's `load_day_context`. It asks the
+    # agent for `/api/day-chats?limit=1`, which is ordered `local_date DESC`
+    # (app/api/day_chats.py:205-207), and prints whatever comes back under
+    # the header "# Today's Full Conversation History". When the user has
+    # not spoken yet today — the ordinary voice-first morning — the newest
+    # day chat is a PREVIOUS day, so the voice model is told a stale day
+    # happened today. The text runner never has this problem: it resolves
+    # the day from the user's local *now* (agent_runner.py:1109 →
+    # resolve_day_chat_id_for_now) and creates today's row if missing.
+    #
+    # ON: (a) the header names the day's real date and says it is not
+    # today when it isn't, and (b) the direct-date fallback asks for the
+    # user's LOCAL date instead of the server's UTC date. Nothing is
+    # dropped from context either way — only the label changes, and only
+    # when the loaded day is not today. Default OFF: it edits the prompt a
+    # LIVE voice call speaks from, so it ships dark and gets flipped
+    # (VOICE_DAY_CONTEXT_DATE_GUARD=true) after a canary listen.
+    voice_day_context_date_guard: bool = False
     # Full-parity `think` (V2): the realtime relay runs on platform-api, where
     # the in-process agent_runner is absent, so `think` runs the user's OWN
     # agent over its HTTP /api/chat (the SAME AgentRunner text chat uses — full
@@ -734,6 +819,28 @@ class Settings(BaseSettings):
     #     ceiling. Nothing is ever served unbilled.
     # OFF (default) is byte-for-byte today's behavior.
     credit_cap_admission_control: bool = False
+    # SHADOW MODE — measurement only, and the ONLY way to answer "what would
+    # enforcement actually deny?" without denying anything.
+    #
+    # When True, every MESSAGE-bucket charge asks the real admission gate
+    # (`_admission_verdict`, shared with `check_balance`) what it WOULD have
+    # answered had both flags above been on, writes the verdict to the log as a
+    # `[CREDIT-SHADOW]` line, and throws it away. Nothing is denied, no balance
+    # moves, no ledger row changes — the verdict has no caller. Roll the lines
+    # up with `python -m scripts.credit_shadow_rollup`.
+    #
+    # Why the existing signal is not enough: `try_charge` already stashes
+    # `shadow_would_deny` in ledger metadata, but it is computed WITHOUT
+    # `ignore_daily_cap` (which needs `credit_cap_admission_control`, off), so
+    # it models the PRE-#471 policy — the one that zeroed costs already paid.
+    # The 2026-08-03 "59% of real-user LLM spend served free" figure came from
+    # those rows and therefore describes the broken gate, not the fixed one.
+    #
+    # DEFAULT OFF. Log-only either way, but flipping it starts writing one line
+    # per charge carrying a user id, so it is an explicit ops decision. Turning
+    # it on cannot change a single user's balance or refusal; see
+    # tests/test_credit_shadow_mode.py.
+    credit_shadow_admission_logging: bool = False
     # Sybil resistance: when True, the one-time free-credit grant is deduped
     # per CANONICAL email identity (Gmail dot/+alias variants AND
     # delete→re-signup collapse to a single grant) via the grant_eligibility
@@ -1627,15 +1734,33 @@ class Settings(BaseSettings):
     # ($30/$180) and is barred from chat/agent selection by the resolver
     # guard (model_resolver.has_cached_input_rate).
     pricing_per_1k: dict[str, dict[str, float]] = {
-        "gpt-5.5": {"input": 0.005, "output": 0.030},
-        "gpt-5.6-terra": {"input": 0.0025, "cached_input": 0.00025, "cache_write": 0.003125, "output": 0.015},
+        # cached_input MEASURED 2026-08-07 against OpenAI organization billing
+        # (billed `cached input` line / cached tokens, 14d): $0.5493/M, which
+        # is 0.098x the same window's uncached rate — i.e. the published 10%.
+        # Its absence billed every cached 5.5 token at the FULL input rate, and
+        # 56.8% of 5.5's input comes back cached.
+        "gpt-5.5": {"input": 0.005, "cached_input": 0.0005, "output": 0.030},
+        # cache_write was 0.003125 (a modelled 1.25x input). MEASURED, that
+        # line prices at $2.548/M — terra's LIST INPUT rate — while the
+        # separate `terra, input` line is $0.0045, i.e. nil. OpenAI is not
+        # surcharging cache writes; it files terra's ordinary uncached input
+        # under that label. See docs/audits/2026-08-g1-cost-and-latency.md 8.2.
+        "gpt-5.6-terra": {"input": 0.0025, "cached_input": 0.00025, "cache_write": 0.0025, "output": 0.015},
+        # sol/luna keep their MODELLED 1.25x cache_write: neither has carried
+        # production traffic, so there is nothing to measure. Do not "correct"
+        # them by analogy with terra — that would be inventing a number.
         "gpt-5.6-sol": {"input": 0.005, "cached_input": 0.0005, "cache_write": 0.00625, "output": 0.030},
         "gpt-5.6-luna": {"input": 0.001, "cached_input": 0.0001, "cache_write": 0.00125, "output": 0.006},
         "gpt-5.4": {"input": 0.003, "output": 0.012},
         "gpt-5": {"input": 0.003, "output": 0.012},
         "gpt-4.1": {"input": 0.002, "output": 0.008},
         "gpt-4o": {"input": 0.0025, "output": 0.01},
-        "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+        # cached_input MEASURED 2026-08-07: $0.0750/M = exactly 0.500x the
+        # measured uncached rate ($0.1502/M), matching the published $0.075/M.
+        # 4o-mini is the memory-extraction model, so it runs a very high cache
+        # hit rate (43.3% of 46.2M input tokens in 14 days) — this was the
+        # second-largest instance of the same missing-column defect.
+        "gpt-4o-mini": {"input": 0.00015, "cached_input": 0.000075, "output": 0.0006},
         "claude-opus-4-6": {"input": 0.015, "output": 0.075},
         "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
         "claude-sonnet-4-5-20250514": {"input": 0.003, "output": 0.015},

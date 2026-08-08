@@ -53,6 +53,7 @@ from typing import Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connectors.base import (
+    ConnectorConfirmationRequired,
     ConnectorContext,
     ConnectorOk,
     ConnectorProviderDown,
@@ -78,6 +79,7 @@ from app.db.models import (
     EVENT_REFRESH_FAILED,
     EVENT_REFRESH_SUCCEEDED,
     EVENT_TOOL_CALLED,
+    EVENT_TOOL_ELEVATION_REQUIRED,
     EVENT_TOOL_FAILED,
     EVENT_TOOL_SUCCEEDED,
 )
@@ -87,6 +89,17 @@ logger = logging.getLogger(__name__)
 
 # ─── Tunables ─────────────────────────────────────────────────────────
 
+
+# Channels that can render a confirmation card and collect a tap. An
+# `elevation: true` tool called from anywhere else is REFUSED, never
+# silently executed — see the gate in `execute`. Kept as a frozenset
+# next to the other channel policy so the two are read together.
+_CONFIRMABLE_CHANNELS = frozenset({"web", "app", "mobile"})
+
+# How long a staged draft stays actionable. Long enough to survive
+# "I'll deal with this after lunch", short enough that a card found by
+# scrolling through last week cannot fire.
+_PENDING_ACTION_TTL_HOURS = 24
 
 # Refresh skew: refresh if access token expires within this many seconds.
 # Same value as agent_key_rotation_verify; the underlying problem is the
@@ -173,12 +186,20 @@ async def execute(
     channel: str = "web",
     *,
     agent_request_id: Optional[str] = None,
+    approved_action_id: Optional[str] = None,
 ) -> ConnectorResult:
     """Run one connector tool call end-to-end.
 
     Returns a `ConnectorResult` subclass — never raises for normal
     error paths. Unhandled exceptions surface as `ConnectorToolError`
     so the LLM gets a well-shaped message instead of a 500.
+
+    `approved_action_id` lifts the `elevation: true` confirmation gate
+    for exactly this call. ONLY `connector_pending_actions.py` passes
+    it, and only after it has atomically claimed the row (flipped
+    `pending → approved` in a single guarded UPDATE). It is keyword-only
+    and the MCP tool handler never supplies it, so nothing on the
+    agent-facing path can approve its own send.
     """
     started = time.monotonic()
     # Phase-level timing breakdown. Logged at the end of `execute`
@@ -328,6 +349,55 @@ async def execute(
             ),
             retryable=False,
         )
+
+    # 3.7 Elevation gate. `elevation: true` in the manifest means this
+    #     call does something the user must see and approve BEFORE it
+    #     happens — sending mail, posting publicly, writing a calendar
+    #     event. We stage the arguments and return without touching the
+    #     provider; the user reviews (and may edit) them on a card in
+    #     chat, and `POST /api/connectors/pending-actions/{id}/approve`
+    #     re-enters this function with `approved_action_id` set.
+    #
+    #     Deliberately placed AFTER the identity/read-only checks — a
+    #     disconnected or read-only connector should say so rather than
+    #     stage a draft that could never run — and BEFORE the refresh,
+    #     the EVENT_TOOL_CALLED audit, and the credit pre-flight, none
+    #     of which should fire for a call that is not being made.
+    #
+    #     `approved_action_id` is keyword-only and the MCP handler never
+    #     passes it, so the agent-facing path cannot lift its own gate.
+    if manifest_tool.elevation and approved_action_id is None:
+        if channel not in _CONFIRMABLE_CHANNELS:
+            # Fail SAFE. Every elevation:true tool today is also
+            # `mutates: true`, so the channel policy above has already
+            # denied these on voice/telegram/unattended — this is the
+            # backstop for a future elevated-but-not-mutating tool, or a
+            # new channel added without revisiting this list. Silently
+            # executing because we have nowhere to draw a card is the
+            # one outcome that must never happen.
+            _log(user_hash, connector_id, tool_name, channel,
+                 "elevation_unconfirmable_channel", started)
+            return ConnectorToolError(
+                message=(
+                    f"{tool_name!r} needs your confirmation before it runs, "
+                    f"and the {channel!r} channel cannot show a confirmation "
+                    f"card. Ask again from the Toup app or the web chat."
+                ),
+                retryable=False,
+            )
+        staged = await _stage_pending_action(
+            db,
+            user_id=user_id,
+            connector_id=connector_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            channel=channel,
+            agent_request_id=agent_request_id,
+            manifest_tool=manifest_tool,
+        )
+        _mark("elevation_staged")
+        _log(user_hash, connector_id, tool_name, channel, "elevation_staged", started)
+        return staged
 
     # 4. Refresh-on-expiring (lazy, coalesced via per-identity lock).
     if _needs_refresh(identity):
@@ -749,6 +819,161 @@ async def _refresh_with_coalescing(
                 reauth_url=f"/agent/integrations/{latest.connector_id}",
             )
         return refreshed, None
+
+
+# ─── Elevation staging ───────────────────────────────────────────────
+
+
+def summarize_pending_action(tool_name: str, payload: dict) -> str:
+    """One line describing what the user is being asked to approve.
+
+    Rendered as the card's title, and it is also the ONLY description a
+    text-only surface (a notification, an audit export, a screen reader
+    reaching the card's aria-label) ever gets. So it names the outcome
+    and the recipient — "Send email to sam@x.com" — never the tool.
+
+    Falls back to the tool name for connectors that have not earned a
+    bespoke line yet; a generic card is still a real gate.
+    """
+    def _s(key: str) -> str:
+        v = payload.get(key)
+        return v.strip() if isinstance(v, str) else ""
+
+    # Shape first, name second. Anything carrying a recipient AND a
+    # subject is mail, whoever delivers it — so a connector added later
+    # gets a real card line instead of "Run fastmail__send_message"
+    # without anyone remembering to extend this list.
+    if _s("to") or "subject" in payload:
+        to = _s("to") or "(no recipient)"
+        subject = _s("subject") or "(no subject)"
+        return f"Send email to {to} — “{subject}”"
+    if tool_name == "linkedin__share_post":
+        return "Post publicly to your LinkedIn feed"
+    if tool_name == "calendar__create_event":
+        title = _s("summary") or _s("title") or "(untitled)"
+        when = _s("start") or _s("start_time")
+        return f"Create calendar event “{title}”" + (f" at {when}" if when else "")
+    if tool_name == "github__create_comment":
+        owner, repo = _s("owner"), _s("repo")
+        number = payload.get("number")
+        where = f" on {owner}/{repo}#{number}" if owner and repo and number else ""
+        return f"Post a GitHub comment{where}"
+    if tool_name.startswith("sheets__"):
+        return f"Write to your spreadsheet ({tool_name.split('__', 1)[1]})"
+    if tool_name.startswith("drive__"):
+        return f"Write to your Drive ({tool_name.split('__', 1)[1]})"
+    return f"Run {tool_name}"
+
+
+async def _stage_pending_action(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    connector_id: str,
+    tool_name: str,
+    tool_input: dict,
+    channel: str,
+    agent_request_id: Optional[str],
+    manifest_tool,
+) -> ConnectorResult:
+    """Persist the draft and return the confirmation result.
+
+    Dedupes against an identical live draft: a model that re-issues the
+    same send after reading "awaiting confirmation" — which they do —
+    must not stack a second identical card on the thread. Same user,
+    same tool, same arguments, still pending and unexpired → hand back
+    the EXISTING action_id.
+
+    A staging failure is fail-CLOSED. If we cannot record the draft we
+    return an error rather than falling through to the provider: the
+    entire point of the gate is that this call does not happen without
+    a recorded, user-visible approval.
+    """
+    from app.db.models import ConnectorPendingAction
+
+    now = datetime.utcnow()
+    expires_at = now + timedelta(hours=_PENDING_ACTION_TTL_HOURS)
+    payload_json = json.dumps(tool_input, sort_keys=True, default=str)
+    summary = summarize_pending_action(tool_name, tool_input)
+
+    try:
+        from sqlalchemy import select as _select
+
+        existing = (await db.execute(
+            _select(ConnectorPendingAction)
+            .where(ConnectorPendingAction.user_id == user_id)
+            .where(ConnectorPendingAction.tool_name == tool_name)
+            .where(ConnectorPendingAction.status == "pending")
+            .where(ConnectorPendingAction.payload_json == payload_json)
+            .where(ConnectorPendingAction.expires_at > now)
+            .order_by(ConnectorPendingAction.created_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if existing is not None:
+            return ConnectorConfirmationRequired(
+                action_id=existing.id,
+                summary=summary,
+                payload=dict(tool_input),
+                expires_at=existing.expires_at,
+            )
+
+        row = ConnectorPendingAction(
+            user_id=user_id,
+            connector_id=connector_id,
+            tool_name=tool_name,
+            payload_json=payload_json,
+            status="pending",
+            channel=channel,
+            agent_request_id=agent_request_id,
+            created_at=now,
+            expires_at=expires_at,
+        )
+        db.add(row)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.exception(
+            "[dispatcher] could not stage pending action for tool=%s: %s",
+            tool_name, e,
+        )
+        return ConnectorToolError(
+            message=(
+                "Could not stage this action for your confirmation, so it "
+                "was not run. Try again in a moment."
+            ),
+            retryable=True,
+        )
+
+    # Audit AFTER the row exists so the event can name the action id.
+    # Best-effort: the draft is already durable and the user can act on
+    # it: losing the audit line must not cost them the card.
+    try:
+        await _audit_then_commit(
+            db,
+            user_id=user_id,
+            connector_id=connector_id,
+            event_type=EVENT_TOOL_ELEVATION_REQUIRED,
+            channel=channel,
+            tool_name=tool_name,
+            agent_request_id=agent_request_id,
+            metadata={
+                "action_id": row.id,
+                "summary": summary,
+                "input": _redact(tool_input, manifest_tool.output_redaction),
+            },
+        )
+    except Exception:
+        logger.exception(
+            "[dispatcher] elevation audit failed for action=%s (card still live)",
+            row.id,
+        )
+
+    return ConnectorConfirmationRequired(
+        action_id=row.id,
+        summary=summary,
+        payload=dict(tool_input),
+        expires_at=expires_at,
+    )
 
 
 # ─── Outcome audit ───────────────────────────────────────────────────

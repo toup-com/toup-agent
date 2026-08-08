@@ -27,6 +27,7 @@ from app.db import get_db
 from app.db.models import ConnectorIdentity
 from app.services import connector_vault as vault
 from app.services.connector_registry import get_registry
+from app.services.provider_apps import list_configured_async
 
 router = APIRouter(prefix="/connectors", tags=["Connectors"])
 
@@ -61,7 +62,17 @@ class CatalogConnectorEntry(BaseModel):
     last_used_at: Optional[str] = None
     scopes: list[CatalogScopeEntry]
     tools: list[CatalogToolEntry]
+    # True when this connector cannot currently be connected. Both the
+    # web page and the mobile Connectors screen already render this as
+    # a dimmed, non-actionable tile, so it is the right channel for
+    # "advertised but unreachable" — see `unavailable_reason` for why.
     coming_soon: bool = False
+    # Machine-readable cause when `coming_soon` is set by the platform
+    # rather than by the connector's own roadmap status. Currently only
+    # 'credentials_missing'. Nothing renders this yet; it exists so the
+    # catalogue stays honest to an operator debugging a dimmed tile,
+    # instead of claiming a finished connector is "coming soon".
+    unavailable_reason: Optional[str] = None
     # Per-identity read-only flag. Defaults to False; only meaningful
     # when status is 'active' or 'reauth_required'.
     read_only: bool = False
@@ -107,6 +118,14 @@ async def get_connector_catalog(
     user_id = str(current_user.id)
     registry = get_registry()
 
+    # Which provider apps actually have OAuth credentials. A connector
+    # whose provider app is missing them cannot complete a connect —
+    # `/api/oauth/connect` answers 503 `credentials_missing` — so
+    # advertising a live Connect button for it is a button that is
+    # guaranteed to fail. LinkedIn and Outlook did exactly that on
+    # every client for months.
+    configured = await list_configured_async()
+
     # One indexed query — same shape as `vault.list_active` but
     # includes non-active rows (we want `reauth_required` shown too).
     from sqlalchemy import select
@@ -134,6 +153,18 @@ async def get_connector_catalog(
             continue
 
         ident = status_by_id.get(manifest.id)
+        # An ALREADY-CONNECTED identity keeps its live tile even if the
+        # provider app's credentials were later removed: the user has a
+        # working grant, the tools still dispatch, and dimming their
+        # connected account would read as data loss. The gate is about
+        # not offering a connect that cannot succeed.
+        # `configured is None` means the credential lookup failed — gate
+        # nothing rather than greying out the whole page on a DB blip.
+        unconfigured = (
+            configured is not None
+            and manifest.oauth.provider_app not in configured
+            and ident is None
+        )
         scope_descs = getattr(manifest, "scope_descriptions", None) or {}
         all_scopes = [(s, True) for s in manifest.oauth.scopes] + [
             (s, False) for s in (manifest.oauth.scopes_optional or [])
@@ -175,7 +206,10 @@ async def get_connector_catalog(
                     )
                     for t in manifest.tools
                 ],
-                coming_soon=False,  # T3+ may flip this for previews
+                coming_soon=unconfigured,
+                unavailable_reason=(
+                    "credentials_missing" if unconfigured else None
+                ),
             )
         )
 

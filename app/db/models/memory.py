@@ -73,6 +73,16 @@ class Memory(Base):
     consolidation_count: Mapped[int] = mapped_column(Integer, default=0)
     decay_rate: Mapped[float] = mapped_column(Float, default=0.1)
 
+    # The instant a decay pass last WROTE `strength`, and therefore the point
+    # the stored value is accurate as of. DecayService multiplies the stored
+    # strength by e^(-elapsed/stability); without this stamp every pass
+    # re-applies the WHOLE elapsed exponent to an already-decayed number, so
+    # the total decay grows with how often the job ran rather than with how
+    # much time passed. NULL = never decayed, which is correct for every row
+    # written before 2026-08-06 — those fall back to the reinforcement /
+    # creation reference and receive exactly one catch-up curve.
+    last_decayed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Temporal validity. NULL = this memory never expires, which is correct
     # for durable facts and for every row written before 2026-07-29. Set only
     # when the extractor flags a memory transient AND its category permits

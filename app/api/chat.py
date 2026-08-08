@@ -458,6 +458,26 @@ async def _chat_stream(
                         _ukey = _r2.scalar_one_or_none()
                     except Exception:
                         pass
+
+                    # Close the transaction that SELECT just opened, BEFORE the
+                    # LLM call below.
+                    #
+                    # There is a commit further up, but reading the key starts a
+                    # fresh implicit transaction, and `extract_memories_with_llm`
+                    # is a multi-second network round trip. Holding a pooled
+                    # connection across it is the shape that has taken this
+                    # service down before: the connection is pinned for the whole
+                    # call, the pool drains under concurrency, and the tail is
+                    # PendingRollbackError on every subsequent turn.
+                    #
+                    # rollback(), not commit(): nothing is pending, and this must
+                    # not silently persist anything the code above did not choose
+                    # to commit itself.
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
+
                     extracted = await memory_extractor.extract_memories_with_llm(
                         user_message=request.message,
                         assistant_response=full_response,

@@ -27,18 +27,23 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Cost per 1M tokens (USD)
-# `cached_input` / `cache_write` (gpt-5.6 family only) mirror the optional
-# columns in settings.pricing_per_1k — 5.6 bills cache writes at 1.25x input.
-# `_calculate_cost` reads only input/output (this tracker has no per-call
-# cached-token counts); the extra keys keep the three pricing dicts in sync.
+# `cached_input` / `cache_write` mirror the optional columns in
+# settings.pricing_per_1k. `_calculate_cost` reads only input/output (this
+# tracker has no per-call cached-token counts); the extra keys exist to keep
+# the pricing dicts in sync, and test_pricing_table_matches_billing pins that.
+#
+# 2026-08-07: cached_input MEASURED against OpenAI organization billing for
+# gpt-5.5 ($0.5493/M, 0.098x uncached) and gpt-4o-mini ($0.0750/M, 0.500x);
+# both were missing it. terra's cache_write dropped 3.125 -> 2.50 because the
+# billed line measures at terra's list input rate, not a 1.25x surcharge.
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
-    "gpt-5.5": {"input": 5.00, "output": 30.00},
-    "gpt-5.6-terra": {"input": 2.50, "cached_input": 0.25, "cache_write": 3.125, "output": 15.00},
+    "gpt-5.5": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-terra": {"input": 2.50, "cached_input": 0.25, "cache_write": 2.50, "output": 15.00},
     "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "cache_write": 6.25, "output": 30.00},
     "gpt-5.6-luna": {"input": 1.00, "cached_input": 0.10, "cache_write": 1.25, "output": 6.00},
     "gpt-5.4": {"input": 3.00, "output": 12.00},
     "gpt-4o": {"input": 2.50, "output": 10.00},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
     "gpt-4-turbo": {"input": 10.00, "output": 30.00},
     "o1": {"input": 15.00, "output": 60.00},
     "o1-mini": {"input": 3.00, "output": 12.00},

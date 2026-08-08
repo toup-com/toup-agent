@@ -840,6 +840,18 @@ async def init_db():
         "CREATE INDEX IF NOT EXISTS ix_memories_expires_at "
         "ON memories (user_id, expires_at) "
         "WHERE expires_at IS NOT NULL AND is_active = TRUE",
+        # Decay clock (alembic 080, 2026-08-06). The decay pass writes
+        # `strength` but used to leave no mark, so every run re-applied the
+        # FULL span since the last reinforcement to an already-decayed value
+        # — the accumulated exponent grew with the number of runs instead of
+        # with elapsed time. `last_decayed_at` is the point the stored
+        # strength is accurate as of; DecayService decays FROM it. NULL =
+        # never decayed, correct for every pre-existing row (they fall back
+        # to the reinforcement/creation reference and get one catch-up
+        # curve), so this is purely additive and safe on live tenants. No
+        # index: the decay query filters on user_id/is_deleted/strength and
+        # reads this column per row it already selected.
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_decayed_at TIMESTAMP",
         # The tsvector column has existed since the decay migration but its
         # maintenance trigger shipped ONLY in alembic — and agent containers
         # boot via create_all, so 100% of tenant rows had search_vector NULL

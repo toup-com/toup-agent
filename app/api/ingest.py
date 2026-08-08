@@ -15,6 +15,7 @@ TOPOLOGY (see app/api/tenant_proxy.py)
 """
 
 import json
+import logging
 import uuid
 from datetime import datetime
 from typing import List, Optional
@@ -33,7 +34,9 @@ from app.api.memories import memory_to_response
 from app.api.tenant_proxy import agent_proxy_info, proxy_to_agent
 from app.services import get_memory_extractor, get_embedding_service
 from app.services.memory_service import MemoryService
-from app.services.memory_gate import MemoryRejected
+from app.services.memory_gate import MemoryRejected, memory_gate_reason
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ingest", tags=["Ingestion"])
 
@@ -129,6 +132,32 @@ async def ingest_message(
         )
         
         for ext_memory in extracted:
+            # FULL gate, not just the never-store backstop.
+            #
+            # This route reaches `memories` through create_memory directly, so
+            # it was screened only by that function's never-store tier — cards,
+            # identity numbers, API keys. Every junk rule (scaffolding, echo,
+            # quoted content, inferred interest, unsupported claim, transient
+            # horizon) was skipped, on a surface the frontend calls
+            # (`api.ts -> POST /ingest/message`) with `extract_memories`
+            # defaulting to True.
+            #
+            # The provenance rules need the conversation turn, which is exactly
+            # what this endpoint already has in the request — so unlike the
+            # storage backstop in create_memory, the full gate CAN be applied
+            # here, and this is the boundary that should apply it.
+            gate_reason = memory_gate_reason(
+                ext_memory.content,
+                user_message=request.user_message,
+                assistant_response=request.assistant_response,
+            )
+            if gate_reason:
+                logger.info(
+                    "[memory_gate] ingest refused (%s) for user=%s",
+                    gate_reason, str(current_user.id)[:8],
+                )
+                continue
+
             # Create memory
             memory_data = MemoryCreate(
                 content=ext_memory.content,
@@ -140,7 +169,7 @@ async def ingest_message(
                 tags=ext_memory.tags,
                 metadata=ext_memory.metadata,
             )
-            
+
             try:
                 memory = await memory_service.create_memory(
                     current_user.id,
@@ -259,6 +288,23 @@ async def ingest_conversation(
                     )
                     
                     for ext_memory in extracted:
+                        # Same full gate as /ingest/message above. This bulk
+                        # path had neither the gate NOR the MemoryRejected
+                        # catch, so a never-store value here aborted the whole
+                        # conversation import with a 500 instead of skipping
+                        # one row.
+                        gate_reason = memory_gate_reason(
+                            ext_memory.content,
+                            user_message=user_msg.content,
+                            assistant_response=assistant_msg.content,
+                        )
+                        if gate_reason:
+                            logger.info(
+                                "[memory_gate] conversation ingest refused (%s) "
+                                "for user=%s", gate_reason, str(current_user.id)[:8],
+                            )
+                            continue
+
                         memory_data = MemoryCreate(
                             content=ext_memory.content,
                             summary=ext_memory.summary,
@@ -269,7 +315,7 @@ async def ingest_conversation(
                             tags=ext_memory.tags,
                             metadata=ext_memory.metadata,
                         )
-                        
+
                         memory = await memory_service.create_memory(
                             current_user.id,
                             memory_data,

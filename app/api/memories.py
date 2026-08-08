@@ -13,13 +13,13 @@ from app.db import get_db, Memory, MemoryEvent, AgentConfig
 from app.schemas import (
     MemoryCreate, MemoryUpdate, MemoryResponse, MemoryWithScore,
     MemoryWithRelations, MemorySearchRequest, MemorySearchResponse,
-    MemoryCategory, MemoryType, EntityResponse,
+    MemoryCategory, MemoryType, MemoryLevel, EntityResponse,
     MemoryEventResponse, MemoryEventsResponse
 )
 from app.api.auth import get_current_user
 from app.memory_taxonomy import normalize_category
 from app.services.memory_service import MemoryService
-from app.services.memory_gate import MemoryRejected
+from app.services.memory_gate import MemoryRejected, sensitive_content_reason
 
 logger = logging.getLogger(__name__)
 
@@ -426,6 +426,19 @@ async def search_memories_get(
                 detail=f"Unknown brain_type {brain_type!r}.",
             )
     
+    memory_level_list = None
+    if memory_level:
+        try:
+            memory_level_list = [MemoryLevel(memory_level)]
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Unknown memory_level {memory_level!r}. Valid values: "
+                    + ", ".join(sorted(m.value for m in MemoryLevel))
+                ),
+            )
+
     # Build search request
     request = MemorySearchRequest(
         query=query,
@@ -435,7 +448,13 @@ async def search_memories_get(
         min_importance=min_importance,
         min_similarity=min_similarity,
         min_strength=min_strength,
-        memory_level=memory_level
+        # The schema field is `memory_levels` (plural, a list). Passing the
+        # singular name meant pydantic dropped it on the floor: the caller asked
+        # for episodic memories and silently got everything. Mapped, and an
+        # unknown value now 422s instead of quietly widening the search —
+        # mirroring the brain_type handling above rather than the `categories`
+        # path, which degrades on purpose because it carries retired aliases.
+        memory_levels=memory_level_list,
     )
     
     _key = await _get_user_api_key(db, current_user.id)
@@ -574,7 +593,20 @@ async def update_memory(
         return JSONResponse(content=data)
 
     service = MemoryService(db)
-    memory = await service.update_memory(memory_id, current_user.id, update_data)
+    try:
+        memory = await service.update_memory(memory_id, current_user.id, update_data)
+    except MemoryRejected as exc:
+        # Same answer as create: a never-store value must not become storable
+        # by editing an existing row instead of making a new one.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "That memory carries a value we never store "
+                f"({exc.reason.removeprefix('sensitive_')}). "
+                "Card numbers, government identity numbers and API keys are "
+                "refused on every path."
+            ),
+        )
 
     if not memory:
         raise HTTPException(
@@ -933,6 +965,29 @@ async def merge_into_memory(
             detail="Memory not found"
         )
     
+    # Never-store backstop, same as create_memory and update_memory.
+    #
+    # This route calls MemoryDedupService._merge_memories directly, which
+    # UPDATES an existing row — so it passes through neither smart_create_
+    # memory's full gate nor create_memory's storage backstop. A card number
+    # refused at create and refused at update was still accepted here, as a
+    # query parameter.
+    #
+    # Never-store tier only: a manual merge is an explicit user action, so the
+    # junk rules (which ask "did the user actually state this?") do not apply —
+    # the same argument create_memory makes for its own backstop.
+    _secret = sensitive_content_reason(new_content or "", explicit_save=True)
+    if _secret:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "That content carries a value we never store "
+                f"({_secret.removeprefix('sensitive_')}). "
+                "Card numbers, government identity numbers and API keys are "
+                "refused on every path."
+            ),
+        )
+
     _key = await _get_user_api_key(db, current_user.id)
     dedup_service = MemoryDedupService(db, api_key=_key)
 

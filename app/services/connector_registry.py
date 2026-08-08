@@ -518,6 +518,10 @@ def _collect_builtin_tool_names() -> set[str]:
             get_agent_tools,
             get_extended_tools,
             get_doc_generation_tools,
+            # `navigate_to` moved out of the doc-generation group (it is
+            # navigation, not export). It must stay in the reserved-name set
+            # or a connector could claim it.
+            get_navigation_tools,
         )
     except ImportError as e:
         # Tool definitions might not import in some test contexts; treat
@@ -530,7 +534,12 @@ def _collect_builtin_tool_names() -> set[str]:
         return set()
 
     names: set[str] = set()
-    for fn in (get_agent_tools, get_extended_tools, get_doc_generation_tools):
+    for fn in (
+        get_agent_tools,
+        get_extended_tools,
+        get_doc_generation_tools,
+        get_navigation_tools,
+    ):
         try:
             for tool in fn():
                 name = tool.get("name")

@@ -184,6 +184,10 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "connector_oauth_sessions",
     "connector_events",
     "connector_user_preferences",
+    # Staged elevation:true tool calls awaiting the user's tap on the
+    # confirmation card. Platform-side because the tokens that execute
+    # them are, so approval never round-trips to a tenant container.
+    "connector_pending_actions",
     # OAuth provider-app credentials (Google/GitHub/etc client_id+secret).
     # Persisted in DB so the operator can paste them through the admin
     # UI instead of editing env vars + redeploying.

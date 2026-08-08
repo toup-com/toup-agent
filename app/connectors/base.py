@@ -95,6 +95,31 @@ class ConnectorScopeMissing(ConnectorResult):
 
 
 @dataclass(frozen=True)
+class ConnectorConfirmationRequired(ConnectorResult):
+    """The tool declares `elevation: true` and the user has not approved
+    THIS call yet. The dispatcher has staged the arguments as a
+    `ConnectorPendingAction` row and did NOT invoke the provider.
+
+    `action_id` is the pending row's id; the client approves via
+    `POST /api/connectors/pending-actions/{action_id}/approve`, which
+    re-enters the dispatcher with the gate lifted exactly once.
+
+    `payload` is the staged arguments echoed back so the agent can hand
+    the client a card without a second read, and `summary` is a
+    one-line human description for channels that can only render text.
+
+    Note for whoever adds the next provider: never construct this in a
+    provider. The gate lives in the dispatcher precisely so a provider
+    cannot forget it — a provider that has already made the API call
+    has nothing left to confirm.
+    """
+    action_id: str
+    summary: str
+    payload: dict = field(default_factory=dict)
+    expires_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
 class ConnectorToolError(ConnectorResult):
     """Provider returned 4xx (other than 401/403/429) — caller error,
     not a connector-layer problem. `retryable` tells the dispatcher

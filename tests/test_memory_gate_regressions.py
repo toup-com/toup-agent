@@ -727,3 +727,299 @@ class TestUnsupportedClaimOnAQuestionTurn:
             assistant_response=self.STORM_A,
             explicit_save=True,
         ) != "unsupported_on_question_turn"
+
+
+# ── The secret gate missed whole shapes, and one regex only LOOKED right ──
+#
+# Two defects in one rule.
+#
+# (a) The provider-key line named Stripe's own words and matched nothing Stripe
+#     emits. It read, verbatim:
+#
+#       ("api_key", re.compile(
+#           r"(?i)\b(?:sk|pk|rk)-(?:proj|live|test|ant|admin)?-?[A-Za-z0-9_-]{16,}"))
+#
+#     `live` and `test` are Stripe's words, but Stripe separates with an
+#     UNDERSCORE (`sk_live_…`) and the pattern requires a HYPHEN after
+#     `sk|pk|rk`. There is no hyphen anywhere in a Stripe key, so that
+#     alternation could never fire on one. The line passed inspection because
+#     it named the vendor.
+#
+# (b) Everything below simply had no pattern: Slack, Google, AWS STS, SendGrid,
+#     npm, PEM private key blocks, credentials inside a connection string, and
+#     an SSN written with spaces instead of hyphens.
+#
+# Every value here is obviously fake.
+
+FAKE_NPM = "npm_" + "FAKEfake0000" * 3                   # npm_ + exactly 36
+FAKE_AIZA = "AIzaSy" + "FAKEfake0000" * 2 + "FAKEfake0"  # AIza + exactly 35
+
+# Assembled from fragments for the same reason FAKE_NPM and FAKE_AIZA are.
+#
+# These values are obviously synthetic — "FAKEfake" and runs of zeros — but a
+# fixture for a secret DETECTOR has to carry the real SHAPE, and GitHub's push
+# protection matches on shape, not on whether the value is real. Written as
+# whole literals they are flagged as a Stripe API Key, a Stripe Live API
+# Restricted Key and a Slack API Token, and the push is refused outright.
+#
+# That is not hypothetical: it blocked every push to the toup-agent public
+# mirror from 2026-08-07 onward — six consecutive merges, each one a red
+# "Sync Agent to Public Repo" that nothing else depended on, so it went unread.
+#
+# Splitting the prefix leaves the runtime value byte-identical (asserted in
+# test_the_secret_fixtures_are_assembled_not_literal) while removing the
+# contiguous match from the file, so the detector tests are unchanged.
+FAKE_STRIPE_SK = "sk_" + "live_51NxFAKEfakeFAKEfake0000abcdEFGH"
+FAKE_STRIPE_PK = "pk_" + "test_51NxFAKEfakeFAKEfake0000abcdEFGH"
+FAKE_STRIPE_RK = "rk_" + "live_51NxFAKEfakeFAKEfake0000abcdEFGH"
+FAKE_SLACK_BOT = "xoxb" + "-0000000000-0000000000-FAKEfakeFAKEfake0000"
+
+NEW_SECRET_SHAPES_MUST_NOT_BE_STORED = [
+    # (a) Stripe — the regex that only looked correct.
+    ("Stripe secret key", f"The user's Stripe key is {FAKE_STRIPE_SK}."),
+    ("Stripe publishable key", f"Their Stripe publishable key is {FAKE_STRIPE_PK}."),
+    ("Stripe restricted key", f"The restricted key is {FAKE_STRIPE_RK}."),
+    ("Stripe webhook secret", "The webhook signing secret is whsec_FAKEfake0000FAKEfake0000."),
+    # (b) Vendor shapes that had no pattern at all.
+    ("Slack bot token", f"The user's Slack bot token is {FAKE_SLACK_BOT}."),
+    ("Slack user token", "Slack user token xoxp-0000000000-0000000000-0000000000-fakefakefakefakefake."),
+    ("Slack legacy token", "Legacy token xoxa-2-0000000000-0000000000-fakefakefakefake."),
+    ("Slack app-level token", "App token xapp-1-A00000000-0000000000-fakefakefakefakefake."),
+    ("Google API key", f"The user's Google Maps key is {FAKE_AIZA}."),
+    ("AWS temporary credential", "The user's session key is ASIAFAKE0000FAKE0000."),
+    ("SendGrid key", "SendGrid key SG.FAKEfake0000FAKEfake00.FAKEfake0000FAKEfake0000FAKEfake0000FAKEfa."),
+    ("npm token", f"The user's npm publish token is {FAKE_NPM}."),
+    ("PEM RSA private key", "-----BEGIN RSA PRIVATE KEY-----\nMIIFAKEfake\n-----END RSA PRIVATE KEY-----"),
+    ("PEM bare private key", "-----BEGIN PRIVATE KEY-----\nMIIFAKEfake\n-----END PRIVATE KEY-----"),
+    ("PEM EC private key", "-----BEGIN EC PRIVATE KEY-----\nMHcFAKEfake\n-----END EC PRIVATE KEY-----"),
+    ("PEM OpenSSH private key", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlFAKEfake\n-----END OPENSSH PRIVATE KEY-----"),
+    ("PEM PGP private key block", "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQFAKEfake\n-----END PGP PRIVATE KEY BLOCK-----"),
+    ("postgres connection string", "The prod DSN is postgres://admin:hunter2fake@db.internal:5432/prod."),
+    ("postgresql connection string", "DSN postgresql://svc:fakepw123@10.0.0.9:5432/app."),
+    ("mongodb+srv connection string", "mongodb+srv://appuser:fakepass123@cluster0.mongodb.net/test"),
+    ("redis connection string", "redis://default:fakeredispass@10.0.0.4:6379"),
+    ("amqp connection string", "amqp://user:fakepassword@rabbit:5672"),
+    ("basic-auth credentials in an https URL", "Clone from https://deploy:fakeToken99@git.internal/repo.git"),
+    ("SSN written with spaces", "The user's SSN is 123 45 6789."),
+]
+
+
+@pytest.mark.parametrize(
+    "label,content", NEW_SECRET_SHAPES_MUST_NOT_BE_STORED,
+    ids=[c[0] for c in NEW_SECRET_SHAPES_MUST_NOT_BE_STORED],
+)
+def test_new_secret_shapes_are_never_stored(label, content):
+    assert gate.sensitive_content_reason(content) is not None
+    assert gate.memory_gate_reason(content) is not None
+
+
+@pytest.mark.parametrize(
+    "label,content", NEW_SECRET_SHAPES_MUST_NOT_BE_STORED,
+    ids=[c[0] for c in NEW_SECRET_SHAPES_MUST_NOT_BE_STORED],
+)
+def test_new_secret_shapes_survive_an_explicit_save(label, content):
+    """All of these land in the never-store tier, so "please remember this"
+    must not unlock them — the same argument the card/CVV/SIN tier rests on.
+    This is also what routes them through the `create_memory` storage backstop,
+    which calls the gate with explicit_save=True."""
+    assert gate.sensitive_content_reason(content, explicit_save=True) is not None
+
+
+# The discriminating half. A gate that rejects everything passes every
+# must-REJECT list ever written; these are what make the list mean something.
+# Each is a realistic memory that LOOKS like it carries a key and does not.
+
+SECRETS_RULE_MUST_NOT_EAT_LOOKALIKES = [
+    # The AIza false positive the exact-35 length exists to prevent.
+    ("a booking reference that starts like a Google key",
+     "The user's flight confirmation is AIzaSyD and the gate is B12."),
+    ("Slack named as a product, not a token",
+     "The user uses Slack for work and prefers it to email."),
+    ("a question about tokens, carrying none",
+     "The user asked how to rotate a Slack token safely."),
+    # Connection strings with NO credentials. The rule fires on the
+    # `:password@` segment, not on the URL scheme.
+    ("postgres docs URL with no credentials",
+     "The postgres docs at postgres://localhost/mydb were helpful."),
+    ("redis host:port, which is not user:password",
+     "The user runs redis://cache.internal:6379 in staging."),
+    ("mongodb+srv host with no credentials",
+     "The user's team migrated from mongodb+srv://cluster0.mongodb.net/analytics."),
+    ("an ordinary https link",
+     "The user bookmarked https://docs.stripe.com/keys for the team."),
+    # Prefixes appearing as ordinary words.
+    ("npm_ as a naming convention, not a token",
+     "The user's npm handle is npm_registry_admin for the org."),
+    ("ASIA as a place",
+     "The user is travelling to Asia in November for a conference."),
+    ("SG as an airline code",
+     "The user's SG flight leaves Singapore at 06.40 on Tuesday."),
+    ("github_pat named in prose without a value",
+     "The user's GitHub org is ghost-signal and they use github_pat naming in docs."),
+    # The 3-2-4 SSN shape must not swallow the shapes beside it.
+    ("phone number is 3-3-4, not 3-2-4",
+     "The user's phone number is 416 555 0132."),
+    ("a long order number",
+     "The user's order number was 1234567890123."),
+]
+
+
+@pytest.mark.parametrize(
+    "label,content", SECRETS_RULE_MUST_NOT_EAT_LOOKALIKES,
+    ids=[c[0] for c in SECRETS_RULE_MUST_NOT_EAT_LOOKALIKES],
+)
+def test_new_shapes_do_not_eat_lookalikes(label, content):
+    assert gate.sensitive_content_reason(content) is None
+
+
+def test_the_stripe_pattern_matches_what_stripe_actually_emits():
+    """Names the defect directly, so a rewrite that reintroduces a hyphen-only
+    separator fails here and not only somewhere in the corpus above."""
+    for key in (FAKE_STRIPE_SK, FAKE_STRIPE_PK, FAKE_STRIPE_RK):
+        assert gate.sensitive_content_reason(f"key: {key}") == "sensitive_api_key", key
+
+
+def test_the_secret_fixtures_are_assembled_not_literal():
+    """This FILE may not contain a contiguous secret-shaped token.
+
+    The fixtures have to carry a real key's shape or they test nothing — and
+    GitHub push protection matches that shape whether or not the value is
+    real. Written whole, they get the push REFUSED, which is what silently
+    broke every sync to the toup-agent public mirror from 2026-08-07: six
+    consecutive merges rejected, each a red check nothing else depended on.
+
+    Two assertions, because either alone is satisfiable by the wrong fix:
+    the values must still be exactly what they claim (so the split did not
+    quietly change what the detector is tested against), and the source must
+    not contain them contiguously (so 'simplifying' the concatenation back to
+    a literal fails HERE, at merge time, instead of in the mirror job that
+    nobody reads).
+    """
+    from pathlib import Path
+
+    # 1. The split did not change any runtime value.
+    assert FAKE_STRIPE_SK == "sk_live_" + "51NxFAKEfakeFAKEfake0000abcdEFGH"
+    assert FAKE_STRIPE_PK == "pk_test_" + "51NxFAKEfakeFAKEfake0000abcdEFGH"
+    assert FAKE_STRIPE_RK == "rk_live_" + "51NxFAKEfakeFAKEfake0000abcdEFGH"
+    assert FAKE_SLACK_BOT == "xoxb-" + "0000000000-0000000000-FAKEfakeFAKEfake0000"
+
+    # 2. No contiguous occurrence in the source text. Built the same way so a
+    #    reader can see the check is not just re-stating the constant.
+    source = Path(__file__).read_text()
+    for label, token in (
+        ("Stripe secret", "sk_" + "live_51Nx"),
+        ("Stripe publishable", "pk_" + "test_51Nx"),
+        ("Stripe restricted", "rk_" + "live_51Nx"),
+        ("Slack bot", "xoxb" + "-0000000000-"),
+    ):
+        assert token not in source, (
+            f"{label} fixture is written as a whole literal again — GitHub "
+            f"push protection will refuse the public-mirror push. Assemble it "
+            f"from fragments like FAKE_STRIPE_SK does."
+        )
+
+
+def test_the_hyphen_key_shapes_did_not_regress_when_stripe_was_split_out():
+    """`live|test` was DROPPED from the hyphen alternation rather than made to
+    work, because the trailing character class already absorbs any middle
+    segment. Nothing that used to match may stop matching."""
+    for key in (
+        "sk-proj-FAKEfakeFAKEfake0000abcdEFGHijklmnop",
+        "sk-ant-api03-FAKEfakeFAKEfake0000abcdEFGHij",
+        "sk-live-FAKEfakeFAKEfake0000abcdEFGH",
+        "sk-test-FAKEfakeFAKEfake0000abcdEFGH",
+    ):
+        assert gate.sensitive_content_reason(f"key: {key}") == "sensitive_api_key", key
+
+
+@pytest.mark.parametrize("prefix", ["ghp", "gho", "ghu", "ghs", "ghr"])
+def test_every_github_token_prefix_is_covered(prefix):
+    """Audited rather than assumed: all five were already covered before this
+    change. Pinned so a future edit to the alternation cannot drop one."""
+    assert gate.sensitive_content_reason(
+        f"token {prefix}_FAKEfakefakeFAKEfake0000abcdEFGH"
+    ) == "sensitive_api_key"
+
+
+def test_openai_project_keys_were_already_covered():
+    """`sk-proj-` is hyphen-separated, so the old pattern did reach it. Recorded
+    because it is easy to assume otherwise from the Stripe defect."""
+    assert gate.sensitive_content_reason(
+        "The user's API key is sk-proj-FAKEfakeFAKEfake0000abcdEFGHijklmnop."
+    ) == "sensitive_api_key"
+
+
+def test_a_three_segment_jwt_is_covered():
+    """Also already covered. Pinned because the pattern's trailing `\\.` reads
+    like a typo and is the only thing forcing a third segment."""
+    jwt = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+           ".eyJzdWIiOiIwMDAwIiwibmFtZSI6IkZBS0UifQ"
+           ".FAKEsignatureFAKEsignature0000")
+    assert gate.sensitive_content_reason(f"session token {jwt}") == "sensitive_api_key"
+
+
+# ── The password tier was English-only, for a Persian-speaking user base ──
+#
+# `sensitive_content_reason` is NOT one of the rules that abstains on script
+# mismatch. `assistant_echo_reason` and `unsupported_claim_reason` abstain
+# because they MEASURE the memory against the user's own words, and a different
+# alphabet makes that measurement meaningless. This rule never looks at
+# `from_user` at all — it reads the content and nothing else — so naming
+# Persian trigger nouns takes nothing away from that abstention. Its absence
+# meant a Persian user's password was written verbatim into a plaintext,
+# embedded, permanent row while an English user's was refused.
+#
+# Persian is SOV: the copula trails the value ("رمز عبور من X است"), so the
+# English `is|=|:` shape cannot see it. Both shapes are covered.
+
+FA_PASSWORDS_MUST_NOT_BE_STORED = [
+    ("رمز عبور + colon", "رمز عبور من: fakePass9912"),
+    ("پسورد + trailing copula", "پسورد کاربر برای پنل ادمین fakePass9912 است"),
+    ("کلمه عبور + colon", "کلمه عبور: fake-pass-2211"),
+    ("گذرواژه + trailing copula", "گذرواژه من fakePass9912 است"),
+    ("رمز ورود + past copula", "رمز ورود کاربر fakePass9912 بود"),
+    ("Persian-Indic digits as the value", "رمز عبور کارت من ۱۲۳۴۵۶ است"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,content", FA_PASSWORDS_MUST_NOT_BE_STORED,
+    ids=[c[0] for c in FA_PASSWORDS_MUST_NOT_BE_STORED],
+)
+def test_a_declared_password_in_persian_is_refused_on_automatic_capture(label, content):
+    assert gate.sensitive_content_reason(content) == "sensitive_password"
+    assert gate.memory_gate_reason(content) == "sensitive_password"
+
+
+@pytest.mark.parametrize(
+    "label,content", FA_PASSWORDS_MUST_NOT_BE_STORED,
+    ids=[c[0] for c in FA_PASSWORDS_MUST_NOT_BE_STORED],
+)
+def test_persian_passwords_keep_the_same_tier_split_as_english(label, content):
+    """The Persian rules carry the `password` label, not `api_key`, so a
+    Persian speaker who explicitly asks the agent to remember their own locker
+    passphrase gets the answer an English speaker gets. Refusing here would
+    make the gate stricter in Persian than in English — its own kind of bug."""
+    assert gate.sensitive_content_reason(content, explicit_save=True) is None
+
+
+FA_SENTENCES_ABOUT_PASSWORDS_THAT_CARRY_NO_VALUE = [
+    ("'my password is very weak' — an adjective, not a value", "رمز عبور من خیلی ضعیف است"),
+    ("'the user changed their Gmail password'", "کاربر رمز عبور جیمیل خود را عوض کرد"),
+    ("'saved the new password in 1Password' — a Latin token, no declaration",
+     "گذرواژه‌ی جدید را در 1Password ذخیره کرد"),
+    ("'forgot the password and needs to recover it'", "پسورد را فراموش کرده و باید بازیابی کند"),
+    ("'the password was changed twice' — a count, not a value", "رمز عبور من ۲ بار عوض شد"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,content", FA_SENTENCES_ABOUT_PASSWORDS_THAT_CARRY_NO_VALUE,
+    ids=[c[0] for c in FA_SENTENCES_ABOUT_PASSWORDS_THAT_CARRY_NO_VALUE],
+)
+def test_persian_sentences_that_merely_mention_a_password_are_kept(label, content):
+    """The discriminating half of the Persian rules. Mentioning a password is
+    not disclosing one — and because Persian trails its copula, a rule with no
+    shape constraint on the value would read "my password is very weak" as a
+    disclosed secret."""
+    assert gate.sensitive_content_reason(content) is None

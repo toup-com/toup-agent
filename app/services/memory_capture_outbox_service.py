@@ -191,21 +191,39 @@ async def replay_pending(
                 payload = row.payload_json
                 if isinstance(payload, str):     # sqlite JSON round-trip
                     payload = json.loads(payload)
-                creates = [
-                    MemoryCreate(
-                        content=item["content"],
-                        summary=item.get("summary"),
-                        brain_type=BrainType.USER,
-                        category=item.get("category") or "other",
-                        memory_type=item.get("memory_type") or "fact",
-                        importance=item.get("importance", 0.5),
-                        confidence=item.get("confidence", 0.8),
-                        tags=item.get("tags") or [],
-                        metadata=item.get("metadata") or {},
-                        source_type="outbox_replay",
+                # Carry the lease back across the replay. serialize_extracted
+                # deliberately stores `ttl_days`, and this rebuild used to drop
+                # it — MemoryCreate.expires_at then defaulted to None, so every
+                # parked transient memory came back PERMANENT. Worse, if the
+                # replayed content deduped against the row that did land, the
+                # reinforce path reads `expires_at is None` as "restated as
+                # durable" and clears the lease on the survivor too.
+                #
+                # Anchor on when the fact was STATED (row.created_at), not on
+                # when the retry happened to run: a fact parked for two days is
+                # two days into its life, not starting fresh.
+                _anchor = row.created_at or datetime.utcnow()
+                creates = []
+                for item in (payload or []):
+                    _ttl = item.get("ttl_days")
+                    creates.append(
+                        MemoryCreate(
+                            content=item["content"],
+                            summary=item.get("summary"),
+                            brain_type=BrainType.USER,
+                            category=item.get("category") or "other",
+                            memory_type=item.get("memory_type") or "fact",
+                            importance=item.get("importance", 0.5),
+                            confidence=item.get("confidence", 0.8),
+                            tags=item.get("tags") or [],
+                            metadata=item.get("metadata") or {},
+                            source_type="outbox_replay",
+                            expires_at=(
+                                _anchor + timedelta(days=float(_ttl))
+                                if _ttl else None
+                            ),
+                        )
                     )
-                    for item in (payload or [])
-                ]
                 if creates:
                     await dedup.smart_create_memories(
                         new_memories=creates, user_id=user_id

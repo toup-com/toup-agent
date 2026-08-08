@@ -202,10 +202,59 @@ def get_provider_app(name: str) -> Optional[ProviderAppConfig]:
 
 
 def list_registered() -> list[str]:
-    """Names of providers currently resolvable via env vars OR DB. The
-    superset is the deduped union — UI uses this to decide which tiles
-    to enable. Sync (env-only) for callers in module-init paths."""
+    """Names of providers registered from ENV VARS at boot. Sync, for
+    callers in module-init paths that run before the DB is ready.
+
+    Not the whole picture — admin-UI credentials live in the DB and
+    are invisible here. Anything user-facing wants
+    `list_configured_async()`."""
     return sorted(_apps.keys())
+
+
+async def list_configured_async() -> Optional[set[str]]:
+    """Every provider app that has usable OAuth credentials right now:
+    DB rows (admin-UI saves) unioned with the env-var registrations.
+
+    One query, not one per provider — the catalogue calls this once per
+    request and `provider_app_credentials` is a handful of rows.
+
+    A connector whose provider app is NOT in this set cannot complete a
+    connect: `/api/oauth/connect` answers 503 `credentials_missing`. The
+    catalogue uses that to stop advertising a Connect button that is
+    guaranteed to fail, which is what LinkedIn and Outlook did to every
+    user for months.
+
+    Returns **None** when the answer is UNKNOWN — i.e. the DB read
+    failed — and the caller must then gate nothing.
+
+    That distinction is the whole safety of this function. Returning the
+    env-var set on failure looks like a reasonable fallback and is a trap
+    in production: platform-api runs with no `GOOGLE_OAUTH_*` /
+    `GITHUB_OAUTH_*` env vars at all (credentials live in the DB), so
+    `_apps` is EMPTY there. A single transient DB hiccup would therefore
+    answer "nothing is configured" with total confidence and grey out
+    every connector on the page, Google and GitHub included.
+
+    None means "don't know, so don't act". The worst case is then a
+    Connect button that 503s — exactly the behaviour we had before this
+    function existed, which is the correct thing to degrade back to.
+    """
+    try:
+        from sqlalchemy import select
+        from app.db.database import async_session_maker
+        from app.db.models import ProviderAppCredential
+
+        async with async_session_maker() as db:
+            rows = (await db.execute(
+                select(ProviderAppCredential.name),
+            )).scalars().all()
+    except Exception as e:
+        logger.warning(
+            "[provider_apps] configured-list DB read failed (%s) — "
+            "catalogue will not gate any connector this request", e,
+        )
+        return None
+    return set(_apps.keys()) | {r for r in rows if r}
 
 
 def reset_for_tests() -> None:

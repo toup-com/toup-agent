@@ -279,6 +279,54 @@ async def google_request(
     return {"raw": resp.text}
 
 
+async def google_liveness(url: str, *, access_token: str) -> tuple[bool, str]:
+    """A health probe that can actually fail. Returns `(ok, detail)`.
+
+    Point the `url` at a cheap, well-formed request for a resource that
+    does not exist. Any answer Google gives — including 404 — proves
+    three things at once: the API is ENABLED on the project, the access
+    token was accepted, and the scope covers the call. Google
+    authenticates before it resolves the entity, so 404 can only be
+    reached by a request that already passed auth.
+
+    Unhealthy is therefore the narrow set: 401 (token rejected), 403
+    (API disabled on the project, or the scope was revoked from the
+    grant), 5xx, and transport failures. 429 is explicitly HEALTHY —
+    being throttled proves the API is up, and flipping an identity to
+    `provider_down` because Google rate-limited our own probe would be
+    a self-inflicted outage.
+
+    Why this exists: a probe that only checks that a token decrypts
+    cannot detect a provider outage. The Docs connector shipped with
+    exactly that, and on 2026-08-07 it reported `active` for two days
+    while every real call returned 403 `SERVICE_DISABLED` — the Docs
+    API had never been enabled on the Cloud project. The identity card
+    said "Connected" the whole time.
+
+    Cost: one small request per identity per sweep. That is the price
+    of the probe meaning anything; do not "optimise" it back into a
+    local token check.
+    """
+    try:
+        client = await _get_google_client()
+        resp = await client.get(
+            url, headers={"Authorization": f"Bearer {access_token}"},
+        )
+    except Exception as e:
+        return False, f"transport: {type(e).__name__}: {e}"
+
+    code = resp.status_code
+    if code == 401:
+        return False, "401 — access token rejected"
+    if code == 403:
+        # Carry Google's own sentence through. It names the project and
+        # links the enable page, which is the entire diagnosis.
+        return False, f"403 — {(resp.text or '')[:300]}"
+    if code >= 500:
+        return False, f"{code} — provider down"
+    return True, f"{code}"
+
+
 def to_connector_result(result_or_error: Any) -> ConnectorResult:
     """Helper: if you caught `_GoogleConnectorError`, surface its
     inner `.result`. Otherwise wrap whatever happened as

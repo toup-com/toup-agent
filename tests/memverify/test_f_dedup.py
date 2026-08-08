@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from .conftest import record_metric
@@ -161,6 +163,59 @@ async def test_distinct_facts_are_not_collapsed(db, user_a):
     joined = " | ".join(contents)
     assert "4471" in joined and "8823" in joined, (
         f"two distinct people's codes collapsed into one row: {contents}"
+    )
+
+
+async def test_a_fact_arriving_between_two_like_it_destroys_neither(db):
+    """A fact whose neighbours STRADDLE it must not retire either of them.
+
+    This is the deterministic form of the silent loss that
+    test_i_concurrency.py::test_rapid_fire_writes_lose_nothing catches by
+    accident, and it took measuring to find the right shape — writing the same
+    facts in order does NOT reproduce it. What matters is not how many
+    same-shaped facts exist but WHERE the incoming one sits among the
+    candidates it is adjudicated against (gpt-4o-mini, 40 trials per cell,
+    2026-08-08; "destructive" = the applied verdict removed a fact):
+
+        incoming 04, candidates {05, 03}  straddled   -> 70%
+        incoming 04, candidates {03, 02}  both below  ->  0%
+        incoming 02, candidates {00, 01}  sequential  ->  0%
+        incoming 03, candidates {00,01,02}            ->  0%
+
+    Straddled, the model reads "project 04 … vireo-04" as project 05's value
+    having changed and answers contradiction_update, which RETIRES the
+    existing row (is_active=False). Nothing raises; the fact is simply gone.
+    Widen the batch and the misfire fades (5 candidates -> 2%), so the
+    exposure is greatest when only a couple of rows exist — which is exactly
+    what racing writes produce, and why this needed concurrency to show up at
+    all.
+
+    Each triple gets its OWN user: sharing a store would let earlier triples
+    appear as extra candidates, widening the batch out of the cell under test
+    and quietly making this vacuous. Four triples because one reproduces the
+    pre-fix failure about half the time — four make a regression ~94% likely
+    to be caught rather than a coin toss.
+    """
+    from .conftest import make_user
+
+    lost = []
+    for stem in ("vireo", "kestrel", "marlin", "ibis"):
+        uid = await make_user(db, email=f"{stem}-{uuid.uuid4().hex[:8]}@memverify.local")
+        fact = lambda n: f"The user's project number {n} is codenamed {stem}-{n}."
+
+        # Order matters: the two outer facts must be stored BEFORE the middle
+        # one, or there is no straddle to adjudicate against.
+        for n in ("03", "05", "04"):
+            await store_direct(db, uid, fact(n), category="work")
+
+        contents = " | ".join(await active_contents(db, uid))
+        lost += [f"{stem}-{n}" for n in ("03", "04", "05")
+                 if f"{stem}-{n}" not in contents]
+
+    record_metric("straddled_facts_lost", len(lost))
+    assert not lost, (
+        f"{len(lost)} of 12 facts were destroyed by a neighbour arriving "
+        f"between them: {lost}"
     )
 
 

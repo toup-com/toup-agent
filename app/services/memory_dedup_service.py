@@ -62,6 +62,24 @@ _ACTION_PRECEDENCE = {
     "contradiction_update": 3,
 }
 
+# Verdicts that make a fact stop being retrievable, and must therefore be
+# confirmed by a second, independent adjudication before they are applied.
+#
+#   duplicate            -> the INCOMING text is discarded (existing row is
+#                           reinforced instead)
+#   contradiction_update -> the MATCHED row is retired (is_active=False)
+#
+# `merge` is deliberately absent: it composes both texts into one row rather
+# than dropping either, so a wrong merge is a tidiness problem, not a
+# disappearance. See _confirm_destructive_verdict.
+_DESTRUCTIVE_ACTIONS = frozenset({"duplicate", "contradiction_update"})
+
+# Verdict origins that are already reproducible, so a second opinion could only
+# add noise. Every decision dict carries an explicit `source`; anything NOT
+# listed here — including a dict that omits the key — gets confirmed, so the
+# default for a future verdict producer is the safe one.
+_DETERMINISTIC_SOURCES = frozenset({"threshold", "heuristic", "default"})
+
 # How long a same-user write will queue for the dedup advisory lock before
 # giving up and proceeding unlocked. Must stay comfortably under the engine's
 # 30s `command_timeout` / `statement_timeout`: past that the DATABASE kills the
@@ -564,6 +582,7 @@ class MemoryDedupService:
         )
         decision = decisions[best] or {
             "action": "new", "reason": "no verdict returned for this candidate",
+            "source": "default",
         }
         return decision, candidates[best]
 
@@ -624,11 +643,18 @@ class MemoryDedupService:
             return {
                 "action": "duplicate",
                 "reason": f"auto: similarity {similarity:.2f} >= {AUTO_DUPLICATE_THRESHOLD}",
+                # source=threshold: deterministic and reproducible, and it only
+                # gets here with both guards above satisfied. Re-asking an LLM
+                # would replace a guarded measurement with a sampled opinion —
+                # and an LLM "new" on a true paraphrase creates exactly the
+                # near-duplicate rows dedup exists to prevent. Not confirmed.
+                "source": "threshold",
             }
         if similarity < AUTO_NEW_THRESHOLD:
             return {
                 "action": "new",
                 "reason": f"auto: similarity {similarity:.2f} < {AUTO_NEW_THRESHOLD}",
+                "source": "threshold",
             }
         if not allow_llm:
             return None
@@ -645,9 +671,17 @@ class MemoryDedupService:
         user_id: str,
         new_embedding: Optional[List[float]] = None
     ) -> Tuple[Memory, str]:
-        """Apply an adjudication verdict. Logic unchanged from the original
-        inline block in smart_create_memory — factored out so the batch path
-        (smart_create_memories) shares it."""
+        """Apply an adjudication verdict.
+
+        Every verdict that would make a fact stop being retrievable is
+        re-asked on its own first (_confirm_destructive_verdict). This is the
+        one choke point all three entry points reach, so the confirmation
+        cannot be bypassed by adding a fourth.
+        """
+        decision = await self._confirm_destructive_verdict(
+            decision, top_match, new_memory.content
+        )
+
         if decision['action'] == 'duplicate':
             # Same information, just reinforce
             existing = await self._get_memory_by_id(top_match['id'])
@@ -691,6 +725,126 @@ class MemoryDedupService:
         )
         logger.info(f"Created new memory: {memory.id}")
         return memory, "created"
+
+    async def _confirm_destructive_verdict(
+        self,
+        decision: Dict[str, str],
+        top_match: Dict[str, Any],
+        new_content: str,
+    ) -> Dict[str, str]:
+        """Re-ask a fact-destroying verdict on its own before acting on it.
+
+        WHY (measured, 2026-08-08 — this is the mechanism behind the silent
+        loss in test_i_concurrency.py::test_rapid_fire_writes_lose_nothing).
+
+        Adjudication is batched: every candidate above CANDIDATE_THRESHOLD for
+        one write goes into a SINGLE `_llm_decide_actions_batch` request, and
+        `_select_decision` then applies the highest-precedence verdict among
+        them. Both halves are deliberate — widening from 1 candidate to N
+        (2026-07-29) fixed a real bug where a contradicting row that ranked
+        2nd was never compared at all. But together they mean ONE verdict out
+        of N decides a destructive action, so a per-pair error rate of p
+        becomes roughly 1-(1-p)^N per write.
+
+        The error rate is not small, and what drives it is not the facts but
+        WHERE the incoming one sits among the candidates it is shown next to.
+        Memories that share a sentence template and differ only in a two-digit
+        number ("project number 04 … vireo-04"), embedding at 0.91–0.92,
+        gpt-4o-mini, 40 trials per cell, "destructive" = the applied verdict
+        removed a fact:
+
+            incoming 04 vs {05, 03}   straddled    │ 15/40 and 28/40 (two runs)
+            incoming 04 vs {03, 02}   both below   │  0/40
+            incoming 02 vs {00, 01}   sequential   │  0/40
+            incoming 03 vs {00,01,02} sequential   │  0/40
+
+        Straddled, the model reads the incoming fact as project 05's value
+        having CHANGED and answers contradiction_update, which retires the
+        existing row. Widening the batch dilutes it — the same straddled pair
+        inside 3 candidates measured 4/40, inside 5 candidates 1/40, and asked
+        on its own 0/40.
+
+        So the misfire needs TWO things at once: a straddle, and few enough
+        candidates that it is not diluted. Sequential writes never straddle;
+        a large store never has few candidates. Concurrency produces both,
+        because arrival order at the `_lock_user_writes` advisory lock decides
+        which neighbours have committed — which is why the same twenty facts
+        produce a different store on different runs, and why this needed a
+        race to surface at all.
+
+        Prompt drift was NOT the cause, though it existed: re-running the
+        straddled two-candidate cell with the batched prompt brought to parity
+        with the single-pair prompt's rubric moved it 28% -> 22%, i.e. nothing
+        outside sampling noise. What is reliable is asking about ONE pair at a
+        time. So the batched call stays the cheap pre-filter it was designed
+        to be, and the verdicts that destroy data are confirmed by the
+        accurate question.
+
+        Measured end to end on the real write path, three writes where the
+        third lands between the first two: 5 of 10 rounds lost a fact before
+        this gate, 0 of 10 after. Full protocol against the live model across
+        the three batch sizes: 0/120.
+
+        Cost: one extra `memory_extraction_model` call, and only when a
+        destructive verdict wins — `new` and `merge` never pay it.
+
+        A refusal is not a downgrade to silence: returning `new` stores the
+        incoming fact and leaves the matched row alone, so the outcome of a
+        disagreement is that BOTH facts remain retrievable. That is the
+        recoverable direction; the unconfirmed verdicts were not.
+        """
+        action = decision.get("action")
+        if action not in _DESTRUCTIVE_ACTIONS:
+            return decision
+
+        # Only verdicts the MODEL produced are re-asked. A "threshold" verdict
+        # is a similarity measurement past both guards and a "heuristic" one is
+        # a string comparison — both deterministic, so a second opinion would
+        # substitute noise for a reproducible decision rather than corroborate
+        # it. `source` is set explicitly at every return site instead of being
+        # sniffed out of `reason`, so a new verdict producer that forgets it
+        # gets confirmed (the safe default) rather than silently exempted.
+        if decision.get("source") in _DETERMINISTIC_SOURCES:
+            return decision
+
+        existing_content = (top_match or {}).get("content") or ""
+        if not existing_content:
+            return decision
+
+        try:
+            confirmation = await self._llm_decide_action(
+                existing_content=existing_content,
+                new_content=new_content,
+            )
+        except Exception as e:
+            # An unavailable adjudicator must not be able to authorise data
+            # loss by failing. Degrade to the outcome that keeps both facts.
+            logger.warning(
+                "[dedup] could not confirm %s verdict (%s); keeping both facts",
+                action, e,
+            )
+            return {
+                "action": "new",
+                "reason": f"unconfirmed {action}: adjudicator unavailable ({e})",
+            }
+
+        confirmed_action = (confirmation or {}).get("action")
+        if confirmed_action == action:
+            return decision
+
+        logger.info(
+            "[dedup] REFUSED %s: re-asked on its own the adjudicator said %s "
+            "— keeping both facts. existing=%s incoming=%s",
+            action, confirmed_action,
+            describe_memory(existing_content), describe_memory(new_content),
+        )
+        return {
+            "action": "new",
+            "reason": (
+                f"unconfirmed {action}: re-adjudicated alone as "
+                f"{confirmed_action}"
+            ),
+        }
 
     async def _get_memory_by_id(self, memory_id: str) -> Optional[Memory]:
         """Get a memory by ID without user check (internal use)."""
@@ -760,15 +914,30 @@ class MemoryDedupService:
         memory.access_count = (memory.access_count or 0) + 1
         memory.updated_at = datetime.utcnow()
         
-        # Add to history
+        # Add to history.
+        #
+        # `content` is the SURVIVING row's text — that is what the rest of the
+        # history schema means by it, and _supersede_with_new writes the same
+        # field the same way. But a reinforcement is the one action that throws
+        # text away: the incoming wording is discarded and the existing row
+        # kept. Recording only the survivor made that discard untraceable —
+        # after the fact there was no way to tell whether a fact the user
+        # stated had been correctly recognised as a restatement or wrongly
+        # absorbed, which is precisely the question asked when a memory goes
+        # missing. `discarded_content` closes that: the text is preserved
+        # whenever it differs from what was kept.
         history = json.loads(memory.history_json) if memory.history_json else []
-        history.append({
+        entry = {
             "date": datetime.utcnow().isoformat(),
             "content": memory.canonical_content or memory.content,
             "source": new_data.source_type or "conversation",
             "action": "reinforced",
             "change_summary": "Memory reinforced (duplicate occurrence)"
-        })
+        }
+        incoming = (new_data.content or "").strip()
+        if incoming and incoming != (memory.content or "").strip():
+            entry["discarded_content"] = incoming
+        history.append(entry)
         memory.history_json = json.dumps(history)
         
         await self.db.commit()
@@ -935,12 +1104,35 @@ class MemoryDedupService:
             new_embedding=merged_embedding
         )
         
+        # Reconcile the expiry lease, with exactly the rule
+        # _reinforce_existing_memory applies. MERGE and REINFORCE are the two
+        # outcomes of the same dedup decision, and only one of them honoured the
+        # lifetime model: a transient memory ("I'm working on the billing
+        # rewrite", 30d) restated as a durable fact ("the billing rewrite is my
+        # main project") kept its 30-day lease if the adjudicator happened to
+        # choose merge instead of reinforce, and was archived on schedule.
+        #   - restated as DURABLE (no expires_at) -> promote to permanent
+        #   - restated as transient with a LATER horizon -> extend
+        #   - restated as transient with an earlier horizon -> keep the longer
+        _dirty = False
+        if updated.expires_at is not None:
+            _new_expiry = getattr(new_memory_data, "expires_at", None)
+            if _new_expiry is None:
+                updated.expires_at = None
+                _dirty = True
+            elif _new_expiry > updated.expires_at:
+                updated.expires_at = _new_expiry
+                _dirty = True
+
         # Update importance if new info is significant
         if new_memory_data.importance and new_memory_data.importance > (updated.importance or 0.5):
             updated.importance = new_memory_data.importance
+            _dirty = True
+
+        if _dirty:
             await self.db.commit()
             await self.db.refresh(updated)
-        
+
         return updated
     
     def _is_same_information(self, content1: str, content2: str) -> bool:
@@ -1065,21 +1257,44 @@ Respond in JSON:
             if action not in ["duplicate", "merge", "contradiction_update", "new"]:
                 action = "new"
             
-            return {"action": action, "reason": reason}
-            
+            return {"action": action, "reason": reason, "source": "llm"}
+
         except Exception as e:
             logger.error(f"LLM decision failed: {e}")
             # Fallback: use simple heuristic
-            if self._is_same_information(existing_content, new_content):
-                return {"action": "duplicate", "reason": "Fallback: text similarity"}
-            return {"action": "new", "reason": f"Fallback due to error: {e}"}
+            return self._heuristic_decision(existing_content, new_content, error=e)
 
-    def _heuristic_decision(self, existing_content: str, new_content: str) -> Dict[str, str]:
-        """Non-LLM fallback verdict — same heuristic as _llm_decide_action's
-        except-branch."""
+    def _heuristic_decision(
+        self,
+        existing_content: str,
+        new_content: str,
+        *,
+        error: Optional[BaseException] = None,
+    ) -> Dict[str, str]:
+        """Non-LLM fallback verdict — shared by _llm_decide_action's
+        except-branch and by _llm_decide_actions_batch's missing-entry filler,
+        so the two cannot drift.
+
+        source="heuristic": `_is_same_information` is a normalised text
+        comparison (one string contains the other, within 20 characters), not
+        a judgement. It is deterministic, so a second opinion adds nothing —
+        and it must not be sent to an adjudicator that has just been shown to
+        be unreachable.
+        """
         if self._is_same_information(existing_content, new_content):
-            return {"action": "duplicate", "reason": "Fallback: text similarity"}
-        return {"action": "new", "reason": "Fallback: heuristic"}
+            return {
+                "action": "duplicate",
+                "reason": "Fallback: text similarity",
+                "source": "heuristic",
+            }
+        return {
+            "action": "new",
+            "reason": (
+                f"Fallback due to error: {error}" if error is not None
+                else "Fallback: heuristic"
+            ),
+            "source": "heuristic",
+        }
 
     async def _llm_decide_actions_batch(
         self,
@@ -1182,7 +1397,16 @@ Respond in JSON with EXACTLY one decision per pair, in order:
                 action = item.get("action", "new")
                 if action not in ["duplicate", "merge", "contradiction_update", "new"]:
                     action = "new"
-                decisions[idx] = {"action": action, "reason": item.get("reason", "")}
+                decisions[idx] = {
+                    "action": action,
+                    "reason": item.get("reason", ""),
+                    # source=llm AND batched: this is the population measured
+                    # at up to 70% wrong when the incoming fact straddles its
+                    # candidates. A destructive verdict from here is re-asked
+                    # on its own before it is applied
+                    # (_confirm_destructive_verdict).
+                    "source": "llm",
+                }
             return decisions
 
         except Exception as e:

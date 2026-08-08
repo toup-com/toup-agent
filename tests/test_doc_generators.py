@@ -190,14 +190,21 @@ def test_tool_dispatch_and_pending_attachments():
 def test_doc_generation_tools_schema_count_and_names():
     schemas = get_doc_generation_tools()
     names = {s["name"] for s in schemas}
-    # convert_document (LibreOffice DOCX/PPTX→PDF) and navigate_to ship in
-    # the same gated block — this assertion went stale when they landed
-    # (the file wasn't CI-wired, so nothing caught it).
+    # convert_document (LibreOffice DOCX/PPTX→PDF) ships in the same gated
+    # block — this assertion went stale when it landed (the file wasn't
+    # CI-wired, so nothing caught it).
+    #
+    # `navigate_to` USED to be in this list. It is page navigation, not
+    # document generation, so gating the group took "take me to my brain"
+    # down with the exporters; it now lives in get_navigation_tools() and
+    # ships unconditionally. Pinned in
+    # tests/test_tool_family_entitlements.py.
     assert names == {
         "generate_pdf", "generate_docx", "generate_xlsx",
         "generate_pptx", "generate_markdown", "generate_html_to_pdf",
-        "convert_document", "navigate_to",
+        "convert_document",
     }
+    assert "navigate_to" not in names
     # Each tool has required input schema
     for s in schemas:
         assert "input_schema" in s
