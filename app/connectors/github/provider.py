@@ -14,6 +14,7 @@ a Prometheus gauge.
 from __future__ import annotations
 
 import json
+import re
 from typing import ClassVar, Optional
 
 import httpx
@@ -54,6 +55,39 @@ async def _resolve_token(user_id: str) -> str:
     return ident.access_token
 
 
+def _gh_message(body: str) -> str:
+    """GitHub's own `message` field, if the body is the usual JSON error."""
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return ""
+    msg = parsed.get("message") if isinstance(parsed, dict) else None
+    return msg if isinstance(msg, str) else ""
+
+
+def _org_from_restriction(body: str) -> str:
+    """Pull the org login out of GitHub's OAuth-App-restriction message.
+
+    The org name is the whole value of the error: without it we can only
+    say "some organization", and the user has to guess which of theirs is
+    blocking us. GitHub backticks it:
+
+        …credentials, the `toup-com` organization has enabled OAuth App
+        access restrictions…
+
+    Matched against the `message` field rather than the raw body so a
+    backticked string elsewhere in the payload can't be mistaken for it.
+    """
+    msg = _gh_message(body) or body
+    m = re.search(r"`([^`]{1,100})`\s+organization has enabled OAuth App", msg)
+    if not m:
+        return ""
+    org = m.group(1).strip()
+    # Only ever interpolated into a URL path, so refuse anything that
+    # isn't a plausible GitHub login rather than building a broken link.
+    return org if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", org) else ""
+
+
 def _handle_response(resp: httpx.Response, *, scope_hint: str = "") -> dict:
     if 200 <= resp.status_code < 300:
         if resp.headers.get("content-type", "").startswith("application/json"):
@@ -64,15 +98,91 @@ def _handle_response(resp: httpx.Response, *, scope_hint: str = "") -> dict:
             reauth_url="/agent/integrations/github",
         ))
     if resp.status_code == 403:
-        # Could be rate-limit OR scope. GH puts scope-missing into
-        # `X-Accepted-OAuth-Scopes` and rate-limit into
-        # `X-RateLimit-Remaining: 0`.
+        # A 403 from GitHub is four different problems wearing one status
+        # code, and three of them are NOT the user's permissions. Order
+        # matters: rate-limit is header-detectable, the two org policies
+        # are body/header-detectable, and only what is left is a scope
+        # problem — which this used to assume unconditionally.
         if resp.headers.get("X-RateLimit-Remaining") == "0":
             reset = int(resp.headers.get("X-RateLimit-Reset", "0") or 0)
             import time
             wait = max(reset - int(time.time()), 30)
             raise _GHError(ConnectorRateLimited(retry_after_s=wait))
-        raise _GHError(ConnectorScopeMissing(required_scope=scope_hint or "unknown"))
+
+        body = resp.text or ""
+
+        # ── Org has OAuth App access restrictions and hasn't approved us ──
+        # GitHub says so explicitly, and names the org:
+        #   "Although you appear to have the correct authorization
+        #    credentials, the `acme` organization has enabled OAuth App
+        #    access restrictions…"
+        # Reporting this as a missing scope was actively harmful: the
+        # scope IS granted (X-Accepted-OAuth-Scopes: repo against
+        # X-OAuth-Scopes: read:user, repo), so the "re-authorize to grant
+        # it" advice that follows a scope error sends the user round a
+        # loop that cannot succeed — re-auth issues the same scopes and
+        # the org blocks them again. Only an org owner changing a setting
+        # fixes it, so say that, and say where.
+        if "OAuth App access restrictions" in body:
+            org = _org_from_restriction(body)
+            where = (
+                f"https://github.com/organizations/{org}/settings/oauth_application_policy"
+                if org else
+                "the organization's Settings → Third-party Access → OAuth app policy"
+            )
+            named = f"The '{org}' organization" if org else "That repository's organization"
+            raise _GHError(ConnectorToolError(
+                message=(
+                    f"{named} restricts third-party OAuth apps, and Toup has not been "
+                    f"approved for it yet. This is an organization setting on GitHub's "
+                    f"side — your account and permissions are fine, and reconnecting "
+                    f"will not change it. An organization owner needs to grant Toup "
+                    f"access at {where} (open it, find Toup, choose Grant). "
+                    f"Repositories in your personal account and in unrestricted "
+                    f"organizations keep working meanwhile."
+                ),
+                retryable=False,
+            ))
+
+        # ── Org enforces SAML SSO and this token isn't authorized for it ──
+        # Same shape of problem, different remedy: the user authorizes
+        # their existing token rather than an owner approving the app.
+        sso = resp.headers.get("X-GitHub-SSO") or ""
+        if sso or "SAML enforcement" in body or "single sign-on" in body.lower():
+            raise _GHError(ConnectorToolError(
+                message=(
+                    "That organization enforces SAML single sign-on, and this GitHub "
+                    "connection has not been authorized for it. Open "
+                    "https://github.com/settings/connections/applications and authorize "
+                    "the Toup app for that organization, then try again. Your "
+                    "permissions are fine — SSO authorization is a separate step."
+                ),
+                retryable=False,
+            ))
+
+        # ── Genuinely a scope problem — but only claim it if it's true ──
+        # `X-Accepted-OAuth-Scopes` is what the endpoint requires and
+        # `X-OAuth-Scopes` is what we hold. If we already hold one of the
+        # accepted scopes then the missing-scope story is false, and a
+        # false diagnosis is worse than an honest unknown.
+        accepted = {s.strip() for s in (resp.headers.get("X-Accepted-OAuth-Scopes") or "").split(",") if s.strip()}
+        granted = {s.strip() for s in (resp.headers.get("X-OAuth-Scopes") or "").split(",") if s.strip()}
+        if accepted and not (accepted & granted):
+            raise _GHError(ConnectorScopeMissing(
+                required_scope=", ".join(sorted(accepted)) or scope_hint or "unknown",
+            ))
+        if not accepted and scope_hint:
+            raise _GHError(ConnectorScopeMissing(required_scope=scope_hint))
+
+        raise _GHError(ConnectorToolError(
+            message=(
+                "GitHub refused this request (403) even though the connection holds "
+                f"the scopes it asks for ({', '.join(sorted(granted)) or 'none reported'}). "
+                "This is usually an organization policy or a repository you no longer "
+                f"have access to. GitHub said: {_gh_message(body) or body[:200]}"
+            ),
+            retryable=False,
+        ))
     if resp.status_code == 429:
         wait = 30
         try:
