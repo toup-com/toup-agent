@@ -22,8 +22,8 @@ Why an explicit module rather than a settings field per provider:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Mapping, Optional
 
 from app.config import settings
 
@@ -44,6 +44,42 @@ class ProviderAppConfig:
     authorize_url: str      # base URL — query params appended at /connect
     token_url: str          # POST endpoint for code-exchange and refresh
     use_pkce: bool = True
+
+    # ── Per-provider protocol quirks ─────────────────────────────────
+    # OAuth 2.0 is a family of dialects, not one wire format, and the
+    # differences are load-bearing: GitHub's token endpoint answers
+    # form-urlencoded unless asked otherwise (which 500'd every GitHub
+    # connect from launch until 2026-08-08), Notion authenticates the
+    # CLIENT with HTTP Basic and wants a JSON body, and Atlassian
+    # rejects an authorize request that omits `audience`.
+    #
+    # These live on the config rather than as `if provider_name == …`
+    # branches in oauth.py because that file already carries one such
+    # branch for Google and it does not generalise: every new provider
+    # would add another, in a function two OAuth legs deep, where the
+    # cost of getting it wrong is a 500 AFTER the user has consented.
+
+    # Extra query params on the authorize URL. Atlassian documents both
+    # `audience=api.atlassian.com` and `prompt=consent` as REQUIRED;
+    # without `audience` the grant is not valid for api.atlassian.com.
+    extra_authorize_params: Mapping[str, str] = field(default_factory=dict)
+
+    # How the client credentials reach the token endpoint.
+    #   "body"  — client_id + client_secret as form/JSON fields (default,
+    #             what Google / Microsoft / GitHub / LinkedIn expect)
+    #   "basic" — RFC 6749 §2.3.1 HTTP Basic. Notion REQUIRES this and
+    #             401s on body credentials.
+    token_auth_style: str = "body"
+
+    # Encoding of the token-request body. RFC 6749 §4.1.3 mandates form
+    # encoding and everyone here uses it except Notion, which documents
+    # JSON and answers 400 invalid_json to a form body.
+    token_body_format: str = "form"
+
+    # Extra headers on the token request. Notion requires `Notion-Version`
+    # even on the token endpoint (400 missing_version without it) — no
+    # other provider in this repo versions its OAuth endpoint at all.
+    extra_token_headers: Mapping[str, str] = field(default_factory=dict)
 
 
 # Module-level registry. Populated at platform lifespan; cleared via
@@ -97,6 +133,49 @@ _TEMPLATES: dict[str, dict] = {
         "authorize_url": "https://www.linkedin.com/oauth/v2/authorization",
         "token_url": "https://www.linkedin.com/oauth/v2/accessToken",
         "use_pkce": False,
+    },
+    "jira": {
+        # Atlassian OAuth 2.0 (3LO). Two REQUIRED authorize params that
+        # no other provider here needs:
+        #   audience=api.atlassian.com — without it the grant is not
+        #     valid against the api.atlassian.com gateway, which is
+        #     where every Jira Cloud REST call goes.
+        #   prompt=consent — Atlassian otherwise skips the consent
+        #     screen for a returning user and the scope set silently
+        #     stays whatever was granted the first time.
+        # PKCE is off: Atlassian's documented 3LO parameter list has no
+        # `code_challenge`, so the plain authorization-code flow is the
+        # only one on offer.
+        "authorize_url": "https://auth.atlassian.com/authorize",
+        "token_url": "https://auth.atlassian.com/oauth/token",
+        "use_pkce": False,
+        "extra_authorize_params": {
+            "audience": "api.atlassian.com",
+            "prompt": "consent",
+        },
+    },
+    "notion": {
+        # Notion deviates on all three axes at once, which is why the
+        # quirk fields exist rather than another `if` in oauth.py:
+        #   - the client authenticates with HTTP Basic, not body fields
+        #   - the token body is JSON, not form-encoded
+        #   - `Notion-Version` is mandatory even on the token endpoint
+        # `owner=user` is a REQUIRED authorize param and rides in the
+        # base URL rather than through `extra_authorize_params` purely
+        # because it would work either way; keeping it visible in the
+        # URL matches Notion's own documentation. `_build_authorize_url`
+        # picks `&` as its separator when the base already has a query.
+        #
+        # There are no OAuth scopes at all: access comes from the
+        # integration's capabilities (set once by us) plus the pages
+        # each user shares at consent time. Hence `scopes: []` in the
+        # manifest — not an oversight.
+        "authorize_url": "https://api.notion.com/v1/oauth/authorize?owner=user",
+        "token_url": "https://api.notion.com/v1/oauth/token",
+        "use_pkce": False,
+        "token_auth_style": "basic",
+        "token_body_format": "json",
+        "extra_token_headers": {"Notion-Version": "2026-03-11"},
     },
     "stub_provider_app": {
         "authorize_url": "/api/oauth/_stub/authorize",
@@ -175,6 +254,12 @@ async def get_provider_app_async(name: str) -> Optional[ProviderAppConfig]:
                 ),
             )).scalar_one_or_none()
         if row is not None:
+            # Every protocol quirk must be carried across, not just the
+            # three URLs. This is the path admin-entered credentials
+            # take, so it is the ONLY path Jira and Notion will ever use
+            # — dropping `token_auth_style` here would send Notion body
+            # credentials it answers 401 to, and the failure would land
+            # after the user had already consented.
             return ProviderAppConfig(
                 name=name,
                 client_id=row.client_id,
@@ -182,6 +267,10 @@ async def get_provider_app_async(name: str) -> Optional[ProviderAppConfig]:
                 authorize_url=template["authorize_url"],
                 token_url=template["token_url"],
                 use_pkce=template["use_pkce"],
+                extra_authorize_params=template.get("extra_authorize_params", {}),
+                token_auth_style=template.get("token_auth_style", "body"),
+                token_body_format=template.get("token_body_format", "form"),
+                extra_token_headers=template.get("extra_token_headers", {}),
             )
     except Exception as e:
         # Never block /connect on a transient DB hiccup — fall through

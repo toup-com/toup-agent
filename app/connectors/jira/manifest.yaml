@@ -1,0 +1,212 @@
+# Jira Cloud connector — manifest.
+#
+# Scopes are Atlassian's CLASSIC 3LO scopes. Atlassian's own guidance is
+# to prefer classic over granular ("use classic scopes to the maximum
+# extent possible"), and every operation this connector performs is
+# covered by exactly two of them:
+#
+#   read:jira-work  — JQL search, read an issue, list projects
+#   write:jira-work — create an issue, post a comment
+#   offline_access  — issue a refresh_token (rotating; see provider.py)
+#
+# Verified against the Jira Cloud v3 OpenAPI document (swagger-v3.v3.json,
+# fetched 2026-08-08): every one of the five endpoints below declares
+# `OAuth2: [read:jira-work]` or `OAuth2: [write:jira-work]` and nothing
+# else.
+#
+# `read:jira-user` is deliberately NOT requested. It grants "usernames,
+# email addresses, and avatars" — real PII — and no tool here needs it:
+# assignee/reporter display names ride along inside the issue payload
+# under read:jira-work. Listed under scopes_optional purely so the
+# scope-review UI can explain why it is absent. Note that scopes_optional
+# is never sent at /connect (see connectors_catalog.py) — moving a scope
+# there does not request it, it only documents it.
+manifest_version: 1
+id: jira
+name: Jira
+short_description: Search issues with JQL, read issues and their comments, list projects, and file or comment on work.
+icon: cloud
+docs_url: https://developer.atlassian.com/cloud/jira/platform/rest/v3/
+status: stable
+category: productivity
+
+oauth:
+  provider_app: jira
+  scopes:
+    - read:jira-work
+    - write:jira-work
+    - offline_access
+  scopes_optional:
+    - read:jira-user
+  # Atlassian staff state on the developer community that 3LO supports
+  # the plain authorization-code flow only, and that PKCE exists solely
+  # behind an unexposed internal flag (ECO-283). The documented authorize
+  # parameter list has no `code_challenge`. So: false, honestly.
+  #
+  # ⚠ Coupled risk the orchestrator must resolve: `_exchange_code_for_tokens`
+  # in api/oauth.py posts `code_verifier` UNCONDITIONALLY, ignoring this
+  # flag. GitHub and LinkedIn tolerate the stray parameter; auth.atlassian.com
+  # is Auth0-hosted and Auth0 validates a verifier when one is presented.
+  # Untested against the live endpoint — see provider.py's docstring.
+  pkce: false
+  refresh: true
+
+scope_descriptions:
+  read:jira-work: Read your Jira projects, issues, comments, and run searches.
+  write:jira-work: Create issues and post comments as you.
+  offline_access: Stay connected without signing in again every hour.
+  read:jira-user: Not requested. Would expose Jira usernames, email addresses, and avatars — nothing here needs it.
+
+health:
+  probe: jira__list_projects
+
+tools:
+  - name: jira__search_issues
+    description: |
+      Search Jira issues with JQL. The query MUST be bounded — Jira rejects an unrestricted search — so always include at least one restriction such as `project = ENG`, `assignee = currentUser()`, or `updated >= -30d`. Example: `project = ENG AND status != Done ORDER BY updated DESC`. Returns a compact row per issue plus a `next_page_token`; pass that back as `next_page_token` for the following page.
+    input_schema:
+      type: object
+      properties:
+        jql:
+          type: string
+          description: A bounded JQL expression, e.g. "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC".
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 25
+        fields:
+          type: string
+          description: Comma-separated Jira field names to return. Defaults to a summary set. Use "*all" only when you genuinely need every custom field.
+        next_page_token:
+          type: string
+          description: The `next_page_token` from a previous call. Omit for the first page.
+        site:
+          type: string
+          description: Which Jira site to use — name, URL, or cloud id. Only needed when the account has more than one site; the response always names the site that was used.
+      required: [jql]
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: jira__get_issue
+    description: |
+      Fetch one issue by key (e.g. "ENG-1421") or numeric id, including its description AND its comment thread in the SAME call. Do not follow up with a separate comment fetch — there isn't one.
+    input_schema:
+      type: object
+      properties:
+        issue_key:
+          type: string
+          description: Issue key such as "ENG-1421", or the numeric issue id.
+        max_comments:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 20
+          description: How many of the most recent comments to include. 0 omits the thread.
+        site:
+          type: string
+          description: Which Jira site to use — name, URL, or cloud id. Only needed for multi-site accounts.
+      required: [issue_key]
+    mutates: false
+    elevation: false
+    output_redaction: ["description", "comments"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: jira__list_projects
+    description: List the Jira projects you can see, optionally filtered by a literal string matched against project key or name.
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Literal filter matched case-insensitively against project key and name.
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 50
+        site:
+          type: string
+          description: Which Jira site to use — name, URL, or cloud id. Only needed for multi-site accounts.
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: jira__create_issue
+    description: |
+      Create a Jira issue. `project_key` and `summary` are required. `issue_type` must be a type that EXISTS in that project — "Task", "Bug" and "Story" are the common ones, but a project can be configured with any set, and Jira rejects an unknown one with a message naming the valid values. Call jira__list_projects first if you are unsure of the project key.
+    input_schema:
+      type: object
+      properties:
+        project_key:
+          type: string
+          description: Project key, e.g. "ENG".
+        summary:
+          type: string
+          description: One-line issue title.
+        description:
+          type: string
+          description: Plain text. Blank lines separate paragraphs; converted to Atlassian Document Format on the way out.
+        issue_type:
+          type: string
+          default: Task
+          description: Issue type NAME as configured in the project, e.g. "Task", "Bug", "Story".
+        labels:
+          type: array
+          items: { type: string }
+          description: Jira labels. Must not contain spaces.
+        priority:
+          type: string
+          description: Priority name, e.g. "High". Omit unless the project uses priorities.
+        assignee_account_id:
+          type: string
+          description: Atlassian accountId of the assignee. Jira Cloud does not accept usernames or email addresses here.
+        site:
+          type: string
+          description: Which Jira site to use — name, URL, or cloud id. Only needed for multi-site accounts.
+      required: [project_key, summary]
+    mutates: true
+    elevation: true
+    output_redaction: ["description"]
+    pii: medium
+    rate_limit: "10/min"
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: jira__add_comment
+    description: Post a comment on a Jira issue, as the connected user. Plain text in; blank lines separate paragraphs.
+    input_schema:
+      type: object
+      properties:
+        issue_key:
+          type: string
+          description: Issue key such as "ENG-1421", or the numeric issue id.
+        body:
+          type: string
+          description: Comment text. Plain text; blank lines separate paragraphs.
+        site:
+          type: string
+          description: Which Jira site to use — name, URL, or cloud id. Only needed for multi-site accounts.
+      required: [issue_key, body]
+    mutates: true
+    elevation: true
+    output_redaction: ["body"]
+    pii: medium
+    rate_limit: "20/min"
+    channel_policy:
+      default: allow
+      deny: []

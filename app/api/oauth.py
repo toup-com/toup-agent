@@ -42,7 +42,7 @@ import logging
 import re
 import secrets
 import urllib.parse
-from typing import Optional
+from typing import Mapping, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -138,6 +138,7 @@ def _build_authorize_url(
     use_pkce: bool,
     provider_name: str = "",
     force_account_selection: bool = False,
+    extra_params: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Compose the standard OAuth 2.0 authorize URL.
 
@@ -193,6 +194,17 @@ def _build_authorize_url(
         # the right thing for "Switch account", and Google still
         # honours `access_type=offline` so refresh_token is preserved.
         params["prompt"] = "select_account"
+
+    # Provider-declared required params (`ProviderAppConfig.
+    # extra_authorize_params`). Applied LAST so a provider that declares
+    # a param as REQUIRED wins over the generic handling above — the
+    # motivating case is Atlassian, which documents `prompt=consent` as
+    # required and would otherwise be silently overwritten with
+    # `select_account` by the Switch-account path, turning a documented
+    # requirement into an intermittent one that only breaks for users
+    # who switch accounts.
+    for _k, _v in (extra_params or {}).items():
+        params[_k] = _v
 
     sep = "&" if "?" in base_url else "?"
     return f"{base_url}{sep}{urllib.parse.urlencode(params)}"
@@ -259,6 +271,10 @@ async def _exchange_code_for_tokens(
     client_id: str,
     client_secret: str,
     redirect_uri: str,
+    use_pkce: bool = True,
+    token_auth_style: str = "body",
+    token_body_format: str = "form",
+    extra_headers: Optional[Mapping[str, str]] = None,
 ) -> dict:
     """Standard PKCE token exchange. Returns the parsed token response.
 
@@ -274,11 +290,29 @@ async def _exchange_code_for_tokens(
     body = {
         "grant_type": "authorization_code",
         "code": code,
-        "code_verifier": code_verifier,
-        "client_id": client_id,
-        "client_secret": client_secret,
         "redirect_uri": redirect_uri,
     }
+    # `code_verifier` belongs to PKCE. It used to be sent unconditionally,
+    # which made `manifest.oauth.pkce` and `ProviderAppConfig.use_pkce`
+    # decorative on this leg — Google/GitHub/LinkedIn happen to ignore a
+    # stray field, so nothing broke and nothing revealed that the flag had
+    # no reader here. A provider that validates its inputs would reject
+    # the whole exchange.
+    if use_pkce:
+        body["code_verifier"] = code_verifier
+
+    headers = {"Accept": "application/json"}
+    headers.update(extra_headers or {})
+
+    # RFC 6749 §2.3.1: a client may authenticate with HTTP Basic instead
+    # of body parameters, and some providers accept ONLY that. Notion
+    # 401s on body credentials.
+    auth = None
+    if token_auth_style == "basic":
+        auth = (client_id, client_secret)
+    else:
+        body["client_id"] = client_id
+        body["client_secret"] = client_secret
     # If the URL is relative (stub), we resolve against the platform's
     # own host. The caller (callback handler) passes its request.url for
     # this resolution.
@@ -290,8 +324,13 @@ async def _exchange_code_for_tokens(
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
         # `Accept` is load-bearing for GitHub and a no-op everywhere
-        # else — see `_parse_token_response`.
-        r = await client.post(token_url, data=body, headers={"Accept": "application/json"})
+        # else — see `_parse_token_response`. RFC 6749 §4.1.3 mandates a
+        # form body and every provider here uses one except Notion, which
+        # documents JSON and answers 400 invalid_json to a form body.
+        if token_body_format == "json":
+            r = await client.post(token_url, json=body, headers=headers, auth=auth)
+        else:
+            r = await client.post(token_url, data=body, headers=headers, auth=auth)
         r.raise_for_status()
         return _parse_token_response(r)
 
@@ -408,6 +447,7 @@ async def oauth_connect(
         use_pkce=app_cfg.use_pkce,
         provider_name=app_cfg.name,
         force_account_selection=switch_account,
+        extra_params=app_cfg.extra_authorize_params,
     )
 
     # T1d Q2: absolutise stub authorize URLs so the frontend's
@@ -614,6 +654,10 @@ async def oauth_callback(
             client_id=app_cfg.client_id,
             client_secret=app_cfg.client_secret,
             redirect_uri=settings.oauth_callback_url,
+            use_pkce=app_cfg.use_pkce,
+            token_auth_style=app_cfg.token_auth_style,
+            token_body_format=app_cfg.token_body_format,
+            extra_headers=app_cfg.extra_token_headers,
         )
     except (httpx.HTTPError, TokenResponseUnparseable) as e:
         await db.rollback()

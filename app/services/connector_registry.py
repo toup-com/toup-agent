@@ -78,6 +78,13 @@ KNOWN_PROVIDER_APPS: frozenset[str] = frozenset({
     # env-var registration live in `provider_apps.py`.
     "microsoft",
     "linkedin",
+    # 2026-08-08 — Jira + Notion. Both carry protocol quirks the shared
+    # OAuth layer now expresses via `ProviderAppConfig` (Atlassian's
+    # required `audience`, Notion's Basic-auth JSON token exchange);
+    # see `_TEMPLATES` in provider_apps.py. Teams needs no entry — it
+    # rides the existing `microsoft` app.
+    "jira",
+    "notion",
     "stub_provider_app",
 })
 

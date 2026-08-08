@@ -1,0 +1,205 @@
+# Notion connector manifest.
+#
+# ── Why `scopes: []` ──────────────────────────────────────────────────
+# Notion has no OAuth scopes. Its authorize endpoint accepts exactly
+# `client_id`, `redirect_uri`, `response_type`, `owner` and `state` —
+# there is no `scope` parameter to send and none comes back in the token
+# response. Access is granted along two other axes, both set OUTSIDE
+# this manifest:
+#
+#   1. Capabilities (read content / update content / insert content, and
+#      how much user data) — chosen once by whoever owns the Notion
+#      integration, in Notion's connection settings, not per user.
+#   2. Per-page sharing — the user picks which pages and databases the
+#      connection may see, on the consent screen and afterwards from a
+#      page's ⋯ → Connections menu.
+#
+# So an empty scope list is the honest declaration, and a permission
+# failure here can NEVER be fixed by re-authorizing with a bigger scope
+# set. That is why `provider.py` never returns ConnectorScopeMissing —
+# see the long comment on `_handle_notion_error`.
+#
+# ── Status: beta ──────────────────────────────────────────────────────
+# Deliberate. Notion's token exchange needs HTTP Basic auth and a JSON
+# body, which `app/api/oauth.py::_exchange_code_for_tokens` does not yet
+# send (it posts form fields). Until that lands, this connector cannot
+# complete a connect, so it must not present itself as `stable`. Flip to
+# `stable` once a live round-trip has been observed.
+manifest_version: 1
+id: notion
+name: Notion
+short_description: Search your Notion workspace, read pages and databases, and create new pages.
+icon: notion
+docs_url: https://developers.notion.com/reference/intro
+status: beta
+category: productivity
+
+oauth:
+  provider_app: notion
+  scopes: []
+  scopes_optional: []
+  # Notion's documented public-integration flow has no PKCE: the
+  # authorize URL takes no `code_challenge`, and the token endpoint's
+  # body accepts only `grant_type` / `code` / `redirect_uri`. Sending a
+  # `code_verifier` risks a `validation_error` on the one request the
+  # whole connect depends on.
+  pkce: false
+  # Notion issues a rotating refresh_token. It also returns NO
+  # `expires_in`, so the vault stores `access_expires_at = NULL` and the
+  # dispatcher's `_needs_refresh` never fires — in practice a dead token
+  # surfaces as a 401 → reauth. `provider.refresh()` is implemented
+  # correctly anyway so the path works the day Notion starts expiring
+  # tokens for our client.
+  refresh: true
+
+health:
+  probe: notion__search
+
+tools:
+  - name: notion__search
+    description: |
+      Search the connected Notion workspace for pages and databases by title. Only content the user has explicitly shared with this connection is visible — an empty result usually means "not shared yet", not "does not exist". Returns ids, titles and URLs; use notion__get_page_content to read a page's body.
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Title search term. Omit or leave empty to list everything shared with the connection.
+        filter:
+          type: string
+          enum: [any, page, data_source]
+          description: Restrict results to pages or to databases. Notion calls a database's queryable table a "data source".
+          default: any
+        sort:
+          type: string
+          enum: [relevance, last_edited_desc, last_edited_asc]
+          description: Omit for Notion's default ordering. Use last_edited_desc for "what did I work on recently".
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 25
+        start_cursor:
+          type: string
+          description: Pagination cursor from a previous call's next_cursor.
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["results"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: notion__get_page
+    description: |
+      Fetch one Notion page's properties (title, status, dates, select values, relations…) by id or Notion URL. Returns metadata only — this endpoint does NOT return the page body; call notion__get_page_content for that.
+    input_schema:
+      type: object
+      properties:
+        page_id:
+          type: string
+          description: Page id (dashed or undashed) or a full Notion page URL.
+      required: [page_id]
+    mutates: false
+    elevation: false
+    output_redaction: ["properties"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: notion__get_page_content
+    description: |
+      Read a Notion page's body as plain text. Walks the page's block children, including nested blocks, and renders them with light markdown (headings, lists, checkboxes, code fences). Linked sub-pages are listed by title but not expanded. Long pages are truncated; the response says so.
+    input_schema:
+      type: object
+      properties:
+        page_id:
+          type: string
+          description: Page id (dashed or undashed) or a full Notion page URL.
+        max_chars:
+          type: integer
+          minimum: 500
+          maximum: 100000
+          description: Stop reading once this many characters have been collected.
+          default: 40000
+      required: [page_id]
+    mutates: false
+    elevation: false
+    output_redaction: ["content"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: notion__query_database
+    description: |
+      Query a Notion database and return its rows with properties flattened to plain values. Accepts either a database id/URL or a data source id. `filter` and `sorts` take Notion's own query syntax, e.g. filter {"property":"Status","status":{"equals":"Done"}} and sorts [{"property":"Due","direction":"ascending"}]. Omit both to list everything.
+    input_schema:
+      type: object
+      properties:
+        database_id:
+          type: string
+          description: Database id (dashed or undashed) or a full Notion database URL. Resolved to its data source automatically.
+        data_source_id:
+          type: string
+          description: Data source id, when you already have one (from notion__search results). Takes precedence over database_id.
+        filter:
+          type: object
+          description: Notion filter object. See https://developers.notion.com/reference/filter-data-source-entries
+        sorts:
+          type: array
+          description: Notion sorts array, e.g. [{"property":"Due","direction":"ascending"}].
+          items:
+            type: object
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 25
+        start_cursor:
+          type: string
+          description: Pagination cursor from a previous call's next_cursor.
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["results"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: notion__create_page
+    description: |
+      Create a Notion page. Give exactly one parent — parent_page_id to nest it under a page, or parent_database_id / parent_data_source_id to add a row to a database. `content` becomes the page body as paragraphs. For a database parent, extra column values go in `properties` using Notion's property-value syntax; the title column is filled from `title` and does not need to be repeated.
+    input_schema:
+      type: object
+      properties:
+        parent_page_id:
+          type: string
+          description: Create as a child of this page (id or Notion URL).
+        parent_database_id:
+          type: string
+          description: Create as a row in this database (id or Notion URL).
+        parent_data_source_id:
+          type: string
+          description: Create as a row in this data source, when you already have its id.
+        title:
+          type: string
+          description: The page title. Written into the parent's title column automatically.
+        content:
+          type: string
+          description: Page body as plain text. Blank lines separate paragraphs.
+        properties:
+          type: object
+          description: Extra column values for a database parent, keyed by column name, in Notion's property-value syntax, e.g. {"Status":{"status":{"name":"Todo"}}}.
+      required: [title]
+    mutates: true
+    elevation: true
+    output_redaction: ["title", "content", "properties"]
+    pii: medium
+    rate_limit: "10/min"
+    channel_policy:
+      default: allow
+      deny: []

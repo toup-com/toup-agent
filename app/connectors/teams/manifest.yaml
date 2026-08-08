@@ -1,0 +1,194 @@
+# Microsoft Teams connector — manifest.
+#
+# THE SCOPE DECISION — read this before adding a tool.
+#
+# Teams' Graph permissions split in two, and the split decides what this
+# connector can be. Verified 2026-08-08 against
+# https://learn.microsoft.com/en-us/graph/permissions-reference and each
+# API's own reference page (delegated / work-or-school column):
+#
+#   User-consentable — "Admin consent required: No"
+#     Team.ReadBasic.All      names + descriptions of the user's teams
+#     Channel.ReadBasic.All   names of channels inside those teams
+#     Chat.Read               the user's 1:1 + group chats AND their messages
+#     ChatMessage.Send        post into one of those chats
+#
+#   Admin-consent-only — "Admin consent required: Yes"
+#     ChannelMessage.Read.All reading messages posted in a team CHANNEL
+#
+# So this connector is chats-first: everything an ordinary user can grant
+# by themselves. Reading channel messages is the one candidate capability
+# that was dropped, because ChannelMessage.Read.All is admin-restricted —
+# and an admin-restricted scope does not degrade, it fails the WHOLE
+# consent request: Entra shows a non-admin "you are not authorized to
+# consent" page and the user ends up with no connection at all
+# (https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow,
+# "Request an authorization code"). One admin-only scope in `scopes`
+# would therefore make Teams unconnectable for most of our users, to buy
+# a feature only some of them could have used.
+#
+# `scopes_optional` records it rather than requesting it: the OAuth
+# builder reads `oauth.scopes` ONLY (`api/oauth.py` `_build_authorize_url(
+# scopes=entry.manifest.oauth.scopes)`), so nothing here reaches Entra.
+# If that ever changes, this entry must move out of the manifest first.
+#
+# Channel tools therefore stop at names + web links. Posting to a channel
+# (ChannelMessage.Send) IS user-consentable and was still left out: a
+# message to a whole team is a different blast radius from a message in a
+# chat the user already has open, and nothing reads channels back.
+#
+# Also note Teams' Graph APIs are work/school only — "Delegated (personal
+# Microsoft account): Not supported" on every endpoint used here. The
+# shared `microsoft` provider app signs in through the `common` tenant, so
+# an Outlook.com account CAN connect and then 4xx on every tool. The
+# provider surfaces Graph's own message rather than guessing at that.
+manifest_version: 1
+id: teams
+name: Microsoft Teams
+short_description: Read your Teams chats, list your teams and channels, and send a chat message.
+icon: message-square
+docs_url: https://learn.microsoft.com/en-us/graph/api/resources/teams-api-overview
+status: stable
+category: productivity
+
+oauth:
+  # Same Entra app registration as Outlook — additional Graph delegated
+  # permissions only, no new client id/secret.
+  provider_app: microsoft
+  scopes:
+    - https://graph.microsoft.com/Team.ReadBasic.All
+    - https://graph.microsoft.com/Channel.ReadBasic.All
+    - https://graph.microsoft.com/Chat.Read
+    - https://graph.microsoft.com/ChatMessage.Send
+    - offline_access
+  scopes_optional:
+    # Admin-consent-only. Never requested — see the header.
+    - https://graph.microsoft.com/ChannelMessage.Read.All
+  pkce: true
+  refresh: true
+
+scope_descriptions:
+  https://graph.microsoft.com/Team.ReadBasic.All: Read the names and descriptions of the teams you belong to.
+  https://graph.microsoft.com/Channel.ReadBasic.All: Read the names of channels in those teams.
+  https://graph.microsoft.com/Chat.Read: Read your 1:1 and group chats, including their messages.
+  https://graph.microsoft.com/ChatMessage.Send: Send a message to one of your existing chats.
+  https://graph.microsoft.com/ChannelMessage.Read.All: Read messages posted in team channels. Requires your IT administrator's approval, so Toup does not ask for it.
+  offline_access: Refresh tokens so we don't ask you to sign in every hour.
+
+health:
+  # Read-only, needs only Chat.Read, and bounded by $top=1. list_teams
+  # would also work but Graph supports no query parameters on
+  # /me/joinedTeams, so its cost grows with the user's team count.
+  probe: teams__list_chats
+
+tools:
+  - name: teams__list_teams
+    description: |
+      List the Microsoft Teams teams you are a member of. Returns the team id (needed by teams__list_channels), name, and description. Graph supports no filtering or paging on this endpoint, so it always returns every team you belong to.
+    input_schema:
+      type: object
+      properties: {}
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: teams__list_channels
+    description: |
+      List the channels in one team. Pass a team_id from teams__list_teams. Private and shared channels you are not a member of are not returned. Reading channel MESSAGES is not available — use the returned web_url to open the channel in Teams.
+    input_schema:
+      type: object
+      properties:
+        team_id:
+          type: string
+          description: Team id from teams__list_teams.
+      required: [team_id]
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: teams__list_chats
+    description: |
+      List your recent Teams chats (1:1, group, and meeting chats), most recently active first, with their participants. Use this to find the chat_id for teams__read_chat_messages or teams__send_chat_message. One-on-one chats have no topic — identify them by their members.
+    input_schema:
+      type: object
+      properties:
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: Number of chats to return. Graph caps this at 50.
+          default: 25
+      required: []
+    mutates: false
+    elevation: false
+    # `_redact` strips TOP-LEVEL keys only, so naming the list itself is
+    # what keeps participant names and emails out of the audit row.
+    output_redaction: ["chats"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: teams__read_chat_messages
+    description: |
+      Read the most recent messages in one Teams chat, newest first. Pass a chat_id from teams__list_chats. Message bodies may be HTML — body_content_type says which. System messages (someone joined, chat renamed) come back with sender null.
+    input_schema:
+      type: object
+      properties:
+        chat_id:
+          type: string
+          description: Chat id from teams__list_chats.
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: Number of messages to return. Graph caps this at 50.
+          default: 25
+      required: [chat_id]
+    mutates: false
+    elevation: false
+    # Same top-level-key reasoning as list_chats — this is the message
+    # content itself, so it must never reach the audit metadata.
+    output_redaction: ["messages"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: teams__send_chat_message
+    description: |
+      Send a message to an existing Teams chat. Cannot start a new chat — pass a chat_id from teams__list_chats. Sends as you, into a conversation other people are reading.
+    input_schema:
+      type: object
+      properties:
+        chat_id:
+          type: string
+          description: Chat id from teams__list_chats.
+        message:
+          type: string
+          description: Message text. Plain text unless content_type is set to html.
+        content_type:
+          type: string
+          enum: [text, html]
+          default: text
+      required: [chat_id, message]
+    mutates: true
+    elevation: true
+    # One list covers both directions: `message` is a top-level key of the
+    # INPUT, so declaring it here keeps the outgoing text out of the audit
+    # row too.
+    output_redaction: ["message"]
+    pii: high
+    rate_limit: "10/min"
+    channel_policy:
+      default: allow
+      deny: []
