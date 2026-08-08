@@ -33,6 +33,7 @@ import uuid
 from typing import AsyncIterator
 from urllib.parse import urlparse, parse_qs
 
+import httpx
 import pytest
 import pytest_asyncio
 from cryptography.fernet import Fernet
@@ -527,3 +528,182 @@ async def _connect_and_get_callback(http_client, alice, headers) -> str:
     location = r.headers["location"]
     parsed_cb = urlparse(location)
     return parsed_cb.path + "?" + parsed_cb.query
+
+
+# ─── 11. Token-response parsing (GitHub's form-urlencoded body) ──────
+#
+# Every GitHub connect attempt ever made 500'd here. `_exchange_code_
+# for_tokens` called `r.json()` on a body GitHub serves as
+# `application/x-www-form-urlencoded` unless asked otherwise, so the
+# callback raised `JSONDecodeError: Expecting value: line 1 column 1`
+# AFTER the user had already consented — an "Internal Server Error"
+# page in the OAuth popup and zero rows in connector_identities.
+#
+# The stub provider exchanges in-process and never touches this branch,
+# which is exactly why the end-to-end tests above stayed green for the
+# entire life of the bug. These go at the parser directly.
+
+
+def test_parse_token_response_reads_form_urlencoded_body():
+    """GitHub's default shape."""
+    from app.api.oauth import _parse_token_response
+
+    r = httpx.Response(
+        200,
+        headers={"content-type": "application/x-www-form-urlencoded; charset=utf-8"},
+        text="access_token=gho_abc123&scope=repo%2Cread%3Auser&token_type=bearer",
+    )
+    assert _parse_token_response(r) == {
+        "access_token": "gho_abc123",
+        "scope": "repo,read:user",
+        "token_type": "bearer",
+    }
+
+
+def test_parse_token_response_reads_json_body():
+    """Google / Microsoft / LinkedIn shape — must not regress."""
+    from app.api.oauth import _parse_token_response
+
+    r = httpx.Response(
+        200,
+        headers={"content-type": "application/json; charset=utf-8"},
+        json={"access_token": "ya29.abc", "expires_in": 3599, "scope": "a b"},
+    )
+    assert _parse_token_response(r)["access_token"] == "ya29.abc"
+
+
+def test_parse_token_response_survives_a_mislabelled_content_type():
+    """A JSON body under a form content-type (and vice versa) must not
+    500 — the whole point of the belt-and-braces parser."""
+    from app.api.oauth import _parse_token_response
+
+    lying_form = httpx.Response(
+        200,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        text='{"access_token": "tok"}',
+    )
+    assert _parse_token_response(lying_form)["access_token"] == "tok"
+
+    lying_json = httpx.Response(
+        200,
+        headers={"content-type": "application/json"},
+        text="access_token=tok",
+    )
+    assert _parse_token_response(lying_json)["access_token"] == "tok"
+
+
+def test_parse_token_response_raises_typed_error_on_garbage():
+    """An HTML error page must raise the typed error the callback
+    catches (→ a bridge redirect the user can read), never the bare
+    ValueError that became a 500."""
+    from app.api.oauth import TokenResponseUnparseable, _parse_token_response
+
+    r = httpx.Response(
+        502,
+        headers={"content-type": "text/html"},
+        text="<html><body>Bad Gateway</body></html>",
+    )
+    with pytest.raises(TokenResponseUnparseable):
+        _parse_token_response(r)
+
+
+@pytest.mark.asyncio
+async def test_token_exchange_sends_accept_json(monkeypatch):
+    """`Accept: application/json` is what makes GitHub answer in JSON at
+    all. Without it GitHub content-negotiates down to form-urlencoded —
+    verified against the live endpoint. Assert we actually send it."""
+    from app.api import oauth as oauth_mod
+
+    seen: dict = {}
+
+    async def fake_post(self, url, **kwargs):
+        seen["url"] = url
+        seen["headers"] = kwargs.get("headers") or {}
+        seen["data"] = kwargs.get("data")
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+            text="access_token=gho_x&scope=repo&token_type=bearer",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    tokens = await oauth_mod._exchange_code_for_tokens(
+        token_url="https://github.com/login/oauth/access_token",
+        code="abc",
+        code_verifier="v",
+        client_id="cid",
+        client_secret="sec",
+        redirect_uri="https://toup.ai/api/oauth/callback",
+    )
+    assert seen["headers"].get("Accept") == "application/json"
+    assert tokens["access_token"] == "gho_x"
+
+
+def test_github_comma_scopes_split_into_separate_entries():
+    """RFC 6749 says space-delimited; GitHub sends `repo,read:user`.
+    A bare `.split()` stored one scope literally named "repo,read:user"."""
+    import re as _re
+
+    scope = "repo,read:user"
+    assert [s for s in _re.split(r"[,\s]+", scope) if s] == ["repo", "read:user"]
+
+
+# ─── 12. verify_state's ascii escape hatch ───────────────────────────
+#
+# `verify_state` promises in its own docstring that every failure mode
+# maps to a 400. One did not: `body_b64.encode("ascii")` sat outside
+# any try, so a non-ASCII state raised UnicodeEncodeError — a
+# ValueError, NOT a StateVerificationError — and escaped to the
+# unauthenticated /api/oauth/callback as an unhandled 500.
+
+
+def test_verify_state_rejects_non_ascii_without_leaking_unicode_error():
+    from app.services.oauth_state import StateVerificationError, verify_state
+
+    with pytest.raises(StateVerificationError):
+        verify_state("é.abc")
+
+    # And the ordinary tampered-token path still behaves.
+    with pytest.raises(StateVerificationError):
+        verify_state("abc.def")
+
+
+def test_state_hash_does_not_raise_on_non_ascii():
+    """Currently unreachable — `verify_state` runs first — but safety
+    by call ordering evaporates the moment a second caller appears."""
+    from app.services.oauth_state import state_hash
+
+    assert len(state_hash("é.abc")) == 64
+    # utf-8 vs ascii must not have moved the hash for real tokens.
+    import hashlib as _h
+    assert state_hash("abc.def") == _h.sha256(b"abc.def").hexdigest()
+
+
+def test_declining_consent_says_cancelled_not_failed():
+    """`access_denied` is the commonest code on this branch. The
+    frontend's message-less fallback is the literal string "OAuth flow
+    failed", which is untrue for a user who pressed Cancel."""
+    from app.api.oauth import _PROVIDER_ERROR_COPY
+
+    copy = _PROVIDER_ERROR_COPY["access_denied"]
+    assert "cancel" in copy.lower()
+    assert "fail" not in copy.lower()
+
+
+def test_bridge_error_carries_the_connector_id():
+    """The bridge posts one connectorId field and `useOAuthHandoff`
+    drops any message whose id doesn't match the connector it opened
+    the popup for — so an error redirect without `connector=` is
+    discarded on arrival and surfaces as a false "Cancelled"."""
+    from urllib.parse import parse_qs, urlparse
+
+    from app.api.oauth import _bridge_error
+
+    r = _bridge_error("token_exchange_failed", connector_id="github", message="nope")
+    assert r.status_code == 302
+    q = parse_qs(urlparse(r.headers["location"]).query)
+    assert q["connector"] == ["github"]
+    assert q["error"] == ["token_exchange_failed"]
+    assert q["message"] == ["nope"]

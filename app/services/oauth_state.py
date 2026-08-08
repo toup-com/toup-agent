@@ -159,8 +159,21 @@ def verify_state(token: str) -> StatePayload:
     except ValueError:
         raise StateVerificationError("token missing signature")
 
+    # `.encode("ascii")` raises UnicodeEncodeError — a ValueError, NOT a
+    # StateVerificationError — on any non-ASCII byte, so it escaped this
+    # function and reached the unauthenticated /api/oauth/callback as an
+    # unhandled 500. A signed state is base64url by construction
+    # (`_b64url_encode` ends in `.decode("ascii")`), so no provider can
+    # produce one; only a hand-crafted URL gets here. Still, the
+    # docstring above promises every failure mode maps to a 400, and one
+    # of them did not.
+    try:
+        body_bytes = body_b64.encode("ascii")
+    except UnicodeEncodeError:
+        raise StateVerificationError("token is not ascii")
+
     expected_sig = hmac.new(
-        _secret_bytes(), body_b64.encode("ascii"), hashlib.sha256,
+        _secret_bytes(), body_bytes, hashlib.sha256,
     ).digest()
     try:
         provided_sig = _b64url_decode(sig_b64)
@@ -212,7 +225,12 @@ def state_hash(token: str) -> str:
 
     Caller looks up by `state_hash(token)` then atomic-deletes the row
     (single-use replay defense)."""
-    return hashlib.sha256(token.encode("ascii")).hexdigest()
+    # utf-8, not ascii: identical bytes (and so an identical hash) for
+    # every token `sign_state` can mint, but it cannot raise. Today the
+    # only caller is downstream of `verify_state`, which rejects
+    # non-ASCII — safety by call ordering is the kind that disappears
+    # the moment someone adds a second caller.
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 # ─── b64url helpers (no padding) ─────────────────────────────────────

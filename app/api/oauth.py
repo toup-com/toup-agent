@@ -39,6 +39,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import secrets
 import urllib.parse
 from typing import Optional
@@ -197,6 +198,59 @@ def _build_authorize_url(
     return f"{base_url}{sep}{urllib.parse.urlencode(params)}"
 
 
+class TokenResponseUnparseable(Exception):
+    """The token endpoint answered, but not in any shape we can read.
+
+    Distinct from `httpx.HTTPError` (transport/status) on purpose: this
+    one means the provider is reachable and answering, so the operator
+    fix is a parser or a header, not a network probe.
+    """
+
+
+def _parse_token_response(r: httpx.Response) -> dict:
+    """Read a token response as JSON *or* form-urlencoded.
+
+    RFC 6749 §5.1 mandates JSON, and Google / Microsoft / LinkedIn all
+    comply unconditionally. **GitHub does not**: its token endpoint
+    content-negotiates and defaults to `application/x-www-form-
+    urlencoded`, so a bare `r.json()` raised `JSONDecodeError: Expecting
+    value: line 1 column 1` — an unhandled 500 on the callback, for
+    every GitHub connect attempt ever made. Sending `Accept:
+    application/json` (below) is the real fix; this parser is the belt
+    to that pair of braces, so a provider that ignores the header can
+    never again turn a *successful* authorization into a 500.
+    """
+    ctype = r.headers.get("content-type", "").split(";")[0].strip().lower()
+
+    def _form() -> dict:
+        # `parse_qs` drops blank values and returns a list per key; the
+        # OAuth token response is flat, so collapse to the first.
+        return {k: v[0] for k, v in urllib.parse.parse_qs(r.text).items() if v}
+
+    if ctype.endswith("x-www-form-urlencoded"):
+        parsed = _form()
+        if parsed:
+            return parsed
+        # Mislabelled — fall through and try JSON below.
+
+    try:
+        payload = r.json()
+    except ValueError:
+        # Not JSON either. A form body sent under the wrong content-type
+        # is the realistic case; an HTML error page is the other, and
+        # `parse_qs` yields nothing useful for it, which is what we want.
+        parsed = _form()
+        if parsed:
+            return parsed
+        raise TokenResponseUnparseable(
+            f"content-type={ctype or 'none'!r} body={r.text[:120]!r}"
+        ) from None
+
+    if not isinstance(payload, dict):
+        raise TokenResponseUnparseable(f"expected an object, got {type(payload).__name__}")
+    return payload
+
+
 async def _exchange_code_for_tokens(
     *,
     token_url: str,
@@ -206,11 +260,16 @@ async def _exchange_code_for_tokens(
     client_secret: str,
     redirect_uri: str,
 ) -> dict:
-    """Standard PKCE token exchange. Returns the parsed JSON response.
+    """Standard PKCE token exchange. Returns the parsed token response.
 
     For local stub (`token_url` starts with `/api/...`), the call goes
     in-process via httpx ASGITransport. In production, hits the real
     provider endpoint over the public internet.
+
+    Note the response is not necessarily JSON on the wire — see
+    `_parse_token_response`. Nor does a 2xx mean success: GitHub returns
+    HTTP 200 with an `error=` body, so the caller must check for
+    `access_token` rather than trusting the status.
     """
     body = {
         "grant_type": "authorization_code",
@@ -230,9 +289,11 @@ async def _exchange_code_for_tokens(
         return await _stub_token_exchange(body)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-        r = await client.post(token_url, data=body)
+        # `Accept` is load-bearing for GitHub and a no-op everywhere
+        # else — see `_parse_token_response`.
+        r = await client.post(token_url, data=body, headers={"Accept": "application/json"})
         r.raise_for_status()
-        return r.json()
+        return _parse_token_response(r)
 
 
 # ─── /connect ────────────────────────────────────────────────────────
@@ -366,6 +427,49 @@ async def oauth_connect(
 # ─── /callback ───────────────────────────────────────────────────────
 
 
+# The standard codes a provider may hand back on the authorize leg
+# (RFC 6749 §4.1.2.1), in the user's words rather than the spec's. Any
+# code not listed falls through to the frontend's generic copy.
+_PROVIDER_ERROR_COPY = {
+    "access_denied": "You cancelled the connection. Nothing was changed.",
+    "invalid_scope": "This connector asked for a permission the provider refused.",
+    "server_error": "The provider hit an error on their side. Please try again.",
+    "temporarily_unavailable": "The provider is temporarily unavailable. Please try again shortly.",
+}
+
+
+def _bridge_error(
+    code: str,
+    *,
+    connector_id: Optional[str] = None,
+    message: Optional[str] = None,
+) -> RedirectResponse:
+    """Send a callback failure to the frontend bridge instead of raising.
+
+    `connector_id` is not decoration. The bridge posts one `connectorId`
+    field, and `useOAuthHandoff` drops any message whose id doesn't match
+    the connector it opened the popup for — so an error redirect carrying
+    only `?error=<code>` was discarded on arrival and the sheet sat until
+    its cancellation timeout, reporting a backend failure to the user as
+    "Cancelled — popup closed before completion". Always pass the
+    connector when it is known.
+
+    Raising HTTPException here is the other trap: the popup is a browser
+    window, so a 4xx/5xx renders as a bare "Internal Server Error" page
+    with no way back — which is precisely how the GitHub token-exchange
+    crash presented for its entire life.
+    """
+    params = {"error": code}
+    if connector_id:
+        params["connector"] = connector_id
+    if message:
+        params["message"] = message
+    return RedirectResponse(
+        url=f"/oauth/callback-bridge?{urllib.parse.urlencode(params)}",
+        status_code=status.HTTP_302_FOUND,
+    )
+
+
 @router.get("/callback")
 async def oauth_callback(
     request: Request,
@@ -384,14 +488,33 @@ async def oauth_callback(
     # error. Surface to the frontend so it can show the right state.
     if error:
         logger.info("[oauth.callback] provider returned error=%s", error)
+        # Best-effort connector id so the bridge's message survives the
+        # id match in `useOAuthHandoff` (see `_bridge_error`). The state
+        # is untrusted at this point and there is no code to redeem, so a
+        # failed verify costs only the connector label.
+        _cid = None
+        if state:
+            try:
+                _cid = verify_state(state).connector_id
+            except Exception:
+                # Deliberately broad. This lookup is best-effort and its
+                # only output is a label, so nothing it can raise should
+                # be able to fail the request it is decorating — and
+                # `verify_state` did leak a UnicodeEncodeError past
+                # `StateVerificationError` until it was fixed at the
+                # source. Narrow this back and a second such leak turns
+                # a branch that always redirected into an unhandled 500.
+                pass
         # Same bridge route — popup gets the postMessage in error mode,
         # full-page fallback gets the URL params on the bridge page
         # and bounces back to /agent/integrations via the parent's
         # `?error=` handler when the bridge can't postMessage.
-        return RedirectResponse(
-            url=f"/oauth/callback-bridge?error={urllib.parse.quote(error)}",
-            status_code=status.HTTP_302_FOUND,
-        )
+        #
+        # Carry a sentence, because the frontend's fallback for a
+        # message-less error is the literal string "OAuth flow failed" —
+        # which is a lie for `access_denied`, by far the commonest code
+        # here. The user pressed Cancel; nothing failed.
+        return _bridge_error(error, connector_id=_cid, message=_PROVIDER_ERROR_COPY.get(error))
 
     if not code or not state:
         raise HTTPException(
@@ -452,12 +575,10 @@ async def oauth_callback(
             "[oauth.callback] user_id %s has no agent_config — refusing vault.put",
             payload.user_id[:8],
         )
-        return RedirectResponse(
-            url=(
-                "/oauth/callback-bridge?error="
-                + urllib.parse.quote("no_agent_config")
-            ),
-            status_code=status.HTTP_302_FOUND,
+        return _bridge_error(
+            "no_agent_config",
+            connector_id=payload.connector_id,
+            message="Your agent isn't set up yet. Finish onboarding, then connect again.",
         )
 
     # 3. Look up connector + provider-app config.
@@ -494,21 +615,38 @@ async def oauth_callback(
             client_secret=app_cfg.client_secret,
             redirect_uri=settings.oauth_callback_url,
         )
-    except httpx.HTTPError as e:
+    except (httpx.HTTPError, TokenResponseUnparseable) as e:
         await db.rollback()
-        logger.exception("[oauth.callback] token exchange failed: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"token exchange failed: {type(e).__name__}",
+        logger.exception(
+            "[oauth.callback] token exchange failed connector=%s: %s",
+            payload.connector_id, e,
+        )
+        return _bridge_error(
+            "token_exchange_failed",
+            connector_id=payload.connector_id,
+            message=f"{entry.manifest.name} did not complete the handshake. Please try again.",
         )
 
     access_token = tokens.get("access_token")
     if not access_token:
         await db.rollback()
-        logger.error("[oauth.callback] token endpoint did not return access_token: %s", tokens)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="provider did not return access_token",
+        # A 2xx is not success: GitHub answers HTTP 200 with an `error=`
+        # body, so this branch is the real error channel for it. Log the
+        # provider's own words and the KEYS only — never the values, a
+        # partial response can still carry a refresh_token.
+        provider_error = tokens.get("error") or "missing_access_token"
+        provider_detail = tokens.get("error_description") or ""
+        logger.error(
+            "[oauth.callback] no access_token connector=%s provider_error=%s detail=%s keys=%s",
+            payload.connector_id, provider_error, provider_detail, sorted(tokens.keys()),
+        )
+        return _bridge_error(
+            "token_exchange_failed",
+            connector_id=payload.connector_id,
+            message=(
+                provider_detail
+                or f"{entry.manifest.name} refused the connection ({provider_error})."
+            ),
         )
 
     refresh_token = tokens.get("refresh_token")
@@ -518,8 +656,12 @@ async def oauth_callback(
         datetime.utcnow() + timedelta(seconds=int(expires_in))
         if expires_in else None
     )
+    # RFC 6749 §5.1 says space-delimited; GitHub sends `repo,read:user`.
+    # A bare `.split()` stored that as ONE scope named "repo,read:user",
+    # so the audit record of what the user actually granted was a string
+    # no scope check could ever match. Split on either.
     granted_scopes = (
-        tokens.get("scope", "").split() if tokens.get("scope")
+        [s for s in re.split(r"[,\s]+", tokens["scope"]) if s] if tokens.get("scope")
         else entry.manifest.oauth.scopes
     )
 
