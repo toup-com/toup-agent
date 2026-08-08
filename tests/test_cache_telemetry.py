@@ -308,9 +308,14 @@ async def test_cache_daily_admin_gets_rollup(admin_app_client):
         ))
         await db.commit()
 
+    # endpoint is explicit: this test is about the ROLLUP ARITHMETIC, and it
+    # seeds chat rows. It used to rely on the handler defaulting to "chat",
+    # which silently coupled an arithmetic test to a policy default — and
+    # meant that when the default stopped matching the fleet's wire, this
+    # test kept passing while the real dashboard went empty.
     res = await client.get(
         "/api/admin/llm/cache-daily",
-        params={"days": 7, "user_id": "cache-user-1"},
+        params={"days": 7, "user_id": "cache-user-1", "endpoint": "chat"},
     )
     assert res.status_code == 200, res.text
     body = res.json()
@@ -322,6 +327,68 @@ async def test_cache_daily_admin_gets_rollup(admin_app_client):
     assert row["cached_tokens"] == 750
     assert row["calls"] == 2
     assert row["cache_hit_ratio"] == pytest.approx(750 / 2000, abs=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_cache_daily_default_shows_the_wire_the_fleet_actually_uses(admin_app_client):
+    """The default view must contain the fleet's own agent traffic.
+
+    It did not. The handler defaulted to the literal endpoint="chat", which
+    was right when written and became wrong the moment the fleet moved to
+    gpt-5.6-terra on the Responses wire (#507) — agent turns then recorded
+    endpoint="responses" and the default view stopped containing one of them.
+    Measured in production 2026-08-08 over 14 days: chat 1,967 calls / 9.0M
+    input tokens / 49.0% cached, responses 783 calls / 11.2M input tokens /
+    18.3% cached. The view defaulted to the healthy half and excluded the
+    half carrying 55% of all input tokens at a third of the hit rate.
+
+    Seeds BOTH wires and asserts the default returns the fleet's one. The
+    other-wire row is what makes this a real test: without it, "returns the
+    rows I seeded" would pass under any default at all.
+    """
+    from app.api.auth import get_current_user
+    from app.db import async_session_maker
+    from app.db.models.platform import LLMProxyEvent
+    from app.services.model_resolver import default_model, wire_api_for
+
+    fleet_wire = wire_api_for(default_model())
+    other_wire = "chat" if fleet_wire == "responses" else "responses"
+
+    client, app = admin_app_client
+    app.dependency_overrides[get_current_user] = lambda: _user("admin-1", role="admin")
+
+    async with async_session_maker() as db:
+        db.add(LLMProxyEvent(
+            user_id="wire-user-1", provider="openai", model="m",
+            endpoint=fleet_wire, input_tokens=1000, output_tokens=10,
+            cost_cents=1, cached_tokens=400,
+        ))
+        db.add(LLMProxyEvent(
+            user_id="wire-user-1", provider="openai", model="m",
+            endpoint=other_wire, input_tokens=5000, output_tokens=10,
+            cost_cents=1, cached_tokens=4900,
+        ))
+        await db.commit()
+
+    res = await client.get(
+        "/api/admin/llm/cache-daily", params={"days": 7, "user_id": "wire-user-1"},
+    )
+    assert res.status_code == 200, res.text
+    rows = res.json()["rows"]
+    assert len(rows) == 1, rows
+    assert rows[0]["prompt_tokens"] == 1000, (
+        f"default view returned the {other_wire!r} row, not the fleet's "
+        f"{fleet_wire!r} traffic"
+    )
+    assert rows[0]["cached_tokens"] == 400
+
+    # endpoint=all must still span both wires — the derivation narrows the
+    # DEFAULT, it must not remove the unfiltered view.
+    res_all = await client.get(
+        "/api/admin/llm/cache-daily",
+        params={"days": 7, "user_id": "wire-user-1", "endpoint": "all"},
+    )
+    assert res_all.json()["rows"][0]["prompt_tokens"] == 6000
 
 
 @pytest.mark.asyncio

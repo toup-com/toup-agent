@@ -2409,7 +2409,7 @@ class CacheDailyResponse(BaseModel):
 async def get_admin_cache_daily(
     days: int = Query(7, ge=1, le=90),
     user_id: Optional[str] = Query(None),
-    endpoint: str = Query("chat", pattern=r"^[a-z_]{1,32}$|^all$"),
+    endpoint: Optional[str] = Query(None, pattern=r"^[a-z_]{1,32}$|^all$"),
     _admin=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2420,11 +2420,31 @@ async def get_admin_cache_daily(
     sum(input_tokens); rows recorded before migration 075 have NULL
     cached_tokens and count as 0 hits, so early ratios understate.
 
-    Review pr5-#1: defaults to the chat endpoint and successful calls —
+    Review pr5-#1: filters to successful calls on ONE endpoint —
     voice/embeddings/image and error rows would dilute prompt_tokens and
-    inflate calls, understating the chat-path hit ratio this exists to
-    watch. Pass endpoint=all for the unfiltered view.
+    inflate calls, understating the hit ratio this exists to watch. Pass
+    endpoint=all for the unfiltered view.
+
+    The default is DERIVED, not the literal "chat" it used to be. That
+    literal was correct when it was written and silently wrong from the
+    moment the fleet moved to gpt-5.6-terra on the Responses wire (#507):
+    agent turns began writing endpoint="responses", so the default view
+    stopped containing a single one of them. Measured 2026-08-08 over 14
+    days — chat 1,967 calls / 9.0M input tokens / 49.0% cached, responses
+    783 calls / 11.2M input tokens / 18.3% cached. The endpoint this view
+    defaulted to was the healthy half; the half carrying 55% of all input
+    tokens at a third of the hit rate was the one it excluded, and the
+    dashboard read green throughout.
+
+    Deriving it from the fleet's own model resolution means the next wire
+    migration moves this view with it instead of quietly emptying it —
+    the same reason `wire_api_for` derives the wire rather than reading a
+    flag that can disagree with the model.
     """
+    if endpoint is None:
+        from app.services.model_resolver import default_model, wire_api_for
+
+        endpoint = wire_api_for(default_model())
     since = _today_utc_start() - timedelta(days=days - 1)
     day_col = func.date(LLMProxyEvent.created_at)
     stmt = (
