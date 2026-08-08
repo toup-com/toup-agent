@@ -69,10 +69,16 @@ class CatalogConnectorEntry(BaseModel):
     coming_soon: bool = False
     # Machine-readable cause when `coming_soon` is set by the platform
     # rather than by the connector's own roadmap status. Currently only
-    # 'credentials_missing'. Nothing renders this yet; it exists so the
-    # catalogue stays honest to an operator debugging a dimmed tile,
-    # instead of claiming a finished connector is "coming soon".
+    # 'credentials_missing'. The web grid reads this to offer "Set up"
+    # instead of a mute "Coming soon" — a finished connector missing
+    # only its provider credentials is an admin task, not a roadmap item.
     unavailable_reason: Optional[str] = None
+    # The provider app these credentials belong to ('google', 'microsoft'
+    # …), from the manifest. Several connectors share one: Gmail, Drive,
+    # Docs, Sheets and Calendar are all 'google'. The setup form is keyed
+    # by THIS, not by connector id, and without it the client could only
+    # learn the name by failing a connect and reading the 503 body.
+    provider_app: Optional[str] = None
     # Per-identity read-only flag. Defaults to False; only meaningful
     # when status is 'active' or 'reauth_required'.
     read_only: bool = False
@@ -210,6 +216,7 @@ async def get_connector_catalog(
                 unavailable_reason=(
                     "credentials_missing" if unconfigured else None
                 ),
+                provider_app=manifest.oauth.provider_app,
             )
         )
 
