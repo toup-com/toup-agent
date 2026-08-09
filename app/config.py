@@ -729,10 +729,14 @@ class Settings(BaseSettings):
     # today when it isn't, and (b) the direct-date fallback asks for the
     # user's LOCAL date instead of the server's UTC date. Nothing is
     # dropped from context either way — only the label changes, and only
-    # when the loaded day is not today. Default OFF: it edits the prompt a
-    # LIVE voice call speaks from, so it ships dark and gets flipped
-    # (VOICE_DAY_CONTEXT_DATE_GUARD=true) after a canary listen.
-    voice_day_context_date_guard: bool = False
+    # when the loaded day is not today.
+    #
+    # Shipped dark 2026-07-31 pending "a canary listen" that never
+    # happened; flipped ON 2026-08-09 (audit G-9): nine days with the
+    # wrong-day header live by default is strictly worse than the
+    # label-only change this guards, and the OFF escape hatch
+    # (VOICE_DAY_CONTEXT_DATE_GUARD=false) remains.
+    voice_day_context_date_guard: bool = True
     # Full-parity `think` (V2): the realtime relay runs on platform-api, where
     # the in-process agent_runner is absent, so `think` runs the user's OWN
     # agent over its HTTP /api/chat (the SAME AgentRunner text chat uses — full
@@ -1309,12 +1313,17 @@ class Settings(BaseSettings):
     blue_green_drain_timeout_s: int = 60
 
     # ── MCP transport auth (T0c) ─────────────────────────────
-    # When False (default), the platform MCP server logs unauthenticated
-    # requests as warnings but lets them through. When True, missing or
-    # invalid X-Agent-Key returns 401 from the transport before any tool
-    # dispatch. Flip to True only after a clean staging soak shows zero
-    # warn-only rejections (per docs/integrations/02-rollout.md T0c).
-    mcp_require_x_agent_key: bool = False
+    # When False, the platform MCP server logs unauthenticated requests as
+    # warnings but lets them through. When True, missing or invalid
+    # X-Agent-Key returns 401 from the transport before any tool dispatch.
+    #
+    # Flipped to True 2026-08-09 (audit G-10) on the soak evidence the
+    # warn-only mode existed to produce: 0 "would-reject in enforce mode"
+    # warnings across 20 production containers (all 5 assigned + 15 pool)
+    # over 7 days of logs. Nothing observed breaks; an unauthenticated
+    # future caller SHOULD 401 — that is the point. Escape hatch:
+    # MCP_REQUIRE_X_AGENT_KEY=false.
+    mcp_require_x_agent_key: bool = True
 
     # ── Agent-key rotation primitive (T0b) ──────────────────
     # When False (default), POST /api/agent/rotate-key returns 503. Flip

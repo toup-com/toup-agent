@@ -1625,6 +1625,17 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                 session_id=session_id,
                 channel="voice",
                 model_override=model_override,
+                # Parity with the V2 relay path (it sends save=False, which
+                # api_v1's agent-turn maps to exactly these three): `task` is
+                # a string the REALTIME MODEL synthesised, not what the user
+                # said — persisting it double-writes the day chat next to
+                # _save_voice_messages' real transcripts, and mining it for
+                # memories minted facts the user never stated (the 409A
+                # incident api_v1.py documents). Voice memory extraction runs
+                # from real transcripts via _extract_voice_memories instead.
+                save_user_message=False,
+                save_assistant_message=False,
+                disable_post_processing=True,
             )
             logger.info(
                 "[REALTIME] think via agent_runner: %d chars, model=%s, %dms",

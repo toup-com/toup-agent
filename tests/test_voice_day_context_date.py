@@ -19,8 +19,9 @@ morning — the user has said nothing yet today — the newest day chat is a
 previous day, so the model was handed yesterday's transcript labelled as
 today's and narrated it as "earlier today".
 
-`settings.voice_day_context_date_guard` (DEFAULT OFF — it edits the
-prompt a live call speaks from) makes two changes and only two:
+`settings.voice_day_context_date_guard` (default ON since 2026-08-09,
+audit G-9; shipped dark 2026-07-31 pending a canary listen that never
+happened) makes two changes and only two:
   1. the header names the day's real date when it is not today;
   2. the direct-date fallback asks for the user's LOCAL date instead of
      the relay's UTC date.

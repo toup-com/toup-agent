@@ -474,3 +474,14 @@ async def test_db_lookup_failure_fails_closed(monkeypatch, warn_only_mode):
     assert status == 503
     assert b"MCP auth lookup failed" in body
     assert inner.calls == 0
+
+
+def test_enforce_mode_is_the_default():
+    """G-10 (audit 2026-08-09): warn-only was a SOAK mode, not a resting
+    state. The soak it existed for concluded — 0 'would-reject in enforce
+    mode' warnings across 20 production containers over 7 days — so the
+    default is enforce. Pinned via model_fields so an env var cannot fake
+    this green; MCP_REQUIRE_X_AGENT_KEY=false remains the escape hatch."""
+    from app.config import settings as _settings
+
+    assert _settings.model_fields["mcp_require_x_agent_key"].default is True

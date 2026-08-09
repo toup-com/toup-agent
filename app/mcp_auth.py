@@ -24,17 +24,17 @@ What this module does:
 
 Modes (settings.mcp_require_x_agent_key):
 
-  * False (default — warn-only). On missing/invalid key, log a structured
+  * False (warn-only soak mode). On missing/invalid key, log a structured
     warning with fingerprint (key prefix, path, request_id, client) and
     let the request proceed. Tool handlers then raise ValueError from
     `get_mcp_user_id()`, which FastMCP serialises as a clean error
-    response. This lets us soak the auth flow in production without
-    breaking any caller that's already exercising the broken pre-auth
-    path.
+    response. This existed to soak the auth flow in production without
+    breaking any caller exercising the broken pre-auth path.
 
-  * True (enforce). On missing/invalid key, return 401 from the transport
-    before any tool dispatch. Flip to True after staging shows a clean
-    24h with zero warn-only rejections.
+  * True (enforce — the default since 2026-08-09). On missing/invalid
+    key, return 401 from the transport before any tool dispatch. The
+    soak the warn-only mode existed for concluded: 0 would-reject
+    warnings across 20 production containers over 7 days (audit G-10).
 
 What this module deliberately does NOT do:
 
