@@ -350,12 +350,12 @@ async def _log_event(
     scope for those). None means the call site had no usage to inspect
     (error paths).
 
-    `cache_write_tokens` (G1 prep): prompt-cache WRITE tokens — billed at
-    1.25x input on the gpt-5.6 family. Threaded into the credit charge
-    (tokens_to_credits) alongside cached_tokens; both are no-ops for
-    models whose pricing entry lacks the cache columns, so legacy billing
-    is byte-identical. Not persisted (no DB column) — cost_cents and the
-    [CACHE] log lines carry the evidence for the G1 canary.
+    `cache_write_tokens` (G1 prep; persisted since alembic 083): prompt-
+    cache WRITE tokens — billed at a premium on part of the gpt-5.6
+    family. Threaded into the credit charge (tokens_to_credits) alongside
+    cached_tokens; both are no-ops for models whose pricing entry lacks
+    the cache columns, so legacy billing is byte-identical. Before 083 it
+    was priced and then dropped — recoverable only from [CACHE] log lines.
 
     `operation_type` semantics (CRITICAL — do not change without updating _get_spend):
       - None or "user.*" → user-attributable, counts toward the user's cap.
@@ -391,6 +391,7 @@ async def _log_event(
         status=status,
         operation_type=operation_type,
         cached_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
         channel=_sanitize_channel(channel),
     )
     db.add(event)
@@ -2457,6 +2458,9 @@ class CacheDailyRow(BaseModel):
     day: str
     prompt_tokens: int
     cached_tokens: int
+    # Prompt-cache WRITE volume (alembic 083). 0 for days recorded before
+    # 083 — NULLs aggregate as 0 here, same convention as cached_tokens.
+    cache_write_tokens: int
     cache_hit_ratio: float
     calls: int
 
@@ -2514,6 +2518,7 @@ async def get_admin_cache_daily(
             day_col.label("day"),
             func.coalesce(func.sum(LLMProxyEvent.input_tokens), 0).label("prompt_tokens"),
             func.coalesce(func.sum(LLMProxyEvent.cached_tokens), 0).label("cached_tokens"),
+            func.coalesce(func.sum(LLMProxyEvent.cache_write_tokens), 0).label("cache_write_tokens"),
             func.count().label("calls"),
         )
         .where(LLMProxyEvent.created_at >= since)
@@ -2535,6 +2540,7 @@ async def get_admin_cache_daily(
             day=str(r.day),
             prompt_tokens=prompt,
             cached_tokens=cached,
+            cache_write_tokens=int(r.cache_write_tokens or 0),
             cache_hit_ratio=round(cached / prompt, 4) if prompt > 0 else 0.0,
             calls=int(r.calls or 0),
         ))

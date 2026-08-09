@@ -190,6 +190,15 @@ class LLMProxyEvent(Base):
     # cache_read_input_tokens. Telemetry only — never enters cost_cents or
     # credit math. NULL = recorded before 075 or usage wasn't inspectable.
     cached_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Prompt-cache WRITE tokens (alembic 083). Billed at a premium on part of
+    # the gpt-5.6 family (sol/luna 1.25x input; terra's measured write rate
+    # equals list input — config.pricing_per_1k). Extracted on both wires and
+    # already priced into cost_cents since G1 prep; until 083 it was then
+    # DROPPED — the one cache number recoverable only by grepping [CACHE]
+    # platform logs. NULL = pre-083 row, or usage wasn't inspectable, or the
+    # provider reported no write field (chat wire reports none today; the
+    # Responses wire does).
+    cache_write_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # Surface the turn came from — "web", "voice", "telegram", … (alembic 082).
     #
     # Prompt caching is prefix-exact and the wire TOOLS ARRAY heads the prefix,
