@@ -1697,7 +1697,16 @@ async def delete_account(
 
 @router.post("/demo", response_model=Token)
 async def demo_login(db: AsyncSession = Depends(get_db)):
-    """Create or login as demo user (for testing)"""
+    """Create or login as the shared demo user — local development only.
+
+    Gated hard OFF by default (settings.demo_login_enabled): this route is
+    unauthenticated and the password is in source, so anywhere it is
+    reachable, anyone can mint a valid session. 404 rather than 403 so the
+    disabled route does not advertise its own existence.
+    """
+    if not settings.demo_login_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
     demo_email = "demo@toup.local"
     demo_password = "demo123456"
     user = await get_user_by_email(db, demo_email)

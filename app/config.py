@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     # into explicitly (SQL_ECHO=true) and never ride on a general dev flag.
     sql_echo: bool = False
 
+    # POST /auth/demo mints a real session token for a shared demo account,
+    # unauthenticated, with a password hardcoded in source. That is a login
+    # backdoor when reachable in production (the demo user was found live in
+    # the prod DB, created 2026-07-08). Like sql_echo, a convenience for
+    # local development must be opted into explicitly (DEMO_LOGIN_ENABLED=true)
+    # — when off, the route 404s so it does not even advertise itself.
+    demo_login_enabled: bool = False
+
     # Plan init_db()'s boot-time ALTER list against the live catalog and issue
     # only the statements whose effect is actually missing, instead of
     # replaying all ~358 every start.
