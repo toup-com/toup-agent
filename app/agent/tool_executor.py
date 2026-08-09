@@ -5049,11 +5049,15 @@ class ToolExecutor:
             DEFAULT_TTL_SECONDS,
         )
 
-        # Channel gate — hard check matches the tool-list filter in
-        # agent_runner.py. Defense in depth: even if the LLM hallucinates
-        # the tool on a blocked channel, it never runs.
-        blocked = {"telegram", "voice", "mobile"}
-        if (self._current_channel or "") in blocked:
+        # Channel gate — defense in depth: even if the LLM hallucinates
+        # the tool on a blocked channel, it never runs. Import the SAME set
+        # the tool-list filter uses; the previous hardcoded copy had already
+        # drifted (it was missing `autopilot`, added to the runner's set by
+        # Vault CP4.1 but never mirrored here). Function-local import: the
+        # runner imports this module at boot, so a top-level import back
+        # would be circular; by the time a tool runs, agent_runner is loaded.
+        from app.agent.agent_runner import VAULT_TOOL_CHANNEL_BLOCK
+        if (self._current_channel or "") in VAULT_TOOL_CHANNEL_BLOCK:
             return (
                 "ERROR: save_streaming_credential is not available on this channel. "
                 "Tell the user to use the web app."

@@ -162,4 +162,8 @@ def make_openai_client(byok_key: Optional[str] = None):
     key = (byok_key or settings.openai_api_key or "").strip()
     if not key:
         return None
-    return AsyncOpenAI(api_key=key)
+    # Same 120s ceiling as every other client in this module. Bare
+    # AsyncOpenAI rides the SDK default of 600s — a hung upstream held a
+    # BYOK turn (and its WS) open for ten minutes while the bundle path
+    # gave up in two (audit G-12).
+    return AsyncOpenAI(api_key=key, timeout=120.0)

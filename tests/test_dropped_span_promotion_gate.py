@@ -150,8 +150,16 @@ async def _drive_one_turn(monkeypatch, tmp_path, *, disable_post_processing: boo
         seen["on_drop"] = on_drop
         # Reproduce context_manager.compact_messages' own contract verbatim
         # (see test_context_manager_only_promotes_when_on_drop_is_not_none):
-        # the promotion block is entered only when on_drop is not None.
-        if on_drop is not None:
+        # the promotion block is entered only when on_drop is not None — and
+        # a given span is promoted at most ONCE, because the real function
+        # advances the persisted compaction_promoted_through cursor. With
+        # needs_compaction forced True, the harness now reaches TWO gated
+        # sites (pre-loop + the G-7 first-request routed-model gate, whose
+        # 128k window for the unknown 'gpt-5.5-mini' override is below the
+        # default model's); firing the same span from both would model a
+        # cursor that doesn't exist.
+        if on_drop is not None and not seen.get("span_promoted"):
+            seen["span_promoted"] = True
             on_drop(list(_DROPPED_SPAN))
         return messages
 
@@ -254,9 +262,10 @@ def test_promotion_callback_is_bound_through_the_gate():
     assert "on_drop=_promote_dropped_span" not in _RUNNER_SRC, (
         "a compaction site binds the raw callback and bypasses the gate"
     )
-    # Every compaction site in run() must go through it. Three sites:
-    # pre-loop, the context_length_exceeded retry, and the 80% mid-loop.
-    assert _RUNNER_SRC.count("on_drop=_on_drop,") == 3, (
+    # Every compaction site in run() must go through it. Four sites:
+    # pre-loop, the G-7 first-request routed-model gate, the
+    # context_length_exceeded retry, and the 80% mid-loop.
+    assert _RUNNER_SRC.count("on_drop=_on_drop,") == 4, (
         "not every compact_messages() call site routes on_drop through the gate"
     )
 

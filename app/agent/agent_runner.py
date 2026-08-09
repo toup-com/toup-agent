@@ -922,6 +922,20 @@ class AgentRunner:
             str((a or {}).get("mime_type", "")).startswith("image/")
             for a in (inbound_attachments or [])
         )
+        # inbound_attachments is only supplied by the ws_chat caller. Every
+        # other channel (Telegram, WhatsApp, all BaseChannel adapters) delivers
+        # the same image as a media_path — the model could SEE it via
+        # _build_media_content while the media tools stayed ungated, which is
+        # exactly the "can't edit/render the image in this chat" failure this
+        # block exists to prevent. Classify by the same mimetypes call
+        # _build_media_content uses, so the two views of "is this an image"
+        # cannot drift.
+        if not _has_inbound_image and media_paths:
+            import mimetypes as _mt
+            _has_inbound_image = any(
+                (_mt.guess_type(p)[0] or "").startswith("image/")
+                for p in media_paths
+            )
         if _has_inbound_image:
             query_intent = with_inbound_image(query_intent)
         logger.info(
@@ -1535,8 +1549,13 @@ class AgentRunner:
                 "(disable_post_processing=True)"
             )
 
-        # Context window management — initial check
-        if needs_compaction(system_prompt, messages, settings.agent_model):
+        # Context window management — initial check. Output headroom is
+        # reserved (the window bounds input+output together): a prompt that
+        # "fits" with nothing left for the answer is still an overflow.
+        if needs_compaction(
+            system_prompt, messages, settings.agent_model,
+            reserve_output_tokens=int(getattr(settings, "agent_max_tokens", 0) or 0),
+        ):
             logger.info(f"[AGENT] Context compaction triggered ({len(messages)} messages)")
             messages = await compact_messages(
                 messages, settings.agent_model,
@@ -1640,6 +1659,27 @@ class AgentRunner:
         # 1.00M sent to a 200k Claude model is a guaranteed overflow.
         # Re-key the mid-loop compaction math to the ACTIVE model.
         _context_window = get_context_window(active_model)
+
+        # A8-3 closed the MID-loop math; the FIRST request was still
+        # budgeted against settings.agent_model (the initial
+        # needs_compaction above runs before routing exists). When routing
+        # lands on a smaller-window model, guard the first send too —
+        # otherwise iteration 1 is a deterministic 400 that only the
+        # reactive overflow handler can rescue, one full round-trip late.
+        if _context_window < get_context_window(settings.agent_model) and needs_compaction(
+            system_prompt, messages, active_model,
+            reserve_output_tokens=int(getattr(settings, "agent_max_tokens", 0) or 0),
+        ):
+            logger.info(
+                "[AGENT] First-request compaction for routed model %s "
+                "(window %d < default-model window %d, %d messages)",
+                active_model, _context_window,
+                get_context_window(settings.agent_model), len(messages),
+            )
+            messages = await compact_messages(
+                messages, active_model,
+                conversation_id=session_id, on_drop=_on_drop,
+            )
 
         active_llm = self.anthropic if _is_claude_model(active_model) else self.llm
 
@@ -4404,6 +4444,7 @@ class AgentRunner:
                 "you are on it and keep going."
             ),
             "telegram":  "User is on Telegram messenger (talking to the Toup bot there). Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
+            "whatsapp":  "User is on WhatsApp (talking to the Toup bot there). Short messages, plain text first. WhatsApp renders only *bold*, _italic_ and ```monospace``` — no headings, no tables, no links-as-markdown. Avoid long code blocks.",
             "discord":   "User is on Discord (Toup bot). Full markdown and code blocks OK. Keep message length under ~2000 chars.",
             "slack":     "User is on Slack (Toup integration). Slack-flavored markdown (limited). Short messages preferred.",
             "extension": (

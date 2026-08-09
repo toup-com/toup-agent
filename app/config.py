@@ -1779,6 +1779,13 @@ class Settings(BaseSettings):
         # second-largest instance of the same missing-column defect.
         "gpt-4o-mini": {"input": 0.00015, "cached_input": 0.000075, "output": 0.0006},
         "claude-opus-4-6": {"input": 0.015, "output": 0.075},
+        # The Anthropic CANONICAL (model_resolver._CANONICAL_ANTHROPIC_MODEL)
+        # had a context-window row (A8-3) but no pricing row, so if Anthropic
+        # is re-enabled it would fall through _calc_cost_cents' conservative
+        # default and bill Opus at Sonnet rates (5x under). MODELLED at the
+        # opus-4-6 rate, not measured — correct against real org billing
+        # before trusting any 4-7 cost figure (the #509 lesson).
+        "claude-opus-4-7": {"input": 0.015, "output": 0.075},
         "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
         "claude-sonnet-4-5-20250514": {"input": 0.003, "output": 0.015},
         "claude-sonnet-4-20250514": {"input": 0.003, "output": 0.015},

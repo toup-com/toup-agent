@@ -191,9 +191,17 @@ def needs_compaction(
     system_prompt: str,
     messages: List[Dict[str, Any]],
     model: str,
+    reserve_output_tokens: int = 0,
 ) -> bool:
-    """Check if the conversation context needs compaction."""
-    context_window = get_context_window(model)
+    """Check if the conversation context needs compaction.
+
+    `reserve_output_tokens`: window share held back for the model's OUTPUT.
+    The window bounds input+output together; budgeting input against the
+    full window means a prompt that fits with 0 tokens to spare 400s the
+    moment the model tries to answer. Callers pass their max-output setting
+    (agent_max_tokens) so the input budget is what is actually spendable.
+    """
+    context_window = max(1, get_context_window(model) - max(0, reserve_output_tokens))
     system_tokens = estimate_tokens(system_prompt)
     messages_tokens = estimate_messages_tokens(messages)
     total = system_tokens + messages_tokens
