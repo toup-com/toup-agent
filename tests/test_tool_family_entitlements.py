@@ -482,3 +482,107 @@ def test_gate_takes_no_per_turn_input():
         "the entitlement re-resolved mid-process — that is a mid-life tools "
         "array mutation and a new cache lineage"
     )
+
+
+# ----------------------------------------------------------------------
+# 8. The app_builder family must gate the WHOLE app builder
+#
+# `AppGatewaySkill` lives in `skills/builtins/app_builder/` and registers
+# under the name "app", so its 13 tools are `app__*` — not `app_builder__*`.
+# The family listed only "app_builder", which meant a tenant who withheld
+# "the app builder" lost its 6 entry points and kept all 13 tools of the
+# machine behind them: two thirds of the tokens, and a set of tools the
+# agent can still call with no way to have built anything to call them on.
+#
+# It stopped being a token-accounting nicety when the wire array went over
+# OpenAI's hard 128-tool cap, where the overflow is TRUNCATED — every tool
+# this family fails to withhold is paid for by dropping whichever tools
+# happen to sort last.
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_withholding_the_app_builder_withholds_its_gateway_too():
+    from app.agent.skills.builtins.app_builder.app_gateway_skill import (
+        AppGatewaySkill,
+    )
+    from app.agent.skills.builtins.app_builder.skill import AppBuilderSkill
+    from app.agent.skills.builtins.routines.skill import RoutinesSkill
+    from app.agent.skills.loader import SkillLoader
+
+    _entitle("doc_generation,toup")  # app_builder withheld
+    loader = SkillLoader()
+    assert await loader.register_dynamic(AppBuilderSkill()) is False
+    assert await loader.register_dynamic(AppGatewaySkill()) is False
+    # CONTROL: a skill in no gated family still loads, so this is not a
+    # loader that has simply stopped accepting anything.
+    assert await loader.register_dynamic(RoutinesSkill()) is True
+
+    names = {t["name"] for t in loader.get_all_tool_definitions()}
+    assert not any(n.startswith("app__") for n in names), sorted(names)
+    assert not any(n.startswith("app_builder__") for n in names)
+    assert any(n.startswith("routines__") for n in names)
+
+
+@pytest.mark.asyncio
+async def test_an_entitled_tenant_still_gets_the_gateway():
+    """ANTI-VACUITY control for the test above."""
+    from app.agent.skills.builtins.app_builder.app_gateway_skill import (
+        AppGatewaySkill,
+    )
+    from app.agent.skills.loader import SkillLoader
+
+    _entitle("*")
+    loader = SkillLoader()
+    assert await loader.register_dynamic(AppGatewaySkill()) is True
+    names = {t["name"] for t in loader.get_all_tool_definitions()}
+    assert any(n.startswith("app__") for n in names)
+
+
+def test_every_skill_shipped_under_app_builder_is_named_by_the_family():
+    """Structural, so the NEXT skill dropped into that directory is covered
+    the day it is added rather than the day someone notices the token bill.
+
+    The defect was not that "app" was hard to find — it is one directory
+    listing away. It was that nothing connected the family's membership to
+    the directory it is named after, so the two could drift silently and
+    the only symptom was a number in a token report.
+    """
+    import ast
+    import pathlib
+
+    pkg = pathlib.Path(te_mod.__file__).parent / "skills/builtins/app_builder"
+    assert pkg.is_dir(), pkg
+
+    declared = set()
+    for path in sorted(pkg.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            # `meta = SkillMeta(name="app", ...)` — read the literal rather
+            # than importing, so this cannot be defeated by an import error.
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "id", None) != "SkillMeta":
+                continue
+            for kw in node.keywords:
+                if kw.arg == "name" and isinstance(kw.value, ast.Constant):
+                    declared.add(kw.value.value)
+
+    assert declared, f"no SkillMeta(name=…) found under {pkg} — did skills move?"
+    gated = te_mod.FAMILIES["app_builder"].skills
+    missing = sorted(declared - set(gated))
+    assert not missing, (
+        f"skills {missing} ship from the app_builder package but are not in the "
+        f"`app_builder` family, so withholding 'the app builder' leaves them "
+        f"loaded — tokens on every turn, and tool slots against OpenAI's 128 cap."
+    )
+
+
+def test_skill_enabled_answers_for_the_gateway_by_name():
+    """The loader's actual question, asked directly."""
+    _entitle("doc_generation,toup")
+    assert te_mod.skill_enabled("app") is False
+    assert te_mod.skill_enabled("app_builder") is False
+    assert te_mod.skill_enabled("routines") is True
+    _entitle("*")
+    assert te_mod.skill_enabled("app") is True

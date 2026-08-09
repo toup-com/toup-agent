@@ -108,7 +108,25 @@ FAMILIES: Dict[str, _Family] = {
         _Family(
             "app_builder",
             "the app builder",
-            skills=("app_builder",),
+            # BOTH skills, and the second one is the bigger half. The
+            # `app_builder` skill declares 6 tools (`app_builder__*`);
+            # `AppGatewaySkill` — same directory, registered under the
+            # name "app" — declares 13 more (`app__*`: read_file,
+            # write_file, git_push, query_db, logs, restart, publish_web…).
+            #
+            # Listing only "app_builder" made a family labelled "the app
+            # builder" withhold 6 of the app builder's 19 tools, so a
+            # tenant who set AGENT_TOOL_FAMILIES to exclude it lost the
+            # entry points and kept the entire machine behind them —
+            # ~2/3 of the tokens, and 13 tools the agent could still call
+            # with no way to have built anything to call them on.
+            #
+            # Not a token-accounting nicety: with four connectors added
+            # in the last two days the wire array is over OpenAI's hard
+            # 128-tool cap, where the overflow is TRUNCATED, so the tools
+            # this family fails to withhold are paid for by dropping
+            # whichever tools sort last.
+            skills=("app_builder", "app"),
         ),
         _Family(
             "toup",
